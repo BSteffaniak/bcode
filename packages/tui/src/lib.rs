@@ -22,6 +22,7 @@ pub(crate) mod exit_state;
 pub(crate) mod filtered_list;
 pub(crate) mod helpers;
 pub(crate) mod history_flow;
+pub(crate) mod indexed_transcript_layout;
 pub(crate) mod input;
 pub(crate) mod input_history;
 pub(crate) mod interactive_surface;

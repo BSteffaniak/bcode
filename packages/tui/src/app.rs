@@ -280,6 +280,8 @@ pub struct BmuxApp {
     live_tool_previews: BTreeMap<String, LiveToolPreviewState>,
     live_preview_revision: u64,
     live_preview_frames_requested: u64,
+    elapsed_layout_revision: u64,
+    elapsed_dirty_visuals: BTreeSet<String>,
     live_preview_duplicates_skipped: u64,
     live_preview_truncated_snapshots: u64,
     pending_submissions: PendingSubmissions,
@@ -487,6 +489,8 @@ impl BmuxApp {
             live_tool_previews: BTreeMap::new(),
             live_preview_revision: 0,
             live_preview_frames_requested: 0,
+            elapsed_layout_revision: 0,
+            elapsed_dirty_visuals: BTreeSet::new(),
             live_preview_duplicates_skipped: 0,
             live_preview_truncated_snapshots: 0,
             pending_submissions: PendingSubmissions::default(),
@@ -958,13 +962,24 @@ impl BmuxApp {
         self.transcript.items()
     }
 
-    /// Return revision for layout-affecting transcript collection changes.
+    /// Return revision for elapsed-time labels in active transcript entries.
     #[must_use]
-    pub const fn transcript_projection_revision(&self) -> u64 {
+    pub const fn elapsed_layout_revision(&self) -> u64 {
+        self.elapsed_layout_revision
+    }
+
+    /// Return revision for layout-affecting transcript collection changes excluding targeted time labels.
+    #[must_use]
+    pub const fn transcript_structural_projection_revision(&self) -> u64 {
         self.transcript
             .revision()
             .saturating_add(self.live_preview_revision)
             .saturating_add(self.live_preview_frames_requested)
+    }
+
+    /// Drain transcript invocation identifiers whose elapsed-time label changed.
+    pub fn drain_elapsed_dirty_visuals(&mut self) -> BTreeSet<String> {
+        std::mem::take(&mut self.elapsed_dirty_visuals)
     }
 
     /// Return revision for layout-affecting pending submission changes.
@@ -2794,7 +2809,9 @@ impl BmuxApp {
                     };
                 }
                 invalidation.merge(UiInvalidation::Paint)
-            } else if is_tool_elapsed_invalidation(key) {
+            } else if let Some(invocation_id) = tool_elapsed_invalidation_invocation_id(key) {
+                self.elapsed_layout_revision = self.elapsed_layout_revision.saturating_add(1);
+                self.elapsed_dirty_visuals.insert(invocation_id.to_owned());
                 invalidation.merge(UiInvalidation::Layout)
             } else {
                 invalidation
@@ -2920,10 +2937,12 @@ impl BmuxApp {
                     now_system,
                     TOOL_ELAPSED_INVALIDATION_MAX_INTERVAL,
                 )?;
+                let invocation_id = item
+                    .visual_invocation_id()
+                    .map_or_else(|| item.id().get().to_string(), str::to_owned);
                 Some(InvalidationRequest::new(
                     InvalidationKey::new(format!(
-                        "{TOOL_ELAPSED_INVALIDATION_PREFIX}:{}",
-                        item.id().get()
+                        "{TOOL_ELAPSED_INVALIDATION_PREFIX}:{invocation_id}"
                     )),
                     at,
                 ))
@@ -4502,8 +4521,11 @@ fn latest_bar_active_frame_duration(burst: u8) -> Duration {
     )
 }
 
-fn is_tool_elapsed_invalidation(key: &InvalidationKey) -> bool {
-    key.as_str().starts_with(TOOL_ELAPSED_INVALIDATION_PREFIX)
+fn tool_elapsed_invalidation_invocation_id(key: &InvalidationKey) -> Option<&str> {
+    key.as_str()
+        .strip_prefix(TOOL_ELAPSED_INVALIDATION_PREFIX)?
+        .strip_prefix(':')
+        .filter(|invocation_id| !invocation_id.is_empty())
 }
 
 fn is_latest_bar_animation_invalidation(key: &InvalidationKey) -> bool {
@@ -5068,6 +5090,26 @@ mod tests {
                 algorithm_version: 1,
             },
         }
+    }
+
+    #[test]
+    fn tool_elapsed_invalidation_targets_structural_projection_entry() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let before = app.elapsed_layout_revision;
+        let invalidation = app.handle_invalidations(
+            &[InvalidationKey::new(format!(
+                "{TOOL_ELAPSED_INVALIDATION_PREFIX}:call-item"
+            ))],
+            Instant::now(),
+        );
+
+        assert_eq!(invalidation, UiInvalidation::Layout);
+        assert_eq!(app.elapsed_layout_revision, before.saturating_add(1));
+        assert_eq!(
+            app.drain_elapsed_dirty_visuals(),
+            BTreeSet::from(["call-item".to_owned()])
+        );
+        assert!(app.drain_elapsed_dirty_visuals().is_empty());
     }
 
     #[test]

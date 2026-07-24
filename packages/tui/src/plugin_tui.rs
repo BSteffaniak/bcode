@@ -4,7 +4,7 @@ use bcode_plugin::{PluginHost, PluginLoadError, PluginRuntimeHost, StaticBundled
 use bcode_plugin_sdk::tui::{
     BoxedPluginTuiSurface, PluginTuiArtifactChunk, PluginTuiRegistry, PluginTuiSurfaceOpenRequest,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -42,6 +42,8 @@ pub struct PluginTuiPresentation {
     host: Arc<PluginHost>,
     registries: Mutex<BTreeMap<String, Arc<PluginTuiRegistry>>>,
     visual_revisions: Mutex<BTreeMap<String, u64>>,
+    dirty_visuals: Mutex<BTreeSet<String>>,
+    visual_generation: AtomicU64,
     full_generation: AtomicU64,
     timings: Mutex<Vec<PluginVisualTiming>>,
 }
@@ -60,6 +62,8 @@ impl PluginTuiPresentation {
             host,
             registries: Mutex::new(BTreeMap::new()),
             visual_revisions: Mutex::new(BTreeMap::new()),
+            dirty_visuals: Mutex::new(BTreeSet::new()),
+            visual_generation: AtomicU64::new(0),
             full_generation: AtomicU64::new(0),
             timings: Mutex::new(Vec::new()),
         }
@@ -75,6 +79,12 @@ impl PluginTuiPresentation {
     #[must_use]
     pub fn revision(&self) -> u64 {
         self.full_generation.load(Ordering::Relaxed)
+    }
+
+    /// Return the aggregate generation for isolated visual-state updates.
+    #[must_use]
+    pub fn visual_generation(&self) -> u64 {
+        self.visual_generation.load(Ordering::Relaxed)
     }
 
     /// Return the generic adapter-state revision for one invocation.
@@ -93,6 +103,21 @@ impl PluginTuiPresentation {
             let revision = revisions.entry(invocation_id.to_owned()).or_default();
             *revision = revision.wrapping_add(1);
         }
+        self.mark_visual_dirty(invocation_id);
+    }
+
+    fn mark_visual_dirty(&self, invocation_id: &str) {
+        self.visual_generation.fetch_add(1, Ordering::Relaxed);
+        if let Ok(mut dirty) = self.dirty_visuals.lock() {
+            dirty.insert(invocation_id.to_owned());
+        }
+    }
+
+    /// Drain invocation identifiers whose retained adapter state changed.
+    pub fn drain_dirty_visuals(&self) -> BTreeSet<String> {
+        self.dirty_visuals
+            .lock()
+            .map_or_else(|_| BTreeSet::new(), |mut dirty| std::mem::take(&mut *dirty))
     }
 
     #[cfg(test)]
@@ -235,6 +260,9 @@ impl PluginTuiPresentation {
         if delivered && let Ok(mut revisions) = self.visual_revisions.lock() {
             let revision = revisions.entry(chunk.tool_call_id.clone()).or_default();
             *revision = revision.wrapping_add(1);
+        }
+        if delivered {
+            self.mark_visual_dirty(&chunk.tool_call_id);
         }
         Ok(delivered)
     }
@@ -469,6 +497,9 @@ mod tests {
                 fingerprint: crate::transcript_layout::TranscriptLayoutFingerprint::new(
                     "baseline-initial".to_owned(),
                 ),
+                structural_fingerprint: crate::transcript_layout::TranscriptLayoutFingerprint::new(
+                    "baseline-structure".to_owned(),
+                ),
                 transcript_len,
                 pending_len: 0,
                 transcript_signature: |index| {
@@ -479,6 +510,7 @@ mod tests {
                     )
                 },
                 transcript_rows: |index| vec![Line::from(format!("row-{index}"))],
+                transcript_invocation_id: |index| Some(format!("call-{index}")),
                 pending_signature: |index| {
                     crate::transcript_layout::TranscriptLayoutSignature::new(format!(
                         "pending-{index}"
@@ -491,31 +523,20 @@ mod tests {
             });
             presentation.bump_visual_revision_for_test("call-0");
             let started = Instant::now();
-            let stats = cache.sync(crate::transcript_layout::TranscriptLayoutSpec {
-                width: 80,
-                fingerprint: crate::transcript_layout::TranscriptLayoutFingerprint::new(
+            let stats = cache.sync_visuals(
+                crate::transcript_layout::TranscriptLayoutFingerprint::new(
                     "baseline-updated".to_owned(),
                 ),
-                transcript_len,
-                pending_len: 0,
-                transcript_signature: |index| {
+                &std::collections::BTreeSet::from(["call-0".to_owned()]),
+                |index| {
                     crate::transcript_projection::test_layout_signature(
                         &items[index],
                         80,
                         Some(&presentation),
                     )
                 },
-                transcript_rows: |index| vec![Line::from(format!("row-{index}"))],
-                pending_signature: |index| {
-                    crate::transcript_layout::TranscriptLayoutSignature::new(format!(
-                        "pending-{index}"
-                    ))
-                },
-                pending_rows: |_| Vec::new(),
-                history_banner_signature: || None,
-                history_banner_rows: Vec::new,
-                reset: || false,
-            });
+                |index| vec![Line::from(format!("row-{index}"))],
+            );
             println!(
                 "BCODE_PERF_CASE {}",
                 serde_json::json!({
@@ -554,6 +575,9 @@ mod tests {
                 fingerprint: crate::transcript_layout::TranscriptLayoutFingerprint::new(
                     "initial".to_owned(),
                 ),
+                structural_fingerprint: crate::transcript_layout::TranscriptLayoutFingerprint::new(
+                    "structure".to_owned(),
+                ),
                 transcript_len,
                 pending_len: 0,
                 transcript_signature: |index| {
@@ -564,6 +588,7 @@ mod tests {
                     )
                 },
                 transcript_rows: |index| vec![Line::from(format!("row-{index}"))],
+                transcript_invocation_id: |index| Some(format!("call-{index}")),
                 pending_signature: |index| {
                     crate::transcript_layout::TranscriptLayoutSignature::new(format!(
                         "pending-{index}"
@@ -577,32 +602,19 @@ mod tests {
             assert_eq!(initial.entries_rebuilt, transcript_len);
 
             presentation.bump_visual_revision_for_test("call-0");
-            let updated = cache.sync(crate::transcript_layout::TranscriptLayoutSpec {
-                width: 80,
-                fingerprint: crate::transcript_layout::TranscriptLayoutFingerprint::new(
-                    "updated".to_owned(),
-                ),
-                transcript_len,
-                pending_len: 0,
-                transcript_signature: |index| {
+            let updated = cache.sync_visuals(
+                crate::transcript_layout::TranscriptLayoutFingerprint::new("updated".to_owned()),
+                &std::collections::BTreeSet::from(["call-0".to_owned()]),
+                |index| {
                     crate::transcript_projection::test_layout_signature(
                         &items[index],
                         80,
                         Some(&presentation),
                     )
                 },
-                transcript_rows: |index| vec![Line::from(format!("row-{index}"))],
-                pending_signature: |index| {
-                    crate::transcript_layout::TranscriptLayoutSignature::new(format!(
-                        "pending-{index}"
-                    ))
-                },
-                pending_rows: |_| Vec::new(),
-                history_banner_signature: || None,
-                history_banner_rows: Vec::new,
-                reset: || false,
-            });
-            assert_eq!(updated.entries_scanned, transcript_len);
+                |index| vec![Line::from(format!("row-{index}"))],
+            );
+            assert_eq!(updated.entries_scanned, 1);
             assert_eq!(updated.signatures_changed, 1);
             assert_eq!(updated.entries_rebuilt, 1);
             assert_eq!(updated.rows_regenerated, 1);

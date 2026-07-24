@@ -36,9 +36,11 @@ run_probe() {
 
 python3 - "${output}" <<'PY'
 import json
+import os
 import sys
 
 path = sys.argv[1]
+require_over_budget = os.environ.get("BCODE_REQUIRE_OVER_BUDGET") == "1"
 with open(path, encoding="utf-8") as source:
     records = [json.loads(line) for line in source if line.strip()]
 
@@ -88,12 +90,13 @@ if actual_matrix != expected_matrix:
     raise SystemExit(f"expected 27 shell/TUI matrix cases, found {len(actual_matrix)}")
 if any(
     record["emulate_bytes"] != record["output_bytes"]
+    or record["entries_scanned"] != 1
     or record["entries_rebuilt"] != 1
     or record["reset_total"] != 0
     for record in matrix
 ):
     raise SystemExit("shell/TUI matrix detected replay or transcript rebuild amplification")
-if not any(record["over_budget"] for record in matrix):
+if require_over_budget and not any(record["over_budget"] for record in matrix):
     raise SystemExit("shell/TUI matrix did not reproduce an over-budget frame")
 if len(fetches) != 3:
     raise SystemExit(f"expected 3 artifact fetch cases, found {len(fetches)}")

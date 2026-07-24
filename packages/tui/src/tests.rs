@@ -5286,6 +5286,32 @@ fn active_visual_frame_baseline_report() {
 }
 
 #[test]
+fn structural_transcript_change_overrides_dirty_visual_targeting() {
+    let terminal = Rect::new(0, 0, 80, 18);
+    let session_id = SessionId::new();
+    let presentation = growing_visual_presentation();
+    let mut app = growing_visual_app(session_id, Arc::clone(&presentation));
+    render::prepare_frame(&mut app, terminal).expect("initial frame");
+    let _ = app.transcript_layout_mut().drain_sync_stats();
+
+    deliver_growing_visual_rows(&presentation, "call-growing", &["new visual row"], 1);
+    app.absorb_session_event(&event(
+        session_id,
+        25,
+        SessionEventKind::AssistantMessage {
+            text: "structural transcript change".to_owned(),
+        },
+    ));
+    let expected_entries = app.transcript().len();
+    render::prepare_frame(&mut app, terminal).expect("updated frame");
+    let stats = app.transcript_layout_mut().drain_sync_stats();
+
+    assert!(!stats.is_empty(), "{stats:?}");
+    assert_eq!(stats[0].entries_scanned, expected_entries);
+    assert!(stats[0].entries_scanned > 1);
+}
+
+#[test]
 fn active_visual_height_changes_preserve_viewport_latest_scroll_and_interaction_dock() {
     let terminal = Rect::new(0, 0, 80, 18);
     let interaction_height = 4;
@@ -5298,6 +5324,7 @@ fn active_visual_height_changes_preserve_viewport_latest_scroll_and_interaction_
     assert!(detached.scroll_transcript_up(8));
     let detached_top = detached.transcript_top_row(layout.transcript_area().height);
     let max_before = detached.transcript_layout().total_rows();
+    let _ = detached.transcript_layout_mut().drain_sync_stats();
 
     deliver_growing_visual_rows(
         &presentation,
@@ -5318,6 +5345,16 @@ fn active_visual_height_changes_preserve_viewport_latest_scroll_and_interaction_
     assert!(detached.newer_transcript_content_below());
     assert_eq!(dock_after, dock_before);
     assert!(layout.transcript_area().bottom() <= dock_after.y);
+    let targeted = detached.transcript_layout_mut().drain_sync_stats();
+    assert!(!targeted.is_empty(), "{targeted:?}");
+    assert_eq!(targeted[0].entries_scanned, 1);
+    assert_eq!(targeted[0].entries_rebuilt, 1);
+    assert!(
+        targeted[1..]
+            .iter()
+            .all(|stats| stats.entries_scanned == 0 && stats.entries_rebuilt == 0),
+        "{targeted:?}"
+    );
 
     let follow_presentation = growing_visual_presentation();
     let mut following = growing_visual_app(session_id, Arc::clone(&follow_presentation));

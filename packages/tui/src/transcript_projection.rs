@@ -58,18 +58,46 @@ fn max_bottom_overscroll(area: Rect) -> usize {
 
 fn sync_layout(app: &mut BmuxApp, width: u16) {
     let started = Instant::now();
+    let elapsed_dirty_visuals = app.drain_elapsed_dirty_visuals();
     let mut transcript_layout = std::mem::take(app.transcript_layout_mut());
     let input = TranscriptLayoutInput::from_app(app, width);
     let fingerprint = input.fingerprint();
+    let structural_fingerprint = input.structural_fingerprint();
     if transcript_layout.is_current(&fingerprint) {
         transcript_layout
             .record_cache_hit(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
         *app.transcript_layout_mut() = transcript_layout;
         return;
     }
+    let mut dirty_visuals = input.plugin_host.map_or_else(
+        std::collections::BTreeSet::new,
+        crate::plugin_tui::PluginTuiPresentation::drain_dirty_visuals,
+    );
+    dirty_visuals.extend(elapsed_dirty_visuals);
+    if !dirty_visuals.is_empty() && transcript_layout.structure_is_current(&structural_fingerprint)
+    {
+        transcript_layout.sync_visuals(
+            fingerprint,
+            &dirty_visuals,
+            |index| transcript_item_signature(&input.transcript[index], &input),
+            |index| {
+                render::transcript_item_rows(
+                    input.transcript,
+                    input.live_tool_previews,
+                    index,
+                    input.width,
+                    input.plugin_host,
+                    input.diff_viewer_config,
+                )
+            },
+        );
+        *app.transcript_layout_mut() = transcript_layout;
+        return;
+    }
     transcript_layout.sync(TranscriptLayoutSpec {
         width,
         fingerprint,
+        structural_fingerprint,
         transcript_len: input.transcript.len(),
         pending_len: input.pending.len(),
         transcript_signature: |index| transcript_item_signature(&input.transcript[index], &input),
@@ -82,6 +110,11 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
                 input.plugin_host,
                 input.diff_viewer_config,
             )
+        },
+        transcript_invocation_id: |index: usize| {
+            input.transcript[index]
+                .visual_invocation_id()
+                .map(ToOwned::to_owned)
         },
         pending_signature: |index| {
             render::pending_submission_signature(&input.pending[index], width)
@@ -106,7 +139,8 @@ struct TranscriptLayoutInput<'a> {
     plugin_host: Option<&'a crate::plugin_tui::PluginTuiPresentation>,
     diff_viewer_config: TuiDiffViewerConfig,
     pending: &'a [PendingSubmission],
-    transcript_projection_revision: u64,
+    elapsed_layout_revision: u64,
+    transcript_structural_projection_revision: u64,
     pending_submissions_projection_revision: u64,
     has_older_history: bool,
     loading_older_history: bool,
@@ -121,7 +155,9 @@ impl<'a> TranscriptLayoutInput<'a> {
             plugin_host: app.plugin_presentation(),
             diff_viewer_config: app.effective_diff_viewer_config(),
             pending: app.pending_submissions(),
-            transcript_projection_revision: app.transcript_projection_revision(),
+            elapsed_layout_revision: app.elapsed_layout_revision(),
+            transcript_structural_projection_revision: app
+                .transcript_structural_projection_revision(),
             pending_submissions_projection_revision: app.pending_submissions_projection_revision(),
             has_older_history: app.has_older_history(),
             loading_older_history: app.loading_older_history(),
@@ -129,53 +165,39 @@ impl<'a> TranscriptLayoutInput<'a> {
     }
 
     fn fingerprint(&self) -> TranscriptLayoutFingerprint {
-        let transcript = self
-            .transcript
-            .iter()
-            .map(|item| {
-                let elapsed = render::terminal_elapsed_signature_fragment(item).unwrap_or_default();
-                let live_preview_revision = match item.kind() {
-                    super::transcript::TranscriptItemKind::LiveToolPreviewAnchor {
-                        tool_call_id,
-                        ..
-                    } => self
-                        .live_tool_previews
-                        .get(tool_call_id)
-                        .map_or(0, |preview| preview.revision),
-                    _ => 0,
-                };
-                let visual_revision = item.visual_invocation_id().map_or(0, |invocation_id| {
-                    self.plugin_host
-                        .map_or(0, |host| host.visual_revision(invocation_id))
-                });
+        let presentation = self.plugin_host.map_or_else(
+            || "none".to_owned(),
+            |host| {
                 format!(
-                    "{}:{}:{elapsed}:visual:{visual_revision}:live-preview:{live_preview_revision}",
-                    item.id().get(),
-                    item.revision()
+                    "{}:{}:{}",
+                    std::ptr::from_ref(host).addr(),
+                    host.revision(),
+                    host.visual_generation()
                 )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
-        let pending = self
-            .pending
-            .iter()
-            .map(|pending| format!("{}:{:?}", pending.text(), pending.state()))
-            .collect::<Vec<_>>()
-            .join(",");
-        let plugin_host_generation = self.plugin_host.map_or_else(
+            },
+        );
+        TranscriptLayoutFingerprint::new(format!(
+            "{};elapsed-rev:{};visual-generation:{presentation}",
+            self.structural_fingerprint().as_str(),
+            self.elapsed_layout_revision
+        ))
+    }
+
+    fn structural_fingerprint(&self) -> TranscriptLayoutFingerprint {
+        let presentation = self.plugin_host.map_or_else(
             || "none".to_owned(),
             |host| format!("{}:{}", std::ptr::from_ref(host).addr(), host.revision()),
         );
         TranscriptLayoutFingerprint::new(format!(
-            "width:{};diff:{:?};history:{}:{};plugin-host-generation:{plugin_host_generation};transcript-rev:{};transcript:{};pending-rev:{};pending:{}",
+            "width:{};diff:{:?};history:{}:{};presentation:{presentation};transcript-rev:{};transcript-len:{};pending-rev:{};pending-len:{}",
             self.width,
             self.diff_viewer_config,
             self.has_older_history,
             self.loading_older_history,
-            self.transcript_projection_revision,
-            transcript,
+            self.transcript_structural_projection_revision,
+            self.transcript.len(),
             self.pending_submissions_projection_revision,
-            pending
+            self.pending.len()
         ))
     }
 }
@@ -197,7 +219,8 @@ pub fn test_layout_signature(
         plugin_host,
         diff_viewer_config: TuiDiffViewerConfig::default(),
         pending: &pending,
-        transcript_projection_revision: 0,
+        elapsed_layout_revision: 0,
+        transcript_structural_projection_revision: 0,
         pending_submissions_projection_revision: 0,
         has_older_history: false,
         loading_older_history: false,

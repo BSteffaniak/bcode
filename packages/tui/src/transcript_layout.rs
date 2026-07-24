@@ -1,9 +1,10 @@
 //! Cached transcript layout for virtualized TUI rendering.
 
 use bmux_tui::prelude::Line;
-use bmux_tui::retained_sectioned_list::{RetainedSectionedListLayout, RetainedSectionedListLine};
-use std::cell::Cell;
+use std::collections::BTreeSet;
 use std::time::Instant;
+
+use super::indexed_transcript_layout::IndexedTranscriptLayout;
 
 /// Stable identity for a rendered transcript entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +33,12 @@ impl TranscriptLayoutFingerprint {
     #[must_use]
     pub const fn new(value: String) -> Self {
         Self(value)
+    }
+
+    /// Return the fingerprint text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -98,7 +105,8 @@ impl TranscriptLayoutSyncStats {
 pub struct TranscriptLayoutCache {
     width: Option<u16>,
     fingerprint: Option<TranscriptLayoutFingerprint>,
-    entries: RetainedSectionedListLayout<VisibleTranscriptSource, TranscriptLayoutSignature>,
+    structural_fingerprint: Option<TranscriptLayoutFingerprint>,
+    entries: IndexedTranscriptLayout,
     sync_stats: Vec<TranscriptLayoutSyncStats>,
 }
 
@@ -107,29 +115,9 @@ pub struct TranscriptLayoutCache {
 pub struct VisibleTranscriptLine {
     /// Global transcript row index from the oldest row.
     pub row_index: usize,
-    entry_index: usize,
-    row_in_entry: usize,
-    source: VisibleTranscriptSource,
-}
-
-impl VisibleTranscriptLine {
-    /// Return the cached entry index for this row.
-    #[must_use]
-    pub const fn entry_index(self) -> usize {
-        self.entry_index
-    }
-
-    /// Return the cached row index within this row's entry.
-    #[must_use]
-    pub const fn row_in_entry(self) -> usize {
-        self.row_in_entry
-    }
-
-    /// Return the cached entry source for this row.
-    #[must_use]
-    pub const fn source(self) -> VisibleTranscriptSource {
-        self.source
-    }
+    pub(crate) entry_index: usize,
+    pub(crate) row_in_entry: usize,
+    pub(crate) source: VisibleTranscriptSource,
 }
 
 /// Cached transcript entry source.
@@ -150,6 +138,40 @@ impl TranscriptLayoutCache {
         self.fingerprint.as_ref() == Some(fingerprint)
     }
 
+    /// Return whether the cache structure matches inputs excluding isolated visual revisions.
+    #[must_use]
+    pub fn structure_is_current(&self, fingerprint: &TranscriptLayoutFingerprint) -> bool {
+        self.structural_fingerprint.as_ref() == Some(fingerprint)
+    }
+
+    /// Synchronize only transcript entries owned by dirty visual invocations.
+    pub fn sync_visuals<S, R>(
+        &mut self,
+        fingerprint: TranscriptLayoutFingerprint,
+        invocation_ids: &BTreeSet<String>,
+        signature: S,
+        rows: R,
+    ) -> TranscriptLayoutSyncStats
+    where
+        S: Fn(usize) -> TranscriptLayoutSignature,
+        R: FnMut(usize) -> Vec<Line>,
+    {
+        let started = Instant::now();
+        let (entries_scanned, signatures_changed, rows_regenerated) =
+            self.entries.sync_visuals(invocation_ids, signature, rows);
+        self.fingerprint = Some(fingerprint);
+        let stats = TranscriptLayoutSyncStats {
+            invalidation: TranscriptLayoutInvalidation::Incremental,
+            entries_scanned,
+            signatures_changed,
+            entries_rebuilt: signatures_changed,
+            rows_regenerated,
+            duration_micros: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        };
+        self.sync_stats.push(stats);
+        stats
+    }
+
     /// Record one cache-hit synchronization attempt.
     pub fn record_cache_hit(&mut self, duration_micros: u64) {
         self.sync_stats
@@ -162,13 +184,14 @@ impl TranscriptLayoutCache {
     }
 
     /// Synchronize the cache for a terminal width and current transcript data.
-    pub fn sync<TS, TR, PS, PR, HS, HR, R>(
+    pub fn sync<TS, TR, TI, PS, PR, HS, HR, R>(
         &mut self,
-        spec: TranscriptLayoutSpec<TS, TR, PS, PR, HS, HR, R>,
+        spec: TranscriptLayoutSpec<TS, TR, TI, PS, PR, HS, HR, R>,
     ) -> TranscriptLayoutSyncStats
     where
         TS: Fn(usize) -> TranscriptLayoutSignature,
         TR: Fn(usize) -> Vec<Line>,
+        TI: Fn(usize) -> Option<String>,
         PS: Fn(usize) -> TranscriptLayoutSignature,
         PR: Fn(usize) -> Vec<Line>,
         HS: FnOnce() -> Option<TranscriptLayoutSignature>,
@@ -188,6 +211,7 @@ impl TranscriptLayoutCache {
         if width_changed || explicit_reset {
             self.width = Some(spec.width);
             self.fingerprint = None;
+            self.structural_fingerprint = None;
             self.entries.clear();
         }
 
@@ -196,61 +220,32 @@ impl TranscriptLayoutCache {
             .transcript_len
             .saturating_add(spec.pending_len)
             .saturating_add(usize::from(history_signature.is_some()));
-        let signatures_changed = Cell::new(0_usize);
-        let rows_regenerated = Cell::new(0_usize);
-
-        self.entries.sync_sections([
-            VisibleTranscriptSource::HistoryBanner,
-            VisibleTranscriptSource::Transcript,
-            VisibleTranscriptSource::Pending,
-        ]);
-        self.entries.sync_section(
-            &VisibleTranscriptSource::Transcript,
+        let (history_changed, history_rows) = self
+            .entries
+            .sync_history(history_signature, spec.history_banner_rows);
+        let (transcript_changed, transcript_rows) = self.entries.sync_transcript(
             spec.transcript_len,
             spec.transcript_signature,
-            |index| {
-                let rows = (spec.transcript_rows)(index);
-                signatures_changed.set(signatures_changed.get().saturating_add(1));
-                rows_regenerated.set(rows_regenerated.get().saturating_add(rows.len()));
-                rows
-            },
+            spec.transcript_rows,
+            spec.transcript_invocation_id,
         );
-        self.entries.sync_section(
-            &VisibleTranscriptSource::Pending,
-            spec.pending_len,
-            spec.pending_signature,
-            |index| {
-                let rows = (spec.pending_rows)(index);
-                signatures_changed.set(signatures_changed.get().saturating_add(1));
-                rows_regenerated.set(rows_regenerated.get().saturating_add(rows.len()));
-                rows
-            },
-        );
-        match history_signature {
-            Some(signature) => {
-                let rows = (spec.history_banner_rows)();
-                self.entries.sync_section(
-                    &VisibleTranscriptSource::HistoryBanner,
-                    1,
-                    |_| signature.clone(),
-                    |_| {
-                        signatures_changed.set(signatures_changed.get().saturating_add(1));
-                        rows_regenerated.set(rows_regenerated.get().saturating_add(rows.len()));
-                        rows.clone()
-                    },
-                );
-            }
-            None => self
-                .entries
-                .clear_section(&VisibleTranscriptSource::HistoryBanner),
-        }
+        let (pending_changed, pending_rows) =
+            self.entries
+                .sync_pending(spec.pending_len, spec.pending_signature, spec.pending_rows);
+        let signatures_changed = history_changed
+            .saturating_add(transcript_changed)
+            .saturating_add(pending_changed);
+        let rows_regenerated = history_rows
+            .saturating_add(transcript_rows)
+            .saturating_add(pending_rows);
         self.fingerprint = Some(spec.fingerprint);
+        self.structural_fingerprint = Some(spec.structural_fingerprint);
         let stats = TranscriptLayoutSyncStats {
             invalidation,
             entries_scanned,
-            signatures_changed: signatures_changed.get(),
-            entries_rebuilt: signatures_changed.get(),
-            rows_regenerated: rows_regenerated.get(),
+            signatures_changed,
+            entries_rebuilt: signatures_changed,
+            rows_regenerated,
             duration_micros: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
         };
         self.sync_stats.push(stats);
@@ -270,36 +265,26 @@ impl TranscriptLayoutCache {
         start: usize,
         viewport_height: u16,
     ) -> Vec<VisibleTranscriptLine> {
-        self.entries
-            .visible_lines_from_top(start, viewport_height)
-            .into_iter()
-            .map(VisibleTranscriptLine::from)
-            .collect()
+        self.entries.visible_lines_from_top(start, viewport_height)
     }
 
     /// Return cached line for a visible transcript line.
     #[must_use]
     pub fn line(&self, visible: VisibleTranscriptLine) -> Option<&Line> {
-        self.entries.line(&RetainedSectionedListLine::from(visible))
+        self.entries.line(visible)
     }
 
     /// Return visible cached row metadata for one global row index.
+    #[cfg(test)]
     #[must_use]
     pub fn line_at_row(&self, row: usize) -> Option<VisibleTranscriptLine> {
-        self.visible_lines_from_top(row, 1).into_iter().next()
+        self.entries.line_at_row(row)
     }
 
     /// Return the first distinct cached transcript entry start at or after `row`.
     #[must_use]
     pub fn first_entry_start_at_or_after_row(&self, row: usize) -> Option<usize> {
-        (row..self.total_rows()).find(|candidate| self.entry_starts_at_row(*candidate))
-    }
-
-    /// Return whether a distinct cached transcript entry starts at `row`.
-    #[must_use]
-    pub fn entry_starts_at_row(&self, row: usize) -> bool {
-        self.line_at_row(row)
-            .is_some_and(|line| line.row_in_entry == 0)
+        self.entries.first_entry_start_at_or_after_row(row)
     }
 
     /// Return the global start row for a cached transcript entry.
@@ -309,7 +294,7 @@ impl TranscriptLayoutCache {
         source: VisibleTranscriptSource,
         entry_index: usize,
     ) -> Option<usize> {
-        self.entries.entry_start_row(&source, entry_index)
+        self.entries.entry_start_row(source, entry_index)
     }
 
     /// Return a stable pointer to the first cached row of a transcript entry for cache-reuse tests.
@@ -322,34 +307,14 @@ impl TranscriptLayoutCache {
     }
 }
 
-impl From<RetainedSectionedListLine<VisibleTranscriptSource>> for VisibleTranscriptLine {
-    fn from(line: RetainedSectionedListLine<VisibleTranscriptSource>) -> Self {
-        Self {
-            row_index: line.row_index,
-            entry_index: line.entry_index,
-            row_in_entry: line.row_in_entry,
-            source: line.section,
-        }
-    }
-}
-
-impl From<VisibleTranscriptLine> for RetainedSectionedListLine<VisibleTranscriptSource> {
-    fn from(line: VisibleTranscriptLine) -> Self {
-        Self {
-            row_index: line.row_index,
-            section: line.source,
-            entry_index: line.entry_index,
-            row_in_entry: line.row_in_entry,
-        }
-    }
-}
-
 /// Specification used to synchronize transcript layout cache.
-pub struct TranscriptLayoutSpec<TS, TR, PS, PR, HS, HR, R> {
+pub struct TranscriptLayoutSpec<TS, TR, TI, PS, PR, HS, HR, R> {
     /// Render width.
     pub width: u16,
     /// Fingerprint for all layout-affecting inputs.
     pub fingerprint: TranscriptLayoutFingerprint,
+    /// Structural fingerprint excluding isolated adapter-owned visual revisions.
+    pub structural_fingerprint: TranscriptLayoutFingerprint,
     /// Current committed transcript item count.
     pub transcript_len: usize,
     /// Current pending submission count.
@@ -358,6 +323,8 @@ pub struct TranscriptLayoutSpec<TS, TR, PS, PR, HS, HR, R> {
     pub transcript_signature: TS,
     /// Render rows for a committed transcript item.
     pub transcript_rows: TR,
+    /// Return the generic invocation id owning a transcript item, when any.
+    pub transcript_invocation_id: TI,
     /// Return signature for a pending submission.
     pub pending_signature: PS,
     /// Render rows for a pending submission.
@@ -381,6 +348,7 @@ mod tests {
     ) -> TranscriptLayoutSpec<
         impl Fn(usize) -> TranscriptLayoutSignature,
         impl Fn(usize) -> Vec<Line>,
+        impl Fn(usize) -> Option<String>,
         impl Fn(usize) -> TranscriptLayoutSignature,
         impl Fn(usize) -> Vec<Line>,
         impl FnOnce() -> Option<TranscriptLayoutSignature>,
@@ -390,10 +358,14 @@ mod tests {
         TranscriptLayoutSpec {
             width: 80,
             fingerprint: TranscriptLayoutFingerprint::new(fingerprint.to_owned()),
+            structural_fingerprint: TranscriptLayoutFingerprint::new(format!(
+                "structural-{fingerprint}"
+            )),
             transcript_len,
             pending_len: 0,
             transcript_signature: |index| TranscriptLayoutSignature::new(format!("item-{index}")),
             transcript_rows: |index| vec![Line::from(format!("row-{index}"))],
+            transcript_invocation_id: |_| None,
             pending_signature: |index| TranscriptLayoutSignature::new(format!("pending-{index}")),
             pending_rows: |_| Vec::new(),
             history_banner_signature: || None,
@@ -422,6 +394,71 @@ mod tests {
         assert_eq!(unchanged.signatures_changed, 0);
         assert_eq!(unchanged.entries_rebuilt, 0);
         assert_eq!(unchanged.rows_regenerated, 0);
+    }
+
+    #[test]
+    fn targeted_visual_sync_updates_row_index_without_scanning_siblings() {
+        let mut cache = TranscriptLayoutCache::default();
+        cache.sync(TranscriptLayoutSpec {
+            width: 80,
+            fingerprint: TranscriptLayoutFingerprint::new("initial".to_owned()),
+            structural_fingerprint: TranscriptLayoutFingerprint::new("structure".to_owned()),
+            transcript_len: 3,
+            pending_len: 0,
+            transcript_signature: |index| TranscriptLayoutSignature::new(format!("item-{index}")),
+            transcript_rows: |_| vec![Line::from("row")],
+            transcript_invocation_id: |index| Some(format!("call-{index}")),
+            pending_signature: |index| TranscriptLayoutSignature::new(format!("pending-{index}")),
+            pending_rows: |_| Vec::new(),
+            history_banner_signature: || None,
+            history_banner_rows: Vec::new,
+            reset: || false,
+        });
+        let stats = cache.sync_visuals(
+            TranscriptLayoutFingerprint::new("updated".to_owned()),
+            &BTreeSet::from(["call-1".to_owned()]),
+            |index| TranscriptLayoutSignature::new(format!("updated-{index}")),
+            |_| vec![Line::from("one"), Line::from("two"), Line::from("three")],
+        );
+
+        assert_eq!(stats.entries_scanned, 1);
+        assert_eq!(stats.entries_rebuilt, 1);
+        assert_eq!(stats.rows_regenerated, 3);
+        assert_eq!(cache.total_rows(), 5);
+        assert_eq!(
+            cache.entry_start_row(VisibleTranscriptSource::Transcript, 2),
+            Some(4)
+        );
+        let visible = cache.visible_lines_from_top(3, 2);
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].entry_index, 1);
+        assert_eq!(visible[0].row_in_entry, 2);
+        assert_eq!(visible[1].entry_index, 2);
+        assert_eq!(visible[1].row_in_entry, 0);
+    }
+
+    #[test]
+    fn first_entry_navigation_crosses_indexed_sections() {
+        let mut cache = TranscriptLayoutCache::default();
+        cache.sync(TranscriptLayoutSpec {
+            width: 80,
+            fingerprint: TranscriptLayoutFingerprint::new("initial".to_owned()),
+            structural_fingerprint: TranscriptLayoutFingerprint::new("structure".to_owned()),
+            transcript_len: 1,
+            pending_len: 1,
+            transcript_signature: |_| TranscriptLayoutSignature::new("item".to_owned()),
+            transcript_rows: |_| vec![Line::from("a"), Line::from("b")],
+            transcript_invocation_id: |_| None,
+            pending_signature: |_| TranscriptLayoutSignature::new("pending".to_owned()),
+            pending_rows: |_| vec![Line::from("pending")],
+            history_banner_signature: || Some(TranscriptLayoutSignature::new("history".to_owned())),
+            history_banner_rows: || vec![Line::from("history")],
+            reset: || false,
+        });
+
+        assert_eq!(cache.first_entry_start_at_or_after_row(0), Some(0));
+        assert_eq!(cache.first_entry_start_at_or_after_row(2), Some(3));
+        assert_eq!(cache.first_entry_start_at_or_after_row(3), Some(3));
     }
 
     #[test]
