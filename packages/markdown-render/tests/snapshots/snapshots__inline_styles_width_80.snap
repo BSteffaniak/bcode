@@ -1,0 +1,5 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "styled_snapshot(INLINE, 80)"
+---
+00 │ Plain paragraph with [bold]strong[/], [italic]emphasis[/], [fg=yellow]code[/], [crossed-out]removed[/], and [fg=blue,underline]link[/].

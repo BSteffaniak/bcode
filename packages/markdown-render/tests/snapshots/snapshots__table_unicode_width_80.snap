@@ -1,0 +1,11 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "visible_snapshot(TABLE_UNICODE, 80)"
+---
+00 │ ┌──────────┬────────────┐
+01 │ │ Language │ Greeting   │
+02 │ ├──────────┼────────────┤
+03 │ │ English  │ café       │
+04 │ ├──────────┼────────────┤
+05 │ │ Japanese │ こんにちは │
+06 │ └──────────┴────────────┘

@@ -1,0 +1,11 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "visible_snapshot(TABLE_UNEVEN, 80)"
+---
+00 │ ┌──────┬─────┬───────┐
+01 │ │ A    │ B   │ C     │
+02 │ ├──────┼─────┼───────┤
+03 │ │ one  │     │ three │
+04 │ ├──────┼─────┼───────┤
+05 │ │ only │ two │       │
+06 │ └──────┴─────┴───────┘

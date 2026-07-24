@@ -1,0 +1,9 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "styled_snapshot(TABLE_FORMATTED, 80)"
+---
+00 │ [fg=bright-black]┌────────┬───────────────┐[/]
+01 │ [fg=bright-black]│[/] [bold]Kind[/]   [fg=bright-black]│[/] [bold]Detail[/]        [fg=bright-black]│[/]
+02 │ [fg=bright-black]├────────┼───────────────┤[/]
+03 │ [fg=bright-black]│[/] [bold]strong[/] [fg=bright-black]│[/] [fg=yellow]code[/] and [fg=blue,underline]link[/] [fg=bright-black]│[/]
+04 │ [fg=bright-black]└────────┴───────────────┘[/]

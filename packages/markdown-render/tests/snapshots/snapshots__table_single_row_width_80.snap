@@ -1,0 +1,9 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "styled_snapshot(TABLE_SINGLE_ROW, 80)"
+---
+00 │ [fg=bright-black]┌─────┬─────┐[/]
+01 │ [fg=bright-black]│[/] [bold]A[/]   [fg=bright-black]│[/] [bold]B[/]   [fg=bright-black]│[/]
+02 │ [fg=bright-black]├─────┼─────┤[/]
+03 │ [fg=bright-black]│[/] one [fg=bright-black]│[/] two [fg=bright-black]│[/]
+04 │ [fg=bright-black]└─────┴─────┘[/]

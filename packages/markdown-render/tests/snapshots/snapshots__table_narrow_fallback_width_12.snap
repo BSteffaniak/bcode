@@ -1,0 +1,12 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "visible_snapshot(TABLE_MULTIPLE_ROWS, 12)"
+---
+00 │ Name: alpha
+01 │ Value: 1
+02 │ 
+03 │ Name: beta
+04 │ Value: 2
+05 │ 
+06 │ Name: gamma
+07 │ Value: 3

@@ -1,0 +1,5 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "visible_snapshot(INLINE, 80)"
+---
+00 │ Plain paragraph with strong, emphasis, code, removed, and link.

@@ -1,0 +1,6 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "visible_snapshot(UNICODE, 20)"
+---
+00 │ ASCII café こんにち
+01 │ は 👩‍💻 é end

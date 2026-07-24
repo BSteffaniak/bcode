@@ -18,8 +18,10 @@ hyperchad_markdown           = { workspace = true, features = ["syntax-highlight
 hyperchad_transformer        = { workspace = true }
 hyperchad_transformer_models = { workspace = true }
 unicode-segmentation         = { workspace = true }
+unicode-width                = { workspace = true }
 
 [dev-dependencies]
+insta    = { workspace = true }
 test-log = { workspace = true }
 
 [features]

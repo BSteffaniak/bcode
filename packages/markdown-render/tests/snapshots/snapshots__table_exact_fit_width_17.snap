@@ -1,0 +1,13 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "visible_snapshot(TABLE_MULTIPLE_ROWS, 17)"
+---
+00 │ ┌───────┬───────┐
+01 │ │ Name  │ Value │
+02 │ ├───────┼───────┤
+03 │ │ alpha │ 1     │
+04 │ ├───────┼───────┤
+05 │ │ beta  │ 2     │
+06 │ ├───────┼───────┤
+07 │ │ gamma │ 3     │
+08 │ └───────┴───────┘

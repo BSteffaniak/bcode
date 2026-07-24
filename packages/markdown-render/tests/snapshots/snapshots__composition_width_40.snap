@@ -1,0 +1,19 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "styled_snapshot(COMPOSITION, 40)"
+---
+00 │ [fg=cyan,bold]Summary[/]
+01 │ 
+02 │ Read the [fg=blue,underline]guide[/] before continuing.
+03 │ [fg=bright-black]•  [/]Review [bold]important[/] details
+04 │ [fg=bright-black]•  [/]Run [fg=yellow]cargo test[/]
+05 │ 
+06 │ [fg=bright-black]│ [/]Keep output readable.
+07 │ 
+08 │ [fg=bright-black]┌───────────┬────────┐[/]
+09 │ [fg=bright-black]│[/] [bold]Item[/]      [fg=bright-black]│[/] [bold]State[/]  [fg=bright-black]│[/]
+10 │ [fg=bright-black]├───────────┼────────┤[/]
+11 │ [fg=bright-black]│[/] renderer  [fg=bright-black]│[/] ready  [fg=bright-black]│[/]
+12 │ [fg=bright-black]├───────────┼────────┤[/]
+13 │ [fg=bright-black]│[/] snapshots [fg=bright-black]│[/] active [fg=bright-black]│[/]
+14 │ [fg=bright-black]└───────────┴────────┘[/]

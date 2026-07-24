@@ -1,0 +1,24 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "styled_snapshot(LISTS, 30)"
+---
+00 │ [fg=bright-black]•  [/]first unordered item
+01 │ [fg=bright-black]•  [/]second item with enough tex
+02 │ [fg=bright-black]   [/]t to wrap at a constrained 
+03 │ [fg=bright-black]   [/]terminal width
+04 │ [fg=bright-black]   •  [/]nested unordered
+05 │ 
+06 │ [fg=bright-black]1.  [/]first ordered
+07 │ [fg=bright-black]2.  [/]second ordered
+08 │ [fg=bright-black]    1.  [/]nested ordered
+09 │ 
+10 │ [fg=bright-black]•  ☑ [/]complete
+11 │ [fg=bright-black]•  ☐ [/]incomplete
+12 │ 
+13 │ [fg=bright-black]1.  [/]item with quote
+14 │ [fg=bright-black]    │ [/]quoted inside list
+15 │ [fg=bright-black]2.  [/]item with code
+16 │ [fg=bright-black]    [/]
+17 │ [fg=bright-black]    ┌─ text[/]
+18 │ [fg=bright-black]    │ [/][fg=yellow]preserved[/]
+19 │ [fg=bright-black]    └─[/]

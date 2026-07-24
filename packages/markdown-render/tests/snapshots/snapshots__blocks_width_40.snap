@@ -1,0 +1,23 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "visible_snapshot(BLOCKS, 40)"
+---
+00 │ Heading 1
+01 │ 
+02 │ Heading 2
+03 │ 
+04 │ Heading 3
+05 │ 
+06 │ Paragraph one with a soft break and a
+07 │ hard break.
+08 │ 
+09 │ ────────────────────────────────────────
+10 │ 
+11 │ │ quoted line
+12 │ │ │ nested quote
+13 │ 
+14 │ ┌─ rust
+15 │ │ fn main() {
+16 │ │     println!("hello");
+17 │ │ }
+18 │ └─

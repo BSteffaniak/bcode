@@ -15,6 +15,7 @@ use hyperchad_markdown::{MarkdownOptions, markdown_to_container_with_options};
 use hyperchad_transformer::{Container, Element, Input};
 use hyperchad_transformer_models::{FontWeight, TextDecorationLine};
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// Terminal styles used for Markdown rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -508,9 +509,13 @@ impl TerminalMarkdownRenderer {
         self.rows
             .push(table_border_line('┌', '┬', '┐', &widths, border_style));
         for (row_index, row) in rows.iter().enumerate() {
-            self.rows
-                .push(table_content_line(&row.cells, &widths, border_style));
-            if (row.header || row_index == 0) && rows.len() > 1 {
+            self.rows.push(table_content_line(
+                &row.cells,
+                &widths,
+                border_style,
+                row.header.then_some(self.theme.strong),
+            ));
+            if row_index + 1 < rows.len() {
                 self.rows
                     .push(table_border_line('├', '┼', '┤', &widths, border_style));
             }
@@ -522,12 +527,26 @@ impl TerminalMarkdownRenderer {
 
     fn render_stacked_table_rows(&mut self, rows: &[TableRow]) {
         let muted = self.theme.table_border;
-        for (row_index, row) in rows.iter().enumerate() {
+        let (headers, body_rows) = rows
+            .split_first()
+            .filter(|(first, _)| first.header)
+            .map_or((None, rows), |(header, body)| (Some(&header.cells), body));
+        for (row_index, row) in body_rows.iter().enumerate() {
             if row_index > 0 {
                 self.rows.push(Line::default());
             }
             for (column_index, cell) in row.cells.iter().enumerate() {
-                let mut spans = vec![Span::styled(format!("{}: ", column_index + 1), muted)];
+                let label = headers
+                    .and_then(|cells| cells.get(column_index))
+                    .map(|spans| {
+                        spans
+                            .iter()
+                            .map(|span| span.content.as_str())
+                            .collect::<String>()
+                    })
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or_else(|| column_index.saturating_add(1).to_string());
+                let mut spans = vec![Span::styled(format!("{label}: "), muted)];
                 spans.extend(cell.clone());
                 self.rows.push(Line::from_spans(spans));
             }
@@ -609,7 +628,7 @@ struct TableRow {
 
 fn table_rows(container: &Container, style: TextStyle, theme: MarkdownTheme) -> Vec<TableRow> {
     let mut rows = Vec::new();
-    collect_table_rows(container, style, theme, &mut rows);
+    collect_table_rows(container, style, theme, false, &mut rows);
     rows
 }
 
@@ -617,27 +636,26 @@ fn collect_table_rows(
     container: &Container,
     style: TextStyle,
     theme: MarkdownTheme,
+    in_header: bool,
     rows: &mut Vec<TableRow>,
 ) {
     let style = style.merge_container(container, theme);
-    if matches!(container.element, Element::TR) {
-        let header = container
-            .children
-            .iter()
-            .any(|child| matches!(child.element, Element::TH { .. }));
+    let in_header = in_header || matches!(container.element, Element::THead);
+    let cells = container
+        .children
+        .iter()
+        .filter(|child| matches!(child.element, Element::TH { .. } | Element::TD { .. }))
+        .map(|cell| inline_spans_for_container(cell, style, theme))
+        .collect::<Vec<_>>();
+    if matches!(container.element, Element::TR) || in_header && !cells.is_empty() {
         rows.push(TableRow {
-            cells: container
-                .children
-                .iter()
-                .filter(|child| matches!(child.element, Element::TH { .. } | Element::TD { .. }))
-                .map(|cell| inline_spans_for_container(cell, style, theme))
-                .collect(),
-            header,
+            cells,
+            header: in_header,
         });
         return;
     }
     for child in &container.children {
-        collect_table_rows(child, style, theme, rows);
+        collect_table_rows(child, style, theme, in_header, rows);
     }
 }
 
@@ -686,12 +704,22 @@ fn table_border_line(
     Line::from_spans(vec![Span::styled(text, style)])
 }
 
-fn table_content_line(row: &[Vec<Span>], widths: &[usize], border_style: Style) -> Line {
+fn table_content_line(
+    row: &[Vec<Span>],
+    widths: &[usize],
+    border_style: Style,
+    cell_style: Option<Style>,
+) -> Line {
     let mut spans = vec![Span::styled("│", border_style)];
     for (index, width) in widths.iter().enumerate() {
         spans.push(Span::raw(" "));
         if let Some(cell) = row.get(index) {
-            spans.extend(cell.clone());
+            spans.extend(cell.iter().cloned().map(|mut span| {
+                if let Some(style) = cell_style {
+                    span.style = span.style.patch(style);
+                }
+                span
+            }));
             let padding = width.saturating_sub(spans_width(cell));
             if padding > 0 {
                 spans.push(Span::raw(" ".repeat(padding)));
@@ -821,19 +849,10 @@ fn spans_width(spans: &[Span]) -> usize {
 }
 
 fn text_display_width(text: &str) -> usize {
-    text.chars().map(char_display_width).sum()
-}
-
-fn char_display_width(ch: char) -> usize {
-    if ch == '\t' {
-        4
-    } else if ch.is_control() {
-        0
-    } else if ch.len_utf8() > 1 {
-        2
-    } else {
-        1
-    }
+    text.split('\t')
+        .map(UnicodeWidthStr::width)
+        .sum::<usize>()
+        .saturating_add(text.matches('\t').count().saturating_mul(4))
 }
 
 #[cfg(test)]
