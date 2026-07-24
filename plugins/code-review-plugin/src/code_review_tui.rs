@@ -546,6 +546,8 @@ async fn drain_pending_workspace_changes(
         {
             Ok(review) => {
                 app.replace_review(review);
+                app.workspace_materialization_in_progress = false;
+                app.workspace_materialization_failed = false;
                 changed = true;
                 let diagnostics = app.review.diagnostics.len();
                 app.status_message = Some(if diagnostics == 0 {
@@ -555,8 +557,12 @@ async fn drain_pending_workspace_changes(
                 });
             }
             Err(error) => {
-                app.pending_workspace_reload = true;
-                app.status_message = Some(format!("review reload failed: {error}"));
+                app.pending_workspace_reload = false;
+                app.workspace_materialization_in_progress = false;
+                app.workspace_materialization_failed = true;
+                app.status_message = Some(format!(
+                    "review materialization failed: {error}; fix the source diagnostic and press R to retry"
+                ));
                 return WorkspaceDrainOutcome::Failed;
             }
         }
@@ -4577,6 +4583,8 @@ pub enum ReviewPromptKind {
     FileSearch,
     /// Add a source to the workspace.
     AddSourceKind,
+    /// Add an advanced source to the workspace.
+    AddAdvancedSourceKind,
     /// Pick a commit source from recent repository commits.
     AddCommitPicker,
     /// Add a commit source to the workspace.
@@ -4630,6 +4638,8 @@ pub enum AddSourceMenuKind {
     LastCommit,
     /// Repository source.
     Repository,
+    /// Open advanced source menu.
+    Advanced,
 }
 
 /// Add-source menu item.
@@ -4668,14 +4678,31 @@ pub const fn add_source_menu_items() -> &'static [AddSourceMenuItem] {
             help: "changes introduced by HEAD",
         },
         AddSourceMenuItem {
-            kind: AddSourceMenuKind::BranchCompare,
-            label: "branch compare",
-            help: "compare base..head or base...head branches",
-        },
-        AddSourceMenuItem {
             kind: AddSourceMenuKind::File,
             label: "file",
             help: "whole file from repository tree",
+        },
+        AddSourceMenuItem {
+            kind: AddSourceMenuKind::Repository,
+            label: "repository browser",
+            help: "browse repository files as review context",
+        },
+        AddSourceMenuItem {
+            kind: AddSourceMenuKind::Advanced,
+            label: "advanced…",
+            help: "commit/range, branch comparison, or file range",
+        },
+    ]
+}
+
+/// Advanced source menu items disclosed from the common-source menu.
+#[must_use]
+pub const fn advanced_source_menu_items() -> &'static [AddSourceMenuItem] {
+    &[
+        AddSourceMenuItem {
+            kind: AddSourceMenuKind::BranchCompare,
+            label: "branch compare",
+            help: "compare base..head or base...head branches",
         },
         AddSourceMenuItem {
             kind: AddSourceMenuKind::FileRange,
@@ -4691,11 +4718,6 @@ pub const fn add_source_menu_items() -> &'static [AddSourceMenuItem] {
             kind: AddSourceMenuKind::CommitRange,
             label: "commit range",
             help: "compare base..head or base...head revisions",
-        },
-        AddSourceMenuItem {
-            kind: AddSourceMenuKind::Repository,
-            label: "repository browser",
-            help: "browse repository files as review context",
         },
     ]
 }
@@ -4857,6 +4879,10 @@ pub struct ReviewApp {
     pub published_review_threads: BTreeMap<String, String>,
     /// Durable provider-neutral external review snapshots.
     pub external_review_imports: Vec<ExternalReviewImportRecord>,
+    /// Whether workspace materialization is currently queued/running.
+    pub workspace_materialization_in_progress: bool,
+    /// Whether the most recent materialization attempt failed.
+    pub workspace_materialization_failed: bool,
     /// Active draft editor, if open.
     pub comment_editor: Option<ReviewCommentEditor>,
     /// External review import awaiting provider discovery/invocation.
@@ -4975,6 +5001,8 @@ impl ReviewApp {
             excluded_publish_threads: BTreeSet::new(),
             published_review_threads: BTreeMap::new(),
             external_review_imports: Vec::new(),
+            workspace_materialization_in_progress: false,
+            workspace_materialization_failed: false,
             comment_editor: None,
             pending_external_import_request: None,
             external_importers: Vec::new(),
@@ -5072,7 +5100,7 @@ impl ReviewApp {
         }
         self.prompt_state = Some(ReviewPromptState::new(ReviewPromptKind::AddSourceKind));
         self.status_message = Some(
-            "add source kind: file, file-range, commit, range, branch, staged, unstaged, working-tree"
+            "add common source; choose advanced… for ranges, commits, and branch comparisons"
                 .to_string(),
         );
         true
@@ -5257,6 +5285,9 @@ impl ReviewApp {
             ReviewPromptKind::JumpToLine => self.submit_jump_to_line(&text),
             ReviewPromptKind::FileSearch => self.submit_file_search(&text),
             ReviewPromptKind::AddSourceKind => self.submit_add_source_kind(&text, prompt.selected),
+            ReviewPromptKind::AddAdvancedSourceKind => {
+                self.submit_add_advanced_source_kind(&text, prompt.selected)
+            }
             ReviewPromptKind::AddCommitPicker => {
                 self.submit_add_commit_picker(&text, prompt.selected)
             }
@@ -5312,6 +5343,44 @@ impl ReviewApp {
             AddSourceMenuKind::Repository => {
                 self.push_workspace_source(ReviewSourceKind::Repository)
             }
+            AddSourceMenuKind::Advanced => {
+                self.prompt_state = Some(ReviewPromptState::new(
+                    ReviewPromptKind::AddAdvancedSourceKind,
+                ));
+                self.status_message = Some("choose an advanced review source".to_string());
+                true
+            }
+        }
+    }
+
+    fn submit_add_advanced_source_kind(&mut self, text: &str, selected: usize) -> bool {
+        if text.trim().is_empty()
+            && let Some(kind) = advanced_source_menu_items()
+                .get(selected)
+                .map(|item| item.kind)
+        {
+            return self.start_add_source_kind(kind);
+        }
+        match text.trim().to_ascii_lowercase().as_str() {
+            "file-range" | "range-file" | "fr" => {
+                self.start_add_source_kind(AddSourceMenuKind::FileRange)
+            }
+            "commit" | "c" => self.start_add_source_kind(AddSourceMenuKind::Commit),
+            "range" | "commit-range" | "r" => {
+                self.start_add_source_kind(AddSourceMenuKind::CommitRange)
+            }
+            "branch" | "branch-compare" | "compare" | "bc" => {
+                self.start_add_source_kind(AddSourceMenuKind::BranchCompare)
+            }
+            _ => {
+                self.prompt_state = Some(ReviewPromptState::new(
+                    ReviewPromptKind::AddAdvancedSourceKind,
+                ));
+                self.status_message = Some(
+                    "advanced source must be branch, commit, range, or file-range".to_string(),
+                );
+                true
+            }
         }
     }
 
@@ -5323,6 +5392,9 @@ impl ReviewApp {
         }
         match text.trim().to_ascii_lowercase().as_str() {
             "file" | "f" => return self.start_add_source_kind(AddSourceMenuKind::File),
+            "advanced" | "advanced…" => {
+                return self.start_add_source_kind(AddSourceMenuKind::Advanced);
+            }
             "file-range" | "range-file" | "fr" => {
                 return self.start_add_source_kind(AddSourceMenuKind::FileRange);
             }
@@ -5840,6 +5912,7 @@ impl ReviewApp {
             prompt.kind,
             ReviewPromptKind::FilePicker
                 | ReviewPromptKind::AddSourceKind
+                | ReviewPromptKind::AddAdvancedSourceKind
                 | ReviewPromptKind::AddCommitPicker
                 | ReviewPromptKind::AddCommitRangeBasePicker
                 | ReviewPromptKind::AddCommitRangeHeadPicker { .. }
@@ -5852,6 +5925,9 @@ impl ReviewApp {
         }
         let max = match &prompt.kind {
             ReviewPromptKind::AddSourceKind => add_source_menu_items().len().saturating_sub(1),
+            ReviewPromptKind::AddAdvancedSourceKind => {
+                advanced_source_menu_items().len().saturating_sub(1)
+            }
             ReviewPromptKind::AddCommitPicker
             | ReviewPromptKind::AddCommitRangeBasePicker
             | ReviewPromptKind::AddCommitRangeHeadPicker { .. } => self
@@ -5889,6 +5965,7 @@ impl ReviewApp {
             prompt.kind,
             ReviewPromptKind::FilePicker
                 | ReviewPromptKind::AddSourceKind
+                | ReviewPromptKind::AddAdvancedSourceKind
                 | ReviewPromptKind::AddCommitPicker
                 | ReviewPromptKind::AddCommitRangeBasePicker
                 | ReviewPromptKind::AddCommitRangeHeadPicker { .. }
@@ -6540,7 +6617,9 @@ impl ReviewApp {
     /// Rematerialize workspace content.
     pub fn rematerialize_workspace(&mut self) -> bool {
         self.pending_workspace_reload = true;
-        self.status_message = Some("refreshing review sources".to_string());
+        self.workspace_materialization_in_progress = true;
+        self.workspace_materialization_failed = false;
+        self.status_message = Some("materializing review sources…".to_string());
         true
     }
 
@@ -13046,6 +13125,63 @@ mod tests {
         assert!(prompt.contains(ReviewAiCommand::FindRisk.instruction()));
         assert!(prompt.chars().count() <= MAX_AI_CONTEXT_CHARS);
         assert!(prompt.matches("\n* ").count() <= MAX_AI_THREAD_SUMMARIES);
+    }
+
+    #[test]
+    fn advanced_sources_are_progressively_disclosed() {
+        let common = add_source_menu_items();
+        let advanced = advanced_source_menu_items();
+
+        assert!(
+            common
+                .iter()
+                .any(|item| item.kind == AddSourceMenuKind::Advanced)
+        );
+        assert!(!common.iter().any(|item| matches!(
+            item.kind,
+            AddSourceMenuKind::Commit
+                | AddSourceMenuKind::CommitRange
+                | AddSourceMenuKind::BranchCompare
+                | AddSourceMenuKind::FileRange
+        )));
+        assert!(
+            advanced
+                .iter()
+                .any(|item| item.kind == AddSourceMenuKind::BranchCompare)
+        );
+        assert!(
+            advanced
+                .iter()
+                .any(|item| item.kind == AddSourceMenuKind::CommitRange)
+        );
+
+        let mut app = sample_app();
+        app.set_build_mode();
+        assert!(app.open_add_source_prompt());
+        assert_eq!(
+            app.prompt_state.as_ref().map(|prompt| &prompt.kind),
+            Some(&ReviewPromptKind::AddSourceKind)
+        );
+        assert!(app.start_add_source_kind(AddSourceMenuKind::Advanced));
+        assert_eq!(
+            app.prompt_state.as_ref().map(|prompt| &prompt.kind),
+            Some(&ReviewPromptKind::AddAdvancedSourceKind)
+        );
+    }
+
+    #[test]
+    fn rematerialize_workspace_exposes_explicit_progress_state() {
+        let mut app = sample_app();
+
+        assert!(app.rematerialize_workspace());
+
+        assert!(app.pending_workspace_reload);
+        assert!(app.workspace_materialization_in_progress);
+        assert!(!app.workspace_materialization_failed);
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("materializing review sources…")
+        );
     }
 
     #[test]

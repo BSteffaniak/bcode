@@ -1742,11 +1742,12 @@ fn materialize_review_workspace_for_request(
             &mut additions,
             &mut deletions,
         ) {
+            let (code, message) = actionable_materialization_error(source, &error);
             diagnostics.push(source_diagnostic(
                 source,
                 ReviewSourceDiagnosticSeverity::Error,
-                "materialize_failed",
-                error.to_string(),
+                code,
+                message,
             ));
             continue;
         }
@@ -1777,6 +1778,44 @@ fn materialize_review_workspace_for_request(
             deletions,
         },
     })
+}
+
+fn actionable_materialization_error(
+    source: &ReviewSource,
+    error: &ReviewError,
+) -> (&'static str, String) {
+    let recovery = match &source.kind {
+        ReviewSourceKind::LastCommit | ReviewSourceKind::Commit { .. } => {
+            "Verify the revision exists locally and fetch it if needed."
+        }
+        ReviewSourceKind::CommitRange { .. } => {
+            "Verify both revisions exist locally; fetch missing refs or edit the range."
+        }
+        ReviewSourceKind::BranchCompare { .. } => {
+            "Verify both branches exist locally; fetch missing branches or edit the comparison."
+        }
+        ReviewSourceKind::WorkingTreeAndIndex => {
+            "Create an initial commit first, or review staged and unstaged changes separately."
+        }
+        ReviewSourceKind::File { .. } | ReviewSourceKind::FileRange { .. } => {
+            "Verify the repository-relative path and range, then edit or remove this source."
+        }
+        ReviewSourceKind::WorkingTreeUnstaged
+        | ReviewSourceKind::IndexStaged
+        | ReviewSourceKind::Repository => "Verify the repository state, then refresh this source.",
+    };
+    let code = match source.kind {
+        ReviewSourceKind::CommitRange { .. } | ReviewSourceKind::Commit { .. } => {
+            "invalid_revision"
+        }
+        ReviewSourceKind::BranchCompare { .. } => "missing_branch",
+        ReviewSourceKind::LastCommit | ReviewSourceKind::WorkingTreeAndIndex => "missing_head",
+        ReviewSourceKind::File { .. } | ReviewSourceKind::FileRange { .. } => "invalid_file_source",
+        ReviewSourceKind::WorkingTreeUnstaged
+        | ReviewSourceKind::IndexStaged
+        | ReviewSourceKind::Repository => "materialize_failed",
+    };
+    (code, format!("{error}. {recovery}"))
 }
 
 fn source_diagnostic(
@@ -4360,6 +4399,280 @@ bcode_plugin_sdk::export_plugin!(CodeReviewPlugin, include_str!("../bcode-plugin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn materialization_reports_invalid_revision_and_missing_branch() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = initialized_test_repository(temp.path());
+        let workspace = test_workspace(
+            &repo,
+            vec![
+                test_source(
+                    "invalid-revision",
+                    ReviewSourceKind::CommitRange {
+                        base: "does-not-exist".to_string(),
+                        head: "HEAD".to_string(),
+                        merge_base: false,
+                    },
+                ),
+                test_source(
+                    "missing-branch",
+                    ReviewSourceKind::BranchCompare {
+                        base_branch: "does-not-exist".to_string(),
+                        head_branch: "HEAD".to_string(),
+                        merge_base: true,
+                    },
+                ),
+            ],
+        );
+
+        let response =
+            materialize_review_workspace_for_request(MaterializeReviewWorkspaceRequest {
+                repo_path: repo,
+                workspace,
+            })
+            .expect("materialization returns per-source diagnostics");
+        let diagnostics = response.materialization.diagnostics;
+
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.source_id == "invalid-revision"
+                && diagnostic.code == "invalid_revision"
+                && diagnostic.message.contains("Verify both revisions")
+        }));
+        assert!(diagnostics.iter().any(|diagnostic| {
+            diagnostic.source_id == "missing-branch"
+                && diagnostic.code == "missing_branch"
+                && diagnostic.message.contains("Verify both branches")
+        }));
+    }
+
+    #[test]
+    fn materialization_reports_empty_diff_without_failing_workspace() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = initialized_test_repository(temp.path());
+        let workspace = test_workspace(
+            &repo,
+            vec![test_source(
+                "empty-unstaged",
+                ReviewSourceKind::WorkingTreeUnstaged,
+            )],
+        );
+
+        let response =
+            materialize_review_workspace_for_request(MaterializeReviewWorkspaceRequest {
+                repo_path: repo,
+                workspace,
+            })
+            .expect("empty diff is a successful materialization");
+
+        assert!(response.materialization.surfaces.is_empty());
+        assert!(
+            response
+                .materialization
+                .diagnostics
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.source_id == "empty-unstaged"
+                        && diagnostic.code == "no_surfaces"
+                        && diagnostic.severity == ReviewSourceDiagnosticSeverity::Info
+                })
+        );
+    }
+
+    #[test]
+    fn multi_source_materialization_preserves_success_when_one_source_fails() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = initialized_test_repository(temp.path());
+        let workspace = test_workspace(
+            &repo,
+            vec![
+                test_source("valid", ReviewSourceKind::LastCommit),
+                test_source(
+                    "invalid",
+                    ReviewSourceKind::BranchCompare {
+                        base_branch: "does-not-exist".to_string(),
+                        head_branch: "HEAD".to_string(),
+                        merge_base: true,
+                    },
+                ),
+            ],
+        );
+
+        let response =
+            materialize_review_workspace_for_request(MaterializeReviewWorkspaceRequest {
+                repo_path: repo,
+                workspace,
+            })
+            .expect("partial workspace materialization");
+
+        assert!(
+            response
+                .materialization
+                .surfaces
+                .iter()
+                .any(|surface| surface.source_id == "valid")
+        );
+        assert!(
+            response
+                .materialization
+                .diagnostics
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic.source_id == "invalid"
+                        && diagnostic.severity == ReviewSourceDiagnosticSeverity::Error
+                })
+        );
+    }
+
+    fn initialized_test_repository(repo: &Path) -> PathBuf {
+        git_test(repo, &["init", "--quiet"]);
+        git_test(repo, &["config", "user.email", "review@example.test"]);
+        git_test(repo, &["config", "user.name", "Review Test"]);
+        std::fs::write(repo.join("file.txt"), "base\n").expect("write base");
+        git_test(repo, &["add", "file.txt"]);
+        git_test(repo, &["commit", "--quiet", "-m", "base"]);
+        std::fs::write(repo.join("file.txt"), "base\nhead\n").expect("write head");
+        git_test(repo, &["add", "file.txt"]);
+        git_test(repo, &["commit", "--quiet", "-m", "head"]);
+        repo.to_path_buf()
+    }
+
+    fn test_workspace(repo: &Path, sources: Vec<ReviewSource>) -> ReviewWorkspace {
+        ReviewWorkspace {
+            id: "workspace".to_string(),
+            title: "Test review".to_string(),
+            repo_root: repo.to_path_buf(),
+            sources,
+            created_at_ms: None,
+            updated_at_ms: None,
+            viewed_files: BTreeSet::new(),
+            archived_at_ms: None,
+        }
+    }
+
+    fn test_source(id: &str, kind: ReviewSourceKind) -> ReviewSource {
+        ReviewSource {
+            id: id.to_string(),
+            label: id.to_string(),
+            kind,
+            included: true,
+        }
+    }
+
+    #[test]
+    fn all_common_git_targets_materialize_expected_changes() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git_test(repo, &["init", "--quiet"]);
+        git_test(repo, &["config", "user.email", "review@example.test"]);
+        git_test(repo, &["config", "user.name", "Review Test"]);
+        std::fs::write(repo.join("file.txt"), "base\n").expect("write base");
+        git_test(repo, &["add", "file.txt"]);
+        git_test(repo, &["commit", "--quiet", "-m", "base"]);
+        let base = git_test_output(repo, &["rev-parse", "HEAD"]);
+        git_test(repo, &["branch", "base-branch"]);
+        std::fs::write(repo.join("file.txt"), "base\ncommit\n").expect("write commit");
+        git_test(repo, &["add", "file.txt"]);
+        git_test(repo, &["commit", "--quiet", "-m", "head"]);
+        let head = git_test_output(repo, &["rev-parse", "HEAD"]);
+        git_test(repo, &["branch", "head-branch"]);
+        std::fs::write(repo.join("file.txt"), "base\ncommit\nstaged\n").expect("write staged");
+        git_test(repo, &["add", "file.txt"]);
+        std::fs::write(repo.join("file.txt"), "base\ncommit\nstaged\nunstaged\n")
+            .expect("write unstaged");
+
+        let targets = [
+            ReviewTarget::WorkingTreeUnstaged,
+            ReviewTarget::IndexStaged,
+            ReviewTarget::WorkingTreeAndIndex,
+            ReviewTarget::LastCommit,
+            ReviewTarget::CommitRange {
+                base,
+                head,
+                merge_base: false,
+            },
+            ReviewTarget::BranchCompare {
+                base_branch: "base-branch".to_string(),
+                head_branch: "head-branch".to_string(),
+                merge_base: true,
+            },
+        ];
+        for target in targets {
+            let summary = create_review_summary(&CreateReviewRequest {
+                repo_path: repo.to_path_buf(),
+                target,
+            })
+            .expect("materialize target");
+            assert!(!summary.files.is_empty());
+        }
+    }
+
+    fn git_test(repo: &Path, args: &[&str]) {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .expect("run git")
+                .success()
+        );
+    }
+
+    fn git_test_output(repo: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("run git");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("utf8 git output")
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn invalid_target_diagnostics_include_actionable_recovery() {
+        let cases = [
+            (
+                ReviewSourceKind::CommitRange {
+                    base: "missing".to_string(),
+                    head: "HEAD".to_string(),
+                    merge_base: false,
+                },
+                "invalid_revision",
+                "Verify both revisions",
+            ),
+            (
+                ReviewSourceKind::BranchCompare {
+                    base_branch: "missing".to_string(),
+                    head_branch: "HEAD".to_string(),
+                    merge_base: true,
+                },
+                "missing_branch",
+                "Verify both branches",
+            ),
+            (
+                ReviewSourceKind::WorkingTreeAndIndex,
+                "missing_head",
+                "Create an initial commit",
+            ),
+        ];
+        for (kind, expected_code, expected_recovery) in cases {
+            let source = ReviewSource {
+                id: "source".to_string(),
+                label: "source".to_string(),
+                included: true,
+                kind,
+            };
+            let (code, message) = actionable_materialization_error(
+                &source,
+                &ReviewError::Git("ambiguous argument".to_string()),
+            );
+            assert_eq!(code, expected_code);
+            assert!(message.contains(expected_recovery));
+        }
+    }
 
     #[test]
     fn external_import_persistence_round_trips_and_replaces_snapshot_atomically() {

@@ -16,8 +16,8 @@ use bmux_tui::text_width::{display_width, truncate_to_display_width};
 
 use crate::code_review_tui::{
     ReviewApp, ReviewFile, ReviewLineKind, ReviewMouseAction, ReviewPromptKind, ReviewPublishState,
-    ReviewSidebarMode, ReviewThreadFilter, add_source_menu_items, review_thread_kind_label,
-    review_thread_severity_label, sidebar_width,
+    ReviewSidebarMode, ReviewThreadFilter, add_source_menu_items, advanced_source_menu_items,
+    review_thread_kind_label, review_thread_severity_label, sidebar_width,
 };
 use crate::code_review_tui_display::{
     ReviewDisplayRow, ReviewDisplayRowSource, ReviewDisplaySegment, ReviewDisplayTextRole,
@@ -1413,6 +1413,18 @@ fn build_workspace_rows(app: &ReviewApp) -> Vec<(String, String, bool, bool)> {
         ),
         false,
         false,
+    ));
+    rows.push((
+        "Materialization".to_string(),
+        if app.workspace_materialization_in_progress {
+            ": in progress — keep this review open".to_string()
+        } else if app.workspace_materialization_failed {
+            ": failed — inspect diagnostics, edit the source, then press R".to_string()
+        } else {
+            ": ready — press R to refresh sources".to_string()
+        },
+        false,
+        app.workspace_materialization_failed,
     ));
     if workspace.sources.is_empty() {
         rows.push((
@@ -3170,6 +3182,7 @@ fn prompt_popup_height(kind: &ReviewPromptKind, area: Rect) -> u16 {
     match kind {
         ReviewPromptKind::FilePicker
         | ReviewPromptKind::AddSourceKind
+        | ReviewPromptKind::AddAdvancedSourceKind
         | ReviewPromptKind::AddFileSourcePicker
         | ReviewPromptKind::AddFileRangePathPicker
         | ReviewPromptKind::AddCommitPicker
@@ -3195,6 +3208,7 @@ const fn prompt_title(kind: &ReviewPromptKind) -> &'static str {
         ReviewPromptKind::JumpToLine => " Jump to line ",
         ReviewPromptKind::FileSearch => " Search file ",
         ReviewPromptKind::AddSourceKind => " Add source ",
+        ReviewPromptKind::AddAdvancedSourceKind => " Add advanced source ",
         ReviewPromptKind::AddCommitPicker => " Pick commit ",
         ReviewPromptKind::AddCommitSource => " Add commit ",
         ReviewPromptKind::AddCommitRangeBasePicker => " Pick base commit ",
@@ -3219,7 +3233,25 @@ fn render_add_source_menu(
     height: u16,
     frame: &mut Frame<'_>,
 ) {
-    let items = add_source_menu_items();
+    render_source_menu_items(prompt, add_source_menu_items(), popup, height, frame);
+}
+
+fn render_advanced_source_menu(
+    prompt: &crate::code_review_tui::ReviewPromptState,
+    popup: Rect,
+    height: u16,
+    frame: &mut Frame<'_>,
+) {
+    render_source_menu_items(prompt, advanced_source_menu_items(), popup, height, frame);
+}
+
+fn render_source_menu_items(
+    prompt: &crate::code_review_tui::ReviewPromptState,
+    items: &[crate::code_review_tui::AddSourceMenuItem],
+    popup: Rect,
+    height: u16,
+    frame: &mut Frame<'_>,
+) {
     for (row, item) in items
         .iter()
         .take(usize::from(height.saturating_sub(3)))
@@ -3289,6 +3321,9 @@ fn render_prompt(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     );
     match &prompt.kind {
         ReviewPromptKind::AddSourceKind => render_add_source_menu(prompt, popup, height, frame),
+        ReviewPromptKind::AddAdvancedSourceKind => {
+            render_advanced_source_menu(prompt, popup, height, frame);
+        }
         ReviewPromptKind::AddFileSourcePicker | ReviewPromptKind::AddFileRangePathPicker => {
             render_add_repository_file_picker(app, prompt, popup, height, query, frame);
         }
