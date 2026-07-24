@@ -4454,6 +4454,8 @@ const fn runtime_work_kind_name(kind: RuntimeWorkKind) -> &'static str {
         RuntimeWorkKind::PluginInvocation => "plugin_invocation",
         RuntimeWorkKind::ModelTurn => "model_turn",
         RuntimeWorkKind::EventDelivery => "event_delivery",
+        RuntimeWorkKind::Workflow => "workflow",
+        RuntimeWorkKind::WorkflowNode => "workflow_node",
     }
 }
 
@@ -4462,6 +4464,8 @@ fn parse_runtime_work_kind(value: &str) -> RuntimeWorkKind {
         "plugin_invocation" => RuntimeWorkKind::PluginInvocation,
         "model_turn" => RuntimeWorkKind::ModelTurn,
         "event_delivery" => RuntimeWorkKind::EventDelivery,
+        "workflow" => RuntimeWorkKind::Workflow,
+        "workflow_node" => RuntimeWorkKind::WorkflowNode,
         _ => RuntimeWorkKind::Tool,
     }
 }

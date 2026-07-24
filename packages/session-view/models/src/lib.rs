@@ -1112,6 +1112,8 @@ pub fn runtime_work_status_label(runtime_work: &[RuntimeWorkView]) -> Option<Str
             RuntimeWorkKind::Tool => "running tool",
             RuntimeWorkKind::PluginInvocation => "running plugin",
             RuntimeWorkKind::EventDelivery => "delivering event",
+            RuntimeWorkKind::Workflow => "running workflow",
+            RuntimeWorkKind::WorkflowNode => "running workflow node",
         },
         RuntimeWorkStatus::Completed
         | RuntimeWorkStatus::Cancelled

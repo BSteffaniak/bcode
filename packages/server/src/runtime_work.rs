@@ -22,6 +22,9 @@ pub enum CancellationHandle {
         /// Run ID to mark cancellation-requested.
         run_id: String,
     },
+    /// Cancel a server-hosted durable workflow run.
+    #[cfg(test)]
+    WorkflowRun(Arc<crate::WorkflowRunCancelState>),
     /// Test/no-op cancellation hook.
     #[cfg(test)]
     Test(Arc<std::sync::atomic::AtomicUsize>),
@@ -49,6 +52,11 @@ impl CancellationHandle {
                 .request_run_cancel(run_id)
                 .map_err(|error| error.to_string()),
             #[cfg(test)]
+            Self::WorkflowRun(cancel_state) => {
+                cancel_state.cancel();
+                Ok(())
+            }
+            #[cfg(test)]
             Self::Test(count) => {
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Ok(())
@@ -70,6 +78,8 @@ impl CancellationHandle {
     pub const fn is_cancellable(&self) -> bool {
         match self {
             Self::SessionTurn(_) | Self::PluginInvocation(_) | Self::RalphRun { .. } => true,
+            #[cfg(test)]
+            Self::WorkflowRun(_) => true,
             #[cfg(test)]
             Self::Test(_) | Self::TestBlocked(_) | Self::TestFailed(_) => true,
         }
@@ -128,6 +138,14 @@ struct ActiveRuntimeWork {
     cancelled: bool,
 }
 
+/// Active runtime-work identity returned by recursive cancellation routing.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelledRuntimeWork {
+    pub session_id: SessionId,
+    pub work_id: WorkId,
+}
+
 /// Central server registry and cancellation router for active runtime work.
 #[derive(Debug, Default)]
 pub struct RuntimeWorkManager {
@@ -174,6 +192,32 @@ impl RuntimeWorkManager {
         };
         drop(active);
         replaced
+    }
+
+    /// Cancel active work by exact ID across sessions and return every work item newly signalled.
+    #[cfg(test)]
+    pub async fn cancel_global_with_children(&self, work_id: &WorkId) -> Vec<CancelledRuntimeWork> {
+        let session_ids = self
+            .active
+            .lock()
+            .await
+            .keys()
+            .filter(|(_, active_work_id)| active_work_id == work_id)
+            .map(|(session_id, _)| *session_id)
+            .collect::<Vec<_>>();
+        let mut cancelled = Vec::new();
+        for session_id in session_ids {
+            cancelled.extend(
+                self.cancel_with_children(session_id, work_id)
+                    .await
+                    .into_iter()
+                    .map(|work_id| CancelledRuntimeWork {
+                        session_id,
+                        work_id,
+                    }),
+            );
+        }
+        cancelled
     }
 
     /// Cancel active work by exact ID and return every work item newly signalled.
@@ -294,6 +338,8 @@ const fn runtime_work_kind_label(kind: RuntimeWorkKind) -> &'static str {
         RuntimeWorkKind::Tool => "tool",
         RuntimeWorkKind::PluginInvocation => "plugin_invocation",
         RuntimeWorkKind::EventDelivery => "event_delivery",
+        RuntimeWorkKind::Workflow => "workflow",
+        RuntimeWorkKind::WorkflowNode => "workflow_node",
     }
 }
 
@@ -319,6 +365,26 @@ mod tests {
             work_id.to_string(),
             CancellationHandle::Test(count),
         )
+    }
+
+    #[tokio::test]
+    async fn global_cancellation_finds_exact_work_across_sessions() {
+        let manager = RuntimeWorkManager::default();
+        let first_session = SessionId::new();
+        let second_session = SessionId::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let work_id = WorkId::new("shared-work");
+        manager
+            .start(first_session, test_spec("shared-work", Arc::clone(&count)))
+            .await;
+        manager
+            .start(second_session, test_spec("other-work", Arc::clone(&count)))
+            .await;
+        let cancelled = manager.cancel_global_with_children(&work_id).await;
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].session_id, first_session);
+        assert_eq!(cancelled[0].work_id, work_id);
+        wait_for_count(&count, 1).await;
     }
 
     #[tokio::test]

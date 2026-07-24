@@ -1098,6 +1098,10 @@ pub enum RuntimeWorkKind {
     ModelTurn,
     /// Plugin event delivery.
     EventDelivery,
+    /// Durable multi-node workflow run.
+    Workflow,
+    /// One node/attempt within a durable workflow run.
+    WorkflowNode,
 }
 
 /// Durable runtime work terminal/current status.

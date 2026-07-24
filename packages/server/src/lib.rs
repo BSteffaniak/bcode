@@ -513,6 +513,24 @@ impl SessionTurnPermit {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct WorkflowRunCancelState {
+    token: CancellationToken,
+}
+
+#[cfg(test)]
+impl WorkflowRunCancelState {
+    fn cancel(&self) {
+        self.token.cancel();
+    }
+
+    #[cfg(test)]
+    fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+}
+
 #[derive(Debug, Default)]
 struct TurnCancelState {
     token: CancellationToken,
@@ -18262,9 +18280,56 @@ async fn register_runtime_work(state: &ServerState, session_id: SessionId, spec:
 }
 
 #[cfg(test)]
+async fn register_workflow_runtime_work(
+    state: &ServerState,
+    session_id: SessionId,
+    run_id: &str,
+    label: String,
+    cancel_state: Arc<WorkflowRunCancelState>,
+) -> WorkId {
+    let work_id = WorkId::new(format!("workflow:{run_id}"));
+    register_runtime_work(
+        state,
+        session_id,
+        RuntimeWorkSpec::new(
+            work_id.clone(),
+            RuntimeWorkKind::Workflow,
+            label,
+            CancellationHandle::WorkflowRun(cancel_state),
+        ),
+    )
+    .await;
+    work_id
+}
+
+#[cfg(test)]
+async fn register_workflow_node_runtime_work(
+    state: &ServerState,
+    session_id: SessionId,
+    run_work_id: &WorkId,
+    dispatch_identity: &str,
+    label: String,
+    cancellation: CancellationHandle,
+) -> WorkId {
+    let work_id = WorkId::new(dispatch_identity.to_string());
+    register_runtime_work(
+        state,
+        session_id,
+        RuntimeWorkSpec::new(
+            work_id.clone(),
+            RuntimeWorkKind::WorkflowNode,
+            label,
+            cancellation,
+        )
+        .with_parent_work_id(Some(run_work_id.clone())),
+    )
+    .await;
+    work_id
+}
+
+#[cfg(test)]
 struct WorkflowRuntimeWorkCancellationOwner<'a> {
     state: &'a ServerState,
-    session_id: SessionId,
 }
 
 #[cfg(test)]
@@ -18275,14 +18340,27 @@ impl AttemptCancellationOwner for WorkflowRuntimeWorkCancellationOwner<'_> {
     ) -> Pin<Box<dyn Future<Output = Result<(), WorkflowStoreError>> + Send + 'a>> {
         Box::pin(async move {
             let work_id = WorkId::new(request.dispatch_identity.clone());
-            if cancel_registered_runtime_work(self.state, self.session_id, work_id, None).await {
-                Ok(())
-            } else {
-                Err(WorkflowStoreError::InvalidData(format!(
+            let cancelled = self
+                .state
+                .runtime_work
+                .cancel_global_with_children(&work_id)
+                .await;
+            if cancelled.is_empty() {
+                return Err(WorkflowStoreError::InvalidData(format!(
                     "active runtime work not found for workflow dispatch: {}",
                     request.dispatch_identity
-                )))
+                )));
             }
+            for cancelled_work in cancelled {
+                append_runtime_work_cancel_requested_event(
+                    self.state,
+                    cancelled_work.session_id,
+                    cancelled_work.work_id,
+                    None,
+                )
+                .await;
+            }
+            Ok(())
         })
     }
 }
@@ -18291,14 +18369,13 @@ impl AttemptCancellationOwner for WorkflowRuntimeWorkCancellationOwner<'_> {
 async fn propagate_workflow_cancellation(
     state: &ServerState,
     store: &mut bcode_workflow_store::WorkflowStore,
-    session_id: SessionId,
     run_id: &str,
     limit: usize,
 ) -> Result<bcode_workflow_store::CancellationPropagationSummary, WorkflowStoreError> {
     store
         .propagate_cancellation(
             run_id,
-            &WorkflowRuntimeWorkCancellationOwner { state, session_id },
+            &WorkflowRuntimeWorkCancellationOwner { state },
             limit,
             current_unix_millis(),
         )
@@ -18457,6 +18534,8 @@ const fn runtime_work_kind_label(kind: RuntimeWorkKind) -> &'static str {
         RuntimeWorkKind::PluginInvocation => "plugin_invocation",
         RuntimeWorkKind::ModelTurn => "model_turn",
         RuntimeWorkKind::EventDelivery => "event_delivery",
+        RuntimeWorkKind::Workflow => "workflow",
+        RuntimeWorkKind::WorkflowNode => "workflow_node",
     }
 }
 
@@ -28876,6 +28955,72 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn workflow_runtime_work_registers_parent_and_node_relationships() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("workflow".to_string()), PathBuf::from("."))
+            .await
+            .expect("session");
+        let state = test_server_state(sessions);
+        let run_cancel = Arc::new(WorkflowRunCancelState::default());
+        let node_cancelled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let run_work_id = register_workflow_runtime_work(
+            &state,
+            session.id,
+            "run-1",
+            "workflow run".to_string(),
+            Arc::clone(&run_cancel),
+        )
+        .await;
+        let node_work_id = register_workflow_node_runtime_work(
+            &state,
+            session.id,
+            &run_work_id,
+            "dispatch-1",
+            "workflow node".to_string(),
+            CancellationHandle::Test(Arc::clone(&node_cancelled)),
+        )
+        .await;
+
+        let history = state
+            .sessions
+            .session_history(session.id)
+            .await
+            .expect("history");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::RuntimeWorkStarted {
+                work_id,
+                kind: RuntimeWorkKind::Workflow,
+                parent_work_id: None,
+                ..
+            } if work_id == &run_work_id
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::RuntimeWorkStarted {
+                work_id,
+                kind: RuntimeWorkKind::WorkflowNode,
+                parent_work_id: Some(parent),
+                ..
+            } if work_id == &node_work_id && parent == &run_work_id
+        )));
+        assert!(
+            cancel_registered_runtime_work(&state, session.id, run_work_id, None).await,
+            "parent workflow cancellation should recursively signal its node"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while node_cancelled.load(std::sync::atomic::Ordering::SeqCst) != 1
+                || !run_cancel.is_cancelled()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("parent and node cancellation");
+    }
+
+    #[tokio::test]
     async fn workflow_cancellation_routes_exact_dispatch_to_runtime_owner() {
         let sessions = SessionManager::default();
         let session = sessions
@@ -28952,7 +29097,7 @@ library = "test"
         .await;
         store.request_cancellation("run-1", 5).expect("intent");
 
-        let summary = propagate_workflow_cancellation(&state, &mut store, session.id, "run-1", 10)
+        let summary = propagate_workflow_cancellation(&state, &mut store, "run-1", 10)
             .await
             .expect("propagation");
         assert_eq!(summary.signalled, [dispatch_identity]);
