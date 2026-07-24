@@ -110,6 +110,10 @@ use bcode_workflow::{
     WorkflowApprovalResolver, WorkflowError, WorkflowGrantScope, WorkflowPolicyGrant,
     WorkflowToolCapability,
 };
+#[cfg(test)]
+use bcode_workflow_store::{
+    ActiveAttemptCancellation, AttemptCancellationOwner, WorkflowStoreError,
+};
 use futures::StreamExt;
 use runtime_work::{CancellationHandle, RuntimeWorkManager, RuntimeWorkSpec};
 use serde::{Deserialize, Serialize};
@@ -18257,6 +18261,50 @@ async fn register_runtime_work(state: &ServerState, session_id: SessionId, spec:
     }
 }
 
+#[cfg(test)]
+struct WorkflowRuntimeWorkCancellationOwner<'a> {
+    state: &'a ServerState,
+    session_id: SessionId,
+}
+
+#[cfg(test)]
+impl AttemptCancellationOwner for WorkflowRuntimeWorkCancellationOwner<'_> {
+    fn cancel_attempt<'a>(
+        &'a self,
+        request: &'a ActiveAttemptCancellation,
+    ) -> Pin<Box<dyn Future<Output = Result<(), WorkflowStoreError>> + Send + 'a>> {
+        Box::pin(async move {
+            let work_id = WorkId::new(request.dispatch_identity.clone());
+            if cancel_registered_runtime_work(self.state, self.session_id, work_id, None).await {
+                Ok(())
+            } else {
+                Err(WorkflowStoreError::InvalidData(format!(
+                    "active runtime work not found for workflow dispatch: {}",
+                    request.dispatch_identity
+                )))
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+async fn propagate_workflow_cancellation(
+    state: &ServerState,
+    store: &mut bcode_workflow_store::WorkflowStore,
+    session_id: SessionId,
+    run_id: &str,
+    limit: usize,
+) -> Result<bcode_workflow_store::CancellationPropagationSummary, WorkflowStoreError> {
+    store
+        .propagate_cancellation(
+            run_id,
+            &WorkflowRuntimeWorkCancellationOwner { state, session_id },
+            limit,
+            current_unix_millis(),
+        )
+        .await
+}
+
 async fn cancel_registered_runtime_work(
     state: &ServerState,
     session_id: SessionId,
@@ -28825,6 +28873,96 @@ library = "test"
                 ralph_store,
             },
         )
+    }
+
+    #[tokio::test]
+    async fn workflow_cancellation_routes_exact_dispatch_to_runtime_owner() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("workflow".to_string()), PathBuf::from("."))
+            .await
+            .expect("session");
+        let state = test_server_state(sessions);
+        let cancelled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let temp = tempfile::tempdir().expect("workflow store");
+        let mut store = bcode_workflow_store::WorkflowStore::open_in_state_dir(temp.path())
+            .expect("workflow store");
+        let definition = bcode_workflow::WorkflowBuilder::new(
+            "server-cancellation",
+            bcode_workflow::Step::task("node", |value: u32, _context| async move { Ok(value) }),
+        )
+        .build()
+        .expect("workflow")
+        .definition()
+        .clone();
+        store
+            .persist_definition("server-cancellation", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "run-1".to_string(),
+                definition_id: "server-cancellation".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot-1".to_string(),
+                parent_session_id: Some(session.id.to_string()),
+                created_at_ms: 1,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        store
+            .create_activation(&bcode_workflow_store::NewActivation {
+                run_id: "run-1".to_string(),
+                node_id: "node".to_string(),
+                activation_id: "activation-1".to_string(),
+                dependency_generation: 0,
+                created_at_ms: 2,
+            })
+            .expect("activation");
+        let attempt = bcode_workflow_store::PreparedAttempt {
+            run_id: "run-1".to_string(),
+            node_id: "node".to_string(),
+            activation_id: "activation-1".to_string(),
+            attempt: 1,
+            side_effect: bcode_workflow_store::DispatchSideEffect::ReadOnly,
+            intent: serde_json::json!({"owner": "runtime_work"}),
+            prepared_at_ms: 3,
+        };
+        let dispatch_identity = store.prepare_attempt(&attempt).expect("prepare");
+        store
+            .persist_dispatch_receipt(&bcode_workflow_store::DispatchReceipt {
+                run_id: attempt.run_id,
+                node_id: attempt.node_id,
+                activation_id: attempt.activation_id,
+                attempt: attempt.attempt,
+                dispatch_identity: dispatch_identity.clone(),
+                receipt: serde_json::json!({"work_id": dispatch_identity}),
+                admitted_at_ms: 4,
+            })
+            .expect("receipt");
+        register_runtime_work(
+            &state,
+            session.id,
+            RuntimeWorkSpec::new(
+                WorkId::new(dispatch_identity.clone()),
+                RuntimeWorkKind::PluginInvocation,
+                "workflow node".to_string(),
+                CancellationHandle::Test(Arc::clone(&cancelled)),
+            ),
+        )
+        .await;
+        store.request_cancellation("run-1", 5).expect("intent");
+
+        let summary = propagate_workflow_cancellation(&state, &mut store, session.id, "run-1", 10)
+            .await
+            .expect("propagation");
+        assert_eq!(summary.signalled, [dispatch_identity]);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cancelled.load(std::sync::atomic::Ordering::SeqCst) != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owner cancellation");
     }
 
     #[tokio::test]

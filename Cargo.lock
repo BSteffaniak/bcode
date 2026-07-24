@@ -2215,6 +2215,7 @@ dependencies = [
  "bcode_vim_edit_plugin",
  "bcode_web_search_plugin",
  "bcode_workflow",
+ "bcode_workflow_store",
  "bcode_worktree",
  "bcode_worktree_models",
  "futures 0.3.33",
@@ -2567,6 +2568,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "thiserror 2.0.19",
+ "tokio",
 ]
 
 [[package]]

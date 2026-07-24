@@ -9,7 +9,9 @@ use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use thiserror::Error;
 
 const DATABASE_FILE: &str = "workflow.db";
@@ -205,6 +207,39 @@ pub struct DispatchReceipt {
     pub dispatch_identity: String,
     pub receipt: serde_json::Value,
     pub admitted_at_ms: u64,
+}
+
+/// One active durable workflow attempt to signal after cancellation intent commits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActiveAttemptCancellation {
+    pub run_id: String,
+    pub node_id: String,
+    pub activation_id: String,
+    pub attempt: u32,
+    pub dispatch_identity: String,
+    pub receipt: Option<serde_json::Value>,
+}
+
+/// Result of signaling active attempt owners after durable cancellation intent.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CancellationPropagationSummary {
+    pub signalled: Vec<String>,
+    pub already_terminal: Vec<String>,
+}
+
+/// Owner boundary for active workflow attempt cancellation.
+pub trait AttemptCancellationOwner: Sync {
+    /// Signal one active owner using its stable dispatch identity and optional receipt.
+    ///
+    /// Implementations must be idempotent for repeated calls with the same request.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the owner cannot durably accept or safely repeat cancellation.
+    fn cancel_attempt<'a>(
+        &'a self,
+        request: &'a ActiveAttemptCancellation,
+    ) -> Pin<Box<dyn Future<Output = Result<(), WorkflowStoreError>> + Send + 'a>>;
 }
 
 /// One explicit durable workflow decision.
@@ -1579,49 +1614,126 @@ impl WorkflowStore {
         Ok(changed == 1)
     }
 
-    /// Return dispatch identities for active children after cancellation intent is durable.
+    /// Return bounded active attempts only after cancellation intent is durable.
     ///
-    /// Executors use this bounded list to signal turn/plugin owners only after
-    /// [`Self::request_cancellation`] commits.
+    /// Receipts are included when present so the owner can route cancellation to the exact turn or
+    /// plugin operation. Receipt-less prepared attempts remain discoverable by stable identity.
     ///
     /// # Errors
     ///
-    /// Returns an error when the run identity/limit is invalid, cancellation was not persisted, or
-    /// the bounded query fails.
+    /// Returns an error when the run identity/limit is invalid, cancellation was not persisted,
+    /// receipt JSON is malformed, or the bounded query fails.
+    pub fn active_attempt_cancellations(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<ActiveAttemptCancellation>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let limit = bounded_limit(limit)?;
+        require_cancellation_requested(&self.connection, run_id)?;
+        let mut statement = self.connection.prepare(
+            "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, receipt_json \
+             FROM workflow_attempts WHERE run_id = ?1 \
+             AND status IN ('prepared', 'admitted', 'running') \
+             ORDER BY prepared_at_ms, dispatch_identity LIMIT ?2",
+        )?;
+        statement
+            .query_map((run_id, limit), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u32>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })?
+            .map(|row| {
+                let (run_id, node_id, activation_id, attempt, dispatch_identity, receipt_json) =
+                    row?;
+                Ok(ActiveAttemptCancellation {
+                    run_id,
+                    node_id,
+                    activation_id,
+                    attempt,
+                    dispatch_identity,
+                    receipt: receipt_json
+                        .map(|receipt| serde_json::from_str(&receipt))
+                        .transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    /// Signal active attempt owners after durable cancellation intent is confirmed.
+    ///
+    /// Signaling occurs outside a database transaction. Successful signals are marked
+    /// `cancelling`; a crash before that marker is safe because owner signaling must be idempotent
+    /// and the attempt remains discoverable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when discovery, owner signaling, or durable marking fails. Unsignalled
+    /// attempts remain discoverable for a later retry.
+    pub async fn propagate_cancellation<O>(
+        &mut self,
+        run_id: &str,
+        owner: &O,
+        limit: usize,
+        signalled_at_ms: u64,
+    ) -> Result<CancellationPropagationSummary, WorkflowStoreError>
+    where
+        O: AttemptCancellationOwner + ?Sized,
+    {
+        let attempts = self.active_attempt_cancellations(run_id, limit)?;
+        let mut summary = CancellationPropagationSummary::default();
+        for attempt in attempts {
+            owner.cancel_attempt(&attempt).await?;
+            let transaction = self.connection.transaction()?;
+            let changed = transaction.execute(
+                "UPDATE workflow_attempts SET status = 'cancelling' \
+                 WHERE dispatch_identity = ?1 \
+                 AND status IN ('prepared', 'admitted', 'running')",
+                [&attempt.dispatch_identity],
+            )?;
+            if changed == 1 {
+                append_event(
+                    &transaction,
+                    run_id,
+                    "attempt_cancellation_signalled",
+                    &serde_json::json!({"dispatch_identity": attempt.dispatch_identity})
+                        .to_string(),
+                    signalled_at_ms,
+                )?;
+                summary.signalled.push(attempt.dispatch_identity);
+            } else {
+                summary.already_terminal.push(attempt.dispatch_identity);
+            }
+            transaction.commit()?;
+        }
+        Ok(summary)
+    }
+
+    /// Return dispatch identities for active children after cancellation intent is durable.
+    ///
+    /// New owner routers should use [`Self::active_attempt_cancellations`] to retain receipts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the run identity/limit is invalid, cancellation was not persisted,
+    /// receipt JSON is malformed, or the bounded query fails.
     pub fn active_attempts_for_cancellation(
         &self,
         run_id: &str,
         limit: usize,
     ) -> Result<Vec<String>, WorkflowStoreError> {
-        validate_id("run_id", run_id)?;
-        let limit = bounded_limit(limit)?;
-        let cancellation_requested: bool = self
-            .connection
-            .query_row(
-                "SELECT cancellation_requested_at_ms IS NOT NULL FROM workflow_runs \
-                 WHERE run_id = ?1",
-                [run_id],
-                |row| row.get(0),
-            )
-            .optional()?
-            .ok_or_else(|| {
-                WorkflowStoreError::InvalidData(format!("workflow run not found: {run_id}"))
-            })?;
-        if !cancellation_requested {
-            return Err(WorkflowStoreError::InvalidData(
-                "workflow cancellation intent must be persisted before signaling children"
-                    .to_string(),
-            ));
-        }
-        let mut statement = self.connection.prepare(
-            "SELECT dispatch_identity FROM workflow_attempts WHERE run_id = ?1 \
-             AND status IN ('prepared', 'admitted', 'running') \
-             ORDER BY prepared_at_ms, dispatch_identity LIMIT ?2",
-        )?;
-        statement
-            .query_map((run_id, limit), |row| row.get(0))?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(WorkflowStoreError::from)
+        self.active_attempt_cancellations(run_id, limit)
+            .map(|attempts| {
+                attempts
+                    .into_iter()
+                    .map(|attempt| attempt.dispatch_identity)
+                    .collect()
+            })
     }
 
     /// Return one run summary without replaying workflow events.
@@ -1810,7 +1922,7 @@ fn receipt_backed_attempts(
 ) -> Result<Vec<AttemptReconciliationRequest>, WorkflowStoreError> {
     let mut statement = connection.prepare(
         "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, side_effect, \
-         receipt_json FROM workflow_attempts WHERE status IN ('admitted', 'running') \
+         receipt_json FROM workflow_attempts WHERE status IN ('admitted', 'running', 'cancelling') \
          AND receipt_json IS NOT NULL ORDER BY prepared_at_ms, dispatch_identity LIMIT ?1",
     )?;
     statement
@@ -1926,7 +2038,7 @@ fn transition_attempt(
 ) -> Result<(), WorkflowStoreError> {
     let changed = transaction.execute(
         "UPDATE workflow_attempts SET status = ?2, terminal_at_ms = COALESCE(?3, terminal_at_ms) \
-         WHERE dispatch_identity = ?1 AND status IN ('admitted', 'running')",
+         WHERE dispatch_identity = ?1 AND status IN ('admitted', 'running', 'cancelling')",
         (&request.dispatch_identity, status, terminal_at_ms),
     )?;
     if changed != 1 {
@@ -2028,7 +2140,7 @@ fn enforce_attempt_limits(
     }
     let active_count: u32 = connection.query_row(
         "SELECT COUNT(*) FROM workflow_attempts WHERE run_id = ?1 \
-         AND status IN ('prepared', 'admitted', 'running')",
+         AND status IN ('prepared', 'admitted', 'running', 'cancelling')",
         [&attempt.run_id],
         |row| row.get(0),
     )?;
@@ -2238,6 +2350,28 @@ fn repair_required_attempt(
                 "repair-required workflow attempt not found: {dispatch_identity}"
             ))
         })
+}
+
+fn require_cancellation_requested(
+    connection: &Connection,
+    run_id: &str,
+) -> Result<(), WorkflowStoreError> {
+    let cancellation_requested = connection
+        .query_row(
+            "SELECT cancellation_requested_at_ms IS NOT NULL FROM workflow_runs WHERE run_id = ?1",
+            [run_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()?
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!("workflow run not found: {run_id}"))
+        })?;
+    if !cancellation_requested {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow cancellation intent must be persisted before signaling children".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_repair_resolution(resolution: &RepairResolution) -> Result<(), WorkflowStoreError> {
@@ -2992,6 +3126,103 @@ mod tests {
                 .active_attempts_for_cancellation("run-1", 10)
                 .expect("active children"),
             Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_propagates_to_receipt_backed_owner_after_durable_intent() {
+        #[derive(Default)]
+        struct Owner {
+            requests: std::sync::Mutex<Vec<ActiveAttemptCancellation>>,
+        }
+
+        impl AttemptCancellationOwner for Owner {
+            fn cancel_attempt<'a>(
+                &'a self,
+                request: &'a ActiveAttemptCancellation,
+            ) -> Pin<Box<dyn Future<Output = Result<(), WorkflowStoreError>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    self.requests
+                        .lock()
+                        .expect("owner requests")
+                        .push(request.clone());
+                    Ok(())
+                })
+            }
+        }
+
+        let (_temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::ReadOnly);
+        let owner = Owner::default();
+        assert!(
+            store
+                .propagate_cancellation("run-1", &owner, 10, 20)
+                .await
+                .is_err(),
+            "owner signaling must be impossible before durable cancellation intent"
+        );
+        assert!(owner.requests.lock().expect("requests").is_empty());
+
+        store.request_cancellation("run-1", 20).expect("intent");
+        let summary = store
+            .propagate_cancellation("run-1", &owner, 10, 21)
+            .await
+            .expect("propagate");
+        assert_eq!(
+            summary.signalled.as_slice(),
+            std::slice::from_ref(&identity)
+        );
+        let requests = owner.requests.lock().expect("requests").clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].dispatch_identity, identity);
+        assert_eq!(
+            requests[0].receipt,
+            Some(serde_json::json!({"turn_id": "turn-1"}))
+        );
+        let repeated = store
+            .propagate_cancellation("run-1", &owner, 10, 22)
+            .await
+            .expect("already signalled");
+        assert!(repeated.signalled.is_empty());
+        assert_eq!(owner.requests.lock().expect("requests").len(), 1);
+        assert_eq!(
+            store.attempt_history("run-1", None, 10).expect("attempts")[0].status,
+            "cancelling"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_propagation_is_retryable_after_owner_failure() {
+        struct Owner;
+        impl AttemptCancellationOwner for Owner {
+            fn cancel_attempt<'a>(
+                &'a self,
+                _request: &'a ActiveAttemptCancellation,
+            ) -> Pin<Box<dyn Future<Output = Result<(), WorkflowStoreError>> + Send + 'a>>
+            {
+                Box::pin(async {
+                    Err(WorkflowStoreError::InvalidData(
+                        "owner unavailable".to_string(),
+                    ))
+                })
+            }
+        }
+
+        let (_temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::ReadOnly);
+        store.request_cancellation("run-1", 20).expect("intent");
+        assert!(
+            store
+                .propagate_cancellation("run-1", &Owner, 10, 21)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .active_attempts_for_cancellation("run-1", 10)
+                .expect("retryable"),
+            [identity]
         );
     }
 

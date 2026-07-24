@@ -21,6 +21,8 @@ for required in \
   'pub fn persist_dispatch_receipt' \
   'pub fn persist_validated_output' \
   'pub fn reconcile_prepared_attempts' \
+  'pub fn active_attempt_cancellations' \
+  'pub async fn propagate_cancellation' \
   'pub fn doctor_run' \
   'pub fn repair_attempt' \
   'RepairRequired'; do

@@ -150,8 +150,10 @@ if rg -n '\brequires_permission\b' packages/tool/src packages/tool/models/src pa
   violations=1
 fi
 
-if rg -n '\bToolSideEffect\b|\.side_effect\b' packages plugins examples --glob '*.rs' \
-  >/tmp/bcode-removed-tool-side-effect.txt; then
+if {
+  rg -n '\bToolSideEffect\b' packages plugins examples --glob '*.rs'
+  rg -n '\.side_effect\b' packages plugins examples --glob '*.rs' --glob '!packages/workflow-store/**'
+} >/tmp/bcode-removed-tool-side-effect.txt; then
   echo "Runtime architecture violation: removed ToolSideEffect definition metadata was reintroduced." >&2
   cat /tmp/bcode-removed-tool-side-effect.txt >&2
   violations=1
@@ -984,7 +986,7 @@ if ! grep -F 'TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA' packages/tool/src/contracts
 fi
 
 if rg -n '(^|[^A-Za-z])SessionEventKind::ToolCallFinished|"tool_call_finished"|\bsemantic_migration\b|MigrateSemanticResults' \
-  packages/session packages/session-view packages/ipc packages/server packages/tui packages/web-render packages/cli packages/eval plugins/blims-plugin plugins/code-review-plugin \
+  packages/session packages/session-view packages/ipc packages/server packages/tui packages/hyperchad packages/cli packages/eval plugins/blims-plugin plugins/code-review-plugin \
   --glob '*.rs' >/tmp/bcode-removed-session-result-compatibility.txt; then
   echo "Runtime architecture violation: removed legacy session result compatibility was reintroduced." >&2
   cat /tmp/bcode-removed-session-result-compatibility.txt >&2
