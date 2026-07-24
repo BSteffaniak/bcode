@@ -12,6 +12,7 @@ const BLOCKQUOTES: &str = include_str!("fixtures/blockquotes.md");
 const BLOCKS: &str = include_str!("fixtures/blocks.md");
 const CODE_BLOCKS: &str = include_str!("fixtures/code_blocks.md");
 const COMPOSITION: &str = include_str!("fixtures/composition.md");
+const FOOTNOTES: &str = include_str!("fixtures/footnotes.md");
 const GITHUB_MARKDOWN_EXAMPLE: &str = include_str!("../../../github-markdown-example.md");
 const HEADINGS: &str = include_str!("fixtures/headings.md");
 const HTML_XSS: &str = include_str!("fixtures/html_xss.md");
@@ -174,6 +175,29 @@ fn contribution_snapshot(markdown: &str) -> String {
 }
 
 #[test]
+fn snapshots_footnotes_at_normal_and_narrow_widths() {
+    insta::assert_snapshot!(
+        "footnotes_widths_60_24",
+        [60_u16, 24]
+            .into_iter()
+            .map(|width| format!("== width {width} ==\n{}", styled_snapshot(FOOTNOTES, width)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn footnotes_use_first_reference_numbers_and_preserve_all_content() {
+    let output = visible_snapshot(FOOTNOTES, 60);
+
+    assert!(output.contains("First[1], repeated[1], and second[2]. Missing[3]."));
+    assert!(output.contains("1.  First definition over multiple lines. ↩×2"));
+    assert!(output.contains("2.  Second definition with strong text. ↩"));
+    assert!(output.contains("3.  Unreferenced definition."));
+    assert!(!output.contains("[^alpha]"));
+}
+
+#[test]
 fn snapshots_parser_neutral_semantic_contributions() {
     insta::assert_snapshot!(
         "semantic_contributions",
@@ -227,7 +251,7 @@ fn malformed_extensions_remain_visible_and_balanced() {
     assert!(visible.contains("[!NOTE incomplete alert"));
     assert!(visible.contains("Unclosed [link]( destination"));
     assert!(visible.contains("Inline $unterminated"));
-    assert!(visible.contains("Reference [^missing]"));
+    assert!(visible.contains("Reference [1]"));
     assert!(visible.contains("<details open data-unsupported"));
     assert!(visible.contains("┌─ mermaid"));
 }
@@ -362,8 +386,12 @@ fn github_markdown_example_documents_current_semantic_gaps() {
     assert!(output.contains("<details>"), "details HTML changed");
     assert!(output.contains("<summary>"), "summary HTML changed");
     assert!(output.contains("(n)"), "inline math degradation changed");
-    assert!(output.contains("[^compat]"), "footnote reference changed");
-    assert!(output.contains("[^compat]:"), "footnote definition changed");
+    assert!(output.contains("[1]"), "footnote reference changed");
+    assert!(output.contains("Footnotes"), "footnote section changed");
+    assert!(
+        output.contains("This enables older clients"),
+        "footnote definition changed"
+    );
     assert!(output.contains("[image: Build]"), "badge fallback changed");
     assert!(output.contains("docs/protocol.md"), "link label changed");
     assert!(output.contains("Closes"), "issue-closing keyword changed");

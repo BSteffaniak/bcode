@@ -33,7 +33,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use std::{cell::Cell, ops::Range, rc::Rc};
+use std::{borrow::Cow, cell::Cell, collections::BTreeMap, fmt::Write as _, ops::Range, rc::Rc};
 
 use bcode_syntax_render::SyntaxHighlighter;
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
@@ -537,10 +537,216 @@ pub enum MarkdownContributionKind {
 #[must_use]
 pub fn render_markdown(markdown: &str, options: MarkdownRenderOptions) -> MarkdownRenderResult {
     let document = parse_markdown_document(markdown);
+    let projected_markdown = project_semantic_fallbacks(markdown, &document);
     MarkdownRenderResult {
-        lines: render_markdown_lines_internal(markdown, options),
+        lines: render_markdown_lines_internal(&projected_markdown, options),
         contributions: markdown_contributions(&document),
     }
+}
+
+fn project_semantic_fallbacks<'a>(markdown: &'a str, document: &MarkdownDocument) -> Cow<'a, str> {
+    let footnotes = collect_footnotes(markdown, document);
+    if footnotes.references.is_empty() && footnotes.definitions.is_empty() {
+        return Cow::Borrowed(markdown);
+    }
+
+    let mut replacements = Vec::new();
+    for reference in &footnotes.references {
+        replacements.push((
+            reference.source_range.clone(),
+            format!("[{}]", reference.number),
+        ));
+    }
+    for definition in footnotes.definitions.values() {
+        replacements.push((definition.source_range.clone(), String::new()));
+    }
+    let mut projected = replace_source_ranges(markdown, replacements);
+    if !footnotes.definitions.is_empty() {
+        projected.push_str("\n\n---\n\nFootnotes\n\n");
+        for definition in footnotes.definitions.values() {
+            let _ = write!(
+                projected,
+                "{}. {}",
+                definition.number,
+                definition.body.trim()
+            );
+            if !definition.reference_numbers.is_empty() {
+                projected.push_str(" ↩");
+                if definition.reference_numbers.len() > 1 {
+                    let _ = write!(projected, "×{}", definition.reference_numbers.len());
+                }
+            }
+            projected.push_str("\n\n");
+        }
+    }
+    Cow::Owned(projected)
+}
+
+#[derive(Debug)]
+struct FootnoteProjection {
+    references: Vec<FootnoteReferenceProjection>,
+    definitions: BTreeMap<String, FootnoteDefinitionProjection>,
+}
+
+#[derive(Debug)]
+struct FootnoteReferenceProjection {
+    source_range: Range<usize>,
+    number: usize,
+}
+
+#[derive(Debug)]
+struct FootnoteDefinitionProjection {
+    source_range: Range<usize>,
+    number: usize,
+    body: String,
+    reference_numbers: Vec<usize>,
+}
+
+fn collect_footnotes(markdown: &str, document: &MarkdownDocument) -> FootnoteProjection {
+    let mut label_numbers = BTreeMap::<String, usize>::new();
+    let mut references = Vec::new();
+    let mut definition_events = BTreeMap::<String, (Range<usize>, String)>::new();
+    let mut active_definition: Option<(String, Range<usize>, String)> = None;
+
+    for event in &document.events {
+        match &event.kind {
+            MarkdownSemanticEventKind::FootnoteReference(label) => {
+                let next_number = label_numbers.len().saturating_add(1);
+                let number = *label_numbers.entry(label.clone()).or_insert(next_number);
+                references.push((
+                    label.clone(),
+                    FootnoteReferenceProjection {
+                        source_range: event.source_range.clone(),
+                        number,
+                    },
+                ));
+            }
+            MarkdownSemanticEventKind::Start(MarkdownSemanticTag::FootnoteDefinition(label)) => {
+                active_definition =
+                    Some((label.clone(), event.source_range.clone(), String::new()));
+            }
+            MarkdownSemanticEventKind::End(MarkdownSemanticTagEnd::FootnoteDefinition) => {
+                if let Some((label, range, body)) = active_definition.take() {
+                    definition_events.insert(label, (range, body));
+                }
+            }
+            MarkdownSemanticEventKind::Text(text) | MarkdownSemanticEventKind::Code(text) => {
+                if let Some((_, _, body)) = &mut active_definition {
+                    body.push_str(text);
+                }
+            }
+            MarkdownSemanticEventKind::SoftBreak | MarkdownSemanticEventKind::HardBreak => {
+                if let Some((_, _, body)) = &mut active_definition {
+                    body.push(' ');
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (label, range) in unresolved_footnote_references(markdown, document) {
+        let next_number = label_numbers.len().saturating_add(1);
+        let number = *label_numbers.entry(label.clone()).or_insert(next_number);
+        references.push((
+            label,
+            FootnoteReferenceProjection {
+                source_range: range,
+                number,
+            },
+        ));
+    }
+    references.sort_by_key(|(_, reference)| reference.source_range.start);
+    for label in definition_events.keys() {
+        let next_number = label_numbers.len().saturating_add(1);
+        label_numbers.entry(label.clone()).or_insert(next_number);
+    }
+    let mut reference_counts = BTreeMap::<String, Vec<usize>>::new();
+    for (ordinal, (label, _)) in references.iter().enumerate() {
+        reference_counts
+            .entry(label.clone())
+            .or_default()
+            .push(ordinal.saturating_add(1));
+    }
+    let definitions = definition_events
+        .into_iter()
+        .map(|(label, (source_range, body))| {
+            let number = label_numbers[&label];
+            (
+                label.clone(),
+                FootnoteDefinitionProjection {
+                    source_range,
+                    number,
+                    body,
+                    reference_numbers: reference_counts.remove(&label).unwrap_or_default(),
+                },
+            )
+        })
+        .collect();
+    FootnoteProjection {
+        references: references
+            .into_iter()
+            .map(|(_, reference)| reference)
+            .collect(),
+        definitions,
+    }
+}
+
+fn unresolved_footnote_references(
+    markdown: &str,
+    document: &MarkdownDocument,
+) -> Vec<(String, Range<usize>)> {
+    let known_ranges = document
+        .events
+        .iter()
+        .filter_map(|event| {
+            matches!(
+                event.kind,
+                MarkdownSemanticEventKind::FootnoteReference(_)
+                    | MarkdownSemanticEventKind::Start(MarkdownSemanticTag::FootnoteDefinition(_))
+            )
+            .then_some(event.source_range.clone())
+        })
+        .collect::<Vec<_>>();
+    let mut output = Vec::new();
+    let bytes = markdown.as_bytes();
+    let mut index = 0;
+    while index + 3 < bytes.len() {
+        if bytes[index] == b'['
+            && bytes[index + 1] == b'^'
+            && let Some(relative_end) = markdown[index + 2..].find(']')
+        {
+            let end = index + 2 + relative_end + 1;
+            let range = index..end;
+            let is_definition = bytes.get(end) == Some(&b':');
+            if !is_definition
+                && !known_ranges
+                    .iter()
+                    .any(|known| known.start <= index && known.end >= end)
+            {
+                let label = &markdown[index + 2..end - 1];
+                if !label.is_empty()
+                    && label
+                        .chars()
+                        .all(|character| character.is_alphanumeric() || "-_".contains(character))
+                {
+                    output.push((label.to_owned(), range));
+                }
+            }
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+    output
+}
+
+fn replace_source_ranges(markdown: &str, mut replacements: Vec<(Range<usize>, String)>) -> String {
+    replacements.sort_by_key(|(range, _)| (range.start, range.end));
+    let mut output = markdown.to_owned();
+    for (range, replacement) in replacements.into_iter().rev() {
+        output.replace_range(range, &replacement);
+    }
+    output
 }
 
 /// Render Markdown into terminal lines.

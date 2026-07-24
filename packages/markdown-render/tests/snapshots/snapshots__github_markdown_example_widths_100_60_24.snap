@@ -120,11 +120,15 @@ expression: "[100_u16, 60,\n24].into_iter().map(|width|\nformat!(\"== width {wid
 114 │ 
 115 │ [fg=bright-black]1.  [/]Events are ordered [bold]per task[/], not globally.
 116 │ [fg=bright-black]2.  [/]Delivery is [italic]at least once[/].
-117 │ [fg=bright-black]3.  [/]Clients should preserve unknown fields for forward compatibility.[^compat]
+117 │ [fg=bright-black]3.  [/]Clients should preserve unknown fields for forward compatibility.[1]
 118 │ 
-119 │ [^compat]: This enables older clients to safely proxy events created by newer protocol versions.
-120 │ [bold]Next step:[/] review [fg=yellow,underline]docs/protocol.md[/] and open a pull request referencing an issue—for example, [fg=yellow]Closes [/]
-121 │ [fg=yellow]#42[/].
+119 │ [bold]Next step:[/] review [fg=yellow,underline]docs/protocol.md[/] and open a pull request referencing an issue—for example, [fg=yellow]Closes [/]
+120 │ [fg=yellow]#42[/].
+121 │ 
+122 │ [fg=bright-black]────────────────────────────────────────────────────────────────────────────────────────────────────[/]
+123 │ 
+124 │ Footnotes
+125 │ [fg=bright-black]1.  [/]This enables older clients to safely proxy events created by newer protocol versions. ↩
 == width 60 ==
 00 │ [fg=cyan,bold]🚀 Project Nebula[/]
 01 │ 
@@ -246,12 +250,16 @@ expression: "[100_u16, 60,\n24].into_iter().map(|width|\nformat!(\"== width {wid
 117 │ [fg=bright-black]1.  [/]Events are ordered [bold]per task[/], not globally.
 118 │ [fg=bright-black]2.  [/]Delivery is [italic]at least once[/].
 119 │ [fg=bright-black]3.  [/]Clients should preserve unknown fields for forward compa
-120 │ [fg=bright-black]    [/]tibility.[^compat]
+120 │ [fg=bright-black]    [/]tibility.[1]
 121 │ 
-122 │ [^compat]: This enables older clients to safely proxy events
-123 │  created by newer protocol versions.
-124 │ [bold]Next step:[/] review [fg=yellow,underline]docs/protocol.md[/] and open a pull request r
-125 │ eferencing an issue—for example, [fg=yellow]Closes #42[/].
+122 │ [bold]Next step:[/] review [fg=yellow,underline]docs/protocol.md[/] and open a pull request r
+123 │ eferencing an issue—for example, [fg=yellow]Closes #42[/].
+124 │ 
+125 │ [fg=bright-black]────────────────────────────────────────────────────────────[/]
+126 │ 
+127 │ Footnotes
+128 │ [fg=bright-black]1.  [/]This enables older clients to safely proxy events create
+129 │ [fg=bright-black]    [/]d by newer protocol versions. ↩
 == width 24 ==
 00 │ [fg=cyan,bold]🚀 Project Nebula[/]
 01 │ 
@@ -431,14 +439,19 @@ expression: "[100_u16, 60,\n24].into_iter().map(|width|\nformat!(\"== width {wid
 175 │ [fg=bright-black]3.  [/]Clients should prese
 176 │ [fg=bright-black]    [/]rve unknown fields f
 177 │ [fg=bright-black]    [/]or forward compatibi
-178 │ [fg=bright-black]    [/]lity.[^compat]
+178 │ [fg=bright-black]    [/]lity.[1]
 179 │ 
-180 │ [^compat]: This enables 
-181 │ older clients to safely 
-182 │ proxy events created by 
-183 │ newer protocol versions.
-184 │ [bold]Next step:[/] review [fg=yellow,underline]docs/p[/]
-185 │ [fg=yellow,underline]rotocol.md[/] and open a pu
-186 │ ll request referencing a
-187 │ n issue—for example, [fg=yellow]Clo[/]
-188 │ [fg=yellow]ses #42[/].
+180 │ [bold]Next step:[/] review [fg=yellow,underline]docs/p[/]
+181 │ [fg=yellow,underline]rotocol.md[/] and open a pu
+182 │ ll request referencing a
+183 │ n issue—for example, [fg=yellow]Clo[/]
+184 │ [fg=yellow]ses #42[/].
+185 │ 
+186 │ [fg=bright-black]────────────────────────[/]
+187 │ 
+188 │ Footnotes
+189 │ [fg=bright-black]1.  [/]This enables older c
+190 │ [fg=bright-black]    [/]lients to safely pro
+191 │ [fg=bright-black]    [/]xy events created by
+192 │ [fg=bright-black]    [/] newer protocol vers
+193 │ [fg=bright-black]    [/]ions. ↩

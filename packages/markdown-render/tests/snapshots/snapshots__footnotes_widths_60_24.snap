@@ -1,0 +1,28 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "[60_u16,\n24].into_iter().map(|width|\nformat!(\"== width {width} ==\\n{}\",\nstyled_snapshot(FOOTNOTES, width))).collect::<Vec<_>>().join(\"\\n\")"
+---
+== width 60 ==
+00 │ First[1], repeated[1], and second[2]. Missing[3].
+01 │ 
+02 │ [fg=bright-black]────────────────────────────────────────────────────────────[/]
+03 │ 
+04 │ Footnotes
+05 │ [fg=bright-black]1.  [/]First definition over multiple lines. ↩×2
+06 │ [fg=bright-black]2.  [/]Second definition with strong text. ↩
+07 │ [fg=bright-black]3.  [/]Unreferenced definition.
+== width 24 ==
+00 │ First[1], repeated[1], a
+01 │ nd second[2]. Missing[3]
+02 │ .
+03 │ 
+04 │ [fg=bright-black]────────────────────────[/]
+05 │ 
+06 │ Footnotes
+07 │ [fg=bright-black]1.  [/]First definition ove
+08 │ [fg=bright-black]    [/]r multiple lines. ↩×
+09 │ [fg=bright-black]    [/]2
+10 │ [fg=bright-black]2.  [/]Second definition wi
+11 │ [fg=bright-black]    [/]th strong text. ↩
+12 │ [fg=bright-black]3.  [/]Unreferenced definit
+13 │ [fg=bright-black]    [/]ion.
