@@ -142,6 +142,8 @@ pub struct ToolPolicyPreparation {
     pub identity: ToolPolicyIdentity,
     /// Owner-extracted operation and resources.
     pub operation: ToolPolicyOperation,
+    /// Opaque tool-owner invocation descriptor.
+    pub descriptor: serde_json::Value,
 }
 
 impl ToolPolicyPreparation {
@@ -152,6 +154,7 @@ impl ToolPolicyPreparation {
             requires_permission,
             identity: ToolPolicyIdentity::default(),
             operation,
+            descriptor: serde_json::Value::Null,
         }
     }
 
@@ -159,6 +162,13 @@ impl ToolPolicyPreparation {
     #[must_use]
     pub fn with_identity(mut self, identity: ToolPolicyIdentity) -> Self {
         self.identity = identity;
+        self
+    }
+
+    /// Attach an opaque tool-owner invocation descriptor.
+    #[must_use]
+    pub fn with_descriptor(mut self, descriptor: serde_json::Value) -> Self {
+        self.descriptor = descriptor;
         self
     }
 
@@ -235,6 +245,7 @@ pub fn prepare_tool_policy_with_operation(
             requires_permission,
             identity,
             operation,
+            descriptor: serde_json::Value::Null,
         },
     )
 }
@@ -256,6 +267,7 @@ pub fn prepare_tool_policy(
             request.invocation.tool_name
         ));
     }
+    let descriptor = preparation.descriptor;
     let metadata = ToolPolicyAuthorizationMetadata {
         requires_permission: preparation.requires_permission,
         aliases: preparation.identity.aliases,
@@ -272,7 +284,7 @@ pub fn prepare_tool_policy(
             resource: Some(definition.name.clone()),
             metadata: serde_json::to_value(metadata).map_err(|error| error.to_string())?,
         }],
-        descriptor: serde_json::Value::Null,
+        descriptor,
     })
 }
 
@@ -416,4 +428,36 @@ pub struct PolicyStatusResponse {
     /// Non-fatal degradation diagnostics surfaced by the policy provider.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standard_policy_preparation_preserves_owner_descriptor() {
+        let definition = ToolDefinition {
+            name: "owner.tool".to_owned(),
+            description: "fixture".to_owned(),
+            input_schema: serde_json::json!({"type": "object"}),
+        };
+        let request = ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "call-1".to_owned(),
+                tool_name: definition.name.clone(),
+                arguments: serde_json::Value::Null,
+            },
+            host_context: Vec::new(),
+        };
+        let descriptor = serde_json::json!({"owner": "prepared"});
+
+        let prepared = prepare_tool_policy(
+            &request,
+            &definition,
+            ToolPolicyPreparation::read_only().with_descriptor(descriptor.clone()),
+        )
+        .expect("owner preparation");
+
+        assert_eq!(prepared.descriptor, descriptor);
+    }
 }

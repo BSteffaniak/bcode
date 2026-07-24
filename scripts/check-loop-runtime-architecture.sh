@@ -316,6 +316,20 @@ if ! rg -U 'impl ToolInvoker for SdkToolInvoker[\s\S]*fn prepare_tool[\s\S]*Tool
   violations=1
 fi
 
+if ! grep -F 'pub const TOOL_WORKSPACE_CONTEXT_SCHEMA' packages/tool/src/contracts.rs >/dev/null ||
+   ! grep -F 'pub const TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION' packages/tool/src/contracts.rs >/dev/null ||
+   ! grep -F 'pub const TOOL_ARTIFACT_CONTEXT_SCHEMA' packages/tool/src/contracts.rs >/dev/null ||
+   ! grep -F 'pub const TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION' packages/tool/src/contracts.rs >/dev/null ||
+   ! grep -F 'direct_sdk_supplies_versioned_workspace_context_to_preparation' packages/bcode/tests/builder_adapters.rs >/dev/null ||
+   ! grep -F 'server_workspace_host_context_preserves_session_identity_and_directory' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'server_artifact_host_context_preserves_session_root' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'direct_tool_preparation_uses_versioned_opaque_workspace_context' packages/eval/src/lib.rs >/dev/null ||
+   ! rg -U 'fn tool_host_context\([\s\S]*TOOL_WORKSPACE_CONTEXT_SCHEMA[\s\S]*working_directory' packages/bcode/src/lib.rs >/dev/null ||
+   ! rg -U 'fn invocation_service_host_context\([\s\S]*workspace_host_context_entry[\s\S]*artifact_host_context_entry' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: SDK/server/Eval host-context preparation parity was removed." >&2
+  violations=1
+fi
+
 if ! rg -U 'pub async fn run<P>\([\s\S]*self\.generate_text_with_provider\(provider, prompt\)\.await' packages/bcode/src/lib.rs >/dev/null \
   || ! rg -U 'generate_text_with_provider_with_options<P>\([\s\S]*\.run_provider_tool_loop\(' packages/bcode/src/lib.rs >/dev/null \
   || ! rg -U 'pub fn stream<P>\([\s\S]*self\.stream_with_cancellation\(' packages/bcode/src/lib.rs >/dev/null \
@@ -857,6 +871,54 @@ if ! grep -F 'document_tools_emit_request_contributions' plugins/document-plugin
    ! grep -F 'ocr_tools_emit_request_contributions' plugins/ocr-plugin/src/lib.rs >/dev/null ||
    ! grep -F 'web_tools_emit_mapped_request_contributions' plugins/web-search-plugin/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: generic Document/OCR/Web request coverage was removed." >&2
+  violations=1
+fi
+
+if rg -n '\bartifact_dir\b|default_artifact_root|XDG_STATE_HOME' \
+  plugins/ocr-plugin --glob '*.{rs,toml}' >/tmp/bcode-ocr-legacy-artifact-directory.txt ||
+   ! grep -F 'downloaded_source_scratch_directory_is_removed_on_drop' plugins/ocr-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'url_source_metadata_does_not_expose_scratch_path' plugins/ocr-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: OCR reintroduced host artifact-directory transport or lost scratch cleanup coverage." >&2
+  cat /tmp/bcode-ocr-legacy-artifact-directory.txt 2>/dev/null >&2 || true
+  violations=1
+fi
+
+if rg -n '\bpub artifact_dir: Option<PathBuf>|ToolInvocationRequest \{[[:space:][:print:]]*artifact_dir:' \
+   packages/tool/src packages/server/src packages/bcode/src packages/eval/src packages/plugin/src plugins \
+   >/tmp/bcode-tool-invocation-artifact-directory.txt; then
+  echo "Runtime architecture violation: legacy ToolInvocationRequest artifact-directory transport returned." >&2
+  cat /tmp/bcode-tool-invocation-artifact-directory.txt >&2
+  violations=1
+fi
+
+if awk '/^#\[cfg\(test\)\]/{exit} {print}' plugins/document-plugin/src/lib.rs |
+   rg -n '\bartifact_dir\b|artifact_scope|default_global_document_artifact_dir|XDG_STATE_HOME|BCODE_STATE_DIR' \
+   >/tmp/bcode-document-legacy-artifact-directory.txt ||
+   ! grep -F 'document_scratch_directory_is_removed_on_drop' plugins/document-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'extraction_payload_omits_scratch_and_host_artifact_paths' plugins/document-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: Document reintroduced host artifact-directory transport or scratch paths." >&2
+  cat /tmp/bcode-document-legacy-artifact-directory.txt 2>/dev/null >&2 || true
+  violations=1
+fi
+
+if awk '/^#\[cfg\(test\)\]/{exit} {print}' plugins/shell-plugin/src/lib.rs |
+   rg -n 'request\.(artifact_dir|cwd)|invocation\.(artifact_dir|cwd)' \
+   >/tmp/bcode-shell-legacy-invocation-paths.txt ||
+   ! grep -F 'shell_preparation_serializes_owner_resolved_workspace_and_artifact_roots' plugins/shell-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'shell_preparation_rejects_relative_artifact_root' plugins/shell-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: Shell reintroduced legacy invocation path transport." >&2
+  cat /tmp/bcode-shell-legacy-invocation-paths.txt 2>/dev/null >&2 || true
+  violations=1
+fi
+
+if awk '/^#\[cfg\(test\)\]/{exit} {print}' plugins/git-plugin/src/lib.rs |
+   rg -n '\bartifact_dir\b|invocation\.cwd' >/tmp/bcode-git-legacy-invocation-paths.txt ||
+   ! grep -F 'git_owner_prepares_permission_required_clone_policy' plugins/git-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'default_destination_uses_owner_resolved_artifact_root' plugins/git-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'preparation_requires_valid_workspace_context' plugins/git-plugin/src/lib.rs >/dev/null ||
+   ! rg -U 'execute_direct_tool_variant\([\s\S]*OP_PREPARE_TOOL[\s\S]*preparation_descriptor: prepared\.descriptor' packages/eval/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: Git/Eval reintroduced legacy invocation path transport or preparation bypass." >&2
+  cat /tmp/bcode-git-legacy-invocation-paths.txt 2>/dev/null >&2 || true
   violations=1
 fi
 

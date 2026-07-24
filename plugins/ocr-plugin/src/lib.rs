@@ -18,7 +18,6 @@ use bcode_tool::{
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -179,7 +178,6 @@ impl OcrPlugin {
         progress.emit("OCR extraction started");
         match runtime.block_on(extract_async(
             request,
-            invocation.artifact_dir.clone(),
             invocation.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
             Some(progress),
         )) {
@@ -273,15 +271,6 @@ enum OcrSource {
     Url(String),
 }
 
-impl OcrSource {
-    fn as_string(&self) -> String {
-        match self {
-            Self::Path(path) => path.display().to_string(),
-            Self::Url(url) => url.clone(),
-        }
-    }
-}
-
 #[derive(Debug, Error)]
 enum OcrError {
     #[error("provide exactly one of path or url")]
@@ -312,7 +301,6 @@ enum OcrError {
 
 async fn extract_async(
     request: ExtractRequest,
-    artifact_dir: Option<PathBuf>,
     working_directory: PathBuf,
     progress: Option<ProgressReporter>,
 ) -> Result<ExtractResponse, OcrError> {
@@ -330,17 +318,17 @@ async fn extract_async(
         .max_bytes
         .unwrap_or(DEFAULT_MAX_BYTES)
         .clamp(1, MAX_BYTES);
+    let mut scratch = None;
     let input_path = match &source {
         OcrSource::Path(path) => path.clone(),
         OcrSource::Url(url) => {
-            let artifact_root = artifact_dir
-                .unwrap_or_else(default_artifact_root)
-                .join("ocr");
-            std::fs::create_dir_all(&artifact_root)?;
+            let directory = ocr_scratch_directory()?;
             if let Some(progress) = &progress {
                 progress.emit(format!("OCR download started: {url}"));
             }
-            download_source(url, &artifact_root, timeout_ms).await?
+            let path = download_source(url, directory.path(), timeout_ms).await?;
+            scratch = Some(directory);
+            path
         }
     };
     if let Some(progress) = &progress {
@@ -358,22 +346,40 @@ async fn extract_async(
         timeout_ms,
     )
     .await?;
+    drop(scratch);
     let full_text_bytes = full_text.len();
     let truncated = full_text_bytes > max_bytes;
     let text = truncate_utf8(&full_text, max_bytes).to_string();
     Ok(ExtractResponse {
         text,
         full_text,
-        source: SourceResponse {
-            path: input_path.display().to_string(),
-            url: matches!(source, OcrSource::Url(_)).then(|| source.as_string()),
-        },
+        source: source_response(&source),
         engine,
         language,
         truncated,
         text_bytes: full_text_bytes.min(max_bytes),
         full_text_bytes,
     })
+}
+
+fn ocr_scratch_directory() -> Result<tempfile::TempDir, OcrError> {
+    tempfile::Builder::new()
+        .prefix("bcode-ocr-")
+        .tempdir()
+        .map_err(OcrError::Io)
+}
+
+fn source_response(source: &OcrSource) -> SourceResponse {
+    match source {
+        OcrSource::Path(path) => SourceResponse {
+            path: path.display().to_string(),
+            url: None,
+        },
+        OcrSource::Url(url) => SourceResponse {
+            path: String::new(),
+            url: Some(url.clone()),
+        },
+    }
 }
 
 fn source(request: &ExtractRequest) -> Result<OcrSource, OcrError> {
@@ -590,19 +596,6 @@ fn stable_name(value: &str) -> String {
             }
         })
         .collect()
-}
-
-fn default_artifact_root() -> PathBuf {
-    if let Ok(state_home) = env::var("XDG_STATE_HOME") {
-        return PathBuf::from(state_home).join("bcode");
-    }
-    if let Ok(home) = env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("bcode");
-    }
-    env::temp_dir().join("bcode")
 }
 
 fn truncate_utf8(text: &str, max_bytes: usize) -> &str {
@@ -962,7 +955,31 @@ mod tests {
             timeout_ms: None,
         })
         .expect("path source");
-        assert_eq!(result.as_string(), "a.png");
+        assert_eq!(result, OcrSource::Path(PathBuf::from("a.png")));
+    }
+
+    #[test]
+    fn url_source_metadata_does_not_expose_scratch_path() {
+        let source = OcrSource::Url("https://example.com/image.png".to_owned());
+
+        assert_eq!(
+            source_response(&source),
+            SourceResponse {
+                path: String::new(),
+                url: Some("https://example.com/image.png".to_owned()),
+            }
+        );
+    }
+
+    #[test]
+    fn downloaded_source_scratch_directory_is_removed_on_drop() {
+        let directory = ocr_scratch_directory().expect("OCR scratch directory");
+        let path = directory.path().to_path_buf();
+        std::fs::write(path.join("source.png"), b"fixture").expect("scratch fixture");
+
+        drop(directory);
+
+        assert!(!path.exists());
     }
 
     #[test]

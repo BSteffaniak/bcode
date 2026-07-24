@@ -1507,7 +1507,6 @@ mod tests {
             }),
             preparation_descriptor: serde_json::Value::Null,
             cwd: None,
-            artifact_dir: None,
         });
         assert!(!response.is_error, "{}", response.output);
         assert!(response.output.contains("bar"));
@@ -1534,7 +1533,6 @@ mod tests {
             }),
             preparation_descriptor: serde_json::Value::Null,
             cwd: None,
-            artifact_dir: None,
         });
         assert!(!response.is_error, "{}", response.output);
         assert_eq!(
@@ -1565,7 +1563,6 @@ mod tests {
             }),
             preparation_descriptor: serde_json::Value::Null,
             cwd: None,
-            artifact_dir: None,
         });
         assert!(!response.is_error, "{}", response.output);
         assert_eq!(
@@ -1602,7 +1599,6 @@ mod tests {
             }),
             preparation_descriptor: serde_json::Value::Null,
             cwd: None,
-            artifact_dir: None,
         });
         assert!(!response.is_error, "{}", response.output);
         assert_eq!(
@@ -1636,7 +1632,6 @@ mod tests {
             }),
             preparation_descriptor: serde_json::Value::Null,
             cwd: None,
-            artifact_dir: None,
         });
         assert!(response.is_error);
         assert_eq!(

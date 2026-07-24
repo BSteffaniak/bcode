@@ -41,33 +41,23 @@ impl RustPlugin for GitPlugin {
 
 fn git_policy_preparation(
     request: &bcode_tool::ToolPreparationRequest,
-    definition: &ToolDefinition,
-) -> bcode_plugin_sdk::ToolPolicyPreparation {
-    bcode_plugin_sdk::ToolPolicyPreparation::new(true, git_policy_operation(request, definition))
-        .with_identity(bcode_plugin_sdk::ToolPolicyIdentity {
-            aliases: Vec::new(),
-            compatibility_aliases: Vec::new(),
-            capabilities: Vec::new(),
-            permission_category: Some("write".to_string()),
-        })
-}
-
-fn git_policy_operation(
-    request: &bcode_tool::ToolPreparationRequest,
     _definition: &ToolDefinition,
-) -> bcode_plugin_sdk::ToolPolicyOperation {
-    let paths = request
-        .invocation
-        .arguments
-        .get("destination")
-        .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string)
-        .into_iter()
-        .collect();
-    bcode_plugin_sdk::ToolPolicyOperation::Write {
-        paths,
+) -> Result<bcode_plugin_sdk::ToolPolicyPreparation, String> {
+    let descriptor = git_preparation_descriptor(request)?;
+    let operation = bcode_plugin_sdk::ToolPolicyOperation::Write {
+        paths: vec![descriptor.destination.display().to_string()],
         category: "write".to_owned(),
-    }
+    };
+    Ok(
+        bcode_plugin_sdk::ToolPolicyPreparation::new(true, operation)
+            .with_identity(bcode_plugin_sdk::ToolPolicyIdentity {
+                aliases: Vec::new(),
+                compatibility_aliases: Vec::new(),
+                capabilities: Vec::new(),
+                permission_category: Some("write".to_string()),
+            })
+            .with_descriptor(serde_json::to_value(descriptor).map_err(|error| error.to_string())?),
+    )
 }
 
 fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
@@ -77,7 +67,7 @@ fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
         bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
             request,
             [clone_tool_definition(), github_clone_alias_definition()],
-            |request, definition| Ok(git_policy_preparation(request, definition)),
+            git_policy_preparation,
         ),
         OP_INVOKE_TOOL => invoke_tool(context),
         _ => ServiceResponse::error(
@@ -130,7 +120,13 @@ fn invoke_clone(
         events,
         &clone_request_contribution(&invocation.tool_call_id, &request),
     );
-    match clone_repository(&request, invocation.artifact_dir.as_deref()) {
+    let descriptor = match serde_json::from_value::<GitPreparationDescriptor>(
+        invocation.preparation_descriptor.clone(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => return tool_error(format!("invalid Git preparation descriptor: {error}")),
+    };
+    match clone_repository(&request, &descriptor) {
         Ok(response) => json_tool_response_with_artifact(
             &response,
             &invocation.tool_call_id,
@@ -140,6 +136,108 @@ fn invoke_clone(
         ),
         Err(error) => tool_error(error.to_string()),
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitWorkspaceContext {
+    working_directory: PathBuf,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitArtifactContext {
+    root: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GitPreparationDescriptor {
+    destination: PathBuf,
+    artifact_scope: String,
+}
+
+fn git_preparation_descriptor(
+    request: &bcode_tool::ToolPreparationRequest,
+) -> Result<GitPreparationDescriptor, String> {
+    let clone: CloneRequest = serde_json::from_value(request.invocation.arguments.clone())
+        .map_err(|error| format!("invalid Git clone request: {error}"))?;
+    let workspace = decode_owner_context::<GitWorkspaceContext>(
+        &request.host_context,
+        bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA,
+        bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION,
+        true,
+    )?;
+    if !workspace.working_directory.is_absolute() {
+        return Err("workspace working directory must be absolute".to_owned());
+    }
+    let artifact = decode_optional_owner_context::<GitArtifactContext>(
+        &request.host_context,
+        bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA,
+        bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION,
+    )?;
+    if artifact
+        .as_ref()
+        .is_some_and(|context| !context.root.is_absolute())
+    {
+        return Err("artifact root must be absolute".to_owned());
+    }
+    let remote = parse_git_remote(&clone.url).map_err(|error| error.to_string())?;
+    let (destination, artifact_scope) = clone.destination.as_ref().map_or_else(
+        || {
+            let root = artifact
+                .as_ref()
+                .map_or_else(default_global_artifact_dir, |context| context.root.clone());
+            (default_destination(&root, &remote), "session".to_owned())
+        },
+        |destination| {
+            let destination = if destination.is_absolute() {
+                destination.clone()
+            } else {
+                workspace.working_directory.join(destination)
+            };
+            (destination, "explicit".to_owned())
+        },
+    );
+    Ok(GitPreparationDescriptor {
+        destination,
+        artifact_scope,
+    })
+}
+
+fn decode_owner_context<T: serde::de::DeserializeOwned>(
+    entries: &[bcode_tool::ToolHostContextEntry],
+    schema: &str,
+    version: u32,
+    required: bool,
+) -> Result<T, String> {
+    decode_optional_owner_context(entries, schema, version)?.ok_or_else(|| {
+        if required {
+            format!("required host context {schema}@{version} is missing")
+        } else {
+            format!("host context {schema}@{version} is missing")
+        }
+    })
+}
+
+fn decode_optional_owner_context<T: serde::de::DeserializeOwned>(
+    entries: &[bcode_tool::ToolHostContextEntry],
+    schema: &str,
+    version: u32,
+) -> Result<Option<T>, String> {
+    let mut matching = entries.iter().filter(|entry| entry.schema == schema);
+    let Some(entry) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        return Err(format!("duplicate host context for {schema}"));
+    }
+    if entry.schema_version != version {
+        return Err(format!(
+            "unsupported host context version for {schema}: {}; expected {version}",
+            entry.schema_version
+        ));
+    }
+    serde_json::from_value(entry.payload.clone())
+        .map(Some)
+        .map_err(|error| format!("invalid host context {schema}@{version}: {error}"))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -177,15 +275,18 @@ enum GitError {
 
 fn clone_repository(
     request: &CloneRequest,
-    artifact_dir: Option<&Path>,
+    descriptor: &GitPreparationDescriptor,
 ) -> Result<CloneResponse, GitError> {
     let remote = parse_git_remote(&request.url)?;
-    let base = request
-        .destination
-        .clone()
-        .unwrap_or_else(|| default_destination(artifact_dir, &remote));
+    let base = descriptor.destination.clone();
     if base.exists() {
-        return Ok(clone_response(request, remote, base, true));
+        return Ok(clone_response(
+            request,
+            remote,
+            base,
+            true,
+            &descriptor.artifact_scope,
+        ));
     }
     if let Some(parent) = base.parent() {
         std::fs::create_dir_all(parent)?;
@@ -207,7 +308,13 @@ fn clone_repository(
             stderr: String::from_utf8_lossy(&output.stderr).to_string(),
         });
     }
-    Ok(clone_response(request, remote, base, false))
+    Ok(clone_response(
+        request,
+        remote,
+        base,
+        false,
+        &descriptor.artifact_scope,
+    ))
 }
 
 fn clone_response(
@@ -215,6 +322,7 @@ fn clone_response(
     remote: GitRemote,
     path: PathBuf,
     already_exists: bool,
+    artifact_scope: &str,
 ) -> CloneResponse {
     CloneResponse {
         url: request.url.clone(),
@@ -224,7 +332,7 @@ fn clone_response(
         repo: remote.repo,
         git_ref: request.git_ref.clone(),
         artifact_kind: "git_repo_clone".to_string(),
-        artifact_scope: artifact_scope(request.destination.as_ref()),
+        artifact_scope: artifact_scope.to_owned(),
         path,
         already_exists,
     }
@@ -342,11 +450,8 @@ fn is_known_non_repo_path(segment: &str) -> bool {
     )
 }
 
-fn default_destination(artifact_dir: Option<&Path>, remote: &GitRemote) -> PathBuf {
-    let mut path = artifact_dir
-        .map_or_else(default_global_artifact_dir, Path::to_path_buf)
-        .join("git")
-        .join(sanitize_path_component(&remote.host));
+fn default_destination(root: &Path, remote: &GitRemote) -> PathBuf {
+    let mut path = root.join("git").join(sanitize_path_component(&remote.host));
     if let Some(owner) = remote.owner.as_deref() {
         path = path.join(sanitize_path_component(owner));
     }
@@ -381,14 +486,6 @@ fn default_state_dir() -> PathBuf {
             .join("bcode");
     }
     env::temp_dir().join("bcode")
-}
-
-fn artifact_scope(explicit_destination: Option<&PathBuf>) -> String {
-    if explicit_destination.is_some() {
-        "explicit".to_string()
-    } else {
-        "session".to_string()
-    }
 }
 
 fn clone_tool_definition() -> ToolDefinition {
@@ -541,6 +638,25 @@ mod tests {
         assert_eq!(contribution.payload["ref"], "main");
     }
 
+    fn host_context(
+        workspace: &Path,
+        artifact_root: Option<&Path>,
+    ) -> Vec<bcode_tool::ToolHostContextEntry> {
+        let mut entries = vec![bcode_tool::ToolHostContextEntry {
+            schema: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA.to_owned(),
+            schema_version: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION,
+            payload: serde_json::json!({"working_directory": workspace}),
+        }];
+        if let Some(root) = artifact_root {
+            entries.push(bcode_tool::ToolHostContextEntry {
+                schema: bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA.to_owned(),
+                schema_version: bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION,
+                payload: serde_json::json!({"root": root}),
+            });
+        }
+        entries
+    }
+
     #[test]
     fn git_owner_prepares_permission_required_clone_policy() {
         let definition = clone_tool_definition();
@@ -550,18 +666,29 @@ mod tests {
                 tool_name: definition.name.clone(),
                 arguments: serde_json::json!({
                     "url": "https://github.com/bmorphism/bcode",
-                    "destination": "/tmp/bcode"
+                    "destination": "repos/bcode"
                 }),
             },
-            host_context: Vec::new(),
+            host_context: host_context(
+                Path::new("/tmp/workspace"),
+                Some(Path::new("/tmp/artifacts")),
+            ),
         };
-        let policy = git_policy_preparation(&request, &definition);
+        let policy = git_policy_preparation(&request, &definition).expect("Git preparation");
         assert!(policy.requires_permission);
         assert_eq!(
             policy.operation,
             bcode_plugin_sdk::ToolPolicyOperation::Write {
-                paths: vec!["/tmp/bcode".to_owned()],
+                paths: vec!["/tmp/workspace/repos/bcode".to_owned()],
                 category: "write".to_owned(),
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<GitPreparationDescriptor>(policy.descriptor)
+                .expect("Git descriptor"),
+            GitPreparationDescriptor {
+                destination: PathBuf::from("/tmp/workspace/repos/bcode"),
+                artifact_scope: "explicit".to_owned(),
             }
         );
     }
@@ -598,12 +725,49 @@ mod tests {
     }
 
     #[test]
-    fn default_destination_uses_artifact_dir_not_workspace() {
-        let remote = parse_git_remote("https://gitlab.com/group/project").expect("repo");
-        let path = default_destination(Some(Path::new("/tmp/artifacts/session-1")), &remote);
+    fn default_destination_uses_owner_resolved_artifact_root() {
+        let definition = clone_tool_definition();
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "call".to_owned(),
+                tool_name: definition.name,
+                arguments: serde_json::json!({
+                    "url": "https://gitlab.com/group/project"
+                }),
+            },
+            host_context: host_context(
+                Path::new("/tmp/workspace"),
+                Some(Path::new("/tmp/artifacts/session-1")),
+            ),
+        };
+
+        let descriptor = git_preparation_descriptor(&request).expect("Git descriptor");
+
         assert_eq!(
-            path,
-            PathBuf::from("/tmp/artifacts/session-1/git/gitlab.com/group/project")
+            descriptor,
+            GitPreparationDescriptor {
+                destination: PathBuf::from("/tmp/artifacts/session-1/git/gitlab.com/group/project"),
+                artifact_scope: "session".to_owned(),
+            }
         );
+    }
+
+    #[test]
+    fn preparation_requires_valid_workspace_context() {
+        let definition = clone_tool_definition();
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "call".to_owned(),
+                tool_name: definition.name,
+                arguments: serde_json::json!({
+                    "url": "https://gitlab.com/group/project"
+                }),
+            },
+            host_context: Vec::new(),
+        };
+
+        let error = git_preparation_descriptor(&request).expect_err("missing workspace");
+
+        assert!(error.contains("required host context"));
     }
 }

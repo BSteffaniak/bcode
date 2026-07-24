@@ -15,10 +15,12 @@ pub use bcode_tool_models::{
     ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
 };
 pub use contracts::{
-    PreparedToolInvocation, TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA, ToolArtifactWriteRequest,
-    ToolArtifactWriteResolution, ToolAuthorizationFact, ToolExecutionOptions, ToolHostContextEntry,
-    ToolInvocationDescriptor, ToolInvocationServiceRequest, ToolInvocationServiceResolution,
-    ToolInvocationServiceRoute, ToolPreparationRequest, ToolPreparationResponse,
+    PreparedToolInvocation, TOOL_ARTIFACT_CONTEXT_SCHEMA, TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION,
+    TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA, TOOL_WORKSPACE_CONTEXT_SCHEMA,
+    TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION, ToolArtifactWriteRequest, ToolArtifactWriteResolution,
+    ToolAuthorizationFact, ToolExecutionOptions, ToolHostContextEntry, ToolInvocationDescriptor,
+    ToolInvocationServiceRequest, ToolInvocationServiceResolution, ToolInvocationServiceRoute,
+    ToolPreparationRequest, ToolPreparationResponse,
 };
 
 pub use interaction::{
@@ -159,9 +161,6 @@ pub struct ToolInvocationRequest {
     /// Canonical session working directory for this invocation.
     #[serde(default)]
     pub cwd: Option<PathBuf>,
-    /// Host-managed artifact directory for this invocation/session.
-    #[serde(default)]
-    pub artifact_dir: Option<PathBuf>,
 }
 
 /// Tool invocation response.

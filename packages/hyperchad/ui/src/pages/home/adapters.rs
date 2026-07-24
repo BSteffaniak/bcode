@@ -276,12 +276,6 @@ pub(super) fn render_document_extract_result(artifact: &ToolArtifactView) -> Opt
     let truncated = metadata
         .get("truncated")
         .and_then(serde_json::Value::as_bool);
-    let document_path = metadata
-        .get("document_path")
-        .and_then(serde_json::Value::as_str);
-    let text_path = metadata
-        .get("text_path")
-        .and_then(serde_json::Value::as_str);
     let text = metadata.get("text").and_then(serde_json::Value::as_str);
     Some(container! {
         div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
@@ -289,8 +283,6 @@ pub(super) fn render_document_extract_result(artifact: &ToolArtifactView) -> Opt
             div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (source) }
             @if let Some(content_type) = content_type { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "type: " (content_type) } }
             @if let Some(extractor) = extractor { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "extractor: " (extractor) } }
-            @if let Some(document_path) = document_path { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) font-family="monospace" white-space="preserve-wrap" { "document: " (document_path) } }
-            @if let Some(text_path) = text_path { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) font-family="monospace" white-space="preserve-wrap" { "text: " (text_path) } }
             @if truncated == Some(true) { div color=(color::WARNING) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "Source extraction was truncated." } }
             @if let Some(text) = text { (extracted_text_panel(text, None)) } @else { div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::SM)) { "No extracted text was returned." } }
             (artifact_references(artifact))        }

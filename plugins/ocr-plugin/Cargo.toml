@@ -23,6 +23,7 @@ image                        = { workspace = true, optional = true }
 reqwest                      = { workspace = true }
 serde                        = { workspace = true, features = ["derive", "std"] }
 serde_json                   = { workspace = true }
+tempfile                     = { workspace = true }
 thiserror                    = { workspace = true }
 tokio                        = { workspace = true, features = ["fs", "io-util", "process", "time"] }
 

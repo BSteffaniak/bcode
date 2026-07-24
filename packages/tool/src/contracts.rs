@@ -72,6 +72,14 @@ pub struct ToolHostContextEntry {
 
 /// Host-context schema containing invocation-scoped nested service routes.
 pub const TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA: &str = "bcode.tool.service-routes";
+/// Host-context schema containing the invocation workspace selected by the host.
+pub const TOOL_WORKSPACE_CONTEXT_SCHEMA: &str = "bcode.workspace-context";
+/// Current workspace host-context schema version.
+pub const TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION: u32 = 1;
+/// Host-context schema containing an optional host-managed invocation artifact root.
+pub const TOOL_ARTIFACT_CONTEXT_SCHEMA: &str = "bcode.artifact-context";
+/// Current artifact host-context schema version.
+pub const TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION: u32 = 1;
 
 /// Opaque host-issued nested service route available to a prepared invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -3579,7 +3579,6 @@ async fn execute_plugin_tool(
         arguments: descriptor.arguments.clone(),
         preparation_descriptor,
         cwd: None,
-        artifact_dir: None,
     };
     let payload = serde_json::to_vec(&request).map_err(|error| RuntimeError::ToolExecution {
         tool_name: descriptor.tool_name.clone(),
@@ -6848,6 +6847,17 @@ impl Agent {
                     )),
                 )
             });
+        let host_context = match self.tool_host_context() {
+            Ok(host_context) => host_context,
+            Err(error) => {
+                return ScopedAgentStream {
+                    stream: None,
+                    observer,
+                    finalizer: None,
+                    pending: Some(ScopedAgentStreamItem::Error(error)),
+                };
+            }
+        };
         let stream = self.runtime.run_streaming_provider_tool_loop(
             provider,
             request.clone(),
@@ -6855,7 +6865,7 @@ impl Agent {
             authorization,
             invoker,
             self.permission_context(),
-            Vec::new(),
+            host_context,
             self.execution_options,
             Arc::clone(&self.invocation_event_sink),
             self.invocation_capabilities.clone(),
@@ -6928,14 +6938,16 @@ impl Agent {
             .authorization_coordinator
             .as_deref()
             .unwrap_or(&policy_authorization);
+        let host_context = self.tool_host_context()?;
         self.runtime
-            .execute_prepared_tool_batch(
+            .execute_prepared_tool_batch_with_host_context(
                 &self.tool_catalog,
                 authorization,
                 invoker,
                 calls,
                 rounds,
                 &self.permission_context(),
+                &host_context,
                 self.execution_options,
                 scope,
             )
@@ -7083,6 +7095,7 @@ impl Agent {
             .unwrap_or(&policy_authorization);
         let observer = SdkToolRoundObserver::new(self);
         let effective_tool_catalog = self.effective_tool_catalog();
+        let host_context = self.tool_host_context()?;
         let result = self
             .runtime
             .run_provider_tool_loop(
@@ -7092,7 +7105,7 @@ impl Agent {
                 authorization,
                 invoker,
                 &self.permission_context(),
-                &[],
+                &host_context,
                 self.execution_options,
                 events,
                 self.invocation_capabilities.clone(),
@@ -7111,6 +7124,24 @@ impl Agent {
             session_id: self.session_id,
             agent_id: self.profile_id.clone(),
         }
+    }
+
+    fn tool_host_context(&self) -> Result<Vec<bcode_tool::ToolHostContextEntry>> {
+        let configured = self.cwd.clone().unwrap_or_else(|| PathBuf::from("."));
+        let working_directory = if configured.is_absolute() {
+            configured
+        } else {
+            std::env::current_dir()
+                .map_err(|error| BcodeError::ToolExecution(error.to_string()))?
+                .join(configured)
+        };
+        Ok(vec![bcode_tool::ToolHostContextEntry {
+            schema: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA.to_owned(),
+            schema_version: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION,
+            payload: serde_json::json!({
+                "working_directory": working_directory,
+            }),
+        }])
     }
 
     fn effective_tool_catalog(&self) -> UnifiedToolCatalog {

@@ -119,8 +119,15 @@ metadata = { agent_id = "build" }
 ## Direct-tool executor
 
 `executor = "direct_tool"` invokes a model-callable tool service through the
-public daemon plugin-service API. Use it to measure tool behavior independent of
-model/tool-choice behavior.
+public daemon plugin-service API. It performs the tool owner's side-effect-free
+`prepare_tool` operation first, forwards the resulting opaque descriptor to
+`invoke_tool`, and reports preparation latency separately. Use it to measure tool
+behavior independent of model/tool-choice behavior.
+
+This is intentionally a raw service harness, not a canonical agent-runtime
+adapter: it does not coordinate authorization or provide exchange, input,
+nested-service, artifact, or cancellation capability brokers. Tools requiring
+those capabilities should be evaluated through `executor = "agent"`.
 
 See `fixtures/evals/direct-tools/suite.toml` for schema examples.
 

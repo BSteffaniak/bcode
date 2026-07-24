@@ -60,7 +60,7 @@ fn request_rows(
 fn extract_rows(
     payload: &Value,
     width: u16,
-    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+    _context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
 ) -> Vec<Line> {
     let metadata = [
         text(payload, "source").map(|value| Span::styled(value.to_owned(), value_style())),
@@ -79,16 +79,6 @@ fn extract_rows(
     if text(payload, "fallback_used").is_some_and(|value| value != "false") {
         push_kv(&mut rows, "fallback", text(payload, "fallback_used"));
     }
-    push_kv(
-        &mut rows,
-        "document",
-        text(payload, "document_path").map(|path| context.display_path(path).to_string()),
-    );
-    push_kv(
-        &mut rows,
-        "text path",
-        text(payload, "text_path").map(|path| context.display_path(path).to_string()),
-    );
     if payload.get("truncated").and_then(Value::as_bool) == Some(true) {
         push_kv(&mut rows, "truncated", Some("yes"));
     }

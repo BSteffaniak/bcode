@@ -1573,8 +1573,6 @@ fn document_and_ocr_results_bound_text_and_show_metadata_and_references() {
                 "source": "file:///tmp/source.pdf",
                 "content_type": "application/pdf",
                 "extractor": "pdftotext",
-                "document_path": "/tmp/source.pdf",
-                "text_path": "/tmp/extracted.txt",
                 "truncated": true,
                 "text": "d".repeat(33_000)
             }),
@@ -1928,9 +1926,6 @@ fn document_artifact_fixture(schema: &str) -> Option<serde_json::Value> {
             "source": "file:///tmp/fixture.pdf",
             "content_type": "application/pdf",
             "artifact_kind": "document",
-            "artifact_scope": "session",
-            "document_path": "/tmp/fixture.pdf",
-            "text_path": "/tmp/fixture.txt",
             "text": "fixture document text",
             "truncated": false,
             "extractor": "native"

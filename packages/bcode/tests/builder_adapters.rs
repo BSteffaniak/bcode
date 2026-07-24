@@ -13,7 +13,7 @@ use bcode_model::{
 use bcode_tool::{ToolContributionEvent, ToolContributionOperation, ToolContributionPersistence};
 use std::collections::VecDeque;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicUsize, Ordering},
 };
 
@@ -32,6 +32,46 @@ fn response(output: &str) -> ToolInvocationResponse {
         content: Vec::new(),
         full_output: None,
         result: None,
+    }
+}
+
+#[derive(Debug)]
+struct WorkspaceContextInvoker(Arc<Mutex<Option<bcode_tool::ToolHostContextEntry>>>);
+
+impl ToolInvoker for WorkspaceContextInvoker {
+    fn prepare_tool<'a>(
+        &'a self,
+        tool: &'a RegisteredTool,
+        request: &'a ToolPreparationRequest,
+        scope: &'a PreparationScope,
+    ) -> RuntimeFuture<'a, ToolPreparationResponse> {
+        assert_eq!(scope.host_context(), request.host_context);
+        let entry = request
+            .host_context
+            .iter()
+            .find(|entry| entry.schema == bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA)
+            .expect("direct SDK workspace context")
+            .clone();
+        *self.0.lock().expect("workspace observation") = Some(entry);
+        let result = bcode_agent_profile::prepare_tool_policy(
+            request,
+            &tool.definition,
+            bcode_agent_profile::ToolPolicyPreparation::read_only(),
+        )
+        .map_err(|message| bcode::RuntimeError::ToolPreparation {
+            tool_name: request.invocation.tool_name.clone(),
+            message,
+        });
+        Box::pin(async move { result })
+    }
+
+    fn invoke_tool<'a>(
+        &'a self,
+        _tool: &'a RegisteredTool,
+        _invocation: &'a PreparedToolInvocation,
+        _scope: &'a InvocationScope,
+    ) -> RuntimeFuture<'a, ToolInvocationResponse> {
+        Box::pin(async { Ok(response("workspace observed")) })
     }
 }
 
@@ -267,6 +307,34 @@ impl ToolAuthorizationCoordinator for AssertOwnerIdentityCoordinator {
         assert_eq!(metadata.permission_category.as_deref(), Some("adapter"));
         Box::pin(async { Ok(vec![ToolAuthorizationDecision::Allow]) })
     }
+}
+
+#[tokio::test]
+async fn direct_sdk_supplies_versioned_workspace_context_to_preparation() {
+    let workspace = tempfile::tempdir().expect("workspace");
+    let observed = Arc::new(Mutex::new(None));
+    let agent = Agent::builder()
+        .cwd(workspace.path())
+        .inline_tool(definition(), |_| Ok(response("inline")))
+        .tool_invoker(Arc::new(WorkspaceContextInvoker(Arc::clone(&observed))))
+        .build();
+
+    agent
+        .execute_tool_call(&call())
+        .await
+        .expect("workspace-aware invocation");
+
+    let observed = observed.lock().expect("workspace observation");
+    let entry = observed.as_ref().expect("workspace context");
+    assert_eq!(entry.schema, bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA);
+    assert_eq!(
+        entry.schema_version,
+        bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION
+    );
+    assert_eq!(
+        entry.payload["working_directory"],
+        workspace.path().display().to_string()
+    );
 }
 
 #[tokio::test]

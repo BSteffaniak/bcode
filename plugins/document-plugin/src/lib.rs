@@ -18,7 +18,6 @@ use bcode_tool::{
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -217,14 +216,13 @@ impl DocumentPlugin {
             Ok(runtime) => runtime,
             Err(error) => return tool_error(format!("document runtime unavailable: {error}")),
         };
-        let artifact_dir = invocation.artifact_dir.clone();
         let progress = ProgressReporter::new(
             events,
             invocation.tool_call_id.clone(),
             invocation.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
         );
         progress.emit("document extraction started");
-        match runtime.block_on(extract_async(request, artifact_dir, Some(progress))) {
+        match runtime.block_on(extract_async(request, Some(progress))) {
             Ok(Ok(response)) => json_tool_response_with_artifact(
                 &response,
                 &invocation.tool_call_id,
@@ -255,9 +253,6 @@ struct ExtractResponse {
     source: String,
     content_type: String,
     artifact_kind: String,
-    artifact_scope: String,
-    document_path: PathBuf,
-    text_path: PathBuf,
     text: String,
     truncated: bool,
     extractor: String,
@@ -303,15 +298,10 @@ enum DocumentError {
 
 async fn extract_async(
     request: ExtractRequest,
-    artifact_dir: Option<PathBuf>,
     progress: Option<ProgressReporter>,
 ) -> Result<ExtractResponse, DocumentError> {
     let source = source(&request)?;
-    let artifact_root = artifact_dir
-        .as_deref()
-        .map_or_else(default_global_document_artifact_dir, Path::to_path_buf)
-        .join("documents");
-    std::fs::create_dir_all(&artifact_root)?;
+    let scratch = document_scratch_directory()?;
     let max_bytes = request
         .max_bytes
         .unwrap_or(DEFAULT_MAX_BYTES)
@@ -321,18 +311,14 @@ async fn extract_async(
             if let Some(progress) = &progress {
                 progress.emit(format!("document download started: {url}"));
             }
-            let path = download_document(
+            download_document(
                 url,
-                &artifact_root,
+                scratch.path(),
                 max_bytes,
                 request.timeout_ms,
                 progress.clone(),
             )
-            .await?;
-            if let Some(progress) = &progress {
-                progress.emit_path("document downloaded", &path);
-            }
-            path
+            .await?
         }
         DocumentSource::Path(path) => {
             if let Some(progress) = &progress {
@@ -347,7 +333,7 @@ async fn extract_async(
     if let Some(progress) = &progress {
         progress.emit("document text extraction started");
     }
-    let text_path = document_path.with_extension("txt");
+    let text_path = scratch.path().join("extracted.txt");
     let extraction = extract_pdf_text(&document_path, &text_path, progress.as_ref())?;
     let bytes = extraction.text.as_bytes();
     let truncated = bytes.len() > max_bytes;
@@ -363,14 +349,6 @@ async fn extract_async(
         source: source.as_string(),
         content_type: "application/pdf".to_string(),
         artifact_kind: "document_extraction".to_string(),
-        artifact_scope: if artifact_dir.is_some() {
-            "session"
-        } else {
-            "global"
-        }
-        .to_string(),
-        document_path,
-        text_path,
         text,
         truncated,
         extractor: extraction.extractor,
@@ -392,7 +370,7 @@ fn extract_pdf_text(
     if let Some(progress) = &progress {
         progress.emit("document native extraction started");
     }
-    match extract_pdf_text_native(document_path, text_path) {
+    match extract_pdf_text_native(document_path) {
         Ok(text) if meaningful_text(&text) => {
             if let Some(progress) = &progress {
                 progress.emit(format!(
@@ -440,14 +418,9 @@ fn extract_pdf_text(
     }
 }
 
-fn extract_pdf_text_native(
-    document_path: &Path,
-    text_path: &Path,
-) -> Result<String, DocumentError> {
-    let text = pdf_extract::extract_text(document_path)
-        .map_err(|error| DocumentError::NativeExtract(error.to_string()))?;
-    std::fs::write(text_path, &text)?;
-    Ok(text)
+fn extract_pdf_text_native(document_path: &Path) -> Result<String, DocumentError> {
+    pdf_extract::extract_text(document_path)
+        .map_err(|error| DocumentError::NativeExtract(error.to_string()))
 }
 
 fn meaningful_text(text: &str) -> bool {
@@ -516,7 +489,7 @@ async fn download_document(
     let path = artifact_root.join(format!("{}.{extension}", stable_name(&final_url)));
     std::fs::write(&path, &bytes[..bytes.len().min(max_bytes)])?;
     if let Some(progress) = &progress {
-        progress.emit_path("document artifact written", &path);
+        progress.emit("document download staged for extraction");
     }
     Ok(path)
 }
@@ -563,24 +536,11 @@ fn stable_name(value: &str) -> String {
     output.trim_matches('_').to_string()
 }
 
-fn default_global_document_artifact_dir() -> PathBuf {
-    default_state_dir().join("artifacts")
-}
-
-fn default_state_dir() -> PathBuf {
-    if let Ok(path) = env::var("BCODE_STATE_DIR") {
-        return PathBuf::from(path);
-    }
-    if let Ok(state_home) = env::var("XDG_STATE_HOME") {
-        return PathBuf::from(state_home).join("bcode");
-    }
-    if let Ok(home) = env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("bcode");
-    }
-    env::temp_dir().join("bcode")
+fn document_scratch_directory() -> Result<tempfile::TempDir, DocumentError> {
+    tempfile::Builder::new()
+        .prefix("bcode-document-")
+        .tempdir()
+        .map_err(DocumentError::Io)
 }
 
 fn list_tools(request: &ServiceRequest) -> ServiceResponse {
@@ -832,6 +792,42 @@ mod tests {
         })
         .expect("url source");
         assert_eq!(result.as_string(), "https://example.com/a.pdf");
+    }
+
+    #[test]
+    fn document_scratch_directory_is_removed_on_drop() {
+        let directory = document_scratch_directory().expect("document scratch directory");
+        let path = directory.path().to_path_buf();
+        std::fs::write(path.join("source.pdf"), b"fixture").expect("scratch fixture");
+
+        drop(directory);
+
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn extraction_payload_omits_scratch_and_host_artifact_paths() {
+        let response = ExtractResponse {
+            source: "https://example.com/report.pdf".to_owned(),
+            content_type: "application/pdf".to_owned(),
+            artifact_kind: "document_extraction".to_owned(),
+            text: "extracted".to_owned(),
+            truncated: false,
+            extractor: "native".to_owned(),
+            fallback_used: None,
+        };
+
+        let payload = serde_json::to_value(response).expect("extract response");
+
+        assert_eq!(payload["source"], "https://example.com/report.pdf");
+        for removed in ["artifact_scope", "document_path", "text_path"] {
+            assert!(
+                !payload
+                    .as_object()
+                    .expect("response object")
+                    .contains_key(removed)
+            );
+        }
     }
 
     #[test]

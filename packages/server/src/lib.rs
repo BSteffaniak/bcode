@@ -15216,20 +15216,54 @@ struct ServerInvocationServiceRoute {
     payload_overlay: serde_json::Value,
 }
 
+fn workspace_host_context_entry(
+    working_directory: &Path,
+    workspace_id: Option<&str>,
+) -> Result<bcode_tool::ToolHostContextEntry, String> {
+    let working_directory = if working_directory.is_absolute() {
+        working_directory.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| error.to_string())?
+            .join(working_directory)
+    };
+    Ok(bcode_tool::ToolHostContextEntry {
+        schema: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA.to_owned(),
+        schema_version: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION,
+        payload: serde_json::json!({
+            "working_directory": working_directory,
+            "workspace_id": workspace_id,
+        }),
+    })
+}
+
+fn artifact_host_context_entry(root: &Path) -> bcode_tool::ToolHostContextEntry {
+    bcode_tool::ToolHostContextEntry {
+        schema: bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA.to_owned(),
+        schema_version: bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION,
+        payload: serde_json::json!({"root": root}),
+    }
+}
+
 async fn invocation_service_host_context(
     state: &ServerState,
     session_id: SessionId,
-) -> Vec<bcode_tool::ToolHostContextEntry> {
+    working_directory: &Path,
+) -> Result<Vec<bcode_tool::ToolHostContextEntry>, String> {
     let routes = invocation_service_routes(state, session_id)
         .await
         .into_iter()
         .map(|route| route.advertised)
         .collect::<Vec<_>>();
-    vec![bcode_tool::ToolHostContextEntry {
-        schema: bcode_tool::TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA.to_owned(),
-        schema_version: 1,
-        payload: serde_json::to_value(routes).unwrap_or(serde_json::Value::Null),
-    }]
+    Ok(vec![
+        bcode_tool::ToolHostContextEntry {
+            schema: bcode_tool::TOOL_INVOCATION_SERVICE_ROUTES_SCHEMA.to_owned(),
+            schema_version: 1,
+            payload: serde_json::to_value(routes).unwrap_or(serde_json::Value::Null),
+        },
+        workspace_host_context_entry(working_directory, Some(&session_id.to_string()))?,
+        artifact_host_context_entry(&default_session_artifact_dir(session_id)),
+    ])
 }
 
 #[derive(Debug)]
@@ -15526,7 +15560,13 @@ async fn prepare_registered_server_tool(
     call: &bcode_model::ToolCall,
     cancel_state: &TurnCancelState,
 ) -> Result<ToolPreparationResponse, String> {
-    let host_context = invocation_service_host_context(state, session_id).await;
+    let working_directory = state
+        .sessions
+        .session_working_directory(session_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let host_context =
+        invocation_service_host_context(state, session_id, &working_directory).await?;
     let request = ToolPreparationRequest {
         invocation: ToolInvocationDescriptor {
             invocation_id: call.id.clone(),
@@ -15542,11 +15582,6 @@ async fn prepare_registered_server_tool(
         ),
         host_context,
     );
-    let working_directory = state
-        .sessions
-        .session_working_directory(session_id)
-        .await
-        .map_err(|error| error.to_string())?;
     let invoker = ServerToolInvoker::new(state, session_id, &working_directory, cancel_state);
     let preparation = invoker
         .prepare_tool(&tool, &request, &scope)
@@ -15960,7 +15995,11 @@ fn execute_model_tool_batch<'a>(
         else {
             return false;
         };
-        let host_context = invocation_service_host_context(state, session_id).await;
+        let Ok(host_context) =
+            invocation_service_host_context(state, session_id, &working_directory).await
+        else {
+            return false;
+        };
         let sink_capacity = calls.len().saturating_mul(8).max(32);
         let (sink, sink_receiver) = SessionInvocationSink::new(sink_capacity);
         let sink_drain = drain_session_invocation_sink(state, session_id, sink_receiver);
@@ -16732,7 +16771,6 @@ async fn invoke_plugin_tool_transport(
         arguments: call.arguments.clone(),
         preparation_descriptor,
         cwd: Some(working_directory),
-        artifact_dir: Some(default_session_artifact_dir(session_id)),
     };
     let payload = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
     let scope = active_plugin_scope_for_tool_call(state, session_id, &call.id).await;
@@ -20587,6 +20625,40 @@ mod tests {
             outcome: terminal.then_some(bcode_session_models::SessionOpenTerminalOutcome::Ready),
             backup_path: None,
         }
+    }
+
+    #[test]
+    fn server_workspace_host_context_preserves_session_identity_and_directory() {
+        let session_id = SessionId::new();
+        let working_directory = std::env::current_dir().expect("working directory");
+        let expected_workspace_id = session_id.to_string();
+        let entry = workspace_host_context_entry(&working_directory, Some(&expected_workspace_id))
+            .expect("server workspace entry");
+
+        assert_eq!(entry.schema, bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA);
+        assert_eq!(
+            entry.schema_version,
+            bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            entry.payload["working_directory"],
+            working_directory.display().to_string()
+        );
+        assert_eq!(entry.payload["workspace_id"], expected_workspace_id);
+    }
+
+    #[test]
+    fn server_artifact_host_context_preserves_session_root() {
+        let session_id = SessionId::new();
+        let root = default_session_artifact_dir(session_id);
+        let entry = artifact_host_context_entry(&root);
+
+        assert_eq!(entry.schema, bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA);
+        assert_eq!(
+            entry.schema_version,
+            bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION
+        );
+        assert_eq!(entry.payload["root"], root.display().to_string());
     }
 
     #[test]

@@ -37,7 +37,7 @@ use contracts::{
     ShellInvocationAction, ShellLiveRecordingPayload, ShellRunArguments, ShellRunResult,
     TERMINAL_PTY_STREAM_CONTENT_TYPE, TERMINAL_PTY_STREAM_REF_KEY,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -87,6 +87,69 @@ fn invoke_shell_service(context: &NativeServiceContext) -> ServiceResponse {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+struct ShellPreparationDescriptor {
+    #[serde(default)]
+    workspace_root: Option<PathBuf>,
+    #[serde(default)]
+    artifact_root: Option<PathBuf>,
+}
+
+fn shell_preparation_descriptor(
+    preparation: &bcode_tool::ToolPreparationRequest,
+) -> Result<ShellPreparationDescriptor, String> {
+    Ok(ShellPreparationDescriptor {
+        workspace_root: shell_context_path(
+            preparation,
+            bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA,
+            bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION,
+            "working_directory",
+        )?,
+        artifact_root: shell_context_path(
+            preparation,
+            bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA,
+            bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION,
+            "root",
+        )?,
+    })
+}
+
+fn shell_context_path(
+    preparation: &bcode_tool::ToolPreparationRequest,
+    schema: &str,
+    expected_version: u32,
+    field: &str,
+) -> Result<Option<PathBuf>, String> {
+    let mut matching = preparation
+        .host_context
+        .iter()
+        .filter(|entry| entry.schema == schema);
+    let Some(entry) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        return Err(format!("duplicate Shell host context for {schema}"));
+    }
+    if entry.schema_version != expected_version {
+        return Err(format!(
+            "unsupported Shell host context version for {schema}: {}; expected {expected_version}",
+            entry.schema_version
+        ));
+    }
+    let path = entry
+        .payload
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("Shell host context {schema} field {field} is missing"))?;
+    let path = PathBuf::from(path);
+    if !path.is_absolute() {
+        return Err(format!(
+            "Shell host context {schema} field {field} must be absolute"
+        ));
+    }
+    Ok(Some(path))
+}
+
 fn prepare_shell_tool(request: &ServiceRequest) -> ServiceResponse {
     let preparation = match request.payload_json::<bcode_tool::ToolPreparationRequest>() {
         Ok(preparation) => preparation,
@@ -102,6 +165,10 @@ fn prepare_shell_tool(request: &ServiceRequest) -> ServiceResponse {
             ),
         );
     }
+    let descriptor = match shell_preparation_descriptor(&preparation) {
+        Ok(descriptor) => descriptor,
+        Err(message) => return ServiceResponse::error("invalid_preparation", message),
+    };
     match bcode_agent_profile::prepare_tool_policy_with_operation(
         &preparation,
         &definition,
@@ -109,7 +176,15 @@ fn prepare_shell_tool(request: &ServiceRequest) -> ServiceResponse {
         shell_policy_identity(),
         shell_policy_operation(&preparation),
     ) {
-        Ok(response) => json_response(&response),
+        Ok(mut response) => {
+            response.descriptor = match serde_json::to_value(descriptor) {
+                Ok(descriptor) => descriptor,
+                Err(error) => {
+                    return ServiceResponse::error("invalid_preparation", error.to_string());
+                }
+            };
+            json_response(&response)
+        }
         Err(message) => ServiceResponse::error("invalid_preparation", message),
     }
 }
@@ -194,16 +269,30 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
+    let descriptor = match serde_json::from_value::<ShellPreparationDescriptor>(
+        request.preparation_descriptor.clone(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return json_response(&ToolInvocationResponse {
+                output: format!("invalid Shell preparation descriptor: {error}"),
+                is_error: true,
+                content: Vec::new(),
+                full_output: None,
+                result: None,
+            });
+        }
+    };
     let response = match request.name.as_str() {
         "shell.run" => run_shell_tool(
             context,
             context.events,
             &request.tool_call_id,
             request.arguments,
-            request.cwd.as_deref(),
+            descriptor.workspace_root.as_deref(),
             TerminalRunPaths {
-                session_cwd: request.cwd.as_deref(),
-                artifact_dir: request.artifact_dir.as_deref(),
+                session_cwd: descriptor.workspace_root.as_deref(),
+                artifact_dir: descriptor.artifact_root.as_deref(),
                 input_bridge: Some(&context.bridge),
             },
         ),
@@ -1661,20 +1750,76 @@ bcode_plugin_sdk::export_concurrent_plugin!(ShellPlugin, include_str!("../bcode-
 mod tests {
     use super::*;
 
-    fn preparation_request(arguments: serde_json::Value) -> ServiceRequest {
+    fn preparation_request_with_context(
+        arguments: serde_json::Value,
+        host_context: Vec<bcode_tool::ToolHostContextEntry>,
+    ) -> ServiceRequest {
         let preparation = bcode_tool::ToolPreparationRequest {
             invocation: bcode_tool::ToolInvocationDescriptor {
                 invocation_id: "prepare-test".to_owned(),
                 tool_name: "shell.run".to_owned(),
                 arguments,
             },
-            host_context: Vec::new(),
+            host_context,
         };
         ServiceRequest {
             interface_id: TOOL_SERVICE_INTERFACE_ID.to_owned(),
             operation: bcode_tool::OP_PREPARE_TOOL.to_owned(),
             payload: serde_json::to_vec(&preparation).expect("preparation request should encode"),
         }
+    }
+
+    fn preparation_request(arguments: serde_json::Value) -> ServiceRequest {
+        preparation_request_with_context(arguments, Vec::new())
+    }
+
+    #[test]
+    fn shell_preparation_serializes_owner_resolved_workspace_and_artifact_roots() {
+        let response = prepare_shell_tool(&preparation_request_with_context(
+            serde_json::json!({"command": "printf hello"}),
+            vec![
+                bcode_tool::ToolHostContextEntry {
+                    schema: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA.to_owned(),
+                    schema_version: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION,
+                    payload: serde_json::json!({"working_directory": "/tmp/workspace"}),
+                },
+                bcode_tool::ToolHostContextEntry {
+                    schema: bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA.to_owned(),
+                    schema_version: bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION,
+                    payload: serde_json::json!({"root": "/tmp/artifacts/session-1"}),
+                },
+            ],
+        ));
+        assert!(response.error.is_none(), "{:?}", response.error);
+        let prepared = response
+            .payload_json::<bcode_tool::ToolPreparationResponse>()
+            .expect("preparation response");
+
+        assert_eq!(
+            serde_json::from_value::<ShellPreparationDescriptor>(prepared.descriptor)
+                .expect("Shell descriptor"),
+            ShellPreparationDescriptor {
+                workspace_root: Some(PathBuf::from("/tmp/workspace")),
+                artifact_root: Some(PathBuf::from("/tmp/artifacts/session-1")),
+            }
+        );
+    }
+
+    #[test]
+    fn shell_preparation_rejects_relative_artifact_root() {
+        let response = prepare_shell_tool(&preparation_request_with_context(
+            serde_json::json!({"command": "printf hello"}),
+            vec![bcode_tool::ToolHostContextEntry {
+                schema: bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA.to_owned(),
+                schema_version: bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION,
+                payload: serde_json::json!({"root": "relative"}),
+            }],
+        ));
+
+        assert!(response.payload.is_empty());
+        let error = response.error.expect("invalid preparation error");
+        assert_eq!(error.code, "invalid_preparation");
+        assert!(error.message.contains("must be absolute"));
     }
 
     fn prepared_metadata(

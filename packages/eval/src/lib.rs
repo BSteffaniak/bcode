@@ -753,11 +753,69 @@ async fn validate_agent_policy_overlay(
     }
 }
 
+fn direct_tool_preparation_request(
+    invocation_id: &str,
+    tool_name: &str,
+    arguments: &serde_json::Value,
+    workspace: &Path,
+    artifact_root: &Path,
+    workspace_id: &str,
+) -> Result<bcode_tool::ToolPreparationRequest, EvalError> {
+    if !workspace.is_absolute() || !artifact_root.is_absolute() {
+        return Err(EvalError::Validation(
+            "direct-tool workspace and artifact root must be absolute".to_owned(),
+        ));
+    }
+    Ok(bcode_tool::ToolPreparationRequest {
+        invocation: bcode_tool::ToolInvocationDescriptor {
+            invocation_id: invocation_id.to_owned(),
+            tool_name: tool_name.to_owned(),
+            arguments: arguments.clone(),
+        },
+        host_context: vec![
+            bcode_tool::ToolHostContextEntry {
+                schema: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA.to_owned(),
+                schema_version: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION,
+                payload: serde_json::json!({
+                    "working_directory": workspace,
+                    "workspace_id": workspace_id,
+                }),
+            },
+            bcode_tool::ToolHostContextEntry {
+                schema: bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA.to_owned(),
+                schema_version: bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION,
+                payload: serde_json::json!({"root": artifact_root}),
+            },
+        ],
+    })
+}
+
+fn plugin_service_payload(
+    operation: &str,
+    response: bcode_ipc::PluginServiceResponse,
+) -> Result<Vec<u8>, EvalError> {
+    if let Some(error) = response.error {
+        return Err(EvalError::Client(format!(
+            "{operation} failed ({}): {}",
+            error.code, error.message
+        )));
+    }
+    Ok(response.payload)
+}
+
+fn decode_plugin_service_payload<T: serde::de::DeserializeOwned>(
+    operation: &str,
+    response: bcode_ipc::PluginServiceResponse,
+) -> Result<T, EvalError> {
+    let payload = plugin_service_payload(operation, response)?;
+    serde_json::from_slice(&payload).map_err(EvalError::Json)
+}
+
 fn execute_direct_tool_variant(
     suite: &EvalSuite,
     case: &EvalCase,
     variant: &EvalVariant,
-    _repetition: u32,
+    repetition: u32,
     rep_dir: &Path,
     workspace: &Path,
 ) -> Result<ExecutionOutput, EvalError> {
@@ -780,58 +838,66 @@ fn execute_direct_tool_variant(
             .ensure_daemon_available()
             .await
             .map_err(|error| EvalError::Client(error.to_string()))?;
-        let request = bcode_tool::ToolInvocationRequest {
-            tool_call_id: format!("eval-{}-{}-{}", suite.id, case.id, variant.id),
-            name: config.tool_name.clone(),
-            arguments: config.arguments.clone(),
-            preparation_descriptor: serde_json::Value::Null,
-            cwd: Some(workspace.to_path_buf()),
-            artifact_dir: Some(rep_dir.to_path_buf()),
-        };
-        let payload = serde_json::to_vec(&request)?;
-        let start = Instant::now();
+        let tool_call_id = format!("eval-{}-{}-{}", suite.id, case.id, variant.id);
         let plugin_id = if let Some(plugin_id) = &config.plugin_id {
             plugin_id.clone()
         } else {
             resolve_tool_plugin_id(&client, &config.tool_name).await?
         };
+        let preparation = direct_tool_preparation_request(
+            &tool_call_id,
+            &config.tool_name,
+            &config.arguments,
+            workspace,
+            rep_dir,
+            &format!("eval:{}:{}:{}:{repetition}", suite.id, case.id, variant.id),
+        )?;
+        let preparation_start = Instant::now();
+        let prepared = client
+            .invoke_plugin_service(
+                plugin_id.clone(),
+                bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_string(),
+                bcode_tool::OP_PREPARE_TOOL.to_string(),
+                serde_json::to_vec(&preparation)?,
+            )
+            .await
+            .map_err(|error| EvalError::Client(error.to_string()))?;
+        let prepared = decode_plugin_service_payload::<bcode_tool::ToolPreparationResponse>(
+            "tool preparation",
+            prepared,
+        )?;
+        let request = bcode_tool::ToolInvocationRequest {
+            tool_call_id,
+            name: config.tool_name.clone(),
+            arguments: config.arguments.clone(),
+            preparation_descriptor: prepared.descriptor,
+            cwd: Some(workspace.to_path_buf()),
+        };
+        let start = Instant::now();
         let response = client
             .invoke_plugin_service(
                 plugin_id,
                 bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_string(),
                 bcode_tool::OP_INVOKE_TOOL.to_string(),
-                payload,
+                serde_json::to_vec(&request)?,
             )
             .await
             .map_err(|error| EvalError::Client(error.to_string()))?;
+        let response = plugin_service_payload("tool invocation", response)?;
         let stdout_path = rep_dir.join("direct-tool-response.json");
         let mut measurements = EvalMeasurementSet::new();
         measurements.insert(
-            "direct_tool_wall_time_ms".into(),
-            start.elapsed().as_millis() as f64,
+            "direct_tool_preparation_ms".into(),
+            preparation_start.elapsed().as_secs_f64() * 1000.0,
         );
         measurements.insert(
-            "direct_tool_response_bytes".into(),
-            response.payload.len() as f64,
+            "direct_tool_wall_time_ms".into(),
+            start.elapsed().as_secs_f64() * 1000.0,
         );
-        if let Some(error) = response.error {
-            fs::write(&stdout_path, serde_json::to_string_pretty(&error)?)?;
-            return Ok(ExecutionOutput {
-                exit_code: Some(1),
-                measurements,
-                diagnostics: vec![EvalDiagnostic {
-                    severity: EvalDiagnosticSeverity::Error,
-                    message: format!("tool service error {}: {}", error.code, error.message),
-                }],
-                artifacts: vec![EvalArtifactRef {
-                    kind: "direct_tool_response".into(),
-                    path: PathBuf::from("direct-tool-response.json"),
-                }],
-            });
-        }
-        fs::write(&stdout_path, &response.payload)?;
+        measurements.insert("direct_tool_response_bytes".into(), response.len() as f64);
+        fs::write(&stdout_path, &response)?;
         let tool_response =
-            serde_json::from_slice::<bcode_tool::ToolInvocationResponse>(&response.payload)?;
+            serde_json::from_slice::<bcode_tool::ToolInvocationResponse>(&response)?;
         measurements.insert(
             "tool_output_bytes".into(),
             tool_response.output.len() as f64,
@@ -3726,5 +3792,86 @@ fn relative_artifact(run_dir: &Path, kind: &str, path: &Path) -> EvalArtifactRef
     EvalArtifactRef {
         kind: kind.into(),
         path: path.strip_prefix(run_dir).unwrap_or(path).to_path_buf(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn direct_tool_preparation_uses_versioned_opaque_workspace_context() {
+        let workspace = std::env::current_dir().expect("working directory");
+
+        let artifact_root = workspace.join("artifacts");
+
+        let request = direct_tool_preparation_request(
+            "call-1",
+            "fixture.tool",
+            &serde_json::json!({"value": 1}),
+            &workspace,
+            &artifact_root,
+            "eval:fixture",
+        )
+        .expect("preparation request");
+
+        assert_eq!(request.invocation.invocation_id, "call-1");
+        assert_eq!(request.invocation.tool_name, "fixture.tool");
+        assert_eq!(request.host_context.len(), 2);
+        let context = &request.host_context[0];
+        assert_eq!(context.schema, bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA);
+        assert_eq!(
+            context.schema_version,
+            bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            context.payload["working_directory"],
+            workspace.display().to_string()
+        );
+        assert_eq!(context.payload["workspace_id"], "eval:fixture");
+        let artifact = &request.host_context[1];
+        assert_eq!(artifact.schema, bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA);
+        assert_eq!(
+            artifact.schema_version,
+            bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            artifact.payload["root"],
+            artifact_root.display().to_string()
+        );
+    }
+
+    #[test]
+    fn direct_tool_preparation_rejects_relative_workspace() {
+        let error = direct_tool_preparation_request(
+            "call-1",
+            "fixture.tool",
+            &serde_json::Value::Null,
+            Path::new("relative"),
+            Path::new("relative-artifacts"),
+            "eval:fixture",
+        )
+        .expect_err("relative workspace");
+
+        assert!(matches!(error, EvalError::Validation(message) if message.contains("absolute")));
+    }
+
+    #[test]
+    fn plugin_service_errors_fail_closed_before_payload_decode() {
+        let error = decode_plugin_service_payload::<bcode_tool::ToolPreparationResponse>(
+            "tool preparation",
+            bcode_ipc::PluginServiceResponse {
+                payload: b"not-json".to_vec(),
+                error: Some(bcode_ipc::PluginServiceError {
+                    code: "invalid_preparation".to_owned(),
+                    message: "owner rejected request".to_owned(),
+                }),
+            },
+        )
+        .expect_err("service error");
+
+        assert!(
+            matches!(error, EvalError::Client(message) if message.contains("invalid_preparation"))
+        );
     }
 }
