@@ -1,0 +1,18 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools", "rendering"]
+description = "Bounded Mermaid diagram rendering for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "diagram", "mermaid"]
+license     = { workspace = true }
+name        = "bcode_mermaid_render"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+mermaid-rs-renderer = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

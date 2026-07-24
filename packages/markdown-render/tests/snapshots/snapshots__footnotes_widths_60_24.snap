@@ -9,8 +9,9 @@ expression: "[60_u16,\n24].into_iter().map(|width|\nformat!(\"== width {width} =
 03 │ 
 04 │ Footnotes
 05 │ [fg=bright-black]1.  [/]First definition over multiple lines. ↩×2
-06 │ [fg=bright-black]2.  [/]Second definition with strong text. ↩
-07 │ [fg=bright-black]3.  [/]Unreferenced definition.
+06 │ [fg=bright-black]2.  [/]Second definition with strong text, emphasis, code, and 
+07 │ [fg=bright-black]    [/]Unicode 東京 🧪. ↩
+08 │ [fg=bright-black]3.  [/]Unreferenced definition.
 == width 24 ==
 00 │ First[1], repeated[1], a
 01 │ nd second[2]. Missing[3]
@@ -23,6 +24,8 @@ expression: "[60_u16,\n24].into_iter().map(|width|\nformat!(\"== width {width} =
 08 │ [fg=bright-black]    [/]r multiple lines. ↩×
 09 │ [fg=bright-black]    [/]2
 10 │ [fg=bright-black]2.  [/]Second definition wi
-11 │ [fg=bright-black]    [/]th strong text. ↩
-12 │ [fg=bright-black]3.  [/]Unreferenced definit
-13 │ [fg=bright-black]    [/]ion.
+11 │ [fg=bright-black]    [/]th strong text, emph
+12 │ [fg=bright-black]    [/]asis, code, and Unic
+13 │ [fg=bright-black]    [/]ode 東京 🧪. ↩
+14 │ [fg=bright-black]3.  [/]Unreferenced definit
+15 │ [fg=bright-black]    [/]ion.

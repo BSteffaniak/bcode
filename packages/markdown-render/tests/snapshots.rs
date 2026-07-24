@@ -1,8 +1,8 @@
 use bcode_markdown_render::{
     GitHubRepository, MarkdownContributionKind, MarkdownDestination, MarkdownDestinationRejection,
     MarkdownDocumentContext, MarkdownRenderOptions, MarkdownSemanticEventKind, MarkdownSemanticTag,
-    MarkdownTableAlignment, parse_markdown_document, render_markdown, render_markdown_lines,
-    resolve_markdown_destination,
+    MarkdownTableAlignment, MermaidContributionRendering, parse_markdown_document, render_markdown,
+    render_markdown_lines, resolve_markdown_destination,
 };
 use bmux_tui::prelude::{Color, Line, Modifier, Style};
 use unicode_width::UnicodeWidthStr;
@@ -175,6 +175,41 @@ fn contribution_snapshot(markdown: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn mermaid_contribution_renders_svg_or_keeps_source_with_diagnostic() {
+    let enabled = MarkdownRenderOptions::new(80).with_mermaid(800, 600);
+    let rendered = render_markdown("```mermaid\nflowchart LR\nA --> B\n```", &enabled);
+    assert!(rendered.contributions.iter().any(|item| matches!(
+        &item.kind,
+        MarkdownContributionKind::Mermaid {
+            source,
+            rendering: MermaidContributionRendering::Svg(svg),
+            ..
+        } if source.contains("A --> B") && String::from_utf8_lossy(svg).contains("<svg")
+    )));
+
+    let rejected = render_markdown(
+        "```mermaid\n%%{init: {}}%%\nflowchart LR\nA --> B\n```",
+        &enabled,
+    );
+    assert!(rejected.contributions.iter().any(|item| matches!(
+        &item.kind,
+        MarkdownContributionKind::Mermaid {
+            source,
+            rendering: MermaidContributionRendering::Failed(message),
+            ..
+        } if source.contains("%%{init") && message.contains("directives are not allowed")
+    )));
+    let visible = rejected
+        .lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .map(|span| span.content.as_str())
+        .collect::<String>();
+    assert!(visible.contains("%%{init"));
+    assert!(visible.contains("flowchart LR"));
 }
 
 #[test]
@@ -371,7 +406,8 @@ fn footnotes_use_first_reference_numbers_and_preserve_all_content() {
 
     assert!(output.contains("First[1], repeated[1], and second[2]. Missing[3]."));
     assert!(output.contains("1.  First definition over multiple lines. ↩×2"));
-    assert!(output.contains("2.  Second definition with strong text. ↩"));
+    assert!(output.contains("2.  Second definition with strong text, emphasis, code, and"));
+    assert!(output.contains("Unicode 東京 🧪. ↩"));
     assert!(output.contains("3.  Unreferenced definition."));
     assert!(!output.contains("[^alpha]"));
 }
@@ -414,7 +450,7 @@ fn semantic_contributions_have_stable_unique_ids_and_expected_payloads() {
     )));
     assert!(first.contributions.iter().any(|item| matches!(
         &item.kind,
-        MarkdownContributionKind::Mermaid { source } if source.contains("A --> B")
+        MarkdownContributionKind::Mermaid { source, .. } if source.contains("A --> B")
     )));
 }
 
@@ -791,6 +827,36 @@ fn snapshots_unicode_table_at_width_80() {
         "table_unicode_width_80",
         visible_snapshot(TABLE_UNICODE, 80)
     );
+}
+
+#[test]
+fn unicode_table_preserves_consistent_edges_and_display_width() {
+    let lines = render(TABLE_UNICODE, 80);
+    let visible = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let widths = visible
+        .iter()
+        .map(|line| UnicodeWidthStr::width(line.as_str()))
+        .collect::<Vec<_>>();
+
+    assert!(!visible.is_empty());
+    assert!(widths.iter().all(|width| *width == widths[0]));
+    assert!(
+        visible
+            .iter()
+            .filter(|line| line.starts_with('│'))
+            .all(|line| line.ends_with('│'))
+    );
+    assert!(visible.iter().any(|line| line.contains("é")));
+    assert!(visible.iter().any(|line| line.contains("東京")));
+    assert!(visible.iter().any(|line| line.contains("🚀")));
 }
 
 #[test]

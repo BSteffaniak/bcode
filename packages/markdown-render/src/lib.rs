@@ -35,6 +35,9 @@
 
 use std::{borrow::Cow, cell::Cell, collections::BTreeMap, fmt::Write as _, ops::Range, rc::Rc};
 
+use bcode_mermaid_render::{
+    MermaidCancellationToken, MermaidRenderRequest, MermaidRenderedOutput, render_mermaid,
+};
 use bcode_syntax_render::SyntaxHighlighter;
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
 use hyperchad_color::Color as HyperChadColor;
@@ -231,6 +234,12 @@ pub struct MarkdownRenderOptions {
     pub theme: MarkdownTheme,
     /// Trusted context used only to resolve relative destinations.
     pub document_context: Option<MarkdownDocumentContext>,
+    /// Whether the Mermaid backend should be used for Mermaid fences.
+    pub mermaid_enabled: bool,
+    /// Maximum Mermaid SVG width in pixels.
+    pub mermaid_width: u32,
+    /// Maximum Mermaid SVG height in pixels.
+    pub mermaid_height: u32,
     /// Stable identity of the owning document or transcript item.
     pub document_id: Option<String>,
 }
@@ -242,6 +251,9 @@ impl Default for MarkdownRenderOptions {
             width: 80,
             theme: MarkdownTheme::default(),
             document_context: None,
+            mermaid_enabled: false,
+            mermaid_width: 1600,
+            mermaid_height: 1200,
             document_id: None,
         }
     }
@@ -275,6 +287,15 @@ impl MarkdownRenderOptions {
     #[must_use]
     pub fn with_document_id(mut self, document_id: impl Into<String>) -> Self {
         self.document_id = Some(document_id.into());
+        self
+    }
+
+    /// Return options with bounded Mermaid rendering enabled.
+    #[must_use]
+    pub const fn with_mermaid(mut self, width: u32, height: u32) -> Self {
+        self.mermaid_enabled = true;
+        self.mermaid_width = width;
+        self.mermaid_height = height;
         self
     }
 }
@@ -658,7 +679,22 @@ pub enum MarkdownContributionKind {
     Mermaid {
         /// Mermaid source without the fence.
         source: String,
+        /// Versioned stable renderer cache key.
+        cache_key: String,
+        /// Backend outcome when Mermaid rendering was requested.
+        rendering: MermaidContributionRendering,
     },
+}
+
+/// Backend-neutral Mermaid contribution rendering state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MermaidContributionRendering {
+    /// Rendering is disabled; highlighted source remains the fallback.
+    Disabled,
+    /// Bcode-owned SVG bytes are available for image presentation.
+    Svg(Vec<u8>),
+    /// Rendering failed; source remains visible with a stable diagnostic.
+    Failed(String),
 }
 
 /// Render Markdown into terminal lines and semantic contributions.
@@ -671,6 +707,7 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
         options.document_context.as_ref(),
         options.document_id.as_deref(),
         &details,
+        options,
     );
     let projected_markdown = project_semantic_fallbacks(markdown, &document, &details);
     MarkdownRenderResult {
@@ -1192,11 +1229,12 @@ fn markdown_contributions(
     context: Option<&MarkdownDocumentContext>,
     document_id: Option<&str>,
     details: &[DetailsProjection],
+    options: &MarkdownRenderOptions,
 ) -> Vec<MarkdownContribution> {
     let mut contributions = Vec::new();
     let mut containers: Vec<ContributionContainer> = Vec::new();
     for event in &document.events {
-        collect_markdown_contribution(event, context, &mut containers, &mut contributions);
+        collect_markdown_contribution(event, context, options, &mut containers, &mut contributions);
     }
     if let Some(repository) = context.and_then(|context| context.github_repository.as_ref()) {
         contributions.extend(github_issue_contributions(document, repository));
@@ -1308,6 +1346,7 @@ fn github_issue_references(text: &str) -> Vec<(usize, u64, bool)> {
 fn collect_markdown_contribution(
     event: &MarkdownSemanticEvent,
     context: Option<&MarkdownDocumentContext>,
+    options: &MarkdownRenderOptions,
     containers: &mut Vec<ContributionContainer>,
     contributions: &mut Vec<MarkdownContribution>,
 ) {
@@ -1350,7 +1389,7 @@ fn collect_markdown_contribution(
             finish_image_contribution(containers, contributions);
         }
         MarkdownSemanticEventKind::End(MarkdownSemanticTagEnd::CodeBlock) => {
-            finish_mermaid_contribution(containers, contributions);
+            finish_mermaid_contribution(containers, contributions, options);
         }
         MarkdownSemanticEventKind::Text(text) | MarkdownSemanticEventKind::Code(text) => {
             if let Some(container) = containers.last_mut() {
@@ -1429,16 +1468,34 @@ fn finish_image_contribution(
 fn finish_mermaid_contribution(
     containers: &mut Vec<ContributionContainer>,
     contributions: &mut Vec<MarkdownContribution>,
+    options: &MarkdownRenderOptions,
 ) {
     if matches!(
         containers.last(),
         Some(ContributionContainer::Mermaid { .. })
     ) && let Some(ContributionContainer::Mermaid { source_range, text }) = containers.pop()
     {
+        let request =
+            MermaidRenderRequest::svg(text.clone(), options.mermaid_width, options.mermaid_height);
+        let cache_key = request.cache_key();
+        let rendering = if options.mermaid_enabled {
+            match render_mermaid(&request, &MermaidCancellationToken::default()) {
+                Ok(rendered) => match rendered.output {
+                    MermaidRenderedOutput::Svg(svg) => MermaidContributionRendering::Svg(svg),
+                },
+                Err(error) => MermaidContributionRendering::Failed(error.to_string()),
+            }
+        } else {
+            MermaidContributionRendering::Disabled
+        };
         contributions.push(contribution(
             "mermaid",
             source_range,
-            MarkdownContributionKind::Mermaid { source: text },
+            MarkdownContributionKind::Mermaid {
+                source: text,
+                cache_key,
+                rendering,
+            },
         ));
     }
 }

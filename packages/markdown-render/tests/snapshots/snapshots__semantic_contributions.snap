@@ -8,5 +8,5 @@ inline-math:136:141 │ 0136..0141 │ InlineMath { source: "x^2" }
 display-math:148:161 │ 0148..0161 │ DisplayMath { source: "x = y + 1" }
 footnote-reference:173:180 │ 0173..0180 │ FootnoteReference { label: "note" }
 footnote-definition:182:211 │ 0182..0211 │ FootnoteDefinition { label: "note" }
-mermaid:267:304 │ 0267..0304 │ Mermaid { source: "flowchart LR\n  A --> B\n" }
+mermaid:267:304 │ 0267..0304 │ Mermaid { source: "flowchart LR\n  A --> B\n", cache_key: "mermaid-v1:svg:1600x1200:4194304:14909077896276104726", rendering: Disabled }
 details:306:352 │ 0306..0352 │ Details { summary: "More", body: "Body", default_open: false }
