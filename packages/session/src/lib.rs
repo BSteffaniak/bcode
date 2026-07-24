@@ -8144,6 +8144,7 @@ mod tests {
                 ..
             })
         ));
+        let blocked_operation_id = terminal.operation_id;
         let unchanged = db::SessionDb::open_existing_turso_in_root(session.id, &root)
             .await
             .expect("legacy database should remain readable");
@@ -8155,8 +8156,13 @@ mod tests {
             u64::from(db::LEGACY_SESSION_STORAGE_WRITER_EPOCH)
         );
         drop(unchanged);
-        drop(contender);
         drop(manager);
+
+        let retry = prepare_session_until_terminal(&contender, session.id).await;
+        assert_ne!(retry.operation_id, blocked_operation_id);
+        assert_eq!(retry.outcome, Some(SessionOpenTerminalOutcome::Ready));
+
+        drop(contender);
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
     #[tokio::test]

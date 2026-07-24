@@ -1,8 +1,8 @@
 //! Coordination for server-owned session-open preparation operations.
 
 use bcode_session_models::{
-    SessionId, SessionMigrationProgress, SessionMigrationStage, SessionOpenOperationId,
-    SessionOpenOperationSnapshot, SessionOpenTerminalOutcome,
+    SessionId, SessionMigrationProgress, SessionMigrationStage, SessionOpenFailureKind,
+    SessionOpenOperationId, SessionOpenOperationSnapshot, SessionOpenTerminalOutcome,
 };
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -153,7 +153,9 @@ impl SessionMigrationOperations {
         let session_id = initial.session_id;
         let operation = {
             let mut entries = self.entries.lock().await;
-            if let Some(existing) = entries.get(&session_id) {
+            if let Some(existing) = entries.get(&session_id)
+                && should_reuse_operation(&existing.snapshot())
+            {
                 return Arc::clone(existing);
             }
             let operation = Arc::new(SessionMigrationOperation::new(initial));
@@ -253,6 +255,16 @@ impl SessionMigrationOperations {
     }
 }
 
+const fn should_reuse_operation(snapshot: &SessionOpenOperationSnapshot) -> bool {
+    !matches!(
+        snapshot.outcome.as_ref(),
+        Some(SessionOpenTerminalOutcome::Failed {
+            kind: SessionOpenFailureKind::OwnedByOtherDaemon,
+            ..
+        })
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,6 +331,49 @@ mod tests {
             .expect("terminal snapshot");
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         assert_eq!(operations.active_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn owned_by_other_daemon_failure_is_retried() {
+        let operations = SessionMigrationOperations::default();
+        let session_id = SessionId::new();
+        let first = operations
+            .start_or_join(snapshot(session_id), |_| async {
+                SessionOpenTerminalOutcome::Failed {
+                    kind: SessionOpenFailureKind::OwnedByOtherDaemon,
+                    message: "owner exited after this failure".to_owned(),
+                    backup_path: None,
+                }
+            })
+            .await;
+        let mut first_receiver = first.subscribe();
+        first_receiver
+            .wait_for(|state| state.outcome.is_some())
+            .await
+            .expect("first terminal snapshot");
+
+        let retry_snapshot = snapshot(session_id);
+        let retry_operation_id = retry_snapshot.operation_id;
+        let runs = Arc::new(AtomicUsize::new(0));
+        let retry_runs = Arc::clone(&runs);
+        let retry = operations
+            .start_or_join(retry_snapshot, move |_| async move {
+                retry_runs.fetch_add(1, Ordering::SeqCst);
+                SessionOpenTerminalOutcome::Ready
+            })
+            .await;
+        assert!(!Arc::ptr_eq(&first, &retry));
+        assert_eq!(retry.snapshot().operation_id, retry_operation_id);
+        let mut retry_receiver = retry.subscribe();
+        retry_receiver
+            .wait_for(|state| state.outcome.is_some())
+            .await
+            .expect("retry terminal snapshot");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            retry.snapshot().outcome,
+            Some(SessionOpenTerminalOutcome::Ready)
+        );
     }
 
     #[tokio::test]
