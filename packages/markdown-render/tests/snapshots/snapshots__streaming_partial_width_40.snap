@@ -1,0 +1,20 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: snapshot
+---
+== code ==
+00 │ ┌─ rust
+01 │ │ fn main() {
+02 │ └─
+== inline ==
+00 │ Text with **unfinished emphasis and [unf
+01 │ inished link](https://example.com
+== structures ==
+00 │ ┌─────────┬───────┐
+01 │ │ Name    │ Value │
+02 │ ├─────────┼───────┤
+03 │ │ partial │       │
+04 │ └─────────┴───────┘
+05 │ 
+06 │ •  first
+07 │ •  unfinished

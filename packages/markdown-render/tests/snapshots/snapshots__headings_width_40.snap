@@ -1,0 +1,15 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "styled_snapshot(HEADINGS, 40)"
+---
+00 │ [fg=cyan,bold]Heading 1[/]
+01 │ 
+02 │ [fg=cyan,bold]Heading 2[/]
+03 │ 
+04 │ [fg=cyan,bold]Heading 3[/]
+05 │ 
+06 │ [fg=cyan,bold]Heading 4[/]
+07 │ 
+08 │ [fg=cyan,bold]Heading 5[/]
+09 │ 
+10 │ [fg=cyan,bold]Heading 6[/]

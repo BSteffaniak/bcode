@@ -1,0 +1,11 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "visible_snapshot(PARAGRAPHS, 40)"
+---
+00 │ Paragraph one with a soft break and a
+01 │ hard break.
+02 │ Paragraph two.
+03 │ 
+04 │ ────────────────────────────────────────
+05 │ 
+06 │ After rule.

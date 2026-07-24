@@ -83,8 +83,6 @@ impl Default for MarkdownTheme {
 pub struct MarkdownRenderOptions {
     /// Available terminal width in cells.
     pub width: u16,
-    /// Whether the source Markdown is still streaming.
-    pub streaming: bool,
     /// Theme used for terminal Markdown styles.
     pub theme: MarkdownTheme,
 }
@@ -94,7 +92,6 @@ impl Default for MarkdownRenderOptions {
     fn default() -> Self {
         Self {
             width: 80,
-            streaming: false,
             theme: MarkdownTheme::default(),
         }
     }
@@ -114,13 +111,6 @@ impl MarkdownRenderOptions {
     #[must_use]
     pub const fn with_theme(mut self, theme: MarkdownTheme) -> Self {
         self.theme = theme;
-        self
-    }
-
-    /// Return options with streaming mode set.
-    #[must_use]
-    pub const fn streaming(mut self, streaming: bool) -> Self {
-        self.streaming = streaming;
         self
     }
 }
@@ -173,7 +163,7 @@ impl TextStyle {
     fn merge_container(self, container: &Container, theme: MarkdownTheme) -> Self {
         let mut output = self;
         if let Some(style) = semantic_markdown_style(container, theme) {
-            output.style = style;
+            output.style = output.style.patch(style);
         } else if let Some(color) = container.color {
             output.style = output.style.fg(hyperchad_color_to_tui(color));
         }
@@ -182,20 +172,20 @@ impl TextStyle {
             .iter()
             .any(|class| class == "markdown-link")
         {
-            output.style = theme.link;
+            output.style = output.style.patch(theme.link);
         }
         if container
             .classes
             .iter()
             .any(|class| class == "markdown-strong")
         {
-            output.style = theme.strong;
+            output.style = output.style.patch(theme.strong);
         }
         if container.classes.iter().any(|class| class == "markdown-em") {
-            output.style = theme.emphasis;
+            output.style = output.style.patch(theme.emphasis);
         }
         if container.font_weight.is_some_and(is_bold_weight) {
-            output.style = theme.strong;
+            output.style = output.style.patch(theme.strong);
         }
         if container
             .text_decoration
@@ -209,7 +199,7 @@ impl TextStyle {
             .as_ref()
             .is_some_and(|decoration| decoration.line.contains(&TextDecorationLine::LineThrough))
         {
-            output.style = theme.strikethrough;
+            output.style = output.style.patch(theme.strikethrough);
         }
         output
     }
@@ -244,8 +234,24 @@ impl TerminalMarkdownRenderer {
     }
 
     fn render_container_children(&mut self, container: &Container, style: TextStyle) {
-        for child in &container.children {
-            self.render_container(child, style);
+        let mut children = container.children.iter().peekable();
+        while let Some(child) = children.next() {
+            if let Element::Image { alt, source, .. } = &child.element {
+                let parsed_alt = children.peek().and_then(|next| match &next.element {
+                    Element::Text { value } if !value.is_empty() => Some(value.as_str()),
+                    _ => None,
+                });
+                if parsed_alt.is_some() {
+                    children.next();
+                }
+                let image = parsed_alt
+                    .or_else(|| alt.as_deref().filter(|value| !value.is_empty()))
+                    .or_else(|| source.as_deref().filter(|value| !value.is_empty()))
+                    .unwrap_or("image");
+                self.push_text(&format!("[image: {image}]"), style);
+            } else {
+                self.render_container(child, style);
+            }
         }
     }
 
@@ -297,7 +303,8 @@ impl TerminalMarkdownRenderer {
                 let image = alt
                     .as_deref()
                     .filter(|value| !value.is_empty())
-                    .unwrap_or_else(|| source.as_deref().unwrap_or("image"));
+                    .or_else(|| source.as_deref().filter(|value| !value.is_empty()))
+                    .unwrap_or("image");
                 self.push_text(&format!("[image: {image}]"), style);
             }
             _ => {
@@ -1087,35 +1094,29 @@ mod tests {
     }
 
     #[test]
-    fn options_builder_sets_width_streaming_and_theme() {
+    fn options_builder_sets_width_and_theme() {
         let theme = MarkdownTheme {
             horizontal_rule: Style::new().fg(Color::Green),
             ..MarkdownTheme::default()
         };
-        let options = MarkdownRenderOptions::new(42)
-            .streaming(true)
-            .with_theme(theme);
+        let options = MarkdownRenderOptions::new(42).with_theme(theme);
 
         assert_eq!(options.width, 42);
-        assert!(options.streaming);
         assert_eq!(options.theme.horizontal_rule, Style::new().fg(Color::Green));
     }
 
     #[test]
-    fn streaming_partial_code_fence_renders() {
-        let output = render_markdown_lines(
-            "```rust\nfn main() {",
-            MarkdownRenderOptions::new(80).streaming(true),
-        )
-        .into_iter()
-        .map(|line| {
-            line.spans
-                .into_iter()
-                .map(|span| span.content)
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    fn partial_code_fence_renders() {
+        let output = render_markdown_lines("```rust\nfn main() {", MarkdownRenderOptions::new(80))
+            .into_iter()
+            .map(|line| {
+                line.spans
+                    .into_iter()
+                    .map(|span| span.content)
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
 
         assert!(output.contains("fn main()"));
     }

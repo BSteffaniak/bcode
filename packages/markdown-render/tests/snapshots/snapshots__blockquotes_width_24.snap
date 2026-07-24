@@ -1,0 +1,13 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "visible_snapshot(BLOCKQUOTES, 24)"
+---
+00 │ │ outer line that wraps 
+01 │ │ because it is delibera
+02 │ │ tely long for the cons
+03 │ │ trained width
+04 │ │ second paragraph
+05 │ │ │ nested quote
+06 │ │ 
+07 │ │ •  quoted list one
+08 │ │ •  quoted list two

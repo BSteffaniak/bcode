@@ -1,0 +1,10 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "visible_snapshot(LISTS_TIGHT_LOOSE, 34)"
+---
+00 │ •  tight one
+01 │ •  tight two
+02 │ •  loose one
+03 │    second paragraph in loose one
+04 │ •  loose two
+05 │    │ quote in loose item

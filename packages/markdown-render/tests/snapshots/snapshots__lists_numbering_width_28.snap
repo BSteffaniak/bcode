@@ -1,0 +1,20 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "visible_snapshot(LISTS_NUMBERING, 28)"
+---
+00 │ 1.  starts at seven
+01 │ 2.  next item
+02 │ 3.  item with enough text to
+03 │      wrap beneath a multi-di
+04 │     git marker at narrow wid
+05 │     th
+06 │ 4.  ten
+07 │ 5.  ordered parent
+08 │     •  unordered child
+09 │        1.  ordered grandchil
+10 │            d
+11 │ 
+12 │ •  unordered parent
+13 │    1.  ordered child
+14 │        •  unordered grandchi
+15 │           ld

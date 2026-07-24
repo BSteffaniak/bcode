@@ -1,0 +1,16 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "visible_snapshot(CODE_BLOCKS, 40)"
+---
+00 │ ┌─ rust
+01 │ │ fn main() {}
+02 │ └─
+03 │ 
+04 │ ┌─
+05 │ │ plain fenced
+06 │ └─
+07 │ 
+08 │ ┌─
+09 │ │ indented code
+10 │ │ second line
+11 │ └─

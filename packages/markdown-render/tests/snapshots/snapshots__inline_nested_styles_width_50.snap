@@ -1,0 +1,8 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "styled_snapshot(INLINE_NESTED, 50)"
+---
+00 │ Nested [bold,italic]bold italic[/], [bold]bold with [/][bold,italic]inner italic[/], [italic]italic[/]
+01 │ [italic] with [/][bold,italic]inner bold[/], and [bold,crossed-out]removed bold[/].
+02 │ Whitespace collapses around [fg=yellow]inline code[/] and escape
+03 │ d [fg=yellow]`tick`[/].

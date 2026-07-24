@@ -2,11 +2,23 @@ use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
 use bmux_tui::prelude::{Color, Line, Modifier, Style};
 use unicode_width::UnicodeWidthStr;
 
+const BLOCKQUOTES: &str = include_str!("fixtures/blockquotes.md");
 const BLOCKS: &str = include_str!("fixtures/blocks.md");
+const CODE_BLOCKS: &str = include_str!("fixtures/code_blocks.md");
 const COMPOSITION: &str = include_str!("fixtures/composition.md");
+const HEADINGS: &str = include_str!("fixtures/headings.md");
+const HTML_XSS: &str = include_str!("fixtures/html_xss.md");
+const IMAGES: &str = include_str!("fixtures/images.md");
 const INLINE: &str = include_str!("fixtures/inline.md");
+const INLINE_NESTED: &str = include_str!("fixtures/inline_nested.md");
 const LINKS_IMAGES: &str = include_str!("fixtures/links_images.md");
 const LISTS: &str = include_str!("fixtures/lists.md");
+const LISTS_NUMBERING: &str = include_str!("fixtures/lists_numbering.md");
+const LISTS_TIGHT_LOOSE: &str = include_str!("fixtures/lists_tight_loose.md");
+const PARAGRAPHS: &str = include_str!("fixtures/paragraphs.md");
+const STREAMING_CODE: &str = include_str!("fixtures/streaming_code.md");
+const STREAMING_INLINE: &str = include_str!("fixtures/streaming_inline.md");
+const STREAMING_STRUCTURES: &str = include_str!("fixtures/streaming_structures.md");
 const TABLE_FORMATTED: &str = include_str!("fixtures/table_formatted.md");
 const TABLE_MULTIPLE_ROWS: &str = include_str!("fixtures/table_multiple_rows.md");
 const TABLE_SINGLE_ROW: &str = include_str!("fixtures/table_single_row.md");
@@ -19,7 +31,11 @@ fn render(markdown: &str, width: u16) -> Vec<Line> {
 }
 
 fn visible_snapshot(markdown: &str, width: u16) -> String {
-    render(markdown, width)
+    visible_lines_snapshot(&render(markdown, width))
+}
+
+fn visible_lines_snapshot(lines: &[Line]) -> String {
+    lines
         .iter()
         .enumerate()
         .map(|(index, line)| {
@@ -117,6 +133,31 @@ fn color_label(color: Color) -> String {
 }
 
 #[test]
+fn snapshots_all_heading_levels_at_width_40() {
+    insta::assert_snapshot!("headings_width_40", styled_snapshot(HEADINGS, 40));
+}
+
+#[test]
+fn snapshots_paragraph_breaks_and_rules_at_width_40() {
+    insta::assert_snapshot!("paragraphs_width_40", visible_snapshot(PARAGRAPHS, 40));
+}
+
+#[test]
+fn snapshots_horizontal_rule_at_width_3() {
+    insta::assert_snapshot!("horizontal_rule_width_3", visible_snapshot("---", 3));
+}
+
+#[test]
+fn snapshots_nested_and_wrapped_blockquotes_at_width_24() {
+    insta::assert_snapshot!("blockquotes_width_24", visible_snapshot(BLOCKQUOTES, 24));
+}
+
+#[test]
+fn snapshots_fenced_and_indented_code_at_width_40() {
+    insta::assert_snapshot!("code_blocks_width_40", visible_snapshot(CODE_BLOCKS, 40));
+}
+
+#[test]
 fn snapshots_blocks_at_width_40() {
     insta::assert_snapshot!("blocks_width_40", visible_snapshot(BLOCKS, 40));
 }
@@ -124,6 +165,42 @@ fn snapshots_blocks_at_width_40() {
 #[test]
 fn snapshots_composition_at_width_40() {
     insta::assert_snapshot!("composition_width_40", styled_snapshot(COMPOSITION, 40));
+}
+
+#[test]
+fn snapshots_nested_inline_styles_at_width_50() {
+    insta::assert_snapshot!(
+        "inline_nested_styles_width_50",
+        styled_snapshot(INLINE_NESTED, 50)
+    );
+}
+
+#[test]
+fn snapshots_formatted_text_wrapping_at_width_16() {
+    insta::assert_snapshot!(
+        "inline_wrapped_styles_width_16",
+        styled_snapshot(
+            "**strong text wraps** and [linked text wraps](https://example.com)",
+            16
+        )
+    );
+}
+
+#[test]
+fn snapshots_images_and_fallbacks_at_width_40() {
+    insta::assert_snapshot!("images_width_40", visible_snapshot(IMAGES, 40));
+}
+
+#[test]
+fn snapshots_html_and_xss_output_at_width_80() {
+    insta::assert_snapshot!("html_xss_width_80", visible_snapshot(HTML_XSS, 80));
+}
+
+#[test]
+fn dangerous_html_is_escaped_and_not_executably_rendered() {
+    let output = visible_snapshot(HTML_XSS, 80);
+    assert!(!output.contains("<script>"));
+    assert!(output.contains("&amp;lt;script&amp;gt;"));
 }
 
 #[test]
@@ -142,8 +219,38 @@ fn snapshots_links_images_escapes_and_entities_at_width_40() {
 }
 
 #[test]
+fn snapshots_tight_and_loose_lists_at_width_34() {
+    insta::assert_snapshot!(
+        "lists_tight_loose_width_34",
+        visible_snapshot(LISTS_TIGHT_LOOSE, 34)
+    );
+}
+
+#[test]
+fn snapshots_numbering_and_mixed_nested_lists_at_width_28() {
+    insta::assert_snapshot!(
+        "lists_numbering_width_28",
+        visible_snapshot(LISTS_NUMBERING, 28)
+    );
+}
+
+#[test]
 fn snapshots_lists_at_width_30() {
     insta::assert_snapshot!("lists_width_30", styled_snapshot(LISTS, 30));
+}
+
+#[test]
+fn snapshots_partial_streaming_inputs_at_width_40() {
+    let snapshot = [
+        "== code ==",
+        &visible_snapshot(STREAMING_CODE, 40),
+        "== inline ==",
+        &visible_snapshot(STREAMING_INLINE, 40),
+        "== structures ==",
+        &visible_snapshot(STREAMING_STRUCTURES, 40),
+    ]
+    .join("\n");
+    insta::assert_snapshot!("streaming_partial_width_40", snapshot);
 }
 
 #[test]
@@ -217,6 +324,15 @@ fn rendered_lines_respect_requested_width_for_wrappable_text() {
                 UnicodeWidthStr::width(text.as_str()) <= usize::from(width.max(1)),
                 "line exceeds width {width}: {text:?}"
             );
+        }
+    }
+}
+
+#[test]
+fn defensive_widths_do_not_panic_for_supported_structures() {
+    for width in [0_u16, 1] {
+        for markdown in [BLOCKS, INLINE, LISTS, TABLE_MULTIPLE_ROWS, UNICODE] {
+            let _ = render(markdown, width);
         }
     }
 }

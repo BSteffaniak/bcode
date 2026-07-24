@@ -961,15 +961,7 @@ fn push_assistant_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) 
     } else {
         Color::Green
     };
-    push_markdown_message_block(
-        rows,
-        title,
-        item.text(),
-        color,
-        width,
-        item.streaming(),
-        true,
-    );
+    push_markdown_message_block(rows, title, item.text(), color, width, true);
 }
 
 fn push_markdown_message_block(
@@ -978,7 +970,6 @@ fn push_markdown_message_block(
     body: &str,
     color: Color,
     width: u16,
-    streaming: bool,
     prominent: bool,
 ) {
     let heading_style = if prominent {
@@ -1003,7 +994,7 @@ fn push_markdown_message_block(
     } else {
         for line in render_markdown_lines(
             body,
-            MarkdownRenderOptions::new(width.saturating_sub(2).max(1)).streaming(streaming),
+            MarkdownRenderOptions::new(width.saturating_sub(2).max(1)),
         ) {
             let mut spans = vec![Span::styled("  ", muted_style())];
             spans.extend(line.spans);
@@ -1020,15 +1011,7 @@ fn push_reasoning_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) 
     } else {
         "Reasoning"
     };
-    push_markdown_message_block(
-        rows,
-        title,
-        item.text(),
-        Color::BrightBlack,
-        width,
-        item.streaming(),
-        false,
-    );
+    push_markdown_message_block(rows, title, item.text(), Color::BrightBlack, width, false);
 }
 
 #[derive(Clone, Copy)]
