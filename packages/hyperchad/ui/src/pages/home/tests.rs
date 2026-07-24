@@ -17,8 +17,9 @@ use bcode_session_models::{RuntimeWorkStatus, ToolArtifact, WorkId};
 use bcode_session_view_models::{
     ChatMessageView, CompactionView, CompactionViewStatus, InteractionViewSummary,
     PermissionBatchView, PermissionView, RuntimeWorkView, SessionViewSnapshot, SkillView,
-    SkillViewStatus, TextFormat, ToolArtifactView, ToolResultView, TranscriptViewItem,
-    TranscriptViewItemId, TranscriptViewItemKind,
+    SkillViewStatus, TextFormat, ToolArtifactView, ToolInvocationView, ToolInvocationViewStatus,
+    ToolResultView, ToolTimingView, TranscriptViewItem, TranscriptViewItemId,
+    TranscriptViewItemKind,
 };
 
 fn container_text(container: &hyperchad_transformer::Container, text: &mut String) {
@@ -305,6 +306,72 @@ fn non_tool_usage_and_plugin_fixture_items() -> Vec<TranscriptViewItem> {
             },
         },
     )]
+}
+
+fn tool_fixture(status: ToolInvocationViewStatus) -> ToolInvocationView {
+    let terminal = matches!(
+        status,
+        ToolInvocationViewStatus::Finished
+            | ToolInvocationViewStatus::Failed
+            | ToolInvocationViewStatus::Cancelled
+    );
+    ToolInvocationView {
+        tool_call_id: format!("fixture-tool-{status:?}"),
+        producer_plugin_id: Some("fixture-plugin".to_owned()),
+        tool_name: Some("fixture.tool".to_owned()),
+        arguments_json: Some(r#"{"path":"/tmp/fixture"}"#.to_owned()),
+        working_directory: Some("/tmp".into()),
+        status,
+        result_text: terminal.then(|| "fixture result".to_owned()),
+        is_error: Some(status == ToolInvocationViewStatus::Failed),
+        result: None,
+        timing: ToolTimingView {
+            started_at_ms: Some(1_000),
+            finished_at_ms: terminal.then_some(2_250),
+            timeout_ms: None,
+            timed_out: None,
+            duration_ms: terminal.then_some(1_250),
+        },
+    }
+}
+
+#[test]
+fn every_tool_transcript_kind_and_lifecycle_state_renders() {
+    for status in [
+        ToolInvocationViewStatus::Requested,
+        ToolInvocationViewStatus::Running,
+        ToolInvocationViewStatus::Finished,
+        ToolInvocationViewStatus::Failed,
+        ToolInvocationViewStatus::Cancelled,
+    ] {
+        let lifecycle = transcript_fixture_item(
+            &format!("fixture-tool-lifecycle-{status:?}"),
+            status == ToolInvocationViewStatus::Running,
+            TranscriptViewItemKind::ToolInvocation {
+                tool: Box::new(tool_fixture(status)),
+            },
+        );
+        let rendered = container_text_all(&transcript_item(&lifecycle));
+        assert!(rendered.contains("fixture.tool"));
+        assert!(rendered.contains(match status {
+            ToolInvocationViewStatus::Requested => "requested",
+            ToolInvocationViewStatus::Running => "running",
+            ToolInvocationViewStatus::Finished => "finished",
+            ToolInvocationViewStatus::Failed => "failed",
+            ToolInvocationViewStatus::Cancelled => "cancelled",
+        }));
+    }
+
+    let request = transcript_fixture_item(
+        "fixture-tool-request",
+        false,
+        TranscriptViewItemKind::ToolRequest {
+            tool: Box::new(tool_fixture(ToolInvocationViewStatus::Requested)),
+        },
+    );
+    let rendered = container_text_all(&transcript_item(&request));
+    assert!(rendered.contains("fixture.tool"));
+    assert!(rendered.contains("requested"));
 }
 
 #[test]
@@ -1859,6 +1926,252 @@ fn filesystem_image_adapter_uses_guarded_context_resource() {
     assert!(urls[0].contains("artifact_id=image artifact / one"));
     assert!(urls[0].contains("reference_key=inline image"));
     assert!(!format!("{containers:?}").contains("bcode-artifact://"));
+}
+
+#[test]
+fn registered_adapters_reject_missing_required_fields_and_unsupported_versions() {
+    for ((schema, schema_version), _adapter) in VISUAL_ADAPTERS.iter() {
+        let missing = bcode_session_models::ToolContributionEvent {
+            invocation_id: "missing-call".to_owned(),
+            contribution_id: "missing-contribution".to_owned(),
+            sequence: 1,
+            producer_id: "fixture-plugin".to_owned(),
+            schema: (*schema).to_owned(),
+            schema_version: *schema_version,
+            operation: bcode_session_models::ToolContributionOperation::Upsert,
+            persistence: bcode_session_models::ToolContributionPersistence::Durable,
+            artifact: None,
+            payload: serde_json::json!({}),
+        };
+        let rendered = super::adapters::render_tool_contribution(
+            &missing,
+            bcode_session_models::ToolContributionPlacement::Request,
+        );
+        let rendered = container_text_all(&rendered);
+        assert!(!rendered.is_empty());
+        assert!(rendered.len() < 32_000);
+        let unsupported = bcode_session_models::ToolContributionEvent {
+            schema_version: schema_version.saturating_add(1),
+            ..missing
+        };
+        let rendered = super::adapters::render_tool_contribution(
+            &unsupported,
+            bcode_session_models::ToolContributionPlacement::Request,
+        );
+        assert!(container_text_all(&rendered).contains("tool request"));
+    }
+
+    for ((schema, schema_version), _adapter) in ARTIFACT_ADAPTERS.iter() {
+        let missing = ToolArtifactView::from(ToolArtifact {
+            artifact_id: "missing-artifact".to_owned(),
+            producer_plugin_id: "fixture-plugin".to_owned(),
+            schema: (*schema).to_owned(),
+            schema_version: *schema_version,
+            tool_call_id: None,
+            title: None,
+            metadata: serde_json::json!({}),
+            refs: Vec::new(),
+        });
+        let rendered_missing = format!(
+            "{:?}",
+            render_tool_result(&ToolResultView::Artifact {
+                artifact: missing.clone()
+            })
+        );
+        assert!(!rendered_missing.is_empty());
+        assert!(rendered_missing.len() < 64_000);
+        let unsupported = ToolArtifactView::from(ToolArtifact {
+            schema_version: schema_version.saturating_add(1),
+            ..missing.artifact
+        });
+        let rendered = format!(
+            "{:?}",
+            render_tool_result(&ToolResultView::Artifact {
+                artifact: unsupported
+            })
+        );
+        assert!(rendered.contains("artifact details"));
+    }
+}
+
+#[test]
+fn rich_adapter_state_matrix_covers_empty_truncated_optional_error_and_fallbacks() {
+    let empty = ToolArtifactView::from(ToolArtifact {
+        artifact_id: "empty-search".to_owned(),
+        producer_plugin_id: "bcode.web-search".to_owned(),
+        schema: "bcode.web-search.search_results".to_owned(),
+        schema_version: 1,
+        tool_call_id: None,
+        title: None,
+        metadata: serde_json::json!({"query": "none", "results": []}),
+        refs: Vec::new(),
+    });
+    let empty = format!(
+        "{:?}",
+        render_tool_result(&ToolResultView::Artifact { artifact: empty })
+    );
+    assert!(empty.contains("No search results"));
+
+    let optional = ToolArtifactView::from(ToolArtifact {
+        artifact_id: "minimal-worktree".to_owned(),
+        producer_plugin_id: "bcode.worktree".to_owned(),
+        schema: "bcode.worktree.create_result".to_owned(),
+        schema_version: 1,
+        tool_call_id: None,
+        title: None,
+        metadata: serde_json::json!({"path": "/tmp/minimal"}),
+        refs: Vec::new(),
+    });
+    assert!(
+        format!(
+            "{:?}",
+            render_tool_result(&ToolResultView::Artifact { artifact: optional })
+        )
+        .contains("/tmp/minimal")
+    );
+
+    let truncated = ToolArtifactView::from(ToolArtifact {
+        artifact_id: "truncated-read".to_owned(),
+        producer_plugin_id: "bcode.filesystem".to_owned(),
+        schema: "bcode.filesystem.read".to_owned(),
+        schema_version: 1,
+        tool_call_id: None,
+        title: None,
+        metadata: serde_json::json!({
+            "path": "/tmp/large.txt",
+            "contents": "x".repeat(40_000),
+            "truncated": true
+        }),
+        refs: Vec::new(),
+    });
+    let truncated = format!(
+        "{:?}",
+        render_tool_result(&ToolResultView::Artifact {
+            artifact: truncated
+        })
+    );
+    assert!(truncated.contains("truncated"));
+
+    for status in [
+        ToolInvocationViewStatus::Requested,
+        ToolInvocationViewStatus::Running,
+        ToolInvocationViewStatus::Finished,
+        ToolInvocationViewStatus::Failed,
+        ToolInvocationViewStatus::Cancelled,
+    ] {
+        let rendered = container_text_all(&transcript_item(&transcript_fixture_item(
+            &format!("state-matrix-{status:?}"),
+            status == ToolInvocationViewStatus::Running,
+            TranscriptViewItemKind::ToolInvocation {
+                tool: Box::new(tool_fixture(status)),
+            },
+        )));
+        assert!(rendered.contains(match status {
+            ToolInvocationViewStatus::Requested => "requested",
+            ToolInvocationViewStatus::Running => "running",
+            ToolInvocationViewStatus::Finished => "finished",
+            ToolInvocationViewStatus::Failed => "failed",
+            ToolInvocationViewStatus::Cancelled => "cancelled",
+        }));
+    }
+}
+
+#[test]
+fn every_registered_visual_adapter_has_a_fixture() {
+    for ((schema, schema_version), adapter) in VISUAL_ADAPTERS.iter() {
+        let contribution = bcode_session_models::ToolContributionEvent {
+            invocation_id: format!("fixture-call:{schema}"),
+            contribution_id: format!("fixture:{schema}:{schema_version}"),
+            sequence: 1,
+            producer_id: "fixture-plugin".to_owned(),
+            schema: (*schema).to_owned(),
+            schema_version: *schema_version,
+            operation: bcode_session_models::ToolContributionOperation::Upsert,
+            persistence: bcode_session_models::ToolContributionPersistence::Durable,
+            artifact: None,
+            payload: visual_adapter_fixture(schema),
+        };
+        let rich = adapter(&contribution).unwrap_or_else(|| {
+            panic!("visual adapter fixture did not render {schema}@{schema_version}")
+        });
+        let rendered = format!("{rich:?}");
+        assert!(!rendered.is_empty());
+        assert!(!rendered.contains("tool request"));
+    }
+}
+
+fn visual_adapter_fixture(schema: &str) -> serde_json::Value {
+    let arguments = match schema {
+        "bcode.tool.request.shell.run" => serde_json::json!({
+            "command": "cargo test",
+            "cwd": "/tmp/fixture"
+        }),
+        "bcode.filesystem.change" => serde_json::json!({
+            "path": "/tmp/fixture.rs",
+            "old_text": "old",
+            "new_text": "new"
+        }),
+        schema if schema.starts_with("bcode.filesystem") => serde_json::json!({
+            "operation": schema.rsplit('.').next().unwrap_or("filesystem"),
+            "path": "/tmp/fixture.rs"
+        }),
+        "bcode.document.request" | "bcode.ocr.request" => serde_json::json!({
+            "operation": "extract",
+            "path": "/tmp/fixture.pdf"
+        }),
+        "bcode.web-search.search_request" => serde_json::json!({
+            "query": "fixture query",
+            "max_results": 5
+        }),
+        "bcode.web-search.fetch_request" => serde_json::json!({
+            "url": "https://example.com/fixture"
+        }),
+        "bcode.web-search.status_request" | "bcode.web-search.inspect_request" => {
+            serde_json::json!({
+                "operation": schema.rsplit('.').next().unwrap_or("web"),
+                "url": "https://example.com/fixture"
+            })
+        }
+        "bcode.git.clone_request" => serde_json::json!({
+            "url": "https://example.com/repository.git",
+            "destination": "/tmp/repository",
+            "ref": "main"
+        }),
+        "bcode.worktree.request" => serde_json::json!({
+            "operation": "create",
+            "name": "fixture",
+            "path": "/tmp/worktree",
+            "branch": "fixture"
+        }),
+        "bcode.vim-edit.request.preview" | "bcode.vim-edit.request.apply" => {
+            serde_json::json!({
+                "operation": "preview",
+                "path": "/tmp/fixture.rs",
+                "steps": [{"insert": "fixture"}]
+            })
+        }
+        "bcode.vim-edit.live" => serde_json::json!({
+            "phase": "running",
+            "path": "/tmp/fixture.rs",
+            "step_index": 1,
+            "step_total": 2,
+            "message": "applying edit"
+        }),
+        "bcode.vim-edit.playback" => serde_json::json!({
+            "success": true,
+            "path": "/tmp/fixture.rs",
+            "tool_mode": "preview",
+            "changed": true,
+            "summary": "edit completed",
+            "diff": "-old\n+new"
+        }),
+        _ => serde_json::json!({"operation": "fixture"}),
+    };
+    if matches!(schema, "bcode.vim-edit.live" | "bcode.vim-edit.playback") {
+        arguments
+    } else {
+        serde_json::json!({"arguments": arguments})
+    }
 }
 
 #[test]

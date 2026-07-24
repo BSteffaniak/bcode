@@ -2204,6 +2204,7 @@ dependencies = [
  "bcode_fake_provider_plugin",
  "bcode_filesystem_plugin",
  "bcode_hyperchad",
+ "bcode_hyperchad_ui",
  "bcode_ipc",
  "bcode_metrics",
  "bcode_model",

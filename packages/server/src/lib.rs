@@ -26690,6 +26690,140 @@ library = "test"
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn queued_and_steered_message_admissions_cover_active_runtime_windows() {
+        let workspace = tempfile::tempdir().expect("message admission workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("message admission session manager");
+        let session = sessions
+            .create_session(
+                Some("message admission fixture".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("message admission session");
+        let state = Arc::new(test_server_state(sessions));
+        let (followup_commands, mut followup_receiver) = mpsc::channel(8);
+        let (steering_commands, mut steering_receiver) = mpsc::channel(8);
+        let (cancel_commands, _cancel_receiver) = mpsc::channel(1);
+        let handle = SessionRuntimeHandle {
+            followup_commands,
+            steering_commands,
+            cancel_commands,
+            queued_followups: Arc::new(AtomicUsize::new(0)),
+            queued_steering: Arc::new(AtomicUsize::new(0)),
+            phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+            current_turn: Arc::new(Mutex::new(None)),
+        };
+        state
+            .session_runtimes
+            .lock()
+            .await
+            .insert(session.id, handle.clone());
+        let client_id = ClientId::new();
+
+        *handle.phase.lock().await = SessionRuntimePhase::ProviderActive;
+        *handle.current_turn.lock().await = Some(RuntimeCurrentTurn {
+            kind: RuntimeOperationKind::ModelTurn,
+            client_id,
+            turn_id: "provider-active-turn".to_owned(),
+            cancel_state: Arc::new(TurnCancelState::default()),
+            model: Some(ModelRequestAttempt {
+                identity: bcode_session_models::ModelRequestIdentity {
+                    provider_plugin_id: "fixture-provider".to_owned(),
+                    requested_model_id: None,
+                    effective_model_id: "fixture-model".to_owned(),
+                    request_id: "provider-active-request".to_owned(),
+                    model_turn_id: "provider-active-turn".to_owned(),
+                    round: 0,
+                    request_fingerprint: "fixture-fingerprint".to_owned(),
+                    effective_auth_profile: None,
+                    context_format_version: None,
+                    compatibility_key: None,
+                    context_epoch: 0,
+                },
+                provider_turn_id: "provider-active-turn".to_owned(),
+                reuse_key: None,
+                request_message_count: 1,
+                context_through_sequence: 1,
+                portable_context: String::new(),
+                local_estimate: bcode_session_models::LocalContextEstimate {
+                    tokens: 0,
+                    algorithm_version: 1,
+                },
+                managed_compaction_persisted: false,
+            }),
+        });
+        let steering = enqueue_user_message_command(
+            &state,
+            session.id,
+            client_id,
+            None,
+            "steer while streaming".to_owned(),
+            bcode_ipc::PromptPlacement::Steering,
+        )
+        .await
+        .expect("steering admission");
+        assert_eq!(
+            steering.disposition,
+            bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
+        );
+        assert!(steering.queued);
+        assert!(matches!(
+            followup_receiver.try_recv(),
+            Ok(FollowupCommand::ExecuteTurn {
+                queued_steering: Some(_),
+                ..
+            })
+        ));
+
+        let follow_up = enqueue_user_message_command(
+            &state,
+            session.id,
+            client_id,
+            None,
+            "explicit follow-up".to_owned(),
+            bcode_ipc::PromptPlacement::FollowUp,
+        )
+        .await
+        .expect("follow-up admission");
+        assert_eq!(
+            follow_up.disposition,
+            bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
+        );
+        assert!(follow_up.queued);
+        assert!(matches!(
+            followup_receiver.try_recv(),
+            Ok(FollowupCommand::ExecuteTurn {
+                queued_steering: None,
+                ..
+            })
+        ));
+
+        *handle.phase.lock().await = SessionRuntimePhase::PreparingModelRequest;
+        *handle.current_turn.lock().await = None;
+        let applied = enqueue_user_message_command(
+            &state,
+            session.id,
+            client_id,
+            None,
+            "steer before request".to_owned(),
+            bcode_ipc::PromptPlacement::Steering,
+        )
+        .await
+        .expect("applied steering admission");
+        assert_eq!(
+            applied.disposition,
+            bcode_ipc::MessageAcceptanceDisposition::AppliedSteering
+        );
+        assert!(!applied.queued);
+        assert!(matches!(
+            steering_receiver.try_recv(),
+            Ok(SteeringCommand { text, .. }) if text == "steer before request"
+        ));
+    }
+
+    #[tokio::test]
     async fn server_web_search_invocation_uses_prepared_generic_provider_route() {
         let workspace = tempfile::tempdir().expect("native search workspace");
         let sessions = SessionManager::persistent(workspace.path().join("sessions"))
@@ -28462,7 +28596,7 @@ library = "test"
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
-    async fn guarded_web_routes_load_daemon_state_and_execute_actions() {
+    async fn guarded_web_end_to_end_fixture_covers_state_actions_and_targeted_render() {
         let workspace = tempfile::tempdir().expect("web route workspace");
         let sessions = SessionManager::persistent(workspace.path().join("sessions"))
             .expect("persistent session manager");
@@ -28572,6 +28706,7 @@ library = "test"
             .expect("other session content");
         let other_selected = format!("{other_selected:?}");
         assert!(other_selected.contains("other-session-draft"));
+        assert!(other_selected.contains("no conversation entries"));
         assert!(!other_selected.contains("selected-session-draft"));
 
         let reselected = router
@@ -28941,6 +29076,34 @@ library = "test"
         for permission in batched_permissions {
             assert_eq!(*permission.decision.lock().await, Some(false));
         }
+
+        let app_state = bcode_hyperchad::HyperChadAppState::new(
+            bcode_client::BcodeClient::new(endpoint.clone()),
+            "end-to-end-token",
+        );
+        let final_snapshot = app_state
+            .session_snapshot(session.id)
+            .await
+            .expect("end-to-end final snapshot");
+        let final_sessions = bcode_client::BcodeClient::new(endpoint.clone())
+            .list_sessions()
+            .await
+            .expect("end-to-end session list");
+        let final_fragment = bcode_hyperchad_ui::pages::home::home_content(
+            &final_snapshot,
+            &final_sessions,
+            &bcode_hyperchad_ui::context::StaticPresentationContext,
+        )
+        .into_iter()
+        .next()
+        .expect("end-to-end targeted snapshot");
+        assert_eq!(
+            final_fragment.str_id.as_deref(),
+            Some("bcode-application-content")
+        );
+        let final_render = format!("{final_fragment:?}");
+        assert!(final_render.contains("web-route-message"));
+        assert!(final_render.contains("load older history"));
         server.abort();
     }
 

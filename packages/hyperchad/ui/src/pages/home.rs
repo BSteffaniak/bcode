@@ -24,7 +24,7 @@ pub(super) fn semantic_dom_id(prefix: &str, value: &str) -> String {
     format!("{prefix}-{hash:016x}-{}", value.len())
 }
 
-pub use shell::home;
+pub use shell::{home, home_content};
 
 #[cfg(test)]
 mod tests;

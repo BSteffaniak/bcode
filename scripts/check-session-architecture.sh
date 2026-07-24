@@ -17,7 +17,7 @@ if [[ -z "$current_event_schema" || "$current_event_schema" != "$fixture_baselin
 fi
 
 retired_event_pattern='interactive_tool_request_created|interactive_tool_request_resolved|plugin_automation_turn_started|plugin_automation_turn_finished|tool_invocation_presentation|request_presentation'
-if rg -n "$retired_event_pattern" packages/session/src packages/session/models/src packages/server/src packages/ipc/src packages/tui/src packages/web-render/src --glob '*.rs' \
+if rg -n "$retired_event_pattern" packages/session/src packages/session/models/src packages/server/src packages/ipc/src packages/tui/src packages/hyperchad/src packages/hyperchad/ui/src --glob '*.rs' \
   >/tmp/bcode-retired-session-event-decoders.txt; then
   echo "Session hard-cutover violation: a named retired event decoder or presentation field was reintroduced." >&2
   cat /tmp/bcode-retired-session-event-decoders.txt >&2

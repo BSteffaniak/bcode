@@ -45,15 +45,15 @@ pub(super) fn status_notice(title: &str, detail: Option<&str>, tone: StatusTone)
     }
 }
 
-/// Render the reusable top-level application shell.
-pub(super) fn application_shell(
+/// Render the replaceable application content inside the stable browser shell.
+pub(super) fn application_content(
     header: &Containers,
     notices: &Containers,
     navigation: &Containers,
     content: &Containers,
 ) -> Containers {
     container! {
-        div #bcode-web-shell padding=(if_responsive("narrow").then::<i32>(space::MD).or_else(space::XL)) background=(surface::APP) color=(color::TEXT) font-family=(typeface::UI) {
+        div #bcode-application-content {
             (header)
             (notices)
             div #application-layout direction=(if_responsive("tablet").then(LayoutDirection::Column).or_else(LayoutDirection::Row)) gap=(space::S18) align-items=start {

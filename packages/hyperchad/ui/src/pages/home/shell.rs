@@ -14,7 +14,7 @@ use super::activity::{
     unrepresented_active_invocations, unrepresented_runtime_work,
 };
 use super::components::{
-    StatusTone, application_shell, composer_panel, section_panel, status_badge, status_notice,
+    StatusTone, application_content, composer_panel, section_panel, status_badge, status_notice,
 };
 use super::composer::composer;
 use super::interactions::interaction_request;
@@ -84,6 +84,23 @@ const fn catalog_notice(
 /// Render the Bcode `HyperChad` application shell.
 #[must_use]
 pub fn home(
+    snapshot: &SessionViewSnapshot,
+    sessions: &[SessionSummary],
+    context: &impl PresentationContext,
+) -> Containers {
+    let application = home_content(snapshot, sessions, context);
+    let shell = container! {
+        div #bcode-web-shell padding=(if_responsive("narrow").then::<i32>(space::MD).or_else(space::XL)) background=(surface::APP) color=(color::TEXT) font-family=(typeface::UI) {
+            (application)
+        }
+    };
+    debug_assert_eq!(shell.len(), 1);
+    shell
+}
+
+/// Render the stable, targeted application fragment used by live browser updates.
+#[must_use]
+pub fn home_content(
     snapshot: &SessionViewSnapshot,
     sessions: &[SessionSummary],
     context: &impl PresentationContext,
@@ -175,7 +192,7 @@ pub fn home(
         }
         (composer_panel(&composer(snapshot, context)))
     };
-    application_shell(
+    application_content(
         &header,
         &notices,
         &session_navigation(

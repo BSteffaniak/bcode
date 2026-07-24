@@ -21,17 +21,53 @@ const ACCESSIBILITY_CSS: &str = r#"
     outline: 3px solid #58a6ff;
     outline-offset: 3px;
 }
-:where(button, input:not([type="hidden"]), select) {
+:where(button, input:not([type="hidden"]), select, summary) {
     min-height: 44px;
+}
+:where(button, input:not([type="hidden"]), select, textarea, summary) {
+    min-width: 44px;
+}
+:where(button, input, select, textarea) {
+    font: inherit;
 }
 textarea {
     min-height: 88px;
+    resize: vertical;
+}
+html, body {
+    max-width: 100%;
+    overflow-x: hidden;
+}
+#bcode-web-shell, #bcode-application-content, #application-layout, #conversation-main {
+    box-sizing: border-box;
+    max-width: 100%;
+}
+@media (max-width: 900px) {
+    #application-layout {
+        flex-direction: column;
+    }
+    #session-navigation, #conversation-main {
+        width: 100%;
+    }
+}
+@media (max-width: 600px) {
+    #bcode-web-shell {
+        padding: 16px;
+    }
+    button, input, select, textarea {
+        max-width: 100%;
+    }
 }
 :where(pre, code) {
     max-width: 100%;
     overflow-x: auto;
+    overflow-wrap: anywhere;
+}
+:where(p, li, dd, blockquote, a) {
+    overflow-wrap: anywhere;
 }
 img {
+    height: auto;
     max-width: 100%;
 }
 "#;

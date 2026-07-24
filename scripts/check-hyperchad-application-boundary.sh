@@ -228,6 +228,11 @@ for token in (
     "ACCESSIBILITY_CSS",
     ":focus-visible",
     "min-height: 44px",
+    "min-width: 44px",
+    "overflow-x: hidden",
+    "overflow-wrap: anywhere",
+    "@media (max-width: 900px)",
+    "@media (max-width: 600px)",
     "render_scope(",
     "hyperchad-event-scope=",
 ):

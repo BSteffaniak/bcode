@@ -1917,6 +1917,29 @@ async fn watch_session_updates(context: SessionWatchContext) -> Result<(), Clien
     }
 }
 
+#[cfg(any(test, feature = "renderer-html-actix"))]
+fn live_update_fragment(
+    snapshot: &SessionViewSnapshot,
+    sessions: &[SessionSummary],
+    context: &impl bcode_hyperchad_ui::context::PresentationContext,
+) -> Option<hyperchad::renderer::transformer::Container> {
+    let mut containers = bcode_hyperchad_ui::pages::home::home_content(snapshot, sessions, context);
+    (containers.len() == 1).then(|| containers.remove(0))
+}
+
+#[cfg(test)]
+fn live_update_view(
+    snapshot: &SessionViewSnapshot,
+    sessions: &[SessionSummary],
+    context: &impl bcode_hyperchad_ui::context::PresentationContext,
+) -> Option<hyperchad::renderer::View> {
+    live_update_fragment(snapshot, sessions, context).map(|fragment| {
+        hyperchad::renderer::View::builder()
+            .with_fragment(fragment)
+            .build()
+    })
+}
+
 /// Configure scoped live snapshot rendering through a `HyperChad` renderer.
 #[cfg(feature = "renderer-html-actix")]
 pub fn configure_live_updates<R>(renderer: &R, state: &HyperChadAppState)
@@ -1933,12 +1956,15 @@ where
     tokio::spawn(async move {
         while let Some(update) = rx.recv().await {
             let context = html_actix::HtmlActixPresentationContext::new(Arc::clone(&access_token));
-            let containers =
-                bcode_hyperchad_ui::pages::home::home(&update.snapshot, &update.sessions, &context);
-            if let Err(error) = renderer
-                .render_scoped(update.scope.0, containers.into())
-                .await
-            {
+            let Some(fragment) = live_update_fragment(&update.snapshot, &update.sessions, &context)
+            else {
+                tracing::error!("HyperChad live update produced no application fragment");
+                continue;
+            };
+            let view = hyperchad::renderer::View::builder()
+                .with_fragment(fragment)
+                .build();
+            if let Err(error) = renderer.render_scoped(update.scope.0, view).await {
                 tracing::error!("failed to render scoped HyperChad snapshot: {error}");
             }
         }
@@ -2473,8 +2499,15 @@ mod tests {
         assert!(html_actix::accessibility_css().contains(":focus-visible"));
         assert!(html_actix::accessibility_css().contains("outline: 3px solid #58a6ff"));
         assert!(html_actix::accessibility_css().contains("min-height: 44px"));
+        assert!(html_actix::accessibility_css().contains("min-width: 44px"));
+        assert!(html_actix::accessibility_css().contains("overflow-x: hidden"));
+        assert!(html_actix::accessibility_css().contains("overflow-wrap: anywhere"));
         assert!(html_actix::accessibility_css().contains("overflow-x: auto"));
         assert!(html_actix::accessibility_css().contains("max-width: 100%"));
+        assert!(html_actix::accessibility_css().contains("height: auto"));
+        assert!(html_actix::accessibility_css().contains("@media (max-width: 900px)"));
+        assert!(html_actix::accessibility_css().contains("@media (max-width: 600px)"));
+        assert!(html_actix::accessibility_css().contains("flex-direction: column"));
     }
 
     #[cfg(feature = "renderer-html-actix")]
@@ -2829,7 +2862,33 @@ mod tests {
 
     #[cfg(feature = "renderer-html-actix")]
     #[test]
+    fn live_updates_target_stable_application_content_fragment() {
+        let context =
+            html_actix::HtmlActixPresentationContext::new(Arc::<str>::from("fragment-token"));
+        let fragment = live_update_fragment(&SessionViewSnapshot::empty(), &[], &context)
+            .expect("application fragment");
+        assert_eq!(
+            fragment.str_id.as_deref(),
+            Some("bcode-application-content")
+        );
+        assert!(format!("{fragment:?}").contains("composer-region"));
+
+        let view = live_update_view(&SessionViewSnapshot::empty(), &[], &context)
+            .expect("application fragment view");
+        assert!(view.primary.is_none());
+        assert_eq!(view.fragments.len(), 1);
+        assert!(matches!(
+            &view.fragments[0].selector,
+            hyperchad::renderer::transformer::models::Selector::Id(id)
+                if id == "bcode-application-content"
+        ));
+    }
+
+    #[cfg(feature = "renderer-html-actix")]
+    #[test]
     fn representative_long_snapshot_render_measurement_stays_bounded() {
+        const LIVE_UPDATES: u32 = 20;
+
         let mut snapshot = SessionViewSnapshot::empty();
         snapshot.session_id = Some(SessionId::new());
         snapshot.connection_status =
@@ -2858,25 +2917,64 @@ mod tests {
 
         let context = html_actix::HtmlActixPresentationContext::new(Arc::from("measure-token"));
         let started = std::time::Instant::now();
-        let containers = bcode_hyperchad_ui::pages::home::home(&snapshot, &[], &context);
+        let initial_fragment = live_update_fragment(&snapshot, &[], &context)
+            .expect("representative application fragment");
         let build_elapsed = started.elapsed();
-        let root: hyperchad::renderer::transformer::Container = containers.into();
         let started = std::time::Instant::now();
         let html = hyperchad::renderer_html::html::container_to_html(
-            &root,
+            &initial_fragment,
             &hyperchad::renderer_html::DefaultHtmlTagRenderer::default(),
         )
         .expect("representative HTML");
         let html_elapsed = started.elapsed();
 
+        let live_started = std::time::Instant::now();
+        let mut transferred_bytes = 0_usize;
+        for update_index in 1..=LIVE_UPDATES {
+            let revision = u64::from(update_index) + 1;
+            snapshot.revision = revision;
+            snapshot.transcript.revision = revision;
+            let last = snapshot
+                .transcript
+                .items
+                .last_mut()
+                .expect("streaming transcript item");
+            last.revision = revision;
+            last.kind = bcode_session_view_models::TranscriptViewItemKind::AssistantMessage {
+                message: bcode_session_view_models::ChatMessageView::markdown(format!(
+                    "## Streamed response 499\n\n{} update {revision}",
+                    "representative bounded content ".repeat(20)
+                )),
+            };
+            let fragment =
+                live_update_fragment(&snapshot, &[], &context).expect("live application fragment");
+            assert_eq!(
+                fragment.str_id.as_deref(),
+                Some("bcode-application-content")
+            );
+            let update_html = hyperchad::renderer_html::html::container_to_html(
+                &fragment,
+                &hyperchad::renderer_html::DefaultHtmlTagRenderer::default(),
+            )
+            .expect("live update HTML");
+            assert!(!update_html.contains("id=\"bcode-web-shell\""));
+            transferred_bytes = transferred_bytes.saturating_add(update_html.len());
+        }
+        let live_elapsed = live_started.elapsed();
+        let updates_per_second =
+            f64::from(LIVE_UPDATES) / live_elapsed.as_secs_f64().max(f64::EPSILON);
+
         eprintln!(
-            "HyperChad representative scoped snapshot: build={build_elapsed:?} html={html_elapsed:?} bytes={}",
+            "HyperChad representative scoped snapshot: build={build_elapsed:?} html={html_elapsed:?} bytes={} live_updates={LIVE_UPDATES} live_elapsed={live_elapsed:?} updates_per_second={updates_per_second:.1} transferred_bytes={transferred_bytes}",
             html.len()
         );
         assert!(html.contains("Streamed response 499"));
         assert!(html.len() < 4 * 1024 * 1024);
         assert!(build_elapsed < std::time::Duration::from_secs(2));
         assert!(html_elapsed < std::time::Duration::from_secs(2));
+        assert!(live_elapsed < std::time::Duration::from_secs(5));
+        assert!(updates_per_second >= 4.0);
+        assert!(transferred_bytes < 80 * 1024 * 1024);
     }
 
     #[cfg(feature = "renderer-html-actix")]

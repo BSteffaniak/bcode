@@ -67,6 +67,7 @@ bcode_hyperchad = { workspace = true, features = [
     "renderer-html-actix",
     "static-bundled-question-plugin",
 ] }
+bcode_hyperchad_ui = { workspace = true }
 bcode_question_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_session_view = { workspace = true }
 bcode_session_view_models = { workspace = true }
