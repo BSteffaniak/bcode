@@ -20,24 +20,27 @@ pub mod tui_host_types;
 use bcode_code_review_models::{
     ArchiveReviewWorkspaceRequest, ArchiveReviewWorkspaceResponse, CreateReviewWorkspaceRequest,
     CreateReviewWorkspaceResponse, DeleteDraftRequest, DeleteDraftResponse, DraftAnchor,
-    DraftComment, GetReviewDiffRequest, GetReviewThreadRequest, GetReviewWorkspaceRequest,
-    GetReviewWorkspaceResponse, LinkThreadSessionRequest, LinkThreadSessionResponse,
-    ListDraftsRequest, ListDraftsResponse, ListReviewPublishersResponse,
-    ListReviewSuggestionsRequest, ListReviewSuggestionsResponse, ListReviewWorkspacesRequest,
-    ListReviewWorkspacesResponse, MaterializeReviewWorkspaceRequest,
-    MaterializeReviewWorkspaceResponse, OP_REVIEW_PUBLISH_RECORD_SAVE, OP_REVIEW_REPO_FILE_GET,
-    OP_REVIEW_WORKSPACE_ARCHIVE, OP_REVIEW_WORKSPACE_CREATE, OP_REVIEW_WORKSPACE_GET,
-    OP_REVIEW_WORKSPACE_LIST, OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE,
-    PublishReviewPreviewResponse, PublishReviewRequest, PublishReviewResponse,
-    RepositoryFileRequest, RepositoryFileResponse, ResolveThreadRequest, ResolveThreadResponse,
-    ReviewAnchorKind, ReviewBundle, ReviewBundleLine, ReviewBundleThread, ReviewContextRequest,
-    ReviewFile, ReviewFileStatus, ReviewFileSummary, ReviewHunk, ReviewLine, ReviewLineKind,
-    ReviewPublishRecord, ReviewPublisherCapabilities, ReviewPublisherManifest,
-    ReviewRepositoryCommit, ReviewScope, ReviewSource, ReviewSourceDiagnostic,
-    ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSuggestion, ReviewSuggestionStatus,
-    ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewThreadKind, ReviewThreadSeverity,
-    ReviewWorkspace, ReviewWorkspaceListItem, ReviewWorkspaceMaterialization, SaveDraftRequest,
-    SaveDraftResponse, SavePublishRecordRequest, SavePublishRecordResponse,
+    DraftComment, ExternalReviewImportRecord, GetReviewDiffRequest, GetReviewThreadRequest,
+    GetReviewWorkspaceRequest, GetReviewWorkspaceResponse, LinkThreadSessionRequest,
+    LinkThreadSessionResponse, ListDraftsRequest, ListDraftsResponse,
+    ListExternalReviewImportsRequest, ListExternalReviewImportsResponse, ListPublishRecordsRequest,
+    ListPublishRecordsResponse, ListReviewPublishersResponse, ListReviewSuggestionsRequest,
+    ListReviewSuggestionsResponse, ListReviewWorkspacesRequest, ListReviewWorkspacesResponse,
+    MaterializeReviewWorkspaceRequest, MaterializeReviewWorkspaceResponse,
+    OP_REVIEW_EXTERNAL_IMPORT_SAVE, OP_REVIEW_EXTERNAL_IMPORTS_LIST, OP_REVIEW_PUBLISH_RECORD_SAVE,
+    OP_REVIEW_PUBLISH_RECORDS_LIST, OP_REVIEW_REPO_FILE_GET, OP_REVIEW_WORKSPACE_ARCHIVE,
+    OP_REVIEW_WORKSPACE_CREATE, OP_REVIEW_WORKSPACE_GET, OP_REVIEW_WORKSPACE_LIST,
+    OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE, PublishReviewPreviewResponse,
+    PublishReviewRequest, PublishReviewResponse, RepositoryFileRequest, RepositoryFileResponse,
+    ResolveThreadRequest, ResolveThreadResponse, ReviewAnchorKind, ReviewBundle, ReviewBundleLine,
+    ReviewBundleThread, ReviewContextRequest, ReviewFile, ReviewFileStatus, ReviewFileSummary,
+    ReviewHunk, ReviewLine, ReviewLineKind, ReviewPublishRecord, ReviewPublisherCapabilities,
+    ReviewPublisherManifest, ReviewRepositoryCommit, ReviewScope, ReviewSource,
+    ReviewSourceDiagnostic, ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSuggestion,
+    ReviewSuggestionStatus, ReviewSurface, ReviewSurfaceKind, ReviewTarget, ReviewThreadKind,
+    ReviewThreadSeverity, ReviewWorkspace, ReviewWorkspaceListItem, ReviewWorkspaceMaterialization,
+    SaveDraftRequest, SaveDraftResponse, SaveExternalReviewImportRequest,
+    SaveExternalReviewImportResponse, SavePublishRecordRequest, SavePublishRecordResponse,
     SaveReviewSuggestionRequest, SaveReviewSuggestionResponse, UpdateDraftRequest,
     UpdateDraftResponse, UpdateReviewWorkspaceRequest, UpdateReviewWorkspaceResponse,
 };
@@ -180,6 +183,9 @@ impl RustPlugin for CodeReviewPlugin {
             OP_REVIEW_PUBLISH_PREVIEW => review_publish_preview(&context),
             OP_REVIEW_PUBLISH_SUBMIT => review_publish_submit(&context),
             OP_REVIEW_PUBLISH_RECORD_SAVE => review_publish_record_save(&context),
+            OP_REVIEW_PUBLISH_RECORDS_LIST => review_publish_records_list(&context),
+            OP_REVIEW_EXTERNAL_IMPORT_SAVE => review_external_import_save(&context),
+            OP_REVIEW_EXTERNAL_IMPORTS_LIST => review_external_imports_list(&context),
             _ => ServiceResponse::error(
                 "unsupported_operation",
                 "unsupported code review service operation",
@@ -888,6 +894,7 @@ fn review_bundle_for_request(
         workspace_id: workspace.id.clone(),
         target: request.target.clone(),
     });
+    let excluded_thread_anchors = request.excluded_thread_anchors;
     let threads = threads_from_drafts(
         list_drafts_for_request(
             &ListDraftsRequest {
@@ -900,6 +907,7 @@ fn review_bundle_for_request(
         .drafts,
     )
     .into_iter()
+    .filter(|thread| !excluded_thread_anchors.contains(&thread.anchor))
     .map(|thread| {
         let (mut selected_lines, selected_diff_lines, hunk_context) =
             context_for_anchor(&summary, &thread.anchor);
@@ -1134,6 +1142,114 @@ fn publish_preview_for_request(
     })
 }
 
+fn review_external_imports_list(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context
+        .request
+        .payload_json::<ListExternalReviewImportsRequest>()
+    {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match list_external_imports_for_request(&request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("external_imports_list_failed", error.to_string()),
+    }
+}
+
+fn list_external_imports_for_request(
+    request: &ListExternalReviewImportsRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<ListExternalReviewImportsResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let workspace_id = request.workspace_id.clone();
+    let records = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .list_external_imports(&workspace_id)
+                .await
+        })
+    })?;
+    Ok(ListExternalReviewImportsResponse { records })
+}
+
+fn review_external_import_save(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context
+        .request
+        .payload_json::<SaveExternalReviewImportRequest>()
+    {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match save_external_import_for_request(request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("external_import_save_failed", error.to_string()),
+    }
+}
+
+fn save_external_import_for_request(
+    request: SaveExternalReviewImportRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<SaveExternalReviewImportResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let workspace_id = request.workspace_id;
+    let importer_id = request.import.importer_id;
+    let record = ExternalReviewImportRecord {
+        workspace_id,
+        importer_id,
+        threads: request.import.threads,
+        warnings: request.import.warnings,
+        updated_at_ms: now_ms(),
+    };
+    let record_to_save = record.clone();
+    with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .save_external_import(&record_to_save)
+                .await
+        })
+    })?;
+    Ok(SaveExternalReviewImportResponse { record })
+}
+
+fn review_publish_records_list(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match context.request.payload_json::<ListPublishRecordsRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let config = match plugin_config(context) {
+        Ok(config) => config,
+        Err(error) => return ServiceResponse::error("invalid_config", error.to_string()),
+    };
+    match list_publish_records_for_request(&request, &config) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("publish_records_list_failed", error.to_string()),
+    }
+}
+
+fn list_publish_records_for_request(
+    request: &ListPublishRecordsRequest,
+    config: &CodeReviewPluginConfig,
+) -> Result<ListPublishRecordsResponse, ReviewError> {
+    let repo_root = resolve_repo_root(&request.repo_path)?;
+    let workspace_id = request.workspace_id.clone();
+    let records = with_database(&repo_root, config, move |database| {
+        Box::pin(async move {
+            CodeReviewDb::new(database)
+                .list_publish_records(&workspace_id)
+                .await
+        })
+    })?;
+    Ok(ListPublishRecordsResponse { records })
+}
+
 fn review_publish_record_save(context: &NativeServiceContext) -> ServiceResponse {
     let config = match plugin_config(context) {
         Ok(config) => config,
@@ -1162,6 +1278,11 @@ fn publish_submit_for_request(
             review_id: bundle.review_id,
             publisher_id: response.publisher_id.clone(),
             submitted: response.submitted,
+            published_thread_anchors: bundle
+                .threads
+                .iter()
+                .map(|thread| thread.anchor.clone())
+                .collect(),
             output: response.output.clone(),
             message: response.message.clone(),
             created_at_ms: now_ms(),
@@ -1192,6 +1313,7 @@ fn save_publish_record_for_request(
         review_id: request.review_id,
         publisher_id: request.publisher_id,
         submitted: request.submitted,
+        published_thread_anchors: request.published_thread_anchors,
         output: request.output,
         message: request.message,
         created_at_ms: now_ms(),
@@ -2479,6 +2601,76 @@ impl<'a> CodeReviewDb<'a> {
         Ok(())
     }
 
+    async fn save_external_import(
+        &self,
+        record: &ExternalReviewImportRecord,
+    ) -> Result<(), ReviewError> {
+        let threads_json = serde_json::to_string(&record.threads)?;
+        let warnings_json = serde_json::to_string(&record.warnings)?;
+        let existing = self
+            .db
+            .select("review_external_imports")
+            .columns(&["workspace_id"])
+            .filter(Box::new(where_eq(
+                "workspace_id",
+                record.workspace_id.clone(),
+            )))
+            .filter(Box::new(where_eq(
+                "importer_id",
+                record.importer_id.clone(),
+            )))
+            .execute_first(self.db)
+            .await?;
+        if existing.is_some() {
+            self.db
+                .update("review_external_imports")
+                .value("threads_json", threads_json)
+                .value("warnings_json", warnings_json)
+                .value("updated_at_ms", u64_to_i64(record.updated_at_ms))
+                .filter(Box::new(where_eq(
+                    "workspace_id",
+                    record.workspace_id.clone(),
+                )))
+                .filter(Box::new(where_eq(
+                    "importer_id",
+                    record.importer_id.clone(),
+                )))
+                .execute(self.db)
+                .await?;
+            return Ok(());
+        }
+        self.db
+            .insert("review_external_imports")
+            .value("workspace_id", record.workspace_id.clone())
+            .value("importer_id", record.importer_id.clone())
+            .value("threads_json", threads_json)
+            .value("warnings_json", warnings_json)
+            .value("updated_at_ms", u64_to_i64(record.updated_at_ms))
+            .execute(self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_external_imports(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<ExternalReviewImportRecord>, ReviewError> {
+        let rows = self
+            .db
+            .select("review_external_imports")
+            .columns(&[
+                "workspace_id",
+                "importer_id",
+                "threads_json",
+                "warnings_json",
+                "updated_at_ms",
+            ])
+            .filter(Box::new(where_eq("workspace_id", workspace_id)))
+            .execute(self.db)
+            .await?;
+        rows.iter().map(external_import_from_row).collect()
+    }
+
     async fn save_publish_record(&self, record: &ReviewPublishRecord) -> Result<(), ReviewError> {
         self.db
             .insert("review_publish_records")
@@ -2487,12 +2679,45 @@ impl<'a> CodeReviewDb<'a> {
             .value("review_id", record.review_id.clone())
             .value("publisher_id", record.publisher_id.clone())
             .value("submitted", i64::from(record.submitted))
+            .value(
+                "published_thread_anchors_json",
+                serde_json::to_string(&record.published_thread_anchors)?,
+            )
             .value("output", record.output.clone())
             .value("message", record.message.clone())
             .value("created_at_ms", u64_to_i64(record.created_at_ms))
             .execute(self.db)
             .await?;
         Ok(())
+    }
+
+    async fn list_publish_records(
+        &self,
+        workspace_id: &str,
+    ) -> Result<Vec<ReviewPublishRecord>, ReviewError> {
+        let rows = self
+            .db
+            .select("review_publish_records")
+            .columns(&[
+                "record_id",
+                "workspace_id",
+                "review_id",
+                "publisher_id",
+                "submitted",
+                "published_thread_anchors_json",
+                "output",
+                "message",
+                "created_at_ms",
+            ])
+            .filter(Box::new(where_eq("workspace_id", workspace_id.to_string())))
+            .execute(self.db)
+            .await?;
+        let mut records = rows
+            .iter()
+            .map(publish_record_from_row)
+            .collect::<Result<Vec<_>, _>>()?;
+        records.sort_by_key(|record| record.created_at_ms);
+        Ok(records)
     }
 
     async fn last_publish_record(
@@ -2511,6 +2736,7 @@ impl<'a> CodeReviewDb<'a> {
                 "review_id",
                 "publisher_id",
                 "submitted",
+                "published_thread_anchors_json",
                 "output",
                 "message",
                 "created_at_ms",
@@ -3370,7 +3596,40 @@ fn code_review_migrations() -> CodeMigrationSource<'static> {
     source.add_migration(thread_anchor_kind_column_migration());
     source.add_migration(thread_metadata_columns_migration());
     source.add_migration(review_suggestions_table_migration());
+    source.add_migration(publish_record_thread_anchors_migration());
+    source.add_migration(external_review_imports_table_migration());
     source
+}
+
+fn external_review_imports_table_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "015_external_review_imports_table".to_string(),
+        Box::new(
+            create_table("review_external_imports")
+                .if_not_exists(true)
+                .column(text_column("workspace_id"))
+                .column(text_column("importer_id"))
+                .column(text_column("threads_json"))
+                .column(text_column("warnings_json"))
+                .column(int_column("updated_at_ms"))
+                .primary_key("workspace_id")
+                .primary_key("importer_id"),
+        ),
+        None,
+    )
+}
+
+fn publish_record_thread_anchors_migration() -> CodeMigration<'static> {
+    CodeMigration::new(
+        "014_publish_record_thread_anchors".to_string(),
+        Box::new(alter_table("review_publish_records").add_column(
+            "published_thread_anchors_json".to_string(),
+            DataType::Text,
+            false,
+            Some(DatabaseValue::String("[]".to_string())),
+        )),
+        None,
+    )
 }
 
 fn review_suggestions_table_migration() -> CodeMigration<'static> {
@@ -3446,6 +3705,16 @@ fn nullable_int_column(name: &str) -> Column {
     }
 }
 
+fn external_import_from_row(row: &Row) -> Result<ExternalReviewImportRecord, ReviewError> {
+    Ok(ExternalReviewImportRecord {
+        workspace_id: required_text(row, "workspace_id")?,
+        importer_id: required_text(row, "importer_id")?,
+        threads: serde_json::from_str(&required_text(row, "threads_json")?)?,
+        warnings: serde_json::from_str(&required_text(row, "warnings_json")?)?,
+        updated_at_ms: i64_to_u64(required_i64(row, "updated_at_ms")?),
+    })
+}
+
 fn publish_record_from_row(row: &Row) -> Result<ReviewPublishRecord, ReviewError> {
     Ok(ReviewPublishRecord {
         id: required_text(row, "record_id")?,
@@ -3453,6 +3722,8 @@ fn publish_record_from_row(row: &Row) -> Result<ReviewPublishRecord, ReviewError
         review_id: required_text(row, "review_id")?,
         publisher_id: required_text(row, "publisher_id")?,
         submitted: required_i64(row, "submitted")? != 0,
+        published_thread_anchors: optional_text(row, "published_thread_anchors_json")
+            .map_or_else(|| Ok(Vec::new()), |json| serde_json::from_str(&json))?,
         output: optional_text(row, "output"),
         message: required_text(row, "message")?,
         created_at_ms: i64_to_u64(required_i64(row, "created_at_ms")?),
@@ -4089,6 +4360,214 @@ bcode_plugin_sdk::export_plugin!(CodeReviewPlugin, include_str!("../bcode-plugin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_import_persistence_round_trips_and_replaces_snapshot_atomically() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&repo)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let config = CodeReviewPluginConfig {
+            state_location: CodeReviewStateLocation::User,
+            state_dir: Some(temp.path().join("state")),
+        };
+        let thread = bcode_code_review_models::ExternalReviewThread {
+            identity: bcode_code_review_models::ExternalReviewIdentity {
+                provider_id: "github".to_string(),
+                external_id: "thread:1".to_string(),
+                url: None,
+            },
+            state: bcode_code_review_models::ExternalReviewThreadState::Open,
+            mapping: bcode_code_review_models::ExternalReviewAnchorMapping {
+                status: bcode_code_review_models::ExternalAnchorMappingStatus::Unmappable,
+                anchor: None,
+                message: Some("outdated".to_string()),
+            },
+            comments: Vec::new(),
+        };
+        let saved = save_external_import_for_request(
+            SaveExternalReviewImportRequest {
+                repo_path: repo.clone(),
+                workspace_id: "workspace-1".to_string(),
+                import: bcode_code_review_models::ExternalReviewImportResponse {
+                    importer_id: "github_pr_review".to_string(),
+                    threads: vec![thread.clone()],
+                    warnings: vec!["first warning".to_string()],
+                },
+            },
+            &config,
+        )
+        .expect("save import");
+        assert_eq!(saved.record.threads, vec![thread]);
+
+        let replacement = save_external_import_for_request(
+            SaveExternalReviewImportRequest {
+                repo_path: repo.clone(),
+                workspace_id: "workspace-1".to_string(),
+                import: bcode_code_review_models::ExternalReviewImportResponse {
+                    importer_id: "github_pr_review".to_string(),
+                    threads: Vec::new(),
+                    warnings: vec!["replacement".to_string()],
+                },
+            },
+            &config,
+        )
+        .expect("replace import");
+        let listed = list_external_imports_for_request(
+            &ListExternalReviewImportsRequest {
+                repo_path: repo,
+                workspace_id: "workspace-1".to_string(),
+            },
+            &config,
+        )
+        .expect("list imports");
+
+        assert_eq!(listed.records, vec![replacement.record]);
+        assert!(listed.records[0].threads.is_empty());
+        assert_eq!(listed.records[0].warnings, vec!["replacement"]);
+    }
+
+    #[test]
+    fn publish_record_thread_membership_round_trips() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&repo)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let config = CodeReviewPluginConfig {
+            state_location: CodeReviewStateLocation::User,
+            state_dir: Some(temp.path().join("state")),
+        };
+        let workspace = ReviewWorkspace {
+            id: "workspace-publish".to_string(),
+            title: "Publish".to_string(),
+            repo_root: repo.clone(),
+            sources: Vec::new(),
+            created_at_ms: None,
+            updated_at_ms: None,
+            viewed_files: BTreeSet::new(),
+            archived_at_ms: None,
+        };
+        let anchor = DraftAnchor {
+            kind: ReviewAnchorKind::Review,
+            file_path: "<review>".to_string(),
+            diff_row: 0,
+            start_diff_row: None,
+            end_diff_row: None,
+            old_start: None,
+            old_end: None,
+            new_start: None,
+            new_end: None,
+            old_line: None,
+            new_line: None,
+            line_kind: ReviewLineKind::Context,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        let request = ServiceRequest {
+            interface_id: CODE_REVIEW_SERVICE_INTERFACE_ID.to_string(),
+            operation: OP_REVIEW_PUBLISH_RECORD_SAVE.to_string(),
+            payload: serde_json::to_vec(&SavePublishRecordRequest {
+                workspace: workspace.clone(),
+                review_id: "review-1".to_string(),
+                publisher_id: "github".to_string(),
+                submitted: true,
+                published_thread_anchors: vec![anchor.clone()],
+                output: None,
+                message: "submitted".to_string(),
+            })
+            .expect("serialize request"),
+        };
+        save_publish_record_for_request(&request, &config).expect("save publish record");
+
+        let records = list_publish_records_for_request(
+            &ListPublishRecordsRequest {
+                repo_path: repo,
+                workspace_id: workspace.id,
+            },
+            &config,
+        )
+        .expect("list publish records");
+
+        assert_eq!(records.records.len(), 1);
+        assert_eq!(records.records[0].published_thread_anchors, vec![anchor]);
+    }
+
+    #[test]
+    fn review_bundle_excludes_requested_thread_anchors() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        assert!(
+            Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(&repo)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        let config = CodeReviewPluginConfig {
+            state_location: CodeReviewStateLocation::User,
+            state_dir: Some(temp.path().join("state")),
+        };
+        let anchor = DraftAnchor {
+            kind: ReviewAnchorKind::Review,
+            file_path: "<review>".to_string(),
+            diff_row: 0,
+            start_diff_row: None,
+            end_diff_row: None,
+            old_start: None,
+            old_end: None,
+            new_start: None,
+            new_end: None,
+            old_line: None,
+            new_line: None,
+            line_kind: ReviewLineKind::Context,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        save_draft_for_request(
+            SaveDraftRequest {
+                repo_path: repo.clone(),
+                target: ReviewTarget::Repository,
+                scope: None,
+                anchor: anchor.clone(),
+                body: "Overall finding".to_string(),
+            },
+            &config,
+        )
+        .expect("save draft");
+
+        let bundle = review_bundle_for_request(
+            PublishReviewRequest {
+                repo_path: repo,
+                target: ReviewTarget::Repository,
+                workspace: None,
+                excluded_thread_anchors: vec![anchor],
+                publisher_id: "local_markdown".to_string(),
+                options: serde_json::Value::Null,
+            },
+            &config,
+        )
+        .expect("bundle");
+
+        assert!(bundle.threads.is_empty());
+    }
 
     #[test]
     fn suggestion_persistence_round_trips_and_updates_lifecycle() {

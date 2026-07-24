@@ -10,19 +10,25 @@ use std::sync::{Arc, RwLock};
 use crate::async_values::{AsyncValue, AsyncValueStore};
 use bcode_client::BcodeClient;
 use bcode_code_review_models::{
-    CODE_REVIEW_SERVICE_INTERFACE_ID, DraftAnchor as ModelDraftAnchor,
-    ListReviewSuggestionsRequest, ListReviewSuggestionsResponse, MaterializeReviewWorkspaceRequest,
-    MaterializeReviewWorkspaceResponse, OP_REVIEW_BUNDLE_GET, OP_REVIEW_PUBLISH_PREVIEW,
-    OP_REVIEW_PUBLISH_RECORD_SAVE, OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST,
-    OP_REVIEW_PUBLISHER_PREVIEW, OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST,
-    OP_REVIEW_REPO_FILE_GET, OP_REVIEW_SUGGESTION_SAVE, OP_REVIEW_SUGGESTIONS_LIST,
-    OP_REVIEW_WORKSPACE_MATERIALIZE, OP_REVIEW_WORKSPACE_UPDATE, REVIEW_PUBLISHER_INTERFACE_ID,
-    ReviewAnchorKind, ReviewBundle, ReviewRepositoryCommit, ReviewScope as ModelReviewScope,
-    ReviewSource, ReviewSourceDiagnostic, ReviewSourceDiagnosticSeverity, ReviewSourceKind,
-    ReviewSuggestion as ModelReviewSuggestion,
+    CODE_REVIEW_SERVICE_INTERFACE_ID, DraftAnchor as ModelDraftAnchor, ExternalAnchorMappingStatus,
+    ExternalReviewImportRecord, ExternalReviewImportRequest, ExternalReviewImportResponse,
+    ExternalReviewThreadState, ListExternalReviewImportsRequest, ListExternalReviewImportsResponse,
+    ListPublishRecordsRequest, ListPublishRecordsResponse, ListReviewSuggestionsRequest,
+    ListReviewSuggestionsResponse, MaterializeReviewWorkspaceRequest,
+    MaterializeReviewWorkspaceResponse, OP_REVIEW_BUNDLE_GET, OP_REVIEW_EXTERNAL_IMPORT_SAVE,
+    OP_REVIEW_EXTERNAL_IMPORTS_LIST, OP_REVIEW_IMPORTER_IMPORT, OP_REVIEW_IMPORTER_MANIFEST,
+    OP_REVIEW_PUBLISH_PREVIEW, OP_REVIEW_PUBLISH_RECORD_SAVE, OP_REVIEW_PUBLISH_RECORDS_LIST,
+    OP_REVIEW_PUBLISH_SUBMIT, OP_REVIEW_PUBLISHER_MANIFEST, OP_REVIEW_PUBLISHER_PREVIEW,
+    OP_REVIEW_PUBLISHER_SUBMIT, OP_REVIEW_PUBLISHERS_LIST, OP_REVIEW_REPO_FILE_GET,
+    OP_REVIEW_SUGGESTION_SAVE, OP_REVIEW_SUGGESTIONS_LIST, OP_REVIEW_WORKSPACE_MATERIALIZE,
+    OP_REVIEW_WORKSPACE_UPDATE, REVIEW_IMPORTER_INTERFACE_ID, REVIEW_PUBLISHER_INTERFACE_ID,
+    ReviewAnchorKind, ReviewBundle, ReviewImporterManifest, ReviewRepositoryCommit,
+    ReviewScope as ModelReviewScope, ReviewSource, ReviewSourceDiagnostic,
+    ReviewSourceDiagnosticSeverity, ReviewSourceKind, ReviewSuggestion as ModelReviewSuggestion,
     ReviewSuggestionStatus as ModelReviewSuggestionStatus, ReviewSurface, ReviewSurfaceKind,
     ReviewTarget as ModelReviewTarget, ReviewTarget as ReviewOpenTarget, ReviewThreadKind,
-    ReviewThreadSeverity, ReviewWorkspace, SavePublishRecordRequest, SavePublishRecordResponse,
+    ReviewThreadSeverity, ReviewWorkspace, SaveExternalReviewImportRequest,
+    SaveExternalReviewImportResponse, SavePublishRecordRequest, SavePublishRecordResponse,
     SaveReviewSuggestionRequest, SaveReviewSuggestionResponse, UpdateReviewWorkspaceRequest,
 };
 use bcode_ipc::PluginServiceResponse;
@@ -59,6 +65,7 @@ const LINK_THREAD_SESSION_OPERATION: &str = "thread.link_session";
 const THREAD_RESOLVE_OPERATION: &str = "thread.resolve";
 const PUBLISH_SUBMIT_OPERATION: &str = OP_REVIEW_PUBLISH_SUBMIT;
 const PUBLISH_RECORD_SAVE_OPERATION: &str = OP_REVIEW_PUBLISH_RECORD_SAVE;
+const PUBLISH_RECORDS_LIST_OPERATION: &str = OP_REVIEW_PUBLISH_RECORDS_LIST;
 const PUBLISHERS_LIST_OPERATION: &str = OP_REVIEW_PUBLISHERS_LIST;
 const PUBLISH_PREVIEW_OPERATION: &str = OP_REVIEW_PUBLISH_PREVIEW;
 const REVIEW_BUNDLE_GET_OPERATION: &str = OP_REVIEW_BUNDLE_GET;
@@ -283,7 +290,24 @@ impl CodeReviewSurface {
             .await;
             needs_redraw = true;
         }
-        if let Some(request) = self.app.take_publish_request() {
+        needs_redraw |= self.drain_review_service_effects().await;
+        needs_redraw
+    }
+
+    async fn drain_review_service_effects(&mut self) -> bool {
+        let imported = if let Some(request) = self.app.take_external_import_request() {
+            handle_external_import_request(
+                &self.client,
+                self.repo_path.clone(),
+                &mut self.app,
+                request,
+            )
+            .await;
+            true
+        } else {
+            false
+        };
+        let published = if let Some(request) = self.app.take_publish_request() {
             handle_publish_request(
                 &self.client,
                 self.repo_path.clone(),
@@ -292,9 +316,11 @@ impl CodeReviewSurface {
                 request,
             )
             .await;
-            needs_redraw = true;
-        }
-        needs_redraw
+            true
+        } else {
+            false
+        };
+        imported || published
     }
 }
 
@@ -615,6 +641,62 @@ fn sync_repository_file_store(
     }
 }
 
+async fn load_external_imports(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    workspace_id: String,
+) -> Result<Vec<ExternalReviewImportRecord>, TuiError> {
+    let payload = serde_json::to_vec(&ListExternalReviewImportsRequest {
+        repo_path,
+        workspace_id,
+    })
+    .map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            OP_REVIEW_EXTERNAL_IMPORTS_LIST.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: ListExternalReviewImportsResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(response.records)
+}
+
+async fn load_publish_records(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    workspace_id: String,
+) -> Result<Vec<bcode_code_review_models::ReviewPublishRecord>, TuiError> {
+    let payload = serde_json::to_vec(&ListPublishRecordsRequest {
+        repo_path,
+        workspace_id,
+    })
+    .map_err(TuiError::Json)?;
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            PUBLISH_RECORDS_LIST_OPERATION.to_string(),
+            payload,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: ListPublishRecordsResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(response.records)
+}
+
 async fn load_review_app(
     client: &BcodeClient,
     repo_path: PathBuf,
@@ -635,11 +717,19 @@ async fn load_review_app(
     .await;
     let suggestions = load_suggestions(
         client,
-        repo_path,
+        repo_path.clone(),
         review_target,
         workspace.as_ref().map(review_scope_for_workspace),
     )
     .await;
+    let (publish_records, external_imports) = if let Some(workspace) = &workspace {
+        (
+            load_publish_records(client, repo_path.clone(), workspace.id.clone()).await,
+            load_external_imports(client, repo_path, workspace.id.clone()).await,
+        )
+    } else {
+        (Ok(Vec::new()), Ok(Vec::new()))
+    };
     let mut app = ReviewApp::new(review);
     if app.workspace.sources.is_empty()
         && let Some(workspace) = workspace
@@ -656,6 +746,18 @@ async fn load_review_app(
         Ok(suggestions) => app.load_persisted_suggestions(suggestions),
         Err(error) => {
             app.status_message = Some(format!("failed to load persisted suggestions: {error}"));
+        }
+    }
+    match publish_records {
+        Ok(records) => app.load_publish_records(records),
+        Err(error) => {
+            app.status_message = Some(format!("failed to load publish history: {error}"));
+        }
+    }
+    match external_imports {
+        Ok(records) => app.load_external_imports(records),
+        Err(error) => {
+            app.status_message = Some(format!("failed to load external reviews: {error}"));
         }
     }
     Ok(app)
@@ -745,6 +847,165 @@ async fn handle_pending_agent_session(
     }
 }
 
+async fn handle_external_import_request(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    app: &mut ReviewApp,
+    request: PendingExternalImportRequest,
+) {
+    match request {
+        PendingExternalImportRequest::Discover => match discover_external_importers(client).await {
+            Ok(importers) => app.show_external_importers(importers),
+            Err(error) => {
+                app.status_message = Some(format!("external importer discovery failed: {error}"));
+            }
+        },
+        PendingExternalImportRequest::Invoke {
+            importer_index,
+            options,
+        } => {
+            let Some(importer) = app.external_importers.get(importer_index).cloned() else {
+                app.status_message = Some("selected external importer is unavailable".to_string());
+                return;
+            };
+            match invoke_external_importer(
+                client,
+                repo_path.clone(),
+                app,
+                &importer,
+                options_json(options),
+            )
+            .await
+            {
+                Ok(import) => match save_external_import_snapshot(
+                    client,
+                    repo_path,
+                    app.workspace.id.clone(),
+                    import,
+                )
+                .await
+                {
+                    Ok(record) => {
+                        let count = record.threads.len();
+                        app.external_review_imports
+                            .retain(|existing| existing.importer_id != record.importer_id);
+                        app.external_review_imports.push(record);
+                        app.import_state = None;
+                        app.status_message =
+                            Some(format!("imported {count} external review thread(s)"));
+                    }
+                    Err(error) => {
+                        app.status_message =
+                            Some(format!("external review persistence failed: {error}"));
+                    }
+                },
+                Err(error) => {
+                    app.status_message = Some(format!("external review import failed: {error}"));
+                }
+            }
+        }
+    }
+}
+
+async fn discover_external_importers(
+    client: &BcodeClient,
+) -> Result<Vec<ExternalImporterRoute>, TuiError> {
+    let services = client.plugin_services().await?;
+    let mut importers = Vec::new();
+    for service in services
+        .into_iter()
+        .filter(|service| service.interface_id == REVIEW_IMPORTER_INTERFACE_ID)
+    {
+        let response = client
+            .invoke_plugin_service(
+                service.plugin_id.clone(),
+                service.interface_id.clone(),
+                OP_REVIEW_IMPORTER_MANIFEST.to_string(),
+                serde_json::to_vec(&serde_json::json!({})).map_err(TuiError::Json)?,
+            )
+            .await?;
+        if let Some(error) = response.error {
+            return Err(TuiError::PluginService {
+                code: error.code,
+                message: error.message,
+            });
+        }
+        importers.push(ExternalImporterRoute {
+            manifest: serde_json::from_slice(&response.payload).map_err(TuiError::Json)?,
+            plugin_id: service.plugin_id,
+            interface_id: service.interface_id,
+        });
+    }
+    Ok(importers)
+}
+
+async fn invoke_external_importer(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    app: &ReviewApp,
+    importer: &ExternalImporterRoute,
+    options: serde_json::Value,
+) -> Result<ExternalReviewImportResponse, TuiError> {
+    let files = app.review.files.iter().map(ReviewFile::to_model).collect();
+    let request = ExternalReviewImportRequest {
+        repo_root: repo_path,
+        files,
+        options,
+    };
+    let response = client
+        .invoke_plugin_service(
+            importer.plugin_id.clone(),
+            importer.interface_id.clone(),
+            OP_REVIEW_IMPORTER_IMPORT.to_string(),
+            serde_json::to_vec(&request).map_err(TuiError::Json)?,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let imported_response: ExternalReviewImportResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    if imported_response.importer_id != importer.manifest.id {
+        return Err(TuiError::PluginService {
+            code: "importer_id_mismatch".to_string(),
+            message: "import response id does not match importer manifest".to_string(),
+        });
+    }
+    Ok(imported_response)
+}
+
+async fn save_external_import_snapshot(
+    client: &BcodeClient,
+    repo_path: PathBuf,
+    workspace_id: String,
+    import: ExternalReviewImportResponse,
+) -> Result<ExternalReviewImportRecord, TuiError> {
+    let request = SaveExternalReviewImportRequest {
+        repo_path,
+        workspace_id,
+        import,
+    };
+    let response = client
+        .call_plugin_service(
+            SERVICE_INTERFACE_ID.to_string(),
+            OP_REVIEW_EXTERNAL_IMPORT_SAVE.to_string(),
+            serde_json::to_vec(&request).map_err(TuiError::Json)?,
+        )
+        .await?;
+    if let Some(error) = response.error {
+        return Err(TuiError::PluginService {
+            code: error.code,
+            message: error.message,
+        });
+    }
+    let response: SaveExternalReviewImportResponse =
+        serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
+    Ok(response.record)
+}
+
 async fn handle_publish_request(
     client: &BcodeClient,
     repo_path: PathBuf,
@@ -769,38 +1030,48 @@ async fn handle_publish_request(
         PendingPublishRequest::Preview {
             publisher_id,
             options,
+            excluded_thread_anchors,
         } => match preview_review(
             client,
-            repo_path,
-            target,
-            Some(app.workspace.clone()),
-            app.publisher_for_id(&publisher_id)
-                .and_then(|publisher| publisher.route.clone()),
-            publisher_id,
-            options,
+            PublishInvocation {
+                repo_path,
+                target,
+                workspace: Some(app.workspace.clone()),
+                excluded_thread_anchors,
+                route: app
+                    .publisher_for_id(&publisher_id)
+                    .and_then(|publisher| publisher.route.clone()),
+                publisher_id,
+                options,
+            },
         )
         .await
         {
             Ok(response) => app.show_publish_preview(response.publisher_id, response.preview),
-            Err(error) => app.status_message = Some(format!("publish preview failed: {error}")),
+            Err(error) => app.fail_publish_preview(&error.to_string()),
         },
         PendingPublishRequest::Submit {
             publisher_id,
             options,
+            excluded_thread_anchors,
         } => match publish_review(
             client,
-            repo_path,
-            target,
-            Some(app.workspace.clone()),
-            app.publisher_for_id(&publisher_id)
-                .and_then(|publisher| publisher.route.clone()),
-            publisher_id,
-            options,
+            PublishInvocation {
+                repo_path,
+                target,
+                workspace: Some(app.workspace.clone()),
+                excluded_thread_anchors,
+                route: app
+                    .publisher_for_id(&publisher_id)
+                    .and_then(|publisher| publisher.route.clone()),
+                publisher_id,
+                options,
+            },
         )
         .await
         {
             Ok(response) => app.finish_publish(response),
-            Err(error) => app.status_message = Some(format!("publish failed: {error}")),
+            Err(error) => app.fail_publish_submit(&error.to_string()),
         },
     }
 }
@@ -825,18 +1096,40 @@ async fn list_publishers(client: &BcodeClient) -> Result<Vec<ReviewPublisherMani
     Ok(response.publishers)
 }
 
-async fn preview_review(
-    client: &BcodeClient,
+#[derive(Debug, Clone)]
+struct PublishInvocation {
     repo_path: PathBuf,
     target: ReviewOpenTarget,
     workspace: Option<ReviewWorkspace>,
+    excluded_thread_anchors: Vec<ModelDraftAnchor>,
     route: Option<ReviewPublisherRoute>,
     publisher_id: String,
     options: Vec<ReviewPublishOption>,
+}
+
+async fn preview_review(
+    client: &BcodeClient,
+    invocation: PublishInvocation,
 ) -> Result<PublishReviewPreviewResponse, TuiError> {
+    let PublishInvocation {
+        repo_path,
+        target,
+        workspace,
+        excluded_thread_anchors,
+        route,
+        publisher_id,
+        options,
+    } = invocation;
     let options = options_json(options);
     if let Some(route) = route {
-        let bundle = load_review_bundle(client, repo_path, target, workspace.clone()).await?;
+        let bundle = load_review_bundle(
+            client,
+            repo_path,
+            target,
+            workspace.clone(),
+            excluded_thread_anchors.clone(),
+        )
+        .await?;
         let response = invoke_external_publisher(
             client,
             route,
@@ -857,6 +1150,7 @@ async fn preview_review(
         repo_path,
         target,
         workspace,
+        excluded_thread_anchors,
         publisher_id,
         options,
     };
@@ -879,17 +1173,27 @@ async fn preview_review(
 
 async fn publish_review(
     client: &BcodeClient,
-    repo_path: PathBuf,
-    target: ReviewOpenTarget,
-    workspace: Option<ReviewWorkspace>,
-    route: Option<ReviewPublisherRoute>,
-    publisher_id: String,
-    options: Vec<ReviewPublishOption>,
+    invocation: PublishInvocation,
 ) -> Result<PublishReviewResponse, TuiError> {
+    let PublishInvocation {
+        repo_path,
+        target,
+        workspace,
+        excluded_thread_anchors,
+        route,
+        publisher_id,
+        options,
+    } = invocation;
     let options = options_json(options);
     if let Some(route) = route {
-        let bundle =
-            load_review_bundle(client, repo_path.clone(), target, workspace.clone()).await?;
+        let bundle = load_review_bundle(
+            client,
+            repo_path.clone(),
+            target,
+            workspace.clone(),
+            excluded_thread_anchors.clone(),
+        )
+        .await?;
         let response = invoke_external_publisher(
             client,
             route,
@@ -907,8 +1211,18 @@ async fn publish_review(
         let publish_response: PublishReviewResponse =
             serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
         if let Some(workspace) = workspace {
-            save_external_publish_record(client, workspace, bundle.review_id, &publish_response)
-                .await?;
+            save_external_publish_record(
+                client,
+                workspace,
+                bundle.review_id,
+                bundle
+                    .threads
+                    .iter()
+                    .map(|thread| thread.anchor.clone())
+                    .collect(),
+                &publish_response,
+            )
+            .await?;
         }
         return Ok(publish_response);
     }
@@ -916,6 +1230,7 @@ async fn publish_review(
         repo_path,
         target,
         workspace,
+        excluded_thread_anchors,
         publisher_id,
         options,
     };
@@ -940,6 +1255,7 @@ async fn save_external_publish_record(
     client: &BcodeClient,
     workspace: ReviewWorkspace,
     review_id: String,
+    published_thread_anchors: Vec<ModelDraftAnchor>,
     response: &PublishReviewResponse,
 ) -> Result<(), TuiError> {
     let request = SavePublishRecordRequest {
@@ -947,6 +1263,7 @@ async fn save_external_publish_record(
         review_id,
         publisher_id: response.publisher_id.clone(),
         submitted: response.submitted,
+        published_thread_anchors,
         output: response.output.clone(),
         message: response.message.clone(),
     };
@@ -967,6 +1284,55 @@ async fn save_external_publish_record(
     let _: SavePublishRecordResponse =
         serde_json::from_slice(&response.payload).map_err(TuiError::Json)?;
     Ok(())
+}
+
+fn cycle_option(
+    options: &mut [ReviewPublishOption],
+    selected: usize,
+    offset: isize,
+    status_message: &mut Option<String>,
+) -> bool {
+    let Some(option) = options.get_mut(selected) else {
+        return false;
+    };
+    if option.choices.is_empty() {
+        *status_message = Some("selected option has no choices".to_string());
+        return true;
+    }
+    let current = option
+        .choices
+        .iter()
+        .position(|choice| choice == &option.value)
+        .unwrap_or(0);
+    let len = option.choices.len();
+    let next = if offset.is_negative() {
+        current
+            .saturating_add(len)
+            .saturating_sub(offset.unsigned_abs() % len)
+            % len
+    } else {
+        current.saturating_add(offset.unsigned_abs()) % len
+    };
+    option.value.clone_from(&option.choices[next]);
+    *status_message = Some(format!("{} = {}", option.name, option.value));
+    true
+}
+
+fn edit_option(options: &mut [ReviewPublishOption], selected: usize, stroke: KeyStroke) -> bool {
+    let Some(option) = options.get_mut(selected) else {
+        return false;
+    };
+    match stroke.key {
+        KeyCode::Char(ch) if stroke.modifiers.is_empty() && option.choices.is_empty() => {
+            option.value.push(ch);
+            true
+        }
+        KeyCode::Backspace if stroke.modifiers.is_empty() && option.choices.is_empty() => {
+            option.value.pop();
+            true
+        }
+        _ => false,
+    }
 }
 
 fn options_from_schema(schema: &serde_json::Value) -> Vec<ReviewPublishOption> {
@@ -1120,11 +1486,13 @@ async fn load_review_bundle(
     repo_path: PathBuf,
     target: ReviewOpenTarget,
     workspace: Option<ReviewWorkspace>,
+    excluded_thread_anchors: Vec<ModelDraftAnchor>,
 ) -> Result<ReviewBundle, TuiError> {
     let request = ReviewBundleRequest {
         repo_path,
         target,
         workspace,
+        excluded_thread_anchors,
     };
     let payload = serde_json::to_vec(&request).map_err(TuiError::Json)?;
     let response = client
@@ -1597,6 +1965,50 @@ async fn resolve_thread(
     Ok(())
 }
 
+fn handle_import_event(app: &mut ReviewApp, event: &Event) -> bool {
+    match event {
+        Event::Key(stroke) => handle_import_key(app, *stroke),
+        Event::Paste(text) => app.insert_import_option_text(text),
+        Event::Resize(_) | Event::Focus(_) | Event::Tick => true,
+        Event::Mouse(_) | Event::User(_) => false,
+    }
+}
+
+fn handle_import_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
+    if stroke.key == KeyCode::Escape && stroke.modifiers.is_empty() {
+        app.import_state = None;
+        return true;
+    }
+    if app.import_options_active() {
+        if stroke.key == KeyCode::Enter && stroke.modifiers.is_empty() {
+            return app.confirm_import_selection();
+        }
+        if stroke.key == KeyCode::Tab && stroke.modifiers.is_empty() {
+            return app.import_down(1);
+        }
+        if stroke.key == KeyCode::Tab && stroke.modifiers.shift {
+            return app.import_up(1);
+        }
+        if matches!(stroke.key, KeyCode::Right | KeyCode::Char(' ')) && stroke.modifiers.is_empty()
+        {
+            return app.cycle_selected_import_option(1);
+        }
+        if stroke.key == KeyCode::Left && stroke.modifiers.is_empty() {
+            return app.cycle_selected_import_option(-1);
+        }
+        return app.edit_import_option(stroke);
+    }
+    if !stroke.modifiers.is_empty() {
+        return false;
+    }
+    match stroke.key {
+        KeyCode::Char('j') | KeyCode::Down => app.import_down(1),
+        KeyCode::Char('k') | KeyCode::Up => app.import_up(1),
+        KeyCode::Enter => app.confirm_import_selection(),
+        _ => false,
+    }
+}
+
 fn handle_publish_event(app: &mut ReviewApp, event: &Event) -> bool {
     match event {
         Event::Key(stroke) => handle_publish_key(app, *stroke),
@@ -1662,6 +2074,7 @@ fn handle_publish_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         KeyCode::Char('j') | KeyCode::Down => app.publish_down(1),
         KeyCode::Char('k') | KeyCode::Up => app.publish_up(1),
         KeyCode::Char('p') => app.back_to_publish_preview(),
+        KeyCode::Char(' ') => app.toggle_selected_publish_thread(),
         KeyCode::Enter => app.confirm_publish_selection(),
         _ => false,
     }
@@ -1670,6 +2083,9 @@ fn handle_publish_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
 fn handle_event_no_resize(app: &mut ReviewApp, event: &Event) -> bool {
     if app.prompt_state.is_some() {
         return handle_prompt_event(app, event);
+    }
+    if app.import_state.is_some() {
+        return handle_import_event(app, event);
     }
     if app.publish_state.is_some() {
         return handle_publish_event(app, event);
@@ -1954,6 +2370,7 @@ fn handle_review_navigation_key(app: &mut ReviewApp, key: KeyCode) -> bool {
                 app.publish_review()
             }
         }
+        KeyCode::Char('X') => app.import_external_review(),
         KeyCode::Char('a') => app.open_comment_editor_with_action(ReviewCommentAction::AskBcode),
         KeyCode::Char('A') => app.toggle_selected_agent_answer_expanded(),
         KeyCode::Char('Y') => app.queue_copy_agent_answer_at_selection(),
@@ -2160,6 +2577,8 @@ struct ReviewBundleRequest {
     target: ReviewOpenTarget,
     #[serde(default)]
     workspace: Option<ReviewWorkspace>,
+    #[serde(default)]
+    excluded_thread_anchors: Vec<ModelDraftAnchor>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -2168,6 +2587,8 @@ struct PublishReviewRequest {
     target: ReviewOpenTarget,
     #[serde(default)]
     workspace: Option<ReviewWorkspace>,
+    #[serde(default)]
+    excluded_thread_anchors: Vec<ModelDraftAnchor>,
     publisher_id: String,
     #[serde(default)]
     options: serde_json::Value,
@@ -2755,6 +3176,18 @@ impl ReviewFile {
         }
     }
 
+    fn to_model(&self) -> bcode_code_review_models::ReviewFile {
+        bcode_code_review_models::ReviewFile {
+            old_path: self.old_path.clone(),
+            new_path: self.new_path.clone(),
+            status: self.status.to_model(),
+            additions: self.additions,
+            deletions: self.deletions,
+            hunks: self.hunks.iter().map(ReviewHunk::to_model).collect(),
+            is_binary: self.is_binary,
+        }
+    }
+
     /// Return the display path.
     #[must_use]
     pub fn display_path(&self) -> &str {
@@ -2784,6 +3217,17 @@ pub enum ReviewFileStatus {
 }
 
 impl ReviewFileStatus {
+    const fn to_model(self) -> bcode_code_review_models::ReviewFileStatus {
+        match self {
+            Self::Modified => bcode_code_review_models::ReviewFileStatus::Modified,
+            Self::Added => bcode_code_review_models::ReviewFileStatus::Added,
+            Self::Deleted => bcode_code_review_models::ReviewFileStatus::Deleted,
+            Self::Renamed => bcode_code_review_models::ReviewFileStatus::Renamed,
+            Self::Copied => bcode_code_review_models::ReviewFileStatus::Copied,
+            Self::Unknown => bcode_code_review_models::ReviewFileStatus::Unknown,
+        }
+    }
+
     const fn from_model(status: bcode_code_review_models::ReviewFileStatus) -> Self {
         match status {
             bcode_code_review_models::ReviewFileStatus::Modified => Self::Modified,
@@ -2837,6 +3281,17 @@ impl ReviewHunk {
             lines: hunk.lines.into_iter().map(ReviewLine::from_model).collect(),
         }
     }
+
+    fn to_model(&self) -> bcode_code_review_models::ReviewHunk {
+        bcode_code_review_models::ReviewHunk {
+            old_start: self.old_start,
+            old_count: self.old_count,
+            new_start: self.new_start,
+            new_count: self.new_count,
+            heading: self.heading.clone(),
+            lines: self.lines.iter().map(ReviewLine::to_model).collect(),
+        }
+    }
 }
 
 /// Review diff line.
@@ -2859,6 +3314,15 @@ impl ReviewLine {
             old_line: line.old_line,
             new_line: line.new_line,
             content: line.content,
+        }
+    }
+
+    fn to_model(&self) -> bcode_code_review_models::ReviewLine {
+        bcode_code_review_models::ReviewLine {
+            kind: self.kind.to_model(),
+            old_line: self.old_line,
+            new_line: self.new_line,
+            content: self.content.clone(),
         }
     }
 }
@@ -2929,6 +3393,46 @@ pub struct ReviewCommentAnchor {
 }
 
 impl ReviewCommentAnchor {
+    const fn file(path: String) -> Self {
+        Self {
+            file_index: 0,
+            path,
+            diff_row: 0,
+            end_diff_row: None,
+            old_line: None,
+            new_line: None,
+            old_start: None,
+            old_end: None,
+            new_start: None,
+            new_end: None,
+            line_kind: ReviewLineKind::Context,
+            is_file_anchor: true,
+            surface_id: None,
+            source_id: None,
+        }
+    }
+
+    fn from_draft_anchor(anchor: &DraftAnchor) -> Self {
+        Self {
+            file_index: 0,
+            path: anchor.file_path.clone(),
+            diff_row: usize::try_from(anchor.diff_row).unwrap_or(usize::MAX),
+            end_diff_row: anchor
+                .end_diff_row
+                .and_then(|row| usize::try_from(row).ok()),
+            old_line: anchor.old_line,
+            new_line: anchor.new_line,
+            old_start: anchor.old_start,
+            old_end: anchor.old_end,
+            new_start: anchor.new_start,
+            new_end: anchor.new_end,
+            line_kind: anchor.line_kind,
+            is_file_anchor: anchor.is_file_anchor,
+            surface_id: anchor.surface_id.clone(),
+            source_id: anchor.source_id.clone(),
+        }
+    }
+
     /// Return this anchor's review scope kind.
     #[must_use]
     pub fn kind(&self) -> ReviewAnchorKind {
@@ -3958,6 +4462,10 @@ pub struct ReviewThreadSummary {
     pub accepted_suggestion_count: usize,
     /// Rejected suggested comment count.
     pub rejected_suggestion_count: usize,
+    /// External provider/importer id when this row came from imported review state.
+    pub external_provider_id: Option<String>,
+    /// External anchor mapping status for imported review state.
+    pub external_mapping_status: Option<ExternalAnchorMappingStatus>,
 }
 
 impl ReviewThreadSummary {
@@ -3977,6 +4485,34 @@ impl ReviewThreadSummary {
     }
 }
 
+fn thread_path(thread: &bcode_code_review_models::ExternalReviewThread) -> String {
+    thread.mapping.anchor.as_ref().map_or_else(
+        || "<unmapped external>".to_string(),
+        |anchor| anchor.file_path.clone(),
+    )
+}
+
+/// Pending external review import request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingExternalImportRequest {
+    /// Discover available provider importers.
+    Discover,
+    /// Invoke one selected importer with configured options.
+    Invoke {
+        /// Importer index in the discovered importer list.
+        importer_index: usize,
+        /// Configured provider options.
+        options: Vec<ReviewPublishOption>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalImporterRoute {
+    manifest: ReviewImporterManifest,
+    plugin_id: String,
+    interface_id: String,
+}
+
 /// Pending publish request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingPublishRequest {
@@ -3988,6 +4524,8 @@ pub enum PendingPublishRequest {
         publisher_id: String,
         /// Publisher options.
         options: Vec<ReviewPublishOption>,
+        /// Excluded thread anchors.
+        excluded_thread_anchors: Vec<ModelDraftAnchor>,
     },
     /// Submit publisher output.
     Submit {
@@ -3995,6 +4533,8 @@ pub enum PendingPublishRequest {
         publisher_id: String,
         /// Publisher options.
         options: Vec<ReviewPublishOption>,
+        /// Excluded thread anchors.
+        excluded_thread_anchors: Vec<ModelDraftAnchor>,
     },
 }
 
@@ -4183,6 +4723,18 @@ impl ReviewPromptState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewImportState {
+    /// Select an importer.
+    Picker,
+    /// Configure selected importer options.
+    Options {
+        importer_index: usize,
+        options: Vec<ReviewPublishOption>,
+        selected: usize,
+    },
+}
+
 /// Publish modal state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReviewPublishState {
@@ -4205,8 +4757,10 @@ pub enum ReviewPublishState {
         publisher_id: String,
         /// Publisher options.
         options: Vec<ReviewPublishOption>,
-        /// Preview text.
+        /// Provider preview text.
         preview: String,
+        /// Thread selection summary captured for this preview.
+        selection_summary: Vec<String>,
         /// Top visible preview line.
         scroll: usize,
     },
@@ -4216,8 +4770,10 @@ pub enum ReviewPublishState {
         publisher_id: String,
         /// Publisher options.
         options: Vec<ReviewPublishOption>,
-        /// Preview text.
+        /// Provider preview text.
         preview: String,
+        /// Thread selection summary captured for this preview.
+        selection_summary: Vec<String>,
         /// Top visible preview line.
         scroll: usize,
     },
@@ -4295,8 +4851,22 @@ pub struct ReviewApp {
     pub pending_clipboard_text: Option<String>,
     /// Suggestions awaiting durable persistence, keyed by suggestion id.
     pub pending_suggestion_saves: BTreeMap<String, ReviewCommentAnchor>,
+    /// Review thread keys excluded from the next publish.
+    pub excluded_publish_threads: BTreeSet<String>,
+    /// Publisher id recorded for locally published review threads.
+    pub published_review_threads: BTreeMap<String, String>,
+    /// Durable provider-neutral external review snapshots.
+    pub external_review_imports: Vec<ExternalReviewImportRecord>,
     /// Active draft editor, if open.
     pub comment_editor: Option<ReviewCommentEditor>,
+    /// External review import awaiting provider discovery/invocation.
+    pub pending_external_import_request: Option<PendingExternalImportRequest>,
+    /// Discovered external review importers.
+    external_importers: Vec<ExternalImporterRoute>,
+    /// Active importer picker/options state.
+    pub import_state: Option<ReviewImportState>,
+    /// Selected importer index.
+    pub selected_importer: usize,
     /// Draft comment awaiting persistence.
     pub pending_draft_save: Option<PendingDraftSave>,
     /// Draft comment awaiting deletion.
@@ -4402,7 +4972,14 @@ impl ReviewApp {
             suggested_comments: BTreeMap::new(),
             pending_clipboard_text: None,
             pending_suggestion_saves: BTreeMap::new(),
+            excluded_publish_threads: BTreeSet::new(),
+            published_review_threads: BTreeMap::new(),
+            external_review_imports: Vec::new(),
             comment_editor: None,
+            pending_external_import_request: None,
+            external_importers: Vec::new(),
+            import_state: None,
+            selected_importer: 0,
             pending_draft_save: None,
             pending_draft_delete: None,
             pending_draft_update: None,
@@ -6523,9 +7100,229 @@ impl ReviewApp {
                     refining_suggestion_count,
                     accepted_suggestion_count,
                     rejected_suggestion_count,
+                    external_provider_id: None,
+                    external_mapping_status: None,
+                })
+            })
+            .chain(self.external_thread_summaries())
+            .collect()
+    }
+
+    fn external_thread_summaries(&self) -> Vec<ReviewThreadSummary> {
+        self.external_review_imports
+            .iter()
+            .flat_map(|record| {
+                record.threads.iter().map(|thread| {
+                    let anchor = thread
+                        .mapping
+                        .anchor
+                        .clone()
+                        .map(DraftAnchor::from)
+                        .map_or_else(
+                            || ReviewCommentAnchor::file(thread_path(thread)),
+                            |anchor| ReviewCommentAnchor::from_draft_anchor(&anchor),
+                        );
+                    ReviewThreadSummary {
+                        anchor,
+                        draft_count: thread.comments.len(),
+                        latest_body: thread.comments.last().map_or_else(
+                            || "external review thread".to_string(),
+                            |comment| comment.body.clone(),
+                        ),
+                        session_id: None,
+                        resolved: thread.state == ExternalReviewThreadState::Resolved,
+                        thread_kind: ReviewThreadKind::Note,
+                        severity: ReviewThreadSeverity::Info,
+                        pending_suggestion_count: 0,
+                        refining_suggestion_count: 0,
+                        accepted_suggestion_count: 0,
+                        rejected_suggestion_count: 0,
+                        external_provider_id: Some(record.importer_id.clone()),
+                        external_mapping_status: Some(thread.mapping.status),
+                    }
                 })
             })
             .collect()
+    }
+
+    /// Show discovered importer picker.
+    fn show_external_importers(&mut self, importers: Vec<ExternalImporterRoute>) {
+        self.external_importers = importers;
+        self.selected_importer = 0;
+        if self.external_importers.is_empty() {
+            self.import_state = None;
+            self.status_message = Some("no external review importer is available".to_string());
+        } else {
+            self.import_state = Some(ReviewImportState::Picker);
+            self.status_message = None;
+        }
+    }
+
+    /// Move importer picker/options selection down.
+    pub fn import_down(&mut self, rows: usize) -> bool {
+        match &mut self.import_state {
+            Some(ReviewImportState::Picker) => {
+                let next = self
+                    .selected_importer
+                    .saturating_add(rows)
+                    .min(self.external_importers.len().saturating_sub(1));
+                if next == self.selected_importer {
+                    return false;
+                }
+                self.selected_importer = next;
+                true
+            }
+            Some(ReviewImportState::Options {
+                options, selected, ..
+            }) => {
+                let next = selected
+                    .saturating_add(rows)
+                    .min(options.len().saturating_sub(1));
+                if next == *selected {
+                    return false;
+                }
+                *selected = next;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Move importer picker/options selection up.
+    pub const fn import_up(&mut self, rows: usize) -> bool {
+        match &mut self.import_state {
+            Some(ReviewImportState::Picker) => {
+                let next = self.selected_importer.saturating_sub(rows);
+                if next == self.selected_importer {
+                    return false;
+                }
+                self.selected_importer = next;
+                true
+            }
+            Some(ReviewImportState::Options { selected, .. }) => {
+                let next = selected.saturating_sub(rows);
+                if next == *selected {
+                    return false;
+                }
+                *selected = next;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Confirm importer picker/options selection.
+    pub fn confirm_import_selection(&mut self) -> bool {
+        match &self.import_state {
+            Some(ReviewImportState::Picker) => {
+                let Some(importer) = self.external_importers.get(self.selected_importer) else {
+                    return false;
+                };
+                let options = options_from_schema(&importer.manifest.options_schema);
+                if options.is_empty() {
+                    self.pending_external_import_request =
+                        Some(PendingExternalImportRequest::Invoke {
+                            importer_index: self.selected_importer,
+                            options,
+                        });
+                    self.status_message = Some("importing external review".to_string());
+                } else {
+                    self.import_state = Some(ReviewImportState::Options {
+                        importer_index: self.selected_importer,
+                        options,
+                        selected: 0,
+                    });
+                }
+                true
+            }
+            Some(ReviewImportState::Options {
+                importer_index,
+                options,
+                ..
+            }) => {
+                self.pending_external_import_request = Some(PendingExternalImportRequest::Invoke {
+                    importer_index: *importer_index,
+                    options: options.clone(),
+                });
+                self.status_message = Some("importing external review".to_string());
+                true
+            }
+            None => false,
+        }
+    }
+
+    const fn import_options_active(&self) -> bool {
+        matches!(self.import_state, Some(ReviewImportState::Options { .. }))
+    }
+
+    fn cycle_selected_import_option(&mut self, offset: isize) -> bool {
+        let Some(ReviewImportState::Options {
+            options, selected, ..
+        }) = &mut self.import_state
+        else {
+            return false;
+        };
+        cycle_option(options, *selected, offset, &mut self.status_message)
+    }
+
+    fn edit_import_option(&mut self, stroke: KeyStroke) -> bool {
+        let Some(ReviewImportState::Options {
+            options, selected, ..
+        }) = &mut self.import_state
+        else {
+            return false;
+        };
+        edit_option(options, *selected, stroke)
+    }
+
+    fn insert_import_option_text(&mut self, text: &str) -> bool {
+        let Some(ReviewImportState::Options {
+            options, selected, ..
+        }) = &mut self.import_state
+        else {
+            return false;
+        };
+        let Some(option) = options.get_mut(*selected) else {
+            return false;
+        };
+        if option.choices.is_empty() {
+            option.value.push_str(text);
+            true
+        } else {
+            false
+        }
+    }
+
+    #[must_use]
+    pub fn external_importers(&self) -> Vec<&ReviewImporterManifest> {
+        self.external_importers
+            .iter()
+            .map(|importer| &importer.manifest)
+            .collect()
+    }
+
+    /// Queue read-only external review import discovery.
+    pub fn import_external_review(&mut self) -> bool {
+        if self.workspace.id.is_empty() {
+            self.status_message = Some("external import requires a durable workspace".to_string());
+            return true;
+        }
+        self.pending_external_import_request = Some(PendingExternalImportRequest::Discover);
+        self.status_message = Some("discovering external review importers".to_string());
+        true
+    }
+
+    /// Take pending external review import request.
+    pub const fn take_external_import_request(&mut self) -> Option<PendingExternalImportRequest> {
+        self.pending_external_import_request.take()
+    }
+
+    /// Replace durable provider-neutral external review snapshots.
+    pub fn load_external_imports(&mut self, records: Vec<ExternalReviewImportRecord>) {
+        self.external_review_imports = records;
+        self.selected_thread = self
+            .selected_thread
+            .min(self.visible_thread_summaries().len().saturating_sub(1));
     }
 
     /// Return review thread summaries visible in the sidebar.
@@ -8854,6 +9651,87 @@ impl ReviewApp {
         ))
     }
 
+    /// Return provider-neutral local publish state for a thread.
+    #[must_use]
+    pub fn thread_publish_label(&self, anchor: &ReviewCommentAnchor) -> &'static str {
+        if self
+            .published_review_threads
+            .contains_key(&Self::thread_key_for_anchor(anchor))
+        {
+            "published"
+        } else {
+            "unpublished"
+        }
+    }
+
+    /// Return publisher id recorded for a published thread.
+    #[must_use]
+    pub fn thread_publisher_id(&self, anchor: &ReviewCommentAnchor) -> Option<&str> {
+        self.published_review_threads
+            .get(&Self::thread_key_for_anchor(anchor))
+            .map(String::as_str)
+    }
+
+    /// Toggle whether the selected review thread is included in publishing.
+    pub fn toggle_selected_publish_thread(&mut self) -> bool {
+        if !matches!(self.publish_state, Some(ReviewPublishState::Checklist)) {
+            return false;
+        }
+        let threads = self.thread_summaries();
+        let Some(thread) = threads.get(self.selected_thread.min(threads.len().saturating_sub(1)))
+        else {
+            self.status_message = Some("no review thread available to select".to_string());
+            return true;
+        };
+        let key = Self::thread_key_for_anchor(&thread.anchor);
+        if self.excluded_publish_threads.remove(&key) {
+            self.status_message = Some("included selected thread in publish".to_string());
+        } else {
+            self.excluded_publish_threads.insert(key);
+            self.status_message = Some("excluded selected thread from publish".to_string());
+        }
+        true
+    }
+
+    /// Return thread selection lines for publish preview/checklist.
+    #[must_use]
+    pub fn publish_thread_selection_lines(&self) -> Vec<String> {
+        self.thread_summaries()
+            .into_iter()
+            .enumerate()
+            .map(|(index, thread)| {
+                let key = Self::thread_key_for_anchor(&thread.anchor);
+                let marker = if self.excluded_publish_threads.contains(&key) {
+                    "[ ] excluded"
+                } else {
+                    "[x] included"
+                };
+                format!(
+                    "{} {marker} {}:{} {}",
+                    if index == self.selected_thread {
+                        ">"
+                    } else {
+                        " "
+                    },
+                    thread.anchor.scope_label(),
+                    thread.line_label(),
+                    truncate_chars(thread.latest_body, 80),
+                )
+            })
+            .collect()
+    }
+
+    fn excluded_publish_anchors(&self) -> Vec<ModelDraftAnchor> {
+        self.thread_summaries()
+            .into_iter()
+            .filter(|thread| {
+                self.excluded_publish_threads
+                    .contains(&Self::thread_key_for_anchor(&thread.anchor))
+            })
+            .map(|thread| thread.anchor.into())
+            .collect()
+    }
+
     /// Queue generic review publish.
     pub fn publish_review(&mut self) -> bool {
         if !self.publish_readiness_ack
@@ -8894,13 +9772,63 @@ impl ReviewApp {
             publisher_id,
             options: self.current_publish_options(),
             preview,
+            selection_summary: self.publish_thread_selection_lines(),
             scroll: 0,
         });
         self.status_message = None;
     }
 
+    /// Keep the configured options available after a preview failure.
+    pub fn fail_publish_preview(&mut self, error: &str) {
+        let Some(ReviewPublishState::Options {
+            publisher_id,
+            options,
+            selected,
+        }) = self.publish_state.take()
+        else {
+            self.status_message = Some(format!("publish preview failed: {error}"));
+            return;
+        };
+        self.publish_state = Some(ReviewPublishState::Options {
+            publisher_id,
+            options,
+            selected,
+        });
+        self.status_message = Some(format!("publish preview failed: {error}"));
+    }
+
+    /// Return to preview after a submission failure so it can be retried safely.
+    pub fn fail_publish_submit(&mut self, error: &str) {
+        if let Some(ReviewPublishState::ConfirmSubmit {
+            publisher_id,
+            options,
+            preview,
+            selection_summary,
+            scroll,
+        }) = self.publish_state.take()
+        {
+            self.publish_state = Some(ReviewPublishState::Preview {
+                publisher_id,
+                options,
+                preview,
+                selection_summary,
+                scroll,
+            });
+        }
+        self.status_message = Some(format!("publish failed: {error}"));
+    }
+
     /// Finish publish flow.
     pub fn finish_publish(&mut self, response: PublishReviewResponse) {
+        if response.submitted {
+            for thread in self.thread_summaries() {
+                let key = Self::thread_key_for_anchor(&thread.anchor);
+                if !self.excluded_publish_threads.contains(&key) {
+                    self.published_review_threads
+                        .insert(key, response.publisher_id.clone());
+                }
+            }
+        }
         self.publish_state = None;
         self.publish_readiness_ack = false;
         self.status_message = Some(response.message);
@@ -9021,30 +9949,7 @@ impl ReviewApp {
         else {
             return false;
         };
-        let Some(option) = options.get_mut(*selected) else {
-            return false;
-        };
-        if option.choices.is_empty() {
-            self.status_message = Some("selected publish option has no choices".to_string());
-            return true;
-        }
-        let current = option
-            .choices
-            .iter()
-            .position(|choice| choice == &option.value)
-            .unwrap_or(0);
-        let len = option.choices.len();
-        let next = if offset.is_negative() {
-            current
-                .saturating_add(len)
-                .saturating_sub(offset.unsigned_abs() % len)
-                % len
-        } else {
-            current.saturating_add(offset.unsigned_abs()) % len
-        };
-        option.value.clone_from(&option.choices[next]);
-        self.status_message = Some(format!("{} = {}", option.name, option.value));
-        true
+        cycle_option(options, *selected, offset, &mut self.status_message)
     }
 
     /// Edit selected publisher option.
@@ -9055,20 +9960,7 @@ impl ReviewApp {
         else {
             return false;
         };
-        let Some(option) = options.get_mut(*selected) else {
-            return false;
-        };
-        match stroke.key {
-            KeyCode::Char(ch) if stroke.modifiers.is_empty() && option.choices.is_empty() => {
-                option.value.push(ch);
-                true
-            }
-            KeyCode::Backspace if stroke.modifiers.is_empty() && option.choices.is_empty() => {
-                option.value.pop();
-                true
-            }
-            _ => false,
-        }
+        edit_option(options, *selected, stroke)
     }
 
     /// Return publish readiness checklist lines.
@@ -9126,6 +10018,7 @@ impl ReviewApp {
             publisher_id,
             options,
             preview,
+            selection_summary,
             scroll,
         }) = self.publish_state.take()
         else {
@@ -9135,6 +10028,7 @@ impl ReviewApp {
             publisher_id,
             options,
             preview,
+            selection_summary,
             scroll,
         });
         self.status_message = Some("returned to review publish preview".to_string());
@@ -9157,11 +10051,14 @@ impl ReviewApp {
                 };
                 let options = options_from_schema(&publisher.options_schema);
                 if options.is_empty() {
+                    let publisher_id = publisher.id.clone();
+                    let publisher_label = publisher.label.clone();
                     self.pending_publish_request = Some(PendingPublishRequest::Preview {
-                        publisher_id: publisher.id.clone(),
+                        publisher_id,
                         options,
+                        excluded_thread_anchors: self.excluded_publish_anchors(),
                     });
-                    self.status_message = Some(format!("previewing publisher {}", publisher.label));
+                    self.status_message = Some(format!("previewing publisher {publisher_label}"));
                 } else {
                     self.publish_state = Some(ReviewPublishState::Options {
                         publisher_id: publisher.id.clone(),
@@ -9180,6 +10077,7 @@ impl ReviewApp {
                 self.pending_publish_request = Some(PendingPublishRequest::Preview {
                     publisher_id: publisher_id.clone(),
                     options: options.clone(),
+                    excluded_thread_anchors: self.excluded_publish_anchors(),
                 });
                 self.status_message = Some(format!("previewing publisher {publisher_id}"));
                 true
@@ -9189,6 +10087,7 @@ impl ReviewApp {
                     publisher_id,
                     options,
                     preview,
+                    selection_summary,
                     scroll,
                 }) = self.publish_state.take()
                 else {
@@ -9199,6 +10098,7 @@ impl ReviewApp {
                     publisher_id,
                     options,
                     preview,
+                    selection_summary,
                     scroll,
                 });
                 true
@@ -9211,6 +10111,7 @@ impl ReviewApp {
                 self.pending_publish_request = Some(PendingPublishRequest::Submit {
                     publisher_id: publisher_id.clone(),
                     options: options.clone(),
+                    excluded_thread_anchors: self.excluded_publish_anchors(),
                 });
                 self.status_message = Some(format!("submitting review via {publisher_id}"));
                 true
@@ -9788,8 +10689,23 @@ impl ReviewApp {
             .as_deref()
             .map_or(String::new(), |session_id| format!("  🤖 {session_id}"));
         let status = if thread.resolved { "resolved" } else { "open" };
+        let external =
+            thread
+                .external_provider_id
+                .as_deref()
+                .map_or_else(String::new, |provider| {
+                    let mapping =
+                        thread
+                            .external_mapping_status
+                            .map_or("external", |status| match status {
+                                ExternalAnchorMappingStatus::Exact => "mapped",
+                                ExternalAnchorMappingStatus::Approximate => "stale",
+                                ExternalAnchorMappingStatus::Unmappable => "unmappable",
+                            });
+                    format!("  external:{provider}/{mapping}")
+                });
         Some(format!(
-            " {status} thread {} {range} x{}:{linked} {}  Enter jump  r resolve/reopen  a ask/follow up  o open ",
+            " {status} thread {} {range} x{}:{linked}{external} {}  Enter jump  r resolve/reopen  a ask/follow up  o open ",
             thread.anchor.path, thread.draft_count, thread.latest_body
         ))
     }
@@ -9864,6 +10780,36 @@ impl ReviewApp {
         let comments = self.draft_comments.get(&anchor)?;
         let index = selected_index.unwrap_or_else(|| comments.len().saturating_sub(1));
         comments.get(index)?.session_id.as_deref()
+    }
+
+    /// Restore provider-neutral per-thread publish state from durable records.
+    pub fn load_publish_records(
+        &mut self,
+        records: Vec<bcode_code_review_models::ReviewPublishRecord>,
+    ) {
+        for record in records.into_iter().filter(|record| record.submitted) {
+            for anchor in record.published_thread_anchors {
+                let local: DraftAnchor = anchor.into();
+                let draft = DraftComment {
+                    comment_id: String::new(),
+                    thread_id: String::new(),
+                    anchor: local,
+                    body: String::new(),
+                    created_at_ms: record.created_at_ms,
+                    updated_at_ms: record.created_at_ms,
+                    session_id: None,
+                    resolved_at_ms: None,
+                    thread_kind: ReviewThreadKind::Note,
+                    severity: ReviewThreadSeverity::Info,
+                };
+                if let Some(anchor) = self.anchor_from_persisted_draft(&draft) {
+                    self.published_review_threads.insert(
+                        Self::thread_key_for_anchor(&anchor),
+                        record.publisher_id.clone(),
+                    );
+                }
+            }
+        }
     }
 
     /// Load persisted suggested comments into local state.
@@ -12103,6 +13049,248 @@ mod tests {
     }
 
     #[test]
+    fn external_import_picker_supports_multiple_providers_and_options() {
+        let mut app = sample_app();
+        app.show_external_importers(vec![
+            ExternalImporterRoute {
+                manifest: ReviewImporterManifest {
+                    id: "first".to_string(),
+                    label: "First".to_string(),
+                    description: "First importer".to_string(),
+                    options_schema: serde_json::json!({"type":"object","properties":{}}),
+                },
+                plugin_id: "plugin.first".to_string(),
+                interface_id: REVIEW_IMPORTER_INTERFACE_ID.to_string(),
+            },
+            ExternalImporterRoute {
+                manifest: ReviewImporterManifest {
+                    id: "github".to_string(),
+                    label: "GitHub".to_string(),
+                    description: "GitHub importer".to_string(),
+                    options_schema: serde_json::json!({
+                        "type":"object",
+                        "properties": {
+                            "repository": {"type":"string"},
+                            "pull_request": {"type":"string"}
+                        }
+                    }),
+                },
+                plugin_id: "plugin.github".to_string(),
+                interface_id: REVIEW_IMPORTER_INTERFACE_ID.to_string(),
+            },
+        ]);
+
+        assert!(matches!(app.import_state, Some(ReviewImportState::Picker)));
+        assert!(app.import_down(1));
+        assert!(app.confirm_import_selection());
+        assert!(matches!(
+            app.import_state,
+            Some(ReviewImportState::Options { .. })
+        ));
+        assert!(app.edit_import_option(KeyStroke::simple(KeyCode::Char('o'))));
+        assert!(app.edit_import_option(KeyStroke::simple(KeyCode::Char('w'))));
+        assert!(app.confirm_import_selection());
+        assert!(matches!(
+            app.take_external_import_request(),
+            Some(PendingExternalImportRequest::Invoke { importer_index: 1, options })
+                if options.first().is_some_and(|option| option.value == "ow")
+        ));
+    }
+
+    #[test]
+    fn queues_external_import_only_for_durable_workspace() {
+        let mut app = sample_app();
+
+        assert!(app.import_external_review());
+        assert_eq!(
+            app.take_external_import_request(),
+            Some(PendingExternalImportRequest::Discover)
+        );
+
+        app.workspace.id.clear();
+        assert!(app.import_external_review());
+        assert!(app.take_external_import_request().is_none());
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("external import requires a durable workspace")
+        );
+    }
+
+    #[test]
+    fn review_files_round_trip_for_external_import_mapping() {
+        let app = sample_app();
+        let restored = app
+            .review
+            .files
+            .iter()
+            .map(ReviewFile::to_model)
+            .map(ReviewFile::from_model)
+            .collect::<Vec<_>>();
+
+        assert_eq!(restored, app.review.files);
+    }
+
+    #[test]
+    fn persisted_external_threads_restore_distinct_mapping_states() {
+        let mut app = sample_app();
+        let mapped_anchor = ModelDraftAnchor {
+            kind: ReviewAnchorKind::Range,
+            file_path: "a.rs".to_string(),
+            diff_row: 2,
+            start_diff_row: Some(2),
+            end_diff_row: Some(2),
+            old_start: None,
+            old_end: None,
+            new_start: Some(2),
+            new_end: Some(2),
+            old_line: None,
+            new_line: Some(2),
+            line_kind: bcode_code_review_models::ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        app.load_external_imports(vec![ExternalReviewImportRecord {
+            workspace_id: app.workspace.id.clone(),
+            importer_id: "github_pr_review".to_string(),
+            threads: vec![
+                external_test_thread(
+                    "thread:1",
+                    ExternalReviewThreadState::Open,
+                    ExternalAnchorMappingStatus::Exact,
+                    Some(mapped_anchor),
+                ),
+                external_test_thread(
+                    "thread:2",
+                    ExternalReviewThreadState::Outdated,
+                    ExternalAnchorMappingStatus::Unmappable,
+                    None,
+                ),
+            ],
+            warnings: vec!["one unmappable thread".to_string()],
+            updated_at_ms: 10,
+        }]);
+
+        let external = app
+            .thread_summaries()
+            .into_iter()
+            .filter(|thread| thread.external_provider_id.is_some())
+            .collect::<Vec<_>>();
+        assert_eq!(external.len(), 2);
+        assert!(external.iter().any(|thread| {
+            thread.external_mapping_status == Some(ExternalAnchorMappingStatus::Exact)
+                && thread.anchor.path == "a.rs"
+        }));
+        assert!(external.iter().any(|thread| {
+            thread.external_mapping_status == Some(ExternalAnchorMappingStatus::Unmappable)
+                && thread.anchor.path == "<unmapped external>"
+        }));
+        let preview = app.selected_thread_preview().expect("external preview");
+        assert!(preview.contains("external:github_pr_review/mapped"));
+    }
+
+    fn external_test_thread(
+        id: &str,
+        state: ExternalReviewThreadState,
+        status: ExternalAnchorMappingStatus,
+        anchor: Option<ModelDraftAnchor>,
+    ) -> bcode_code_review_models::ExternalReviewThread {
+        bcode_code_review_models::ExternalReviewThread {
+            identity: bcode_code_review_models::ExternalReviewIdentity {
+                provider_id: "github".to_string(),
+                external_id: id.to_string(),
+                url: None,
+            },
+            state,
+            mapping: bcode_code_review_models::ExternalReviewAnchorMapping {
+                status,
+                anchor,
+                message: None,
+            },
+            comments: vec![bcode_code_review_models::ExternalReviewComment {
+                identity: bcode_code_review_models::ExternalReviewIdentity {
+                    provider_id: "github".to_string(),
+                    external_id: format!("comment:{id}"),
+                    url: None,
+                },
+                author: None,
+                author_label: Some("reviewer".to_string()),
+                body: "External finding".to_string(),
+                created_at_ms: None,
+                updated_at_ms: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn durable_publish_records_restore_per_thread_state() {
+        let mut app = sample_app();
+        app.selected_diff_line = 2;
+        assert!(app.open_comment_editor());
+        app.comment_editor
+            .as_mut()
+            .expect("editor")
+            .buffer
+            .insert_str("Publish me");
+        assert!(app.save_comment_editor());
+        let anchor = app.selected_comment_anchor().expect("anchor");
+        let model_anchor: ModelDraftAnchor = anchor.clone().into();
+
+        app.load_publish_records(vec![bcode_code_review_models::ReviewPublishRecord {
+            id: "record-1".to_string(),
+            workspace_id: Some(app.workspace.id.clone()),
+            review_id: "review-1".to_string(),
+            publisher_id: "github".to_string(),
+            submitted: true,
+            published_thread_anchors: vec![model_anchor],
+            output: Some("https://example.test/review".to_string()),
+            message: "submitted".to_string(),
+            created_at_ms: 10,
+        }]);
+
+        assert_eq!(app.thread_publish_label(&anchor), "published");
+        assert_eq!(app.thread_publisher_id(&anchor), Some("github"));
+    }
+
+    #[test]
+    fn publish_selection_excludes_threads_and_marks_only_included_as_published() {
+        let mut app = sample_app();
+        for (row, body) in [(1_usize, "first"), (2_usize, "second")] {
+            app.selected_diff_line = row;
+            assert!(app.open_comment_editor());
+            app.comment_editor
+                .as_mut()
+                .expect("editor")
+                .buffer
+                .insert_str(body);
+            assert!(app.save_comment_editor());
+        }
+        app.publish_state = Some(ReviewPublishState::Checklist);
+        app.selected_thread = 0;
+
+        assert!(app.toggle_selected_publish_thread());
+        let selection = app.publish_thread_selection_lines();
+        assert!(selection.iter().any(|line| line.contains("excluded")));
+        assert!(selection.iter().any(|line| line.contains("included")));
+        assert_eq!(app.excluded_publish_anchors().len(), 1);
+
+        app.finish_publish(PublishReviewResponse {
+            publisher_id: "local_markdown".to_string(),
+            submitted: true,
+            output: None,
+            message: "published".to_string(),
+        });
+
+        let threads = app.thread_summaries();
+        let published = threads
+            .iter()
+            .filter(|thread| app.thread_publish_label(&thread.anchor) == "published")
+            .count();
+        assert_eq!(published, 1);
+        assert_eq!(app.published_review_threads.len(), 1);
+    }
+
+    #[test]
     fn structured_ai_commands_queue_expected_action_and_context_metadata() {
         let commands = [
             ReviewAiCommand::ExplainChange,
@@ -12259,6 +13447,137 @@ mod tests {
             app.selected_thread_preview()
                 .expect("thread preview")
                 .contains("resolved thread")
+        );
+    }
+
+    #[test]
+    fn markdown_publish_flow_covers_picker_preview_confirm_submit_and_failure() {
+        let mut app = sample_app();
+        app.publish_state = Some(ReviewPublishState::Checklist);
+        assert!(app.confirm_publish_selection());
+        assert_eq!(
+            app.take_publish_request(),
+            Some(PendingPublishRequest::ListPublishers)
+        );
+        app.show_publishers(vec![ReviewPublisherManifest {
+            id: "markdown_file".to_string(),
+            label: "Markdown file".to_string(),
+            description: "Export Markdown".to_string(),
+            capabilities: ReviewPublisherCapabilities {
+                preview: true,
+                submit: true,
+                update_existing: true,
+                supports_threads: true,
+                supports_ranges: true,
+                supports_inline_comments: true,
+                supports_summary_comment: true,
+            },
+            options_schema: serde_json::json!({"type":"object","properties":{}}),
+            route: None,
+        }]);
+        assert!(app.confirm_publish_selection());
+        assert!(matches!(
+            app.take_publish_request(),
+            Some(PendingPublishRequest::Preview { publisher_id, .. }) if publisher_id == "markdown_file"
+        ));
+        app.show_publish_preview("markdown_file".to_string(), "# Preview".to_string());
+        assert!(matches!(
+            app.publish_state,
+            Some(ReviewPublishState::Preview { .. })
+        ));
+        assert!(app.confirm_publish_selection());
+        assert!(matches!(
+            app.publish_state,
+            Some(ReviewPublishState::ConfirmSubmit { .. })
+        ));
+        assert!(app.confirm_publish_selection());
+        assert!(matches!(
+            app.take_publish_request(),
+            Some(PendingPublishRequest::Submit { publisher_id, .. }) if publisher_id == "markdown_file"
+        ));
+        app.fail_publish_submit("disk full");
+        assert!(matches!(
+            app.publish_state,
+            Some(ReviewPublishState::Preview { .. })
+        ));
+        assert_eq!(
+            app.status_message.as_deref(),
+            Some("publish failed: disk full")
+        );
+    }
+
+    #[test]
+    fn github_publish_flow_covers_options_preview_submit_and_failure() {
+        let mut app = sample_app();
+        app.show_publishers(vec![ReviewPublisherManifest {
+            id: "github".to_string(),
+            label: "GitHub PR review".to_string(),
+            description: "Publish to GitHub".to_string(),
+            capabilities: ReviewPublisherCapabilities {
+                preview: true,
+                submit: true,
+                update_existing: false,
+                supports_threads: true,
+                supports_ranges: true,
+                supports_inline_comments: true,
+                supports_summary_comment: true,
+            },
+            options_schema: serde_json::json!({
+                "type":"object",
+                "properties": {
+                    "submit_event": {"type":"string","default":"COMMENT","enum":["COMMENT","REQUEST_CHANGES","APPROVE"]},
+                    "fallback_unmapped_to_summary": {"type":"boolean","default":false}
+                }
+            }),
+            route: Some(ReviewPublisherRoute {
+                plugin_id: "bcode.github-review-publisher".to_string(),
+                interface_id: REVIEW_PUBLISHER_INTERFACE_ID.to_string(),
+            }),
+        }]);
+        app.selected_publisher = 0;
+        assert!(app.confirm_publish_selection());
+        assert!(matches!(
+            app.publish_state,
+            Some(ReviewPublishState::Options { .. })
+        ));
+        assert!(app.cycle_selected_publish_option(1));
+        assert!(app.publish_down(1));
+        assert!(app.cycle_selected_publish_option(1));
+        assert!(app.confirm_publish_selection());
+        assert!(matches!(
+            app.take_publish_request(),
+            Some(PendingPublishRequest::Preview { publisher_id, options, .. })
+                if publisher_id == "github" && options.iter().any(|option| option.value == "REQUEST_CHANGES")
+        ));
+        app.show_publish_preview(
+            "github".to_string(),
+            "# GitHub PR review preview\n\n## Warnings\n* unmappable anchor".to_string(),
+        );
+        assert!(app.confirm_publish_selection());
+        assert!(app.confirm_publish_selection());
+        assert!(matches!(
+            app.take_publish_request(),
+            Some(PendingPublishRequest::Submit { publisher_id, .. }) if publisher_id == "github"
+        ));
+        app.publish_state = Some(ReviewPublishState::Options {
+            publisher_id: "github".to_string(),
+            options: vec![ReviewPublishOption {
+                name: "submit_event".to_string(),
+                label: "GitHub review event".to_string(),
+                value: "REQUEST_CHANGES".to_string(),
+                choices: vec!["COMMENT".to_string(), "REQUEST_CHANGES".to_string()],
+            }],
+            selected: 0,
+        });
+        app.fail_publish_preview("GitHub unavailable");
+        assert!(matches!(
+            app.publish_state,
+            Some(ReviewPublishState::Options { .. })
+        ));
+        assert!(
+            app.status_message
+                .as_deref()
+                .is_some_and(|message| message.contains("GitHub unavailable"))
         );
     }
 

@@ -12,6 +12,8 @@ use std::path::PathBuf;
 pub const CODE_REVIEW_SERVICE_INTERFACE_ID: &str = "bcode.code_review/v1";
 /// Review publisher service interface.
 pub const REVIEW_PUBLISHER_INTERFACE_ID: &str = "bcode.review_publisher/v1";
+/// External review importer service interface.
+pub const REVIEW_IMPORTER_INTERFACE_ID: &str = "bcode.review_importer/v1";
 
 /// Operation that returns a provider-neutral review bundle.
 pub const OP_REVIEW_BUNDLE_GET: &str = "review.bundle.get";
@@ -23,6 +25,8 @@ pub const OP_REVIEW_PUBLISH_PREVIEW: &str = "review.publish.preview";
 pub const OP_REVIEW_PUBLISH_SUBMIT: &str = "review.publish.submit";
 /// Operation that saves publish history for an externally handled publisher.
 pub const OP_REVIEW_PUBLISH_RECORD_SAVE: &str = "review.publish.record.save";
+/// Operation that returns publish records for a durable workspace.
+pub const OP_REVIEW_PUBLISH_RECORDS_LIST: &str = "review.publish.records.list";
 /// Operation that lists durable review workspaces.
 pub const OP_REVIEW_WORKSPACE_LIST: &str = "review.workspace.list";
 /// Operation that creates a durable review workspace.
@@ -41,12 +45,20 @@ pub const OP_REVIEW_REPO_FILE_GET: &str = "review.repo.file.get";
 pub const OP_REVIEW_SUGGESTIONS_LIST: &str = "review.suggestions.list";
 /// Operation that creates or updates a durable AI-suggested review comment.
 pub const OP_REVIEW_SUGGESTION_SAVE: &str = "review.suggestion.save";
+/// Operation that saves a provider-neutral external review import snapshot.
+pub const OP_REVIEW_EXTERNAL_IMPORT_SAVE: &str = "review.external_import.save";
+/// Operation that lists saved external review import snapshots.
+pub const OP_REVIEW_EXTERNAL_IMPORTS_LIST: &str = "review.external_imports.list";
 /// Operation that returns an external publisher manifest.
 pub const OP_REVIEW_PUBLISHER_MANIFEST: &str = "review.publisher.manifest";
 /// Operation that previews an external publisher request.
 pub const OP_REVIEW_PUBLISHER_PREVIEW: &str = "review.publisher.preview";
 /// Operation that submits an external publisher request.
 pub const OP_REVIEW_PUBLISHER_SUBMIT: &str = "review.publisher.submit";
+/// Operation that returns an external review importer manifest.
+pub const OP_REVIEW_IMPORTER_MANIFEST: &str = "review.importer.manifest";
+/// Operation that imports external review state without mutating it.
+pub const OP_REVIEW_IMPORTER_IMPORT: &str = "review.importer.import";
 
 /// Supported local Git review target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -367,6 +379,22 @@ pub struct MaterializeReviewWorkspaceResponse {
     pub materialization: ReviewWorkspaceMaterialization,
 }
 
+/// Request payload for listing publish records for a workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListPublishRecordsRequest {
+    /// Repository path where the workspace lives.
+    pub repo_path: PathBuf,
+    /// Durable workspace id.
+    pub workspace_id: String,
+}
+
+/// Response payload for listing publish records.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListPublishRecordsResponse {
+    /// Publish records in creation order.
+    pub records: Vec<ReviewPublishRecord>,
+}
+
 /// Request payload for `review.workspace.list`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListReviewWorkspacesRequest {
@@ -391,6 +419,9 @@ pub struct ReviewPublishRecord {
     pub publisher_id: String,
     /// Whether submission happened.
     pub submitted: bool,
+    /// Provider-neutral review thread anchors included in this publish.
+    #[serde(default)]
+    pub published_thread_anchors: Vec<DraftAnchor>,
     /// Output location, when available.
     #[serde(default)]
     pub output: Option<String>,
@@ -1159,6 +1190,9 @@ pub struct PublishReviewRequest {
     /// Review workspace, when publishing a durable mixed-source workspace.
     #[serde(default)]
     pub workspace: Option<ReviewWorkspace>,
+    /// Review thread anchors excluded by the reviewer from this publish.
+    #[serde(default)]
+    pub excluded_thread_anchors: Vec<DraftAnchor>,
     /// Publisher id.
     pub publisher_id: String,
     /// Publisher options.
@@ -1177,6 +1211,9 @@ pub struct SavePublishRecordRequest {
     pub publisher_id: String,
     /// Whether submission happened.
     pub submitted: bool,
+    /// Provider-neutral review thread anchors included in this publish.
+    #[serde(default)]
+    pub published_thread_anchors: Vec<DraftAnchor>,
     /// Output location, when available.
     #[serde(default)]
     pub output: Option<String>,
@@ -1210,6 +1247,177 @@ pub struct PublishReviewPreviewResponse {
     pub preview: String,
 }
 
+/// Provider-neutral state of an externally hosted review thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalReviewThreadState {
+    /// Thread is active remotely.
+    Open,
+    /// Thread was resolved remotely.
+    Resolved,
+    /// Provider reports that the thread's diff context is outdated.
+    Outdated,
+}
+
+/// Confidence of mapping an external comment to the current local review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalAnchorMappingStatus {
+    /// The provider supplied enough current information for an exact mapping.
+    Exact,
+    /// The anchor was mapped heuristically and should be reviewed.
+    Approximate,
+    /// The external anchor cannot be mapped to the current local review.
+    Unmappable,
+}
+
+/// Provider-neutral identity for an external review object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalReviewIdentity {
+    /// Provider id, such as `github`.
+    pub provider_id: String,
+    /// Provider-owned opaque identifier.
+    pub external_id: String,
+    /// Browser URL, when supplied by the provider.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// Provider-neutral mapping from external diff coordinates to a local anchor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalReviewAnchorMapping {
+    /// Mapping result.
+    pub status: ExternalAnchorMappingStatus,
+    /// Local anchor when mapping succeeded.
+    #[serde(default)]
+    pub anchor: Option<DraftAnchor>,
+    /// Human-readable mapping explanation.
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// A provider-neutral externally hosted review comment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalReviewComment {
+    /// Stable provider identity for the comment.
+    pub identity: ExternalReviewIdentity,
+    /// Stable provider identity for the author, when available.
+    #[serde(default)]
+    pub author: Option<ExternalReviewIdentity>,
+    /// Author display label.
+    #[serde(default)]
+    pub author_label: Option<String>,
+    /// Markdown comment body.
+    pub body: String,
+    /// Creation timestamp in milliseconds since Unix epoch, when available.
+    #[serde(default)]
+    pub created_at_ms: Option<u64>,
+    /// Last update timestamp in milliseconds since Unix epoch, when available.
+    #[serde(default)]
+    pub updated_at_ms: Option<u64>,
+}
+
+/// A provider-neutral externally hosted review thread.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalReviewThread {
+    /// Stable provider identity for the thread.
+    pub identity: ExternalReviewIdentity,
+    /// Current remote state.
+    pub state: ExternalReviewThreadState,
+    /// Mapping to the current local review.
+    pub mapping: ExternalReviewAnchorMapping,
+    /// Comments ordered from oldest to newest.
+    pub comments: Vec<ExternalReviewComment>,
+}
+
+/// External review importer manifest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewImporterManifest {
+    /// Stable importer id.
+    pub id: String,
+    /// Human-readable label.
+    pub label: String,
+    /// Human-readable description.
+    pub description: String,
+    /// JSON-schema-like option description.
+    pub options_schema: serde_json::Value,
+}
+
+/// Read-only external review import request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalReviewImportRequest {
+    /// Repository root used for provider discovery.
+    pub repo_root: PathBuf,
+    /// Current local review files used for anchor mapping.
+    #[serde(default)]
+    pub files: Vec<ReviewFile>,
+    /// Provider options such as repository and pull request.
+    #[serde(default)]
+    pub options: serde_json::Value,
+}
+
+/// Read-only external review import response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalReviewImportResponse {
+    /// Importer that produced this response.
+    pub importer_id: String,
+    /// Imported provider-neutral threads.
+    pub threads: Vec<ExternalReviewThread>,
+    /// Non-fatal discovery or mapping warnings.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+/// Durable provider-neutral external review import snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExternalReviewImportRecord {
+    /// Durable workspace id.
+    pub workspace_id: String,
+    /// Importer that produced this snapshot.
+    pub importer_id: String,
+    /// Imported provider-neutral threads.
+    pub threads: Vec<ExternalReviewThread>,
+    /// Non-fatal discovery or mapping warnings.
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    /// Snapshot update time in milliseconds since Unix epoch.
+    pub updated_at_ms: u64,
+}
+
+/// Request to atomically replace an external import snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveExternalReviewImportRequest {
+    /// Repository containing the durable workspace.
+    pub repo_path: PathBuf,
+    /// Durable workspace id.
+    pub workspace_id: String,
+    /// Read-only importer response to persist.
+    pub import: ExternalReviewImportResponse,
+}
+
+/// Response after saving an external import snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SaveExternalReviewImportResponse {
+    /// Persisted snapshot.
+    pub record: ExternalReviewImportRecord,
+}
+
+/// Request to list durable external import snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListExternalReviewImportsRequest {
+    /// Repository containing the durable workspace.
+    pub repo_path: PathBuf,
+    /// Durable workspace id.
+    pub workspace_id: String,
+}
+
+/// Response containing durable external import snapshots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListExternalReviewImportsResponse {
+    /// Snapshots ordered by importer id.
+    pub records: Vec<ExternalReviewImportRecord>,
+}
+
 /// Response payload for publish submit.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PublishReviewResponse {
@@ -1230,6 +1438,45 @@ const fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn external_review_import_models_round_trip_json() {
+        let response = ExternalReviewImportResponse {
+            importer_id: "github_pr_review".to_string(),
+            threads: vec![ExternalReviewThread {
+                identity: ExternalReviewIdentity {
+                    provider_id: "github".to_string(),
+                    external_id: "thread-1".to_string(),
+                    url: Some("https://github.com/owner/repo/pull/1#discussion_r1".to_string()),
+                },
+                state: ExternalReviewThreadState::Outdated,
+                mapping: ExternalReviewAnchorMapping {
+                    status: ExternalAnchorMappingStatus::Unmappable,
+                    anchor: None,
+                    message: Some("diff context is outdated".to_string()),
+                },
+                comments: vec![ExternalReviewComment {
+                    identity: ExternalReviewIdentity {
+                        provider_id: "github".to_string(),
+                        external_id: "comment-1".to_string(),
+                        url: None,
+                    },
+                    author: None,
+                    author_label: Some("reviewer".to_string()),
+                    body: "Please handle this case.".to_string(),
+                    created_at_ms: Some(10),
+                    updated_at_ms: Some(20),
+                }],
+            }],
+            warnings: vec!["one thread was unmappable".to_string()],
+        };
+
+        let json = serde_json::to_string(&response).expect("serialize import response");
+        let decoded: ExternalReviewImportResponse =
+            serde_json::from_str(&json).expect("deserialize import response");
+
+        assert_eq!(decoded, response);
+    }
 
     #[test]
     fn review_suggestion_models_round_trip_json() {

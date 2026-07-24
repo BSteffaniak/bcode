@@ -8,6 +8,12 @@ description  = "Publishes Bcode review threads to GitHub pull requests"
 interface_id = "bcode.review_publisher/v1"
 name         = "GitHub Review Publisher"
 
+[[services]]
+class        = "service"
+description  = "Imports GitHub pull request review threads without remote mutation"
+interface_id = "bcode.review_importer/v1"
+name         = "GitHub Review Importer"
+
 [concurrency]
 max  = 2
 type = "limited"

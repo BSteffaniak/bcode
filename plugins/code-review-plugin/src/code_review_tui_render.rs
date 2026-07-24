@@ -196,6 +196,9 @@ fn render_overlays(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     if app.prompt_state.is_some() {
         render_prompt(app, area, frame);
     }
+    if app.import_state.is_some() {
+        render_import_modal(app, area, frame);
+    }
     if app.publish_state.is_some() {
         render_publish_modal(app, area, frame);
     }
@@ -486,7 +489,7 @@ fn render_footer(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             }
             if app.review.is_repository_review() {
                 return format!(
-                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  M attention  u/i file-open  P/O global-open  L/B AI-linked  ! attention-sidebar  c comment  F file-comment  C review-comment  w viewed  W/I unviewed  V/E all-viewed/unviewed  H hide-viewed  v range  x publish  a ask Bcode  t sidebar-tab:{sidebar}  b sidebar:{sidebar}  ? {help}  q exit "
+                    " j/k move  enter open/toggle  ←/→ collapse/expand  f picker  : line  / search  n/N next/prev  M attention  u/i file-open  P/O global-open  L/B AI-linked  ! attention-sidebar  c comment  F file-comment  C review-comment  w viewed  W/I unviewed  V/E all-viewed/unviewed  H hide-viewed  v range  x publish  X import  a ask Bcode  t sidebar-tab:{sidebar}  b sidebar:{sidebar}  ? {help}  q exit "
                 );
             }
             format!(
@@ -946,7 +949,13 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             } else {
                 Style::new().fg(Color::White).bg(Color::Black)
             };
-            let marker = if thread.resolved { "✓" } else { "●" };
+            let marker = if thread.external_provider_id.is_some() {
+                "⇩"
+            } else if thread.resolved {
+                "✓"
+            } else {
+                "●"
+            };
             let line_label = thread.line_label();
             let body = thread.latest_body.lines().next().unwrap_or_default();
             let status = if thread.resolved { "RESOLVED" } else { "OPEN" };
@@ -969,8 +978,10 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             } else {
                 ""
             };
+            let publish_status = app.thread_publish_label(&thread.anchor);
+            let external_status = external_sidebar_label(thread);
             let text = format!(
-                " {marker} {status:<8} {kind}/{severity} {path_label}:{line_label} d:{} {suggestion_status}{linked} {body}{agent_status}",
+                " {marker} {status:<8} {kind}/{severity} {path_label}:{line_label} d:{} [{publish_status}] {external_status}{suggestion_status}{linked} {body}{agent_status}",
                 thread.draft_count
             );
             frame.write_line_with_fallback_style(
@@ -998,6 +1009,19 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         );
         render_thread_detail(app, detail_area, frame, &threads);
     }
+}
+
+fn external_sidebar_label(thread: &crate::code_review_tui::ReviewThreadSummary) -> String {
+    let Some(provider) = thread.external_provider_id.as_deref() else {
+        return String::new();
+    };
+    let mapping = match thread.external_mapping_status {
+        Some(bcode_code_review_models::ExternalAnchorMappingStatus::Exact) => "mapped",
+        Some(bcode_code_review_models::ExternalAnchorMappingStatus::Approximate) => "stale",
+        Some(bcode_code_review_models::ExternalAnchorMappingStatus::Unmappable) => "unmappable",
+        None => "external",
+    };
+    format!("[{provider}:{mapping}] ")
 }
 
 fn suggestion_sidebar_label(thread: &crate::code_review_tui::ReviewThreadSummary) -> String {
@@ -2457,6 +2481,89 @@ const DIFF_HELP_LINES: &[&str] = &[
     " q or esc            exit review",
 ];
 
+fn render_import_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
+    let Some(state) = &app.import_state else {
+        return;
+    };
+    let width = area.width.min(90);
+    let height = area.height.min(24);
+    if width < 30 || height < 8 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x.saturating_add(area.width.saturating_sub(width) / 2),
+        area.y
+            .saturating_add(area.height.saturating_sub(height) / 2),
+        width,
+        height,
+    );
+    frame.fill(
+        popup,
+        " ",
+        Style::new().fg(Color::White).bg(Color::BrightBlack),
+    );
+    let header = Rect::new(
+        popup.x.saturating_add(1),
+        popup.y,
+        popup.width.saturating_sub(2),
+        1,
+    );
+    match state {
+        crate::code_review_tui::ReviewImportState::Picker => {
+            frame.write_line(
+                header,
+                &Line::from_spans(vec![Span::styled(
+                    " Import external review  j/k select  Enter configure/import  Esc cancel ",
+                    Style::new().fg(Color::Black).bg(Color::Cyan),
+                )]),
+            );
+            for (row, importer) in app.external_importers().iter().enumerate() {
+                let selected = row == app.selected_importer;
+                let style = if selected {
+                    Style::new().fg(Color::Black).bg(Color::White)
+                } else {
+                    Style::new().fg(Color::White).bg(Color::BrightBlack)
+                };
+                let line = format!(
+                    " {}  {}  {}",
+                    importer.label, importer.description, importer.id
+                );
+                frame.write_line_with_fallback_style(
+                    Rect::new(
+                        popup.x.saturating_add(1),
+                        popup
+                            .y
+                            .saturating_add(2)
+                            .saturating_add(u16::try_from(row).unwrap_or(u16::MAX)),
+                        popup.width.saturating_sub(2),
+                        1,
+                    ),
+                    &Line::from_spans(vec![Span::styled(
+                        truncate_to_display_width(
+                            &line,
+                            usize::from(popup.width.saturating_sub(2)),
+                        ),
+                        style,
+                    )]),
+                    style,
+                );
+            }
+        }
+        crate::code_review_tui::ReviewImportState::Options {
+            options, selected, ..
+        } => {
+            frame.write_line(
+                header,
+                &Line::from_spans(vec![Span::styled(
+                    " Import options  Tab/j/k field  ←/→ choice  Enter import  Esc cancel ",
+                    Style::new().fg(Color::Black).bg(Color::Cyan),
+                )]),
+            );
+            render_publish_options(options, *selected, popup, frame);
+        }
+    }
+}
+
 fn render_publish_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     let Some(state) = &app.publish_state else {
         return;
@@ -2485,15 +2592,33 @@ fn render_publish_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {
         ReviewPublishState::Preview {
             publisher_id,
             preview,
+            selection_summary,
             scroll,
             ..
-        } => render_publish_preview(publisher_id, preview, *scroll, false, popup, frame),
+        } => render_publish_preview(
+            publisher_id,
+            selection_summary,
+            preview,
+            *scroll,
+            false,
+            popup,
+            frame,
+        ),
         ReviewPublishState::ConfirmSubmit {
             publisher_id,
             preview,
+            selection_summary,
             scroll,
             ..
-        } => render_publish_preview(publisher_id, preview, *scroll, true, popup, frame),
+        } => render_publish_preview(
+            publisher_id,
+            selection_summary,
+            preview,
+            *scroll,
+            true,
+            popup,
+            frame,
+        ),
     }
 }
 
@@ -2506,16 +2631,19 @@ fn render_publish_checklist(app: &ReviewApp, popup: Rect, frame: &mut Frame<'_>)
             1,
         ),
         &Line::from_spans(vec![Span::styled(
-            " Publish checklist  Enter continue  ! attention  W unviewed  P open thread  Esc cancel ",
+            " Publish checklist  ↑/↓ thread  Space include/exclude  Enter continue  ! attention  W unviewed  P open  Esc cancel ",
             Style::new()
                 .fg(Color::Black)
                 .bg(Color::White)
                 .add_modifier(Modifier::BOLD),
         )]),
     );
-    for (row, line) in app
+    let checklist_lines = app
         .publish_checklist_lines()
         .into_iter()
+        .chain(std::iter::once("threads selected for publish:".to_string()))
+        .chain(app.publish_thread_selection_lines());
+    for (row, line) in checklist_lines
         .take(usize::from(popup.height.saturating_sub(2)))
         .enumerate()
     {
@@ -2658,6 +2786,7 @@ fn render_publish_options(
 
 fn render_publish_preview(
     publisher_id: &str,
+    selection_summary: &[String],
     preview: &str,
     scroll: usize,
     confirming: bool,
@@ -2684,7 +2813,13 @@ fn render_publish_preview(
         )]),
     );
     let rows = usize::from(popup.height.saturating_sub(2));
-    for (row, line) in preview.lines().skip(scroll).take(rows).enumerate() {
+    let content = selection_summary
+        .iter()
+        .cloned()
+        .chain(std::iter::once("--- provider preview ---".to_string()))
+        .chain(preview.lines().map(ToString::to_string))
+        .collect::<Vec<_>>();
+    for (row, line) in content.iter().skip(scroll).take(rows).enumerate() {
         let y = popup
             .y
             .saturating_add(1 + u16::try_from(row).unwrap_or(u16::MAX));
@@ -3372,6 +3507,8 @@ mod tests {
             refining_suggestion_count: 0,
             accepted_suggestion_count: 1,
             rejected_suggestion_count: 1,
+            external_provider_id: None,
+            external_mapping_status: None,
         };
 
         assert_eq!(
