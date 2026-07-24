@@ -1,7 +1,8 @@
 use bcode_markdown_render::{
-    MarkdownContributionKind, MarkdownRenderOptions, MarkdownSemanticEventKind,
-    MarkdownSemanticTag, MarkdownTableAlignment, parse_markdown_document, render_markdown,
-    render_markdown_lines,
+    GitHubRepository, MarkdownContributionKind, MarkdownDestination, MarkdownDestinationRejection,
+    MarkdownDocumentContext, MarkdownRenderOptions, MarkdownSemanticEventKind, MarkdownSemanticTag,
+    MarkdownTableAlignment, parse_markdown_document, render_markdown, render_markdown_lines,
+    resolve_markdown_destination,
 };
 use bmux_tui::prelude::{Color, Line, Modifier, Style};
 use unicode_width::UnicodeWidthStr;
@@ -159,7 +160,7 @@ fn semantic_snapshot(markdown: &str) -> String {
 }
 
 fn contribution_snapshot(markdown: &str) -> String {
-    render_markdown(markdown, MarkdownRenderOptions::new(80))
+    render_markdown(markdown, &MarkdownRenderOptions::new(80))
         .contributions
         .into_iter()
         .map(|contribution| {
@@ -173,6 +174,116 @@ fn contribution_snapshot(markdown: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn github_issue_references_require_explicit_repository_context() {
+    let markdown = "Closes #42, see #7, but not #0 or #abc.";
+    let without_context = render_markdown(markdown, &MarkdownRenderOptions::new(80));
+    assert!(
+        !without_context
+            .contributions
+            .iter()
+            .any(|item| matches!(item.kind, MarkdownContributionKind::GitHubIssue { .. }))
+    );
+
+    let options = MarkdownRenderOptions::new(80).with_document_context(MarkdownDocumentContext {
+        github_repository: Some(GitHubRepository {
+            owner: "acme".to_owned(),
+            name: "nebula".to_owned(),
+        }),
+        ..MarkdownDocumentContext::default()
+    });
+    let with_context = render_markdown(markdown, &options);
+    let issues = with_context
+        .contributions
+        .iter()
+        .filter_map(|item| match &item.kind {
+            MarkdownContributionKind::GitHubIssue { number, closes, .. } => {
+                Some((*number, *closes))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(issues, [(42, true), (7, false)]);
+}
+
+#[test]
+fn contribution_ids_include_explicit_owner_and_remain_width_stable() {
+    let wide_options = MarkdownRenderOptions::new(80).with_document_id("transcript:42");
+    let narrow_options = MarkdownRenderOptions::new(20).with_document_id("transcript:42");
+    let other_options = MarkdownRenderOptions::new(80).with_document_id("transcript:43");
+    let wide = render_markdown(SEMANTIC_EXTENSIONS, &wide_options);
+    let narrow = render_markdown(SEMANTIC_EXTENSIONS, &narrow_options);
+    let other = render_markdown(SEMANTIC_EXTENSIONS, &other_options);
+    let ids = |result: &bcode_markdown_render::MarkdownRenderResult| {
+        result
+            .contributions
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>()
+    };
+
+    assert_eq!(ids(&wide), ids(&narrow));
+    assert!(ids(&wide).iter().all(|id| id.starts_with("transcript:42:")));
+    assert_ne!(ids(&wide), ids(&other));
+}
+
+#[test]
+fn link_destinations_require_explicit_safe_context() {
+    let context = MarkdownDocumentContext {
+        base_url: Some(url::Url::parse("https://github.com/acme/nebula/blob/main/").unwrap()),
+        base_directory: Some(std::path::PathBuf::from("/trusted/repository")),
+        github_repository: Some(GitHubRepository {
+            owner: "acme".to_owned(),
+            name: "nebula".to_owned(),
+        }),
+    };
+
+    assert_eq!(
+        resolve_markdown_destination("https://example.com/docs", None),
+        MarkdownDestination::Web(url::Url::parse("https://example.com/docs").unwrap())
+    );
+    assert_eq!(
+        resolve_markdown_destination("./docs/protocol.md", Some(&context)),
+        MarkdownDestination::Web(
+            url::Url::parse("https://github.com/acme/nebula/blob/main/docs/protocol.md").unwrap()
+        )
+    );
+    assert_eq!(
+        resolve_markdown_destination("./docs/protocol.md", None),
+        MarkdownDestination::UnresolvedRelative("./docs/protocol.md".to_owned())
+    );
+    assert_eq!(
+        resolve_markdown_destination("javascript:alert(1)", Some(&context)),
+        MarkdownDestination::Inert {
+            original: "javascript:alert(1)".to_owned(),
+            reason: MarkdownDestinationRejection::UnsupportedScheme,
+        }
+    );
+    assert_eq!(
+        resolve_markdown_destination("#section", Some(&context)),
+        MarkdownDestination::Fragment("section".to_owned())
+    );
+}
+
+#[test]
+fn rendered_link_contributions_include_classified_destinations() {
+    let context = MarkdownDocumentContext {
+        base_url: None,
+        base_directory: Some(std::path::PathBuf::from("/trusted/repository")),
+        github_repository: None,
+    };
+    let options = MarkdownRenderOptions::new(80).with_document_context(context);
+    let result = render_markdown("[Protocol](./docs/protocol.md)", &options);
+    assert!(result.contributions.iter().any(|item| matches!(
+        &item.kind,
+        MarkdownContributionKind::Link { label, destination, .. }
+            if label == "Protocol"
+                && destination == &MarkdownDestination::LocalPath(
+                    std::path::PathBuf::from("/trusted/repository/docs/protocol.md")
+                )
+    )));
 }
 
 #[test]
@@ -231,8 +342,8 @@ fn snapshots_parser_neutral_semantic_contributions() {
 
 #[test]
 fn semantic_contributions_have_stable_unique_ids_and_expected_payloads() {
-    let first = render_markdown(SEMANTIC_EXTENSIONS, MarkdownRenderOptions::new(80));
-    let second = render_markdown(SEMANTIC_EXTENSIONS, MarkdownRenderOptions::new(24));
+    let first = render_markdown(SEMANTIC_EXTENSIONS, &MarkdownRenderOptions::new(80));
+    let second = render_markdown(SEMANTIC_EXTENSIONS, &MarkdownRenderOptions::new(24));
     let first_ids = first
         .contributions
         .iter()

@@ -20,6 +20,7 @@ hyperchad_transformer_models = { workspace = true }
 pulldown-cmark               = { workspace = true }
 unicode-segmentation         = { workspace = true }
 unicode-width                = { workspace = true }
+url                          = { workspace = true }
 
 [dev-dependencies]
 insta    = { workspace = true }

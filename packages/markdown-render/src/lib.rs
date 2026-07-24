@@ -47,6 +47,7 @@ use pulldown_cmark::{
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
+use url::Url;
 
 /// Terminal styles used for Markdown rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,13 +137,102 @@ impl MarkdownTheme {
     }
 }
 
-/// Options controlling terminal Markdown rendering.
+/// Trusted context for resolving Markdown destinations.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MarkdownDocumentContext {
+    /// Base URL for URL-relative destinations.
+    pub base_url: Option<Url>,
+    /// Base filesystem directory for path-relative destinations.
+    pub base_directory: Option<std::path::PathBuf>,
+    /// Explicit GitHub repository identity for issue references.
+    pub github_repository: Option<GitHubRepository>,
+}
+
+/// Explicit GitHub repository identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitHubRepository {
+    /// Repository owner.
+    pub owner: String,
+    /// Repository name.
+    pub name: String,
+}
+
+/// Classified destination suitable for explicit activation handling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkdownDestination {
+    /// Safe HTTP(S) URL.
+    Web(Url),
+    /// Trusted local filesystem path.
+    LocalPath(std::path::PathBuf),
+    /// In-document fragment.
+    Fragment(String),
+    /// Unsupported or dangerous scheme; remains visible but inert.
+    Inert {
+        /// Original destination.
+        original: String,
+        /// Stable reason suitable for UI diagnostics.
+        reason: MarkdownDestinationRejection,
+    },
+    /// Relative destination without trusted context.
+    UnresolvedRelative(String),
+}
+
+/// Reasons a destination is intentionally inert.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkdownDestinationRejection {
+    /// URL scheme is not allowed for activation.
+    UnsupportedScheme,
+    /// File URL does not map to a local path.
+    InvalidFileUrl,
+}
+
+/// Resolve a Markdown destination under explicit trusted context.
+#[must_use]
+pub fn resolve_markdown_destination(
+    destination: &str,
+    context: Option<&MarkdownDocumentContext>,
+) -> MarkdownDestination {
+    if let Some(fragment) = destination.strip_prefix('#') {
+        return MarkdownDestination::Fragment(fragment.to_owned());
+    }
+    if let Ok(url) = Url::parse(destination) {
+        return match url.scheme() {
+            "http" | "https" => MarkdownDestination::Web(url),
+            "file" => url.to_file_path().map_or_else(
+                |()| MarkdownDestination::Inert {
+                    original: destination.to_owned(),
+                    reason: MarkdownDestinationRejection::InvalidFileUrl,
+                },
+                MarkdownDestination::LocalPath,
+            ),
+            _ => MarkdownDestination::Inert {
+                original: destination.to_owned(),
+                reason: MarkdownDestinationRejection::UnsupportedScheme,
+            },
+        };
+    }
+    if let Some(base_url) = context.and_then(|context| context.base_url.as_ref())
+        && let Ok(url) = base_url.join(destination)
+    {
+        return MarkdownDestination::Web(url);
+    }
+    if let Some(base_directory) = context.and_then(|context| context.base_directory.as_ref()) {
+        return MarkdownDestination::LocalPath(base_directory.join(destination));
+    }
+    MarkdownDestination::UnresolvedRelative(destination.to_owned())
+}
+
+/// Options controlling terminal Markdown rendering.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownRenderOptions {
     /// Available terminal width in cells.
     pub width: u16,
     /// Theme used for terminal Markdown styles.
     pub theme: MarkdownTheme,
+    /// Trusted context used only to resolve relative destinations.
+    pub document_context: Option<MarkdownDocumentContext>,
+    /// Stable identity of the owning document or transcript item.
+    pub document_id: Option<String>,
 }
 
 impl Default for MarkdownRenderOptions {
@@ -151,6 +241,8 @@ impl Default for MarkdownRenderOptions {
         Self {
             width: 80,
             theme: MarkdownTheme::default(),
+            document_context: None,
+            document_id: None,
         }
     }
 }
@@ -169,6 +261,20 @@ impl MarkdownRenderOptions {
     #[must_use]
     pub const fn with_theme(mut self, theme: MarkdownTheme) -> Self {
         self.theme = theme;
+        self
+    }
+
+    /// Return options with trusted link-resolution context.
+    #[must_use]
+    pub fn with_document_context(mut self, context: MarkdownDocumentContext) -> Self {
+        self.document_context = Some(context);
+        self
+    }
+
+    /// Return options with a stable owning document or transcript-item identity.
+    #[must_use]
+    pub fn with_document_id(mut self, document_id: impl Into<String>) -> Self {
+        self.document_id = Some(document_id.into());
         self
     }
 }
@@ -498,6 +604,8 @@ pub enum MarkdownContributionKind {
         link: MarkdownLink,
         /// Parser-semantic visible label.
         label: String,
+        /// Safe classified activation destination.
+        destination: MarkdownDestination,
     },
     /// Image and its alt text.
     Image {
@@ -515,6 +623,17 @@ pub enum MarkdownContributionKind {
     FootnoteDefinition {
         /// Source footnote label.
         label: String,
+    },
+    /// GitHub issue reference resolved under explicit repository context.
+    GitHubIssue {
+        /// Repository identity.
+        repository: GitHubRepository,
+        /// Issue number.
+        number: u64,
+        /// Safe issue URL.
+        destination: MarkdownDestination,
+        /// Whether the reference follows a closing keyword.
+        closes: bool,
     },
     /// Inline math source.
     InlineMath {
@@ -535,12 +654,17 @@ pub enum MarkdownContributionKind {
 
 /// Render Markdown into terminal lines and semantic contributions.
 #[must_use]
-pub fn render_markdown(markdown: &str, options: MarkdownRenderOptions) -> MarkdownRenderResult {
+pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> MarkdownRenderResult {
     let document = parse_markdown_document(markdown);
     let projected_markdown = project_semantic_fallbacks(markdown, &document);
+    let contributions = markdown_contributions(
+        &document,
+        options.document_context.as_ref(),
+        options.document_id.as_deref(),
+    );
     MarkdownRenderResult {
         lines: render_markdown_lines_internal(&projected_markdown, options),
-        contributions: markdown_contributions(&document),
+        contributions,
     }
 }
 
@@ -942,10 +1066,12 @@ fn replace_source_ranges(markdown: &str, mut replacements: Vec<(Range<usize>, St
 /// Render Markdown into terminal lines.
 #[must_use]
 pub fn render_markdown_lines(markdown: &str, options: MarkdownRenderOptions) -> Vec<Line> {
-    render_markdown(markdown, options).lines
+    let result = render_markdown(markdown, &options);
+    drop(options);
+    result.lines
 }
 
-fn render_markdown_lines_internal(markdown: &str, options: MarkdownRenderOptions) -> Vec<Line> {
+fn render_markdown_lines_internal(markdown: &str, options: &MarkdownRenderOptions) -> Vec<Line> {
     let table_alignments = table_alignments(markdown);
     let alert_kinds = alert_kinds(markdown);
     let container = markdown_to_container_with_options(markdown, hyperchad_markdown_options());
@@ -961,18 +1087,115 @@ fn render_markdown_lines_internal(markdown: &str, options: MarkdownRenderOptions
     renderer.finish()
 }
 
-fn markdown_contributions(document: &MarkdownDocument) -> Vec<MarkdownContribution> {
+fn markdown_contributions(
+    document: &MarkdownDocument,
+    context: Option<&MarkdownDocumentContext>,
+    document_id: Option<&str>,
+) -> Vec<MarkdownContribution> {
     let mut contributions = Vec::new();
     let mut containers: Vec<ContributionContainer> = Vec::new();
     for event in &document.events {
-        collect_markdown_contribution(event, &mut containers, &mut contributions);
+        collect_markdown_contribution(event, context, &mut containers, &mut contributions);
+    }
+    if let Some(repository) = context.and_then(|context| context.github_repository.as_ref()) {
+        contributions.extend(github_issue_contributions(document, repository));
     }
     contributions.sort_by_key(|item| (item.source_range.start, item.source_range.end));
+    if let Some(document_id) = document_id {
+        for item in &mut contributions {
+            item.id = format!("{document_id}:{}", item.id);
+        }
+    }
     contributions
+}
+
+fn github_issue_contributions(
+    document: &MarkdownDocument,
+    repository: &GitHubRepository,
+) -> Vec<MarkdownContribution> {
+    let mut output = Vec::new();
+    for event in &document.events {
+        let MarkdownSemanticEventKind::Text(text) = &event.kind else {
+            continue;
+        };
+        for (offset, number, closes) in github_issue_references(text) {
+            let start = event.source_range.start.saturating_add(offset);
+            let end = start
+                .saturating_add(number.to_string().len())
+                .saturating_add(1);
+            let url = format!(
+                "https://github.com/{}/{}/issues/{number}",
+                repository.owner, repository.name
+            );
+            let destination = Url::parse(&url).map_or_else(
+                |_| MarkdownDestination::Inert {
+                    original: url,
+                    reason: MarkdownDestinationRejection::UnsupportedScheme,
+                },
+                MarkdownDestination::Web,
+            );
+            output.push(contribution(
+                "github-issue",
+                start..end,
+                MarkdownContributionKind::GitHubIssue {
+                    repository: repository.clone(),
+                    number,
+                    destination,
+                    closes,
+                },
+            ));
+        }
+    }
+    output
+}
+
+fn github_issue_references(text: &str) -> Vec<(usize, u64, bool)> {
+    let mut output = Vec::new();
+    for (index, _) in text.match_indices('#') {
+        let digits = text[index + 1..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect::<String>();
+        if digits.is_empty() {
+            continue;
+        }
+        let boundary = text[index + 1 + digits.len()..].chars().next();
+        if boundary.is_some_and(|character| character.is_alphanumeric() || character == '_') {
+            continue;
+        }
+        if let Ok(number) = digits.parse::<u64>()
+            && number > 0
+        {
+            let prefix = text[..index].trim_end();
+            let keyword = prefix
+                .split_whitespace()
+                .next_back()
+                .unwrap_or_default()
+                .trim_matches(|character: char| !character.is_alphabetic());
+            output.push((
+                index,
+                number,
+                matches!(
+                    keyword.to_ascii_lowercase().as_str(),
+                    "close"
+                        | "closes"
+                        | "closed"
+                        | "fix"
+                        | "fixes"
+                        | "fixed"
+                        | "resolve"
+                        | "resolves"
+                        | "resolved"
+                ),
+            ));
+        }
+    }
+    output
 }
 
 fn collect_markdown_contribution(
     event: &MarkdownSemanticEvent,
+    context: Option<&MarkdownDocumentContext>,
     containers: &mut Vec<ContributionContainer>,
     contributions: &mut Vec<MarkdownContribution>,
 ) {
@@ -1009,7 +1232,7 @@ fn collect_markdown_contribution(
             });
         }
         MarkdownSemanticEventKind::End(MarkdownSemanticTagEnd::Link) => {
-            finish_link_contribution(containers, contributions);
+            finish_link_contribution(containers, contributions, context);
         }
         MarkdownSemanticEventKind::End(MarkdownSemanticTagEnd::Image) => {
             finish_image_contribution(containers, contributions);
@@ -1050,6 +1273,7 @@ fn collect_markdown_contribution(
 fn finish_link_contribution(
     containers: &mut Vec<ContributionContainer>,
     contributions: &mut Vec<MarkdownContribution>,
+    context: Option<&MarkdownDocumentContext>,
 ) {
     if let Some(ContributionContainer::Link {
         metadata,
@@ -1061,6 +1285,7 @@ fn finish_link_contribution(
             "link",
             source_range,
             MarkdownContributionKind::Link {
+                destination: resolve_markdown_destination(&metadata.destination, context),
                 link: metadata,
                 label: normalize_inline_whitespace(&text).trim().to_owned(),
             },
@@ -2391,6 +2616,8 @@ mod tests {
 
         assert_eq!(options.width, 42);
         assert_eq!(options.theme.horizontal_rule, Style::new().fg(Color::Green));
+        assert!(options.document_context.is_none());
+        assert!(options.document_id.is_none());
     }
 
     #[test]

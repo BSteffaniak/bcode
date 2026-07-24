@@ -1883,6 +1883,7 @@ dependencies = [
  "test-log",
  "unicode-segmentation",
  "unicode-width 0.2.2",
+ "url 2.5.8",
 ]
 
 [[package]]
