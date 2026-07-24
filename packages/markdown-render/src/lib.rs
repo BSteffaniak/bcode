@@ -634,6 +634,8 @@ pub enum MarkdownContributionKind {
         image: MarkdownImage,
         /// Parser-semantic alt text.
         alt: String,
+        /// Classified source; unsafe schemes are inert.
+        source: MarkdownDestination,
     },
     /// Footnote reference.
     FootnoteReference {
@@ -828,11 +830,16 @@ fn collect_details_projections(markdown: &str) -> Vec<DetailsProjection> {
 }
 
 fn details_has_open_attribute(open_tag: &str) -> bool {
-    open_tag
+    let mut attributes = open_tag
         .trim_matches(|character| character == '<' || character == '>')
-        .split_whitespace()
-        .skip(1)
-        .any(|attribute| attribute.trim_end_matches('=').eq_ignore_ascii_case("open"))
+        .split_ascii_whitespace();
+    let _ = attributes.next();
+    attributes.any(|attribute| {
+        attribute
+            .split_once('=')
+            .map_or(attribute, |(name, _)| name)
+            .eq_ignore_ascii_case("open")
+    })
 }
 
 fn safe_summary_markdown(summary: &str) -> String {
@@ -1386,7 +1393,7 @@ fn collect_markdown_contribution(
             finish_link_contribution(containers, contributions, context);
         }
         MarkdownSemanticEventKind::End(MarkdownSemanticTagEnd::Image) => {
-            finish_image_contribution(containers, contributions);
+            finish_image_contribution(containers, contributions, context);
         }
         MarkdownSemanticEventKind::End(MarkdownSemanticTagEnd::CodeBlock) => {
             finish_mermaid_contribution(containers, contributions, options);
@@ -1447,6 +1454,7 @@ fn finish_link_contribution(
 fn finish_image_contribution(
     containers: &mut Vec<ContributionContainer>,
     contributions: &mut Vec<MarkdownContribution>,
+    context: Option<&MarkdownDocumentContext>,
 ) {
     if let Some(ContributionContainer::Image {
         metadata,
@@ -1458,6 +1466,7 @@ fn finish_image_contribution(
             "image",
             source_range,
             MarkdownContributionKind::Image {
+                source: resolve_markdown_destination(&metadata.source, context),
                 image: metadata,
                 alt: normalize_inline_whitespace(&text).trim().to_owned(),
             },

@@ -2,7 +2,8 @@
 source: packages/markdown-render/tests/snapshots.rs
 expression: "styled_snapshot(LINKS_IMAGES, 40)"
 ---
-00 │ [image: Diagram]
-01 │ [fg=blue,underline]https://example.com[/]
-02 │ Escaped *literal* and & entity – punctua
-03 │ tion…
+00 │ [image: Diagram] [image: Danger] [image:
+01 │  Remote]
+02 │ [fg=blue,underline]https://example.com[/]
+03 │ Escaped *literal* and & entity – punctua
+04 │ tion…

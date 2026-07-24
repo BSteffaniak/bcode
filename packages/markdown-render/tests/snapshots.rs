@@ -178,6 +178,38 @@ fn contribution_snapshot(markdown: &str) -> String {
 }
 
 #[test]
+fn image_sources_use_the_same_safe_context_classification_as_links() {
+    let options = MarkdownRenderOptions::new(80).with_document_context(MarkdownDocumentContext {
+        base_url: None,
+        base_directory: Some(std::path::PathBuf::from("/trusted/repository")),
+        github_repository: None,
+    });
+    let result = render_markdown(LINKS_IMAGES, &options);
+    assert!(result.contributions.iter().any(|item| matches!(
+        &item.kind,
+        MarkdownContributionKind::Image { alt, source, .. }
+            if alt == "Diagram"
+                && source == &MarkdownDestination::LocalPath(
+                    std::path::PathBuf::from("/trusted/repository/diagram.png")
+                )
+    )));
+    assert!(result.contributions.iter().any(|item| matches!(
+        &item.kind,
+        MarkdownContributionKind::Image { alt, source, .. }
+            if alt == "Danger"
+                && matches!(source, MarkdownDestination::Inert {
+                    reason: MarkdownDestinationRejection::UnsupportedScheme,
+                    ..
+                })
+    )));
+    assert!(result.contributions.iter().any(|item| matches!(
+        &item.kind,
+        MarkdownContributionKind::Image { alt, source, .. }
+            if alt == "Remote" && matches!(source, MarkdownDestination::Web(_))
+    )));
+}
+
+#[test]
 fn mermaid_contribution_renders_svg_or_keeps_source_with_diagnostic() {
     let enabled = MarkdownRenderOptions::new(80).with_mermaid(800, 600);
     let rendered = render_markdown("```mermaid\nflowchart LR\nA --> B\n```", &enabled);
@@ -568,6 +600,78 @@ fn github_alert_labels_are_semantic_and_unknown_markers_remain_quotes() {
     assert!(output.contains("[!UNKNOWN]"));
     assert!(output.contains("[!NOTE] trailing text"));
     assert!(output.contains("[!NOTE Incomplete marker"));
+}
+
+#[test]
+fn github_markdown_fixture_support_contract_is_fully_represented() {
+    let options = MarkdownRenderOptions::new(100).with_document_context(MarkdownDocumentContext {
+        base_url: Some(url::Url::parse("https://github.com/acme/nebula/blob/main/").unwrap()),
+        base_directory: None,
+        github_repository: Some(GitHubRepository {
+            owner: "acme".to_owned(),
+            name: "nebula".to_owned(),
+        }),
+    });
+    let result = render_markdown(GITHUB_MARKDOWN_EXAMPLE, &options);
+
+    assert!(result.contributions.iter().any(|item| matches!(
+        &item.kind,
+        MarkdownContributionKind::Mermaid { source, .. } if source.contains("flowchart LR")
+    )));
+    assert!(result.contributions.iter().any(|item| matches!(
+        &item.kind,
+        MarkdownContributionKind::Details { summary, body, .. }
+            if summary.contains("retry algorithm") && body.contains("delay(n)")
+    )));
+    assert!(result.contributions.iter().any(|item| matches!(
+        &item.kind,
+        MarkdownContributionKind::FootnoteReference { label } if label == "compat"
+    )));
+    assert!(result.contributions.iter().any(|item| matches!(
+        &item.kind,
+        MarkdownContributionKind::Image { alt, .. } if alt == "Build"
+    )));
+    assert!(result.contributions.iter().any(|item| matches!(
+        &item.kind,
+        MarkdownContributionKind::Link { label, destination, .. }
+            if label == "docs/protocol.md"
+                && matches!(destination, MarkdownDestination::Web(url) if url.path().ends_with("/docs/protocol.md"))
+    )));
+    assert!(
+        !result.contributions.iter().any(|item| matches!(
+            &item.kind,
+            MarkdownContributionKind::GitHubIssue { number: 42, .. }
+        )),
+        "inline-code issue text must remain code, matching GitHub semantics"
+    );
+    let text = result
+        .lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .map(|span| span.content.as_str())
+        .collect::<String>();
+    for expected in [
+        "❗ IMPORTANT",
+        "⚠ WARNING",
+        "(n)",
+        "Footnotes",
+        "This enables older clients",
+        "Gateway",
+        "42k req/s",
+    ] {
+        assert!(
+            text.contains(expected),
+            "missing fixture contract text {expected:?}"
+        );
+    }
+}
+
+#[test]
+fn snapshots_github_markdown_example_semantic_contributions() {
+    insta::assert_snapshot!(
+        "github_markdown_example_semantic_contributions",
+        contribution_snapshot(GITHUB_MARKDOWN_EXAMPLE)
+    );
 }
 
 #[test]
