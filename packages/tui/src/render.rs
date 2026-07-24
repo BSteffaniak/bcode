@@ -248,6 +248,23 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
 
 #[cfg(test)]
 #[test]
+fn local_plain_and_markdown_system_notes_keep_distinct_formats() {
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    app.push_system_plain("* literal".to_owned());
+    app.push_system_markdown("* rendered".to_owned());
+
+    assert_eq!(
+        app.transcript()[0].text_format(),
+        bcode_session_view_models::TextFormat::PlainText
+    );
+    assert_eq!(
+        app.transcript()[1].text_format(),
+        bcode_session_view_models::TextFormat::Markdown
+    );
+}
+
+#[cfg(test)]
+#[test]
 fn bottom_dock_never_overlaps_transcript_and_preserves_one_row() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
     let terminal = Rect::new(0, 0, 80, 20);
@@ -1105,8 +1122,34 @@ fn tui_markdown_message_block_preserves_table_borders_after_indent() {
 
 #[cfg(test)]
 #[test]
+fn tui_help_markdown_renders_at_normal_and_constrained_widths() {
+    const HELP: &str = "# TUI help\n\n* Use the command palette for sessions, plugin commands, cancellation, and context compaction.\n* Transcript scrolling, composer history, session picker, and permissions honor configured keybindings where wired.\n* In permission dialogs, approve or deny directly, or move focus and confirm.";
+    for width in [80_u16, 24] {
+        let mut rows = Vec::new();
+        push_markdown_block(&mut rows, "System", HELP, Color::BrightBlack, width, false);
+        let text = rows
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_str())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(text[0], "System");
+        assert_eq!(text[1], "  TUI help");
+        assert!(text.iter().any(|line| line.starts_with("  •  Use")));
+        assert!(
+            rows.iter()
+                .all(|line| spans_width(&line.spans) <= usize::from(width))
+        );
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn pending_and_finalized_user_markdown_share_body_layout() {
-    let markdown = "- one\n- two\n\n```text\nvalue\n```";
+    let markdown = "- one\n- two with **wrapped emphasis that spans the available width**\n\n```text\nvalue\n```\n\n| A | B |\n|---|---|\n| 1 | 2 |";
     let pending = PendingSubmission::new(markdown.to_owned());
     let pending_rows = pending_submission_rows(&pending, 30);
     let finalized = TranscriptItem::with_format("You", markdown.to_owned(), TextFormat::Markdown);
@@ -1114,6 +1157,40 @@ fn pending_and_finalized_user_markdown_share_body_layout() {
         transcript_item_rows(&[finalized], 0, 30, None, TuiDiffViewerConfig::default());
 
     assert_eq!(&pending_rows[1..], &finalized_rows[1..]);
+}
+
+#[cfg(test)]
+#[test]
+fn transcript_layout_signature_changes_when_only_format_changes() {
+    let plain = TranscriptItem::with_format("You", "* value".to_owned(), TextFormat::PlainText);
+    let markdown = TranscriptItem::with_format("You", "* value".to_owned(), TextFormat::Markdown);
+
+    assert_ne!(
+        transcript_item_signature(&plain, 30, ()),
+        transcript_item_signature(&markdown, 30, ())
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn format_aware_blocks_respect_requested_width() {
+    for format in [
+        TextFormat::Markdown,
+        TextFormat::PlainText,
+        TextFormat::Json,
+    ] {
+        let mut rows = Vec::new();
+        push_formatted_block(
+            &mut rows,
+            "Title",
+            "1234567890 * [value] | more",
+            format,
+            Color::Blue,
+            true,
+            12,
+        );
+        assert!(rows.iter().all(|line| spans_width(&line.spans) <= 12));
+    }
 }
 
 #[cfg(test)]

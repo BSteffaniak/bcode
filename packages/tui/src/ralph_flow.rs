@@ -171,7 +171,7 @@ fn view_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
         return Ok(());
     };
     let readiness = draft.readiness();
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph setup draft review\n* Draft: {}\n* Status: {}\n* Mode: {}\n* Target state: {}\n* Loop: {}\n* Branch: {}\n* Worktree: {}\n* Validation: {}\n* Ready: charter={} progress={} approved={}\n* Draft JSON: {}\n* Setup transcript: {}\n\nCharter preview:\n{}\n\nProgress preview:\n{}",
         draft.draft_id,
         draft.status,
@@ -272,7 +272,7 @@ fn revise_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
     )?;
     chat.app.composer_mut().clear();
     chat.app.composer_mut().insert_str(&prompt);
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph setup draft revision prompt prepared\n* Draft: {}\n* Status: {}\n* Next: submit the prompt, then use Save setup draft on the assistant's revised artifact",
         updated.draft_id, updated.status
     ));
@@ -289,7 +289,7 @@ fn approve_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
     };
     let readiness = draft.readiness();
     if !readiness.has_charter || !readiness.has_progress {
-        chat.app.push_system_note(format!(
+        chat.app.push_system_markdown(format!(
             "Ralph setup draft is not ready for approval\n* Draft: {}\n* Has charter: {}\n* Has progress: {}\n* Next: ask the assistant to produce explicit charter.md and progress.md drafts, then save setup draft again",
             draft.draft_id, readiness.has_charter, readiness.has_progress
         ));
@@ -315,7 +315,7 @@ fn approve_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
             updated.draft_id
         ),
     )?;
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph setup draft approved\n* Draft: {}\n* Path: {}\n* Next: {}",
         updated.draft_id,
         display_from_current_dir(&updated.draft_path),
@@ -339,7 +339,7 @@ async fn create_loop_from_draft(
         return Ok(());
     };
     if draft.mode != ralph_state::RalphSetupDraftMode::NewLoop {
-        chat.app.push_system_note(format!(
+        chat.app.push_system_markdown(format!(
             "Ralph setup draft is not a new-loop draft\n* Draft: {}\n* Mode: {}\n* Next: use Apply draft to loop for rebuild drafts",
             draft.draft_id, draft.mode
         ));
@@ -349,7 +349,7 @@ async fn create_loop_from_draft(
     }
     let readiness = draft.readiness();
     if !readiness.ready() {
-        chat.app.push_system_note(format!(
+        chat.app.push_system_markdown(format!(
             "Ralph setup draft is not approved for loop creation\n* Draft: {}\n* Has charter: {}\n* Has progress: {}\n* Approved: {}\n* Next: save and approve the setup draft before creating the loop",
             draft.draft_id, readiness.has_charter, readiness.has_progress, readiness.approved
         ));
@@ -388,7 +388,7 @@ async fn create_loop_from_draft(
         work_area.branch.as_deref(),
         work_area_session_id.as_deref(),
     )?;
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph loop created from setup draft\n* Draft: {}\n* Loop: {}\n* Charter: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Next: prepare a run, then approve/start it",
         draft.draft_id,
         draft.loop_name,
@@ -534,7 +534,7 @@ fn save_setup_draft(chat: &mut ActiveChat) -> Result<(), TuiError> {
         ),
     )?;
     let readiness = updated.readiness();
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph setup draft saved\n* Draft: {}\n* Status: {}\n* Loop: {}\n* Branch: {}\n* Worktree: {}\n* Has charter: {}\n* Has progress: {}\n* Path: {}\n* Next: {}",
         updated.draft_id,
         updated.status,
@@ -942,7 +942,7 @@ pub async fn rebuild_loop_context<W: Write>(
             bcode_ipc::PromptPlacement::FollowUp,
         )
         .await?;
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph rebuild conversation started\n* Draft: {}\n* Target loop: {}\n* Target state: {}\n* Transcript: {}\n* Assistant turn: started automatically from the guided rebuild context\n* Next: answer Ralph's questions here, then Save/View/Approve/Apply the setup draft from Ralph UI",
         draft.draft_id,
         loop_summary.loop_name,
@@ -964,7 +964,7 @@ fn apply_draft_to_existing_loop(chat: &mut ActiveChat) -> Result<(), TuiError> {
         return Ok(());
     };
     if draft.mode != ralph_state::RalphSetupDraftMode::RebuildExistingLoop {
-        chat.app.push_system_note(format!(
+        chat.app.push_system_markdown(format!(
             "Ralph setup draft is not a rebuild draft\n* Draft: {}\n* Mode: {}\n* Next: use Create loop from draft for new-loop drafts, or start Rebuild loop context",
             draft.draft_id, draft.mode
         ));
@@ -974,7 +974,7 @@ fn apply_draft_to_existing_loop(chat: &mut ActiveChat) -> Result<(), TuiError> {
     }
     let readiness = draft.readiness();
     if !readiness.ready() {
-        chat.app.push_system_note(format!(
+        chat.app.push_system_markdown(format!(
             "Ralph rebuild draft is not ready to apply\n* Draft: {}\n* Has charter: {}\n* Has progress: {}\n* Approved: {}\n* Next: save and approve the rebuild draft before applying it",
             draft.draft_id, readiness.has_charter, readiness.has_progress, readiness.approved
         ));
@@ -983,7 +983,7 @@ fn apply_draft_to_existing_loop(chat: &mut ActiveChat) -> Result<(), TuiError> {
         return Ok(());
     }
     let result = ralph_state::apply_setup_draft_to_existing_loop(&draft.draft_id, &repo_root)?;
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph loop context rebuilt\n* State dir: {}\n* Backups: {}\n* Charter: {}\n* Progress: {}\n* Run history was preserved",
         display_from_current_dir(&result.state_dir),
         display_from_current_dir(&result.backup_dir),
@@ -1022,7 +1022,7 @@ pub async fn plan_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Res
             draft.source_context
         ),
     )?;
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph guided setup draft created\n* Draft: {}\n* Status: {}\n* Repo: {}\n* Next: answer the assistant's clarifying questions; approve only after charter/progress are meaningful",
         draft.draft_id,
         draft.status,
@@ -1164,7 +1164,7 @@ pub async fn show_status(
             .set_status("no Ralph loops for current repository".to_owned());
         return Ok(());
     };
-    chat.app.push_system_note(format_status_note(
+    chat.app.push_system_markdown(format_status_note(
         &summary,
         response.active_run.as_ref(),
         response.interrupted_runs.len(),
@@ -1177,7 +1177,7 @@ pub async fn show_status(
 pub async fn run_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Result<(), TuiError> {
     let repo_root = current_repo_root(chat)?;
     if let Some(draft) = active_unapplied_rebuild_draft(&repo_root)? {
-        chat.app.push_system_note(format!(
+        chat.app.push_system_markdown(format!(
             "Ralph rebuild draft is active\n* Draft: {}\n* Status: {}\n* Target loop: {}\n* Next: View/Revise/Approve/Apply the rebuild draft before preparing another autonomous run. This prevents running against stale loop context.",
             draft.draft_id, draft.status, draft.loop_name
         ));
@@ -1196,7 +1196,7 @@ pub async fn run_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Resu
             require_approval: true,
         })
         .await?;
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph run prepared\n* Run: {}\n* Status: {}\n* State: {}\n* Session: {}\n* Next: /ralph approve",
         response.run.run_id,
         response.run.status,
@@ -1222,7 +1222,7 @@ pub async fn approve_run(
             run_id: None,
         })
         .await?;
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph run approved\n* Run: {}\n* Status: {}\n* State: {}\n* Session: {}",
         response.run.run_id,
         response.run.status,
@@ -1313,7 +1313,7 @@ pub async fn list_runs(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Res
             .collect::<Vec<_>>()
             .join("\n")
     };
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph runs\n* Loop: {}\n{}",
         summary.loop_name, runs
     ));
@@ -1393,7 +1393,7 @@ pub async fn list_iterations(
             .collect::<Vec<_>>()
             .join("\n")
     };
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph iterations\n* Loop: {}\n* Run: {}\nIterations:\n{}\nValidations:\n{}",
         summary.loop_name, run_label, iterations, validations
     ));
@@ -1412,7 +1412,7 @@ pub async fn resume_run(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Re
             interrupted_run_id: None,
         })
         .await?;
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph resume prepared\n* Interrupted run: {}\n* New run: {}\n* Status: {}\n* Next: approve before autonomous execution continues",
         response.interrupted_run.run_id,
         response.resumed_run.run_id,
@@ -1434,7 +1434,7 @@ pub async fn stop_loop(services: &TuiServices<'_>, chat: &mut ActiveChat) -> Res
             loop_state_dir: None,
         })
         .await?;
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph stop requested\n* Run: {}\n* Status: {}\n* Cancel requested: {}",
         response.run.run_id, response.run.status, response.cancel_requested
     ));
@@ -1520,7 +1520,7 @@ pub fn show_prompt(
         ralph_state::RalphLifecycleEventKind::PromptPrepared,
         "Prepared Ralph orchestration prompt",
     )?;
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph prompt prepared\n* Loop: {}\n* Progress doc: {}\n\n{}",
         summary.loop_name,
         display_from_current_dir(&summary.progress_doc_path),
@@ -1544,7 +1544,7 @@ pub fn open_progress(chat: &mut ActiveChat) -> Result<(), TuiError> {
         ralph_state::RalphLifecycleEventKind::ProgressOpened,
         "Viewed Ralph progress doc path",
     )?;
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph progress doc\n* Loop: {}\n* Path: {}",
         summary.loop_name,
         display_from_current_dir(&summary.progress_doc_path)
@@ -1699,7 +1699,7 @@ async fn confirm_start_loop(
     } else {
         validation_commands.join("; ")
     };
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Ralph loop created\n* Loop: {loop_name}\n* Charter: {}\n* Progress doc: {}\n* State: {}\n* Isolated work area: {}\n* Session: {}\n* Validation: {}\n* Next: review docs if desired, then prepare a run and approve/start it",
         display_from_current_dir(&state.charter_doc_path),
         display_from_current_dir(&state.progress_doc_path),

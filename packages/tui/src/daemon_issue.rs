@@ -271,12 +271,12 @@ pub fn report_tui_issue(app: &mut BmuxApp, label: &str, error: &TuiError) {
             || format!("{}\n\n{diagnostic}", message.status),
             |detail| format!("{}\n\n{detail}\n\n{diagnostic}", message.status),
         );
-        app.push_system_note(note);
+        app.push_system_plain(note);
         return;
     }
     let diagnostic = error_diagnostic(error);
     app.set_status(format!("{label}: {}", diagnostic.replace('\n', "; ")));
-    app.push_system_note(format!("{label}\n\n{diagnostic}"));
+    app.push_system_plain(format!("{label}\n\n{diagnostic}"));
 }
 
 fn report_issue(
@@ -296,7 +296,7 @@ fn report_issue(
         || format!("{}\n\n{diagnostic}", message.status),
         |detail| format!("{}\n\n{detail}\n\n{diagnostic}", message.status),
     );
-    app.push_system_note(note);
+    app.push_system_plain(note);
 }
 
 #[cfg(test)]

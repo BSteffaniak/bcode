@@ -214,7 +214,7 @@ async fn apply_command_effect<W: Write>(
 ) -> Result<(), TuiError> {
     match effect {
         CommandEffect::Status { message } => chat.app.set_status(message),
-        CommandEffect::AppendText { text } => chat.app.push_system_note(text),
+        CommandEffect::AppendText { text } => chat.app.push_system_plain(text),
         CommandEffect::ToggleSurface { surface_id } => toggle_surface(chat, &surface_id),
         CommandEffect::OpenPluginSurface {
             surface_kind,
@@ -357,7 +357,7 @@ fn apply_plugin_surface_outcome(chat: &mut ActiveChat, outcome: Option<serde_jso
         .get("append_text")
         .and_then(serde_json::Value::as_str)
     {
-        chat.app.push_system_note(text.to_string());
+        chat.app.push_system_plain(text.to_string());
     }
     if let Some(path) = outcome
         .get("set_session_working_directory")

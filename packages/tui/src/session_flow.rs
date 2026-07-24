@@ -213,7 +213,7 @@ pub fn complete_switch_session(
         Err(error) => {
             chat.app.set_status(format!("session open failed: {error}"));
             chat.app
-                .push_system_note(format!("session open failed: {error}"));
+                .push_system_plain(format!("session open failed: {error}"));
         }
     }
 }

@@ -1311,7 +1311,7 @@ fn apply_create_worktree_result(
         chat.app.apply_session_summary(&session);
         chat.session_id = Some(session_id);
     }
-    chat.app.push_system_note(format!(
+    chat.app.push_system_markdown(format!(
         "Created worktree\n* Path: {}",
         display_from_current_dir(&path)
     ));

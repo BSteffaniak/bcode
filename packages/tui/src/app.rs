@@ -1442,11 +1442,6 @@ impl BmuxApp {
         self.jump_to_latest_key_label = key_label;
     }
 
-    /// Append a system-style transcript note.
-    pub fn push_system_note(&mut self, text: String) {
-        self.push_system_plain(text);
-    }
-
     /// Append a plain-text system-style transcript note.
     pub fn push_system_plain(&mut self, text: String) {
         self.transcript.push(TranscriptItem::with_format(

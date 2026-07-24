@@ -34,7 +34,7 @@ pub async fn pick_skill_for_session<W: Write>(
     if skills.skills.is_empty() {
         chat.app.set_status("no skills available".to_owned());
         chat.app
-            .push_system_note("No skills are available.".to_owned());
+            .push_system_plain("No skills are available.".to_owned());
         return Ok(());
     }
     let mut picker = skill_picker::SkillPickerApp::new(skills.skills);
