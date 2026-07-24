@@ -1,3 +1,5 @@
+#![cfg(feature = "config")]
+
 use std::collections::BTreeMap;
 
 use bcode::Bcode;
