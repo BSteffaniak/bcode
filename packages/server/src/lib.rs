@@ -19983,7 +19983,24 @@ fn forward_session_events(
                         }
                         break;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::warn!(
+                            client_id = %sink.client_id(),
+                            %session_id,
+                            "durable session event broker closed; requesting renderer resync"
+                        );
+                        if let Err(error) = sink
+                            .send(Event::SessionViewResyncRequired { session_id })
+                            .await
+                            && !is_expected_disconnect(&error)
+                        {
+                            tracing::warn!(
+                                "failed to request session resync from {}: {error}",
+                                sink.client_id()
+                            );
+                        }
+                        break;
+                    }
                 },
                 live = live_events.recv() => match live {
                     Ok(event) => Event::SessionLive(event),
@@ -20006,7 +20023,24 @@ fn forward_session_events(
                         }
                         break;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::warn!(
+                            client_id = %sink.client_id(),
+                            %session_id,
+                            "live session event broker closed; requesting renderer resync"
+                        );
+                        if let Err(error) = sink
+                            .send(Event::SessionViewResyncRequired { session_id })
+                            .await
+                            && !is_expected_disconnect(&error)
+                        {
+                            tracing::warn!(
+                                "failed to request session resync from {}: {error}",
+                                sink.client_id()
+                            );
+                        }
+                        break;
+                    }
                 },
             };
             if let Err(error) = sink.send(event).await {
@@ -29006,6 +29040,24 @@ library = "test"
             .expect("initial attach");
         let mut view = bcode_session_view::SessionView::new();
         view.apply_history(&attached.history);
+
+        assert!(
+            state
+                .sessions
+                .release_session_database_resources(session_id)
+                .await
+                .expect("release attached session database")
+        );
+        state
+            .sessions
+            .append_user_message(session_id, ClientId::new(), "after idle".to_owned())
+            .await
+            .expect("append after idle release");
+        assert!(matches!(
+            next_session_view_event(&mut connection).await,
+            bcode_ipc::Event::Session(event)
+                if matches!(event.kind, SessionEventKind::UserMessage { ref text, .. } if text == "after idle")
+        ));
 
         for text in ["live ", "answer"] {
             state

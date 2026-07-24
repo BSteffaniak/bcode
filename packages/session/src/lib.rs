@@ -8169,6 +8169,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn attached_subscribers_survive_database_release_and_summary_refresh() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("subscriber continuity".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should create");
+        let client_id = ClientId::new();
+        let mut attachment = manager
+            .attach_session_recent(session.id, client_id, 8)
+            .await
+            .expect("session should attach");
+
+        assert!(
+            manager
+                .release_session_database_resources(session.id)
+                .await
+                .expect("database release should succeed")
+        );
+        let appended = manager
+            .append_user_message(session.id, ClientId::new(), "after idle".to_owned())
+            .await
+            .expect("idle session should reload and append");
+        let expected_sequence = appended.last().expect("user event").sequence;
+        let durable =
+            tokio::time::timeout(std::time::Duration::from_secs(1), attachment.events.recv())
+                .await
+                .expect("original durable subscriber should remain live")
+                .expect("durable broker should remain open");
+        assert_eq!(durable.sequence, expected_sequence);
+        assert!(matches!(
+            durable.kind,
+            SessionEventKind::UserMessage { ref text, .. } if text == "after idle"
+        ));
+
+        let published = manager
+            .publish_live_event(
+                session.id,
+                SessionLiveEventKind::AssistantTextDelta {
+                    turn_id: "turn-after-idle".to_owned(),
+                    text: "live after idle".to_owned(),
+                },
+            )
+            .await;
+        assert!(published.is_some());
+        let live = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            attachment.live_events.recv(),
+        )
+        .await
+        .expect("original live subscriber should remain live")
+        .expect("live broker should remain open");
+        assert!(matches!(
+            live.kind,
+            SessionLiveEventKind::AssistantTextDelta { ref text, .. }
+                if text == "live after idle"
+        ));
+
+        assert_eq!(
+            manager
+                .session_summary(session.id)
+                .await
+                .expect("summary")
+                .client_count,
+            1
+        );
+        assert!(
+            manager
+                .detach_session(session.id, client_id)
+                .await
+                .expect("original client should detach")
+        );
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn release_idle_session_resources_drops_loaded_state_but_retains_lease() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent_with_metrics_and_lease_owner(

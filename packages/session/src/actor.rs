@@ -634,8 +634,7 @@ impl SessionActor {
                 let _ = reply.send(self.publish_transient_event(kind));
             }
             SessionCommand::ReplaceState { state, reply } => {
-                self.state = *state;
-                self.refresh_snapshot();
+                self.replace_persisted_state(*state);
                 let _ = reply.send(());
             }
             SessionCommand::ReleaseIdleResources(reply) => {
@@ -650,6 +649,18 @@ impl SessionActor {
             }
         }
         false
+    }
+
+    fn replace_persisted_state(&mut self, mut state: SessionState) {
+        // Broadcast brokers and attached clients belong to the actor's lifetime, not to the
+        // persisted snapshot. Replacing them would strand existing session forwarders on closed
+        // receivers after an idle database reload.
+        state.clients.clone_from(&self.state.clients);
+        state.summary.client_count = state.clients.len();
+        state.sender = self.state.sender.clone();
+        state.live_events = self.state.live_events.clone();
+        self.state = state;
+        self.refresh_snapshot();
     }
 
     fn refresh_snapshot(&self) {
@@ -786,14 +797,8 @@ impl SessionActor {
             .updated_at_ms
             .or_else(|| activity_bounds.map(|(_, updated_at_ms)| updated_at_ms))
             .unwrap_or(self.state.summary.updated_at_ms);
-        let clients = self.state.clients.clone();
-        let sender = self.state.sender.clone();
-        let live_events = self.state.live_events.clone();
-        self.state = SessionState::from_db_state(db_state, created_at_ms, updated_at_ms);
-        self.state.clients = clients;
-        self.state.summary.client_count = self.state.clients.len();
-        self.state.sender = sender;
-        self.state.live_events = live_events;
+        let state = SessionState::from_db_state(db_state, created_at_ms, updated_at_ms);
+        self.replace_persisted_state(state);
         Ok(())
     }
 
