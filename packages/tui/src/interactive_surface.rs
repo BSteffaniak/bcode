@@ -213,6 +213,11 @@ impl InteractiveSurfaceState {
         self.surface.render(area, frame);
     }
 
+    #[cfg(test)]
+    pub(crate) fn render_for_test(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        self.render(area, frame);
+    }
+
     /// Clear a pending resolution so the user can retry after host delivery fails.
     pub fn clear_pending_resolution(&mut self) {
         self.pending_resolution = None;

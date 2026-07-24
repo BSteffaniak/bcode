@@ -307,6 +307,78 @@ fn docked_frame_preserves_anchored_transcript_top_and_latest_indicator() {
 }
 
 #[cfg(test)]
+#[tokio::test]
+async fn explanatory_assistant_context_remains_visible_above_question_dock() {
+    let session_id = bcode_session_models::SessionId::new();
+    let history = vec![bcode_session_models::SessionEvent {
+        schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+        sequence: 1,
+        timestamp_ms: 1,
+        session_id,
+        provenance: None,
+        kind: bcode_session_models::SessionEventKind::AssistantMessage {
+            text: "Review this explanation before choosing.".to_owned(),
+        },
+    }];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let plugin = bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/question-plugin/bcode-plugin.toml"),
+        bcode_question_plugin::static_plugin(),
+    );
+    let runtime = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+        &bcode_plugin::PluginSelection::all_enabled(),
+        &[plugin],
+    )
+    .expect("question plugin runtime");
+    let mut surface = super::interactive_surface::InteractiveSurfaceState::open(
+        &runtime,
+        "question-call-question",
+        "bcode.question.inline",
+        &serde_json::json!({
+            "questions": [{
+                "header": null,
+                "question": "Proceed with the explained choice?",
+                "options": [{"label": "Yes", "value": "yes", "description": null}],
+                "control": "radio",
+                "selection_mode": "single",
+                "custom": false,
+                "custom_mode": "additional",
+                "required": true
+            }]
+        })
+        .to_string(),
+    )
+    .await
+    .expect("question surface");
+    let terminal = Rect::new(0, 0, 64, 18);
+    let preferred_height = surface.preferred_height(terminal.width);
+    let (layout, dock) =
+        prepare_frame_with_bottom_dock(&mut app, terminal, preferred_height).expect("docked frame");
+    let mut buffer = bmux_tui::buffer::Buffer::empty(terminal);
+    let mut frame = Frame::new(&mut buffer);
+    render_prepared(&mut app, &mut frame, layout);
+    surface.render_for_test(dock, &mut frame);
+
+    let context_row = (0..terminal.height)
+        .find(|row| {
+            buffer
+                .row_symbols(*row)
+                .is_some_and(|line| line.contains("Review this explanation"))
+        })
+        .expect("assistant context row");
+    let question_row = (0..terminal.height)
+        .find(|row| {
+            buffer
+                .row_symbols(*row)
+                .is_some_and(|line| line.contains("Proceed with the explained choice?"))
+        })
+        .expect("question row");
+    assert!(context_row < dock.y);
+    assert!(question_row >= dock.y);
+    assert!(context_row < question_row);
+}
+
+#[cfg(test)]
 #[test]
 fn bottom_dock_handles_short_narrow_and_resized_terminals() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);

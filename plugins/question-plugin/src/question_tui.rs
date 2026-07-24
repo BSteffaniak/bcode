@@ -483,12 +483,30 @@ impl TerminalInteractionRenderer<QuestionInteractionController> for QuestionTerm
                 })
             }
             Event::Key(stroke) if stroke.modifiers.is_empty() => match stroke.key {
-                KeyCode::Tab | KeyCode::Down | KeyCode::Right => Some(InteractionInput::Navigate {
+                KeyCode::Tab | KeyCode::Down => Some(InteractionInput::Navigate {
                     direction: InteractionNavigation::Next,
                 }),
-                KeyCode::Up | KeyCode::Left => Some(InteractionInput::Navigate {
+                KeyCode::Up => Some(InteractionInput::Navigate {
                     direction: InteractionNavigation::Previous,
                 }),
+                KeyCode::Right => {
+                    if matches!(snapshot.focus, QuestionFocusTarget::Custom { .. }) {
+                        None
+                    } else {
+                        Some(InteractionInput::Navigate {
+                            direction: InteractionNavigation::Next,
+                        })
+                    }
+                }
+                KeyCode::Left => {
+                    if matches!(snapshot.focus, QuestionFocusTarget::Custom { .. }) {
+                        None
+                    } else {
+                        Some(InteractionInput::Navigate {
+                            direction: InteractionNavigation::Previous,
+                        })
+                    }
+                }
                 KeyCode::Enter | KeyCode::Space => Some(InteractionInput::Activate {
                     control_id: snapshot.focused_control_id.clone(),
                 }),
@@ -602,6 +620,7 @@ mod tests {
     use super::*;
     use bcode_plugin_sdk::interaction::PluginInteraction;
     use bcode_tool::InteractionInput;
+    use bmux_keyboard::{KeyStroke, Modifiers};
     use bmux_tui::buffer::Buffer;
     use bmux_tui::geometry::Point;
 
@@ -650,6 +669,42 @@ mod tests {
             .filter_map(|row| buffer.row_symbols(row))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn custom_input_reserves_left_right_home_end_and_delete_for_host_behavior() {
+        let mut controller = QuestionInteractionController::new(NormalizedQuestionRequest {
+            questions: vec![question("Explain", &[], true, true)],
+        });
+        controller.handle_input(InteractionInput::Change {
+            control_id: custom_control_id(0),
+            value: InteractionValue::String("answer".to_owned()),
+        });
+        let snapshot = controller.snapshot();
+        let mut renderer = QuestionTerminalRenderer::default();
+        for key in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Delete,
+        ] {
+            assert_eq!(
+                renderer.input(
+                    &Event::Key(KeyStroke {
+                        key,
+                        modifiers: Modifiers::NONE,
+                    }),
+                    &snapshot,
+                ),
+                None,
+                "{key:?} must remain unsupported until cursor-aware editing exists"
+            );
+        }
+        assert_eq!(
+            controller.snapshot().answers[0].custom.as_deref(),
+            Some("answer")
+        );
     }
 
     #[test]
