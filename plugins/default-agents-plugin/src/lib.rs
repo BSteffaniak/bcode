@@ -446,6 +446,8 @@ mod tests {
             tool_name: "shell.run".to_string(),
             operation: bcode_agent_profile::ToolPolicyOperation::Command {
                 command: Some("git diff && git commit -m nope".to_string()),
+                analysis: None,
+                analysis_error: None,
             },
             aliases: vec!["command".to_string()],
             requires_permission: true,

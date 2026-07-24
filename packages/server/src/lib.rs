@@ -34120,6 +34120,8 @@ library = "test"
         let write = policy_metadata(bcode_agent_profile::ToolPolicyOperation::Mutating);
         let command = policy_metadata(bcode_agent_profile::ToolPolicyOperation::Command {
             command: Some("synthetic".to_string()),
+            analysis: None,
+            analysis_error: None,
         });
         assert!(!tool_policy_denies_tool(read_only, Some(&read)));
         assert!(tool_policy_denies_tool(read_only, Some(&write)));
