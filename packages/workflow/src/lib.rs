@@ -811,7 +811,247 @@ impl ValueSchema {
     }
 }
 
-/// Resource access requested by a workflow node.
+/// Maximum tool capability a workflow node may request.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowToolCapability {
+    /// No tool calls are permitted.
+    #[default]
+    Disabled,
+    /// Only tools declared read-only by their owners are permitted.
+    ReadOnly,
+    /// Mutating tools may be permitted by the configured profile and grant.
+    Mutating,
+}
+
+/// Bounded grant scope used by workflow policy preflight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowGrantScope {
+    /// Stable workflow definition identity.
+    pub definition: String,
+    /// Definition schema/version identity covered by the grant.
+    pub definition_version: u32,
+    /// Stable workspace identity covered by the grant.
+    pub workspace: String,
+    /// Stable node identity covered by the grant.
+    pub node: String,
+    /// Optional run identity narrowing the grant to one run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+}
+
+/// Auditable grant that can widen an initiating context only within its bounded scope.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowPolicyGrant {
+    /// Opaque non-secret grant identity retained for audit.
+    pub grant_id: String,
+    /// Exact grant scope.
+    pub scope: WorkflowGrantScope,
+    /// Maximum capability approved by the grant.
+    pub capability: WorkflowToolCapability,
+}
+
+/// Immutable policy inputs for one workflow-node preflight.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowPolicyRequest {
+    /// Capability available to the initiating context.
+    pub initiating: WorkflowToolCapability,
+    /// Maximum capability permitted by the selected configured profile.
+    pub profile: WorkflowToolCapability,
+    /// Capability requested by the node restriction.
+    pub node: WorkflowToolCapability,
+    /// Scope that an optional grant must exactly match.
+    pub scope: WorkflowGrantScope,
+    /// Optional bounded approved grant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<WorkflowPolicyGrant>,
+}
+
+/// Result of policy preflight before node execution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WorkflowPolicyPreflight {
+    /// Node policy is authorized and immutable for execution.
+    Authorized {
+        /// Effective maximum capability after intersection.
+        effective: WorkflowToolCapability,
+        /// Stable non-secret identity suitable for audit records.
+        audit_identity: String,
+    },
+    /// Node requires a bounded grant before it may execute.
+    ApprovalRequired {
+        /// Capability requested by the node.
+        requested: WorkflowToolCapability,
+        /// Exact scope an approval must cover.
+        scope: WorkflowGrantScope,
+    },
+    /// Supplied policy inputs are invalid and must not execute.
+    Rejected { reason: String },
+}
+
+/// Host callback for resolving workflow elevation through the normal permission path.
+pub trait WorkflowApprovalResolver: Send + Sync {
+    /// Request approval for one exact scope and capability.
+    fn request_approval<'a>(
+        &'a self,
+        requested: WorkflowToolCapability,
+        scope: &'a WorkflowGrantScope,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<WorkflowPolicyGrant>, WorkflowError>> + Send + 'a>>;
+}
+
+/// Resolve policy preflight, requesting approval only when elevation is required.
+///
+/// # Errors
+///
+/// Returns an error when the approval host fails, returns no grant, or returns a malformed,
+/// mismatched, or insufficient grant.
+pub async fn authorize_workflow_policy<R>(
+    request: &WorkflowPolicyRequest,
+    resolver: &R,
+) -> Result<(WorkflowToolCapability, String), WorkflowError>
+where
+    R: WorkflowApprovalResolver + ?Sized,
+{
+    match preflight_workflow_policy(request) {
+        WorkflowPolicyPreflight::Authorized {
+            effective,
+            audit_identity,
+        } => Ok((effective, audit_identity)),
+        WorkflowPolicyPreflight::Rejected { reason } => Err(WorkflowError::Build {
+            path: request.scope.node.clone(),
+            message: reason,
+        }),
+        WorkflowPolicyPreflight::ApprovalRequired { requested, scope } => {
+            let grant = resolver
+                .request_approval(requested, &scope)
+                .await?
+                .ok_or_else(|| WorkflowError::Build {
+                    path: scope.node.clone(),
+                    message: "workflow elevation was not approved".to_string(),
+                })?;
+            let granted = WorkflowPolicyRequest {
+                grant: Some(grant),
+                ..request.clone()
+            };
+            match preflight_workflow_policy(&granted) {
+                WorkflowPolicyPreflight::Authorized {
+                    effective,
+                    audit_identity,
+                } => Ok((effective, audit_identity)),
+                WorkflowPolicyPreflight::Rejected { reason } => Err(WorkflowError::Build {
+                    path: granted.scope.node,
+                    message: reason,
+                }),
+                WorkflowPolicyPreflight::ApprovalRequired { .. } => {
+                    unreachable!("a supplied grant must authorize or reject")
+                }
+            }
+        }
+    }
+}
+
+/// Evaluate workflow policy intersection and explicit elevation.
+///
+/// The configured profile always caps authority. Without a grant, the initiating context also
+/// caps authority. A grant may widen beyond the initiating context only when its scope exactly
+/// matches the node and its capability covers the request.
+#[must_use]
+pub fn preflight_workflow_policy(request: &WorkflowPolicyRequest) -> WorkflowPolicyPreflight {
+    if let Err(reason) = validate_grant_scope(&request.scope) {
+        return WorkflowPolicyPreflight::Rejected { reason };
+    }
+    if request.node > request.profile {
+        return WorkflowPolicyPreflight::Rejected {
+            reason: "node requests capability broader than its configured profile".to_string(),
+        };
+    }
+    if request.node <= request.initiating {
+        return WorkflowPolicyPreflight::Authorized {
+            effective: request.node,
+            audit_identity: policy_audit_identity(request, None),
+        };
+    }
+    let Some(grant) = &request.grant else {
+        return WorkflowPolicyPreflight::ApprovalRequired {
+            requested: request.node,
+            scope: request.scope.clone(),
+        };
+    };
+    if grant.grant_id.trim().is_empty() {
+        return WorkflowPolicyPreflight::Rejected {
+            reason: "grant identity must not be empty".to_string(),
+        };
+    }
+    if grant.grant_id.len() > MAX_POLICY_GRANT_ID_BYTES {
+        return WorkflowPolicyPreflight::Rejected {
+            reason: format!("grant identity exceeds {MAX_POLICY_GRANT_ID_BYTES} bytes"),
+        };
+    }
+    if grant.scope != request.scope {
+        return WorkflowPolicyPreflight::Rejected {
+            reason: "grant scope does not match the requested workflow node".to_string(),
+        };
+    }
+    if grant.capability < request.node {
+        return WorkflowPolicyPreflight::Rejected {
+            reason: "grant capability does not cover the node request".to_string(),
+        };
+    }
+    WorkflowPolicyPreflight::Authorized {
+        effective: request.node,
+        audit_identity: policy_audit_identity(request, Some(grant.grant_id.as_str())),
+    }
+}
+
+const MAX_POLICY_SCOPE_ID_BYTES: usize = 512;
+const MAX_POLICY_GRANT_ID_BYTES: usize = 512;
+
+fn validate_grant_scope(scope: &WorkflowGrantScope) -> Result<(), String> {
+    for (label, value) in [
+        ("definition", scope.definition.as_str()),
+        ("workspace", scope.workspace.as_str()),
+        ("node", scope.node.as_str()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!("grant scope {label} must not be empty"));
+        }
+        if value.len() > MAX_POLICY_SCOPE_ID_BYTES {
+            return Err(format!(
+                "grant scope {label} exceeds {MAX_POLICY_SCOPE_ID_BYTES} bytes"
+            ));
+        }
+    }
+    if scope.definition_version == 0 {
+        return Err("grant scope definition version must be positive".to_string());
+    }
+    if let Some(run) = &scope.run {
+        if run.trim().is_empty() {
+            return Err("grant scope run must not be empty".to_string());
+        }
+        if run.len() > MAX_POLICY_SCOPE_ID_BYTES {
+            return Err(format!(
+                "grant scope run exceeds {MAX_POLICY_SCOPE_ID_BYTES} bytes"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn policy_audit_identity(request: &WorkflowPolicyRequest, grant_id: Option<&str>) -> String {
+    format!(
+        "workflow={};version={};workspace={};node={};run={};profile={:?};node_capability={:?};grant={}",
+        request.scope.definition,
+        request.scope.definition_version,
+        request.scope.workspace,
+        request.scope.node,
+        request.scope.run.as_deref().unwrap_or("*"),
+        request.profile,
+        request.node,
+        grant_id.unwrap_or("none")
+    )
+}
+
+/// Shared read or exclusive write claim for a workflow resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceAccess {
@@ -2496,6 +2736,208 @@ mod tests {
     #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
     struct Labelled {
         label: String,
+    }
+
+    #[tokio::test]
+    async fn approval_resolver_is_used_only_for_required_elevation() {
+        #[derive(Debug)]
+        struct Resolver {
+            calls: Arc<AtomicUsize>,
+            grant: Option<WorkflowPolicyGrant>,
+        }
+
+        impl WorkflowApprovalResolver for Resolver {
+            fn request_approval<'a>(
+                &'a self,
+                _requested: WorkflowToolCapability,
+                _scope: &'a WorkflowGrantScope,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<Option<WorkflowPolicyGrant>, WorkflowError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let grant = self.grant.clone();
+                Box::pin(async move { Ok(grant) })
+            }
+        }
+
+        let scope = WorkflowGrantScope {
+            definition: "review-flow".to_string(),
+            definition_version: 1,
+            workspace: "workspace-1".to_string(),
+            node: "commit".to_string(),
+            run: Some("run-1".to_string()),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let resolver = Resolver {
+            calls: Arc::clone(&calls),
+            grant: Some(WorkflowPolicyGrant {
+                grant_id: "approval-1".to_string(),
+                scope: scope.clone(),
+                capability: WorkflowToolCapability::Mutating,
+            }),
+        };
+        let elevated = WorkflowPolicyRequest {
+            initiating: WorkflowToolCapability::ReadOnly,
+            profile: WorkflowToolCapability::Mutating,
+            node: WorkflowToolCapability::Mutating,
+            scope: scope.clone(),
+            grant: None,
+        };
+        let (effective, audit) = authorize_workflow_policy(&elevated, &resolver)
+            .await
+            .expect("approved elevation");
+        assert_eq!(effective, WorkflowToolCapability::Mutating);
+        assert!(audit.contains("grant=approval-1"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let narrowed = WorkflowPolicyRequest {
+            initiating: WorkflowToolCapability::ReadOnly,
+            profile: WorkflowToolCapability::ReadOnly,
+            node: WorkflowToolCapability::ReadOnly,
+            scope,
+            grant: None,
+        };
+        authorize_workflow_policy(&narrowed, &resolver)
+            .await
+            .expect("no approval needed");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn approval_resolver_cannot_authorize_mismatched_grant() {
+        #[derive(Debug)]
+        struct Resolver(WorkflowPolicyGrant);
+
+        impl WorkflowApprovalResolver for Resolver {
+            fn request_approval<'a>(
+                &'a self,
+                _requested: WorkflowToolCapability,
+                _scope: &'a WorkflowGrantScope,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<Option<WorkflowPolicyGrant>, WorkflowError>>
+                        + Send
+                        + 'a,
+                >,
+            > {
+                let grant = self.0.clone();
+                Box::pin(async move { Ok(Some(grant)) })
+            }
+        }
+
+        let scope = WorkflowGrantScope {
+            definition: "review-flow".to_string(),
+            definition_version: 1,
+            workspace: "workspace-1".to_string(),
+            node: "commit".to_string(),
+            run: None,
+        };
+        let request = WorkflowPolicyRequest {
+            initiating: WorkflowToolCapability::ReadOnly,
+            profile: WorkflowToolCapability::Mutating,
+            node: WorkflowToolCapability::Mutating,
+            scope: scope.clone(),
+            grant: None,
+        };
+        let resolver = Resolver(WorkflowPolicyGrant {
+            grant_id: "approval-1".to_string(),
+            scope: WorkflowGrantScope {
+                node: "other".to_string(),
+                ..scope
+            },
+            capability: WorkflowToolCapability::Mutating,
+        });
+        let error = authorize_workflow_policy(&request, &resolver)
+            .await
+            .expect_err("mismatched grant rejected");
+        assert!(error.to_string().contains("scope"));
+    }
+
+    #[test]
+    fn policy_preflight_intersects_profile_initiator_node_and_grant() {
+        let scope = WorkflowGrantScope {
+            definition: "review-flow".to_string(),
+            definition_version: 1,
+            workspace: "workspace-1".to_string(),
+            node: "commit".to_string(),
+            run: Some("run-1".to_string()),
+        };
+        let request = WorkflowPolicyRequest {
+            initiating: WorkflowToolCapability::ReadOnly,
+            profile: WorkflowToolCapability::Mutating,
+            node: WorkflowToolCapability::Mutating,
+            scope: scope.clone(),
+            grant: None,
+        };
+        assert_eq!(
+            preflight_workflow_policy(&request),
+            WorkflowPolicyPreflight::ApprovalRequired {
+                requested: WorkflowToolCapability::Mutating,
+                scope: scope.clone(),
+            }
+        );
+
+        let authorized = preflight_workflow_policy(&WorkflowPolicyRequest {
+            grant: Some(WorkflowPolicyGrant {
+                grant_id: "approval-1".to_string(),
+                scope,
+                capability: WorkflowToolCapability::Mutating,
+            }),
+            ..request
+        });
+        assert!(matches!(
+            authorized,
+            WorkflowPolicyPreflight::Authorized {
+                effective: WorkflowToolCapability::Mutating,
+                audit_identity,
+            } if audit_identity.contains("grant=approval-1")
+        ));
+    }
+
+    #[test]
+    fn policy_preflight_rejects_self_elevation_and_mismatched_grants() {
+        let scope = WorkflowGrantScope {
+            definition: "review-flow".to_string(),
+            definition_version: 1,
+            workspace: "workspace-1".to_string(),
+            node: "review".to_string(),
+            run: None,
+        };
+        let broader_than_profile = WorkflowPolicyRequest {
+            initiating: WorkflowToolCapability::ReadOnly,
+            profile: WorkflowToolCapability::ReadOnly,
+            node: WorkflowToolCapability::Mutating,
+            scope: scope.clone(),
+            grant: None,
+        };
+        assert!(matches!(
+            preflight_workflow_policy(&broader_than_profile),
+            WorkflowPolicyPreflight::Rejected { reason }
+                if reason.contains("configured profile")
+        ));
+
+        let mismatched = WorkflowPolicyRequest {
+            initiating: WorkflowToolCapability::ReadOnly,
+            profile: WorkflowToolCapability::Mutating,
+            node: WorkflowToolCapability::Mutating,
+            scope: scope.clone(),
+            grant: Some(WorkflowPolicyGrant {
+                grant_id: "approval-1".to_string(),
+                scope: WorkflowGrantScope {
+                    node: "other".to_string(),
+                    ..scope
+                },
+                capability: WorkflowToolCapability::Mutating,
+            }),
+        };
+        assert!(matches!(
+            preflight_workflow_policy(&mismatched),
+            WorkflowPolicyPreflight::Rejected { reason } if reason.contains("scope")
+        ));
     }
 
     #[test]

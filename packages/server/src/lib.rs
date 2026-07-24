@@ -11032,8 +11032,9 @@ async fn run_model_turn_inner(
     phase: &Arc<Mutex<SessionRuntimePhase>>,
 ) -> ModelTurnCompletion {
     let execution = turn_execution_options(trigger_event);
-    let selection =
+    let mut selection =
         session_model_selection_with_runtime_context(state, session_id, runtime_context).await;
+    apply_turn_model_selection(&mut selection, &execution);
 
     if !has_model_provider(state, selection.provider_plugin_id.as_deref()) {
         return ModelTurnCompletion::with_message(
@@ -11093,6 +11094,7 @@ async fn run_model_turn_inner(
             state,
             session_id,
             trigger_event,
+            &execution,
             round,
             provider_plugin_id.as_deref(),
             selection.model_id.as_deref(),
@@ -11158,6 +11160,7 @@ async fn run_model_turn_inner(
                     state,
                     session_id,
                     trigger_event,
+                    &execution,
                     round,
                     provider_plugin_id.as_deref(),
                     selection.model_id.as_deref(),
@@ -13700,6 +13703,19 @@ fn turn_execution_options(
     }
 }
 
+fn apply_turn_model_selection(
+    selection: &mut SessionModelSelection,
+    execution: &bcode_session_models::TurnExecutionOptions,
+) {
+    if let Some(provider_plugin_id) = &execution.provider_plugin_id {
+        selection.provider_plugin_id = Some(provider_plugin_id.clone());
+    }
+    if let Some(model_id) = &execution.model_id {
+        selection.requested_model_id = Some(model_id.clone());
+        selection.model_id = Some(model_id.clone());
+    }
+}
+
 async fn prepare_static_model_turn_context(
     state: &ServerState,
     session_id: SessionId,
@@ -13778,6 +13794,7 @@ async fn build_model_turn_request(
     state: &ServerState,
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
+    execution: &bcode_session_models::TurnExecutionOptions,
     round: u32,
     provider_plugin_id: Option<&str>,
     selected_model_id: Option<&str>,
@@ -14017,7 +14034,13 @@ async fn build_model_turn_request(
         tools,
         tool_call_policy: parallel_capabilities
             .negotiate(state.tool_execution.parallel, bcode_model::ToolChoice::Auto),
-        structured_output: None,
+        structured_output: execution.structured_output.as_ref().map(|request| {
+            bcode_model::StructuredOutputRequest {
+                name: request.name.clone(),
+                schema: request.schema.clone(),
+                strict: request.strict,
+            }
+        }),
         context_management,
         parameters,
         prompt_cache,
@@ -33586,6 +33609,16 @@ library = "test"
                         tools: bcode_session_models::TurnToolPolicy::ReadOnly,
                         agent_profile: Some("review".to_string()),
                         tool_allowlist: Some(vec!["git.diff".to_string()]),
+                        provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                        model_id: Some("fake-structured".to_string()),
+                        structured_output: Some(
+                            bcode_session_models::TurnStructuredOutputRequest {
+                                name: "review_result".to_string(),
+                                schema: serde_json::json!({"type": "object"}),
+                                strict: true,
+                            },
+                        ),
+                        ..bcode_session_models::TurnExecutionOptions::default()
                     },
                     ..bcode_session_models::TurnAdmissionMetadata::default()
                 },
@@ -33597,6 +33630,106 @@ library = "test"
         assert_eq!(
             execution.tool_allowlist.as_deref(),
             Some(["git.diff".to_string()].as_slice())
+        );
+        assert_eq!(
+            execution.provider_plugin_id.as_deref(),
+            Some("bcode.fake-provider")
+        );
+        assert_eq!(execution.model_id.as_deref(), Some("fake-structured"));
+        assert!(execution.structured_output.as_ref().is_some_and(|request| {
+            request.name == "review_result" && request.strict && request.schema.is_object()
+        }));
+    }
+
+    #[test]
+    fn turn_model_selection_overrides_provider_and_requested_model() {
+        let mut selection = SessionModelSelection {
+            provider_plugin_id: Some("provider-default".to_string()),
+            requested_model_id: Some("model-default".to_string()),
+            model_id: Some("model-default".to_string()),
+            ..SessionModelSelection::default()
+        };
+        let execution = bcode_session_models::TurnExecutionOptions {
+            provider_plugin_id: Some("provider-turn".to_string()),
+            model_id: Some("model-turn".to_string()),
+            ..bcode_session_models::TurnExecutionOptions::default()
+        };
+
+        apply_turn_model_selection(&mut selection, &execution);
+
+        assert_eq!(
+            selection.provider_plugin_id.as_deref(),
+            Some("provider-turn")
+        );
+        assert_eq!(selection.requested_model_id.as_deref(), Some("model-turn"));
+        assert_eq!(selection.model_id.as_deref(), Some("model-turn"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_turn_request_carries_structured_output() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(Some("structured".to_string()), PathBuf::from("."))
+            .await
+            .expect("session");
+        let state = test_server_state_with_fake_provider(sessions);
+        let trigger = session_event(
+            summary.id,
+            1,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "return structured output".to_string(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        );
+        let execution = bcode_session_models::TurnExecutionOptions {
+            structured_output: Some(bcode_session_models::TurnStructuredOutputRequest {
+                name: "answer".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                    "required": ["value"]
+                }),
+                strict: true,
+            }),
+            ..bcode_session_models::TurnExecutionOptions::default()
+        };
+        let selection = SessionModelSelection {
+            provider_plugin_id: Some("bcode.fake-provider".to_string()),
+            requested_model_id: Some("fake-echo".to_string()),
+            model_id: Some("fake-echo".to_string()),
+            ..SessionModelSelection::default()
+        };
+        let static_context = StaticModelTurnContext {
+            system_prompt: String::new(),
+            system_messages: Vec::new(),
+            tools: Vec::new(),
+        };
+        let compaction_policy = automatic_compaction_policy(&state, &selection).await;
+
+        let prepared = build_model_turn_request(
+            &state,
+            summary.id,
+            &trigger,
+            &execution,
+            0,
+            selection.provider_plugin_id.as_deref(),
+            selection.model_id.as_deref(),
+            None,
+            &selection,
+            &compaction_policy,
+            &static_context,
+        )
+        .await
+        .expect("request builds");
+
+        assert_eq!(
+            prepared.request.structured_output,
+            Some(bcode_model::StructuredOutputRequest {
+                name: "answer".to_string(),
+                schema: execution.structured_output.expect("request").schema,
+                strict: true,
+            })
         );
     }
 

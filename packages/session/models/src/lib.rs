@@ -809,17 +809,77 @@ pub enum TurnToolPolicy {
     Disabled,
 }
 
+/// Generic correlation for one externally orchestrated execution unit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnExecutionCorrelation {
+    /// Stable owner-defined execution identity, such as a run ID.
+    pub execution_id: String,
+    /// Stable owner-defined unit identity within the execution.
+    pub unit_id: String,
+    /// Owner-defined attempt number for this unit.
+    pub attempt: u32,
+}
+
+/// Persisted provider-neutral structured-output request for one admitted turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnStructuredOutputRequest {
+    /// Human-readable output object name.
+    pub name: String,
+    /// JSON schema the provider should satisfy.
+    pub schema: serde_json::Value,
+    /// Whether provider-native strict validation should be requested where supported.
+    #[serde(default)]
+    pub strict: bool,
+}
+
 /// Generic execution options applied to one admitted turn.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnExecutionOptions {
+    /// Persisted execution-options schema version.
+    #[serde(default = "turn_execution_options_schema_version")]
+    pub schema_version: u32,
     #[serde(default)]
     pub tools: TurnToolPolicy,
+    /// Optional generic external-execution correlation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correlation: Option<TurnExecutionCorrelation>,
     /// Immutable agent/profile override for this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_profile: Option<String>,
     /// Exact tool names available to this turn, intersected with profile and generic tool policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_allowlist: Option<Vec<String>>,
+    /// Immutable model-provider plugin override for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_plugin_id: Option<String>,
+    /// Immutable provider-neutral requested model identifier for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_id: Option<String>,
+    /// Optional provider-neutral structured-output request for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output: Option<TurnStructuredOutputRequest>,
+}
+
+/// Current persisted turn execution-options schema version.
+pub const TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 1;
+
+const fn turn_execution_options_schema_version() -> u32 {
+    TURN_EXECUTION_OPTIONS_SCHEMA_VERSION
+}
+
+impl Default for TurnExecutionOptions {
+    fn default() -> Self {
+        Self {
+            schema_version: TURN_EXECUTION_OPTIONS_SCHEMA_VERSION,
+            tools: TurnToolPolicy::default(),
+            correlation: None,
+            agent_profile: None,
+            tool_allowlist: None,
+            provider_plugin_id: None,
+            model_id: None,
+            structured_output: None,
+        }
+    }
 }
 
 /// Generic metadata carried by an ordinary admitted turn.
@@ -837,9 +897,15 @@ pub struct TurnAdmissionMetadata {
 
 const MAX_TURN_PRODUCER_BYTES: usize = 256;
 const MAX_TURN_IDEMPOTENCY_KEY_BYTES: usize = 512;
+const MAX_TURN_EXECUTION_ID_BYTES: usize = 512;
+const MAX_TURN_EXECUTION_UNIT_ID_BYTES: usize = 512;
 const MAX_TURN_AGENT_PROFILE_BYTES: usize = 256;
+const MAX_TURN_PROVIDER_PLUGIN_ID_BYTES: usize = 256;
+const MAX_TURN_MODEL_ID_BYTES: usize = 512;
 const MAX_TURN_TOOL_ALLOWLIST_ENTRIES: usize = 256;
 const MAX_TURN_TOOL_NAME_BYTES: usize = 256;
+const MAX_TURN_STRUCTURED_OUTPUT_NAME_BYTES: usize = 256;
+const MAX_TURN_STRUCTURED_OUTPUT_SCHEMA_BYTES: usize = 256 * 1024;
 
 /// Generic turn-admission metadata validation error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -854,6 +920,20 @@ pub enum TurnAdmissionMetadataError {
     EmptyAllowedTool,
     AllowedToolTooLong,
     DuplicateAllowedTool,
+    UnsupportedExecutionOptionsVersion,
+    EmptyExecutionId,
+    ExecutionIdTooLong,
+    EmptyExecutionUnitId,
+    ExecutionUnitIdTooLong,
+    InvalidExecutionAttempt,
+    EmptyProviderPluginId,
+    ProviderPluginIdTooLong,
+    EmptyModelId,
+    ModelIdTooLong,
+    EmptyStructuredOutputName,
+    StructuredOutputNameTooLong,
+    StructuredOutputSchemaTooLarge,
+    InvalidStructuredOutputSchema,
 }
 
 impl Display for TurnAdmissionMetadataError {
@@ -871,6 +951,24 @@ impl Display for TurnAdmissionMetadataError {
             Self::EmptyAllowedTool => "turn tool allowlist entries must not be empty",
             Self::AllowedToolTooLong => "turn tool allowlist entry is too long",
             Self::DuplicateAllowedTool => "turn tool allowlist contains a duplicate entry",
+            Self::UnsupportedExecutionOptionsVersion => {
+                "turn execution options schema version is unsupported"
+            }
+            Self::EmptyExecutionId => "turn execution correlation ID must not be empty",
+            Self::ExecutionIdTooLong => "turn execution correlation ID is too long",
+            Self::EmptyExecutionUnitId => "turn execution unit ID must not be empty",
+            Self::ExecutionUnitIdTooLong => "turn execution unit ID is too long",
+            Self::InvalidExecutionAttempt => "turn execution attempt must be greater than zero",
+            Self::EmptyProviderPluginId => "turn provider plugin ID must not be empty",
+            Self::ProviderPluginIdTooLong => "turn provider plugin ID is too long",
+            Self::EmptyModelId => "turn model ID must not be empty",
+            Self::ModelIdTooLong => "turn model ID is too long",
+            Self::EmptyStructuredOutputName => "turn structured-output name must not be empty",
+            Self::StructuredOutputNameTooLong => "turn structured-output name is too long",
+            Self::StructuredOutputSchemaTooLarge => "turn structured-output schema is too large",
+            Self::InvalidStructuredOutputSchema => {
+                "turn structured-output schema must be a JSON object"
+            }
         })
     }
 }
@@ -885,6 +983,9 @@ impl TurnAdmissionMetadata {
     /// Returns an error when producer/idempotency fields are empty where identity requires them
     /// or exceed their durable bounds.
     pub fn validate(&self) -> Result<(), TurnAdmissionMetadataError> {
+        if self.execution.schema_version != TURN_EXECUTION_OPTIONS_SCHEMA_VERSION {
+            return Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion);
+        }
         if self
             .origin
             .as_ref()
@@ -905,6 +1006,23 @@ impl TurnAdmissionMetadata {
                 .is_none_or(|origin| origin.producer.is_empty())
             {
                 return Err(TurnAdmissionMetadataError::MissingIdempotencyProducer);
+            }
+        }
+        if let Some(correlation) = &self.execution.correlation {
+            if correlation.execution_id.is_empty() {
+                return Err(TurnAdmissionMetadataError::EmptyExecutionId);
+            }
+            if correlation.execution_id.len() > MAX_TURN_EXECUTION_ID_BYTES {
+                return Err(TurnAdmissionMetadataError::ExecutionIdTooLong);
+            }
+            if correlation.unit_id.is_empty() {
+                return Err(TurnAdmissionMetadataError::EmptyExecutionUnitId);
+            }
+            if correlation.unit_id.len() > MAX_TURN_EXECUTION_UNIT_ID_BYTES {
+                return Err(TurnAdmissionMetadataError::ExecutionUnitIdTooLong);
+            }
+            if correlation.attempt == 0 {
+                return Err(TurnAdmissionMetadataError::InvalidExecutionAttempt);
             }
         }
         if let Some(profile) = &self.execution.agent_profile {
@@ -930,6 +1048,38 @@ impl TurnAdmissionMetadata {
                 if !unique.insert(tool) {
                     return Err(TurnAdmissionMetadataError::DuplicateAllowedTool);
                 }
+            }
+        }
+        if let Some(provider) = &self.execution.provider_plugin_id {
+            if provider.is_empty() {
+                return Err(TurnAdmissionMetadataError::EmptyProviderPluginId);
+            }
+            if provider.len() > MAX_TURN_PROVIDER_PLUGIN_ID_BYTES {
+                return Err(TurnAdmissionMetadataError::ProviderPluginIdTooLong);
+            }
+        }
+        if let Some(model) = &self.execution.model_id {
+            if model.is_empty() {
+                return Err(TurnAdmissionMetadataError::EmptyModelId);
+            }
+            if model.len() > MAX_TURN_MODEL_ID_BYTES {
+                return Err(TurnAdmissionMetadataError::ModelIdTooLong);
+            }
+        }
+        if let Some(request) = &self.execution.structured_output {
+            if request.name.is_empty() {
+                return Err(TurnAdmissionMetadataError::EmptyStructuredOutputName);
+            }
+            if request.name.len() > MAX_TURN_STRUCTURED_OUTPUT_NAME_BYTES {
+                return Err(TurnAdmissionMetadataError::StructuredOutputNameTooLong);
+            }
+            let schema_bytes = serde_json::to_vec(&request.schema)
+                .map_err(|_| TurnAdmissionMetadataError::InvalidStructuredOutputSchema)?;
+            if schema_bytes.len() > MAX_TURN_STRUCTURED_OUTPUT_SCHEMA_BYTES {
+                return Err(TurnAdmissionMetadataError::StructuredOutputSchemaTooLarge);
+            }
+            if !request.schema.is_object() {
+                return Err(TurnAdmissionMetadataError::InvalidStructuredOutputSchema);
             }
         }
         Ok(())
@@ -2524,6 +2674,16 @@ mod tests {
         assert_eq!(metadata.priority, TurnPriority::Interactive);
         assert_eq!(metadata.idempotency_key, None);
         assert_eq!(metadata.execution.tools, TurnToolPolicy::Enabled);
+        assert_eq!(
+            metadata.execution.schema_version,
+            TURN_EXECUTION_OPTIONS_SCHEMA_VERSION
+        );
+        assert_eq!(metadata.execution.agent_profile, None);
+        assert_eq!(metadata.execution.correlation, None);
+        assert_eq!(metadata.execution.tool_allowlist, None);
+        assert_eq!(metadata.execution.provider_plugin_id, None);
+        assert_eq!(metadata.execution.model_id, None);
+        assert_eq!(metadata.execution.structured_output, None);
         assert_eq!(metadata.validate(), Ok(()));
     }
 
@@ -2532,8 +2692,25 @@ mod tests {
         let metadata = TurnAdmissionMetadata {
             execution: TurnExecutionOptions {
                 tools: TurnToolPolicy::ReadOnly,
+                correlation: Some(TurnExecutionCorrelation {
+                    execution_id: "run-1".to_string(),
+                    unit_id: "review".to_string(),
+                    attempt: 1,
+                }),
                 agent_profile: Some("review".to_string()),
                 tool_allowlist: Some(vec!["filesystem.read".to_string(), "git.diff".to_string()]),
+                provider_plugin_id: Some("bcode.fake-provider".to_string()),
+                model_id: Some("fake-structured".to_string()),
+                structured_output: Some(TurnStructuredOutputRequest {
+                    name: "review_result".to_string(),
+                    schema: serde_json::json!({
+                        "type": "object",
+                        "properties": {"approved": {"type": "boolean"}},
+                        "required": ["approved"]
+                    }),
+                    strict: true,
+                }),
+                ..TurnExecutionOptions::default()
             },
             ..TurnAdmissionMetadata::default()
         };
@@ -2569,6 +2746,50 @@ mod tests {
         assert_eq!(
             duplicate_tool.validate(),
             Err(TurnAdmissionMetadataError::DuplicateAllowedTool)
+        );
+
+        let invalid_correlation = TurnAdmissionMetadata {
+            execution: TurnExecutionOptions {
+                correlation: Some(TurnExecutionCorrelation {
+                    execution_id: "run-1".to_string(),
+                    unit_id: "review".to_string(),
+                    attempt: 0,
+                }),
+                ..TurnExecutionOptions::default()
+            },
+            ..TurnAdmissionMetadata::default()
+        };
+        assert_eq!(
+            invalid_correlation.validate(),
+            Err(TurnAdmissionMetadataError::InvalidExecutionAttempt)
+        );
+
+        let unsupported_version = TurnAdmissionMetadata {
+            execution: TurnExecutionOptions {
+                schema_version: TURN_EXECUTION_OPTIONS_SCHEMA_VERSION + 1,
+                ..TurnExecutionOptions::default()
+            },
+            ..TurnAdmissionMetadata::default()
+        };
+        assert_eq!(
+            unsupported_version.validate(),
+            Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion)
+        );
+
+        let invalid_schema = TurnAdmissionMetadata {
+            execution: TurnExecutionOptions {
+                structured_output: Some(TurnStructuredOutputRequest {
+                    name: "result".to_string(),
+                    schema: serde_json::Value::Bool(true),
+                    strict: false,
+                }),
+                ..TurnExecutionOptions::default()
+            },
+            ..TurnAdmissionMetadata::default()
+        };
+        assert_eq!(
+            invalid_schema.validate(),
+            Err(TurnAdmissionMetadataError::InvalidStructuredOutputSchema)
         );
     }
 

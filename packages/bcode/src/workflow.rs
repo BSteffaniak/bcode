@@ -10,10 +10,13 @@ use crate::{
 pub use bcode_workflow::{
     AbortTaskOnDrop, ArtifactReference, EdgeDefinition, EdgeKind, Field, NodeDefinition, NodeKind,
     NodeRunState, ParallelFailurePolicy, Predicate, PredicateExpression, ResourceAccess,
-    ResourceClaim, RetryPolicy, Step, StepContext, ValueSchema, Workflow, WorkflowBuilder,
-    WorkflowCancellation, WorkflowDefinition, WorkflowError, WorkflowEvent, WorkflowEventReceiver,
-    WorkflowEventSender, WorkflowOutcome, WorkflowPlan, WorkflowRunObserver, WorkflowRunSnapshot,
-    fan_out, field, parallel, parallel_named, parallel_named_with_policy, workflow_event_channel,
+    ResourceClaim, RetryPolicy, Step, StepContext, ValueSchema, Workflow, WorkflowApprovalResolver,
+    WorkflowBuilder, WorkflowCancellation, WorkflowDefinition, WorkflowError, WorkflowEvent,
+    WorkflowEventReceiver, WorkflowEventSender, WorkflowGrantScope, WorkflowOutcome, WorkflowPlan,
+    WorkflowPolicyGrant, WorkflowPolicyPreflight, WorkflowPolicyRequest, WorkflowRunObserver,
+    WorkflowRunSnapshot, WorkflowToolCapability, authorize_workflow_policy, fan_out, field,
+    parallel, parallel_named, parallel_named_with_policy, preflight_workflow_policy,
+    workflow_event_channel,
 };
 use schemars::JsonSchema;
 use serde::{Serialize, de::DeserializeOwned};
