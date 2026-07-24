@@ -254,7 +254,10 @@ mod tests {
     async fn telemetry_enabled_disabled_overhead_baseline_report() {
         const ITERATIONS: u64 = 100_000;
         for enabled in [false, true] {
-            let client = BcodeClient::default_endpoint();
+            let endpoint = bcode_ipc::IpcEndpoint::unix_socket(
+                std::env::temp_dir().join(format!("bcode-telemetry-baseline-{enabled}.sock")),
+            );
+            let client = BcodeClient::new(endpoint);
             let mut telemetry = TuiTelemetry::new(client, enabled);
             let started = Instant::now();
             for frame in 0..ITERATIONS {

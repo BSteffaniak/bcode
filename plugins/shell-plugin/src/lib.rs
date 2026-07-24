@@ -1648,6 +1648,30 @@ mod tests {
         assert!(shell_tool_definition().ui.request_visual.is_none());
     }
 
+    struct CapturedServiceEvent {
+        payload: Vec<u8>,
+        observed_at: Instant,
+    }
+
+    extern "C" fn capture_timed_service_event(
+        payload: *const u8,
+        payload_len: usize,
+        user_data: *mut c_void,
+    ) {
+        // SAFETY: tests pass a live `Mutex<Vec<CapturedServiceEvent>>` pointer for the entire
+        // invocation and the emitter invokes this callback synchronously.
+        let events = unsafe { &*(user_data.cast::<Mutex<Vec<CapturedServiceEvent>>>()) };
+        // SAFETY: the emitter provides a valid payload pointer and length for this callback.
+        let payload = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+        events
+            .lock()
+            .expect("event lock")
+            .push(CapturedServiceEvent {
+                payload: payload.to_vec(),
+                observed_at: Instant::now(),
+            });
+    }
+
     extern "C" fn capture_service_event(
         payload: *const u8,
         payload_len: usize,
@@ -2151,7 +2175,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert!(artifact_updates.len() >= 3);
+        assert!(artifact_updates.len() >= 2);
         assert!(
             artifact_updates
                 .windows(2)
@@ -2661,20 +2685,77 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct PublicationWorkloadMetrics {
+        publication_count: usize,
+        average_committed_delta: u64,
+        maximum_committed_delta: u64,
+        maximum_interarrival_us: u64,
+        ipc_bytes: usize,
+    }
+
+    fn publication_workload_metrics(events: &[CapturedServiceEvent]) -> PublicationWorkloadMetrics {
+        let mut previous_bytes = 0_u64;
+        let mut committed_deltas = Vec::new();
+        let mut ipc_bytes = 0_usize;
+        for event in events {
+            ipc_bytes = ipc_bytes.saturating_add(event.payload.len());
+            let envelope: bcode_tool::ToolContributionEnvelope =
+                serde_json::from_slice(&event.payload).expect("artifact contribution envelope");
+            assert_eq!(envelope.placement, ToolContributionPlacement::Progress);
+            let artifact = envelope.contribution.artifact.expect("artifact revision");
+            let delta = artifact.committed_bytes.saturating_sub(previous_bytes);
+            previous_bytes = artifact.committed_bytes;
+            if !artifact.finalized {
+                committed_deltas.push(delta);
+            }
+        }
+        PublicationWorkloadMetrics {
+            publication_count: events.len(),
+            average_committed_delta: committed_deltas
+                .iter()
+                .copied()
+                .sum::<u64>()
+                .checked_div(u64::try_from(committed_deltas.len()).unwrap_or(u64::MAX))
+                .unwrap_or(0),
+            maximum_committed_delta: committed_deltas.iter().copied().max().unwrap_or(0),
+            maximum_interarrival_us: events
+                .windows(2)
+                .map(|window| {
+                    u64::try_from(
+                        window[1]
+                            .observed_at
+                            .saturating_duration_since(window[0].observed_at)
+                            .as_micros(),
+                    )
+                    .unwrap_or(u64::MAX)
+                })
+                .max()
+                .unwrap_or(0),
+            ipc_bytes,
+        }
+    }
+
+    #[derive(Debug)]
     struct ChunkWorkloadMetrics {
         raw_bytes: usize,
         recording_bytes: u64,
-        notification_count: usize,
+        raw_update_count: usize,
+        publication_count: usize,
+        average_committed_delta: u64,
+        maximum_committed_delta: u64,
+        maximum_interarrival_us: u64,
         ipc_bytes: usize,
+        wall_time: Duration,
     }
 
     fn run_output_chunk_workload(output_bytes: usize, chunk_bytes: usize) -> ChunkWorkloadMetrics {
         let chunks = output_bytes.div_ceil(chunk_bytes);
+        let started = Instant::now();
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("many-chunks.bcsr");
-        let events = Mutex::new(Vec::<Vec<u8>>::new());
+        let events = Mutex::new(Vec::<CapturedServiceEvent>::new());
         let emitter = ServiceEventEmitter::new(
-            Some(capture_service_event),
+            Some(capture_timed_service_event),
             std::ptr::from_ref(&events).cast_mut().cast(),
         );
         let mut output = read_limited_streaming(
@@ -2706,24 +2787,11 @@ mod tests {
             .expect("finish recording");
 
         let events = events.lock().expect("events");
-        let mut committed = 0_u64;
-        let mut revisions = 0_usize;
-        let mut ipc_bytes = 0_usize;
-        for payload in events.iter() {
-            ipc_bytes = ipc_bytes.saturating_add(payload.len());
-            let envelope: bcode_tool::ToolContributionEnvelope =
-                serde_json::from_slice(payload).expect("artifact contribution envelope");
-            assert_eq!(envelope.placement, ToolContributionPlacement::Progress);
-            let artifact = envelope.contribution.artifact.expect("artifact revision");
-            assert!(artifact.committed_bytes >= committed);
-            committed = artifact.committed_bytes;
-            revisions = revisions.max(usize::try_from(artifact.revision).unwrap_or(usize::MAX));
-        }
-        let notification_count = events.len();
+        let publication = publication_workload_metrics(&events);
         drop(events);
         let recording_bytes = std::fs::metadata(&path).expect("recording metadata").len();
         let raw_bytes = output_bytes;
-        assert!(revisions <= chunks.saturating_mul(2).saturating_add(2));
+        assert!(publication.publication_count <= chunks.saturating_mul(2).saturating_add(2));
         let (_, frames) = recording::read_recording(&path).expect("recording");
         let exact_output_bytes = frames
             .iter()
@@ -2736,8 +2804,13 @@ mod tests {
         ChunkWorkloadMetrics {
             raw_bytes,
             recording_bytes,
-            notification_count,
-            ipc_bytes,
+            raw_update_count: chunks,
+            publication_count: publication.publication_count,
+            average_committed_delta: publication.average_committed_delta,
+            maximum_committed_delta: publication.maximum_committed_delta,
+            maximum_interarrival_us: publication.maximum_interarrival_us,
+            ipc_bytes: publication.ipc_bytes,
+            wall_time: started.elapsed(),
         }
     }
 
@@ -2749,7 +2822,6 @@ mod tests {
 
         for output_bytes in OUTPUT_VOLUMES {
             for chunk_bytes in CHUNK_BYTES {
-                let started = std::time::Instant::now();
                 let metrics = run_output_chunk_workload(output_bytes, chunk_bytes);
                 println!(
                     "BCODE_PERF_CASE {}",
@@ -2758,9 +2830,13 @@ mod tests {
                         "output_bytes": metrics.raw_bytes,
                         "chunk_bytes": chunk_bytes,
                         "recording_bytes": metrics.recording_bytes,
-                        "raw_updates": metrics.notification_count,
+                        "raw_updates": metrics.raw_update_count,
+                        "published_updates": metrics.publication_count,
+                        "average_committed_delta": metrics.average_committed_delta,
+                        "maximum_committed_delta": metrics.maximum_committed_delta,
+                        "maximum_interarrival_us": metrics.maximum_interarrival_us,
                         "ipc_bytes": metrics.ipc_bytes,
-                        "wall_us": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+                        "wall_us": u64::try_from(metrics.wall_time.as_micros()).unwrap_or(u64::MAX),
                     })
                 );
             }
@@ -2777,7 +2853,20 @@ mod tests {
                 let chunks = output_bytes.div_ceil(chunk_bytes);
                 let metrics = run_output_chunk_workload(output_bytes, chunk_bytes);
                 assert_eq!(metrics.raw_bytes, output_bytes);
-                assert_eq!(metrics.notification_count, chunks.saturating_add(2));
+                assert_eq!(metrics.raw_update_count, chunks);
+                let timer_publications = usize::try_from(
+                    metrics
+                        .wall_time
+                        .as_millis()
+                        .div_ceil(Duration::from_millis(16).as_millis()),
+                )
+                .unwrap_or(usize::MAX);
+                let maximum_publications = usize::try_from(metrics.recording_bytes)
+                    .unwrap_or(usize::MAX)
+                    .div_ceil(64 * 1024)
+                    .saturating_add(timer_publications)
+                    .saturating_add(2);
+                assert!(metrics.publication_count <= maximum_publications);
                 assert!(metrics.recording_bytes >= u64::try_from(output_bytes).unwrap_or(u64::MAX));
                 assert!(metrics.ipc_bytes > 0);
             }
@@ -2801,7 +2890,8 @@ mod tests {
         let input_scale = large.raw_bytes / small.raw_bytes;
 
         assert_eq!(input_scale, 8);
-        assert!(large.notification_count <= small.notification_count.saturating_mul(input_scale));
+        assert!(large.raw_update_count <= small.raw_update_count.saturating_mul(input_scale));
+        assert!(large.publication_count <= small.publication_count.saturating_mul(input_scale));
         assert!(
             large.ipc_bytes
                 <= small

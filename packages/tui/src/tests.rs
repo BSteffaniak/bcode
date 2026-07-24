@@ -5017,6 +5017,199 @@ fn growing_visual_app(
     app
 }
 
+fn shell_matrix_recording(output_bytes: usize, chunk_bytes: usize) -> Vec<u8> {
+    let dir = tempfile::tempdir().expect("recording temp dir");
+    let path = dir.path().join("matrix.bcsr");
+    let mut writer = bcode_shell_plugin::recording::ShellRecordingWriter::create(&path, 80, 24)
+        .expect("recording writer");
+    let chunk = vec![b'x'; chunk_bytes];
+    let mut written = 0_usize;
+    let mut sequence = 1_u64;
+    while written < output_bytes {
+        let length = (output_bytes - written).min(chunk_bytes);
+        writer
+            .write_output(sequence, &chunk[..length])
+            .expect("exact output frame");
+        writer
+            .write_replay_output(sequence, &chunk[..length])
+            .expect("replay output frame");
+        written = written.saturating_add(length);
+        sequence = sequence.saturating_add(1);
+    }
+    writer
+        .finish(sequence, Some(0), None, false, false)
+        .expect("finish recording");
+    std::fs::read(path).expect("recording bytes")
+}
+
+fn shell_matrix_app(
+    transcript_entries: u64,
+    presentation: Arc<super::plugin_tui::PluginTuiPresentation>,
+) -> BmuxApp {
+    let session_id = SessionId::new();
+    let mut history = (0..transcript_entries.saturating_sub(1))
+        .map(|sequence| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("history {sequence}"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    history.push(event(
+        session_id,
+        transcript_entries,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-matrix".to_owned(),
+            producer_plugin_id: Some("bcode.shell".to_owned()),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: r#"{"command":"matrix"}"#.to_owned(),
+            working_directory: None,
+            request_visual: Some(PluginVisualDescriptor {
+                visual_id: None,
+                producer_plugin_id: Some("bcode.shell".to_owned()),
+                schema: "bcode.shell.run".to_owned(),
+                schema_version: 1,
+                title: Some("Shell run".to_owned()),
+                subtitle: None,
+                payload: serde_json::json!({
+                    "mode": "terminal",
+                    "columns": 80,
+                    "rows": 24,
+                    "streaming": true,
+                    "command": "matrix"
+                }),
+            }),
+            legacy_request_presentation: None,
+        },
+    ));
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_presentation(presentation);
+    app
+}
+
+#[test]
+#[ignore = "manual deterministic performance baseline"]
+#[allow(clippy::too_many_lines)] // One integration matrix case keeps delivery and frame measurements together.
+fn shell_output_chunk_transcript_matrix_report() {
+    const OUTPUT_VOLUMES: [usize; 3] = [64 * 1024, 1024 * 1024, 8 * 1024 * 1024];
+    const CHUNK_BYTES: [usize; 3] = [17, 4 * 1024, 16 * 1024];
+    const TRANSCRIPT_ENTRIES: [u64; 3] = [10, 500, 2_000];
+    const ARTIFACT_RANGE_BYTES: usize = 256 * 1024;
+    let terminal = Rect::new(0, 0, 80, 30);
+
+    for output_bytes in OUTPUT_VOLUMES {
+        for chunk_bytes in CHUNK_BYTES {
+            let recording = shell_matrix_recording(output_bytes, chunk_bytes);
+            for transcript_entries in TRANSCRIPT_ENTRIES {
+                let presentation = Arc::new(super::plugin_tui::PluginTuiPresentation::new(
+                    shell_plugin_host(),
+                ));
+                let mut app = shell_matrix_app(transcript_entries, Arc::clone(&presentation));
+                let mut buffer = Buffer::empty(terminal);
+                let mut frame = Frame::new(&mut buffer);
+                render::render(&mut app, &mut frame);
+                let _ = app.transcript_layout_mut().drain_sync_stats();
+                let _ = presentation.drain_timings();
+                let _ = presentation.drain_diagnostics();
+
+                let delivery_started = Instant::now();
+                let total_bytes = u64::try_from(recording.len()).expect("recording length");
+                for (index, bytes) in recording.chunks(ARTIFACT_RANGE_BYTES).enumerate() {
+                    let offset = u64::try_from(index.saturating_mul(ARTIFACT_RANGE_BYTES))
+                        .expect("artifact offset");
+                    assert!(
+                        presentation
+                            .deliver_artifact_chunk(
+                                &bcode_plugin_sdk::tui::PluginTuiArtifactChunk {
+                                    tool_call_id: "call-matrix".to_owned(),
+                                    artifact_id: "call-matrix-shell-run".to_owned(),
+                                    reference_key: "shell_recording".to_owned(),
+                                    producer_plugin_id: "bcode.shell".to_owned(),
+                                    schema: "bcode.shell.run".to_owned(),
+                                    schema_version: 1,
+                                    content_type: Some(
+                                        "application/x-bcode-shell-recording; version=3".to_owned(),
+                                    ),
+                                    offset,
+                                    total_bytes,
+                                    revision: u64::try_from(index).unwrap_or(u64::MAX) + 1,
+                                    finalized: false,
+                                    bytes: bytes.to_vec(),
+                                }
+                            )
+                            .expect("deliver recording range")
+                    );
+                }
+                let delivery_us =
+                    u64::try_from(delivery_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let prepare_started = Instant::now();
+                let layout = render::prepare_frame(&mut app, terminal).expect("prepared frame");
+                let prepare_us =
+                    u64::try_from(prepare_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let mut buffer = Buffer::empty(terminal);
+                let mut frame = Frame::new(&mut buffer);
+                let draw_started = Instant::now();
+                render::render_prepared(&mut app, &mut frame, layout);
+                let draw_us = u64::try_from(draw_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let sync = app
+                    .transcript_layout_mut()
+                    .drain_sync_stats()
+                    .into_iter()
+                    .fold(
+                        (0_usize, 0_usize, 0_usize, 0_usize),
+                        |(scanned, changed, rebuilt, rows), stats| {
+                            (
+                                scanned.saturating_add(stats.entries_scanned),
+                                changed.saturating_add(stats.signatures_changed),
+                                rebuilt.saturating_add(stats.entries_rebuilt),
+                                rows.saturating_add(stats.rows_regenerated),
+                            )
+                        },
+                    );
+                let diagnostics = presentation
+                    .drain_diagnostics()
+                    .into_iter()
+                    .map(|diagnostic| (diagnostic.name, diagnostic.value))
+                    .collect::<BTreeMap<_, _>>();
+                let visual_render_us = presentation
+                    .drain_timings()
+                    .into_iter()
+                    .filter(|timing| timing.operation == "render_rows")
+                    .map(|timing| timing.duration_micros)
+                    .sum::<u64>();
+                println!(
+                    "BCODE_PERF_CASE {}",
+                    serde_json::json!({
+                        "domain": "shell_tui_matrix",
+                        "output_bytes": output_bytes,
+                        "chunk_bytes": chunk_bytes,
+                        "transcript_entries": transcript_entries,
+                        "recording_bytes": recording.len(),
+                        "artifact_ranges": recording.len().div_ceil(ARTIFACT_RANGE_BYTES),
+                        "artifact_delivery_us": delivery_us,
+                        "prepare_us": prepare_us,
+                        "draw_us": draw_us,
+                        "frame_total_us": prepare_us.saturating_add(draw_us),
+                        "over_budget": prepare_us.saturating_add(draw_us) >= 16_000,
+                        "entries_scanned": sync.0,
+                        "signatures_changed": sync.1,
+                        "entries_rebuilt": sync.2,
+                        "rows_regenerated": sync.3,
+                        "visual_render_us": visual_render_us,
+                        "decode_bytes": diagnostics.get("decode_bytes").copied().unwrap_or(0),
+                        "emulate_bytes": diagnostics.get("emulate_bytes").copied().unwrap_or(0),
+                        "emulate_frames": diagnostics.get("emulate_frames").copied().unwrap_or(0),
+                        "reset_total": diagnostics.get("reset_total").copied().unwrap_or(0),
+                    })
+                );
+            }
+        }
+    }
+}
+
 #[test]
 #[ignore = "manual deterministic performance baseline"]
 fn active_visual_frame_baseline_report() {

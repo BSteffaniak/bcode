@@ -2233,7 +2233,7 @@ mod tests {
                 kind: MetricKind::Counter,
                 value: 10,
                 labels: MetricLabels::from([
-                    ("plugin_id".to_owned(), "bcode.shell".to_owned()),
+                    ("plugin_id".to_owned(), "example.plugin".to_owned()),
                     ("diagnostic".to_owned(), "emulate_bytes".to_owned()),
                 ]),
             },
@@ -2243,8 +2243,8 @@ mod tests {
                 kind: MetricKind::Counter,
                 value: 1,
                 labels: MetricLabels::from([
-                    ("producer".to_owned(), "bcode.shell".to_owned()),
-                    ("schema".to_owned(), "bcode.shell.recording".to_owned()),
+                    ("producer".to_owned(), "example.plugin".to_owned()),
+                    ("schema".to_owned(), "example.artifact".to_owned()),
                     ("finalized".to_owned(), "false".to_owned()),
                 ]),
             },

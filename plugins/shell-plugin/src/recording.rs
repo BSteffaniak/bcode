@@ -26,6 +26,7 @@ use std::sync::{
     mpsc,
 };
 use std::thread;
+use std::time::{Duration, Instant};
 
 /// One readable committed boundary of an active shell recording.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,8 @@ const FRAME_START: u8 = 4;
 const FRAME_REPLAY_OUTPUT: u8 = 5;
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const ASYNC_RECORDING_QUEUE_CAPACITY: usize = 256;
+const RECORDING_PUBLICATION_INTERVAL: Duration = Duration::from_millis(16);
+const RECORDING_PUBLICATION_BYTES: u64 = 64 * 1024;
 const RECORDING_HEADER_BYTES: usize = 14;
 const RECORDING_FRAME_HEADER_BYTES: usize = 13;
 
@@ -390,7 +393,7 @@ impl AsyncShellRecordingWriter {
         observer: Option<ShellRecordingCommitObserver>,
     ) -> io::Result<Self> {
         let mut writer = ShellRecordingWriter::create(path, columns, rows)?;
-        writer.publish_commit(observer.as_ref(), false)?;
+        let _ = writer.publish_commit(observer.as_ref(), false)?;
         let (sender, receiver) = mpsc::sync_channel(ASYNC_RECORDING_QUEUE_CAPACITY);
         let worker = thread::Builder::new()
             .name("bcode-shell-recording".to_owned())
@@ -557,13 +560,94 @@ impl Drop for AsyncShellRecordingWriter {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+struct RecordingPublicationState {
+    last_published_bytes: u64,
+    last_published_at: Instant,
+}
+
+impl RecordingPublicationState {
+    const fn new(last_published_bytes: u64, now: Instant) -> Self {
+        Self {
+            last_published_bytes,
+            last_published_at: now,
+        }
+    }
+
+    fn due(self, encoded_bytes: u64, now: Instant) -> bool {
+        encoded_bytes > self.last_published_bytes
+            && (encoded_bytes.saturating_sub(self.last_published_bytes)
+                >= RECORDING_PUBLICATION_BYTES
+                || now.saturating_duration_since(self.last_published_at)
+                    >= RECORDING_PUBLICATION_INTERVAL)
+    }
+
+    fn timeout(self, now: Instant) -> Duration {
+        RECORDING_PUBLICATION_INTERVAL
+            .saturating_sub(now.saturating_duration_since(self.last_published_at))
+    }
+
+    const fn published(&mut self, committed_bytes: u64, now: Instant) {
+        self.last_published_bytes = committed_bytes;
+        self.last_published_at = now;
+    }
+}
+
+fn receive_recording_command(
+    receiver: &mpsc::Receiver<AsyncRecordingCommand>,
+    observer_enabled: bool,
+    has_unpublished_bytes: bool,
+    publication: RecordingPublicationState,
+) -> Result<AsyncRecordingCommand, mpsc::RecvTimeoutError> {
+    if observer_enabled && has_unpublished_bytes {
+        receiver.recv_timeout(publication.timeout(Instant::now()))
+    } else {
+        receiver
+            .recv()
+            .map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+    }
+}
+
+fn publish_pending_recording(
+    writer: &mut ShellRecordingWriter,
+    observer: Option<&ShellRecordingCommitObserver>,
+    publication: &mut RecordingPublicationState,
+) -> io::Result<()> {
+    let committed_bytes = writer.publish_commit(observer, false)?;
+    publication.published(committed_bytes, Instant::now());
+    Ok(())
+}
+
 fn run_async_recording_writer(
     mut writer: ShellRecordingWriter,
     receiver: &mpsc::Receiver<AsyncRecordingCommand>,
     observer: Option<&ShellRecordingCommitObserver>,
 ) {
     let mut failure = None;
-    while let Ok(command) = receiver.recv() {
+    let mut publication = RecordingPublicationState::new(writer.encoded_bytes(), Instant::now());
+    loop {
+        let command_result = receive_recording_command(
+            receiver,
+            observer.is_some(),
+            writer.encoded_bytes() > publication.last_published_bytes,
+            publication,
+        );
+        let command = match command_result {
+            Ok(command) => command,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if failure.is_none() && writer.encoded_bytes() > publication.last_published_bytes {
+                    if let Err(error) =
+                        publish_pending_recording(&mut writer, observer, &mut publication)
+                    {
+                        failure = Some(error);
+                    }
+                } else {
+                    continue;
+                }
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         match command {
             AsyncRecordingCommand::Output {
                 offset_micros,
@@ -578,7 +662,7 @@ fn run_async_recording_writer(
                         {
                             writer.write_replay_output(offset_micros, &replay_bytes)?;
                         }
-                        writer.publish_commit(observer, false)
+                        Ok(())
                     })();
                     if let Err(error) = write_result {
                         failure = Some(error);
@@ -590,13 +674,10 @@ fn run_async_recording_writer(
                 columns,
                 rows,
             } => {
-                if failure.is_none() {
-                    let write_result = writer
-                        .write_resize(offset_micros, columns, rows)
-                        .and_then(|()| writer.publish_commit(observer, false));
-                    if let Err(error) = write_result {
-                        failure = Some(error);
-                    }
+                if failure.is_none()
+                    && let Err(error) = writer.write_resize(offset_micros, columns, rows)
+                {
+                    failure = Some(error);
                 }
             }
             AsyncRecordingCommand::Finish {
@@ -631,6 +712,13 @@ fn run_async_recording_writer(
                 let _ = response.send(result);
                 break;
             }
+        }
+        if failure.is_none()
+            && observer.is_some()
+            && publication.due(writer.encoded_bytes(), Instant::now())
+            && let Err(error) = publish_pending_recording(&mut writer, observer, &mut publication)
+        {
+            failure = Some(error);
         }
     }
 }
@@ -689,6 +777,7 @@ pub struct ShellRecordingWriter {
     columns: u16,
     rows: u16,
     frame_count: u64,
+    encoded_bytes: u64,
     output_bytes: u64,
     checksum: Sha256,
     finished: bool,
@@ -722,6 +811,7 @@ impl ShellRecordingWriter {
             columns,
             rows,
             frame_count: 0,
+            encoded_bytes: RECORDING_HEADER_BYTES as u64,
             output_bytes: 0,
             checksum: Sha256::new(),
             finished: false,
@@ -811,13 +901,17 @@ impl ShellRecordingWriter {
         })
     }
 
+    const fn encoded_bytes(&self) -> u64 {
+        self.encoded_bytes
+    }
+
     fn publish_commit(
         &mut self,
         observer: Option<&ShellRecordingCommitObserver>,
         finalized: bool,
-    ) -> io::Result<()> {
+    ) -> io::Result<u64> {
         let Some(observer) = observer else {
-            return Ok(());
+            return Ok(0);
         };
         if !finalized {
             self.writer.flush()?;
@@ -833,7 +927,7 @@ impl ShellRecordingWriter {
             committed_bytes,
             finalized,
         });
-        Ok(())
+        Ok(committed_bytes)
     }
 
     fn write_frame(&mut self, kind: u8, offset_micros: u64, payload: &[u8]) -> io::Result<()> {
@@ -845,6 +939,10 @@ impl ShellRecordingWriter {
         self.writer.write_all(&length.to_le_bytes())?;
         self.writer.write_all(payload)?;
         self.frame_count = self.frame_count.saturating_add(1);
+        self.encoded_bytes = self
+            .encoded_bytes
+            .saturating_add(RECORDING_FRAME_HEADER_BYTES as u64)
+            .saturating_add(u64::try_from(payload.len()).unwrap_or(u64::MAX));
         Ok(())
     }
 }
@@ -1226,6 +1324,141 @@ mod tests {
     }
 
     #[test]
+    fn publication_policy_uses_exact_time_and_byte_boundaries() {
+        let started = Instant::now();
+        let mut publication = RecordingPublicationState::new(100, started);
+        assert!(!publication.due(100, started + RECORDING_PUBLICATION_INTERVAL));
+        assert!(!publication.due(101, started + RECORDING_PUBLICATION_INTERVAL / 2));
+        assert!(publication.due(101, started + RECORDING_PUBLICATION_INTERVAL));
+        assert!(!publication.due(
+            100 + RECORDING_PUBLICATION_BYTES - 1,
+            started + RECORDING_PUBLICATION_INTERVAL / 2,
+        ));
+        assert!(publication.due(
+            100 + RECORDING_PUBLICATION_BYTES,
+            started + RECORDING_PUBLICATION_INTERVAL / 2,
+        ));
+        assert_eq!(
+            publication.timeout(started + RECORDING_PUBLICATION_INTERVAL / 2),
+            RECORDING_PUBLICATION_INTERVAL / 2
+        );
+        publication.published(200, started + RECORDING_PUBLICATION_INTERVAL);
+        assert_eq!(publication.last_published_bytes, 200);
+        assert_eq!(
+            publication.timeout(started + RECORDING_PUBLICATION_INTERVAL),
+            RECORDING_PUBLICATION_INTERVAL
+        );
+    }
+
+    #[test]
+    fn async_writer_timer_publishes_small_pending_prefix() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("timer.bcsr");
+        let (commit_tx, commit_rx) = mpsc::channel();
+        let observer: ShellRecordingCommitObserver = Arc::new(move |commit| {
+            let _ = commit_tx.send(commit);
+        });
+        let mut writer =
+            AsyncShellRecordingWriter::create_with_observer(&path, 80, 24, Some(observer))
+                .expect("writer");
+        let initial = commit_rx.recv().expect("initial commit");
+        assert!(!initial.finalized);
+        assert!(writer.try_write_output(1, b"small pending prefix"));
+        let published = commit_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("timer publication");
+        assert!(!published.finalized);
+        assert!(published.committed_bytes > initial.committed_bytes);
+        writer
+            .finish(2, Some(0), None, false, false)
+            .expect("finish");
+        assert!(
+            commit_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("final commit")
+                .finalized
+        );
+    }
+
+    #[test]
+    fn steady_small_writes_publish_within_bounded_timer_freshness() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("steady-timer.bcsr");
+        let (commit_tx, commit_rx) = mpsc::channel();
+        let observer: ShellRecordingCommitObserver = Arc::new(move |commit| {
+            let _ = commit_tx.send((Instant::now(), commit));
+        });
+        let mut writer =
+            AsyncShellRecordingWriter::create_with_observer(&path, 80, 24, Some(observer))
+                .expect("writer");
+        let (_, initial) = commit_rx.recv().expect("initial commit");
+        assert!(!initial.finalized);
+        let started = Instant::now();
+        for sequence in 1..=8 {
+            assert!(writer.try_write_output(sequence, b"steady"));
+            thread::sleep(Duration::from_millis(2));
+        }
+        let (published_at, published) = commit_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("timer publication");
+        assert!(!published.finalized);
+        assert!(published_at.saturating_duration_since(started) <= Duration::from_millis(50));
+        writer
+            .finish(9, Some(0), None, false, false)
+            .expect("finish");
+    }
+
+    #[test]
+    fn async_writer_byte_threshold_publishes_before_timer() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("threshold.bcsr");
+        let (commit_tx, commit_rx) = mpsc::channel();
+        let observer: ShellRecordingCommitObserver = Arc::new(move |commit| {
+            let _ = commit_tx.send(commit);
+        });
+        let mut writer =
+            AsyncShellRecordingWriter::create_with_observer(&path, 80, 24, Some(observer))
+                .expect("writer");
+        let initial = commit_rx.recv().expect("initial commit");
+        let output = vec![b'x'; usize::try_from(RECORDING_PUBLICATION_BYTES).expect("threshold")];
+        assert!(writer.try_write_output(1, &output));
+        let published = commit_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("threshold publication");
+        assert!(!published.finalized);
+        assert!(
+            published
+                .committed_bytes
+                .saturating_sub(initial.committed_bytes)
+                >= RECORDING_PUBLICATION_BYTES
+        );
+        writer
+            .finish(2, Some(0), None, false, false)
+            .expect("finish");
+        let (_, frames) = read_recording(&path).expect("recording");
+        assert!(frames.iter().any(|frame| matches!(
+            frame,
+            ShellRecordingFrame::Output { bytes, .. } if bytes == &output
+        )));
+    }
+
+    #[test]
+    fn bounded_recording_queue_rejects_pressure_without_blocking() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        let failed = Arc::new(AtomicBool::new(false));
+        let mut writer = AsyncShellRecordingWriter {
+            sender,
+            worker: None,
+            sequence: Arc::new(Mutex::new(())),
+            failed: Arc::clone(&failed),
+        };
+        assert!(writer.try_write_output(1, b"first"));
+        assert!(!writer.try_write_output(2, b"overflow"));
+        assert!(failed.load(Ordering::SeqCst));
+        assert!(writer.finish(3, Some(0), None, false, false).is_err());
+    }
+
+    #[test]
     fn contended_recording_sequence_never_blocks_live_output_and_prevents_publication() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("contended.bcsr");
@@ -1258,7 +1491,7 @@ mod tests {
             .expect("finish");
 
         let commits = commits.lock().expect("commits");
-        assert!(commits.len() >= 4);
+        assert!((2..=4).contains(&commits.len()), "{commits:?}");
         assert!(
             commits
                 .windows(2)
