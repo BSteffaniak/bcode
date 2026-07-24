@@ -67,6 +67,9 @@ enabled = ["bcode.fake-provider", "bcode.shell"]
 provider_plugin_id = "bcode.fake-provider"
 model_id = "fake-echo"
 
+[model.prompt_cache]
+mode = "off"
+
 [agent.build.permission]
 command = { "*" = "allow" }
 
@@ -248,7 +251,7 @@ PY
 
 "${root}/target/debug/bcode" server status >/dev/null
 "${root}/target/debug/bcode" server stop >/dev/null
-wait "${server_pid}"
+wait "${server_pid}" || true
 server_pid=""
 
 echo "smoke-tui-pty: PASS"
