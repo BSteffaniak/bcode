@@ -1451,6 +1451,15 @@ impl BmuxApp {
         ));
     }
 
+    /// Append a JSON system-style transcript note.
+    pub fn push_system_json(&mut self, text: String) {
+        self.transcript.push(TranscriptItem::with_format(
+            "System",
+            text,
+            bcode_session_view_models::TextFormat::Json,
+        ));
+    }
+
     /// Append a Markdown system-style transcript note.
     pub fn push_system_markdown(&mut self, text: String) {
         self.transcript.push(TranscriptItem::with_format(

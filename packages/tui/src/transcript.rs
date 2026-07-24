@@ -166,7 +166,7 @@ impl TranscriptItem {
         Self::with_identity(role, text, streaming, TextFormat::PlainText, kind)
     }
 
-    fn with_identity(
+    pub(crate) fn with_identity(
         role: &'static str,
         text: String,
         streaming: bool,
@@ -1100,6 +1100,31 @@ mod tests {
                 .replace_from_shared(terminal_item_from_shared(&item(1, TextFormat::Markdown,)))
         );
         assert_eq!(terminal.text_format(), TextFormat::Markdown);
+    }
+
+    #[test]
+    fn generic_skill_and_interaction_items_remain_explicit_plain_text() {
+        let skill = terminal_skill_item_from_shared(&bcode_session_view_models::SkillView {
+            skill_id: "review".to_owned(),
+            status: bcode_session_view_models::SkillViewStatus::ContextLoaded,
+            text: "* literal context".to_owned(),
+        });
+        let interaction = terminal_interaction_item_from_shared(&InteractionViewSummary {
+            interaction_id: "question-1".to_owned(),
+            kind: "bcode.question".to_owned(),
+            surface_kind: "bcode.question.inline".to_owned(),
+            tool_call_id: None,
+            title: Some("* literal title".to_owned()),
+            required: true,
+            snapshot: None,
+            state: bcode_session_view_models::InteractionViewState::Pending,
+            status_detail: None,
+            resolved: false,
+            resolution: None,
+        });
+
+        assert_eq!(skill.text_format(), TextFormat::PlainText);
+        assert_eq!(interaction.text_format(), TextFormat::PlainText);
     }
 
     #[test]

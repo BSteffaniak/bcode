@@ -3224,7 +3224,7 @@ fn submitted_user_message_anchors_at_top() {
 }
 
 #[test]
-fn accepted_submission_preserves_submitted_user_message_transition() {
+fn accepted_markdown_submission_preserves_submitted_user_message_transition() {
     let session_id = SessionId::new();
     let history = (0..12)
         .map(|sequence| {
@@ -3243,7 +3243,9 @@ fn accepted_submission_preserves_submitted_user_message_transition() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
 
-    app.replace_composer_with("new prompt");
+    app.replace_composer_with(
+        "# New prompt\n\n- first\n- second with **emphasis**\n\n```sh\ncargo test\n```",
+    );
     app.stage_submission();
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);

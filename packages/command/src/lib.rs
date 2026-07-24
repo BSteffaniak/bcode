@@ -66,6 +66,19 @@ pub struct InvokeCommandResponse {
     pub effects: Vec<CommandEffect>,
 }
 
+/// Renderer-neutral format for command-contributed transcript text.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandTextFormat {
+    /// Preserve text literally.
+    #[default]
+    PlainText,
+    /// Render Markdown-compatible text.
+    Markdown,
+    /// Pretty-print valid JSON and preserve invalid JSON literally.
+    Json,
+}
+
 /// Generic effect requested by a plugin-owned command.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -75,10 +88,16 @@ pub enum CommandEffect {
         /// Message to show.
         message: String,
     },
-    /// Append a text note to the current transcript.
+    /// Append text to the current transcript.
+    ///
+    /// `format` is renderer-neutral and explicit. Omit it for backward-compatible plain text;
+    /// use `markdown` or `json` only when the command owns those semantics.
     AppendText {
         /// Text to append.
         text: String,
+        /// Explicit renderer-neutral text format. Omitted legacy values remain plain text.
+        #[serde(default, skip_serializing_if = "is_plain_text_format")]
+        format: CommandTextFormat,
     },
     /// Toggle a generic host surface by stable surface id.
     ToggleSurface {
@@ -95,6 +114,11 @@ pub enum CommandEffect {
         #[serde(default)]
         options: serde_json::Value,
     },
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_plain_text_format(format: &CommandTextFormat) -> bool {
+    *format == CommandTextFormat::PlainText
 }
 
 /// Command owner identity.
@@ -333,6 +357,54 @@ pub enum CommandError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_text_defaults_legacy_payloads_to_plain_text() {
+        let effect = serde_json::from_value::<CommandEffect>(serde_json::json!({
+            "type": "append_text",
+            "text": "* literal"
+        }))
+        .expect("legacy append text");
+
+        assert_eq!(
+            effect,
+            CommandEffect::AppendText {
+                text: "* literal".to_owned(),
+                format: CommandTextFormat::PlainText,
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(effect).expect("serialize legacy-compatible effect"),
+            serde_json::json!({"type": "append_text", "text": "* literal"})
+        );
+    }
+
+    #[test]
+    fn append_text_serializes_explicit_markdown_format() {
+        let effect = CommandEffect::AppendText {
+            text: "* rendered".to_owned(),
+            format: CommandTextFormat::Markdown,
+        };
+
+        assert_eq!(
+            serde_json::to_value(&effect).expect("serialize markdown effect"),
+            serde_json::json!({
+                "type": "append_text",
+                "text": "* rendered",
+                "format": "markdown"
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CommandEffect>(
+                serde_json::to_value(effect).expect("serialize markdown effect")
+            )
+            .expect("deserialize markdown effect"),
+            CommandEffect::AppendText {
+                text: "* rendered".to_owned(),
+                format: CommandTextFormat::Markdown,
+            }
+        );
+    }
 
     #[test]
     fn registry_filters_commands_by_surface() {

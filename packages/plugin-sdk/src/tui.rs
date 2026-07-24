@@ -156,6 +156,50 @@ pub trait PluginTuiHost: Send + Sync {
     }
 }
 
+/// Text returned by a plugin-owned TUI surface.
+///
+/// Legacy string values deserialize as plain text. Rich text is opt-in through the formatted
+/// object shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum PluginTuiText {
+    /// Backward-compatible untyped text, interpreted literally.
+    Plain(String),
+    /// Explicitly formatted text.
+    Formatted {
+        /// Text content.
+        text: String,
+        /// Renderer-neutral format.
+        #[serde(default)]
+        format: bcode_command::CommandTextFormat,
+    },
+}
+
+impl PluginTuiText {
+    /// Split this value into text and its explicit renderer-neutral format.
+    #[must_use]
+    pub fn into_parts(self) -> (String, bcode_command::CommandTextFormat) {
+        match self {
+            Self::Plain(text) => (text, bcode_command::CommandTextFormat::PlainText),
+            Self::Formatted { text, format } => (text, format),
+        }
+    }
+}
+
+/// Typed outcome returned when a plugin-owned TUI surface closes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginTuiSurfaceOutcome {
+    /// Optional host status text.
+    #[serde(default)]
+    pub status: Option<String>,
+    /// Optional transcript text. Legacy strings remain plain text.
+    #[serde(default)]
+    pub append_text: Option<PluginTuiText>,
+    /// Optional working directory to attach to the active session.
+    #[serde(default)]
+    pub set_session_working_directory: Option<String>,
+}
+
 /// Actions a native TUI surface can return to the host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginTuiAction {

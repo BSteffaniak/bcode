@@ -438,6 +438,60 @@ mod tests {
     }
 
     #[test]
+    fn removing_pending_entry_removes_its_cached_rows() {
+        let mut cache = TranscriptLayoutCache::default();
+        cache.sync(TranscriptLayoutSpec {
+            width: 80,
+            fingerprint: TranscriptLayoutFingerprint::new("with-pending".to_owned()),
+            structural_fingerprint: TranscriptLayoutFingerprint::new("structure-with".to_owned()),
+            transcript_len: 1,
+            pending_len: 1,
+            transcript_signature: |_| TranscriptLayoutSignature::new("item".to_owned()),
+            transcript_rows: |_| vec![Line::from("committed")],
+            transcript_invocation_id: |_| None,
+            pending_signature: |_| TranscriptLayoutSignature::new("pending".to_owned()),
+            pending_rows: |_| vec![Line::from("pending-one"), Line::from("pending-two")],
+            history_banner_signature: || None,
+            history_banner_rows: Vec::new,
+            reset: || false,
+        });
+        assert_eq!(cache.total_rows(), 3);
+
+        cache.sync(TranscriptLayoutSpec {
+            width: 80,
+            fingerprint: TranscriptLayoutFingerprint::new("without-pending".to_owned()),
+            structural_fingerprint: TranscriptLayoutFingerprint::new(
+                "structure-without".to_owned(),
+            ),
+            transcript_len: 1,
+            pending_len: 0,
+            transcript_signature: |_| TranscriptLayoutSignature::new("item".to_owned()),
+            transcript_rows: |_| vec![Line::from("committed")],
+            transcript_invocation_id: |_| None,
+            pending_signature: |_| unreachable!("no pending entries"),
+            pending_rows: |_| unreachable!("no pending entries"),
+            history_banner_signature: || None,
+            history_banner_rows: Vec::new,
+            reset: || false,
+        });
+
+        assert_eq!(cache.total_rows(), 1);
+        assert_eq!(
+            cache
+                .visible_lines_from_top(0, 10)
+                .into_iter()
+                .filter_map(|visible| cache.line(visible))
+                .map(|line| line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_str())
+                    .collect::<String>())
+                .collect::<Vec<_>>(),
+            ["committed"]
+        );
+    }
+
+    #[test]
     fn first_entry_navigation_crosses_indexed_sections() {
         let mut cache = TranscriptLayoutCache::default();
         cache.sync(TranscriptLayoutSpec {

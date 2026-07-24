@@ -248,10 +248,11 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
 
 #[cfg(test)]
 #[test]
-fn local_plain_and_markdown_system_notes_keep_distinct_formats() {
+fn local_plain_markdown_and_json_system_notes_keep_distinct_formats() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
     app.push_system_plain("* literal".to_owned());
     app.push_system_markdown("* rendered".to_owned());
+    app.push_system_json(r#"{"value":1}"#.to_owned());
 
     assert_eq!(
         app.transcript()[0].text_format(),
@@ -260,6 +261,10 @@ fn local_plain_and_markdown_system_notes_keep_distinct_formats() {
     assert_eq!(
         app.transcript()[1].text_format(),
         bcode_session_view_models::TextFormat::Markdown
+    );
+    assert_eq!(
+        app.transcript()[2].text_format(),
+        bcode_session_view_models::TextFormat::Json
     );
 }
 
@@ -1183,6 +1188,36 @@ fn display_role_suffix_remains_plain_title_chrome() {
 
 #[cfg(test)]
 #[test]
+fn assistant_and_reasoning_keep_markdown_body_and_streaming_chrome() {
+    let assistant = TranscriptItem::with_identity(
+        "Assistant",
+        "**bold**".to_owned(),
+        true,
+        TextFormat::Markdown,
+        TranscriptItemKind::AssistantMessage,
+    );
+    let reasoning = TranscriptItem::with_identity(
+        "Reasoning summary",
+        "- step".to_owned(),
+        true,
+        TextFormat::Markdown,
+        TranscriptItemKind::ReasoningMessage,
+    );
+    let assistant_rows =
+        transcript_item_rows(&[assistant], 0, 30, None, TuiDiffViewerConfig::default());
+    let reasoning_rows =
+        transcript_item_rows(&[reasoning], 0, 30, None, TuiDiffViewerConfig::default());
+    let assistant_text = visible_rows_snapshot(&assistant_rows);
+    let reasoning_text = visible_rows_snapshot(&reasoning_rows);
+
+    assert!(assistant_text.contains("00 │ Bcode …"));
+    assert!(assistant_text.contains("01 │   bold"));
+    assert!(reasoning_text.contains("00 │ Reasoning …"));
+    assert!(reasoning_text.contains("01 │   •  step"));
+}
+
+#[cfg(test)]
+#[test]
 fn shared_system_items_render_markdown_and_plain_text_distinctly() {
     let markdown =
         TranscriptItem::with_format("System", "* value".to_owned(), TextFormat::Markdown);
@@ -1272,6 +1307,21 @@ fn tui_help_markdown_renders_at_normal_and_constrained_widths() {
         snapshot.push('\n');
     }
     insta::assert_snapshot!("tui_help_markdown_width_80_24", snapshot.trim_end());
+}
+
+#[cfg(test)]
+#[test]
+fn pending_signature_captures_width_state_and_text() {
+    let mut pending = PendingSubmission::new("# heading".to_owned());
+    let sending = pending_submission_signature(&pending, 30);
+    pending.mark_queued(Some(2));
+
+    assert_ne!(sending, pending_submission_signature(&pending, 30));
+    assert_ne!(sending, pending_submission_signature(&pending, 20));
+    assert_ne!(
+        sending,
+        pending_submission_signature(&PendingSubmission::new("different".to_owned()), 30)
+    );
 }
 
 #[cfg(test)]

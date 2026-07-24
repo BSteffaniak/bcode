@@ -214,7 +214,11 @@ async fn apply_command_effect<W: Write>(
 ) -> Result<(), TuiError> {
     match effect {
         CommandEffect::Status { message } => chat.app.set_status(message),
-        CommandEffect::AppendText { text } => chat.app.push_system_plain(text),
+        CommandEffect::AppendText { text, format } => match format {
+            bcode_command::CommandTextFormat::PlainText => chat.app.push_system_plain(text),
+            bcode_command::CommandTextFormat::Markdown => chat.app.push_system_markdown(text),
+            bcode_command::CommandTextFormat::Json => chat.app.push_system_json(text),
+        },
         CommandEffect::ToggleSurface { surface_id } => toggle_surface(chat, &surface_id),
         CommandEffect::OpenPluginSurface {
             surface_kind,
@@ -350,23 +354,29 @@ fn apply_plugin_surface_outcome(chat: &mut ActiveChat, outcome: Option<serde_jso
     let Some(outcome) = outcome else {
         return;
     };
-    if let Some(status) = outcome.get("status").and_then(serde_json::Value::as_str) {
-        chat.app.set_status(status.to_string());
+    let Ok(outcome) =
+        serde_json::from_value::<bcode_plugin_sdk::tui::PluginTuiSurfaceOutcome>(outcome)
+    else {
+        chat.app
+            .set_status("plugin surface returned an invalid outcome".to_owned());
+        return;
+    };
+    if let Some(status) = outcome.status {
+        chat.app.set_status(status);
     }
-    if let Some(text) = outcome
-        .get("append_text")
-        .and_then(serde_json::Value::as_str)
-    {
-        chat.app.push_system_plain(text.to_string());
+    if let Some(text) = outcome.append_text {
+        let (text, format) = text.into_parts();
+        match format {
+            bcode_command::CommandTextFormat::PlainText => chat.app.push_system_plain(text),
+            bcode_command::CommandTextFormat::Markdown => chat.app.push_system_markdown(text),
+            bcode_command::CommandTextFormat::Json => chat.app.push_system_json(text),
+        }
     }
-    if let Some(path) = outcome
-        .get("set_session_working_directory")
-        .and_then(serde_json::Value::as_str)
-    {
+    if let Some(path) = outcome.set_session_working_directory {
         if let Some(session_id) = chat.app.session_id() {
             chat.start_effect(TuiEffect::AttachWorktree {
                 session_id,
-                path: std::path::PathBuf::from(path),
+                path: std::path::PathBuf::from(&path),
             });
             chat.app.set_status(format!("attaching worktree {path}"));
         } else {
@@ -490,6 +500,33 @@ fn show_bmux_help(chat: &mut ActiveChat) {
 #[cfg(test)]
 mod tests {
     use super::insert_surface_session_id;
+
+    #[test]
+    fn plugin_surface_outcome_supports_legacy_and_formatted_text() {
+        let legacy = serde_json::from_value::<bcode_plugin_sdk::tui::PluginTuiSurfaceOutcome>(
+            serde_json::json!({"append_text": "* literal"}),
+        )
+        .expect("legacy surface outcome");
+        let (legacy_text, legacy_format) = legacy.append_text.expect("legacy text").into_parts();
+        assert_eq!(legacy_text, "* literal");
+        assert_eq!(legacy_format, bcode_command::CommandTextFormat::PlainText);
+
+        for (format, expected) in [
+            ("markdown", bcode_command::CommandTextFormat::Markdown),
+            ("json", bcode_command::CommandTextFormat::Json),
+        ] {
+            let outcome = serde_json::from_value::<bcode_plugin_sdk::tui::PluginTuiSurfaceOutcome>(
+                serde_json::json!({
+                    "append_text": {"text": "* value", "format": format}
+                }),
+            )
+            .expect("formatted surface outcome");
+            assert_eq!(
+                outcome.append_text.expect("formatted text").into_parts(),
+                ("* value".to_owned(), expected)
+            );
+        }
+    }
 
     #[test]
     fn plugin_surface_options_include_active_session_id() {

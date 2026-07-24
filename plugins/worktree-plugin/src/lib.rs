@@ -213,6 +213,7 @@ fn list_worktrees_command(request: &InvokeCommandRequest) -> ServiceResponse {
                 updated_thinking: None,
                 effects: vec![CommandEffect::AppendText {
                     text: lines.join("\n"),
+                    format: bcode_command::CommandTextFormat::Markdown,
                 }],
             })
         }

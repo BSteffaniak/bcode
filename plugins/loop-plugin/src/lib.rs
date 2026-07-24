@@ -253,6 +253,7 @@ fn status_response(message: &str) -> InvokeCommandResponse {
         updated_thinking: None,
         effects: vec![CommandEffect::AppendText {
             text: message.to_owned(),
+            format: bcode_command::CommandTextFormat::PlainText,
         }],
     }
 }
