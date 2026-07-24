@@ -5308,7 +5308,7 @@ mod tests {
         assert!(matches!(
             prepared.outcome,
             Some(SessionOpenTerminalOutcome::RepairRequired { ref reason })
-                if reason.contains("unsupported historical session event kind")
+                if reason.contains("unsupported historical session event schema")
         ));
         assert_eq!(manager.active_session_migration_count().await, 0);
         assert!(

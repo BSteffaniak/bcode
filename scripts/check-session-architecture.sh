@@ -194,10 +194,17 @@ if ! rg -q 'CURRENT_WRITER_EPOCH: u32 = 5' packages/session-migration/src/regist
   || ! rg -q 'session_compatibility_state' packages/session/src/db.rs \
   || ! rg -q 'CompatibilityDegraded' packages/session/src/db.rs \
   || ! rg -q 'epoch_three_unknown_history_fails_writable_migration_atomically' packages/session/src/db.rs \
+  || ! rg -q 'schema_28_incident_distribution_migrates_without_unresolved_issues' packages/session/src/db.rs \
   || ! rg -q 'schema_28_historical_events_normalize_to_current_writable_storage' packages/session/src/db.rs \
   || ! rg -q 'broken_epoch_four_compatibility_state_is_rebuilt_to_writable_epoch_five' packages/session/src/db.rs \
   || ! rg -q 'unknown_legacy_history_preparation_fails_closed' packages/session/src/lib.rs; then
   echo "Session compatibility-projection violation: epoch-5 migration must normalize known history, reject unresolved history atomically, and retain bounded compatibility reporting." >&2
+  violations=1
+fi
+
+if ! rg -q 'historical_codec_never_applies_schema_28_rules_to_other_schemas' packages/session-migration/src/historical.rs \
+  || ! rg -q 'schema_28_store_fixture_classifies_affected_historical_events' packages/session-migration/src/historical.rs; then
+  echo "Session historical-codec violation: released schema rules and exact fixture classifications must remain explicit." >&2
   violations=1
 fi
 

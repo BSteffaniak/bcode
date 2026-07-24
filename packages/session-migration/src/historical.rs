@@ -83,6 +83,12 @@ pub enum HistoricalSessionEventError {
     /// The durable JSON envelope is malformed.
     #[error("historical session event JSON is malformed: {0}")]
     Json(#[from] serde_json::Error),
+    /// The durable schema is not a released historical schema supported by this build.
+    #[error("unsupported historical session event schema {schema_version}")]
+    UnsupportedSchema {
+        /// Durable schema declared by the source event.
+        schema_version: u16,
+    },
     /// The event kind is not a released historical shape supported by this build.
     #[error("unsupported historical session event kind {event_kind:?} at schema {schema_version}")]
     UnsupportedEventKind {
@@ -296,6 +302,11 @@ pub fn decode_for_migration(
     }
 
     let envelope = serde_json::from_str::<HistoricalEnvelope>(payload)?;
+    if envelope.schema_version != 28 {
+        return Err(HistoricalSessionEventError::UnsupportedSchema {
+            schema_version: envelope.schema_version,
+        });
+    }
     let (event_kind, event_payload) = source_kind(&envelope)?;
     let metadata = HistoricalEventMetadata {
         source_schema: envelope.schema_version,
@@ -549,6 +560,17 @@ mod tests {
         assert_eq!(converted.get("28:tool_call_finished"), Some(&1));
         assert_eq!(converted.get("28:context_usage_observed"), Some(&1));
         assert_eq!(retired.get("28:tool_invocation_stream"), Some(&1));
+    }
+
+    #[test]
+    fn historical_codec_never_applies_schema_28_rules_to_other_schemas() {
+        let payload = format!(
+            r#"{{"schema_version":27,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"tool_call_finished":{{"tool_call_id":"call","result":"done"}}}}}}"#
+        );
+        assert!(matches!(
+            decode_for_migration(&payload, reject_current),
+            Err(HistoricalSessionEventError::UnsupportedSchema { schema_version: 27 })
+        ));
     }
 
     #[test]

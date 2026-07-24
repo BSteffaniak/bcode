@@ -5156,6 +5156,149 @@ mod tests {
         }
     }
 
+    async fn insert_schema_28_incident_payload(
+        db: &SessionDb,
+        sequence: u64,
+        mut value: serde_json::Value,
+        event_type: &str,
+    ) {
+        value["sequence"] = serde_json::json!(sequence);
+        value["timestamp_ms"] = serde_json::json!(sequence.saturating_add(1));
+        insert_raw_payload(db, sequence, event_type, 28, &value.to_string()).await;
+    }
+
+    async fn insert_schema_28_incident_distribution_fixture(db: &SessionDb) {
+        let fixture =
+            include_str!("../../session-migration/fixtures/stores/schema-28-tool-context.jsonl")
+                .lines()
+                .map(|payload| {
+                    serde_json::from_str::<serde_json::Value>(payload).expect("fixture JSON")
+                })
+                .collect::<Vec<_>>();
+        let mut sequence = 0_u64;
+        insert_schema_28_incident_payload(db, sequence, fixture[0].clone(), "session_created")
+            .await;
+        sequence = sequence.saturating_add(1);
+        for index in 0..31_u64 {
+            let mut value = fixture[1].clone();
+            value["kind"]["tool_call_requested"]["tool_call_id"] =
+                serde_json::json!(format!("call-{index}"));
+            insert_schema_28_incident_payload(db, sequence, value, "tool_call_requested").await;
+            sequence = sequence.saturating_add(1);
+        }
+        for index in 0..22_u64 {
+            let mut value = fixture[2].clone();
+            value["kind"]["tool_invocation_stream"]["event"]["status"]["tool_call_id"] =
+                serde_json::json!(format!("call-{index}"));
+            value["kind"]["tool_invocation_stream"]["event"]["status"]["sequence"] =
+                serde_json::json!(index);
+            insert_schema_28_incident_payload(db, sequence, value, "tool_invocation_stream").await;
+            sequence = sequence.saturating_add(1);
+        }
+        for index in 0..31_u64 {
+            let mut value = fixture[3].clone();
+            let terminal_kind = concat!("tool_call_", "finished");
+            value["kind"][terminal_kind]["tool_call_id"] =
+                serde_json::json!(format!("call-{index}"));
+            insert_schema_28_incident_payload(db, sequence, value, terminal_kind).await;
+            sequence = sequence.saturating_add(1);
+        }
+        for index in 0..14_u64 {
+            let mut value = fixture[4].clone();
+            let snapshot = &mut value["kind"]["context_usage_observed"]["snapshot"];
+            snapshot["context_through_sequence"] = serde_json::json!(sequence.saturating_sub(1));
+            snapshot["request_id"] = serde_json::json!(format!("request-{index}"));
+            snapshot["model_turn_id"] = serde_json::json!(format!("model-turn-{index}"));
+            snapshot["turn_id"] = serde_json::json!(format!("provider-turn-{index}"));
+            snapshot["request_fingerprint"] = serde_json::json!(format!("fingerprint-{index}"));
+            snapshot["round"] = serde_json::json!(index);
+            insert_schema_28_incident_payload(db, sequence, value, "context_usage_observed").await;
+            sequence = sequence.saturating_add(1);
+        }
+        assert_eq!(sequence, 99);
+    }
+
+    #[tokio::test]
+    async fn schema_28_incident_distribution_migrates_without_unresolved_issues() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id: SessionId = "00000000-0000-0000-0000-000000000001"
+            .parse()
+            .expect("fixture session ID");
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open fixture DB");
+        insert_schema_28_incident_distribution_fixture(&db).await;
+        db.database()
+            .update("session_storage_contract")
+            .value("writer_epoch", DatabaseValue::Int64(2))
+            .where_eq(
+                "contract_id",
+                DatabaseValue::Int32(SESSION_STORAGE_CONTRACT_ID),
+            )
+            .execute(db.database())
+            .await
+            .expect("mark epoch two");
+        drop(db);
+
+        let maintenance =
+            crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
+                .expect("maintenance guard");
+        let write = crate::lease::acquire_maintenance_session_write_lock(
+            &maintenance,
+            temp_dir.path(),
+            session_id,
+        )
+        .expect("write guard");
+        let metrics = MetricsRegistry::in_memory();
+        let migrated = SessionDb::migrate_turso_in_root_observed(
+            session_id,
+            temp_dir.path(),
+            &maintenance,
+            &write,
+            metrics.clone(),
+            None,
+        )
+        .await
+        .expect("incident distribution should migrate");
+        assert_eq!(
+            migrated.all_events_strict().await.expect("history").len(),
+            99
+        );
+        assert_eq!(
+            migrated
+                .session_compatibility_status()
+                .await
+                .expect("compatibility status"),
+            SessionCompatibilityStatus::Compatible { checkpoint: 98 }
+        );
+        migrated
+            .validate_write_readiness()
+            .await
+            .expect("incident distribution should be writable");
+        let report = metrics.report();
+        assert_eq!(
+            report
+                .snapshot
+                .counters
+                .get("session.migration.converted_tool_call_finished_events_total"),
+            Some(&31)
+        );
+        assert_eq!(
+            report
+                .snapshot
+                .counters
+                .get("session.migration.retired_tool_stream_events_total"),
+            Some(&22)
+        );
+        assert_eq!(
+            report
+                .snapshot
+                .counters
+                .get("session.migration.converted_context_usage_observed_events_total"),
+            Some(&14)
+        );
+    }
+
     #[tokio::test]
     async fn every_supported_source_epoch_migrates_to_current_writable_storage() {
         for source_writer_epoch in 1..CURRENT_SESSION_STORAGE_WRITER_EPOCH {
