@@ -297,13 +297,14 @@ fn render_header(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
     } else {
         let (hunk, hunk_total) = app.hunk_position();
         format!(
-            " bcode review  {}  {}  File {}  Surface {}  Hunk {}/{}{}{}  viewed {}/{}  {readiness}  +{} -{} ",
+            " bcode review  {}  {}  File {}  Surface {}  Hunk {}/{}  Row {}{}{}  viewed {}/{}  {readiness}  +{} -{} ",
             app.review.title,
             file_label,
             file_position,
             surface_kind,
             hunk,
             hunk_total,
+            app.selected_diff_line.saturating_add(1),
             draft_label,
             thread_label,
             viewed_files,
@@ -694,12 +695,16 @@ fn render_files(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             continue;
         };
         if let Some(file) = app.review.files.get(index) {
+            let source_label = app.review.file_source_label(index);
             render_file_row(
                 file,
-                index == app.selected_file,
-                app.file_viewed(index),
-                app.draft_comment_count_for_file(index),
-                app.open_thread_count_for_file(index),
+                FileRowState {
+                    source_label: source_label.as_deref(),
+                    selected: index == app.selected_file,
+                    viewed: app.file_viewed(index),
+                    draft_comments: app.draft_comment_count_for_file(index),
+                    open_threads: app.open_thread_count_for_file(index),
+                },
                 line_area,
                 frame,
             );
@@ -941,15 +946,10 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
             } else {
                 Style::new().fg(Color::White).bg(Color::Black)
             };
-            let marker = match (thread.resolved, thread.session_id.is_some()) {
-                (true, true) => "✓🤖",
-                (true, false) => "✓",
-                (false, true) => "🤖💬",
-                (false, false) => "💬",
-            };
+            let marker = if thread.resolved { "✓" } else { "●" };
             let line_label = thread.line_label();
             let body = thread.latest_body.lines().next().unwrap_or_default();
-            let status = if thread.resolved { "resolved" } else { "open" };
+            let status = if thread.resolved { "RESOLVED" } else { "OPEN" };
             let kind = review_thread_kind_label(thread.thread_kind);
             let severity = review_thread_severity_label(thread.severity);
             let path_label = thread.anchor.scope_label();
@@ -964,8 +964,13 @@ fn render_threads(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>) {
                         format!("  🤖 {}{warning}", state.live_state_label())
                     });
             let suggestion_status = suggestion_sidebar_label(thread);
+            let linked = if thread.session_id.is_some() {
+                " [AI]"
+            } else {
+                ""
+            };
             let text = format!(
-                " {marker} {status} {kind}/{severity} {path_label} {line_label} x{} {suggestion_status} {body}{agent_status}",
+                " {marker} {status:<8} {kind}/{severity} {path_label}:{line_label} d:{} {suggestion_status}{linked} {body}{agent_status}",
                 thread.draft_count
             );
             frame.write_line_with_fallback_style(
@@ -1157,15 +1162,23 @@ fn render_thread_toolbar(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
     );
 }
 
-fn render_file_row(
-    file: &ReviewFile,
+#[derive(Clone, Copy)]
+struct FileRowState<'a> {
+    source_label: Option<&'a str>,
     selected: bool,
     viewed: bool,
     draft_comments: usize,
     open_threads: usize,
-    area: Rect,
-    frame: &mut Frame<'_>,
-) {
+}
+
+fn render_file_row(file: &ReviewFile, state: FileRowState<'_>, area: Rect, frame: &mut Frame<'_>) {
+    let FileRowState {
+        source_label,
+        selected,
+        viewed,
+        draft_comments,
+        open_threads,
+    } = state;
     let style = if selected {
         Style::new().fg(Color::Black).bg(Color::White)
     } else if viewed {
@@ -1188,9 +1201,11 @@ fn render_file_row(
             .bg(style.bg.unwrap_or(Color::Black)),
     };
     let counts = file_row_counts(file, draft_comments, open_threads);
+    let source = source_label.map_or_else(String::new, |label| format!(" [{label}]"));
     let viewed_marker = if viewed { "✓ " } else { "  " };
     let path_width = usize::from(area.width)
         .saturating_sub(counts.len())
+        .saturating_sub(source.len())
         .saturating_sub(5);
     let path = truncate_to_display_width(file.display_path(), path_width);
     let line = Line::from_spans(vec![
@@ -1198,6 +1213,12 @@ fn render_file_row(
         Span::styled(viewed_marker, style),
         Span::styled(file.status.label(), status_style),
         Span::raw(" "),
+        Span::styled(
+            source,
+            Style::new()
+                .fg(Color::BrightBlack)
+                .bg(style.bg.unwrap_or(Color::Black)),
+        ),
         Span::styled(path, style),
         Span::styled(
             counts,
@@ -1580,7 +1601,7 @@ fn render_inline_thread_header(
         .fg(Color::Yellow)
         .bg(Color::Rgb(30, 28, 12))
         .add_modifier(Modifier::BOLD);
-    let status = if resolved { "resolved" } else { "open" };
+    let status = if resolved { "RESOLVED" } else { "OPEN" };
     let status_style = if resolved {
         Style::new().fg(Color::Green).bg(Color::Rgb(30, 28, 12))
     } else {
@@ -1590,7 +1611,7 @@ fn render_inline_thread_header(
         line: Line::from_spans(vec![
             Span::styled(
                 format!(
-                    "   {}─ draft thread on rows {}-{} ({comment_count} comment{}) ",
+                    "   {}─ review thread · rows {}-{} · {comment_count} comment{} ",
                     if collapsed { "▸" } else { "▾" },
                     anchor.source_row,
                     anchor.end_source_row(),
@@ -3320,6 +3341,46 @@ mod tests {
     use crate::code_review_tui::ReviewFileStatus;
 
     use super::*;
+
+    #[test]
+    fn thread_sidebar_labels_keep_lifecycle_states_explicit() {
+        let anchor = crate::code_review_tui::ReviewCommentAnchor {
+            file_index: 0,
+            path: "src/lib.rs".to_string(),
+            diff_row: 2,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(2),
+            old_start: None,
+            old_end: None,
+            new_start: Some(2),
+            new_end: Some(2),
+            line_kind: crate::code_review_tui::ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        let thread = crate::code_review_tui::ReviewThreadSummary {
+            anchor,
+            draft_count: 1,
+            latest_body: "Review this".to_string(),
+            session_id: Some("session-1".to_string()),
+            resolved: true,
+            thread_kind: bcode_code_review_models::ReviewThreadKind::Finding,
+            severity: bcode_code_review_models::ReviewThreadSeverity::Warning,
+            pending_suggestion_count: 1,
+            refining_suggestion_count: 0,
+            accepted_suggestion_count: 1,
+            rejected_suggestion_count: 1,
+        };
+
+        assert_eq!(
+            suggestion_sidebar_label(&thread),
+            "[suggest:1/accepted:1/rejected:1]"
+        );
+        assert!(thread.resolved);
+        assert!(thread.session_id.is_some());
+    }
 
     #[test]
     fn expanded_context_rows_render_with_runtime_syntax_highlighting() {

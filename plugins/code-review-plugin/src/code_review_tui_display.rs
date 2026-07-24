@@ -41,7 +41,7 @@ impl ReviewDisplayBuilder {
         let can_highlight =
             self.syntax_highlighting && syntax_highlighter.can_highlight(syntax_hint);
 
-        for hunk in &file.hunks {
+        for (hunk_index, hunk) in file.hunks.iter().enumerate() {
             let heading = hunk.heading.as_deref().unwrap_or_default();
             rows.push(ReviewDisplayRow {
                 source: ReviewDisplayRowSource::HunkHeader,
@@ -49,8 +49,20 @@ impl ReviewDisplayBuilder {
                 new_line: None,
                 segments: vec![ReviewDisplaySegment::new(
                     format!(
-                        "@@ -{},{} +{},{} @@ {}",
-                        hunk.old_start, hunk.old_count, hunk.new_start, hunk.new_count, heading
+                        "@@ hunk {}/{} · old {}..{} · new {}..{}{} @@",
+                        hunk_index.saturating_add(1),
+                        file.hunks.len(),
+                        hunk.old_start,
+                        hunk.old_start
+                            .saturating_add(hunk.old_count.saturating_sub(1)),
+                        hunk.new_start,
+                        hunk.new_start
+                            .saturating_add(hunk.new_count.saturating_sub(1)),
+                        if heading.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" · {heading}")
+                        }
                     ),
                     vec![ReviewDisplayTextRole::HunkHeader],
                 )],
@@ -275,6 +287,10 @@ mod tests {
 
         assert_eq!(display.rows.len(), 2);
         assert_eq!(display.rows[0].source, ReviewDisplayRowSource::HunkHeader);
+        assert_eq!(
+            display.rows[0].segments[0].text,
+            "@@ hunk 1/1 · old 1..1 · new 1..2 · fn demo @@"
+        );
         assert_eq!(display.rows[1].source, ReviewDisplayRowSource::Added);
         assert!(
             display.rows[1]

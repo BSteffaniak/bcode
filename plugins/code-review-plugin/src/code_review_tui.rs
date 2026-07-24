@@ -2523,6 +2523,19 @@ impl ReviewSummary {
         })
     }
 
+    /// Return a compact source label for a review file/surface.
+    #[must_use]
+    pub fn file_source_label(&self, file_index: usize) -> Option<String> {
+        let surface = self.surfaces().get(file_index)?.clone();
+        let source = self
+            .workspace
+            .as_ref()?
+            .sources
+            .iter()
+            .find(|source| source.id == surface.source_id)?;
+        Some(source_kind_short_label_for_ui(&source.kind).to_string())
+    }
+
     /// Return normalized surfaces visible for this review.
     #[must_use]
     pub fn surfaces(&self) -> Vec<ReviewSurface> {
@@ -3130,6 +3143,21 @@ impl LocalReviewThread {
     #[must_use]
     pub fn latest_body(&self) -> Option<&str> {
         self.comments.last().map(|comment| comment.body.as_str())
+    }
+}
+
+const fn source_kind_short_label_for_ui(kind: &ReviewSourceKind) -> &'static str {
+    match kind {
+        ReviewSourceKind::WorkingTreeUnstaged => "unstaged",
+        ReviewSourceKind::IndexStaged => "staged",
+        ReviewSourceKind::WorkingTreeAndIndex => "worktree",
+        ReviewSourceKind::LastCommit => "last",
+        ReviewSourceKind::Commit { .. } => "commit",
+        ReviewSourceKind::CommitRange { .. } => "range",
+        ReviewSourceKind::BranchCompare { .. } => "branch",
+        ReviewSourceKind::File { .. } => "file",
+        ReviewSourceKind::FileRange { .. } => "file-range",
+        ReviewSourceKind::Repository => "repo",
     }
 }
 
@@ -11972,6 +12000,49 @@ mod tests {
         assert_eq!(restored[2].status, ReviewSuggestionStatus::Accepted);
         assert_eq!(restored[3].status, ReviewSuggestionStatus::Rejected);
         assert!(app.pending_suggestion_saves.is_empty());
+    }
+
+    #[test]
+    fn file_source_label_distinguishes_multi_source_surfaces() {
+        let mut app = sample_app();
+        app.workspace.sources = vec![
+            ReviewSource {
+                id: "source-a".to_string(),
+                kind: ReviewSourceKind::WorkingTreeUnstaged,
+                label: "Unstaged".to_string(),
+                included: true,
+            },
+            ReviewSource {
+                id: "source-b".to_string(),
+                kind: ReviewSourceKind::BranchCompare {
+                    base_branch: "main".to_string(),
+                    head_branch: "feature".to_string(),
+                    merge_base: true,
+                },
+                label: "Feature".to_string(),
+                included: true,
+            },
+        ];
+        app.review.workspace = Some(app.workspace.clone());
+        app.review.surfaces = vec![
+            ReviewSurface {
+                id: "surface-a".to_string(),
+                source_id: "source-a".to_string(),
+                path: "a.rs".to_string(),
+                kind: ReviewSurfaceKind::Diff,
+                file: None,
+            },
+            ReviewSurface {
+                id: "surface-b".to_string(),
+                source_id: "source-b".to_string(),
+                path: "b.rs".to_string(),
+                kind: ReviewSurfaceKind::Diff,
+                file: None,
+            },
+        ];
+
+        assert_eq!(app.review.file_source_label(0).as_deref(), Some("unstaged"));
+        assert_eq!(app.review.file_source_label(1).as_deref(), Some("branch"));
     }
 
     #[test]

@@ -1209,6 +1209,63 @@ mod tests {
     use bcode_code_review_models::{ReviewThreadKind, ReviewThreadSeverity};
 
     #[test]
+    fn large_review_document_build_stays_within_baseline() {
+        use std::time::{Duration, Instant};
+
+        let hunks = (0_u32..500)
+            .map(|hunk_index| ReviewHunk {
+                old_start: hunk_index.saturating_mul(20).saturating_add(1),
+                old_count: 10,
+                new_start: hunk_index.saturating_mul(20).saturating_add(1),
+                new_count: 10,
+                heading: Some(format!("section_{hunk_index}")),
+                lines: (0_u32..10)
+                    .map(|line_index| ReviewLine {
+                        kind: if line_index % 2 == 0 {
+                            ReviewLineKind::Added
+                        } else {
+                            ReviewLineKind::Context
+                        },
+                        old_line: Some(
+                            hunk_index
+                                .saturating_mul(20)
+                                .saturating_add(line_index)
+                                .saturating_add(1),
+                        ),
+                        new_line: Some(
+                            hunk_index
+                                .saturating_mul(20)
+                                .saturating_add(line_index)
+                                .saturating_add(1),
+                        ),
+                        content: format!("let value_{hunk_index}_{line_index} = {line_index};"),
+                    })
+                    .collect(),
+            })
+            .collect();
+        let file = ReviewFile {
+            old_path: Some("src/large.rs".to_string()),
+            new_path: Some("src/large.rs".to_string()),
+            status: ReviewFileStatus::Modified,
+            additions: 2_500,
+            deletions: 0,
+            hunks,
+            is_binary: false,
+        };
+
+        let start = Instant::now();
+        let document = ReviewViewDocument::build_diff_file(0, &file, false, None, &BTreeMap::new());
+        let elapsed = start.elapsed();
+
+        assert_eq!(document.hunk_targets().len(), 500);
+        assert!(document.rows.len() >= 5_500);
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "large review document baseline exceeded: {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn diff_file_document_maps_visual_rows_to_semantic_targets() {
         let file = test_file();
 
