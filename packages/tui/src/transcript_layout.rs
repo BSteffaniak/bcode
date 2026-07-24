@@ -375,6 +375,55 @@ mod tests {
     }
 
     #[test]
+    fn width_change_rebuilds_cached_rows_at_new_height() {
+        let mut cache = TranscriptLayoutCache::default();
+        let rows_for_width = |width: u16| {
+            let row_count = if width >= 40 { 1 } else { 3 };
+            move |_| {
+                (0..row_count)
+                    .map(|row| Line::from(format!("row-{row}")))
+                    .collect::<Vec<_>>()
+            }
+        };
+        cache.sync(TranscriptLayoutSpec {
+            width: 80,
+            fingerprint: TranscriptLayoutFingerprint::new("wide".to_owned()),
+            structural_fingerprint: TranscriptLayoutFingerprint::new("wide-structure".to_owned()),
+            transcript_len: 1,
+            pending_len: 0,
+            transcript_signature: |_| TranscriptLayoutSignature::new("item-wide".to_owned()),
+            transcript_rows: rows_for_width(80),
+            transcript_invocation_id: |_| None,
+            pending_signature: |_| unreachable!("no pending"),
+            pending_rows: |_| unreachable!("no pending"),
+            history_banner_signature: || None,
+            history_banner_rows: Vec::new,
+            reset: || false,
+        });
+        assert_eq!(cache.total_rows(), 1);
+
+        let stats = cache.sync(TranscriptLayoutSpec {
+            width: 20,
+            fingerprint: TranscriptLayoutFingerprint::new("narrow".to_owned()),
+            structural_fingerprint: TranscriptLayoutFingerprint::new("narrow-structure".to_owned()),
+            transcript_len: 1,
+            pending_len: 0,
+            transcript_signature: |_| TranscriptLayoutSignature::new("item-narrow".to_owned()),
+            transcript_rows: rows_for_width(20),
+            transcript_invocation_id: |_| None,
+            pending_signature: |_| unreachable!("no pending"),
+            pending_rows: |_| unreachable!("no pending"),
+            history_banner_signature: || None,
+            history_banner_rows: Vec::new,
+            reset: || false,
+        });
+
+        assert_eq!(stats.invalidation, TranscriptLayoutInvalidation::Width);
+        assert_eq!(stats.rows_regenerated, 3);
+        assert_eq!(cache.total_rows(), 3);
+    }
+
+    #[test]
     fn sync_stats_report_scans_and_rebuilds() {
         let mut cache = TranscriptLayoutCache::default();
 

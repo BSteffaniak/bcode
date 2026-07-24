@@ -1051,6 +1051,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reconstructed_user_and_system_messages_preserve_formats() {
+        let session_id = bcode_session_models::SessionId::new();
+        let events = [
+            SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "# User".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            },
+            SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 2,
+                timestamp_ms: 2,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::SystemMessage {
+                    text: "* System".to_owned(),
+                },
+            },
+        ];
+
+        let items = transcript_items_from_events_with_reasoning(&events, false);
+        assert_eq!(items.len(), 2);
+        assert!(
+            items
+                .iter()
+                .all(|item| item.text_format() == TextFormat::Markdown)
+        );
+    }
+
+    #[test]
     fn shared_message_projection_preserves_all_text_formats() {
         for format in [
             TextFormat::Markdown,
