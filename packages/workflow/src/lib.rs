@@ -16,17 +16,19 @@ use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::sync::{Notify, mpsc};
-use tokio::task::JoinSet;
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::task::{JoinHandle, JoinSet};
 
 /// Boxed asynchronous workflow operation.
 pub type StepFuture<T> = Pin<Box<dyn Future<Output = Result<T, WorkflowError>> + Send>>;
 
 type StepFn<I, O> = dyn Fn(I, StepContext) -> StepFuture<O> + Send + Sync;
+
+const DEFAULT_MAX_CONCURRENCY: usize = Semaphore::MAX_PERMITS;
 
 /// Stable workflow definition schema version.
 pub const WORKFLOW_DEFINITION_SCHEMA_VERSION: u32 = 1;
@@ -144,6 +146,15 @@ pub enum WorkflowEvent {
     StepStarted { step: String },
     /// A named step completed.
     StepCompleted { step: String },
+    /// A named step is waiting to acquire its declared resources.
+    StepWaitingForResources {
+        step: String,
+        resources: Vec<ResourceClaim>,
+    },
+    /// A named step is waiting for workflow execution capacity.
+    StepWaitingForConcurrency { step: String },
+    /// A named step failed.
+    StepFailed { step: String, message: String },
     /// A retry attempt started.
     RetryAttempt {
         step: String,
@@ -158,6 +169,395 @@ pub enum WorkflowEvent {
     },
     /// The complete workflow reached a terminal outcome.
     WorkflowFinished { outcome: WorkflowOutcome },
+}
+
+/// Current lifecycle state for one compiled workflow node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeRunState {
+    Pending,
+    Ready,
+    WaitingForConcurrency,
+    WaitingForResources,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelled,
+    TimedOut,
+    Skipped,
+}
+
+/// Incrementally maintained in-memory workflow run snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowRunSnapshot {
+    /// Current state for every compiled node.
+    pub nodes: BTreeMap<String, NodeRunState>,
+    /// Ready node identities.
+    pub ready: BTreeSet<String>,
+    /// Nodes waiting for resources.
+    pub waiting: BTreeSet<String>,
+    /// Running node identities.
+    pub running: BTreeSet<String>,
+    /// Terminal node identities.
+    pub terminal: BTreeSet<String>,
+    /// Current holder count for each resource.
+    pub resource_holders: BTreeMap<String, usize>,
+}
+
+impl WorkflowRunSnapshot {
+    fn new(plan: &WorkflowPlan) -> Self {
+        let nodes = plan
+            .dependencies
+            .iter()
+            .map(|(id, dependencies)| {
+                (
+                    id.clone(),
+                    if *dependencies == 0 {
+                        NodeRunState::Ready
+                    } else {
+                        NodeRunState::Pending
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let ready = plan
+            .dependencies
+            .iter()
+            .filter_map(|(id, dependencies)| (*dependencies == 0).then_some(id.clone()))
+            .collect();
+        Self {
+            nodes,
+            ready,
+            waiting: BTreeSet::new(),
+            running: BTreeSet::new(),
+            terminal: BTreeSet::new(),
+            resource_holders: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RunStateTracker {
+    snapshot: StdMutex<WorkflowRunSnapshot>,
+    incomplete: StdMutex<BTreeSet<String>>,
+}
+
+impl RunStateTracker {
+    fn new(plan: &WorkflowPlan) -> Self {
+        Self {
+            snapshot: StdMutex::new(WorkflowRunSnapshot::new(plan)),
+            incomplete: StdMutex::new(plan.dependencies.keys().cloned().collect()),
+        }
+    }
+
+    fn snapshot(&self) -> WorkflowRunSnapshot {
+        self.snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn transition(&self, node: &str, state: NodeRunState) {
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        snapshot.ready.remove(node);
+        snapshot.waiting.remove(node);
+        snapshot.running.remove(node);
+        snapshot.terminal.remove(node);
+        match state {
+            NodeRunState::Pending => {}
+            NodeRunState::Ready => {
+                snapshot.ready.insert(node.to_string());
+            }
+            NodeRunState::WaitingForConcurrency | NodeRunState::WaitingForResources => {
+                snapshot.waiting.insert(node.to_string());
+            }
+            NodeRunState::Running => {
+                snapshot.running.insert(node.to_string());
+            }
+            NodeRunState::Succeeded
+            | NodeRunState::Failed
+            | NodeRunState::Cancelled
+            | NodeRunState::TimedOut
+            | NodeRunState::Skipped => {
+                snapshot.terminal.insert(node.to_string());
+                self.incomplete
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .remove(node);
+            }
+        }
+        snapshot.nodes.insert(node.to_string(), state);
+    }
+
+    fn finish_incomplete(&self, outcome: WorkflowOutcome) {
+        let incomplete = std::mem::take(
+            &mut *self
+                .incomplete
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let replacement = match outcome {
+            WorkflowOutcome::Succeeded | WorkflowOutcome::Failed => NodeRunState::Skipped,
+            WorkflowOutcome::Cancelled => NodeRunState::Cancelled,
+            WorkflowOutcome::TimedOut => NodeRunState::TimedOut,
+        };
+        for node in incomplete {
+            snapshot.ready.remove(&node);
+            snapshot.waiting.remove(&node);
+            snapshot.running.remove(&node);
+            snapshot.terminal.insert(node.clone());
+            snapshot.nodes.insert(node, replacement);
+        }
+    }
+
+    fn resource_acquired(&self, resources: &[ResourceClaim]) {
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for resource in resources {
+            *snapshot
+                .resource_holders
+                .entry(resource.resource.clone())
+                .or_default() += 1;
+        }
+    }
+
+    fn resource_released(&self, resources: &[ResourceClaim]) {
+        let mut snapshot = self
+            .snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for resource in resources {
+            let remove = snapshot
+                .resource_holders
+                .get_mut(&resource.resource)
+                .is_some_and(|holders| {
+                    *holders = holders.saturating_sub(1);
+                    *holders == 0
+                });
+            if remove {
+                snapshot.resource_holders.remove(&resource.resource);
+            }
+        }
+    }
+}
+
+/// Cloneable observer for one in-process workflow run.
+#[derive(Debug, Clone)]
+pub struct WorkflowRunObserver {
+    plan: WorkflowPlan,
+    tracker: Arc<RunStateTracker>,
+}
+
+impl WorkflowRunObserver {
+    fn new(plan: &WorkflowPlan) -> Self {
+        Self {
+            plan: plan.clone(),
+            tracker: Arc::new(RunStateTracker::new(plan)),
+        }
+    }
+
+    /// Return the current incrementally maintained run snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> WorkflowRunSnapshot {
+        self.tracker.snapshot()
+    }
+}
+
+#[derive(Debug)]
+struct ConcurrencyCoordinator {
+    permits: Arc<Semaphore>,
+}
+
+impl ConcurrencyCoordinator {
+    fn new(max_concurrency: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(max_concurrency)),
+        }
+    }
+
+    async fn acquire(
+        &self,
+        node: &str,
+        context: &StepContext,
+    ) -> Result<OwnedSemaphorePermit, WorkflowError> {
+        context.ensure_active(node.to_string())?;
+        let permit = match Arc::clone(&self.permits).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                context.transition(node, NodeRunState::WaitingForConcurrency);
+                context.emit(WorkflowEvent::StepWaitingForConcurrency {
+                    step: node.to_string(),
+                });
+                tokio::select! {
+                    result = Arc::clone(&self.permits).acquire_owned() => {
+                        result.expect("workflow concurrency semaphore remains open")
+                    }
+                    () = context.cancellation.cancelled() => {
+                        return Err(WorkflowError::Cancelled { step: node.to_string() });
+                    }
+                }
+            }
+            Err(tokio::sync::TryAcquireError::Closed) => {
+                unreachable!("workflow concurrency semaphore remains open")
+            }
+        };
+        context.ensure_active(node.to_string())?;
+        Ok(permit)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ResourceState {
+    readers: usize,
+    writer: bool,
+}
+
+#[derive(Debug, Default)]
+struct ResourceCoordinator {
+    state: StdMutex<BTreeMap<String, ResourceState>>,
+    changed: Notify,
+}
+
+impl ResourceCoordinator {
+    async fn acquire(
+        self: &Arc<Self>,
+        node: &str,
+        claims: &[ResourceClaim],
+        context: &StepContext,
+    ) -> Result<Option<ResourceLease>, WorkflowError> {
+        if claims.is_empty() {
+            return Ok(None);
+        }
+        loop {
+            context.ensure_active(node.to_string())?;
+            let notified = self.changed.notified();
+            let acquired = {
+                let mut state = self
+                    .state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if claims_available(&state, claims) {
+                    apply_claims(&mut state, claims);
+                    true
+                } else {
+                    false
+                }
+            };
+            if acquired {
+                context.tracker.resource_acquired(claims);
+                return Ok(Some(ResourceLease {
+                    coordinator: Some(Arc::clone(self)),
+                    tracker: Arc::clone(&context.tracker),
+                    claims: claims.to_vec(),
+                }));
+            }
+            context.transition(node, NodeRunState::WaitingForResources);
+            context.emit(WorkflowEvent::StepWaitingForResources {
+                step: node.to_string(),
+                resources: claims.to_vec(),
+            });
+            tokio::select! {
+                () = notified => {}
+                () = context.cancellation.cancelled() => {
+                    return Err(WorkflowError::Cancelled { step: node.to_string() });
+                }
+            }
+        }
+    }
+
+    fn release(&self, claims: &[ResourceClaim], tracker: &RunStateTracker) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for claim in claims {
+            if let Some(resource) = state.get_mut(&claim.resource) {
+                match claim.access {
+                    ResourceAccess::Read => resource.readers = resource.readers.saturating_sub(1),
+                    ResourceAccess::Write => resource.writer = false,
+                }
+                if resource.readers == 0 && !resource.writer {
+                    state.remove(&claim.resource);
+                }
+            }
+        }
+        drop(state);
+        tracker.resource_released(claims);
+        self.changed.notify_waiters();
+    }
+}
+
+fn normalize_resource_claims(
+    claims: impl IntoIterator<Item = ResourceClaim>,
+) -> Result<Vec<ResourceClaim>, WorkflowError> {
+    let mut normalized = BTreeMap::<String, ResourceAccess>::new();
+    for claim in claims {
+        let resource = claim.resource.trim();
+        if resource.is_empty() {
+            return Err(WorkflowError::Build {
+                path: "resource".to_string(),
+                message: "resource identity must not be empty".to_string(),
+            });
+        }
+        normalized
+            .entry(resource.to_string())
+            .and_modify(|access| {
+                if claim.access == ResourceAccess::Write {
+                    *access = ResourceAccess::Write;
+                }
+            })
+            .or_insert(claim.access);
+    }
+    Ok(normalized
+        .into_iter()
+        .map(|(resource, access)| ResourceClaim { resource, access })
+        .collect())
+}
+
+fn claims_available(state: &BTreeMap<String, ResourceState>, claims: &[ResourceClaim]) -> bool {
+    claims.iter().all(|claim| {
+        state
+            .get(&claim.resource)
+            .is_none_or(|resource| match claim.access {
+                ResourceAccess::Read => !resource.writer,
+                ResourceAccess::Write => !resource.writer && resource.readers == 0,
+            })
+    })
+}
+
+fn apply_claims(state: &mut BTreeMap<String, ResourceState>, claims: &[ResourceClaim]) {
+    for claim in claims {
+        let resource = state.entry(claim.resource.clone()).or_default();
+        match claim.access {
+            ResourceAccess::Read => resource.readers = resource.readers.saturating_add(1),
+            ResourceAccess::Write => resource.writer = true,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ResourceLease {
+    coordinator: Option<Arc<ResourceCoordinator>>,
+    tracker: Arc<RunStateTracker>,
+    claims: Vec<ResourceClaim>,
+}
+
+impl Drop for ResourceLease {
+    fn drop(&mut self) {
+        let Some(coordinator) = self.coordinator.take() else {
+            return;
+        };
+        coordinator.release(&self.claims, &self.tracker);
+    }
 }
 
 /// Terminal workflow outcome used by observation events.
@@ -233,11 +633,35 @@ pub fn workflow_event_channel(capacity: usize) -> (WorkflowEventSender, Workflow
     )
 }
 
+/// Guard that aborts a Tokio task when its owning operation exits early.
+#[derive(Debug)]
+pub struct AbortTaskOnDrop<T> {
+    handle: JoinHandle<T>,
+}
+
+impl<T> AbortTaskOnDrop<T> {
+    /// Wrap a spawned task.
+    #[must_use]
+    pub const fn new(handle: JoinHandle<T>) -> Self {
+        Self { handle }
+    }
+}
+
+impl<T> Drop for AbortTaskOnDrop<T> {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
 /// Context supplied to an executing workflow step.
 #[derive(Debug, Clone)]
 pub struct StepContext {
     cancellation: WorkflowCancellation,
     events: Option<WorkflowEventSender>,
+    tracker: Arc<RunStateTracker>,
+    concurrency: Arc<ConcurrencyCoordinator>,
+    concurrency_held: bool,
+    resources: Arc<ResourceCoordinator>,
 }
 
 impl StepContext {
@@ -245,6 +669,72 @@ impl StepContext {
     #[must_use]
     pub fn cancellation(&self) -> WorkflowCancellation {
         self.cancellation.clone()
+    }
+
+    /// Return an incrementally maintained run snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> WorkflowRunSnapshot {
+        self.tracker.snapshot()
+    }
+
+    fn transition(&self, node: &str, state: NodeRunState) {
+        self.tracker.transition(node, state);
+    }
+
+    fn controller_started(&self, node: &str) {
+        self.transition(node, NodeRunState::Running);
+        self.emit(WorkflowEvent::StepStarted {
+            step: node.to_string(),
+        });
+    }
+
+    fn controller_finished(&self, node: &str, error: Option<&WorkflowError>) {
+        match error {
+            None => {
+                self.transition(node, NodeRunState::Succeeded);
+                self.emit(WorkflowEvent::StepCompleted {
+                    step: node.to_string(),
+                });
+            }
+            Some(error) => {
+                self.transition(node, node_state_for_error(error));
+                self.emit(WorkflowEvent::StepFailed {
+                    step: node.to_string(),
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+
+    fn skip_nodes(&self, nodes: impl IntoIterator<Item = String>) {
+        for node in nodes {
+            self.transition(&node, NodeRunState::Skipped);
+        }
+    }
+
+    async fn acquire_concurrency(
+        &self,
+        node: &str,
+    ) -> Result<Option<OwnedSemaphorePermit>, WorkflowError> {
+        if self.concurrency_held {
+            Ok(None)
+        } else {
+            self.concurrency.acquire(node, self).await.map(Some)
+        }
+    }
+
+    fn with_concurrency_held(&self) -> Self {
+        let mut context = self.clone();
+        context.concurrency_held = true;
+        context
+    }
+
+    async fn acquire_resources(
+        &self,
+        node: &str,
+        claims: &[ResourceClaim],
+    ) -> Result<Option<ResourceLease>, WorkflowError> {
+        self.resources.acquire(node, claims, self).await
     }
 
     fn emit(&self, event: WorkflowEvent) {
@@ -263,6 +753,41 @@ impl StepContext {
             Err(WorkflowError::Cancelled { step: step.into() })
         } else {
             Ok(())
+        }
+    }
+}
+
+/// Durable-friendly reference to a large workflow value owned by an external artifact store.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ArtifactReference {
+    /// Stable artifact identity.
+    pub artifact_id: String,
+    /// Producer-owned schema identity.
+    pub schema: String,
+    /// Producer-owned schema version.
+    pub schema_version: u32,
+    /// Media type of the referenced bytes.
+    pub content_type: String,
+    /// Opaque host-resolvable reference key.
+    pub reference_key: String,
+}
+
+impl ArtifactReference {
+    /// Create a typed artifact reference without loading its bytes into workflow state.
+    #[must_use]
+    pub fn new(
+        artifact_id: impl Into<String>,
+        schema: impl Into<String>,
+        schema_version: u32,
+        content_type: impl Into<String>,
+        reference_key: impl Into<String>,
+    ) -> Self {
+        Self {
+            artifact_id: artifact_id.into(),
+            schema: schema.into(),
+            schema_version,
+            content_type: content_type.into(),
+            reference_key: reference_key.into(),
         }
     }
 }
@@ -286,6 +811,43 @@ impl ValueSchema {
     }
 }
 
+/// Resource access requested by a workflow node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceAccess {
+    Read,
+    Write,
+}
+
+/// One named workflow resource claim.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ResourceClaim {
+    /// Stable resource identity such as `repository` or `worktree:review-1`.
+    pub resource: String,
+    /// Requested access mode.
+    pub access: ResourceAccess,
+}
+
+impl ResourceClaim {
+    /// Create a shared read claim.
+    #[must_use]
+    pub fn read(resource: impl Into<String>) -> Self {
+        Self {
+            resource: resource.into(),
+            access: ResourceAccess::Read,
+        }
+    }
+
+    /// Create an exclusive write claim.
+    #[must_use]
+    pub fn write(resource: impl Into<String>) -> Self {
+        Self {
+            resource: resource.into(),
+            access: ResourceAccess::Write,
+        }
+    }
+}
+
 /// Serializable description of one workflow node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeDefinition {
@@ -299,6 +861,9 @@ pub struct NodeDefinition {
     pub input: ValueSchema,
     /// Typed output schema.
     pub output: ValueSchema,
+    /// Resources acquired atomically before this node executes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ResourceClaim>,
     /// Node-specific declarative configuration.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub configuration: serde_json::Value,
@@ -466,6 +1031,10 @@ pub struct WorkflowDefinition {
     pub output: ValueSchema,
     /// Nodes in deterministic identity order.
     pub nodes: BTreeMap<String, NodeDefinition>,
+    /// Logical entry node identities.
+    pub entries: Vec<String>,
+    /// Logical exit node identities.
+    pub exits: Vec<String>,
     /// Edges in deterministic order.
     pub edges: Vec<EdgeDefinition>,
 }
@@ -533,6 +1102,7 @@ impl RetryPolicy {
 pub struct Step<I, O> {
     run: Arc<StepFn<I, O>>,
     fragment: DefinitionFragment,
+    leaf_node_id: Option<String>,
     _types: PhantomData<fn(I) -> O>,
 }
 
@@ -541,6 +1111,7 @@ impl<I, O> Clone for Step<I, O> {
         Self {
             run: Arc::clone(&self.run),
             fragment: self.fragment.clone(),
+            leaf_node_id: self.leaf_node_id.clone(),
             _types: PhantomData,
         }
     }
@@ -559,7 +1130,7 @@ impl<I, O> fmt::Debug for Step<I, O> {
 impl<I, O> Step<I, O>
 where
     I: JsonSchema + Send + 'static,
-    O: JsonSchema + Send + 'static,
+    O: Serialize + DeserializeOwned + JsonSchema + Send + 'static,
 {
     /// Create an asynchronous typed application step.
     #[must_use]
@@ -602,6 +1173,7 @@ where
             kind,
             input: ValueSchema::of::<I>(),
             output: ValueSchema::of::<O>(),
+            resources: Vec::new(),
             configuration,
         };
         let id = node.id.clone();
@@ -611,13 +1183,47 @@ where
             let operation = Arc::clone(&operation);
             let step_id = step_id.clone();
             Box::pin(async move {
-                context.ensure_active(step_id.clone())?;
+                context.transition(&step_id, NodeRunState::Ready);
+                if let Err(error) = context.ensure_active(step_id.clone()) {
+                    context.transition(&step_id, NodeRunState::Cancelled);
+                    return Err(error);
+                }
+                let _concurrency_permit = match context.acquire_concurrency(&step_id).await {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        context.transition(&step_id, node_state_for_error(&error));
+                        context.emit(WorkflowEvent::StepFailed {
+                            step: step_id,
+                            message: error.to_string(),
+                        });
+                        return Err(error);
+                    }
+                };
+                let context = context.with_concurrency_held();
+                context.transition(&step_id, NodeRunState::Running);
                 context.emit(WorkflowEvent::StepStarted {
                     step: step_id.clone(),
                 });
-                let output = operation(input, context.clone()).await?;
-                context.emit(WorkflowEvent::StepCompleted { step: step_id });
-                Ok(output)
+                let result = operation(input, context.clone()).await.and_then(|output| {
+                    validate_output(&step_id, &output)?;
+                    Ok(output)
+                });
+                match &result {
+                    Ok(_) => {
+                        context.transition(&step_id, NodeRunState::Succeeded);
+                        context.emit(WorkflowEvent::StepCompleted {
+                            step: step_id.clone(),
+                        });
+                    }
+                    Err(error) => {
+                        context.transition(&step_id, node_state_for_error(error));
+                        context.emit(WorkflowEvent::StepFailed {
+                            step: step_id.clone(),
+                            message: error.to_string(),
+                        });
+                    }
+                }
+                result
             }) as StepFuture<O>
         });
         Self {
@@ -626,17 +1232,63 @@ where
                 nodes: vec![node],
                 edges: Vec::new(),
                 entries: vec![id.clone()],
-                exits: vec![id],
+                exits: vec![id.clone()],
             },
+            leaf_node_id: Some(id),
             _types: PhantomData,
         }
+    }
+
+    /// Declare resources acquired atomically before this leaf step executes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called on a composed flow rather than one leaf task or agent step. Apply
+    /// resource claims before `then`, `branch`, `repeat`, `retry`, or parallel composition.
+    #[must_use]
+    pub fn resources(mut self, claims: impl IntoIterator<Item = ResourceClaim>) -> Self {
+        let leaf = self
+            .leaf_node_id
+            .as_ref()
+            .expect("resource claims can only be added to a leaf step");
+        let node = self
+            .fragment
+            .nodes
+            .iter_mut()
+            .find(|node| &node.id == leaf)
+            .expect("leaf workflow node exists");
+        let claims =
+            normalize_resource_claims(claims).expect("workflow resource claims must be valid");
+        node.resources.clone_from(&claims);
+        let run = Arc::clone(&self.run);
+        let step_id = leaf.clone();
+        self.run = Arc::new(move |input, context| {
+            let run = Arc::clone(&run);
+            let claims = claims.clone();
+            let step_id = step_id.clone();
+            Box::pin(async move {
+                let _resource_lease = match context.acquire_resources(&step_id, &claims).await {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        context.transition(&step_id, node_state_for_error(&error));
+                        context.emit(WorkflowEvent::StepFailed {
+                            step: step_id,
+                            message: error.to_string(),
+                        });
+                        return Err(error);
+                    }
+                };
+                run(input, context).await
+            })
+        });
+        self
     }
 
     /// Run `next` after this step and carry its typed output into `next`.
     #[must_use]
     pub fn then<N>(self, next: Step<O, N>) -> Step<I, N>
     where
-        N: JsonSchema + Send + 'static,
+        N: Serialize + DeserializeOwned + JsonSchema + Send + 'static,
     {
         let first = Arc::clone(&self.run);
         let second = Arc::clone(&next.run);
@@ -650,6 +1302,7 @@ where
                 })
             }),
             fragment: self.fragment.sequence(next.fragment),
+            leaf_node_id: None,
             _types: PhantomData,
         }
     }
@@ -682,6 +1335,7 @@ where
             kind: NodeKind::Repeat,
             input: ValueSchema::of::<O>(),
             output: ValueSchema::of::<O>(),
+            resources: Vec::new(),
             configuration: serde_json::json!({
                 "predicate": expression,
                 "max_iterations": max_iterations,
@@ -711,42 +1365,50 @@ where
                 let expression = run_expression.clone();
                 let repeat_id = repeat_id.clone();
                 Box::pin(async move {
-                    if max_iterations == 0 {
-                        return Err(WorkflowError::Build {
-                            path: repeat_id,
-                            message: "repeat max_iterations must be greater than zero".to_string(),
-                        });
-                    }
-                    let mut output = body_run(input, context.clone()).await?;
-                    context.emit(WorkflowEvent::IterationStarted {
-                        step: repeat_id.clone(),
-                        iteration: 1,
-                        max_iterations,
-                    });
-                    for iteration in 2..=max_iterations {
-                        if !expression.evaluate(&output)? {
-                            return Ok(output);
+                    context.controller_started(&repeat_id);
+                    let result = async {
+                        if max_iterations == 0 {
+                            return Err(WorkflowError::Build {
+                                path: repeat_id.clone(),
+                                message: "repeat max_iterations must be greater than zero"
+                                    .to_string(),
+                            });
                         }
-                        context.ensure_active(repeat_id.clone())?;
+                        let mut output = body_run(input, context.clone()).await?;
                         context.emit(WorkflowEvent::IterationStarted {
                             step: repeat_id.clone(),
-                            iteration,
+                            iteration: 1,
                             max_iterations,
                         });
-                        output = body_run(output.clone().into(), context.clone()).await?;
+                        for iteration in 2..=max_iterations {
+                            if !expression.evaluate(&output)? {
+                                return Ok(output);
+                            }
+                            context.ensure_active(repeat_id.clone())?;
+                            context.emit(WorkflowEvent::IterationStarted {
+                                step: repeat_id.clone(),
+                                iteration,
+                                max_iterations,
+                            });
+                            output = body_run(output.clone().into(), context.clone()).await?;
+                        }
+                        if expression.evaluate(&output)? {
+                            return Err(WorkflowError::Step {
+                                step: repeat_id.clone(),
+                                message: format!(
+                                    "repeat condition remained true after {max_iterations} iterations"
+                                ),
+                            });
+                        }
+                        Ok(output)
                     }
-                    if expression.evaluate(&output)? {
-                        return Err(WorkflowError::Step {
-                            step: repeat_id,
-                            message: format!(
-                                "repeat condition remained true after {max_iterations} iterations"
-                            ),
-                        });
-                    }
-                    Ok(output)
+                    .await;
+                    context.controller_finished(&repeat_id, result.as_ref().err());
+                    result
                 })
             }),
             fragment,
+            leaf_node_id: None,
             _types: PhantomData,
         }
     }
@@ -778,7 +1440,7 @@ where
     ) -> Step<I, N>
     where
         O: Clone + Serialize,
-        N: JsonSchema + Send + 'static,
+        N: Serialize + DeserializeOwned + JsonSchema + Send + 'static,
     {
         let name = name.into();
         let branch_id = name.clone();
@@ -788,14 +1450,28 @@ where
             kind: NodeKind::Branch,
             input: ValueSchema::of::<O>(),
             output: ValueSchema::of::<O>(),
+            resources: Vec::new(),
             configuration: serde_json::to_value(predicate.expression())
                 .expect("workflow predicate should serialize to JSON"),
         };
         let prior_run = Arc::clone(&self.run);
         let true_run = Arc::clone(&when_true.run);
         let false_run = Arc::clone(&when_false.run);
+        let true_nodes = when_true
+            .fragment
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
+        let false_nodes = when_false
+            .fragment
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<Vec<_>>();
         let expression = predicate.expression;
         let run_expression = expression.clone();
+        let run_branch_id = branch_id.clone();
         let mut fragment = self.fragment;
         for exit in &fragment.exits {
             fragment.edges.push(EdgeDefinition {
@@ -840,17 +1516,26 @@ where
                 let prior_run = Arc::clone(&prior_run);
                 let true_run = Arc::clone(&true_run);
                 let false_run = Arc::clone(&false_run);
+                let true_nodes = true_nodes.clone();
+                let false_nodes = false_nodes.clone();
                 let expression = run_expression.clone();
+                let branch_id = run_branch_id.clone();
                 Box::pin(async move {
                     let branch_input = prior_run(input, context.clone()).await?;
-                    if expression.evaluate(&branch_input)? {
-                        true_run(branch_input, context).await
+                    context.controller_started(&branch_id);
+                    let result = if expression.evaluate(&branch_input)? {
+                        context.skip_nodes(false_nodes);
+                        true_run(branch_input, context.clone()).await
                     } else {
-                        false_run(branch_input, context).await
-                    }
+                        context.skip_nodes(true_nodes);
+                        false_run(branch_input, context.clone()).await
+                    };
+                    context.controller_finished(&branch_id, result.as_ref().err());
+                    result
                 })
             }),
             fragment,
+            leaf_node_id: None,
             _types: PhantomData,
         }
     }
@@ -862,8 +1547,19 @@ where
     #[must_use]
     pub fn retry(self, name: impl Into<String>, max_attempts: u32) -> Self
     where
-        I: Clone,
+        I: Clone + Sync,
     {
+        self.retry_with_policy(name, RetryPolicy::new(max_attempts))
+    }
+
+    /// Retry this composed step using an explicit bounded policy.
+    #[must_use]
+    pub fn retry_with_policy(self, name: impl Into<String>, policy: RetryPolicy) -> Self
+    where
+        I: Clone + Sync,
+    {
+        let max_attempts = policy.max_attempts;
+        let backoff = policy.backoff;
         let name = name.into();
         let retry_id = name.clone();
         let run = Arc::clone(&self.run);
@@ -889,7 +1585,11 @@ where
             kind: NodeKind::Retry,
             input: ValueSchema::of::<I>(),
             output: ValueSchema::of::<O>(),
-            configuration: serde_json::json!({"max_attempts": max_attempts}),
+            resources: Vec::new(),
+            configuration: serde_json::json!({
+                "max_attempts": max_attempts,
+                "backoff_ms": u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX),
+            }),
         });
         fragment.exits = vec![retry_id.clone()];
         Self {
@@ -897,41 +1597,53 @@ where
                 let run = Arc::clone(&run);
                 let retry_id = retry_id.clone();
                 Box::pin(async move {
-                    if max_attempts == 0 {
-                        return Err(WorkflowError::Build {
-                            path: retry_id,
-                            message: "retry max_attempts must be greater than zero".to_string(),
-                        });
-                    }
-                    let mut last_error = None;
-                    for attempt in 1..=max_attempts {
-                        context.ensure_active(retry_id.clone())?;
-                        context.emit(WorkflowEvent::RetryAttempt {
-                            step: retry_id.clone(),
-                            attempt,
-                            max_attempts,
-                        });
-                        match run(input.clone(), context.clone()).await {
-                            Ok(output) => return Ok(output),
-                            Err(
-                                error @ (WorkflowError::Cancelled { .. }
-                                | WorkflowError::TimedOut { .. }),
-                            ) => return Err(error),
-                            Err(error) => {
-                                last_error = Some(error);
-                                if attempt < max_attempts {
-                                    tokio::task::yield_now().await;
+                    context.controller_started(&retry_id);
+                    let result = async {
+                        if max_attempts == 0 {
+                            return Err(WorkflowError::Build {
+                                path: retry_id.clone(),
+                                message: "retry max_attempts must be greater than zero".to_string(),
+                            });
+                        }
+                        let mut errors = Vec::new();
+                        for attempt in 1..=max_attempts {
+                            context.ensure_active(retry_id.clone())?;
+                            context.emit(WorkflowEvent::RetryAttempt {
+                                step: retry_id.clone(),
+                                attempt,
+                                max_attempts,
+                            });
+                            match run(input.clone(), context.clone()).await {
+                                Ok(output) => return Ok(output),
+                                Err(
+                                    error @ (WorkflowError::Cancelled { .. }
+                                    | WorkflowError::TimedOut { .. }),
+                                ) => return Err(error),
+                                Err(error) => {
+                                    errors.push(error.to_string());
+                                    if attempt < max_attempts {
+                                        if backoff.is_zero() {
+                                            tokio::task::yield_now().await;
+                                        } else {
+                                            tokio::time::sleep(backoff).await;
+                                        }
+                                    }
                                 }
                             }
                         }
+                        Err(WorkflowError::RetryExhausted {
+                            step: retry_id.clone(),
+                            attempts: max_attempts,
+                            errors,
+                        })
                     }
-                    Err(last_error.unwrap_or_else(|| WorkflowError::Build {
-                        path: retry_id,
-                        message: "retry completed without executing an attempt".to_string(),
-                    }))
+                    .await;
+                    context.controller_finished(&retry_id, result.as_ref().err());
+                    result
                 })
             }),
             fragment,
+            leaf_node_id: None,
             _types: PhantomData,
         }
     }
@@ -957,9 +1669,21 @@ where
                 })
             }),
             fragment: self.fragment,
+            leaf_node_id: self.leaf_node_id,
             _types: PhantomData,
         }
     }
+}
+
+/// Failure behavior for a two-branch parallel join.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParallelFailurePolicy {
+    /// Wait for both branches to settle before returning the first branch-ordered failure.
+    #[default]
+    WaitAll,
+    /// Return the first observed failure and request cooperative sibling cancellation.
+    FailFast,
 }
 
 /// Execute a homogeneous collection through one cloned step with bounded concurrency.
@@ -974,13 +1698,14 @@ pub fn fan_out<I, O>(
 ) -> Step<Vec<I>, Vec<O>>
 where
     I: JsonSchema + Send + 'static,
-    O: JsonSchema + Send + 'static,
+    O: Serialize + DeserializeOwned + JsonSchema + Send + 'static,
 {
     let name = name.into();
     let fan_out_id = name.clone();
     let Step {
         run,
         fragment: mut body,
+        leaf_node_id: _,
         _types: _,
     } = step;
     let body_entries = body.entries.clone();
@@ -998,6 +1723,7 @@ where
         kind: NodeKind::FanOut,
         input: ValueSchema::of::<Vec<I>>(),
         output: ValueSchema::of::<Vec<O>>(),
+        resources: Vec::new(),
         configuration: serde_json::json!({"max_concurrency": max_concurrency}),
     });
     body.entries = body_entries;
@@ -1007,55 +1733,69 @@ where
             let run = Arc::clone(&run);
             let fan_out_id = fan_out_id.clone();
             Box::pin(async move {
-                if max_concurrency == 0 {
-                    return Err(WorkflowError::Build {
-                        path: fan_out_id,
-                        message: "fan_out max_concurrency must be greater than zero".to_string(),
-                    });
-                }
-                context.ensure_active(fan_out_id.clone())?;
-                let mut inputs = inputs.into_iter().enumerate();
-                let mut tasks = JoinSet::new();
-                for _ in 0..max_concurrency {
-                    let Some((index, input)) = inputs.next() else {
-                        break;
-                    };
-                    spawn_fan_out_task(&mut tasks, Arc::clone(&run), context.clone(), index, input);
-                }
-                let mut outputs = BTreeMap::new();
-                while let Some(result) = tasks.join_next().await {
-                    match result {
-                        Ok(Ok((index, output))) => {
-                            outputs.insert(index, output);
-                            if let Some((next_index, input)) = inputs.next() {
-                                spawn_fan_out_task(
-                                    &mut tasks,
-                                    Arc::clone(&run),
-                                    context.clone(),
-                                    next_index,
-                                    input,
-                                );
+                context.controller_started(&fan_out_id);
+                let result = async {
+                    if max_concurrency == 0 {
+                        return Err(WorkflowError::Build {
+                            path: fan_out_id.clone(),
+                            message: "fan_out max_concurrency must be greater than zero"
+                                .to_string(),
+                        });
+                    }
+                    context.ensure_active(fan_out_id.clone())?;
+                    let mut inputs = inputs.into_iter().enumerate();
+                    let mut tasks = JoinSet::new();
+                    for _ in 0..max_concurrency {
+                        let Some((index, input)) = inputs.next() else {
+                            break;
+                        };
+                        spawn_fan_out_task(
+                            &mut tasks,
+                            Arc::clone(&run),
+                            context.clone(),
+                            index,
+                            input,
+                        );
+                    }
+                    let mut outputs = BTreeMap::new();
+                    while let Some(result) = tasks.join_next().await {
+                        match result {
+                            Ok(Ok((index, output))) => {
+                                outputs.insert(index, output);
+                                if let Some((next_index, input)) = inputs.next() {
+                                    spawn_fan_out_task(
+                                        &mut tasks,
+                                        Arc::clone(&run),
+                                        context.clone(),
+                                        next_index,
+                                        input,
+                                    );
+                                }
+                            }
+                            Ok(Err(error)) => {
+                                tasks.abort_all();
+                                while tasks.join_next().await.is_some() {}
+                                return Err(error);
+                            }
+                            Err(error) => {
+                                tasks.abort_all();
+                                while tasks.join_next().await.is_some() {}
+                                return Err(WorkflowError::step(
+                                    &fan_out_id,
+                                    format!("fan-out task failed to join: {error}"),
+                                ));
                             }
                         }
-                        Ok(Err(error)) => {
-                            tasks.abort_all();
-                            while tasks.join_next().await.is_some() {}
-                            return Err(error);
-                        }
-                        Err(error) => {
-                            tasks.abort_all();
-                            while tasks.join_next().await.is_some() {}
-                            return Err(WorkflowError::step(
-                                &fan_out_id,
-                                format!("fan-out task failed to join: {error}"),
-                            ));
-                        }
                     }
+                    Ok(outputs.into_values().collect())
                 }
-                Ok(outputs.into_values().collect())
+                .await;
+                context.controller_finished(&fan_out_id, result.as_ref().err());
+                result
             })
         }),
         fragment: body,
+        leaf_node_id: None,
         _types: PhantomData,
     }
 }
@@ -1078,11 +1818,11 @@ fn spawn_fan_out_task<I, O>(
 pub fn parallel<I, A, B>(left: Step<I, A>, right: Step<I, B>) -> Step<I, (A, B)>
 where
     I: Clone + JsonSchema + Send + 'static,
-    A: JsonSchema + Send + 'static,
-    B: JsonSchema + Send + 'static,
+    A: Serialize + DeserializeOwned + JsonSchema + Send + 'static,
+    B: Serialize + DeserializeOwned + JsonSchema + Send + 'static,
 {
     let name = generated_parallel_name(&left, &right);
-    parallel_named(name, left, right)
+    parallel_named_with_policy(name, ParallelFailurePolicy::WaitAll, left, right)
 }
 
 /// Compose two independent typed steps with an explicit stable join identity.
@@ -1094,18 +1834,37 @@ pub fn parallel_named<I, A, B>(
 ) -> Step<I, (A, B)>
 where
     I: Clone + JsonSchema + Send + 'static,
-    A: JsonSchema + Send + 'static,
-    B: JsonSchema + Send + 'static,
+    A: Serialize + DeserializeOwned + JsonSchema + Send + 'static,
+    B: Serialize + DeserializeOwned + JsonSchema + Send + 'static,
+{
+    parallel_named_with_policy(name, ParallelFailurePolicy::WaitAll, left, right)
+}
+
+/// Compose two independent typed steps with explicit join identity and failure behavior.
+#[must_use]
+#[allow(clippy::too_many_lines)]
+pub fn parallel_named_with_policy<I, A, B>(
+    name: impl Into<String>,
+    failure_policy: ParallelFailurePolicy,
+    left: Step<I, A>,
+    right: Step<I, B>,
+) -> Step<I, (A, B)>
+where
+    I: Clone + JsonSchema + Send + 'static,
+    A: Serialize + DeserializeOwned + JsonSchema + Send + 'static,
+    B: Serialize + DeserializeOwned + JsonSchema + Send + 'static,
 {
     let join_id = name.into();
     let Step {
         run: left_run,
         fragment: left_fragment,
+        leaf_node_id: _,
         _types: _,
     } = left;
     let Step {
         run: right_run,
         fragment: right_fragment,
+        leaf_node_id: _,
         _types: _,
     } = right;
     let mut nodes = Vec::with_capacity(left_fragment.nodes.len() + right_fragment.nodes.len() + 1);
@@ -1117,7 +1876,8 @@ where
         kind: NodeKind::Parallel,
         input: ValueSchema::of::<I>(),
         output: ValueSchema::of::<(A, B)>(),
-        configuration: serde_json::Value::Null,
+        resources: Vec::new(),
+        configuration: serde_json::json!({"failure_policy": failure_policy}),
     });
     let mut edges = left_fragment.edges.clone();
     edges.extend(right_fragment.edges.clone());
@@ -1136,18 +1896,62 @@ where
     entries.extend(right_fragment.entries);
     entries.sort();
     entries.dedup();
+    let run_join_id = join_id.clone();
     Step {
         run: Arc::new(move |input, context| {
             let left_run = Arc::clone(&left_run);
             let right_run = Arc::clone(&right_run);
             let right_input = input.clone();
             let right_context = context.clone();
+            let join_id = run_join_id.clone();
             Box::pin(async move {
-                let (left, right) = tokio::join!(
-                    left_run(input, context),
-                    right_run(right_input, right_context)
-                );
-                Ok((left?, right?))
+                context.controller_started(&join_id);
+                let result = match failure_policy {
+                    ParallelFailurePolicy::WaitAll => {
+                        let (left, right) = tokio::join!(
+                            left_run(input, context.clone()),
+                            right_run(right_input, right_context)
+                        );
+                        Ok((left?, right?))
+                    }
+                    ParallelFailurePolicy::FailFast => {
+                        let sibling_cancellation = WorkflowCancellation::new();
+                        let parent_cancellation = context.cancellation();
+                        let sibling_signal = sibling_cancellation.clone();
+                        let _parent_bridge = AbortTaskOnDrop::new(tokio::spawn(async move {
+                            parent_cancellation.cancelled().await;
+                            sibling_signal.cancel();
+                        }));
+                        let branch_context = StepContext {
+                            cancellation: sibling_cancellation.clone(),
+                            events: context.events.clone(),
+                            tracker: Arc::clone(&context.tracker),
+                            concurrency: Arc::clone(&context.concurrency),
+                            concurrency_held: context.concurrency_held,
+                            resources: Arc::clone(&context.resources),
+                        };
+                        let mut left = Box::pin(left_run(input, branch_context.clone()));
+                        let mut right = Box::pin(right_run(right_input, branch_context));
+                        tokio::select! {
+                            left_result = &mut left => match left_result {
+                                Ok(left_output) => Ok((left_output, right.await?)),
+                                Err(error) => {
+                                    sibling_cancellation.cancel();
+                                    Err(error)
+                                }
+                            },
+                            right_result = &mut right => match right_result {
+                                Ok(right_output) => Ok((left.await?, right_output)),
+                                Err(error) => {
+                                    sibling_cancellation.cancel();
+                                    Err(error)
+                                }
+                            },
+                        }
+                    }
+                };
+                context.controller_finished(&join_id, result.as_ref().err());
+                result
             })
         }),
         fragment: DefinitionFragment {
@@ -1156,6 +1960,7 @@ where
             entries,
             exits: vec![join_id],
         },
+        leaf_node_id: None,
         _types: PhantomData,
     }
 }
@@ -1170,6 +1975,69 @@ fn generated_parallel_name<I, A, B>(left: &Step<I, A>, right: &Step<I, B>) -> St
     format!("parallel:{left}+{right}")
 }
 
+/// Precomputed immutable indexes for scheduling a compiled definition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowPlan {
+    dependencies: BTreeMap<String, usize>,
+    outgoing: BTreeMap<String, Vec<String>>,
+}
+
+impl WorkflowPlan {
+    fn compile(definition: &WorkflowDefinition) -> Self {
+        let mut dependencies = definition
+            .nodes
+            .keys()
+            .map(|id| (id.clone(), 0_usize))
+            .collect::<BTreeMap<_, _>>();
+        let mut outgoing = definition
+            .nodes
+            .keys()
+            .map(|id| (id.clone(), Vec::new()))
+            .collect::<BTreeMap<_, _>>();
+        for edge in definition.edges.iter().filter(|edge| {
+            matches!(edge.kind, EdgeKind::Direct)
+                && definition.nodes.get(&edge.from).is_none_or(|node| {
+                    !matches!(
+                        node.kind,
+                        NodeKind::Parallel
+                            | NodeKind::Branch
+                            | NodeKind::Repeat
+                            | NodeKind::Retry
+                            | NodeKind::FanOut
+                    )
+                })
+        }) {
+            *dependencies
+                .get_mut(&edge.to)
+                .expect("validated workflow edge target exists") += 1;
+            outgoing
+                .get_mut(&edge.from)
+                .expect("validated workflow edge source exists")
+                .push(edge.to.clone());
+        }
+        for targets in outgoing.values_mut() {
+            targets.sort();
+            targets.dedup();
+        }
+        Self {
+            dependencies,
+            outgoing,
+        }
+    }
+
+    /// Return the number of forward dependencies for one node.
+    #[must_use]
+    pub fn dependency_count(&self, node_id: &str) -> Option<usize> {
+        self.dependencies.get(node_id).copied()
+    }
+
+    /// Return deterministic forward targets for one node.
+    #[must_use]
+    pub fn outgoing(&self, node_id: &str) -> Option<&[String]> {
+        self.outgoing.get(node_id).map(Vec::as_slice)
+    }
+}
+
 /// Builder for one typed workflow.
 #[derive(Debug)]
 pub struct WorkflowBuilder<I, O> {
@@ -1180,7 +2048,7 @@ pub struct WorkflowBuilder<I, O> {
 impl<I, O> WorkflowBuilder<I, O>
 where
     I: JsonSchema + Send + 'static,
-    O: JsonSchema + Send + 'static,
+    O: Serialize + DeserializeOwned + JsonSchema + Send + 'static,
 {
     /// Create a workflow from one typed step or composed flow.
     #[must_use]
@@ -1199,8 +2067,10 @@ where
     /// duplicated, an edge references a missing node, or the graph is cyclic.
     pub fn build(self) -> Result<Workflow<I, O>, WorkflowError> {
         let definition = compile_definition::<I, O>(&self.name, &self.step.fragment)?;
+        let plan = WorkflowPlan::compile(&definition);
         Ok(Workflow {
             definition,
+            plan,
             run: self.step.run,
             _types: PhantomData,
         })
@@ -1210,6 +2080,7 @@ where
 /// A validated typed workflow ready for execution.
 pub struct Workflow<I, O> {
     definition: WorkflowDefinition,
+    plan: WorkflowPlan,
     run: Arc<StepFn<I, O>>,
     _types: PhantomData<fn(I) -> O>,
 }
@@ -1219,6 +2090,7 @@ impl<I, O> fmt::Debug for Workflow<I, O> {
         formatter
             .debug_struct("Workflow")
             .field("definition", &self.definition)
+            .field("plan", &self.plan)
             .finish_non_exhaustive()
     }
 }
@@ -1232,6 +2104,12 @@ where
     #[must_use]
     pub const fn definition(&self) -> &WorkflowDefinition {
         &self.definition
+    }
+
+    /// Return precomputed scheduling indexes for the compiled definition.
+    #[must_use]
+    pub const fn plan(&self) -> &WorkflowPlan {
+        &self.plan
     }
 
     /// Run the workflow with a new cancellation token.
@@ -1256,7 +2134,8 @@ where
         input: I,
         cancellation: WorkflowCancellation,
     ) -> Result<O, WorkflowError> {
-        self.run_observed(input, cancellation, None).await
+        self.run_observed(input, cancellation, None, None, DEFAULT_MAX_CONCURRENCY)
+            .await
     }
 
     /// Run the workflow with caller-owned cancellation and bounded non-blocking observation.
@@ -1271,7 +2150,73 @@ where
         cancellation: WorkflowCancellation,
         events: WorkflowEventSender,
     ) -> Result<O, WorkflowError> {
-        self.run_observed(input, cancellation, Some(events)).await
+        self.run_observed(
+            input,
+            cancellation,
+            Some(events),
+            None,
+            DEFAULT_MAX_CONCURRENCY,
+        )
+        .await
+    }
+
+    /// Create an observer initialized for this workflow's compiled plan.
+    #[must_use]
+    pub fn observer(&self) -> WorkflowRunObserver {
+        WorkflowRunObserver::new(&self.plan)
+    }
+
+    /// Run with caller-owned cancellation, bounded events, and a live run observer.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the observer was created for a different workflow definition or when
+    /// normal workflow execution fails.
+    pub async fn run_with_observer(
+        &self,
+        input: I,
+        cancellation: WorkflowCancellation,
+        events: Option<WorkflowEventSender>,
+        observer: WorkflowRunObserver,
+    ) -> Result<O, WorkflowError> {
+        if observer.plan != self.plan {
+            return Err(WorkflowError::Build {
+                path: self.definition.name.clone(),
+                message: "workflow observer belongs to a different compiled plan".to_string(),
+            });
+        }
+        self.run_observed(
+            input,
+            cancellation,
+            events,
+            Some(observer),
+            DEFAULT_MAX_CONCURRENCY,
+        )
+        .await
+    }
+
+    /// Run with a workflow-wide bound on concurrently executing leaf steps.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `max_concurrency` is zero or normal workflow execution fails.
+    pub async fn run_with_concurrency_limit(
+        &self,
+        input: I,
+        cancellation: WorkflowCancellation,
+        max_concurrency: usize,
+    ) -> Result<O, WorkflowError> {
+        if max_concurrency == 0 || max_concurrency > Semaphore::MAX_PERMITS {
+            return Err(WorkflowError::Build {
+                path: self.definition.name.clone(),
+                message: format!(
+                    "workflow max_concurrency must be between 1 and {}",
+                    Semaphore::MAX_PERMITS
+                ),
+            });
+        }
+        self.run_observed(input, cancellation, None, None, max_concurrency)
+            .await
     }
 
     async fn run_observed(
@@ -1279,6 +2224,8 @@ where
         input: I,
         cancellation: WorkflowCancellation,
         events: Option<WorkflowEventSender>,
+        observer: Option<WorkflowRunObserver>,
+        max_concurrency: usize,
     ) -> Result<O, WorkflowError> {
         let first = self
             .definition
@@ -1287,9 +2234,17 @@ where
             .next()
             .cloned()
             .unwrap_or_else(|| self.definition.name.clone());
+        let tracker = observer.map_or_else(
+            || Arc::new(RunStateTracker::new(&self.plan)),
+            |observer| observer.tracker,
+        );
         let context = StepContext {
             cancellation,
             events,
+            tracker,
+            concurrency: Arc::new(ConcurrencyCoordinator::new(max_concurrency)),
+            concurrency_held: false,
+            resources: Arc::new(ResourceCoordinator::default()),
         };
         let result = async {
             context.ensure_active(first)?;
@@ -1299,15 +2254,23 @@ where
             Ok(output)
         }
         .await;
-        context.emit(WorkflowEvent::WorkflowFinished {
-            outcome: match &result {
-                Ok(_) => WorkflowOutcome::Succeeded,
-                Err(WorkflowError::Cancelled { .. }) => WorkflowOutcome::Cancelled,
-                Err(WorkflowError::TimedOut { .. }) => WorkflowOutcome::TimedOut,
-                Err(_) => WorkflowOutcome::Failed,
-            },
-        });
+        let outcome = match &result {
+            Ok(_) => WorkflowOutcome::Succeeded,
+            Err(WorkflowError::Cancelled { .. }) => WorkflowOutcome::Cancelled,
+            Err(WorkflowError::TimedOut { .. }) => WorkflowOutcome::TimedOut,
+            Err(_) => WorkflowOutcome::Failed,
+        };
+        context.tracker.finish_incomplete(outcome);
+        context.emit(WorkflowEvent::WorkflowFinished { outcome });
         result
+    }
+}
+
+const fn node_state_for_error(error: &WorkflowError) -> NodeRunState {
+    match error {
+        WorkflowError::Cancelled { .. } => NodeRunState::Cancelled,
+        WorkflowError::TimedOut { .. } => NodeRunState::TimedOut,
+        _ => NodeRunState::Failed,
     }
 }
 
@@ -1339,6 +2302,7 @@ where
         })
 }
 
+#[allow(clippy::too_many_lines)]
 fn compile_definition<I, O>(
     name: &str,
     fragment: &DefinitionFragment,
@@ -1357,6 +2321,12 @@ where
         return Err(WorkflowError::Build {
             path: name.to_string(),
             message: "workflow must contain at least one step".to_string(),
+        });
+    }
+    if fragment.entries.is_empty() || fragment.exits.is_empty() {
+        return Err(WorkflowError::Build {
+            path: name.to_string(),
+            message: "workflow must have at least one entry and one exit".to_string(),
         });
     }
     let mut nodes = BTreeMap::new();
@@ -1410,6 +2380,14 @@ where
             });
         }
     }
+    for boundary in fragment.entries.iter().chain(&fragment.exits) {
+        if !nodes.contains_key(boundary) {
+            return Err(WorkflowError::Build {
+                path: name.to_string(),
+                message: format!("workflow boundary references missing step '{boundary}'"),
+            });
+        }
+    }
     for edge in &fragment.edges {
         if !nodes.contains_key(&edge.from) || !nodes.contains_key(&edge.to) {
             return Err(WorkflowError::Build {
@@ -1443,6 +2421,8 @@ where
         input: ValueSchema::of::<I>(),
         output: ValueSchema::of::<O>(),
         nodes,
+        entries: fragment.entries.clone(),
+        exits: fragment.exits.clone(),
         edges,
     })
 }
@@ -1518,6 +2498,20 @@ mod tests {
         label: String,
     }
 
+    #[test]
+    fn artifact_references_are_small_typed_values() {
+        let reference = ArtifactReference::new(
+            "artifact-1",
+            "bcode.review.report",
+            1,
+            "application/json",
+            "report.json",
+        );
+        let value = serde_json::to_value(&reference).expect("serializes");
+        assert_eq!(value["artifact_id"], "artifact-1");
+        assert_eq!(value["schema_version"], 1);
+    }
+
     #[tokio::test]
     async fn sequential_workflow_compiles_and_runs() {
         let double = Step::map("double", |input: Input| {
@@ -1542,6 +2536,12 @@ mod tests {
         );
         assert_eq!(workflow.definition().nodes.len(), 2);
         assert_eq!(workflow.definition().edges.len(), 1);
+        assert_eq!(workflow.plan().dependency_count("double"), Some(0));
+        assert_eq!(workflow.plan().dependency_count("label"), Some(1));
+        assert_eq!(
+            workflow.plan().outgoing("double"),
+            Some(["label".to_string()].as_slice())
+        );
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -1570,14 +2570,24 @@ mod tests {
         .build()
         .expect("workflow builds");
 
+        let observer = workflow.observer();
         let output = workflow
-            .run(ReviewState {
-                needs_fixes: true,
-                attempts: 0,
-            })
+            .run_with_observer(
+                ReviewState {
+                    needs_fixes: true,
+                    attempts: 0,
+                },
+                WorkflowCancellation::new(),
+                None,
+                observer.clone(),
+            )
             .await
             .expect("run");
         assert_eq!(output.attempts, 1);
+        let snapshot = observer.snapshot();
+        assert_eq!(snapshot.nodes["needs-fixes?"], NodeRunState::Succeeded);
+        assert_eq!(snapshot.nodes["fix"], NodeRunState::Succeeded);
+        assert_eq!(snapshot.nodes["clean"], NodeRunState::Skipped);
         assert!(
             workflow
                 .definition()
@@ -1632,6 +2642,409 @@ mod tests {
             .build()
             .expect_err("zero bound should fail");
         assert!(error.to_string().contains("greater than zero"));
+    }
+
+    #[tokio::test]
+    async fn workflow_concurrency_limit_bounds_parallel_leaf_execution() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let worker = |name: &'static str| {
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            Step::task(name, move |input: Input, _| {
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(input)
+                }
+            })
+        };
+        let workflow = WorkflowBuilder::new(
+            "bounded-parallel",
+            parallel_named("join", worker("left"), worker("right")),
+        )
+        .build()
+        .expect("workflow builds");
+
+        workflow
+            .run_with_concurrency_limit(Input { value: 1 }, WorkflowCancellation::new(), 1)
+            .await
+            .expect("workflow runs");
+
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_concurrency_wait() {
+        let holder_started = Arc::new(Notify::new());
+        let release_holder = Arc::new(Notify::new());
+        let holder_started_for_step = Arc::clone(&holder_started);
+        let release_holder_for_step = Arc::clone(&release_holder);
+        let holder = Step::task("holder", move |input: Input, _| {
+            let started = Arc::clone(&holder_started_for_step);
+            let release = Arc::clone(&release_holder_for_step);
+            async move {
+                started.notify_one();
+                release.notified().await;
+                Ok(input)
+            }
+        });
+        let waiting = Step::task("waiting", |input: Input, _| async move { Ok(input) });
+        let workflow = Arc::new(
+            WorkflowBuilder::new(
+                "cancel-concurrency",
+                parallel_named("join", holder, waiting),
+            )
+            .build()
+            .expect("workflow builds"),
+        );
+        let observer = workflow.observer();
+        let cancellation = WorkflowCancellation::new();
+        let run_cancellation = cancellation.clone();
+        let run_workflow = Arc::clone(&workflow);
+        let run_observer = observer.clone();
+        let task = tokio::spawn(async move {
+            run_workflow
+                .run_observed(
+                    Input { value: 1 },
+                    run_cancellation,
+                    None,
+                    Some(run_observer),
+                    1,
+                )
+                .await
+        });
+
+        holder_started.notified().await;
+        for _ in 0..20 {
+            if observer.snapshot().waiting.contains("waiting") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            observer.snapshot().nodes["waiting"],
+            NodeRunState::WaitingForConcurrency
+        );
+        cancellation.cancel();
+        release_holder.notify_one();
+        let error = task
+            .await
+            .expect("workflow task joins")
+            .expect_err("workflow cancels");
+        assert!(matches!(error, WorkflowError::Cancelled { .. }));
+        assert!(observer.snapshot().running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrency_and_resource_limits_compose_without_deadlock() {
+        let writer_active = Arc::new(AtomicUsize::new(0));
+        let writer_maximum = Arc::new(AtomicUsize::new(0));
+        let writer = |name: &'static str| {
+            let active = Arc::clone(&writer_active);
+            let maximum = Arc::clone(&writer_maximum);
+            Step::task(name, move |input: Input, _| {
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(input)
+                }
+            })
+            .resources([ResourceClaim::write("repository")])
+        };
+        let workflow = WorkflowBuilder::new(
+            "bounded-resources",
+            parallel_named("join", writer("left"), writer("right")),
+        )
+        .build()
+        .expect("workflow builds");
+
+        workflow
+            .run_with_concurrency_limit(Input { value: 1 }, WorkflowCancellation::new(), 1)
+            .await
+            .expect("workflow runs");
+
+        assert_eq!(writer_maximum.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn zero_workflow_concurrency_limit_is_rejected() {
+        let workflow =
+            WorkflowBuilder::new("invalid-limit", Step::map("step", Ok::<_, WorkflowError>))
+                .build()
+                .expect("workflow builds");
+        let error = workflow
+            .run_with_concurrency_limit(Input { value: 1 }, WorkflowCancellation::new(), 0)
+            .await
+            .expect_err("zero bound fails");
+        assert!(error.to_string().contains("between 1"));
+    }
+
+    #[tokio::test]
+    async fn deterministic_ready_set_is_independent_of_parallel_completion_order() {
+        async fn run_with_delays(
+            left_delay: Duration,
+            right_delay: Duration,
+        ) -> WorkflowRunSnapshot {
+            let left = Step::task("left", move |input: Input, _| async move {
+                tokio::time::sleep(left_delay).await;
+                Ok(input)
+            });
+            let right = Step::task("right", move |input: Input, _| async move {
+                tokio::time::sleep(right_delay).await;
+                Ok(input)
+            });
+            let workflow =
+                WorkflowBuilder::new("deterministic-ready", parallel_named("join", left, right))
+                    .build()
+                    .expect("workflow builds");
+            let observer = workflow.observer();
+            workflow
+                .run_with_observer(
+                    Input { value: 1 },
+                    WorkflowCancellation::new(),
+                    None,
+                    observer.clone(),
+                )
+                .await
+                .expect("workflow runs");
+            observer.snapshot()
+        }
+
+        let left_first = run_with_delays(Duration::from_millis(1), Duration::from_millis(5)).await;
+        let right_first = run_with_delays(Duration::from_millis(5), Duration::from_millis(1)).await;
+
+        assert_eq!(left_first, right_first);
+        assert!(left_first.ready.is_empty());
+        assert!(left_first.waiting.is_empty());
+        assert!(left_first.running.is_empty());
+        assert_eq!(
+            left_first.terminal,
+            BTreeSet::from(["join".to_string(), "left".to_string(), "right".to_string(),])
+        );
+    }
+
+    #[test]
+    fn terminal_cleanup_tracks_only_incremental_incomplete_nodes() {
+        let mut dependencies = BTreeMap::new();
+        dependencies.insert("pending".to_string(), 1);
+        dependencies.insert("ready".to_string(), 0);
+        dependencies.insert("succeeded".to_string(), 0);
+        let plan = WorkflowPlan {
+            dependencies,
+            outgoing: BTreeMap::new(),
+        };
+        let tracker = RunStateTracker::new(&plan);
+        tracker.transition("succeeded", NodeRunState::Succeeded);
+        tracker.finish_incomplete(WorkflowOutcome::Failed);
+
+        let snapshot = tracker.snapshot();
+        assert_eq!(snapshot.nodes["succeeded"], NodeRunState::Succeeded);
+        assert_eq!(snapshot.nodes["pending"], NodeRunState::Skipped);
+        assert_eq!(snapshot.nodes["ready"], NodeRunState::Skipped);
+        assert_eq!(
+            snapshot.terminal,
+            BTreeSet::from([
+                "pending".to_string(),
+                "ready".to_string(),
+                "succeeded".to_string(),
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_resource_writes_serialize_and_expose_waiting_state() {
+        let left_started = Arc::new(Notify::new());
+        let release_left = Arc::new(Notify::new());
+        let left_started_for_step = Arc::clone(&left_started);
+        let release_left_for_step = Arc::clone(&release_left);
+        let left = Step::task("left-writer", move |input: Input, _| {
+            let started = Arc::clone(&left_started_for_step);
+            let release = Arc::clone(&release_left_for_step);
+            async move {
+                started.notify_one();
+                release.notified().await;
+                Ok(input)
+            }
+        })
+        .resources([ResourceClaim::write("repository")]);
+        let right = Step::task("right-writer", |input: Input, _| async move { Ok(input) })
+            .resources([ResourceClaim::write("repository")]);
+        let workflow = Arc::new(
+            WorkflowBuilder::new("serialized-writes", parallel_named("join", left, right))
+                .build()
+                .expect("workflow builds"),
+        );
+        let observer = workflow.observer();
+        let run_observer = observer.clone();
+        let run_workflow = Arc::clone(&workflow);
+        let task = tokio::spawn(async move {
+            run_workflow
+                .run_with_observer(
+                    Input { value: 1 },
+                    WorkflowCancellation::new(),
+                    None,
+                    run_observer,
+                )
+                .await
+        });
+
+        left_started.notified().await;
+        for _ in 0..20 {
+            let snapshot = observer.snapshot();
+            if snapshot.waiting.contains("right-writer") {
+                assert!(snapshot.running.contains("left-writer"));
+                assert_eq!(snapshot.resource_holders.get("repository"), Some(&1));
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(observer.snapshot().waiting.contains("right-writer"));
+        release_left.notify_one();
+        task.await
+            .expect("workflow task joins")
+            .expect("workflow succeeds");
+        let snapshot = observer.snapshot();
+        assert_eq!(snapshot.nodes["left-writer"], NodeRunState::Succeeded);
+        assert_eq!(snapshot.nodes["right-writer"], NodeRunState::Succeeded);
+        assert!(snapshot.resource_holders.is_empty());
+    }
+
+    #[tokio::test]
+    async fn shared_resource_reads_overlap() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let reader = |name: &'static str| {
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            Step::task(name, move |input: Input, _| {
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(input)
+                }
+            })
+            .resources([ResourceClaim::read("repository")])
+        };
+        let workflow = WorkflowBuilder::new(
+            "parallel-readers",
+            parallel_named("join", reader("reader-a"), reader("reader-b")),
+        )
+        .build()
+        .expect("workflow builds");
+
+        workflow
+            .run(Input { value: 1 })
+            .await
+            .expect("workflow runs");
+        assert_eq!(maximum.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cloned_step_resource_configuration_is_value_semantic() {
+        let base = Step::map("worker", |input: Input| Ok(input));
+        let writer = base.clone().resources([ResourceClaim::write("repository")]);
+        assert!(base.fragment.nodes[0].resources.is_empty());
+        assert_eq!(writer.fragment.nodes[0].resources.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn multi_resource_claims_are_atomic_and_order_independent() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let worker = |name: &'static str, claims: [ResourceClaim; 2]| {
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            Step::task(name, move |input: Input, _| {
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                async move {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    maximum.fetch_max(current, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(input)
+                }
+            })
+            .resources(claims)
+        };
+        let workflow = WorkflowBuilder::new(
+            "atomic-resources",
+            parallel_named(
+                "join",
+                worker(
+                    "first",
+                    [ResourceClaim::write("a"), ResourceClaim::write("b")],
+                ),
+                worker(
+                    "second",
+                    [ResourceClaim::write("b"), ResourceClaim::write("a")],
+                ),
+            ),
+        )
+        .build()
+        .expect("workflow builds");
+
+        tokio::time::timeout(Duration::from_secs(1), workflow.run(Input { value: 1 }))
+            .await
+            .expect("no deadlock")
+            .expect("workflow runs");
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_resource_wait() {
+        let left_started = Arc::new(Notify::new());
+        let release_left = Arc::new(Notify::new());
+        let left_started_for_step = Arc::clone(&left_started);
+        let release_left_for_step = Arc::clone(&release_left);
+        let left = Step::task("holder", move |input: Input, _| {
+            let started = Arc::clone(&left_started_for_step);
+            let release = Arc::clone(&release_left_for_step);
+            async move {
+                started.notify_one();
+                release.notified().await;
+                Ok(input)
+            }
+        })
+        .resources([ResourceClaim::write("repository")]);
+        let waiting = Step::task("waiting", |input: Input, _| async move { Ok(input) })
+            .resources([ResourceClaim::write("repository")]);
+        let workflow = Arc::new(
+            WorkflowBuilder::new("cancel-wait", parallel_named("join", left, waiting))
+                .build()
+                .expect("workflow builds"),
+        );
+        let cancellation = WorkflowCancellation::new();
+        let run_cancellation = cancellation.clone();
+        let run_workflow = Arc::clone(&workflow);
+        let task = tokio::spawn(async move {
+            run_workflow
+                .run_with_cancellation(Input { value: 1 }, run_cancellation)
+                .await
+        });
+
+        left_started.notified().await;
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+        release_left.notify_one();
+        let error = task
+            .await
+            .expect("workflow task joins")
+            .expect_err("workflow cancels");
+        assert!(matches!(error, WorkflowError::Cancelled { .. }));
     }
 
     #[tokio::test]
@@ -1785,6 +3198,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exhausted_retry_preserves_ordered_error_history() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let step = Step::map("always-fails", move |_input: Input| {
+            let attempt = observed.fetch_add(1, Ordering::SeqCst) + 1;
+            Err::<Input, _>(WorkflowError::step(
+                "always-fails",
+                format!("failure-{attempt}"),
+            ))
+        })
+        .retry_with_policy(
+            "retry-failure",
+            RetryPolicy::new(2).backoff(Duration::from_millis(1)),
+        );
+        let workflow = WorkflowBuilder::new("retry-history", step)
+            .build()
+            .expect("workflow builds");
+
+        let error = workflow
+            .run(Input { value: 0 })
+            .await
+            .expect_err("retry exhausts");
+        let WorkflowError::RetryExhausted {
+            attempts, errors, ..
+        } = error
+        else {
+            panic!("expected retry exhaustion");
+        };
+        assert_eq!(attempts, 2);
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].contains("failure-1"));
+        assert!(errors[1].contains("failure-2"));
+    }
+
+    #[tokio::test]
     async fn timeout_returns_step_scoped_terminal_error() {
         let step = Step::task("slow", |input: Input, _| async move {
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1800,6 +3248,52 @@ mod tests {
             .await
             .expect_err("times out");
         assert!(matches!(error, WorkflowError::TimedOut { .. }));
+    }
+
+    #[tokio::test]
+    async fn parallel_fail_fast_drops_unfinished_sibling() {
+        struct DropSignal(Arc<AtomicBool>);
+
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let sibling_dropped = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&sibling_dropped);
+        let failing = Step::task("failing", |_input: Input, _| async {
+            tokio::task::yield_now().await;
+            Err::<Doubled, _>(WorkflowError::step("failing", "boom"))
+        });
+        let sibling = Step::task("sibling", move |_input: Input, context| {
+            let observed = Arc::clone(&observed);
+            async move {
+                let _drop_signal = DropSignal(observed);
+                context.cancellation().cancelled().await;
+                Err::<Labelled, _>(WorkflowError::Cancelled {
+                    step: "sibling".to_string(),
+                })
+            }
+        });
+        let workflow = WorkflowBuilder::new(
+            "parallel-fail-fast",
+            parallel_named_with_policy(
+                "parallel",
+                ParallelFailurePolicy::FailFast,
+                failing,
+                sibling,
+            ),
+        )
+        .build()
+        .expect("workflow builds");
+
+        let error = workflow
+            .run(Input { value: 1 })
+            .await
+            .expect_err("branch fails");
+        assert!(error.to_string().contains("boom"));
+        assert!(sibling_dropped.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

@@ -8,10 +8,12 @@ use crate::{
     StructuredOutputOptions,
 };
 pub use bcode_workflow::{
-    EdgeDefinition, EdgeKind, Field, NodeDefinition, NodeKind, Predicate, PredicateExpression,
-    Step, StepContext, ValueSchema, Workflow, WorkflowBuilder, WorkflowCancellation,
-    WorkflowDefinition, WorkflowError, WorkflowEvent, WorkflowEventReceiver, WorkflowEventSender,
-    WorkflowOutcome, fan_out, field, parallel, parallel_named, workflow_event_channel,
+    AbortTaskOnDrop, ArtifactReference, EdgeDefinition, EdgeKind, Field, NodeDefinition, NodeKind,
+    NodeRunState, ParallelFailurePolicy, Predicate, PredicateExpression, ResourceAccess,
+    ResourceClaim, RetryPolicy, Step, StepContext, ValueSchema, Workflow, WorkflowBuilder,
+    WorkflowCancellation, WorkflowDefinition, WorkflowError, WorkflowEvent, WorkflowEventReceiver,
+    WorkflowEventSender, WorkflowOutcome, WorkflowPlan, WorkflowRunObserver, WorkflowRunSnapshot,
+    fan_out, field, parallel, parallel_named, parallel_named_with_policy, workflow_event_channel,
 };
 use schemars::JsonSchema;
 use serde::{Serialize, de::DeserializeOwned};
@@ -34,6 +36,7 @@ pub struct AgentStep<I, O> {
     max_repairs: u32,
     tool_restriction: Option<Vec<String>>,
     read_only_tools: bool,
+    resources: Vec<ResourceClaim>,
     timeout: Option<Duration>,
     _types: PhantomData<fn(I) -> O>,
 }
@@ -47,6 +50,7 @@ impl<I, O> std::fmt::Debug for AgentStep<I, O> {
             .field("max_repairs", &self.max_repairs)
             .field("tool_restriction", &self.tool_restriction)
             .field("read_only_tools", &self.read_only_tools)
+            .field("resources", &self.resources)
             .field("timeout", &self.timeout)
             .finish_non_exhaustive()
     }
@@ -84,6 +88,7 @@ where
             max_repairs: 0,
             tool_restriction: None,
             read_only_tools: false,
+            resources: Vec::new(),
             timeout: None,
             _types: PhantomData,
         }
@@ -144,6 +149,13 @@ where
         self
     }
 
+    /// Declare resources acquired atomically before this agent step executes.
+    #[must_use]
+    pub fn resources(mut self, claims: impl IntoIterator<Item = ResourceClaim>) -> Self {
+        self.resources = claims.into_iter().collect();
+        self
+    }
+
     /// Configure strict provider-native schema output where supported.
     #[must_use]
     pub const fn strict(mut self, strict: bool) -> Self {
@@ -185,6 +197,7 @@ where
         let max_repairs = self.max_repairs;
         let tool_restriction = self.tool_restriction;
         let read_only_tools = self.read_only_tools;
+        let resources = self.resources;
         let timeout = self.timeout;
         let agent = {
             let mut agent = self.agent;
@@ -219,14 +232,14 @@ where
                     let cancellation = CancellationToken::new();
                     let workflow_cancellation = context.cancellation();
                     let cancellation_signal = cancellation.clone();
-                    let cancellation_task = tokio::spawn(async move {
+                    let _cancellation_task = AbortTaskOnDrop::new(tokio::spawn(async move {
                         workflow_cancellation.cancelled().await;
                         cancellation_signal.cancel();
-                    });
+                    }));
                     let options = StructuredOutputOptions::for_type::<O>()
                         .with_strict(strict)
                         .with_max_repairs(max_repairs);
-                    let result = agent
+                    agent
                         .generate_object_with_provider_and_request_options(
                             &mut provider,
                             prompt,
@@ -235,12 +248,11 @@ where
                             cancellation,
                         )
                         .await
-                        .map_err(|error| map_agent_error(&step_name, &error));
-                    cancellation_task.abort();
-                    result
+                        .map_err(|error| map_agent_error(&step_name, &error))
                 }
             },
-        );
+        )
+        .resources(resources);
         if let Some(duration) = timeout {
             step.timeout(duration)
         } else {

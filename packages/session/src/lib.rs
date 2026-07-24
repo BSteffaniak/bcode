@@ -9239,6 +9239,7 @@ mod tests {
             idempotency_key: Some("operation-1".to_string()),
             execution: bcode_session_models::TurnExecutionOptions {
                 tools: bcode_session_models::TurnToolPolicy::Disabled,
+                ..bcode_session_models::TurnExecutionOptions::default()
             },
         };
 

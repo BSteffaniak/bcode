@@ -810,10 +810,16 @@ pub enum TurnToolPolicy {
 }
 
 /// Generic execution options applied to one admitted turn.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnExecutionOptions {
     #[serde(default)]
     pub tools: TurnToolPolicy,
+    /// Immutable agent/profile override for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_profile: Option<String>,
+    /// Exact tool names available to this turn, intersected with profile and generic tool policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_allowlist: Option<Vec<String>>,
 }
 
 /// Generic metadata carried by an ordinary admitted turn.
@@ -831,6 +837,9 @@ pub struct TurnAdmissionMetadata {
 
 const MAX_TURN_PRODUCER_BYTES: usize = 256;
 const MAX_TURN_IDEMPOTENCY_KEY_BYTES: usize = 512;
+const MAX_TURN_AGENT_PROFILE_BYTES: usize = 256;
+const MAX_TURN_TOOL_ALLOWLIST_ENTRIES: usize = 256;
+const MAX_TURN_TOOL_NAME_BYTES: usize = 256;
 
 /// Generic turn-admission metadata validation error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -839,6 +848,12 @@ pub enum TurnAdmissionMetadataError {
     ProducerTooLong,
     IdempotencyKeyTooLong,
     EmptyIdempotencyKey,
+    EmptyAgentProfile,
+    AgentProfileTooLong,
+    TooManyAllowedTools,
+    EmptyAllowedTool,
+    AllowedToolTooLong,
+    DuplicateAllowedTool,
 }
 
 impl Display for TurnAdmissionMetadataError {
@@ -850,6 +865,12 @@ impl Display for TurnAdmissionMetadataError {
             Self::ProducerTooLong => "turn origin producer is too long",
             Self::IdempotencyKeyTooLong => "turn idempotency key is too long",
             Self::EmptyIdempotencyKey => "turn idempotency key must not be empty",
+            Self::EmptyAgentProfile => "turn agent profile must not be empty",
+            Self::AgentProfileTooLong => "turn agent profile is too long",
+            Self::TooManyAllowedTools => "turn tool allowlist has too many entries",
+            Self::EmptyAllowedTool => "turn tool allowlist entries must not be empty",
+            Self::AllowedToolTooLong => "turn tool allowlist entry is too long",
+            Self::DuplicateAllowedTool => "turn tool allowlist contains a duplicate entry",
         })
     }
 }
@@ -884,6 +905,31 @@ impl TurnAdmissionMetadata {
                 .is_none_or(|origin| origin.producer.is_empty())
             {
                 return Err(TurnAdmissionMetadataError::MissingIdempotencyProducer);
+            }
+        }
+        if let Some(profile) = &self.execution.agent_profile {
+            if profile.is_empty() {
+                return Err(TurnAdmissionMetadataError::EmptyAgentProfile);
+            }
+            if profile.len() > MAX_TURN_AGENT_PROFILE_BYTES {
+                return Err(TurnAdmissionMetadataError::AgentProfileTooLong);
+            }
+        }
+        if let Some(tools) = &self.execution.tool_allowlist {
+            if tools.len() > MAX_TURN_TOOL_ALLOWLIST_ENTRIES {
+                return Err(TurnAdmissionMetadataError::TooManyAllowedTools);
+            }
+            let mut unique = std::collections::BTreeSet::new();
+            for tool in tools {
+                if tool.is_empty() {
+                    return Err(TurnAdmissionMetadataError::EmptyAllowedTool);
+                }
+                if tool.len() > MAX_TURN_TOOL_NAME_BYTES {
+                    return Err(TurnAdmissionMetadataError::AllowedToolTooLong);
+                }
+                if !unique.insert(tool) {
+                    return Err(TurnAdmissionMetadataError::DuplicateAllowedTool);
+                }
             }
         }
         Ok(())
@@ -2479,6 +2525,51 @@ mod tests {
         assert_eq!(metadata.idempotency_key, None);
         assert_eq!(metadata.execution.tools, TurnToolPolicy::Enabled);
         assert_eq!(metadata.validate(), Ok(()));
+    }
+
+    #[test]
+    fn turn_execution_overrides_round_trip_and_validate() {
+        let metadata = TurnAdmissionMetadata {
+            execution: TurnExecutionOptions {
+                tools: TurnToolPolicy::ReadOnly,
+                agent_profile: Some("review".to_string()),
+                tool_allowlist: Some(vec!["filesystem.read".to_string(), "git.diff".to_string()]),
+            },
+            ..TurnAdmissionMetadata::default()
+        };
+
+        assert_eq!(metadata.validate(), Ok(()));
+        let encoded = serde_json::to_string(&metadata).expect("metadata should encode");
+        let decoded: TurnAdmissionMetadata =
+            serde_json::from_str(&encoded).expect("metadata should decode");
+        assert_eq!(decoded, metadata);
+    }
+
+    #[test]
+    fn turn_execution_overrides_reject_empty_and_duplicate_values() {
+        let empty_profile = TurnAdmissionMetadata {
+            execution: TurnExecutionOptions {
+                agent_profile: Some(String::new()),
+                ..TurnExecutionOptions::default()
+            },
+            ..TurnAdmissionMetadata::default()
+        };
+        assert_eq!(
+            empty_profile.validate(),
+            Err(TurnAdmissionMetadataError::EmptyAgentProfile)
+        );
+
+        let duplicate_tool = TurnAdmissionMetadata {
+            execution: TurnExecutionOptions {
+                tool_allowlist: Some(vec!["git.diff".to_string(), "git.diff".to_string()]),
+                ..TurnExecutionOptions::default()
+            },
+            ..TurnAdmissionMetadata::default()
+        };
+        assert_eq!(
+            duplicate_tool.validate(),
+            Err(TurnAdmissionMetadataError::DuplicateAllowedTool)
+        );
     }
 
     #[test]

@@ -1314,7 +1314,10 @@ async fn run_ordinary_turn(
                     display_label: Some(display_label),
                 }),
                 idempotency_key: Some(operation_id.clone()),
-                execution: bcode_session_models::TurnExecutionOptions { tools: tool_policy },
+                execution: bcode_session_models::TurnExecutionOptions {
+                    tools: tool_policy,
+                    ..bcode_session_models::TurnExecutionOptions::default()
+                },
                 ..bcode_session_models::TurnAdmissionMetadata::default()
             },
         )

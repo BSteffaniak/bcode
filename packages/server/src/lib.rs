@@ -11031,7 +11031,7 @@ async fn run_model_turn_inner(
     command_context: &mut RuntimeCommandContext<'_>,
     phase: &Arc<Mutex<SessionRuntimePhase>>,
 ) -> ModelTurnCompletion {
-    let tool_policy = turn_tool_policy(trigger_event);
+    let execution = turn_execution_options(trigger_event);
     let selection =
         session_model_selection_with_runtime_context(state, session_id, runtime_context).await;
 
@@ -11052,7 +11052,7 @@ async fn run_model_turn_inner(
         state,
         session_id,
         trigger_event.sequence,
-        tool_policy,
+        &execution,
     )
     .await
     {
@@ -11320,7 +11320,7 @@ async fn run_model_turn_inner(
                     outcome.pending_tool_calls,
                     Arc::clone(&cancel_state),
                     command_context,
-                    tool_policy,
+                    &execution,
                 )
                 .await
                 {
@@ -13691,12 +13691,12 @@ struct StaticModelTurnContext {
     tools: Vec<bcode_model::ToolDefinition>,
 }
 
-fn turn_tool_policy(
+fn turn_execution_options(
     trigger_event: &bcode_session_models::SessionEvent,
-) -> bcode_session_models::TurnToolPolicy {
+) -> bcode_session_models::TurnExecutionOptions {
     match &trigger_event.kind {
-        SessionEventKind::UserMessage { admission, .. } => admission.execution.tools,
-        _ => bcode_session_models::TurnToolPolicy::default(),
+        SessionEventKind::UserMessage { admission, .. } => admission.execution.clone(),
+        _ => bcode_session_models::TurnExecutionOptions::default(),
     }
 }
 
@@ -13704,9 +13704,12 @@ async fn prepare_static_model_turn_context(
     state: &ServerState,
     session_id: SessionId,
     trigger_event_sequence: u64,
-    tool_policy: bcode_session_models::TurnToolPolicy,
+    execution: &bcode_session_models::TurnExecutionOptions,
 ) -> Result<StaticModelTurnContext, bcode_session::SessionError> {
-    let agent_id = session_agent_selection(state, session_id).await;
+    let agent_id = execution
+        .agent_profile
+        .clone()
+        .unwrap_or(session_agent_selection(state, session_id).await);
     let agent_context = agent_context(state, session_id, &agent_id).await;
     let working_directory = state.sessions.session_working_directory(session_id).await?;
     let skill_catalog = if state.system_prompt.sections.skill_catalog {
@@ -13756,10 +13759,13 @@ async fn prepare_static_model_turn_context(
             )
             .await;
     }
-    let enabled_tools = agent_context
-        .as_ref()
-        .and_then(|context| context.enabled_tools.clone());
-    let tools = collect_model_tools(state, session_id, enabled_tools, tool_policy).await;
+    let enabled_tools = intersect_tool_allowlists(
+        agent_context
+            .as_ref()
+            .and_then(|context| context.enabled_tools.clone()),
+        execution.tool_allowlist.as_ref(),
+    );
+    let tools = collect_model_tools(state, session_id, enabled_tools, execution.tools).await;
     Ok(StaticModelTurnContext {
         system_prompt,
         system_messages,
@@ -15150,6 +15156,26 @@ fn tool_policy_denies_tool(
     metadata.is_none_or(|metadata| !tool_policy_allows_operation(policy, metadata.is_read_only()))
 }
 
+fn intersect_tool_allowlists(
+    profile_tools: Option<Vec<String>>,
+    turn_tools: Option<&Vec<String>>,
+) -> Option<Vec<String>> {
+    match (profile_tools, turn_tools) {
+        (None, None) => None,
+        (Some(tools), None) => Some(tools),
+        (None, Some(tools)) => Some(tools.clone()),
+        (Some(profile), Some(turn)) => {
+            let profile = profile.into_iter().collect::<BTreeSet<_>>();
+            Some(
+                turn.iter()
+                    .filter(|tool| profile.contains(*tool))
+                    .cloned()
+                    .collect(),
+            )
+        }
+    }
+}
+
 async fn collect_model_tools(
     state: &ServerState,
     session_id: SessionId,
@@ -15513,6 +15539,7 @@ struct ServerAuthorizationCoordinator<'a> {
     cancel_state: &'a TurnCancelState,
     call_count: usize,
     tool_policy: bcode_session_models::TurnToolPolicy,
+    agent_id: &'a str,
 }
 
 impl<'a> ServerAuthorizationCoordinator<'a> {
@@ -15522,6 +15549,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
         cancel_state: &'a TurnCancelState,
         call_count: usize,
         tool_policy: bcode_session_models::TurnToolPolicy,
+        agent_id: &'a str,
     ) -> Self {
         Self {
             state,
@@ -15529,6 +15557,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
             cancel_state,
             call_count,
             tool_policy,
+            agent_id,
         }
     }
 
@@ -15560,6 +15589,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
         let agent_decision = evaluate_agent_tool_policy_with_metadata(
             self.state,
             self.session_id,
+            self.agent_id,
             &request.call,
             &policy_metadata,
         )
@@ -15571,7 +15601,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
             SessionTracePhase::ToolPolicyEvaluated,
             SessionTracePayload::ToolPolicyEvaluated {
                 tool_call_id: request.call.id.clone(),
-                agent_id: session_agent_selection(self.state, self.session_id).await,
+                agent_id: self.agent_id.to_string(),
                 decision: agent_decision_name(agent_decision.decision).to_string(),
                 reason: agent_decision.reason.clone(),
             },
@@ -15591,7 +15621,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
             SessionTracePhase::ToolPolicyEvaluated,
             SessionTracePayload::ToolPolicyEvaluated {
                 tool_call_id: request.call.id.clone(),
-                agent_id: session_agent_selection(self.state, self.session_id).await,
+                agent_id: self.agent_id.to_string(),
                 decision: skill_tool_policy_decision_name(&skill_decision).to_string(),
                 reason: skill_tool_policy_reason(&skill_decision),
             },
@@ -15630,7 +15660,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
                         SessionTracePhase::ToolPolicyEvaluated,
                         SessionTracePayload::ToolPolicyEvaluated {
                             tool_call_id: request.call.id.clone(),
-                            agent_id: session_agent_selection(self.state, self.session_id).await,
+                            agent_id: self.agent_id.to_string(),
                             decision: "remembered_skill_allow".to_string(),
                             reason: Some(
                                 "remembered skill tool decision allowed prompt skip".to_string(),
@@ -15648,7 +15678,7 @@ impl<'a> ServerAuthorizationCoordinator<'a> {
                         SessionTracePhase::ToolPolicyEvaluated,
                         SessionTracePayload::ToolPolicyEvaluated {
                             tool_call_id: request.call.id.clone(),
-                            agent_id: session_agent_selection(self.state, self.session_id).await,
+                            agent_id: self.agent_id.to_string(),
                             decision: "remembered_skill_deny".to_string(),
                             reason: Some(
                                 "remembered skill tool decision denied tool call".to_string(),
@@ -15733,8 +15763,13 @@ async fn execute_model_tool_batch(
     calls: Vec<bcode_model::ToolCall>,
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
-    tool_policy: bcode_session_models::TurnToolPolicy,
+    execution: &bcode_session_models::TurnExecutionOptions,
 ) -> bool {
+    let tool_policy = execution.tools;
+    let tool_allowlist = execution
+        .tool_allowlist
+        .as_ref()
+        .map(|tools| tools.iter().cloned().collect::<BTreeSet<_>>());
     let call_count = calls.len();
     let catalog = match tokio::select! {
         biased;
@@ -15759,6 +15794,22 @@ async fn execute_model_tool_batch(
     for (index, call) in calls.into_iter().enumerate() {
         if cancel_state.is_cancelled() {
             return false;
+        }
+        if tool_allowlist
+            .as_ref()
+            .is_some_and(|allowed| !allowed.contains(&call.name))
+        {
+            results.push((
+                index,
+                Some(ToolFinishedEventInput {
+                    tool_call_id: call.id,
+                    result: format!("tool denied by turn allowlist: {}", call.name),
+                    is_error: true,
+                    content: Vec::new(),
+                    semantic_result: None,
+                }),
+            ));
+            continue;
         }
         let Some(tool) = catalog.find_tool(&call.name) else {
             results.push((
@@ -15861,9 +15912,13 @@ async fn execute_model_tool_batch(
     }
 
     if !ready.is_empty() {
+        let agent_id = execution
+            .agent_profile
+            .clone()
+            .unwrap_or(session_agent_selection(state, session_id).await);
         let permission_context = bcode_agent_runtime::RuntimePermissionContext {
             session_id,
-            agent_id: session_agent_selection(state, session_id).await,
+            agent_id: agent_id.clone(),
         };
         let authorization_requests = ready
             .iter()
@@ -15887,6 +15942,7 @@ async fn execute_model_tool_batch(
             cancel_state.as_ref(),
             call_count,
             tool_policy,
+            &agent_id,
         );
         let authorization =
             coordinator.authorize_batch(&authorization_requests, &authorization_scope);
@@ -17874,10 +17930,10 @@ const fn convert_tool_output_stream(stream: ToolOutputStream) -> SessionToolOutp
 async fn evaluate_agent_tool_policy_with_metadata(
     state: &ServerState,
     session_id: SessionId,
+    agent_id: &str,
     call: &bcode_model::ToolCall,
     metadata: &ToolPolicyAuthorizationMetadata,
 ) -> EvaluateToolCallResponse {
-    let agent_id = session_agent_selection(state, session_id).await;
     let cwd = state
         .sessions
         .session_working_directory(session_id)
@@ -17890,7 +17946,7 @@ async fn evaluate_agent_tool_policy_with_metadata(
         .collect();
     let request = EvaluateToolCallRequest {
         session_id,
-        agent_id,
+        agent_id: agent_id.to_string(),
         tool_name: call.name.clone(),
         operation: metadata.operation.clone(),
         aliases,
@@ -26698,6 +26754,7 @@ library = "test"
         policy_metadata: &ToolPolicyAuthorizationMetadata,
         cancel_state: &TurnCancelState,
     ) -> Result<ToolInvocationResponse, String> {
+        let agent_id = session_agent_selection(state, session_id).await;
         let request = ToolAuthorizationRequest {
             index: 0,
             call: call.clone(),
@@ -26705,7 +26762,7 @@ library = "test"
             facts: preparation.authorization,
             context: bcode_agent_runtime::RuntimePermissionContext {
                 session_id,
-                agent_id: session_agent_selection(state, session_id).await,
+                agent_id: agent_id.clone(),
             },
         };
         let decision = ServerAuthorizationCoordinator::new(
@@ -26714,6 +26771,7 @@ library = "test"
             cancel_state,
             1,
             bcode_session_models::TurnToolPolicy::Enabled,
+            &agent_id,
         )
         .authorize_one(&request, None)
         .await;
@@ -27573,7 +27631,7 @@ library = "test"
                 ],
                 Arc::new(TurnCancelState::default()),
                 &mut command_context,
-                bcode_session_models::TurnToolPolicy::Enabled,
+                &bcode_session_models::TurnExecutionOptions::default(),
             )
             .await
         );
@@ -27658,7 +27716,7 @@ library = "test"
                 calls,
                 task_cancel,
                 &mut command_context,
-                bcode_session_models::TurnToolPolicy::Enabled,
+                &bcode_session_models::TurnExecutionOptions::default(),
             )
             .await
         });
@@ -33380,6 +33438,7 @@ library = "test"
                 admission: bcode_session_models::TurnAdmissionMetadata {
                     execution: bcode_session_models::TurnExecutionOptions {
                         tools: bcode_session_models::TurnToolPolicy::ReadOnly,
+                        ..bcode_session_models::TurnExecutionOptions::default()
                     },
                     ..bcode_session_models::TurnAdmissionMetadata::default()
                 },
@@ -33396,12 +33455,54 @@ library = "test"
         );
 
         assert_eq!(
-            turn_tool_policy(&read_only),
+            turn_execution_options(&read_only).tools,
             bcode_session_models::TurnToolPolicy::ReadOnly
         );
         assert_eq!(
-            turn_tool_policy(&enabled),
+            turn_execution_options(&enabled).tools,
             bcode_session_models::TurnToolPolicy::Enabled
+        );
+    }
+
+    #[test]
+    fn turn_execution_options_preserve_profile_and_exact_tool_overrides() {
+        let event = session_event(
+            SessionId::new(),
+            1,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "review".to_owned(),
+                admission: bcode_session_models::TurnAdmissionMetadata {
+                    execution: bcode_session_models::TurnExecutionOptions {
+                        tools: bcode_session_models::TurnToolPolicy::ReadOnly,
+                        agent_profile: Some("review".to_string()),
+                        tool_allowlist: Some(vec!["git.diff".to_string()]),
+                    },
+                    ..bcode_session_models::TurnAdmissionMetadata::default()
+                },
+            },
+        );
+
+        let execution = turn_execution_options(&event);
+        assert_eq!(execution.agent_profile.as_deref(), Some("review"));
+        assert_eq!(
+            execution.tool_allowlist.as_deref(),
+            Some(["git.diff".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn exact_turn_tool_allowlist_intersects_profile_tools() {
+        assert_eq!(
+            intersect_tool_allowlists(
+                Some(vec!["git.diff".to_string(), "filesystem.read".to_string()]),
+                Some(&vec!["git.diff".to_string(), "shell.run".to_string()]),
+            ),
+            Some(vec!["git.diff".to_string()])
+        );
+        assert_eq!(
+            intersect_tool_allowlists(None, Some(&Vec::new())),
+            Some(Vec::new())
         );
     }
 

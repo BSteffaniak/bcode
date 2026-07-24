@@ -6981,8 +6981,8 @@ impl Agent {
                         .is_guaranteed()
                 });
             request.tool_call_policy = bcode_model::ParallelToolCallCapabilities {
-                provider: parallel_guaranteed,
-                model: parallel_guaranteed,
+                provider: Some(parallel_guaranteed),
+                model: Some(parallel_guaranteed),
                 runtime: true,
             }
             .negotiate(

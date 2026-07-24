@@ -1,4 +1,7 @@
+#![cfg(feature = "testing")]
+
 use bcode::workflow::{WorkflowBuilder, agent};
+
 use bcode::{
     ProviderError, ProviderErrorCategory, ProviderTurnEvent, StopReason, ToolApplicationError,
     ToolSideEffect, TypedTool,

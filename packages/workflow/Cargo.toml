@@ -16,7 +16,7 @@ schemars   = { workspace = true }
 serde      = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true, features = ["std"] }
 thiserror  = { workspace = true }
-tokio      = { workspace = true, features = ["sync", "time"] }
+tokio      = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
