@@ -1,4 +1,8 @@
-use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
+use bcode_markdown_render::{
+    MarkdownContributionKind, MarkdownRenderOptions, MarkdownSemanticEventKind,
+    MarkdownSemanticTag, MarkdownTableAlignment, parse_markdown_document, render_markdown,
+    render_markdown_lines,
+};
 use bmux_tui::prelude::{Color, Line, Modifier, Style};
 use unicode_width::UnicodeWidthStr;
 
@@ -19,6 +23,8 @@ const LISTS: &str = include_str!("fixtures/lists.md");
 const LISTS_NUMBERING: &str = include_str!("fixtures/lists_numbering.md");
 const LISTS_TIGHT_LOOSE: &str = include_str!("fixtures/lists_tight_loose.md");
 const PARAGRAPHS: &str = include_str!("fixtures/paragraphs.md");
+const SEMANTIC_EXTENSIONS: &str = include_str!("fixtures/semantic_extensions.md");
+const SEMANTIC_MALFORMED: &str = include_str!("fixtures/semantic_malformed.md");
 const STREAMING_CODE: &str = include_str!("fixtures/streaming_code.md");
 const STREAMING_INLINE: &str = include_str!("fixtures/streaming_inline.md");
 const STREAMING_STRUCTURES: &str = include_str!("fixtures/streaming_structures.md");
@@ -134,6 +140,159 @@ fn color_label(color: Color) -> String {
         Color::Indexed(index) => format!("indexed-{index}"),
         Color::Rgb(red, green, blue) => format!("rgb-{red}-{green}-{blue}"),
     }
+}
+
+fn semantic_snapshot(markdown: &str) -> String {
+    parse_markdown_document(markdown)
+        .events
+        .into_iter()
+        .map(|event| {
+            format!(
+                "{:04}..{:04} │ {:?}",
+                event.source_range.start, event.source_range.end, event.kind
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn contribution_snapshot(markdown: &str) -> String {
+    render_markdown(markdown, MarkdownRenderOptions::new(80))
+        .contributions
+        .into_iter()
+        .map(|contribution| {
+            format!(
+                "{} │ {:04}..{:04} │ {:?}",
+                contribution.id,
+                contribution.source_range.start,
+                contribution.source_range.end,
+                contribution.kind
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn snapshots_parser_neutral_semantic_contributions() {
+    insta::assert_snapshot!(
+        "semantic_contributions",
+        contribution_snapshot(SEMANTIC_EXTENSIONS)
+    );
+}
+
+#[test]
+fn semantic_contributions_have_stable_unique_ids_and_expected_payloads() {
+    let first = render_markdown(SEMANTIC_EXTENSIONS, MarkdownRenderOptions::new(80));
+    let second = render_markdown(SEMANTIC_EXTENSIONS, MarkdownRenderOptions::new(24));
+    let first_ids = first
+        .contributions
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<Vec<_>>();
+    let second_ids = second
+        .contributions
+        .iter()
+        .map(|item| item.id.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(first_ids, second_ids);
+    let unique = first_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(unique.len(), first_ids.len());
+    assert!(first.contributions.iter().any(|item| matches!(
+        &item.kind,
+        MarkdownContributionKind::Link { label, .. } if label == "link"
+    )));
+    assert!(first.contributions.iter().any(|item| matches!(
+        &item.kind,
+        MarkdownContributionKind::Image { alt, .. } if alt == "diagram"
+    )));
+    assert!(first.contributions.iter().any(|item| matches!(
+        &item.kind,
+        MarkdownContributionKind::Mermaid { source } if source.contains("A --> B")
+    )));
+}
+
+#[test]
+fn malformed_extensions_remain_visible_and_balanced() {
+    let document = parse_markdown_document(SEMANTIC_MALFORMED);
+    let semantic = semantic_snapshot(SEMANTIC_MALFORMED);
+    let visible = visible_snapshot(SEMANTIC_MALFORMED, 60);
+
+    assert!(!document.events.is_empty());
+    assert!(semantic.contains("incomplete alert"));
+    assert!(semantic.contains("CodeBlock(Some(\"mermaid\"))"));
+    assert!(visible.contains("[!NOTE incomplete alert"));
+    assert!(visible.contains("Unclosed [link]( destination"));
+    assert!(visible.contains("Inline $unterminated"));
+    assert!(visible.contains("Reference [^missing]"));
+    assert!(visible.contains("<details open data-unsupported"));
+    assert!(visible.contains("┌─ mermaid"));
+}
+
+#[test]
+fn snapshots_parser_neutral_semantic_extensions() {
+    insta::assert_snapshot!(
+        "semantic_extensions",
+        semantic_snapshot(SEMANTIC_EXTENSIONS)
+    );
+}
+
+#[test]
+fn semantic_extensions_preserve_required_metadata_and_source_order() {
+    let document = parse_markdown_document(SEMANTIC_EXTENSIONS);
+    for event in &document.events {
+        assert!(event.source_range.start <= event.source_range.end);
+        assert!(event.source_range.end <= SEMANTIC_EXTENSIONS.len());
+    }
+
+    assert!(document.events.iter().any(|event| matches!(
+        &event.kind,
+        MarkdownSemanticEventKind::Start(MarkdownSemanticTag::Link(link))
+            if link.destination == "./docs/protocol.md" && link.title.as_deref() == Some("Protocol")
+    )));
+    assert!(document.events.iter().any(|event| matches!(
+        &event.kind,
+        MarkdownSemanticEventKind::Start(MarkdownSemanticTag::Image(image))
+            if image.source == "diagram.png" && image.title.as_deref() == Some("Diagram")
+    )));
+    assert!(document.events.iter().any(|event| matches!(
+        &event.kind,
+        MarkdownSemanticEventKind::InlineMath(math) if math == "x^2"
+    )));
+    assert!(document.events.iter().any(|event| matches!(
+        &event.kind,
+        MarkdownSemanticEventKind::DisplayMath(math) if math == "x = y + 1"
+    )));
+    assert!(document.events.iter().any(|event| matches!(
+        &event.kind,
+        MarkdownSemanticEventKind::FootnoteReference(label) if label == "note"
+    )));
+    assert!(document.events.iter().any(|event| matches!(
+        &event.kind,
+        MarkdownSemanticEventKind::Start(MarkdownSemanticTag::FootnoteDefinition(label))
+            if label == "note"
+    )));
+    assert!(document.events.iter().any(|event| matches!(
+        &event.kind,
+        MarkdownSemanticEventKind::Start(MarkdownSemanticTag::Table(alignments))
+            if alignments == &[
+                MarkdownTableAlignment::Left,
+                MarkdownTableAlignment::Center,
+                MarkdownTableAlignment::Right,
+            ]
+    )));
+    assert!(document.events.iter().any(|event| matches!(
+        &event.kind,
+        MarkdownSemanticEventKind::Start(MarkdownSemanticTag::CodeBlock(Some(language)))
+            if language == "mermaid"
+    )));
+    assert!(document.events.iter().any(|event| matches!(
+        &event.kind,
+        MarkdownSemanticEventKind::Html(html) if html.contains("<details>")
+    )));
 }
 
 #[test]

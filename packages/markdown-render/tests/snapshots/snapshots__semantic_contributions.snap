@@ -1,0 +1,11 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: contribution_snapshot(SEMANTIC_EXTENSIONS)
+---
+link:54:91 │ 0054..0091 │ Link { link: MarkdownLink { destination: "./docs/protocol.md", title: Some("Protocol"), reference_id: None, kind: Inline }, label: "link" }
+image:96:129 │ 0096..0129 │ Image { image: MarkdownImage { source: "diagram.png", title: Some("Diagram"), reference_id: None, kind: Inline }, alt: "diagram" }
+inline-math:136:141 │ 0136..0141 │ InlineMath { source: "x^2" }
+display-math:148:161 │ 0148..0161 │ DisplayMath { source: "x = y + 1" }
+footnote-reference:173:180 │ 0173..0180 │ FootnoteReference { label: "note" }
+footnote-definition:182:211 │ 0182..0211 │ FootnoteDefinition { label: "note" }
+mermaid:267:304 │ 0267..0304 │ Mermaid { source: "flowchart LR\n  A --> B\n" }

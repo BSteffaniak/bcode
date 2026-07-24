@@ -33,7 +33,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use std::{cell::Cell, rc::Rc};
+use std::{cell::Cell, ops::Range, rc::Rc};
 
 use bcode_syntax_render::SyntaxHighlighter;
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
@@ -41,7 +41,10 @@ use hyperchad_color::Color as HyperChadColor;
 use hyperchad_markdown::{MarkdownOptions, markdown_to_container_with_options};
 use hyperchad_transformer::{Container, Element, Input};
 use hyperchad_transformer_models::{FontWeight, TextDecorationLine};
-use pulldown_cmark::{Alignment, BlockQuoteKind, Event, Options as ParserOptions, Parser, Tag};
+use pulldown_cmark::{
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, LinkType,
+    Options as ParserOptions, Parser, Tag, TagEnd,
+};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -176,55 +179,377 @@ impl MarkdownRenderOptions {
 /// Semantic text is collected through the Markdown parser rather than by stripping punctuation.
 #[must_use]
 pub fn markdown_to_plain_text(markdown: &str) -> String {
-    let container = markdown_to_container_with_options(markdown, hyperchad_markdown_options());
+    let document = parse_markdown_document(markdown);
     let mut output = String::new();
-    collect_plain_text(&container, &mut output);
-    normalize_inline_whitespace(&output).trim().to_owned()
-}
-
-fn collect_plain_text(container: &Container, output: &mut String) {
-    match &container.element {
-        Element::Text { value } | Element::Raw { value } => output.push_str(value),
-        Element::Input {
-            input: Input::Checkbox { checked },
-            ..
-        } => output.push_str(if checked.unwrap_or(false) {
-            "checked "
-        } else {
-            "unchecked "
-        }),
-        Element::Image { alt, source, .. } => {
-            output.push_str(
-                alt.as_deref()
-                    .filter(|value| !value.is_empty())
-                    .or_else(|| source.as_deref().filter(|value| !value.is_empty()))
-                    .unwrap_or("image"),
-            );
-            output.push(' ');
-        }
-        _ => {
-            for child in &container.children {
-                collect_plain_text(child, output);
-                if is_block_container(child)
-                    || matches!(
-                        child.element,
-                        Element::Heading { .. }
-                            | Element::ListItem
-                            | Element::TR
-                            | Element::TH { .. }
-                            | Element::TD { .. }
-                    )
-                {
+    for event in document.events {
+        match event.kind {
+            MarkdownSemanticEventKind::Start(_) => {}
+            MarkdownSemanticEventKind::End(tag) => {
+                if semantic_end_needs_separator(tag) {
                     output.push(' ');
                 }
             }
+            MarkdownSemanticEventKind::Text(text)
+            | MarkdownSemanticEventKind::Code(text)
+            | MarkdownSemanticEventKind::InlineMath(text)
+            | MarkdownSemanticEventKind::DisplayMath(text) => output.push_str(&text),
+            MarkdownSemanticEventKind::Html(html) => {
+                collect_html_plain_text(&html, &mut output);
+            }
+            MarkdownSemanticEventKind::FootnoteReference(label) => {
+                output.push_str(" [");
+                output.push_str(&label);
+                output.push(']');
+            }
+            MarkdownSemanticEventKind::SoftBreak | MarkdownSemanticEventKind::HardBreak => {
+                output.push(' ');
+            }
+            MarkdownSemanticEventKind::Rule => output.push_str(" — "),
+            MarkdownSemanticEventKind::TaskListMarker(checked) => {
+                output.push_str(if checked { "checked " } else { "unchecked " });
+            }
         }
+    }
+    normalize_inline_whitespace(&output).trim().to_owned()
+}
+
+const fn semantic_end_needs_separator(tag: MarkdownSemanticTagEnd) -> bool {
+    matches!(
+        tag,
+        MarkdownSemanticTagEnd::Paragraph
+            | MarkdownSemanticTagEnd::Heading
+            | MarkdownSemanticTagEnd::BlockQuote
+            | MarkdownSemanticTagEnd::CodeBlock
+            | MarkdownSemanticTagEnd::List
+            | MarkdownSemanticTagEnd::Item
+            | MarkdownSemanticTagEnd::FootnoteDefinition
+            | MarkdownSemanticTagEnd::Table
+            | MarkdownSemanticTagEnd::TableHead
+            | MarkdownSemanticTagEnd::TableRow
+            | MarkdownSemanticTagEnd::TableCell
+    )
+}
+
+fn collect_html_plain_text(html: &str, output: &mut String) {
+    let mut in_tag = false;
+    for character in html.chars() {
+        match character {
+            '<' => {
+                in_tag = true;
+                output.push(' ');
+            }
+            '>' if in_tag => {
+                in_tag = false;
+                output.push(' ');
+            }
+            _ if !in_tag => output.push(character),
+            _ => {}
+        }
+    }
+}
+
+/// Semantic Markdown data preserved before terminal projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownDocument {
+    /// Source-order parser events carrying only Bcode-owned types.
+    pub events: Vec<MarkdownSemanticEvent>,
+}
+
+/// A semantic Markdown event with its byte range in the original source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownSemanticEvent {
+    /// Bcode-owned semantic event kind.
+    pub kind: MarkdownSemanticEventKind,
+    /// Byte range in the original Markdown source.
+    pub source_range: Range<usize>,
+}
+
+/// Bcode-owned semantic events needed by terminal rendering and interaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkdownSemanticEventKind {
+    /// Start of a semantic container.
+    Start(MarkdownSemanticTag),
+    /// End of a semantic container.
+    End(MarkdownSemanticTagEnd),
+    /// Plain source text.
+    Text(String),
+    /// Inline code.
+    Code(String),
+    /// Inline math source without delimiters.
+    InlineMath(String),
+    /// Display math source without delimiters.
+    DisplayMath(String),
+    /// Raw HTML source.
+    Html(String),
+    /// Footnote reference label.
+    FootnoteReference(String),
+    /// Soft line break.
+    SoftBreak,
+    /// Hard line break.
+    HardBreak,
+    /// Thematic break.
+    Rule,
+    /// Task-list marker state.
+    TaskListMarker(bool),
+}
+
+/// Semantic container tags independent of the parser implementation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkdownSemanticTag {
+    /// Paragraph.
+    Paragraph,
+    /// Heading level from one through six.
+    Heading(u8),
+    /// Ordinary blockquote or typed GitHub alert.
+    BlockQuote(Option<MarkdownAlertKind>),
+    /// Fenced or indented code block and optional language identifier.
+    CodeBlock(Option<String>),
+    /// Raw HTML block.
+    HtmlBlock,
+    /// Ordered list with its source start, or unordered list when absent.
+    List(Option<u64>),
+    /// List item.
+    Item,
+    /// Footnote definition label.
+    FootnoteDefinition(String),
+    /// Table and per-column alignments.
+    Table(Vec<MarkdownTableAlignment>),
+    /// Table head.
+    TableHead,
+    /// Table row.
+    TableRow,
+    /// Table cell.
+    TableCell,
+    /// Emphasis.
+    Emphasis,
+    /// Strong emphasis.
+    Strong,
+    /// Strikethrough.
+    Strikethrough,
+    /// Link metadata.
+    Link(MarkdownLink),
+    /// Image metadata.
+    Image(MarkdownImage),
+}
+
+/// End tags for semantic containers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkdownSemanticTagEnd {
+    /// Paragraph.
+    Paragraph,
+    /// Heading.
+    Heading,
+    /// Blockquote or alert.
+    BlockQuote,
+    /// Code block.
+    CodeBlock,
+    /// Raw HTML block.
+    HtmlBlock,
+    /// List.
+    List,
+    /// List item.
+    Item,
+    /// Footnote definition.
+    FootnoteDefinition,
+    /// Table.
+    Table,
+    /// Table head.
+    TableHead,
+    /// Table row.
+    TableRow,
+    /// Table cell.
+    TableCell,
+    /// Emphasis.
+    Emphasis,
+    /// Strong emphasis.
+    Strong,
+    /// Strikethrough.
+    Strikethrough,
+    /// Link.
+    Link,
+    /// Image.
+    Image,
+}
+
+/// GitHub alert kinds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkdownAlertKind {
+    /// Note.
+    Note,
+    /// Tip.
+    Tip,
+    /// Important information.
+    Important,
+    /// Warning.
+    Warning,
+    /// Caution.
+    Caution,
+}
+
+/// GFM table cell alignment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkdownTableAlignment {
+    /// No explicit alignment.
+    None,
+    /// Left aligned.
+    Left,
+    /// Center aligned.
+    Center,
+    /// Right aligned.
+    Right,
+}
+
+/// Link metadata preserved independently from its rendered label.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownLink {
+    /// Destination exactly as parsed.
+    pub destination: String,
+    /// Optional title.
+    pub title: Option<String>,
+    /// Reference identifier when present.
+    pub reference_id: Option<String>,
+    /// Link syntax kind.
+    pub kind: MarkdownLinkKind,
+}
+
+/// Image metadata preserved independently from its alt-text events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownImage {
+    /// Image source exactly as parsed.
+    pub source: String,
+    /// Optional title.
+    pub title: Option<String>,
+    /// Reference identifier when present.
+    pub reference_id: Option<String>,
+    /// Image link syntax kind.
+    pub kind: MarkdownLinkKind,
+}
+
+/// Parser-neutral link syntax kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkdownLinkKind {
+    /// Inline destination.
+    Inline,
+    /// Reference destination.
+    Reference,
+    /// Collapsed reference.
+    Collapsed,
+    /// Shortcut reference.
+    Shortcut,
+    /// Automatic URL link.
+    Autolink,
+    /// Automatic email link.
+    Email,
+    /// Wiki-style link.
+    WikiLink,
+    /// Unresolved reference form.
+    Unresolved,
+}
+
+/// Parse Markdown into Bcode-owned source-order semantic events.
+#[must_use]
+pub fn parse_markdown_document(markdown: &str) -> MarkdownDocument {
+    let mut options = ParserOptions::empty();
+    options.insert(ParserOptions::ENABLE_TABLES);
+    options.insert(ParserOptions::ENABLE_STRIKETHROUGH);
+    options.insert(ParserOptions::ENABLE_TASKLISTS);
+    options.insert(ParserOptions::ENABLE_FOOTNOTES);
+    options.insert(ParserOptions::ENABLE_SMART_PUNCTUATION);
+    options.insert(ParserOptions::ENABLE_HEADING_ATTRIBUTES);
+    options.insert(ParserOptions::ENABLE_GFM);
+    options.insert(ParserOptions::ENABLE_MATH);
+
+    MarkdownDocument {
+        events: Parser::new_ext(markdown, options)
+            .into_offset_iter()
+            .filter_map(|(event, source_range)| {
+                semantic_event(event).map(|kind| MarkdownSemanticEvent { kind, source_range })
+            })
+            .collect(),
+    }
+}
+
+/// Rendered Markdown lines plus semantic contributions for richer consumers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownRenderResult {
+    /// Terminal text projection.
+    pub lines: Vec<Line>,
+    /// Source-order semantic contributions independent of TUI event-loop types.
+    pub contributions: Vec<MarkdownContribution>,
+}
+
+/// Stable semantic contribution emitted alongside terminal lines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownContribution {
+    /// Stable identity derived from semantic kind and source byte range.
+    pub id: String,
+    /// Original source byte range.
+    pub source_range: Range<usize>,
+    /// Contribution payload.
+    pub kind: MarkdownContributionKind,
+}
+
+/// Rich Markdown contribution payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkdownContributionKind {
+    /// Link and its semantic label.
+    Link {
+        /// Link metadata.
+        link: MarkdownLink,
+        /// Parser-semantic visible label.
+        label: String,
+    },
+    /// Image and its alt text.
+    Image {
+        /// Image metadata.
+        image: MarkdownImage,
+        /// Parser-semantic alt text.
+        alt: String,
+    },
+    /// Footnote reference.
+    FootnoteReference {
+        /// Source footnote label.
+        label: String,
+    },
+    /// Footnote definition.
+    FootnoteDefinition {
+        /// Source footnote label.
+        label: String,
+    },
+    /// Inline math source.
+    InlineMath {
+        /// Math source without delimiters.
+        source: String,
+    },
+    /// Display math source.
+    DisplayMath {
+        /// Math source without delimiters.
+        source: String,
+    },
+    /// Mermaid fenced source.
+    Mermaid {
+        /// Mermaid source without the fence.
+        source: String,
+    },
+}
+
+/// Render Markdown into terminal lines and semantic contributions.
+#[must_use]
+pub fn render_markdown(markdown: &str, options: MarkdownRenderOptions) -> MarkdownRenderResult {
+    let document = parse_markdown_document(markdown);
+    MarkdownRenderResult {
+        lines: render_markdown_lines_internal(markdown, options),
+        contributions: markdown_contributions(&document),
     }
 }
 
 /// Render Markdown into terminal lines.
 #[must_use]
 pub fn render_markdown_lines(markdown: &str, options: MarkdownRenderOptions) -> Vec<Line> {
+    render_markdown(markdown, options).lines
+}
+
+fn render_markdown_lines_internal(markdown: &str, options: MarkdownRenderOptions) -> Vec<Line> {
     let table_alignments = table_alignments(markdown);
     let alert_kinds = alert_kinds(markdown);
     let container = markdown_to_container_with_options(markdown, hyperchad_markdown_options());
@@ -238,6 +563,350 @@ pub fn render_markdown_lines(markdown: &str, options: MarkdownRenderOptions) -> 
         },
     );
     renderer.finish()
+}
+
+fn markdown_contributions(document: &MarkdownDocument) -> Vec<MarkdownContribution> {
+    let mut contributions = Vec::new();
+    let mut containers: Vec<ContributionContainer> = Vec::new();
+    for event in &document.events {
+        collect_markdown_contribution(event, &mut containers, &mut contributions);
+    }
+    contributions.sort_by_key(|item| (item.source_range.start, item.source_range.end));
+    contributions
+}
+
+fn collect_markdown_contribution(
+    event: &MarkdownSemanticEvent,
+    containers: &mut Vec<ContributionContainer>,
+    contributions: &mut Vec<MarkdownContribution>,
+) {
+    match &event.kind {
+        MarkdownSemanticEventKind::Start(MarkdownSemanticTag::Link(link)) => {
+            containers.push(ContributionContainer::Link {
+                metadata: link.clone(),
+                source_range: event.source_range.clone(),
+                text: String::new(),
+            });
+        }
+        MarkdownSemanticEventKind::Start(MarkdownSemanticTag::Image(image)) => {
+            containers.push(ContributionContainer::Image {
+                metadata: image.clone(),
+                source_range: event.source_range.clone(),
+                text: String::new(),
+            });
+        }
+        MarkdownSemanticEventKind::Start(MarkdownSemanticTag::FootnoteDefinition(label)) => {
+            contributions.push(contribution(
+                "footnote-definition",
+                event.source_range.clone(),
+                MarkdownContributionKind::FootnoteDefinition {
+                    label: label.clone(),
+                },
+            ));
+        }
+        MarkdownSemanticEventKind::Start(MarkdownSemanticTag::CodeBlock(Some(language)))
+            if language.eq_ignore_ascii_case("mermaid") =>
+        {
+            containers.push(ContributionContainer::Mermaid {
+                source_range: event.source_range.clone(),
+                text: String::new(),
+            });
+        }
+        MarkdownSemanticEventKind::End(MarkdownSemanticTagEnd::Link) => {
+            finish_link_contribution(containers, contributions);
+        }
+        MarkdownSemanticEventKind::End(MarkdownSemanticTagEnd::Image) => {
+            finish_image_contribution(containers, contributions);
+        }
+        MarkdownSemanticEventKind::End(MarkdownSemanticTagEnd::CodeBlock) => {
+            finish_mermaid_contribution(containers, contributions);
+        }
+        MarkdownSemanticEventKind::Text(text) | MarkdownSemanticEventKind::Code(text) => {
+            if let Some(container) = containers.last_mut() {
+                container.push_text(text);
+            }
+        }
+        MarkdownSemanticEventKind::FootnoteReference(label) => contributions.push(contribution(
+            "footnote-reference",
+            event.source_range.clone(),
+            MarkdownContributionKind::FootnoteReference {
+                label: label.clone(),
+            },
+        )),
+        MarkdownSemanticEventKind::InlineMath(source) => contributions.push(contribution(
+            "inline-math",
+            event.source_range.clone(),
+            MarkdownContributionKind::InlineMath {
+                source: source.clone(),
+            },
+        )),
+        MarkdownSemanticEventKind::DisplayMath(source) => contributions.push(contribution(
+            "display-math",
+            event.source_range.clone(),
+            MarkdownContributionKind::DisplayMath {
+                source: source.clone(),
+            },
+        )),
+        _ => {}
+    }
+}
+
+fn finish_link_contribution(
+    containers: &mut Vec<ContributionContainer>,
+    contributions: &mut Vec<MarkdownContribution>,
+) {
+    if let Some(ContributionContainer::Link {
+        metadata,
+        source_range,
+        text,
+    }) = containers.pop()
+    {
+        contributions.push(contribution(
+            "link",
+            source_range,
+            MarkdownContributionKind::Link {
+                link: metadata,
+                label: normalize_inline_whitespace(&text).trim().to_owned(),
+            },
+        ));
+    }
+}
+
+fn finish_image_contribution(
+    containers: &mut Vec<ContributionContainer>,
+    contributions: &mut Vec<MarkdownContribution>,
+) {
+    if let Some(ContributionContainer::Image {
+        metadata,
+        source_range,
+        text,
+    }) = containers.pop()
+    {
+        contributions.push(contribution(
+            "image",
+            source_range,
+            MarkdownContributionKind::Image {
+                image: metadata,
+                alt: normalize_inline_whitespace(&text).trim().to_owned(),
+            },
+        ));
+    }
+}
+
+fn finish_mermaid_contribution(
+    containers: &mut Vec<ContributionContainer>,
+    contributions: &mut Vec<MarkdownContribution>,
+) {
+    if matches!(
+        containers.last(),
+        Some(ContributionContainer::Mermaid { .. })
+    ) && let Some(ContributionContainer::Mermaid { source_range, text }) = containers.pop()
+    {
+        contributions.push(contribution(
+            "mermaid",
+            source_range,
+            MarkdownContributionKind::Mermaid { source: text },
+        ));
+    }
+}
+
+#[derive(Debug)]
+enum ContributionContainer {
+    Link {
+        metadata: MarkdownLink,
+        source_range: Range<usize>,
+        text: String,
+    },
+    Image {
+        metadata: MarkdownImage,
+        source_range: Range<usize>,
+        text: String,
+    },
+    Mermaid {
+        source_range: Range<usize>,
+        text: String,
+    },
+}
+
+impl ContributionContainer {
+    fn push_text(&mut self, value: &str) {
+        match self {
+            Self::Link { text, .. } | Self::Image { text, .. } | Self::Mermaid { text, .. } => {
+                text.push_str(value);
+            }
+        }
+    }
+}
+
+fn contribution(
+    prefix: &str,
+    source_range: Range<usize>,
+    kind: MarkdownContributionKind,
+) -> MarkdownContribution {
+    MarkdownContribution {
+        id: format!("{prefix}:{}:{}", source_range.start, source_range.end),
+        source_range,
+        kind,
+    }
+}
+
+fn semantic_event(event: Event<'_>) -> Option<MarkdownSemanticEventKind> {
+    match event {
+        Event::Start(tag) => semantic_start_tag(tag).map(MarkdownSemanticEventKind::Start),
+        Event::End(tag) => semantic_end_tag(tag).map(MarkdownSemanticEventKind::End),
+        Event::Text(text) => Some(MarkdownSemanticEventKind::Text(text.into_string())),
+        Event::Code(code) => Some(MarkdownSemanticEventKind::Code(code.into_string())),
+        Event::InlineMath(math) => Some(MarkdownSemanticEventKind::InlineMath(math.into_string())),
+        Event::DisplayMath(math) => {
+            Some(MarkdownSemanticEventKind::DisplayMath(math.into_string()))
+        }
+        Event::Html(html) | Event::InlineHtml(html) => {
+            Some(MarkdownSemanticEventKind::Html(html.into_string()))
+        }
+        Event::FootnoteReference(label) => Some(MarkdownSemanticEventKind::FootnoteReference(
+            label.into_string(),
+        )),
+        Event::SoftBreak => Some(MarkdownSemanticEventKind::SoftBreak),
+        Event::HardBreak => Some(MarkdownSemanticEventKind::HardBreak),
+        Event::Rule => Some(MarkdownSemanticEventKind::Rule),
+        Event::TaskListMarker(checked) => Some(MarkdownSemanticEventKind::TaskListMarker(checked)),
+    }
+}
+
+fn semantic_start_tag(tag: Tag<'_>) -> Option<MarkdownSemanticTag> {
+    match tag {
+        Tag::Paragraph => Some(MarkdownSemanticTag::Paragraph),
+        Tag::Heading { level, .. } => Some(MarkdownSemanticTag::Heading(heading_level(level))),
+        Tag::BlockQuote(kind) => Some(MarkdownSemanticTag::BlockQuote(kind.map(alert_kind))),
+        Tag::CodeBlock(kind) => Some(MarkdownSemanticTag::CodeBlock(match kind {
+            CodeBlockKind::Indented => None,
+            CodeBlockKind::Fenced(language) => language
+                .split_whitespace()
+                .next()
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+        })),
+        Tag::HtmlBlock => Some(MarkdownSemanticTag::HtmlBlock),
+        Tag::List(start) => Some(MarkdownSemanticTag::List(start)),
+        Tag::Item => Some(MarkdownSemanticTag::Item),
+        Tag::FootnoteDefinition(label) => {
+            Some(MarkdownSemanticTag::FootnoteDefinition(label.into_string()))
+        }
+        Tag::Table(alignments) => Some(MarkdownSemanticTag::Table(
+            alignments.into_iter().map(table_alignment).collect(),
+        )),
+        Tag::TableHead => Some(MarkdownSemanticTag::TableHead),
+        Tag::TableRow => Some(MarkdownSemanticTag::TableRow),
+        Tag::TableCell => Some(MarkdownSemanticTag::TableCell),
+        Tag::Emphasis => Some(MarkdownSemanticTag::Emphasis),
+        Tag::Strong => Some(MarkdownSemanticTag::Strong),
+        Tag::Strikethrough => Some(MarkdownSemanticTag::Strikethrough),
+        Tag::Link {
+            link_type,
+            dest_url,
+            title,
+            id,
+        } => Some(MarkdownSemanticTag::Link(MarkdownLink {
+            destination: dest_url.into_string(),
+            title: optional_parser_string(title.as_ref()),
+            reference_id: optional_parser_string(id.as_ref()),
+            kind: link_kind(link_type),
+        })),
+        Tag::Image {
+            link_type,
+            dest_url,
+            title,
+            id,
+        } => Some(MarkdownSemanticTag::Image(MarkdownImage {
+            source: dest_url.into_string(),
+            title: optional_parser_string(title.as_ref()),
+            reference_id: optional_parser_string(id.as_ref()),
+            kind: link_kind(link_type),
+        })),
+        Tag::DefinitionList
+        | Tag::DefinitionListTitle
+        | Tag::DefinitionListDefinition
+        | Tag::Superscript
+        | Tag::Subscript
+        | Tag::MetadataBlock(_) => None,
+    }
+}
+
+const fn semantic_end_tag(tag: TagEnd) -> Option<MarkdownSemanticTagEnd> {
+    match tag {
+        TagEnd::Paragraph => Some(MarkdownSemanticTagEnd::Paragraph),
+        TagEnd::Heading(_) => Some(MarkdownSemanticTagEnd::Heading),
+        TagEnd::BlockQuote(_) => Some(MarkdownSemanticTagEnd::BlockQuote),
+        TagEnd::CodeBlock => Some(MarkdownSemanticTagEnd::CodeBlock),
+        TagEnd::HtmlBlock => Some(MarkdownSemanticTagEnd::HtmlBlock),
+        TagEnd::List(_) => Some(MarkdownSemanticTagEnd::List),
+        TagEnd::Item => Some(MarkdownSemanticTagEnd::Item),
+        TagEnd::FootnoteDefinition => Some(MarkdownSemanticTagEnd::FootnoteDefinition),
+        TagEnd::Table => Some(MarkdownSemanticTagEnd::Table),
+        TagEnd::TableHead => Some(MarkdownSemanticTagEnd::TableHead),
+        TagEnd::TableRow => Some(MarkdownSemanticTagEnd::TableRow),
+        TagEnd::TableCell => Some(MarkdownSemanticTagEnd::TableCell),
+        TagEnd::Emphasis => Some(MarkdownSemanticTagEnd::Emphasis),
+        TagEnd::Strong => Some(MarkdownSemanticTagEnd::Strong),
+        TagEnd::Strikethrough => Some(MarkdownSemanticTagEnd::Strikethrough),
+        TagEnd::Link => Some(MarkdownSemanticTagEnd::Link),
+        TagEnd::Image => Some(MarkdownSemanticTagEnd::Image),
+        TagEnd::DefinitionList
+        | TagEnd::DefinitionListTitle
+        | TagEnd::DefinitionListDefinition
+        | TagEnd::Superscript
+        | TagEnd::Subscript
+        | TagEnd::MetadataBlock(_) => None,
+    }
+}
+
+const fn heading_level(level: HeadingLevel) -> u8 {
+    match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    }
+}
+
+const fn alert_kind(kind: BlockQuoteKind) -> MarkdownAlertKind {
+    match kind {
+        BlockQuoteKind::Note => MarkdownAlertKind::Note,
+        BlockQuoteKind::Tip => MarkdownAlertKind::Tip,
+        BlockQuoteKind::Important => MarkdownAlertKind::Important,
+        BlockQuoteKind::Warning => MarkdownAlertKind::Warning,
+        BlockQuoteKind::Caution => MarkdownAlertKind::Caution,
+    }
+}
+
+const fn table_alignment(alignment: Alignment) -> MarkdownTableAlignment {
+    match alignment {
+        Alignment::None => MarkdownTableAlignment::None,
+        Alignment::Left => MarkdownTableAlignment::Left,
+        Alignment::Center => MarkdownTableAlignment::Center,
+        Alignment::Right => MarkdownTableAlignment::Right,
+    }
+}
+
+const fn link_kind(kind: LinkType) -> MarkdownLinkKind {
+    match kind {
+        LinkType::Inline => MarkdownLinkKind::Inline,
+        LinkType::Reference => MarkdownLinkKind::Reference,
+        LinkType::Collapsed => MarkdownLinkKind::Collapsed,
+        LinkType::Shortcut => MarkdownLinkKind::Shortcut,
+        LinkType::Autolink => MarkdownLinkKind::Autolink,
+        LinkType::Email => MarkdownLinkKind::Email,
+        LinkType::WikiLink { .. } => MarkdownLinkKind::WikiLink,
+        LinkType::ReferenceUnknown | LinkType::CollapsedUnknown | LinkType::ShortcutUnknown => {
+            MarkdownLinkKind::Unresolved
+        }
+    }
+}
+
+fn optional_parser_string(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_owned())
 }
 
 fn table_alignments(markdown: &str) -> Vec<Vec<Alignment>> {
@@ -1124,6 +1793,16 @@ mod tests {
                 "# Request\n\n- Use **care**\n- Run `cargo test`\n\n[Guide](https://example.com)"
             ),
             "Request Use care Run cargo test Guide"
+        );
+    }
+
+    #[test]
+    fn plain_text_projection_preserves_extension_semantics() {
+        assert_eq!(
+            markdown_to_plain_text(
+                "For $x^2$.[^note]\n\n[^note]: Footnote.\n\n<details><summary>More</summary>Body</details>"
+            ),
+            "For x^2. [note] Footnote. More Body"
         );
     }
 
