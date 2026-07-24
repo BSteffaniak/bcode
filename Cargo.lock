@@ -2329,6 +2329,7 @@ dependencies = [
  "bcode_shell_command_analysis_models",
  "brush-parser",
  "proptest",
+ "rusqlite",
  "serde",
  "serde_json",
 ]
