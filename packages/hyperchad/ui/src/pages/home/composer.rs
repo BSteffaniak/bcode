@@ -3,9 +3,49 @@
 use bcode_session_view_models::SessionViewSnapshot;
 use hyperchad::template::{Containers, container};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerPresentationState {
+    Ready,
+    Pending,
+    Error,
+    Disabled,
+}
+
+fn composer_presentation_state(snapshot: &SessionViewSnapshot) -> ComposerPresentationState {
+    if snapshot.composer.can_submit {
+        return ComposerPresentationState::Ready;
+    }
+    let reason = snapshot
+        .composer
+        .disabled_reason
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if ["error", "failed", "invalid", "cannot", "unavailable"]
+        .iter()
+        .any(|term| reason.contains(term))
+    {
+        ComposerPresentationState::Error
+    } else if ["pending", "sending", "submitting", "waiting", "queued"]
+        .iter()
+        .any(|term| reason.contains(term))
+    {
+        ComposerPresentationState::Pending
+    } else {
+        ComposerPresentationState::Disabled
+    }
+}
+
 pub(super) fn composer(snapshot: &SessionViewSnapshot, access_token: &str) -> Containers {
     let action = format!("/actions/submit-message?token={access_token}");
-    let state = snapshot.composer.disabled_reason.as_deref().unwrap_or({
+    let presentation_state = composer_presentation_state(snapshot);
+    let (state_label, state_color) = match presentation_state {
+        ComposerPresentationState::Ready => ("Ready", "#7ee787"),
+        ComposerPresentationState::Pending => ("Pending", "#f2cc60"),
+        ComposerPresentationState::Error => ("Error", "#f85149"),
+        ComposerPresentationState::Disabled => ("Disabled", "#8b949e"),
+    };
+    let state_detail = snapshot.composer.disabled_reason.as_deref().unwrap_or({
         if snapshot.composer.can_submit {
             "Ready to send"
         } else {
@@ -18,7 +58,9 @@ pub(super) fn composer(snapshot: &SessionViewSnapshot, access_token: &str) -> Co
                 @if let Some(session_id) = snapshot.session_id {
                     input type=hidden name="session_id" value=(session_id.to_string());
                 }
-                div color=(if snapshot.composer.can_submit { "#7ee787" } else { "#f2cc60" }) font-size=11 margin-bottom=8 { (state) }
+                div data-composer-state=(state_label.to_ascii_lowercase()) color=(state_color) font-size=11 margin-bottom=8 {
+                    (state_label) ": " (state_detail)
+                }
                 @if let Some(session_id) = snapshot.session_id {
                     textarea name="text" rows="5" placeholder="Send a message to this session" hx-post=(format!("/actions/update-draft/{session_id}?token={access_token}")) hx-trigger="change" hx-target="#bcode-web-shell" hx-swap=this width=100% padding=10 border="1, #30363d" border-radius=6 background="#010409" color="#c9d1d9" {
                         (snapshot.composer.draft)

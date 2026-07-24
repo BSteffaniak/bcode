@@ -1086,12 +1086,21 @@ fn composer_presents_ready_disabled_and_message_placement_states() {
     ready.composer.draft = "Preserved draft".to_owned();
     ready.session_id = Some(bcode_session_models::SessionId::new());
     let session_id = ready.session_id.expect("composer session");
+    let mut pending = ready.clone();
+    pending.composer.can_submit = false;
+    pending.composer.disabled_reason = Some("Sending message".to_owned());
+    let mut errored = ready.clone();
+    errored.composer.can_submit = false;
+    errored.composer.disabled_reason = Some("Message submission failed".to_owned());
     let mut disabled = ready.clone();
     disabled.composer.can_submit = false;
     disabled.composer.disabled_reason = Some("Wait for the active operation".to_owned());
 
     let ready = format!("{:?}", composer(&ready, "secret-token"));
+    let pending = format!("{:?}", composer(&pending, "secret-token"));
+    let errored = format!("{:?}", composer(&errored, "secret-token"));
     let disabled = format!("{:?}", composer(&disabled, "secret-token"));
+    assert!(ready.contains("Ready"));
     assert!(ready.contains("Ready to send"));
     assert!(ready.contains("Preserved draft"));
     assert!(ready.contains("Steer the active turn"));
@@ -1104,6 +1113,11 @@ fn composer_presents_ready_disabled_and_message_placement_states() {
     assert!(ready.contains("/actions/cancel-turn?token=secret-token"));
     assert!(ready.contains("clear_queue"));
     assert!(ready.contains("placement"));
+    assert!(pending.contains("Pending"));
+    assert!(pending.contains("Sending message"));
+    assert!(errored.contains("Error"));
+    assert!(errored.contains("Message submission failed"));
+    assert!(disabled.contains("Disabled"));
     assert!(disabled.contains("Wait for the active operation"));
     assert!(disabled.contains("Sending unavailable"));
     assert!(disabled.contains("disabled"));
