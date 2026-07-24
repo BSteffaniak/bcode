@@ -7547,7 +7547,7 @@ impl AgentBuilder {
         self.selection_provenance.model = Some(ModelSelectionSource::PerRequest);
         self.model_metadata_source = None;
         self.model_pricing = None;
-        self.parallel_tool_capabilities.model = None;
+        self.parallel_tool_capabilities.model = Some(false);
         self
     }
 
@@ -7575,7 +7575,7 @@ impl AgentBuilder {
         }
         self.registration_source = None;
         self.parallel_tool_capabilities.provider = None;
-        self.parallel_tool_capabilities.model = None;
+        self.parallel_tool_capabilities.model = Some(false);
         self
     }
 
