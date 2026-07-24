@@ -11,10 +11,16 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_agent_policy_models = { workspace = true }
-bcode_agent_profile       = { workspace = true }
-bcode_session_models      = { workspace = true }
-globset                   = { workspace = true }
+bcode_agent_policy_models           = { workspace = true }
+bcode_agent_profile                 = { workspace = true }
+bcode_session_models                = { workspace = true }
+bcode_shell_command_analysis        = { workspace = true }
+bcode_shell_command_analysis_models = { workspace = true }
+globset                             = { workspace = true }
+
+[dev-dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
 
 [features]
 default          = []

@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["data-structures"]
+description = "Owned shell command analysis contract types for Bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "policy", "shell", "syntax"]
+license     = { workspace = true }
+name        = "bcode_shell_command_analysis_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -86,7 +86,7 @@ pub struct AgentContextResponse {
 pub const TOOL_POLICY_AUTHORIZATION_NAMESPACE: &str = "bcode.agent-policy.tool";
 
 /// Current schema version for [`ToolPolicyAuthorizationMetadata`].
-pub const TOOL_POLICY_AUTHORIZATION_SCHEMA_VERSION: u32 = 1;
+pub const TOOL_POLICY_AUTHORIZATION_SCHEMA_VERSION: u32 = 2;
 
 /// Action for invoking a tool under the standard agent policy authorization fact.
 pub const TOOL_POLICY_AUTHORIZATION_ACTION_INVOKE: &str = "invoke";
@@ -95,8 +95,16 @@ pub const TOOL_POLICY_AUTHORIZATION_ACTION_INVOKE: &str = "invoke";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ToolPolicyOperation {
-    /// Evaluate shell command policy for an owner-extracted command.
-    Command { command: Option<String> },
+    /// Evaluate shell command policy using owner-produced structured analysis.
+    Command {
+        /// Original command retained for diagnostics and schema compatibility checks.
+        command: Option<String>,
+        /// Complete or explicitly incomplete analysis produced by the shell owner.
+        analysis: Option<bcode_shell_command_analysis_models::ShellAnalysis>,
+        /// Fatal owner-side analysis failure. Exactly one of `analysis` or `analysis_error` is
+        /// expected for a well-formed shell authorization fact.
+        analysis_error: Option<bcode_shell_command_analysis_models::ShellAnalysisError>,
+    },
     /// Evaluate web policy for an owner-extracted URL.
     Web { url: Option<String> },
     /// Evaluate read policy for owner-extracted paths.
@@ -250,17 +258,25 @@ pub fn tool_policy_authorization_metadata(
     facts: &[ToolAuthorizationFact],
     tool_name: &str,
 ) -> Result<ToolPolicyAuthorizationMetadata, String> {
-    let mut matching = facts.iter().filter(|fact| {
-        fact.namespace == TOOL_POLICY_AUTHORIZATION_NAMESPACE
-            && fact.schema_version == TOOL_POLICY_AUTHORIZATION_SCHEMA_VERSION
-            && fact.action == TOOL_POLICY_AUTHORIZATION_ACTION_INVOKE
-    });
-    let fact = matching
+    let mut namespace_facts = facts
+        .iter()
+        .filter(|fact| fact.namespace == TOOL_POLICY_AUTHORIZATION_NAMESPACE);
+    let first = namespace_facts
         .next()
         .ok_or_else(|| "tool owner omitted the standard policy authorization fact".to_string())?;
-    if matching.next().is_some() {
+    if namespace_facts.next().is_some() {
         return Err("tool owner emitted duplicate standard policy authorization facts".to_string());
     }
+    if first.schema_version != TOOL_POLICY_AUTHORIZATION_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported standard policy authorization schema version {}; expected {}",
+            first.schema_version, TOOL_POLICY_AUTHORIZATION_SCHEMA_VERSION
+        ));
+    }
+    if first.action != TOOL_POLICY_AUTHORIZATION_ACTION_INVOKE {
+        return Err("standard policy authorization fact has an unsupported action".to_string());
+    }
+    let fact = first;
     if fact.resource.as_deref() != Some(tool_name) {
         return Err(
             "authorization fact resource does not match the correlated tool call".to_string(),

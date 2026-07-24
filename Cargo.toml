@@ -29,6 +29,8 @@ members = [
     "plugins/worktree-plugin",
     "packages/agent-policy",
     "packages/agent-policy/models",
+    "packages/shell-command-analysis",
+    "packages/shell-command-analysis/models",
     "packages/agent-permissions",
     "packages/code-review/models",
     "packages/agent-profile",
@@ -157,6 +159,8 @@ bcode_session_models                    = { version = "0.0.1-alpha.0", default-f
 bcode_session_view                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-view" }
 bcode_session_view_models               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-view/models" }
 bcode_settings                          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/settings" }
+bcode_shell_command_analysis            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/shell-command-analysis" }
+bcode_shell_command_analysis_models     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/shell-command-analysis/models" }
 bcode_shell_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/shell-plugin" }
 bcode_skill                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill" }
 bcode_skill_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill/models" }
@@ -218,6 +222,7 @@ aws-sdk-bedrockruntime = { version = "1.130.0", default-features = false, featur
 ] }
 aws-smithy-types = { version = "1.4.7", default-features = false }
 base64 = { version = "0.22.1", default-features = false, features = ["std"] }
+brush-parser = { version = "0.4.0", default-features = false }
 clap = { version = "4.5.40", default-features = false }
 cmake = { version = "0.1.54", default-features = false }
 crossterm = { version = "0.29.0", default-features = false }

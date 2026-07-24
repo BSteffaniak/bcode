@@ -310,69 +310,162 @@ fn url_argument(request: &EvaluateToolCallRequest) -> Option<&str> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn evaluate_shell(config: &AgentConfig, request: &EvaluateToolCallRequest) -> PolicyEvaluation {
-    let Some(command) = command_argument(request) else {
-        return evaluation(
-            AgentDecision::Deny,
-            format!(
-                "{} agent denied shell command with missing command",
-                request.agent_id
-            ),
-            None,
-            None,
-        );
+    let ToolPolicyOperation::Command {
+        command,
+        analysis,
+        analysis_error,
+    } = &request.operation
+    else {
+        return shell_fact_denied(request, "shell policy operation is not a command");
     };
-    let rules = compile_rules(config);
-    if writes_disabled(config)
-        && let Some(part) = mutating_shell_command_part(command, &rules)
+    let Some(command) = command.as_deref() else {
+        return shell_fact_denied(request, "shell command is missing");
+    };
+    if analysis_error.is_some() {
+        return shell_fact_denied(request, "shell analysis failed");
+    }
+    let Some(analysis) = analysis.as_ref() else {
+        return shell_fact_denied(request, "structured shell analysis is missing");
+    };
+    if analysis.schema_version != bcode_shell_command_analysis_models::SHELL_ANALYSIS_SCHEMA_VERSION
+        || analysis.source != command
+        || analysis.dialect != bcode_shell_command_analysis_models::ShellDialect::Posix
+        || !analysis.completeness.is_complete()
     {
-        return evaluation(
-            AgentDecision::Deny,
-            format!(
-                "{} agent denied shell command '{}': shell command writes files; switch agents if implementation is needed",
-                request.agent_id, part
-            ),
-            None,
-            Some(part.to_string()),
+        return shell_fact_denied(
+            request,
+            "structured shell analysis is invalid or incomplete",
         );
     }
-    if let Some(denied) = denied_command_part(command, &rules) {
-        let rule_pattern = denied.rule.as_ref().map(|rule| rule.pattern.clone());
-        return match denied.action {
-            Action::Allow => evaluation(AgentDecision::Allow, String::new(), rule_pattern, None),
-            Action::Ask => evaluation(
-                AgentDecision::Ask,
-                format!(
-                    "{} agent asks before shell command: {}",
-                    request.agent_id, denied.command
-                ),
-                rule_pattern,
-                Some(denied.command.to_string()),
-            ),
-            Action::Deny => evaluation(
-                AgentDecision::Deny,
-                format!(
-                    "{} agent denied shell command '{}'{}",
-                    request.agent_id,
-                    denied.command,
-                    denied
-                        .rule
-                        .as_ref()
-                        .map_or_else(String::new, |rule| format!(" by rule '{}'", rule.pattern))
-                ),
-                rule_pattern,
-                Some(denied.command.to_string()),
-            ),
-        };
+    if analysis.commands.is_empty() {
+        return shell_fact_denied(request, "shell analysis contains no executable command");
     }
-    evaluation(AgentDecision::Allow, String::new(), None, None)
+
+    let rules = compile_rules(config);
+    let mut results = Vec::new();
+    for subject in &analysis.commands {
+        if subject.match_candidates.is_empty() {
+            return shell_fact_denied(request, "shell command has no policy match candidate");
+        }
+        let mut winning: Option<(Action, Rule, &str)> = None;
+        for candidate in &subject.match_candidates {
+            let Some(rule) = matching_rule(&candidate.subject, &rules) else {
+                continue;
+            };
+            let replace = winning.as_ref().is_none_or(|(_, current, _)| {
+                (rule.specificity, rule.pattern.len())
+                    > (current.specificity, current.pattern.len())
+            });
+            if replace {
+                winning = Some((rule.action, rule, candidate.subject.as_str()));
+            }
+        }
+        let (action, rule, candidate) = winning.unwrap_or_else(|| {
+            (
+                Action::Deny,
+                Rule {
+                    pattern: "<missing-rule>".to_owned(),
+                    action: Action::Deny,
+                    specificity: 0,
+                },
+                subject.source.as_str(),
+            )
+        });
+        results.push((action, rule, candidate.to_owned(), subject.source.clone()));
+    }
+
+    for redirect in &analysis.redirections {
+        let Some(path) = redirect.static_path.as_deref() else {
+            if !matches!(
+                redirect.kind,
+                bcode_shell_command_analysis_models::ShellRedirectionKind::HereDocument
+                    | bcode_shell_command_analysis_models::ShellRedirectionKind::Duplicate
+                    | bcode_shell_command_analysis_models::ShellRedirectionKind::Close
+            ) {
+                return shell_fact_denied(request, "shell redirection target is dynamic");
+            }
+            continue;
+        };
+        let (rules, fallback) = match redirect.kind {
+            bcode_shell_command_analysis_models::ShellRedirectionKind::Input => {
+                (&config.permission.read, Action::Allow)
+            }
+            bcode_shell_command_analysis_models::ShellRedirectionKind::OutputTruncate
+            | bcode_shell_command_analysis_models::ShellRedirectionKind::OutputAppend
+            | bcode_shell_command_analysis_models::ShellRedirectionKind::InputOutput => {
+                (&config.permission.write, Action::Deny)
+            }
+            bcode_shell_command_analysis_models::ShellRedirectionKind::Duplicate
+            | bcode_shell_command_analysis_models::ShellRedirectionKind::Close
+            | bcode_shell_command_analysis_models::ShellRedirectionKind::HereDocument => continue,
+            bcode_shell_command_analysis_models::ShellRedirectionKind::HereString => {
+                return shell_fact_denied(request, "unsupported shell redirection");
+            }
+            _ => return shell_fact_denied(request, "unknown shell redirection kind"),
+        };
+        let compiled = compile_path_rules(rules);
+        let action = matching_path_rule(&compiled, path).map_or(fallback, |rule| rule.action);
+        results.push((
+            action,
+            Rule {
+                pattern: format!("redirection:{path}"),
+                action,
+                specificity: usize::MAX,
+            },
+            path.to_owned(),
+            path.to_owned(),
+        ));
+    }
+
+    let (action, rule, candidate, source) = results
+        .into_iter()
+        .max_by_key(|(action, _, _, _)| action_precedence(*action))
+        .expect("shell analysis contains at least one command result");
+    match action {
+        Action::Allow => evaluation(
+            AgentDecision::Allow,
+            String::new(),
+            Some(rule.pattern),
+            Some(source),
+        ),
+        Action::Ask => evaluation(
+            AgentDecision::Ask,
+            format!(
+                "{} agent asks before shell subject '{}' (candidate '{}', rule '{}')",
+                request.agent_id, source, candidate, rule.pattern
+            ),
+            Some(rule.pattern),
+            Some(source),
+        ),
+        Action::Deny => evaluation(
+            AgentDecision::Deny,
+            format!(
+                "{} agent denied shell subject '{}' (candidate '{}', rule '{}')",
+                request.agent_id, source, candidate, rule.pattern
+            ),
+            Some(rule.pattern),
+            Some(source),
+        ),
+    }
 }
 
-fn command_argument(request: &EvaluateToolCallRequest) -> Option<&str> {
-    match &request.operation {
-        ToolPolicyOperation::Command { command } => command.as_deref(),
-        _ => None,
+const fn action_precedence(action: Action) -> u8 {
+    match action {
+        Action::Allow => 0,
+        Action::Ask => 1,
+        Action::Deny => 2,
     }
+}
+
+fn shell_fact_denied(request: &EvaluateToolCallRequest, reason: &str) -> PolicyEvaluation {
+    evaluation(
+        AgentDecision::Deny,
+        format!("{} agent denied shell command: {reason}", request.agent_id),
+        None,
+        None,
+    )
 }
 
 fn evaluation(
@@ -452,86 +545,6 @@ fn tool_enabled(config: &AgentConfig, request: &EvaluateToolCallRequest) -> Opti
         .find_map(|name| config.tools.get(name).copied())
 }
 
-fn writes_disabled(config: &AgentConfig) -> bool {
-    config
-        .tools
-        .iter()
-        .any(|(tool, enabled)| !enabled && is_write_like_tool_id(tool))
-}
-
-fn is_write_like_tool_id(tool: &str) -> bool {
-    tool.rsplit_once('.')
-        .is_some_and(|(_, capability)| matches!(capability, "write" | "edit"))
-}
-
-fn mutating_shell_command_part<'a>(command: &'a str, rules: &[Rule]) -> Option<&'a str> {
-    command_parts(command)
-        .into_iter()
-        .find(|part| shell_part_writes_files(part) && !explicitly_allows_shell_part(part, rules))
-}
-
-fn explicitly_allows_shell_part(part: &str, rules: &[Rule]) -> bool {
-    matching_rule(part, rules).is_some_and(|rule| rule.action == Action::Allow)
-}
-
-fn shell_part_writes_files(part: &str) -> bool {
-    has_unquoted_write_redirection(part) || starts_with_mutating_command(part)
-}
-
-fn has_unquoted_write_redirection(part: &str) -> bool {
-    let mut escaped = false;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let chars = part.chars().collect::<Vec<_>>();
-    for (index, character) in chars.iter().copied().enumerate() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        if character == '\\' && !in_single_quote {
-            escaped = true;
-            continue;
-        }
-        match character {
-            '\'' if !in_double_quote => in_single_quote = !in_single_quote,
-            '"' if !in_single_quote => in_double_quote = !in_double_quote,
-            '>' if !in_single_quote && !in_double_quote => {
-                let previous = index
-                    .checked_sub(1)
-                    .and_then(|previous| chars.get(previous));
-                if chars.get(index + 1) == Some(&'&') && previous != Some(&'&') {
-                    continue;
-                }
-                return true;
-            }
-            _ => {}
-        }
-    }
-    false
-}
-
-fn starts_with_mutating_command(part: &str) -> bool {
-    let Some(command) = first_command_word(part) else {
-        return false;
-    };
-    matches!(
-        command,
-        "cp" | "install" | "mkdir" | "mv" | "rm" | "rmdir" | "tee" | "touch" | "truncate"
-    ) || command == "sed"
-        && part
-            .split_whitespace()
-            .any(|arg| arg == "-i" || arg.starts_with("-i"))
-        || command == "perl"
-            && part
-                .split_whitespace()
-                .any(|arg| arg == "-pi" || arg.starts_with("-pi"))
-}
-
-fn first_command_word(part: &str) -> Option<&str> {
-    part.split_whitespace()
-        .find(|word| !word.contains('=') && *word != "env")
-}
-
 fn tool_aliases(request: &EvaluateToolCallRequest) -> Vec<String> {
     std::iter::once(request.tool_name.clone())
         .chain(request.aliases.iter().cloned())
@@ -553,66 +566,6 @@ pub fn compile_rules(config: &AgentConfig) -> Vec<Rule> {
             specificity: rule_specificity(pattern),
         })
         .collect()
-}
-
-#[derive(Debug, Clone)]
-struct DeniedCommandPart<'a> {
-    command: &'a str,
-    rule: Option<Rule>,
-    action: Action,
-}
-
-fn denied_command_part<'a>(command: &'a str, rules: &[Rule]) -> Option<DeniedCommandPart<'a>> {
-    command_parts(command).into_iter().find_map(|part| {
-        let rule = matching_rule(part, rules);
-        let action = rule.as_ref().map_or(Action::Deny, |rule| rule.action);
-        (action != Action::Allow).then_some(DeniedCommandPart {
-            command: part,
-            rule,
-            action,
-        })
-    })
-}
-
-/// Split shell command chains like the Pi `OpenCode` modes extension.
-#[must_use]
-pub fn command_parts(command: &str) -> Vec<&str> {
-    let mut parts = Vec::new();
-    let mut start = 0usize;
-    let bytes = command.as_bytes();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        let separator_len = if bytes[index] == b'&' && bytes.get(index + 1) == Some(&b'&') {
-            2
-        } else if bytes[index] == b'|' {
-            if bytes.get(index + 1) == Some(&b'|') {
-                2
-            } else {
-                1
-            }
-        } else {
-            usize::from(bytes[index] == b';')
-        };
-        if separator_len == 0 {
-            index = index.saturating_add(1);
-            continue;
-        }
-        let part = command[start..index].trim();
-        if !part.is_empty() {
-            parts.push(part);
-        }
-        index = index.saturating_add(separator_len);
-        start = index;
-    }
-    let part = command[start..].trim();
-    if !part.is_empty() {
-        parts.push(part);
-    }
-    if parts.is_empty() {
-        vec![command]
-    } else {
-        parts
-    }
 }
 
 /// Return the most specific matching rule for a command.
@@ -748,6 +701,11 @@ mod tests {
             tool_name: "shell.run".to_string(),
             operation: ToolPolicyOperation::Command {
                 command: Some(command.to_string()),
+                analysis: bcode_shell_command_analysis::analyze(
+                    &bcode_shell_command_analysis_models::ShellAnalysisRequest::posix(command),
+                )
+                .ok(),
+                analysis_error: None,
             },
             aliases: vec!["command".to_string()],
             requires_permission: true,
@@ -768,23 +726,6 @@ mod tests {
         let tools = active_tools_for(&config);
 
         assert_eq!(tools, vec!["example.read".to_string()]);
-    }
-
-    #[test]
-    fn command_parts_match_pi_splitters() {
-        assert_eq!(
-            command_parts("git diff && git status"),
-            vec!["git diff", "git status"]
-        );
-        assert_eq!(
-            command_parts("cargo check || git reset --hard"),
-            vec!["cargo check", "git reset --hard"]
-        );
-        assert_eq!(command_parts("echo hi | wc -c"), vec!["echo hi", "wc -c"]);
-        assert_eq!(
-            command_parts("git status; git push"),
-            vec!["git status", "git push"]
-        );
     }
 
     #[test]
@@ -900,7 +841,7 @@ mod tests {
             Path::new("/tmp/project"),
         );
 
-        assert_eq!(redirected.response.decision, AgentDecision::Allow);
+        assert_eq!(redirected.response.decision, AgentDecision::Deny);
         assert_eq!(plain_echo.response.decision, AgentDecision::Allow);
     }
 
@@ -1163,6 +1104,13 @@ mod tests {
             tool_name: "custom.exec".to_string(),
             operation: ToolPolicyOperation::Command {
                 command: Some("cargo check".to_string()),
+                analysis: bcode_shell_command_analysis::analyze(
+                    &bcode_shell_command_analysis_models::ShellAnalysisRequest::posix(
+                        "cargo check",
+                    ),
+                )
+                .ok(),
+                analysis_error: None,
             },
             aliases: vec!["command".to_string()],
             requires_permission: true,
@@ -1172,7 +1120,7 @@ mod tests {
         let result = evaluate_tool_call(&config, &request, Path::new("/tmp/project"));
 
         assert_eq!(result.response.decision, AgentDecision::Allow);
-        assert!(result.matched_rule.is_none());
+        assert_eq!(result.matched_rule.as_deref(), Some("cargo check"));
     }
 
     #[test]

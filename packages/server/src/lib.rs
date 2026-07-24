@@ -33892,7 +33892,11 @@ library = "test"
                 )],
                 capabilities: vec!["process.execute".to_owned()],
                 permission_category: Some("command".to_owned()),
-                operation: bcode_agent_profile::ToolPolicyOperation::Command { command: None },
+                operation: bcode_agent_profile::ToolPolicyOperation::Command {
+                    command: None,
+                    analysis: None,
+                    analysis_error: None,
+                },
             },
         );
         assert_eq!(target.name, "shell.run");

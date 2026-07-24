@@ -48,6 +48,8 @@ fn preparation_preserves_owner_computed_operations_and_resources() {
     for operation in [
         ToolPolicyOperation::Command {
             command: Some("cargo test".to_owned()),
+            analysis: None,
+            analysis_error: None,
         },
         ToolPolicyOperation::Web {
             url: Some("https://example.com/doc.pdf".to_owned()),

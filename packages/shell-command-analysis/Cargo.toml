@@ -1,0 +1,23 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools", "parser-implementations"]
+description = "Bounded POSIX shell command analysis for Bcode policy evaluation"
+edition     = { workspace = true }
+keywords    = ["bcode", "parser", "policy", "shell"]
+license     = { workspace = true }
+name        = "bcode_shell_command_analysis"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+bcode_shell_command_analysis_models = { workspace = true }
+brush-parser                        = { workspace = true }
+
+[dev-dependencies]
+serde      = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = ["bcode_shell_command_analysis_models/fail-on-warnings"]

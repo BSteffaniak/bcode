@@ -114,7 +114,30 @@ fn shell_policy_operation(
         .get("command")
         .and_then(serde_json::Value::as_str)
         .map(ToString::to_string);
-    bcode_plugin_sdk::ToolPolicyOperation::Command { command }
+    let (analysis, analysis_error) = command.as_ref().map_or_else(
+        || {
+            (
+                None,
+                Some(bcode_shell_command_analysis_models::ShellAnalysisError {
+                    kind: bcode_shell_command_analysis_models::ShellAnalysisErrorKind::Parser,
+                    message: "shell.run command is missing or is not a string".to_owned(),
+                    dialect: bcode_shell_command_analysis_models::ShellDialect::Posix,
+                    span: None,
+                }),
+            )
+        },
+        |command| match bcode_shell_command_analysis::analyze(
+            &bcode_shell_command_analysis_models::ShellAnalysisRequest::posix(command),
+        ) {
+            Ok(analysis) => (Some(analysis), None),
+            Err(error) => (None, Some(error)),
+        },
+    );
+    bcode_plugin_sdk::ToolPolicyOperation::Command {
+        command,
+        analysis,
+        analysis_error,
+    }
 }
 
 fn shell_tool_definition() -> ToolDefinition {
@@ -1641,10 +1664,17 @@ mod tests {
             },
             host_context: Vec::new(),
         };
-        assert_eq!(
-            shell_policy_operation(&request, &definition),
-            bcode_plugin_sdk::ToolPolicyOperation::Command { command: None }
-        );
+        let bcode_plugin_sdk::ToolPolicyOperation::Command {
+            command,
+            analysis,
+            analysis_error,
+        } = shell_policy_operation(&request, &definition)
+        else {
+            panic!("shell owner must produce command policy");
+        };
+        assert!(command.is_none());
+        assert!(analysis.is_none());
+        assert!(analysis_error.is_some());
     }
 
     #[test]
@@ -1672,12 +1702,17 @@ mod tests {
             policy.identity.permission_category.as_deref(),
             Some("command")
         );
-        assert_eq!(
-            policy.operation,
-            bcode_plugin_sdk::ToolPolicyOperation::Command {
-                command: Some("printf hello".to_owned()),
-            }
-        );
+        let bcode_plugin_sdk::ToolPolicyOperation::Command {
+            command,
+            analysis,
+            analysis_error,
+        } = policy.operation
+        else {
+            panic!("shell owner must produce a command operation");
+        };
+        assert_eq!(command.as_deref(), Some("printf hello"));
+        assert!(analysis.is_some_and(|analysis| analysis.completeness.is_complete()));
+        assert!(analysis_error.is_none());
     }
 
     #[test]

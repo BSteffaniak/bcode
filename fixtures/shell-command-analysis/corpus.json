@@ -1,0 +1,198 @@
+{
+  "schema_version": 1,
+  "dialect": "posix",
+  "cases": [
+    {
+      "id": "newline-denied-sibling",
+      "classification": "parser_boundary_defect",
+      "source": "printf '%s\\n' safe\nrm -f generated.txt",
+      "policy": {"rules": [{"pattern": "printf *", "action": "allow"}, {"pattern": "rm *", "action": "deny"}], "default_action": "ask"},
+      "expected": {"commands": ["printf '%s\\n' safe", "rm -f generated.txt"], "redirections": [], "completeness": "complete", "policy": "deny"}
+    },
+    {
+      "id": "background-denied-sibling",
+      "classification": "parser_boundary_defect",
+      "source": "sleep 1 & rm -f generated.txt",
+      "policy": {"rules": [{"pattern": "sleep *", "action": "allow"}, {"pattern": "rm *", "action": "deny"}], "default_action": "ask"},
+      "expected": {"commands": ["sleep 1", "rm -f generated.txt"], "redirections": [], "completeness": "complete", "policy": "deny"}
+    },
+    {
+      "id": "pipeline-denied-leaf",
+      "classification": "parser_boundary_defect",
+      "source": "printf '%s\\n' safe | rm -f generated.txt",
+      "policy": {"rules": [{"pattern": "printf *", "action": "allow"}, {"pattern": "rm *", "action": "deny"}], "default_action": "ask"},
+      "expected": {"commands": ["printf '%s\\n' safe", "rm -f generated.txt"], "redirections": [], "completeness": "complete", "policy": "deny"}
+    },
+    {
+      "id": "and-or-denied-branches",
+      "classification": "parser_boundary_defect",
+      "source": "true && rm -f generated.txt || printf '%s\\n' fallback",
+      "policy": {"rules": [{"pattern": "true", "action": "allow"}, {"pattern": "printf *", "action": "allow"}, {"pattern": "rm *", "action": "deny"}], "default_action": "ask"},
+      "expected": {"commands": ["true", "rm -f generated.txt", "printf '%s\\n' fallback"], "redirections": [], "completeness": "complete", "policy": "deny"}
+    },
+    {
+      "id": "quoted-pipe-regex",
+      "classification": "parser_boundary_defect",
+      "source": "rg -n 'foo|bar' packages",
+      "policy": {"rules": [{"pattern": "rg *", "action": "allow"}], "default_action": "deny"},
+      "expected": {"commands": ["rg -n 'foo|bar' packages"], "redirections": [], "completeness": "complete", "policy": "allow"}
+    },
+    {
+      "id": "escaped-pipe-regex",
+      "classification": "parser_boundary_defect",
+      "source": "grep -E foo\\|bar input.txt",
+      "policy": {"rules": [{"pattern": "grep *", "action": "allow"}], "default_action": "deny"},
+      "expected": {"commands": ["grep -E foo\\|bar input.txt"], "redirections": [], "completeness": "complete", "policy": "allow"}
+    },
+    {
+      "id": "quoted-semicolon-printf",
+      "classification": "parser_boundary_defect",
+      "source": "printf '%s; %s\\n' alpha beta",
+      "policy": {"rules": [{"pattern": "printf *", "action": "allow"}], "default_action": "deny"},
+      "expected": {"commands": ["printf '%s; %s\\n' alpha beta"], "redirections": [], "completeness": "complete", "policy": "allow"}
+    },
+    {
+      "id": "quoted-semicolon-sql",
+      "classification": "parser_boundary_defect",
+      "source": "sqlite3 data.db 'select 1; select 2;'",
+      "policy": {"rules": [{"pattern": "sqlite3 *", "action": "allow"}], "default_action": "deny"},
+      "expected": {"commands": ["sqlite3 data.db 'select 1; select 2;'"], "redirections": [], "completeness": "complete", "policy": "allow"}
+    },
+    {
+      "id": "quoted-semicolon-awk",
+      "classification": "parser_boundary_defect",
+      "source": "awk '{print $1; print $2}' input.txt",
+      "policy": {"rules": [{"pattern": "awk *", "action": "allow"}], "default_action": "deny"},
+      "expected": {"commands": ["awk '{print $1; print $2}' input.txt"], "redirections": [], "completeness": "complete", "policy": "allow"}
+    },
+    {
+      "id": "quoted-semicolon-git-format",
+      "classification": "parser_boundary_defect",
+      "source": "git log --format='%h;%s' -5",
+      "policy": {"rules": [{"pattern": "git log *", "action": "allow"}, {"pattern": "git *", "action": "deny"}], "default_action": "deny"},
+      "expected": {"commands": ["git log --format='%h;%s' -5"], "redirections": [], "completeness": "complete", "policy": "allow"}
+    },
+    {
+      "id": "quoted-semicolon-interpreter-argument",
+      "classification": "parser_boundary_defect",
+      "source": "python3 -c 'print(1); print(2)'",
+      "policy": {"rules": [{"pattern": "python3 -c *", "action": "ask"}], "default_action": "deny"},
+      "expected": {"commands": ["python3 -c 'print(1); print(2)'"], "redirections": [], "completeness": "complete", "policy": "ask"}
+    },
+    {
+      "id": "heredoc-body-is-data",
+      "classification": "parser_boundary_defect",
+      "source": "python3 - <<'PY'\nprint('rm -rf /; a | b')\nPY\n",
+      "policy": {"rules": [{"pattern": "python3 *", "action": "allow"}, {"pattern": "rm *", "action": "deny"}], "default_action": "deny"},
+      "expected": {"commands": ["python3 - <<'PY'"], "redirections": [{"kind": "heredoc", "target": "PY", "dynamic": false}], "completeness": "complete", "policy": "allow"}
+    },
+    {
+      "id": "git-no-pager-reviewed-alias",
+      "classification": "canonicalization_defect",
+      "source": "git --no-pager diff --stat",
+      "policy": {"rules": [{"pattern": "git diff *", "action": "allow"}, {"pattern": "git *", "action": "deny"}], "default_action": "deny"},
+      "expected": {"commands": ["git --no-pager diff --stat"], "aliases": ["git diff --stat"], "redirections": [], "completeness": "complete", "policy": "allow"},
+      "notes": "The reviewed behavior-neutral alias competes by normal wildcard specificity while retaining the original candidate; a more specific restrictive original match would still win."
+    },
+    {
+      "id": "environment-assignment-prefix",
+      "classification": "canonicalization_defect",
+      "source": "GIT_PAGER=cat git show --stat HEAD",
+      "policy": {"rules": [{"pattern": "git show *", "action": "allow"}, {"pattern": "git *", "action": "deny"}], "default_action": "deny"},
+      "expected": {"commands": ["GIT_PAGER=cat git show --stat HEAD"], "executables": ["git"], "assignments": ["GIT_PAGER=cat"], "redirections": [], "completeness": "complete", "policy": "ask"},
+      "notes": "Alias safety for GIT_PAGER remains a review decision; parsing must still identify git rather than the assignment."
+    },
+    {
+      "id": "missing-printf-policy",
+      "classification": "policy_configuration_gap",
+      "source": "printf '%s\\n' status",
+      "policy": {"rules": [{"pattern": "*", "action": "deny"}], "default_action": "deny"},
+      "expected": {"commands": ["printf '%s\\n' status"], "redirections": [], "completeness": "complete", "policy": "deny"}
+    },
+    {
+      "id": "command-v-policy-gap",
+      "classification": "policy_configuration_gap",
+      "source": "command -v cargo",
+      "policy": {"rules": [{"pattern": "*", "action": "deny"}], "default_action": "deny"},
+      "expected": {"commands": ["command -v cargo"], "redirections": [], "completeness": "complete", "policy": "deny"}
+    },
+    {
+      "id": "for-loop-body",
+      "classification": "parser_boundary_defect",
+      "source": "for item in a b; do printf '%s\\n' \"$item\"; done",
+      "policy": {"rules": [{"pattern": "printf *", "action": "allow"}], "default_action": "deny"},
+      "expected": {"commands": ["printf '%s\\n' \"$item\""], "redirections": [], "completeness": "complete", "policy": "allow"}
+    },
+    {
+      "id": "if-condition-and-body",
+      "classification": "parser_boundary_defect",
+      "source": "if test -f Cargo.toml; then printf '%s\\n' yes; else printf '%s\\n' no; fi",
+      "policy": {"rules": [{"pattern": "test *", "action": "allow"}, {"pattern": "printf *", "action": "allow"}], "default_action": "deny"},
+      "expected": {"commands": ["test -f Cargo.toml", "printf '%s\\n' yes", "printf '%s\\n' no"], "redirections": [], "completeness": "complete", "policy": "allow"}
+    },
+    {
+      "id": "subshell-leaves",
+      "classification": "parser_boundary_defect",
+      "source": "(printf '%s\\n' one; rm -f generated.txt)",
+      "policy": {"rules": [{"pattern": "printf *", "action": "allow"}, {"pattern": "rm *", "action": "deny"}], "default_action": "ask"},
+      "expected": {"commands": ["printf '%s\\n' one", "rm -f generated.txt"], "redirections": [], "completeness": "complete", "policy": "deny"}
+    },
+    {
+      "id": "command-substitution-leaf",
+      "classification": "parser_boundary_defect",
+      "source": "printf '%s\\n' \"$(rm -f generated.txt)\"",
+      "policy": {"rules": [{"pattern": "printf *", "action": "allow"}, {"pattern": "rm *", "action": "deny"}], "default_action": "ask"},
+      "expected": {"commands": ["printf '%s\\n' \"$(rm -f generated.txt)\"", "rm -f generated.txt"], "redirections": [], "completeness": "complete", "policy": "deny"}
+    },
+    {
+      "id": "process-substitution-leaf",
+      "classification": "dynamic_unsupported_fail_closed",
+      "source": "cat <(printf '%s\\n' data)",
+      "policy": {"rules": [{"pattern": "cat *", "action": "allow"}, {"pattern": "printf *", "action": "allow"}], "default_action": "deny"},
+      "expected": {"commands": ["cat <(printf '%s\\n' data)", "printf '%s\\n' data"], "redirections": [], "completeness": "incomplete", "policy": "ask"},
+      "notes": "Process substitution is outside POSIX sh and must fail closed unless the execution dialect and parser explicitly support it."
+    },
+    {
+      "id": "dynamic-command-name",
+      "classification": "dynamic_unsupported_fail_closed",
+      "source": "cmd=printf; \"$cmd\" '%s\\n' data",
+      "policy": {"rules": [{"pattern": "printf *", "action": "allow"}], "default_action": "deny"},
+      "expected": {"commands": ["\"$cmd\" '%s\\n' data"], "redirections": [], "completeness": "incomplete", "policy": "deny"}
+    },
+    {
+      "id": "eval-is-dynamic",
+      "classification": "dynamic_unsupported_fail_closed",
+      "source": "eval \"$SCRIPT\"",
+      "policy": {"rules": [{"pattern": "eval *", "action": "allow"}], "default_action": "deny"},
+      "expected": {"commands": ["eval \"$SCRIPT\""], "redirections": [], "completeness": "incomplete", "policy": "ask"}
+    },
+    {
+      "id": "source-is-dynamic",
+      "classification": "dynamic_unsupported_fail_closed",
+      "source": ". \"$SCRIPT_PATH\"",
+      "policy": {"rules": [{"pattern": ". *", "action": "allow"}], "default_action": "deny"},
+      "expected": {"commands": [". \"$SCRIPT_PATH\""], "redirections": [], "completeness": "incomplete", "policy": "ask"}
+    },
+    {
+      "id": "output-redirection-write",
+      "classification": "parser_boundary_defect",
+      "source": "printf '%s\\n' data > generated.txt",
+      "policy": {"rules": [{"pattern": "printf *", "action": "allow"}], "default_action": "deny", "write_rules": [{"pattern": "**", "action": "deny"}]},
+      "expected": {"commands": ["printf '%s\\n' data > generated.txt"], "redirections": [{"kind": "output_truncate", "target": "generated.txt", "dynamic": false}], "completeness": "complete", "policy": "deny"}
+    },
+    {
+      "id": "input-redirection-read",
+      "classification": "parser_boundary_defect",
+      "source": "cat < input.txt",
+      "policy": {"rules": [{"pattern": "cat *", "action": "allow"}], "default_action": "deny", "read_rules": [{"pattern": "**", "action": "allow"}]},
+      "expected": {"commands": ["cat < input.txt"], "redirections": [{"kind": "input", "target": "input.txt", "dynamic": false}], "completeness": "complete", "policy": "allow"}
+    },
+    {
+      "id": "syntax-error",
+      "classification": "dynamic_unsupported_fail_closed",
+      "source": "if true; then printf '%s\\n' missing-fi",
+      "policy": {"rules": [{"pattern": "true", "action": "allow"}, {"pattern": "printf *", "action": "allow"}], "default_action": "deny"},
+      "expected": {"commands": [], "redirections": [], "completeness": "error", "policy": "deny"}
+    }
+  ]
+}
