@@ -312,6 +312,25 @@ pub enum Request {
     ResumeWorkflowRun {
         run_id: String,
     },
+    /// List bounded durable input/approval waits for one workflow run.
+    ListWorkflowWaits {
+        run_id: String,
+        limit: usize,
+    },
+    /// Resolve one exact durable input wait with schema-validated JSON.
+    ProvideWorkflowInput {
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        value: serde_json::Value,
+    },
+    /// Resolve one exact durable approval wait.
+    ResolveWorkflowApproval {
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        approved: bool,
+    },
     /// Return one bounded page of durable workflow attempts.
     WorkflowAttemptHistory {
         run_id: String,
@@ -1304,6 +1323,12 @@ pub enum ResponsePayload {
     WorkflowRunResumed {
         changed: bool,
     },
+    WorkflowWaitList {
+        waits: Vec<bcode_workflow_store::WaitingActivation>,
+    },
+    WorkflowWaitResolved {
+        result: bcode_workflow_store::WaitingResolutionResult,
+    },
     WorkflowAttemptHistory {
         attempts: Vec<bcode_workflow_store::AttemptSummary>,
     },
@@ -2157,6 +2182,22 @@ mod tests {
             },
             Request::ResumeWorkflowRun {
                 run_id: "run-1".to_string(),
+            },
+            Request::ListWorkflowWaits {
+                run_id: "run-1".to_string(),
+                limit: 25,
+            },
+            Request::ProvideWorkflowInput {
+                run_id: "run-1".to_string(),
+                node_id: "input".to_string(),
+                activation_id: "activation-1".to_string(),
+                value: serde_json::json!({"answer": 42}),
+            },
+            Request::ResolveWorkflowApproval {
+                run_id: "run-1".to_string(),
+                node_id: "approve".to_string(),
+                activation_id: "activation-2".to_string(),
+                approved: true,
             },
             Request::WorkflowAttemptHistory {
                 run_id: "run-1".to_string(),

@@ -95,6 +95,45 @@ pub struct PendingActivation {
     pub created_at_ms: u64,
 }
 
+/// Durable waiting-gate kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowWaitKind {
+    Input,
+    Approval,
+}
+
+impl WorkflowWaitKind {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Approval => "approval",
+        }
+    }
+}
+
+/// Bounded durable waiting activation summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitingActivation {
+    pub run_id: String,
+    pub node_id: String,
+    pub activation_id: String,
+    pub kind: WorkflowWaitKind,
+    pub input: Option<serde_json::Value>,
+    pub requested_at_ms: u64,
+}
+
+/// Result of resolving one exact durable waiting activation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitingResolutionResult {
+    pub run_id: String,
+    pub node_id: String,
+    pub activation_id: String,
+    pub outcome: String,
+    pub activated: Vec<NewActivation>,
+    pub run_status: RunStatus,
+}
+
 /// Keyset cursor for bounded attempt history.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptCursor {
@@ -454,6 +493,81 @@ pub struct RepairResult {
     pub run_status: RunStatus,
 }
 
+/// Optional fault hook used by deterministic output/downstream crash-boundary acceptance tests.
+pub trait WorkflowOutputFault: Sync {
+    /// Observe one boundary inside the atomic output transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an injected error, causing the entire output transaction to roll back.
+    fn after_boundary(
+        &self,
+        boundary: WorkflowOutputBoundary,
+        output: &ValidatedOutput,
+    ) -> Result<(), WorkflowStoreError>;
+}
+
+/// Output transaction boundaries covered by durable crash acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowOutputBoundary {
+    OutputInserted,
+    ActivationCompleted,
+    SuccessorsMaterialized,
+}
+
+/// Production no-op output fault hook.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopWorkflowOutputFault;
+
+impl WorkflowOutputFault for NoopWorkflowOutputFault {
+    fn after_boundary(
+        &self,
+        _boundary: WorkflowOutputBoundary,
+        _output: &ValidatedOutput,
+    ) -> Result<(), WorkflowStoreError> {
+        Ok(())
+    }
+}
+
+/// Optional fault hook used by deterministic crash-boundary acceptance tests.
+///
+/// Production callers use [`NoopWorkflowDispatchFault`]. Hooks run only after the named durable or
+/// external boundary has completed and before the next boundary begins.
+pub trait WorkflowDispatchFault: Sync {
+    /// Observe one dispatch boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an injected error to simulate process loss at this exact boundary.
+    fn after_boundary(
+        &self,
+        boundary: WorkflowDispatchBoundary,
+        request: &PreparedActivationDispatch,
+    ) -> Result<(), WorkflowStoreError>;
+}
+
+/// External-dispatch crash boundaries covered by the durable protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowDispatchBoundary {
+    IntentCommitted,
+    OwnerAccepted,
+    ReceiptCommitted,
+}
+
+/// Production no-op dispatch fault hook.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NoopWorkflowDispatchFault;
+
+impl WorkflowDispatchFault for NoopWorkflowDispatchFault {
+    fn after_boundary(
+        &self,
+        _boundary: WorkflowDispatchBoundary,
+        _request: &PreparedActivationDispatch,
+    ) -> Result<(), WorkflowStoreError> {
+        Ok(())
+    }
+}
+
 /// Owner-specific plan persisted before one pending activation is dispatched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivationDispatchPlan {
@@ -786,11 +900,11 @@ impl WorkflowStore {
             ));
         }
         for node_id in &definition.entries {
-            if !definition.nodes.contains_key(node_id) {
-                return Err(WorkflowStoreError::InvalidData(format!(
+            let node = definition.nodes.get(node_id).ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
                     "workflow entry node is missing: {node_id}"
-                )));
-            }
+                ))
+            })?;
             let activation = NewActivation {
                 run_id: run.run_id.clone(),
                 node_id: node_id.clone(),
@@ -800,7 +914,11 @@ impl WorkflowStore {
                 created_at_ms: run.created_at_ms,
             };
             validate_activation(&activation)?;
-            insert_activation(&transaction, &activation)?;
+            insert_activation_with_status(
+                &transaction,
+                &activation,
+                activation_status_for_node(node),
+            )?;
         }
         transaction.commit()?;
         Ok(())
@@ -1247,6 +1365,32 @@ impl WorkflowStore {
     where
         O: ActivationDispatchOwner + ?Sized,
     {
+        self.dispatch_pending_activations_with_fault(
+            owner,
+            &NoopWorkflowDispatchFault,
+            limit,
+            dispatched_at_ms,
+        )
+        .await
+    }
+
+    /// Dispatch pending activations with deterministic post-boundary fault injection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error from discovery, planning, admission, dispatch, persistence, or the fault
+    /// hook. Already committed boundaries remain durable when a later hook fails.
+    pub async fn dispatch_pending_activations_with_fault<O, F>(
+        &mut self,
+        owner: &O,
+        fault: &F,
+        limit: usize,
+        dispatched_at_ms: u64,
+    ) -> Result<ActivationDispatchSummary, WorkflowStoreError>
+    where
+        O: ActivationDispatchOwner + ?Sized,
+        F: WorkflowDispatchFault + ?Sized,
+    {
         let pending = self.pending_activations(limit)?;
         let mut summary = ActivationDispatchSummary::default();
         for activation in pending {
@@ -1266,7 +1410,9 @@ impl WorkflowStore {
                 summary.raced.push(activation.activation_id);
                 continue;
             };
+            fault.after_boundary(WorkflowDispatchBoundary::IntentCommitted, &prepared)?;
             let receipt = owner.dispatch(&prepared).await?;
+            fault.after_boundary(WorkflowDispatchBoundary::OwnerAccepted, &prepared)?;
             self.persist_dispatch_receipt(&DispatchReceipt {
                 run_id: prepared.activation.run_id.clone(),
                 node_id: prepared.activation.node_id.clone(),
@@ -1276,6 +1422,7 @@ impl WorkflowStore {
                 receipt,
                 admitted_at_ms: dispatched_at_ms,
             })?;
+            fault.after_boundary(WorkflowDispatchBoundary::ReceiptCommitted, &prepared)?;
             summary.admitted.push(prepared.dispatch_identity);
         }
         Ok(summary)
@@ -1449,9 +1596,26 @@ impl WorkflowStore {
         &mut self,
         output: &ValidatedOutput,
     ) -> Result<OutputPersistenceResult, WorkflowStoreError> {
+        self.persist_validated_output_with_fault(output, &NoopWorkflowOutputFault)
+    }
+
+    /// Persist validated output with deterministic in-transaction fault injection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error from validation, persistence, successor scheduling, or the fault hook. Any
+    /// error rolls back output, activation, successor, decision, and run projection changes.
+    pub fn persist_validated_output_with_fault<F>(
+        &mut self,
+        output: &ValidatedOutput,
+        fault: &F,
+    ) -> Result<OutputPersistenceResult, WorkflowStoreError>
+    where
+        F: WorkflowOutputFault + ?Sized,
+    {
         validate_output(output)?;
         let transaction = self.connection.transaction()?;
-        let result = persist_validated_output_transaction(&transaction, output)?;
+        let result = persist_validated_output_transaction_with_fault(&transaction, output, fault)?;
         transaction.commit()?;
         Ok(result)
     }
@@ -2298,6 +2462,258 @@ impl WorkflowStore {
             .collect()
     }
 
+    /// Return bounded durable input/approval waits ordered deterministically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid limit, malformed persisted JSON, or database failure.
+    pub fn waiting_activations(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WaitingActivation>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT run_id, node_id, activation_id, status, input_json, created_at_ms \
+             FROM workflow_activations WHERE run_id = ?1 \
+               AND status IN ('waiting_input', 'waiting_approval') \
+             ORDER BY created_at_ms, node_id, activation_id LIMIT ?2",
+        )?;
+        statement
+            .query_map((run_id, limit), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, u64>(5)?,
+                ))
+            })?
+            .map(|row| {
+                let (run_id, node_id, activation_id, status, input_json, requested_at_ms) = row?;
+                let kind = match status.as_str() {
+                    "waiting_input" => WorkflowWaitKind::Input,
+                    "waiting_approval" => WorkflowWaitKind::Approval,
+                    _ => {
+                        return Err(WorkflowStoreError::InvalidData(format!(
+                            "invalid workflow wait status: {status}"
+                        )));
+                    }
+                };
+                Ok(WaitingActivation {
+                    run_id,
+                    node_id,
+                    activation_id,
+                    kind,
+                    input: input_json
+                        .map(|value| serde_json::from_str(&value))
+                        .transpose()?,
+                    requested_at_ms,
+                })
+            })
+            .collect()
+    }
+
+    /// Resolve one exact waiting input gate with schema-validated typed data.
+    ///
+    /// Resolution, output persistence, activation completion, and downstream materialization are
+    /// atomic and idempotency-safe through the exact activation identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity, wrong gate kind/state, invalid input schema,
+    /// cancellation, conflicting resolution, or database failure.
+    pub fn provide_input(
+        &mut self,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+        value: serde_json::Value,
+        resolved_at_ms: u64,
+    ) -> Result<WaitingResolutionResult, WorkflowStoreError> {
+        self.resolve_waiting_activation(
+            run_id,
+            node_id,
+            activation_id,
+            WorkflowWaitKind::Input,
+            Some(value),
+            true,
+            resolved_at_ms,
+        )
+    }
+
+    /// Resolve one exact waiting approval gate.
+    ///
+    /// Approval forwards the waiting activation's typed input. Denial terminates the run as failed
+    /// and never enables downstream work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity, wrong gate kind/state, cancellation, conflicting
+    /// resolution, invalid forwarded input, or database failure.
+    pub fn resolve_approval(
+        &mut self,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+        approved: bool,
+        resolved_at_ms: u64,
+    ) -> Result<WaitingResolutionResult, WorkflowStoreError> {
+        self.resolve_waiting_activation(
+            run_id,
+            node_id,
+            activation_id,
+            WorkflowWaitKind::Approval,
+            None,
+            approved,
+            resolved_at_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn resolve_waiting_activation(
+        &mut self,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+        kind: WorkflowWaitKind,
+        supplied_value: Option<serde_json::Value>,
+        accepted: bool,
+        resolved_at_ms: u64,
+    ) -> Result<WaitingResolutionResult, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        validate_id("node_id", node_id)?;
+        validate_id("activation_id", activation_id)?;
+        let transaction = self.connection.transaction()?;
+        let (status, input_json, definition_json, run_status, cancellation_requested): (
+            String,
+            Option<String>,
+            String,
+            String,
+            bool,
+        ) = transaction
+            .query_row(
+                "SELECT activation.status, activation.input_json, definition.definition_json, \
+                 run.status, run.cancellation_requested_at_ms IS NOT NULL \
+                 FROM workflow_activations activation \
+                 JOIN workflow_runs run ON run.run_id = activation.run_id \
+                 JOIN workflow_definitions definition \
+                   ON definition.definition_id = run.definition_id \
+                  AND definition.version = run.definition_version \
+                 WHERE activation.run_id = ?1 AND activation.node_id = ?2 \
+                   AND activation.activation_id = ?3",
+                (run_id, node_id, activation_id),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "waiting activation not found: {run_id}/{node_id}/{activation_id}"
+                ))
+            })?;
+        if cancellation_requested || parse_run_status(&run_status)? != RunStatus::Running {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow run is not accepting waiting resolutions".to_string(),
+            ));
+        }
+        let expected_status = match kind {
+            WorkflowWaitKind::Input => "waiting_input",
+            WorkflowWaitKind::Approval => "waiting_approval",
+        };
+        if status != expected_status {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "activation is not waiting for {}: {status}",
+                kind.as_str()
+            )));
+        }
+        let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+        let node = definition.node(node_id).ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!("workflow node not found: {node_id}"))
+        })?;
+        let value = match kind {
+            WorkflowWaitKind::Input => supplied_value.ok_or_else(|| {
+                WorkflowStoreError::InvalidData("input gate requires a value".to_string())
+            })?,
+            WorkflowWaitKind::Approval => input_json
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?
+                .unwrap_or(serde_json::Value::Null),
+        };
+        if accepted {
+            validate_json_schema("waiting activation output", &node.output.schema, &value)?;
+            transaction.execute(
+                "UPDATE workflow_activations SET status = 'running' \
+                 WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND status = ?4",
+                (run_id, node_id, activation_id, expected_status),
+            )?;
+            let output = ValidatedOutput {
+                output_id: format!("{activation_id}:wait-output"),
+                run_id: run_id.to_string(),
+                node_id: node_id.to_string(),
+                activation_id: activation_id.to_string(),
+                schema_id: node.output.type_name.clone(),
+                schema_version: 1,
+                value,
+                artifact_reference: None,
+                created_at_ms: resolved_at_ms,
+            };
+            let result = persist_validated_output_transaction(&transaction, &output)?;
+            append_event(
+                &transaction,
+                run_id,
+                "waiting_activation_resolved",
+                &serde_json::json!({"node_id": node_id, "activation_id": activation_id, "kind": kind, "accepted": true}).to_string(),
+                resolved_at_ms,
+            )?;
+            transaction.commit()?;
+            return Ok(WaitingResolutionResult {
+                run_id: run_id.to_string(),
+                node_id: node_id.to_string(),
+                activation_id: activation_id.to_string(),
+                outcome: "accepted".to_string(),
+                activated: result.activated,
+                run_status: result.run_status,
+            });
+        }
+        transaction.execute(
+            "UPDATE workflow_activations SET status = 'failed' \
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND status = ?4",
+            (run_id, node_id, activation_id, expected_status),
+        )?;
+        transaction.execute(
+            "UPDATE workflow_runs SET status = 'failed', updated_at_ms = ?2 \
+             WHERE run_id = ?1 AND status = 'running'",
+            (run_id, resolved_at_ms),
+        )?;
+        append_event(
+            &transaction,
+            run_id,
+            "waiting_activation_resolved",
+            &serde_json::json!({"node_id": node_id, "activation_id": activation_id, "kind": kind, "accepted": false}).to_string(),
+            resolved_at_ms,
+        )?;
+        append_event(&transaction, run_id, "run_failed", "{}", resolved_at_ms)?;
+        transaction.commit()?;
+        Ok(WaitingResolutionResult {
+            run_id: run_id.to_string(),
+            node_id: node_id.to_string(),
+            activation_id: activation_id.to_string(),
+            outcome: "denied".to_string(),
+            activated: Vec::new(),
+            run_status: RunStatus::Failed,
+        })
+    }
+
     /// Return a keyset-paged bounded attempt history for one run.
     ///
     /// # Errors
@@ -2383,6 +2799,17 @@ fn persist_validated_output_transaction(
     transaction: &Transaction<'_>,
     output: &ValidatedOutput,
 ) -> Result<OutputPersistenceResult, WorkflowStoreError> {
+    persist_validated_output_transaction_with_fault(transaction, output, &NoopWorkflowOutputFault)
+}
+
+fn persist_validated_output_transaction_with_fault<F>(
+    transaction: &Transaction<'_>,
+    output: &ValidatedOutput,
+    fault: &F,
+) -> Result<OutputPersistenceResult, WorkflowStoreError>
+where
+    F: WorkflowOutputFault + ?Sized,
+{
     validate_output(output)?;
     validate_output_against_node_schema(transaction, output)?;
     let value_json = serde_json::to_string(&output.value)?;
@@ -2410,6 +2837,7 @@ fn persist_validated_output_transaction(
             output.created_at_ms,
         ),
     )?;
+    fault.after_boundary(WorkflowOutputBoundary::OutputInserted, output)?;
     let changed = transaction.execute(
         "UPDATE workflow_activations SET status = 'completed', output_id = ?4 \
          WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 \
@@ -2427,6 +2855,7 @@ fn persist_validated_output_transaction(
             output.run_id, output.node_id, output.activation_id
         )));
     }
+    fault.after_boundary(WorkflowOutputBoundary::ActivationCompleted, output)?;
     append_event(
         transaction,
         &output.run_id,
@@ -2435,6 +2864,7 @@ fn persist_validated_output_transaction(
         output.created_at_ms,
     )?;
     let (activated, completed_is_exit) = materialize_direct_successors(transaction, output)?;
+    fault.after_boundary(WorkflowOutputBoundary::SuccessorsMaterialized, output)?;
     let active_count: u64 = transaction.query_row(
         "SELECT COUNT(*) FROM workflow_activations WHERE run_id = ?1 \
          AND status IN ('pending', 'running')",
@@ -2714,10 +3144,16 @@ fn materialize_direct_successors(
             input: Some(input),
             created_at_ms: output.created_at_ms,
         };
+        let node = definition.node(&node_id).ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow successor references missing node: {node_id}"
+            ))
+        })?;
+        let status = activation_status_for_node(node);
         let changed = transaction.execute(
             "INSERT INTO workflow_activations \
              (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
              ON CONFLICT(run_id, node_id, activation_id) DO NOTHING",
             (
                 &activation.run_id,
@@ -2729,6 +3165,7 @@ fn materialize_direct_successors(
                     .as_ref()
                     .map(serde_json::to_string)
                     .transpose()?,
+                status,
                 activation.created_at_ms,
             ),
         )?;
@@ -2736,8 +3173,12 @@ fn materialize_direct_successors(
             append_event(
                 transaction,
                 &activation.run_id,
-                "activation_created",
-                &serde_json::to_string(&activation)?,
+                if status == "pending" {
+                    "activation_created"
+                } else {
+                    "activation_waiting"
+                },
+                &serde_json::json!({"activation": activation, "status": status}).to_string(),
                 activation.created_at_ms,
             )?;
             activated.push(activation);
@@ -3259,10 +3700,26 @@ fn insert_activation(
     transaction: &Transaction<'_>,
     activation: &NewActivation,
 ) -> Result<(), WorkflowStoreError> {
+    insert_activation_with_status(transaction, activation, "pending")
+}
+
+const fn activation_status_for_node(node: &bcode_workflow::NodeDefinition) -> &'static str {
+    match node.kind {
+        bcode_workflow::NodeKind::Input => "waiting_input",
+        bcode_workflow::NodeKind::Approval => "waiting_approval",
+        _ => "pending",
+    }
+}
+
+fn insert_activation_with_status(
+    transaction: &Transaction<'_>,
+    activation: &NewActivation,
+    status: &str,
+) -> Result<(), WorkflowStoreError> {
     transaction.execute(
         "INSERT INTO workflow_activations \
          (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         (
             &activation.run_id,
             &activation.node_id,
@@ -3273,14 +3730,20 @@ fn insert_activation(
                 .as_ref()
                 .map(serde_json::to_string)
                 .transpose()?,
+            status,
             activation.created_at_ms,
         ),
     )?;
+    let event_type = if status == "pending" {
+        "activation_created"
+    } else {
+        "activation_waiting"
+    };
     append_event(
         transaction,
         &activation.run_id,
-        "activation_created",
-        &serde_json::to_string(activation)?,
+        event_type,
+        &serde_json::json!({"activation": activation, "status": status}).to_string(),
         activation.created_at_ms,
     )
 }
@@ -3681,6 +4144,22 @@ fn validate_output(output: &ValidatedOutput) -> Result<(), WorkflowStoreError> {
     }
     if let Some(reference) = &output.artifact_reference {
         validate_id("artifact_reference", reference)?;
+    }
+    Ok(())
+}
+
+fn validate_json_schema(
+    label: &str,
+    schema: &serde_json::Value,
+    value: &serde_json::Value,
+) -> Result<(), WorkflowStoreError> {
+    let validator = jsonschema::validator_for(schema).map_err(|error| {
+        WorkflowStoreError::InvalidData(format!("invalid {label} schema: {error}"))
+    })?;
+    if let Err(error) = validator.validate(value) {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "{label} does not match schema: {error}"
+        )));
     }
     Ok(())
 }
@@ -4925,6 +5404,359 @@ mod tests {
                 ..attempt
             })
             .expect("explicit retry");
+    }
+
+    #[test]
+    fn durable_input_gate_waits_validates_and_activates_successor() {
+        let (_temp, mut store) = initialized_store();
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "u32".to_string(),
+            schema: serde_json::json!({"type": "integer", "minimum": 0}),
+        };
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: 1,
+            name: "input-gate".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: std::collections::BTreeMap::from([
+                (
+                    "input".to_string(),
+                    bcode_workflow::NodeDefinition {
+                        id: "input".to_string(),
+                        name: "input".to_string(),
+                        kind: bcode_workflow::NodeKind::Input,
+                        input: schema.clone(),
+                        output: schema.clone(),
+                        resources: Vec::new(),
+                        configuration: serde_json::json!({"gate_version": 1}),
+                    },
+                ),
+                (
+                    "next".to_string(),
+                    bcode_workflow::NodeDefinition {
+                        id: "next".to_string(),
+                        name: "next".to_string(),
+                        kind: bcode_workflow::NodeKind::Task,
+                        input: schema.clone(),
+                        output: schema,
+                        resources: Vec::new(),
+                        configuration: serde_json::Value::Null,
+                    },
+                ),
+            ]),
+            entries: vec!["input".to_string()],
+            exits: vec!["next".to_string()],
+            edges: vec![bcode_workflow::EdgeDefinition {
+                from: "input".to_string(),
+                to: "next".to_string(),
+                kind: bcode_workflow::EdgeKind::Direct,
+            }],
+        };
+        store
+            .persist_definition("input-gate", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.run_id = "input-run".to_string();
+        run.definition_id = "input-gate".to_string();
+        store.create_run(&run).expect("run");
+        assert!(
+            store
+                .pending_activations(10)
+                .expect("pending")
+                .into_iter()
+                .all(|activation| activation.run_id != "input-run")
+        );
+        let wait = store
+            .waiting_activations("input-run", 10)
+            .expect("waits")
+            .pop()
+            .expect("wait");
+        assert_eq!(wait.kind, WorkflowWaitKind::Input);
+        assert!(
+            store
+                .provide_input(
+                    "input-run",
+                    "input",
+                    &wait.activation_id,
+                    serde_json::json!("wrong"),
+                    20,
+                )
+                .is_err()
+        );
+        let result = store
+            .provide_input(
+                "input-run",
+                "input",
+                &wait.activation_id,
+                serde_json::json!(7),
+                21,
+            )
+            .expect("resolve");
+        assert_eq!(result.outcome, "accepted");
+        assert_eq!(result.activated.len(), 1);
+        let next = store
+            .pending_activations(10)
+            .expect("pending")
+            .into_iter()
+            .find(|activation| activation.run_id == "input-run")
+            .expect("next");
+        assert_eq!(next.node_id, "next");
+        assert_eq!(next.input, Some(serde_json::json!(7)));
+        assert!(
+            store
+                .waiting_activations("input-run", 10)
+                .expect("waits")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn durable_approval_denial_is_terminal_and_never_activates_downstream() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "u32".to_string(),
+            schema: serde_json::json!({"type": "integer"}),
+        };
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: 1,
+            name: "approval".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: std::collections::BTreeMap::from([
+                (
+                    "approve".to_string(),
+                    bcode_workflow::NodeDefinition {
+                        id: "approve".to_string(),
+                        name: "approve".to_string(),
+                        kind: bcode_workflow::NodeKind::Approval,
+                        input: schema.clone(),
+                        output: schema.clone(),
+                        resources: Vec::new(),
+                        configuration: serde_json::json!({"gate_version": 1}),
+                    },
+                ),
+                (
+                    "mutate".to_string(),
+                    bcode_workflow::NodeDefinition {
+                        id: "mutate".to_string(),
+                        name: "mutate".to_string(),
+                        kind: bcode_workflow::NodeKind::Task,
+                        input: schema.clone(),
+                        output: schema,
+                        resources: Vec::new(),
+                        configuration: serde_json::Value::Null,
+                    },
+                ),
+            ]),
+            entries: vec!["approve".to_string()],
+            exits: vec!["mutate".to_string()],
+            edges: vec![bcode_workflow::EdgeDefinition {
+                from: "approve".to_string(),
+                to: "mutate".to_string(),
+                kind: bcode_workflow::EdgeKind::Direct,
+            }],
+        };
+        store
+            .persist_definition("approval", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "approval-run".to_string(),
+                definition_id: "approval".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                input: Some(serde_json::json!(3)),
+                created_at_ms: 1,
+                limits: WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let wait = store
+            .waiting_activations("approval-run", 10)
+            .expect("waits")
+            .pop()
+            .expect("wait");
+        let result = store
+            .resolve_approval("approval-run", "approve", &wait.activation_id, false, 20)
+            .expect("deny");
+        assert_eq!(result.outcome, "denied");
+        assert_eq!(result.run_status, RunStatus::Failed);
+        assert!(store.pending_activations(10).expect("pending").is_empty());
+        assert_eq!(
+            store
+                .run_summary("approval-run")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Failed
+        );
+    }
+
+    #[test]
+    fn output_faults_roll_back_every_atomic_boundary() {
+        struct Fault(WorkflowOutputBoundary);
+        impl WorkflowOutputFault for Fault {
+            fn after_boundary(
+                &self,
+                boundary: WorkflowOutputBoundary,
+                _output: &ValidatedOutput,
+            ) -> Result<(), WorkflowStoreError> {
+                if boundary == self.0 {
+                    return Err(WorkflowStoreError::InvalidData(format!(
+                        "crash after {boundary:?}"
+                    )));
+                }
+                Ok(())
+            }
+        }
+
+        for boundary in [
+            WorkflowOutputBoundary::OutputInserted,
+            WorkflowOutputBoundary::ActivationCompleted,
+            WorkflowOutputBoundary::SuccessorsMaterialized,
+        ] {
+            let temp = tempfile::tempdir().expect("temp");
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            store
+                .persist_definition("sequential", 1, &sequential_definition())
+                .expect("definition");
+            let mut run = new_run();
+            run.run_id = "fault-run".to_string();
+            run.definition_id = "sequential".to_string();
+            store.create_run(&run).expect("run");
+            let output = ValidatedOutput {
+                output_id: "fault-output".to_string(),
+                run_id: "fault-run".to_string(),
+                node_id: "first".to_string(),
+                activation_id: activation_identity("fault-run", "first", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 20,
+            };
+            assert!(
+                store
+                    .persist_validated_output_with_fault(&output, &Fault(boundary))
+                    .is_err()
+            );
+            drop(store);
+            let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+            let output_count: u64 = reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_outputs WHERE run_id = 'fault-run'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("outputs");
+            let first_status: String = reopened
+                .connection
+                .query_row(
+                    "SELECT status FROM workflow_activations WHERE run_id = 'fault-run' AND node_id = 'first'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("first");
+            let successor_count: u64 = reopened
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_activations WHERE run_id = 'fault-run' AND node_id = 'second'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("successor");
+            assert_eq!(output_count, 0);
+            assert_eq!(first_status, "pending");
+            assert_eq!(successor_count, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_faults_preserve_exact_boundary_state() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Owner(AtomicUsize);
+        impl ActivationDispatchOwner for Owner {
+            fn plan(
+                &self,
+                _activation: &PendingActivation,
+            ) -> Result<Option<ActivationDispatchPlan>, WorkflowStoreError> {
+                Ok(Some(ActivationDispatchPlan {
+                    side_effect: DispatchSideEffect::ReadOnly,
+                    intent: serde_json::json!({"operation": "review"}),
+                }))
+            }
+
+            fn dispatch<'a>(
+                &'a self,
+                request: &'a PreparedActivationDispatch,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<serde_json::Value, WorkflowStoreError>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Ok(serde_json::json!({"identity": request.dispatch_identity}))
+                })
+            }
+        }
+
+        struct Fault(WorkflowDispatchBoundary);
+        impl WorkflowDispatchFault for Fault {
+            fn after_boundary(
+                &self,
+                boundary: WorkflowDispatchBoundary,
+                _request: &PreparedActivationDispatch,
+            ) -> Result<(), WorkflowStoreError> {
+                if boundary == self.0 {
+                    return Err(WorkflowStoreError::InvalidData(format!(
+                        "crash after {boundary:?}"
+                    )));
+                }
+                Ok(())
+            }
+        }
+
+        for (boundary, expected_calls, expected_status, has_receipt) in [
+            (
+                WorkflowDispatchBoundary::IntentCommitted,
+                0,
+                "prepared",
+                false,
+            ),
+            (
+                WorkflowDispatchBoundary::OwnerAccepted,
+                1,
+                "prepared",
+                false,
+            ),
+            (
+                WorkflowDispatchBoundary::ReceiptCommitted,
+                1,
+                "admitted",
+                true,
+            ),
+        ] {
+            let (temp, mut store) = initialized_store();
+            let owner = Owner(AtomicUsize::new(0));
+            assert!(
+                store
+                    .dispatch_pending_activations_with_fault(&owner, &Fault(boundary), 10, 20)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(owner.0.load(Ordering::SeqCst), expected_calls);
+            drop(store);
+            let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+            let attempt = reopened
+                .attempt_history("run-1", None, 10)
+                .expect("attempt")
+                .pop()
+                .expect("row");
+            assert_eq!(attempt.status, expected_status);
+            assert_eq!(attempt.has_receipt, has_receipt);
+        }
     }
 
     #[tokio::test]

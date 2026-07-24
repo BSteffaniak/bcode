@@ -1127,6 +1127,10 @@ pub enum NodeKind {
     Parallel,
     /// Homogeneous bounded fan-out.
     FanOut,
+    /// Durable external input gate resolved by the workflow host.
+    Input,
+    /// Durable human approval gate resolved by the workflow host.
+    Approval,
 }
 
 /// Serializable directed workflow edge.
@@ -1372,6 +1376,41 @@ where
     I: JsonSchema + Send + 'static,
     O: Serialize + DeserializeOwned + JsonSchema + Send + 'static,
 {
+    /// Create a durable external-input gate.
+    ///
+    /// The in-process operation is an identity mapping so the same definition remains executable
+    /// without a daemon. Durable hosts recognize the `Input` node kind and wait for schema-validated
+    /// external input before completing the activation.
+    #[must_use]
+    pub fn input(name: impl Into<String>) -> Step<I, I>
+    where
+        I: Serialize + DeserializeOwned,
+    {
+        Step::configured_task(
+            name,
+            NodeKind::Input,
+            serde_json::json!({"gate_version": 1}),
+            |input, _context| async move { Ok(input) },
+        )
+    }
+
+    /// Create a durable approval gate.
+    ///
+    /// Durable hosts require an explicit boolean decision. Approval forwards the typed input;
+    /// denial terminates the activation without enabling downstream work.
+    #[must_use]
+    pub fn approval(name: impl Into<String>) -> Step<I, I>
+    where
+        I: Serialize + DeserializeOwned,
+    {
+        Step::configured_task(
+            name,
+            NodeKind::Approval,
+            serde_json::json!({"gate_version": 1}),
+            |input, _context| async move { Ok(input) },
+        )
+    }
+
     /// Create an asynchronous typed application step.
     #[must_use]
     pub fn task<F, Fut>(name: impl Into<String>, operation: F) -> Self
@@ -2255,6 +2294,8 @@ impl WorkflowPlan {
                             | NodeKind::Repeat
                             | NodeKind::Retry
                             | NodeKind::FanOut
+                            | NodeKind::Input
+                            | NodeKind::Approval
                     )
                 })
         }) {

@@ -2027,6 +2027,77 @@ impl BcodeClient {
         }
     }
 
+    /// List bounded durable input/approval waits for one run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the bounded request.
+    pub async fn list_workflow_waits(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow_store::WaitingActivation>, ClientError> {
+        match self
+            .send_request(Request::ListWorkflowWaits { run_id, limit })
+            .await?
+        {
+            ResponsePayload::WorkflowWaitList { waits } => Ok(waits),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Resolve one exact durable input wait with schema-validated JSON.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the identity, state, or value.
+    pub async fn provide_workflow_input(
+        &self,
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        value: serde_json::Value,
+    ) -> Result<bcode_workflow_store::WaitingResolutionResult, ClientError> {
+        match self
+            .send_request(Request::ProvideWorkflowInput {
+                run_id,
+                node_id,
+                activation_id,
+                value,
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowWaitResolved { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Resolve one exact durable approval wait.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the identity or state.
+    pub async fn resolve_workflow_approval(
+        &self,
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        approved: bool,
+    ) -> Result<bcode_workflow_store::WaitingResolutionResult, ClientError> {
+        match self
+            .send_request(Request::ResolveWorkflowApproval {
+                run_id,
+                node_id,
+                activation_id,
+                approved,
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowWaitResolved { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Return one bounded page of workflow attempts.
     ///
     /// # Errors
