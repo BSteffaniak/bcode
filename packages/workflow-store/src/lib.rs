@@ -15,7 +15,7 @@ use std::pin::Pin;
 use thiserror::Error;
 
 const DATABASE_FILE: &str = "workflow.db";
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const MAX_ID_BYTES: usize = 512;
 const MAX_INLINE_JSON_BYTES: usize = 1_048_576;
 
@@ -90,6 +90,7 @@ pub struct PendingActivation {
     pub node_id: String,
     pub activation_id: String,
     pub dependency_generation: u64,
+    pub input: Option<serde_json::Value>,
     pub node: bcode_workflow::NodeDefinition,
     pub created_at_ms: u64,
 }
@@ -181,6 +182,9 @@ pub struct NewActivation {
     pub node_id: String,
     pub activation_id: String,
     pub dependency_generation: u64,
+    /// Optional schema-validated activation input. Entry activations inherit the run input;
+    /// downstream activations inherit the predecessor output or a controller-derived envelope.
+    pub input: Option<serde_json::Value>,
     pub created_at_ms: u64,
 }
 
@@ -367,6 +371,19 @@ pub trait AttemptStatusObserver {
     ) -> Result<AttemptObservation, WorkflowStoreError>;
 }
 
+/// Asynchronous owner boundary used when status lives behind an async host projection.
+pub trait AsyncAttemptStatusObserver: Sync {
+    /// Observe one receipt-backed attempt without mutating workflow storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bounded owner status API cannot be queried safely.
+    fn observe_async<'a>(
+        &'a self,
+        request: &'a AttemptReconciliationRequest,
+    ) -> Pin<Box<dyn Future<Output = Result<AttemptObservation, WorkflowStoreError>> + Send + 'a>>;
+}
+
 /// Summary of receipt-backed restart reconciliation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReceiptReconciliationSummary {
@@ -435,6 +452,59 @@ pub struct RepairResult {
     pub dispatch_identity: String,
     pub attempt_status: String,
     pub run_status: RunStatus,
+}
+
+/// Owner-specific plan persisted before one pending activation is dispatched.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivationDispatchPlan {
+    pub side_effect: DispatchSideEffect,
+    pub intent: serde_json::Value,
+}
+
+/// Result of bounded owner dispatch from pending activation snapshots.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivationDispatchSummary {
+    pub admitted: Vec<String>,
+    pub unsupported: Vec<String>,
+    pub raced: Vec<String>,
+}
+
+/// Host owner boundary for executable durable workflow activations.
+pub trait ActivationDispatchOwner: Sync {
+    /// Build the exact bounded intent that must be committed before external dispatch.
+    ///
+    /// Returning `None` leaves an unsupported activation pending for another owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the node contract is malformed or policy admission fails.
+    fn plan(
+        &self,
+        activation: &PendingActivation,
+    ) -> Result<Option<ActivationDispatchPlan>, WorkflowStoreError>;
+
+    /// Dispatch one activation only after its prepared intent has committed.
+    ///
+    /// Implementations must use `dispatch_identity` as their idempotency/correlation identity.
+    /// The returned receipt must be sufficient for bounded status observation and cancellation.
+    /// Dispatch must return after durable owner admission, not after operation completion.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the external owner cannot accept the operation. The durable attempt
+    /// remains prepared for explicit reconciliation and must not be blindly redispatched.
+    fn dispatch<'a>(
+        &'a self,
+        request: &'a PreparedActivationDispatch,
+    ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, WorkflowStoreError>> + Send + 'a>>;
+}
+
+/// Result of atomically reserving one pending activation for owner dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedActivationDispatch {
+    pub activation: PendingActivation,
+    pub attempt: u32,
+    pub dispatch_identity: String,
 }
 
 /// Result of atomically persisting output and materializing direct successors.
@@ -533,6 +603,7 @@ impl WorkflowStore {
         }
         let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", true)?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
         migrate(&mut connection)?;
         Ok(Self {
             path: path.to_path_buf(),
@@ -725,6 +796,7 @@ impl WorkflowStore {
                 node_id: node_id.clone(),
                 activation_id: activation_identity(&run.run_id, node_id, 0),
                 dependency_generation: 0,
+                input: run.input.clone(),
                 created_at_ms: run.created_at_ms,
             };
             validate_activation(&activation)?;
@@ -1155,6 +1227,145 @@ impl WorkflowStore {
             .map_err(WorkflowStoreError::from)
     }
 
+    /// Admit and dispatch a bounded snapshot of pending executable activations.
+    ///
+    /// For each activation, owner planning happens before mutation, then activation reservation and
+    /// intent persistence commit atomically before external dispatch. Owner receipts are persisted
+    /// immediately after acceptance. A dispatch error leaves the attempt prepared for explicit
+    /// reconciliation and stops the batch; it is never silently retried.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when pending discovery, owner planning/dispatch, admission, receipt
+    /// persistence, or durable state access fails.
+    pub async fn dispatch_pending_activations<O>(
+        &mut self,
+        owner: &O,
+        limit: usize,
+        dispatched_at_ms: u64,
+    ) -> Result<ActivationDispatchSummary, WorkflowStoreError>
+    where
+        O: ActivationDispatchOwner + ?Sized,
+    {
+        let pending = self.pending_activations(limit)?;
+        let mut summary = ActivationDispatchSummary::default();
+        for activation in pending {
+            let Some(plan) = owner.plan(&activation)? else {
+                summary.unsupported.push(activation.activation_id);
+                continue;
+            };
+            let Some(prepared) = self.prepare_pending_activation(
+                &activation.run_id,
+                &activation.node_id,
+                &activation.activation_id,
+                plan.side_effect,
+                plan.intent,
+                dispatched_at_ms,
+            )?
+            else {
+                summary.raced.push(activation.activation_id);
+                continue;
+            };
+            let receipt = owner.dispatch(&prepared).await?;
+            self.persist_dispatch_receipt(&DispatchReceipt {
+                run_id: prepared.activation.run_id.clone(),
+                node_id: prepared.activation.node_id.clone(),
+                activation_id: prepared.activation.activation_id.clone(),
+                attempt: prepared.attempt,
+                dispatch_identity: prepared.dispatch_identity.clone(),
+                receipt,
+                admitted_at_ms: dispatched_at_ms,
+            })?;
+            summary.admitted.push(prepared.dispatch_identity);
+        }
+        Ok(summary)
+    }
+
+    /// Atomically reserve one exact pending activation and persist its dispatch intent.
+    ///
+    /// This is the scheduler admission boundary: only one caller can transition a pending
+    /// activation to running and create attempt one. External dispatch must happen only after this
+    /// method commits. Repeated admission returns `Ok(None)` without creating another attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity, oversized intent, missing durable state, exhausted
+    /// run limits, or database failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_pending_activation(
+        &mut self,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+        side_effect: DispatchSideEffect,
+        intent: serde_json::Value,
+        prepared_at_ms: u64,
+    ) -> Result<Option<PreparedActivationDispatch>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        validate_id("node_id", node_id)?;
+        validate_id("activation_id", activation_id)?;
+        let intent_json = bounded_json("dispatch intent", &intent)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let activation =
+            pending_activation_by_identity(&transaction, run_id, node_id, activation_id)?;
+        let Some(activation) = activation else {
+            return Ok(None);
+        };
+        let attempt = 1;
+        let prepared = PreparedAttempt {
+            run_id: run_id.to_string(),
+            node_id: node_id.to_string(),
+            activation_id: activation_id.to_string(),
+            attempt,
+            side_effect,
+            intent,
+            prepared_at_ms,
+        };
+        enforce_attempt_limits(&transaction, &prepared)?;
+        let dispatch_identity = prepared.dispatch_identity();
+        let checksum = sha256_hex(intent_json.as_bytes());
+        let changed = transaction.execute(
+            "UPDATE workflow_activations SET status = 'running' \
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND status = 'pending'",
+            (run_id, node_id, activation_id),
+        )?;
+        if changed != 1 {
+            return Ok(None);
+        }
+        transaction.execute(
+            "INSERT INTO workflow_attempts \
+             (run_id, node_id, activation_id, attempt, dispatch_identity, side_effect, status, \
+              intent_json, intent_checksum, prepared_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'prepared', ?7, ?8, ?9)",
+            (
+                run_id,
+                node_id,
+                activation_id,
+                attempt,
+                &dispatch_identity,
+                side_effect.as_str(),
+                &intent_json,
+                &checksum,
+                prepared_at_ms,
+            ),
+        )?;
+        append_event(
+            &transaction,
+            run_id,
+            "attempt_prepared",
+            &serde_json::to_string(&prepared)?,
+            prepared_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(Some(PreparedActivationDispatch {
+            activation,
+            attempt,
+            dispatch_identity,
+        }))
+    }
+
     /// Persist prepared intent before an external operation is dispatched.
     ///
     /// This operation is idempotent only for byte-equivalent intent at the same durable attempt
@@ -1305,6 +1516,42 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// Safely redispatch bounded receipt-less prepared read-only attempts after restart.
+    ///
+    /// Mutating attempts are never returned by this operation. Each read-only operation retains
+    /// its original stable dispatch identity and becomes admitted only after a new receipt commits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when bounded discovery, durable decoding, owner dispatch, or receipt
+    /// persistence fails. An owner error leaves the attempt prepared for another explicit retry.
+    pub async fn redispatch_prepared_read_only<O>(
+        &mut self,
+        owner: &O,
+        limit: usize,
+        admitted_at_ms: u64,
+    ) -> Result<Vec<String>, WorkflowStoreError>
+    where
+        O: ActivationDispatchOwner + ?Sized,
+    {
+        let prepared = prepared_read_only_dispatches(&self.connection, bounded_limit(limit)?)?;
+        let mut admitted = Vec::with_capacity(prepared.len());
+        for request in prepared {
+            let receipt = owner.dispatch(&request).await?;
+            self.persist_dispatch_receipt(&DispatchReceipt {
+                run_id: request.activation.run_id.clone(),
+                node_id: request.activation.node_id.clone(),
+                activation_id: request.activation.activation_id.clone(),
+                attempt: request.attempt,
+                dispatch_identity: request.dispatch_identity.clone(),
+                receipt,
+                admitted_at_ms,
+            })?;
+            admitted.push(request.dispatch_identity);
+        }
+        Ok(admitted)
+    }
+
     /// Reconcile receipt-less prepared attempts after restart without external dispatch.
     ///
     /// Mutating attempts are atomically marked repair-required. Read-only attempts remain prepared
@@ -1372,6 +1619,18 @@ impl WorkflowStore {
         Ok(summary)
     }
 
+    /// Return bounded receipt-backed attempts that need owner reattachment/observation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bound is invalid, receipt data is malformed, or the query fails.
+    pub fn active_attempts(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<AttemptReconciliationRequest>, WorkflowStoreError> {
+        receipt_backed_attempts(&self.connection, bounded_limit(limit)?)
+    }
+
     /// Reconcile receipt-backed admitted/running attempts through a bounded owner status API.
     ///
     /// Observation is read-only. Each returned state is then persisted atomically. Unknown
@@ -1402,6 +1661,42 @@ impl WorkflowStore {
             apply_attempt_observation(
                 &transaction,
                 request,
+                observation,
+                reconciled_at_ms,
+                &mut summary,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(summary)
+    }
+
+    /// Asynchronously reconcile receipt-backed attempts through a bounded owner status API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when bounded discovery/observation or a durable transition fails.
+    pub async fn reconcile_receipt_backed_attempts_async<O>(
+        &mut self,
+        observer: &O,
+        limit: usize,
+        reconciled_at_ms: u64,
+    ) -> Result<ReceiptReconciliationSummary, WorkflowStoreError>
+    where
+        O: AsyncAttemptStatusObserver + ?Sized,
+    {
+        let limit = bounded_limit(limit)?;
+        let requests = receipt_backed_attempts(&self.connection, limit)?;
+        let mut observations = Vec::with_capacity(requests.len());
+        for request in requests {
+            let observation = observer.observe_async(&request).await?;
+            observations.push((request, observation));
+        }
+        let transaction = self.connection.transaction()?;
+        let mut summary = ReceiptReconciliationSummary::default();
+        for (request, observation) in observations {
+            apply_attempt_observation(
+                &transaction,
+                &request,
                 observation,
                 reconciled_at_ms,
                 &mut summary,
@@ -1929,7 +2224,8 @@ impl WorkflowStore {
         let limit = bounded_limit(limit)?;
         let mut statement = self.connection.prepare(
             "SELECT activation.run_id, activation.node_id, activation.activation_id, \
-             activation.dependency_generation, activation.created_at_ms, definition.definition_json \
+             activation.dependency_generation, activation.input_json, activation.created_at_ms, \
+             definition.definition_json \
              FROM workflow_activations activation \
              JOIN workflow_runs run ON run.run_id = activation.run_id \
              JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
@@ -1945,13 +2241,21 @@ impl WorkflowStore {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, u64>(3)?,
-                    row.get::<_, u64>(4)?,
-                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, u64>(5)?,
+                    row.get::<_, String>(6)?,
                 ))
             })?
             .map(|row| {
-                let (run_id, node_id, activation_id, dependency_generation, created_at_ms, json) =
-                    row?;
+                let (
+                    run_id,
+                    node_id,
+                    activation_id,
+                    dependency_generation,
+                    input_json,
+                    created_at_ms,
+                    json,
+                ) = row?;
                 let definition: WorkflowDefinition = serde_json::from_str(&json)?;
                 let node = definition.node(&node_id).cloned().ok_or_else(|| {
                     WorkflowStoreError::InvalidData(format!(
@@ -1963,6 +2267,9 @@ impl WorkflowStore {
                     node_id,
                     activation_id,
                     dependency_generation,
+                    input: input_json
+                        .map(|json| serde_json::from_str(&json))
+                        .transpose()?,
                     node,
                     created_at_ms,
                 })
@@ -2077,6 +2384,7 @@ fn persist_validated_output_transaction(
     output: &ValidatedOutput,
 ) -> Result<OutputPersistenceResult, WorkflowStoreError> {
     validate_output(output)?;
+    validate_output_against_node_schema(transaction, output)?;
     let value_json = serde_json::to_string(&output.value)?;
     if value_json.len() > MAX_INLINE_JSON_BYTES {
         return Err(WorkflowStoreError::InvalidData(format!(
@@ -2104,7 +2412,8 @@ fn persist_validated_output_transaction(
     )?;
     let changed = transaction.execute(
         "UPDATE workflow_activations SET status = 'completed', output_id = ?4 \
-         WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND status = 'pending'",
+         WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 \
+           AND status IN ('pending', 'running')",
         (
             &output.run_id,
             &output.node_id,
@@ -2114,7 +2423,7 @@ fn persist_validated_output_transaction(
     )?;
     if changed != 1 {
         return Err(WorkflowStoreError::InvalidData(format!(
-            "activation is not pending: {}/{}/{}",
+            "activation is not pending or running: {}/{}/{}",
             output.run_id, output.node_id, output.activation_id
         )));
     }
@@ -2156,6 +2465,128 @@ fn persist_validated_output_transaction(
     })
 }
 
+fn evaluate_predicate(
+    expression: &bcode_workflow::PredicateExpression,
+    value: &serde_json::Value,
+) -> Result<bool, WorkflowStoreError> {
+    match expression {
+        bcode_workflow::PredicateExpression::Equals {
+            path,
+            value: expected,
+        } => {
+            let actual = path
+                .split('.')
+                .filter(|part| !part.is_empty())
+                .try_fold(value, |current, part| current.get(part))
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(format!(
+                        "workflow predicate field was not present: {path}"
+                    ))
+                })?;
+            Ok(actual == expected)
+        }
+    }
+}
+
+fn configured_node_ids(
+    configuration: &serde_json::Value,
+    field: &str,
+) -> Result<Vec<String>, WorkflowStoreError> {
+    configuration
+        .get(field)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow branch configuration is missing {field}"
+            ))
+        })?
+        .iter()
+        .map(|value| {
+            value.as_str().map(ToString::to_string).ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "workflow branch configuration {field} must contain node IDs"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn skip_branch_nodes(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    generation: u64,
+    node_ids: &[String],
+    created_at_ms: u64,
+) -> Result<(), WorkflowStoreError> {
+    for node_id in node_ids {
+        transaction.execute(
+            "INSERT INTO workflow_activations \
+             (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, NULL, 'skipped', ?5) \
+             ON CONFLICT(run_id, node_id, activation_id) DO NOTHING",
+            (
+                run_id,
+                node_id,
+                activation_identity(run_id, node_id, generation),
+                generation,
+                created_at_ms,
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+fn activation_output_value(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    node_id: &str,
+    generation: u64,
+) -> Result<serde_json::Value, WorkflowStoreError> {
+    let value_json: String = transaction.query_row(
+        "SELECT output.value_json FROM workflow_activations activation \
+         JOIN workflow_outputs output ON output.output_id = activation.output_id \
+         WHERE activation.run_id = ?1 AND activation.node_id = ?2 \
+           AND activation.dependency_generation = ?3 AND activation.status = 'completed'",
+        (run_id, node_id, generation),
+        |row| row.get(0),
+    )?;
+    Ok(serde_json::from_str(&value_json)?)
+}
+
+fn activation_input(
+    transaction: &Transaction<'_>,
+    definition: &WorkflowDefinition,
+    output: &ValidatedOutput,
+    target: &bcode_workflow::NodeDefinition,
+    generation: u64,
+) -> Result<serde_json::Value, WorkflowStoreError> {
+    if target.kind != bcode_workflow::NodeKind::Parallel {
+        return Ok(output.value.clone());
+    }
+    let left_exits = configured_node_ids(&target.configuration, "left_exits")?;
+    let right_exits = configured_node_ids(&target.configuration, "right_exits")?;
+    let branch_value = |exits: &[String]| {
+        exits
+            .iter()
+            .find_map(|node_id| {
+                definition.node(node_id).and_then(|_| {
+                    activation_output_value(transaction, &output.run_id, node_id, generation).ok()
+                })
+            })
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "parallel join {} has no completed branch output",
+                    target.id
+                ))
+            })
+    };
+    Ok(serde_json::Value::Array(vec![
+        branch_value(&left_exits)?,
+        branch_value(&right_exits)?,
+    ]))
+}
+
+#[allow(clippy::too_many_lines)]
 fn materialize_direct_successors(
     transaction: &Transaction<'_>,
     output: &ValidatedOutput,
@@ -2184,6 +2615,59 @@ fn materialize_direct_successors(
         })
         .map(|edge| edge.to.clone())
         .collect::<Vec<_>>();
+    if let Some(branch) = definition
+        .node(&output.node_id)
+        .filter(|node| node.kind == bcode_workflow::NodeKind::Branch)
+    {
+        let expression: bcode_workflow::PredicateExpression =
+            serde_json::from_value(branch.configuration.get("predicate").cloned().ok_or_else(
+                || {
+                    WorkflowStoreError::InvalidData(
+                        "workflow branch configuration is missing predicate".to_string(),
+                    )
+                },
+            )?)?;
+        let selected = evaluate_predicate(&expression, &output.value)?;
+        let selected_entries = configured_node_ids(
+            &branch.configuration,
+            if selected {
+                "true_entries"
+            } else {
+                "false_entries"
+            },
+        )?;
+        let skipped_nodes = configured_node_ids(
+            &branch.configuration,
+            if selected {
+                "false_nodes"
+            } else {
+                "true_nodes"
+            },
+        )?;
+        skip_branch_nodes(
+            transaction,
+            &output.run_id,
+            generation,
+            &skipped_nodes,
+            output.created_at_ms,
+        )?;
+        targets.extend(selected_entries);
+        transaction.execute(
+            "INSERT INTO workflow_decisions \
+             (decision_id, run_id, node_id, decision_type, value_json, created_at_ms) \
+             VALUES (?1, ?2, ?3, 'branch', ?4, ?5)",
+            (
+                format!("{}:branch", output.activation_id),
+                &output.run_id,
+                &output.node_id,
+                serde_json::to_string(&serde_json::json!({
+                    "selected": selected,
+                    "predicate": expression,
+                }))?,
+                output.created_at_ms,
+            ),
+        )?;
+    }
     targets.sort();
     targets.dedup();
     let mut activated = Vec::new();
@@ -2191,8 +2675,11 @@ fn materialize_direct_successors(
         let dependencies = definition
             .edges
             .iter()
+            .filter(|edge| edge.to == node_id)
             .filter(|edge| {
-                edge.to == node_id && matches!(edge.kind, bcode_workflow::EdgeKind::Direct)
+                matches!(edge.kind, bcode_workflow::EdgeKind::Direct)
+                    || (edge.from == output.node_id
+                        && matches!(edge.kind, bcode_workflow::EdgeKind::Conditional { .. }))
             })
             .map(|edge| edge.from.as_str())
             .collect::<Vec<_>>();
@@ -2200,7 +2687,8 @@ fn materialize_direct_successors(
         for dependency in dependencies {
             let completed = transaction.query_row(
                 "SELECT EXISTS(SELECT 1 FROM workflow_activations WHERE run_id = ?1 \
-                 AND node_id = ?2 AND dependency_generation = ?3 AND status = 'completed')",
+                 AND node_id = ?2 AND dependency_generation = ?3 \
+                 AND status IN ('completed', 'skipped'))",
                 (&output.run_id, dependency, generation),
                 |row| row.get::<_, bool>(0),
             )?;
@@ -2212,23 +2700,35 @@ fn materialize_direct_successors(
         if !ready {
             continue;
         }
+        let target = definition.node(&node_id).ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow successor node is missing: {node_id}"
+            ))
+        })?;
+        let input = activation_input(transaction, &definition, output, target, generation)?;
         let activation = NewActivation {
             run_id: output.run_id.clone(),
             node_id: node_id.clone(),
             activation_id: activation_identity(&output.run_id, &node_id, generation),
             dependency_generation: generation,
+            input: Some(input),
             created_at_ms: output.created_at_ms,
         };
         let changed = transaction.execute(
             "INSERT INTO workflow_activations \
-             (run_id, node_id, activation_id, dependency_generation, status, created_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, 'pending', ?5) \
+             (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6) \
              ON CONFLICT(run_id, node_id, activation_id) DO NOTHING",
             (
                 &activation.run_id,
                 &activation.node_id,
                 &activation.activation_id,
                 activation.dependency_generation,
+                activation
+                    .input
+                    .as_ref()
+                    .map(serde_json::to_string)
+                    .transpose()?,
                 activation.created_at_ms,
             ),
         )?;
@@ -2244,6 +2744,77 @@ fn materialize_direct_successors(
         }
     }
     Ok((activated, completed_is_exit))
+}
+
+fn prepared_read_only_dispatches(
+    connection: &Connection,
+    limit: i64,
+) -> Result<Vec<PreparedActivationDispatch>, WorkflowStoreError> {
+    let mut statement = connection.prepare(
+        "SELECT attempt.run_id, attempt.node_id, attempt.activation_id, attempt.attempt, \
+         attempt.dispatch_identity, activation.dependency_generation, activation.input_json, \
+         activation.created_at_ms, definition.definition_json \
+         FROM workflow_attempts attempt \
+         JOIN workflow_activations activation ON activation.run_id = attempt.run_id \
+           AND activation.node_id = attempt.node_id \
+           AND activation.activation_id = attempt.activation_id \
+         JOIN workflow_runs run ON run.run_id = attempt.run_id \
+         JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+           AND definition.version = run.definition_version \
+         WHERE attempt.status = 'prepared' AND attempt.side_effect = 'read_only' \
+           AND attempt.receipt_json IS NULL AND run.status = 'running' \
+           AND run.cancellation_requested_at_ms IS NULL \
+         ORDER BY attempt.prepared_at_ms, attempt.dispatch_identity LIMIT ?1",
+    )?;
+    statement
+        .query_map([limit], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, u32>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, u64>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, u64>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })?
+        .map(|row| {
+            let (
+                run_id,
+                node_id,
+                activation_id,
+                attempt,
+                dispatch_identity,
+                dependency_generation,
+                input_json,
+                created_at_ms,
+                definition_json,
+            ) = row?;
+            let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+            let node = definition.node(&node_id).cloned().ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "prepared workflow attempt references missing node: {node_id}"
+                ))
+            })?;
+            Ok(PreparedActivationDispatch {
+                activation: PendingActivation {
+                    run_id,
+                    node_id,
+                    activation_id,
+                    dependency_generation,
+                    input: input_json
+                        .map(|json| serde_json::from_str(&json))
+                        .transpose()?,
+                    node,
+                    created_at_ms,
+                },
+                attempt,
+                dispatch_identity,
+            })
+        })
+        .collect()
 }
 
 fn receipt_backed_attempts(
@@ -2393,6 +2964,58 @@ fn validate_observed_output(
         ));
     }
     Ok(())
+}
+
+fn pending_activation_by_identity(
+    connection: &Connection,
+    run_id: &str,
+    node_id: &str,
+    activation_id: &str,
+) -> Result<Option<PendingActivation>, WorkflowStoreError> {
+    let row = connection
+        .query_row(
+            "SELECT activation.dependency_generation, activation.input_json, \
+             activation.created_at_ms, definition.definition_json \
+             FROM workflow_activations activation \
+             JOIN workflow_runs run ON run.run_id = activation.run_id \
+             JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+               AND definition.version = run.definition_version \
+             WHERE activation.run_id = ?1 AND activation.node_id = ?2 \
+               AND activation.activation_id = ?3 AND activation.status = 'pending' \
+               AND run.status = 'running' AND run.cancellation_requested_at_ms IS NULL",
+            (run_id, node_id, activation_id),
+            |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, u64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    row.map(
+        |(dependency_generation, input_json, created_at_ms, definition_json)| {
+            let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+            let node = definition.node(node_id).cloned().ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "workflow activation references missing node: {node_id}"
+                ))
+            })?;
+            Ok(PendingActivation {
+                run_id: run_id.to_string(),
+                node_id: node_id.to_string(),
+                activation_id: activation_id.to_string(),
+                dependency_generation,
+                input: input_json
+                    .map(|json| serde_json::from_str(&json))
+                    .transpose()?,
+                node,
+                created_at_ms,
+            })
+        },
+    )
+    .transpose()
 }
 
 fn enforce_activation_limits(
@@ -2638,13 +3261,18 @@ fn insert_activation(
 ) -> Result<(), WorkflowStoreError> {
     transaction.execute(
         "INSERT INTO workflow_activations \
-         (run_id, node_id, activation_id, dependency_generation, status, created_at_ms) \
-         VALUES (?1, ?2, ?3, ?4, 'pending', ?5)",
+         (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms) \
+         VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6)",
         (
             &activation.run_id,
             &activation.node_id,
             &activation.activation_id,
             activation.dependency_generation,
+            activation
+                .input
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
             activation.created_at_ms,
         ),
     )?;
@@ -3057,6 +3685,46 @@ fn validate_output(output: &ValidatedOutput) -> Result<(), WorkflowStoreError> {
     Ok(())
 }
 
+fn validate_output_against_node_schema(
+    transaction: &Transaction<'_>,
+    output: &ValidatedOutput,
+) -> Result<(), WorkflowStoreError> {
+    let definition_json: String = transaction.query_row(
+        "SELECT definition.definition_json FROM workflow_runs run \
+         JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+           AND definition.version = run.definition_version \
+         WHERE run.run_id = ?1",
+        [&output.run_id],
+        |row| row.get(0),
+    )?;
+    let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+    let node = definition.node(&output.node_id).ok_or_else(|| {
+        WorkflowStoreError::InvalidData(format!(
+            "validated output references missing node: {}",
+            output.node_id
+        ))
+    })?;
+    if output.schema_id != node.output.type_name {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "validated output schema identity mismatch for node {}: expected {}, received {}",
+            output.node_id, node.output.type_name, output.schema_id
+        )));
+    }
+    let validator = jsonschema::validator_for(&node.output.schema).map_err(|error| {
+        WorkflowStoreError::InvalidData(format!(
+            "invalid stored output schema for node {}: {error}",
+            output.node_id
+        ))
+    })?;
+    if let Err(error) = validator.validate(&output.value) {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "validated output does not match node {} schema: {error}",
+            output.node_id
+        )));
+    }
+    Ok(())
+}
+
 fn persist_definition_transaction(
     transaction: &Transaction<'_>,
     stored: &StoredWorkflowDefinition,
@@ -3133,6 +3801,7 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
              node_id TEXT NOT NULL,\
              activation_id TEXT NOT NULL,\
              dependency_generation INTEGER NOT NULL,\
+             input_json TEXT,\
              status TEXT NOT NULL,\
              output_id TEXT,\
              created_at_ms INTEGER NOT NULL,\
@@ -3219,6 +3888,21 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
              projection_version INTEGER NOT NULL,\
              last_event_seq INTEGER NOT NULL\
          );",
+    )?;
+    let columns = transaction
+        .prepare("PRAGMA table_info(workflow_activations)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !columns.iter().any(|column| column == "input_json") {
+        transaction.execute(
+            "ALTER TABLE workflow_activations ADD COLUMN input_json TEXT",
+            [],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE workflow_store_contract SET schema_version = 4 \
+         WHERE contract_id = 1 AND schema_version = 3",
+        [],
     )?;
     let actual: u32 = transaction.query_row(
         "SELECT schema_version FROM workflow_store_contract WHERE contract_id = 1",
@@ -3344,6 +4028,7 @@ mod tests {
             node_id: "review".to_string(),
             activation_id: activation_id(),
             dependency_generation: 0,
+            input: None,
             created_at_ms: 11,
         }
     }
@@ -3389,6 +4074,215 @@ mod tests {
             })
             .expect("receipt");
         identity
+    }
+
+    #[tokio::test]
+    async fn owner_dispatch_persists_intent_before_call_and_receipt_after_acceptance() {
+        use std::sync::Mutex;
+
+        struct Owner {
+            store_path: PathBuf,
+            observed_status: Mutex<Option<String>>,
+        }
+        impl ActivationDispatchOwner for Owner {
+            fn plan(
+                &self,
+                activation: &PendingActivation,
+            ) -> Result<Option<ActivationDispatchPlan>, WorkflowStoreError> {
+                Ok(
+                    (activation.node.kind == bcode_workflow::NodeKind::Task).then(|| {
+                        ActivationDispatchPlan {
+                            side_effect: DispatchSideEffect::ReadOnly,
+                            intent: serde_json::json!({"operation": "review"}),
+                        }
+                    }),
+                )
+            }
+
+            fn dispatch<'a>(
+                &'a self,
+                request: &'a PreparedActivationDispatch,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<serde_json::Value, WorkflowStoreError>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    let connection = Connection::open(&self.store_path)?;
+                    let status = connection.query_row(
+                        "SELECT status FROM workflow_attempts WHERE dispatch_identity = ?1",
+                        [&request.dispatch_identity],
+                        |row| row.get::<_, String>(0),
+                    )?;
+                    *self.observed_status.lock().expect("observed status") = Some(status);
+                    Ok(serde_json::json!({
+                        "work_id": request.dispatch_identity,
+                        "owner": "test"
+                    }))
+                })
+            }
+        }
+
+        let (temp, mut store) = initialized_store();
+        let owner = Owner {
+            store_path: workflow_database_path(temp.path()),
+            observed_status: Mutex::new(None),
+        };
+        let summary = store
+            .dispatch_pending_activations(&owner, 10, 20)
+            .await
+            .expect("dispatch");
+        assert_eq!(summary.admitted.len(), 1);
+        assert!(summary.unsupported.is_empty());
+        assert_eq!(
+            owner.observed_status.lock().expect("status").as_deref(),
+            Some("prepared")
+        );
+        let attempt = store
+            .attempt_history("run-1", None, 10)
+            .expect("attempt")
+            .pop()
+            .expect("attempt row");
+        assert_eq!(attempt.status, "admitted");
+        assert!(attempt.has_receipt);
+    }
+
+    #[tokio::test]
+    async fn dispatch_failure_stays_prepared_and_is_not_redispatched() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Owner(AtomicUsize);
+        impl ActivationDispatchOwner for Owner {
+            fn plan(
+                &self,
+                _activation: &PendingActivation,
+            ) -> Result<Option<ActivationDispatchPlan>, WorkflowStoreError> {
+                Ok(Some(ActivationDispatchPlan {
+                    side_effect: DispatchSideEffect::Mutating,
+                    intent: serde_json::json!({"operation": "apply"}),
+                }))
+            }
+
+            fn dispatch<'a>(
+                &'a self,
+                _request: &'a PreparedActivationDispatch,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<serde_json::Value, WorkflowStoreError>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    self.0.fetch_add(1, Ordering::SeqCst);
+                    Err(WorkflowStoreError::InvalidData(
+                        "owner acceptance unknown".to_string(),
+                    ))
+                })
+            }
+        }
+
+        let (_temp, mut store) = initialized_store();
+        let owner = Owner(AtomicUsize::new(0));
+        assert!(
+            store
+                .dispatch_pending_activations(&owner, 10, 20)
+                .await
+                .is_err()
+        );
+        assert_eq!(owner.0.load(Ordering::SeqCst), 1);
+        assert!(store.pending_activations(10).expect("pending").is_empty());
+        assert!(
+            store
+                .dispatch_pending_activations(&owner, 10, 21)
+                .await
+                .expect("retry scan")
+                .admitted
+                .is_empty()
+        );
+        assert_eq!(owner.0.load(Ordering::SeqCst), 1);
+        let attempt = store
+            .attempt_history("run-1", None, 10)
+            .expect("attempt")
+            .pop()
+            .expect("attempt row");
+        assert_eq!(attempt.status, "prepared");
+        assert!(!attempt.has_receipt);
+    }
+
+    #[test]
+    fn pending_activation_admission_is_atomic_and_single_winner() {
+        let (temp, mut first_store) = initialized_store();
+        let mut second_store = WorkflowStore::open_in_state_dir(temp.path()).expect("second store");
+        let activation = activation_id();
+        let prepared = first_store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation,
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect("admission")
+            .expect("prepared");
+        assert_eq!(prepared.activation.node_id, "review");
+        assert_eq!(prepared.activation.input, Some(serde_json::json!(1)));
+        assert_eq!(prepared.attempt, 1);
+        assert_eq!(
+            prepared.dispatch_identity,
+            dispatch_identity("run-1", "review", &activation, 1)
+        );
+        assert!(
+            second_store
+                .prepare_pending_activation(
+                    "run-1",
+                    "review",
+                    &activation,
+                    DispatchSideEffect::ReadOnly,
+                    serde_json::json!({"operation": "review"}),
+                    13,
+                )
+                .expect("second admission")
+                .is_none()
+        );
+        assert!(
+            first_store
+                .pending_activations(10)
+                .expect("pending")
+                .is_empty()
+        );
+        let attempts = first_store
+            .attempt_history("run-1", None, 10)
+            .expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].dispatch_identity, prepared.dispatch_identity);
+        let status: String = first_store
+            .connection
+            .query_row(
+                "SELECT status FROM workflow_activations WHERE run_id = 'run-1' AND node_id = 'review'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("activation status");
+        assert_eq!(status, "running");
+    }
+
+    #[test]
+    fn pending_activation_admission_rolls_back_when_intent_is_oversized() {
+        let (_temp, mut store) = initialized_store();
+        let error = store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::Value::String("x".repeat(MAX_INLINE_JSON_BYTES)),
+                12,
+            )
+            .expect_err("oversized intent");
+        assert!(error.to_string().contains("exceeds"));
+        assert_eq!(store.pending_activations(10).expect("pending").len(), 1);
+        assert!(
+            store
+                .attempt_history("run-1", None, 10)
+                .expect("attempts")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -3536,9 +4430,9 @@ mod tests {
                         run_id: request.run_id.clone(),
                         node_id: request.node_id.clone(),
                         activation_id: request.activation_id.clone(),
-                        schema_id: "review/v1".to_string(),
+                        schema_id: "u32".to_string(),
                         schema_version: 1,
-                        value: serde_json::json!({"approved": true}),
+                        value: serde_json::json!(1),
                         artifact_reference: None,
                         created_at_ms: 20,
                     },
@@ -3939,9 +4833,9 @@ mod tests {
                         run_id: "wrong-run".to_string(),
                         node_id: "review".to_string(),
                         activation_id: activation_id(),
-                        schema_id: "review/v1".to_string(),
+                        schema_id: "u32".to_string(),
                         schema_version: 1,
-                        value: serde_json::json!({"approved": true}),
+                        value: serde_json::json!(1),
                         artifact_reference: None,
                         created_at_ms: 21,
                     },
@@ -3960,9 +4854,9 @@ mod tests {
                         run_id: "run-1".to_string(),
                         node_id: "review".to_string(),
                         activation_id: activation_id(),
-                        schema_id: "review/v1".to_string(),
+                        schema_id: "u32".to_string(),
                         schema_version: 1,
-                        value: serde_json::json!({"approved": true}),
+                        value: serde_json::json!(1),
                         artifact_reference: None,
                         created_at_ms: 21,
                     },
@@ -4033,6 +4927,77 @@ mod tests {
             .expect("explicit retry");
     }
 
+    #[tokio::test]
+    async fn prepared_read_only_redispatch_reuses_identity_and_persists_receipt() {
+        use std::sync::Mutex;
+
+        struct Owner(Mutex<Vec<String>>);
+        impl ActivationDispatchOwner for Owner {
+            fn plan(
+                &self,
+                _activation: &PendingActivation,
+            ) -> Result<Option<ActivationDispatchPlan>, WorkflowStoreError> {
+                unreachable!("redispatch uses the already committed intent")
+            }
+
+            fn dispatch<'a>(
+                &'a self,
+                request: &'a PreparedActivationDispatch,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<serde_json::Value, WorkflowStoreError>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    self.0
+                        .lock()
+                        .expect("calls")
+                        .push(request.dispatch_identity.clone());
+                    Ok(serde_json::json!({"owner": "test"}))
+                })
+            }
+        }
+
+        let (temp, mut store) = initialized_store();
+        let activation = activation_id();
+        let identity = store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation,
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect("prepare")
+            .expect("prepared")
+            .dispatch_identity;
+        drop(store);
+        let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        let owner = Owner(Mutex::new(Vec::new()));
+        let admitted = reopened
+            .redispatch_prepared_read_only(&owner, 10, 20)
+            .await
+            .expect("redispatch");
+        assert_eq!(admitted.as_slice(), std::slice::from_ref(&identity));
+        assert_eq!(
+            owner.0.lock().expect("calls").as_slice(),
+            std::slice::from_ref(&identity)
+        );
+        let attempt = reopened
+            .attempt_history("run-1", None, 10)
+            .expect("attempt")
+            .pop()
+            .expect("row");
+        assert_eq!(attempt.status, "admitted");
+        assert!(attempt.has_receipt);
+        assert!(
+            reopened
+                .redispatch_prepared_read_only(&owner, 10, 21)
+                .await
+                .expect("idempotent scan")
+                .is_empty()
+        );
+    }
+
     #[test]
     fn crash_boundaries_reopen_without_blind_mutation_redispatch() {
         struct Observer;
@@ -4047,9 +5012,9 @@ mod tests {
                         run_id: request.run_id.clone(),
                         node_id: request.node_id.clone(),
                         activation_id: request.activation_id.clone(),
-                        schema_id: "review/v1".to_string(),
+                        schema_id: "u32".to_string(),
                         schema_version: 1,
-                        value: serde_json::json!({"approved": true}),
+                        value: serde_json::json!(1),
                         artifact_reference: None,
                         created_at_ms: 30,
                     },
@@ -4124,9 +5089,9 @@ mod tests {
                         run_id: request.run_id.clone(),
                         node_id: request.node_id.clone(),
                         activation_id: request.activation_id.clone(),
-                        schema_id: "review/v1".to_string(),
+                        schema_id: "u32".to_string(),
                         schema_version: 1,
-                        value: serde_json::json!({"approved": true}),
+                        value: serde_json::json!(1),
                         artifact_reference: None,
                         created_at_ms: 30,
                     },
@@ -4359,6 +5324,7 @@ mod tests {
         assert_eq!(first.run_status, RunStatus::Running);
         assert_eq!(first.activated.len(), 1);
         assert_eq!(first.activated[0].node_id, "second");
+        assert_eq!(first.activated[0].input, Some(serde_json::json!(2)));
         let second = store
             .persist_validated_output(&ValidatedOutput {
                 output_id: "second-output".to_string(),
@@ -4417,6 +5383,7 @@ mod tests {
             } else {
                 assert_eq!(result.activated.len(), 1);
                 assert_eq!(result.activated[0].node_id, "join");
+                assert_eq!(result.activated[0].input, Some(serde_json::json!([2, 2])));
             }
         }
         let join_count: u64 = store
@@ -4431,7 +5398,7 @@ mod tests {
     }
 
     #[test]
-    fn controller_completion_without_selected_successor_does_not_complete_run() {
+    fn durable_branch_selects_one_path_and_persists_decision() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
         store
@@ -4469,7 +5436,70 @@ mod tests {
             })
             .expect("controller output");
         assert_eq!(choose.run_status, RunStatus::Running);
-        assert!(choose.activated.is_empty());
+        assert_eq!(choose.activated.len(), 1);
+        assert_eq!(choose.activated[0].node_id, "selected");
+        let other_status: String = store
+            .connection
+            .query_row(
+                "SELECT status FROM workflow_activations WHERE run_id = 'conditional-run' AND node_id = 'other'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("other status");
+        assert_eq!(other_status, "skipped");
+        let decision = store
+            .decision(&format!(
+                "{}:branch",
+                activation_identity("conditional-run", "choose", 0)
+            ))
+            .expect("decision query")
+            .expect("decision");
+        assert_eq!(decision.value["selected"], true);
+    }
+
+    #[test]
+    fn validated_output_must_match_exact_compiled_node_schema() {
+        let (_temp, mut store) = initialized_store();
+        let activation_id = activation_identity("run-1", "review", 0);
+        let output_count = |store: &WorkflowStore| {
+            store
+                .connection
+                .query_row("SELECT COUNT(*) FROM workflow_outputs", [], |row| {
+                    row.get::<_, u64>(0)
+                })
+                .expect("output count")
+        };
+        let activation_status = |store: &WorkflowStore| {
+            store
+                .connection
+                .query_row(
+                    "SELECT status FROM workflow_activations WHERE run_id = 'run-1' AND node_id = 'review'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("activation status")
+        };
+
+        let mut output = ValidatedOutput {
+            output_id: "output-1".to_string(),
+            run_id: "run-1".to_string(),
+            node_id: "review".to_string(),
+            activation_id,
+            schema_id: "wrong-schema".to_string(),
+            schema_version: 1,
+            value: serde_json::json!(1),
+            artifact_reference: None,
+            created_at_ms: 20,
+        };
+        assert!(store.persist_validated_output(&output).is_err());
+        assert_eq!(output_count(&store), 0);
+        assert_eq!(activation_status(&store), "pending");
+
+        output.schema_id = "u32".to_string();
+        output.value = serde_json::json!({"not": "an integer"});
+        assert!(store.persist_validated_output(&output).is_err());
+        assert_eq!(output_count(&store), 0);
+        assert_eq!(activation_status(&store), "pending");
     }
 
     #[test]
@@ -4481,9 +5511,9 @@ mod tests {
                 run_id: "run-1".to_string(),
                 node_id: "review".to_string(),
                 activation_id: activation_id(),
-                schema_id: "review/v1".to_string(),
+                schema_id: "u32".to_string(),
                 schema_version: 1,
-                value: serde_json::json!({"approved": true}),
+                value: serde_json::json!(1),
                 artifact_reference: None,
                 created_at_ms: 13,
             })
@@ -4505,6 +5535,7 @@ mod tests {
         let pending = store.pending_activations(10).expect("pending");
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].node_id, "review");
+        assert_eq!(pending[0].input, Some(serde_json::json!(1)));
         assert_eq!(pending[0].node.kind, bcode_workflow::NodeKind::Task);
         store.pause_run("run-1", 20).expect("pause");
         assert!(store.pending_activations(10).expect("paused").is_empty());

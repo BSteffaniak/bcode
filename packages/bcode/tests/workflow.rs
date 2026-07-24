@@ -153,6 +153,22 @@ async fn agent_step_requests_and_validates_structured_output() {
             .configuration["agent_id"],
         "plan"
     );
+    assert_eq!(
+        workflow
+            .definition()
+            .node("review")
+            .expect("agent node")
+            .configuration["prompt_mode"],
+        "json_input"
+    );
+    assert_eq!(
+        workflow
+            .definition()
+            .node("review")
+            .expect("agent node")
+            .configuration["system_prompt"],
+        "Review without modifying the repository"
+    );
 }
 
 #[tokio::test]

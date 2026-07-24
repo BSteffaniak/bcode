@@ -1671,6 +1671,7 @@ where
     ///
     /// Panics only if the internally generated predicate configuration cannot be serialized.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn branch<N>(
         self,
         name: impl Into<String>,
@@ -1684,19 +1685,11 @@ where
     {
         let name = name.into();
         let branch_id = name.clone();
-        let branch_node = NodeDefinition {
-            id: branch_id.clone(),
-            name,
-            kind: NodeKind::Branch,
-            input: ValueSchema::of::<O>(),
-            output: ValueSchema::of::<O>(),
-            resources: Vec::new(),
-            configuration: serde_json::to_value(predicate.expression())
-                .expect("workflow predicate should serialize to JSON"),
-        };
         let prior_run = Arc::clone(&self.run);
         let true_run = Arc::clone(&when_true.run);
         let false_run = Arc::clone(&when_false.run);
+        let true_entries = when_true.fragment.entries.clone();
+        let false_entries = when_false.fragment.entries.clone();
         let true_nodes = when_true
             .fragment
             .nodes
@@ -1740,7 +1733,21 @@ where
                 },
             });
         }
-        fragment.nodes.push(branch_node);
+        fragment.nodes.push(NodeDefinition {
+            id: branch_id,
+            name,
+            kind: NodeKind::Branch,
+            input: ValueSchema::of::<O>(),
+            output: ValueSchema::of::<O>(),
+            resources: Vec::new(),
+            configuration: serde_json::json!({
+                "predicate": expression,
+                "true_entries": &true_entries,
+                "false_entries": &false_entries,
+                "true_nodes": &true_nodes,
+                "false_nodes": &false_nodes,
+            }),
+        });
         fragment.nodes.extend(when_true.fragment.nodes);
         fragment.nodes.extend(when_false.fragment.nodes);
         fragment.edges.extend(when_true.fragment.edges);
@@ -2117,7 +2124,11 @@ where
         input: ValueSchema::of::<I>(),
         output: ValueSchema::of::<(A, B)>(),
         resources: Vec::new(),
-        configuration: serde_json::json!({"failure_policy": failure_policy}),
+        configuration: serde_json::json!({
+            "failure_policy": failure_policy,
+            "left_exits": &left_fragment.exits,
+            "right_exits": &right_fragment.exits,
+        }),
     });
     let mut edges = left_fragment.edges.clone();
     edges.extend(right_fragment.edges.clone());

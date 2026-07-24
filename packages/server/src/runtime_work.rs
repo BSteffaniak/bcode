@@ -24,6 +24,8 @@ pub enum CancellationHandle {
     },
     /// Cancel a server-hosted durable workflow run.
     WorkflowRun(crate::WorkflowRunCancellationHandle),
+    /// Server-hosted workflow node whose active model turn is routed by a child handle.
+    WorkflowNode(Arc<TurnCancelState>),
     /// Test/no-op cancellation hook.
     #[cfg(test)]
     Test(Arc<std::sync::atomic::AtomicUsize>),
@@ -39,7 +41,7 @@ impl CancellationHandle {
     /// Request cancellation through the underlying handle.
     pub async fn cancel(&self) -> Result<(), String> {
         match self {
-            Self::SessionTurn(cancel_state) => {
+            Self::SessionTurn(cancel_state) | Self::WorkflowNode(cancel_state) => {
                 cancel_state.cancel().await;
                 Ok(())
             }
@@ -75,7 +77,8 @@ impl CancellationHandle {
             Self::SessionTurn(_)
             | Self::PluginInvocation(_)
             | Self::RalphRun { .. }
-            | Self::WorkflowRun(_) => true,
+            | Self::WorkflowRun(_)
+            | Self::WorkflowNode(_) => true,
             #[cfg(test)]
             Self::Test(_) | Self::TestBlocked(_) | Self::TestFailed(_) => true,
         }

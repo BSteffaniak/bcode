@@ -29,12 +29,24 @@ use std::time::Duration;
 pub type WorkflowProviderFactory =
     Arc<dyn Fn() -> Box<dyn ModelProviderInvoker> + Send + Sync + 'static>;
 
+/// Durable prompt behavior available to daemon-hosted agent steps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentPromptMode {
+    JsonInput,
+    CustomInProcessOnly,
+}
+
 /// Typed builder for one structured Bcode agent workflow step.
 pub struct AgentStep<I, O> {
     name: String,
     prompt: Arc<dyn Fn(&I) -> String + Send + Sync>,
     agent: AgentBuilder,
     provider: WorkflowProviderFactory,
+    agent_id: Option<String>,
+    provider_plugin_id: Option<String>,
+    model_id: Option<String>,
+    system_prompt: Option<String>,
+    prompt_mode: AgentPromptMode,
     strict: bool,
     max_repairs: u32,
     agent_profile_configured: bool,
@@ -89,6 +101,11 @@ where
             }),
             agent: Agent::builder(),
             provider: Arc::new(move || Box::new(provider())),
+            agent_id: None,
+            provider_plugin_id: None,
+            model_id: None,
+            system_prompt: None,
+            prompt_mode: AgentPromptMode::JsonInput,
             strict: true,
             max_repairs: 0,
             agent_profile_configured: false,
@@ -103,7 +120,9 @@ where
     /// Configure the Bcode agent profile used by this step.
     #[must_use]
     pub fn agent_id(mut self, agent_id: impl Into<String>) -> Self {
-        self.agent = self.agent.agent_id(agent_id);
+        let agent_id = agent_id.into();
+        self.agent = self.agent.agent_id(agent_id.clone());
+        self.agent_id = Some(agent_id);
         self.agent_profile_configured = true;
         self
     }
@@ -111,21 +130,27 @@ where
     /// Configure the model used by this step.
     #[must_use]
     pub fn model(mut self, model_id: impl Into<String>) -> Self {
-        self.agent = self.agent.model(model_id);
+        let model_id = model_id.into();
+        self.agent = self.agent.model(model_id.clone());
+        self.model_id = Some(model_id);
         self
     }
 
     /// Configure the provider plugin identity forwarded to each generated provider request.
     #[must_use]
     pub fn provider_plugin(mut self, plugin_id: impl Into<String>) -> Self {
-        self.agent = self.agent.provider_plugin(plugin_id);
+        let plugin_id = plugin_id.into();
+        self.agent = self.agent.provider_plugin(plugin_id.clone());
+        self.provider_plugin_id = Some(plugin_id);
         self
     }
 
     /// Configure the step system prompt.
     #[must_use]
     pub fn system(mut self, prompt: impl Into<String>) -> Self {
-        self.agent = self.agent.system(prompt);
+        let prompt = prompt.into();
+        self.agent = self.agent.system(prompt.clone());
+        self.system_prompt = Some(prompt);
         self
     }
 
@@ -136,6 +161,7 @@ where
         F: Fn(&I) -> String + Send + Sync + 'static,
     {
         self.prompt = Arc::new(prompt);
+        self.prompt_mode = AgentPromptMode::CustomInProcessOnly;
         self
     }
 
@@ -240,6 +266,11 @@ where
         let provider = self.provider;
         let strict = self.strict;
         let max_repairs = self.max_repairs;
+        let agent_id = self.agent_id;
+        let provider_plugin_id = self.provider_plugin_id;
+        let model_id = self.model_id;
+        let system_prompt = self.system_prompt;
+        let prompt_mode = self.prompt_mode;
         let agent_profile_configured = self.agent_profile_configured;
         let tool_restriction = self.tool_restriction;
         let read_only_tools = self.read_only_tools;
@@ -256,8 +287,12 @@ where
             agent.build()
         };
         let configuration = json!({
-            "agent_id": agent.profile_id(),
+            "agent_id": agent_id,
             "agent_profile_configured": agent_profile_configured,
+            "provider_plugin_id": provider_plugin_id,
+            "model_id": model_id,
+            "system_prompt": system_prompt,
+            "prompt_mode": (prompt_mode == AgentPromptMode::JsonInput).then_some("json_input"),
             "strict": strict,
             "max_repairs": max_repairs,
             "tools": tool_restriction,
