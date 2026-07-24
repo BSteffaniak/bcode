@@ -262,6 +262,7 @@ pkg-config = { version = "0.3.32", default-features = false }
 png = { version = "0.18.1", default-features = false }
 portable-pty = { version = "0.9.0", default-features = false }
 proptest = { version = "1.11.0", default-features = false, features = ["std"] }
+pulldown-cmark = { version = "0.13.4", default-features = false }
 rand = { version = "0.9.4", default-features = false, features = [
     "os_rng",
     "std",

@@ -19,8 +19,8 @@
 //!   layout at narrower widths.
 //! * Ordered lists restart at one because the parser's container projection
 //!   does not retain source start values.
-//! * GFM table alignment is not applied because the parser's container
-//!   projection does not retain alignment metadata.
+//! * GFM table alignment is preserved for bordered tables; narrow stacked
+//!   tables communicate columns through header labels.
 //! * Images render as `[image: description]` using alt text, then source, then
 //!   a generic fallback.
 //! * Dangerous HTML is escaped by parser-level XSS protection; safe raw HTML is
@@ -33,12 +33,15 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+use std::{cell::Cell, rc::Rc};
+
 use bcode_syntax_render::SyntaxHighlighter;
 use bmux_tui::prelude::{Color, Line, Modifier, Span, Style};
 use hyperchad_color::Color as HyperChadColor;
 use hyperchad_markdown::{MarkdownOptions, markdown_to_container_with_options};
 use hyperchad_transformer::{Container, Element, Input};
 use hyperchad_transformer_models::{FontWeight, TextDecorationLine};
+use pulldown_cmark::{Alignment, BlockQuoteKind, Event, Options as ParserOptions, Parser, Tag};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -65,6 +68,16 @@ pub struct MarkdownTheme {
     pub code_block_border: Style,
     /// Blockquote bar style.
     pub blockquote_bar: Style,
+    /// Note alert label and bar style.
+    pub alert_note: Style,
+    /// Tip alert label and bar style.
+    pub alert_tip: Style,
+    /// Important alert label and bar style.
+    pub alert_important: Style,
+    /// Warning alert label and bar style.
+    pub alert_warning: Style,
+    /// Caution alert label and bar style.
+    pub alert_caution: Style,
     /// List marker style.
     pub list_marker: Style,
     /// Checked task marker style.
@@ -94,11 +107,28 @@ impl Default for MarkdownTheme {
             code_block_text: Style::new().fg(Color::Yellow),
             code_block_border: muted,
             blockquote_bar: muted,
+            alert_note: Style::new().fg(Color::Blue),
+            alert_tip: Style::new().fg(Color::Green),
+            alert_important: Style::new().fg(Color::Magenta),
+            alert_warning: Style::new().fg(Color::Yellow),
+            alert_caution: Style::new().fg(Color::Red),
             list_marker: muted,
             task_checked: muted,
             task_unchecked: muted,
             table_border: muted,
             horizontal_rule: muted,
+        }
+    }
+}
+
+impl MarkdownTheme {
+    const fn alert_style(self, kind: BlockQuoteKind) -> Style {
+        match kind {
+            BlockQuoteKind::Note => self.alert_note,
+            BlockQuoteKind::Tip => self.alert_tip,
+            BlockQuoteKind::Important => self.alert_important,
+            BlockQuoteKind::Warning => self.alert_warning,
+            BlockQuoteKind::Caution => self.alert_caution,
         }
     }
 }
@@ -195,8 +225,11 @@ fn collect_plain_text(container: &Container, output: &mut String) {
 /// Render Markdown into terminal lines.
 #[must_use]
 pub fn render_markdown_lines(markdown: &str, options: MarkdownRenderOptions) -> Vec<Line> {
+    let table_alignments = table_alignments(markdown);
+    let alert_kinds = alert_kinds(markdown);
     let container = markdown_to_container_with_options(markdown, hyperchad_markdown_options());
-    let mut renderer = TerminalMarkdownRenderer::new(options.width, options.theme);
+    let mut renderer =
+        TerminalMarkdownRenderer::new(options.width, options.theme, table_alignments, alert_kinds);
     renderer.render_container_children(
         &container,
         TextStyle {
@@ -205,6 +238,28 @@ pub fn render_markdown_lines(markdown: &str, options: MarkdownRenderOptions) -> 
         },
     );
     renderer.finish()
+}
+
+fn table_alignments(markdown: &str) -> Vec<Vec<Alignment>> {
+    let mut options = ParserOptions::empty();
+    options.insert(ParserOptions::ENABLE_TABLES);
+    Parser::new_ext(markdown, options)
+        .filter_map(|event| match event {
+            Event::Start(Tag::Table(alignments)) => Some(alignments),
+            _ => None,
+        })
+        .collect()
+}
+
+fn alert_kinds(markdown: &str) -> Vec<Option<BlockQuoteKind>> {
+    let mut options = ParserOptions::empty();
+    options.insert(ParserOptions::ENABLE_GFM);
+    Parser::new_ext(markdown, options)
+        .filter_map(|event| match event {
+            Event::Start(Tag::BlockQuote(kind)) => Some(kind),
+            _ => None,
+        })
+        .collect()
 }
 
 fn hyperchad_markdown_options() -> MarkdownOptions {
@@ -289,18 +344,46 @@ struct TerminalMarkdownRenderer {
     current_spans: Vec<Span>,
     current_width: usize,
     in_table_collection: bool,
+    table_alignments: Vec<Vec<Alignment>>,
+    next_table_index: usize,
+    alert_kinds: Rc<Vec<Option<BlockQuoteKind>>>,
+    next_blockquote_index: Rc<Cell<usize>>,
     theme: MarkdownTheme,
 }
 
 impl TerminalMarkdownRenderer {
-    fn new(width: u16, theme: MarkdownTheme) -> Self {
+    fn new(
+        width: u16,
+        theme: MarkdownTheme,
+        table_alignments: Vec<Vec<Alignment>>,
+        alert_kinds: Vec<Option<BlockQuoteKind>>,
+    ) -> Self {
         Self {
             width: usize::from(width.max(1)),
             rows: Vec::new(),
             current_spans: Vec::new(),
             current_width: 0,
             in_table_collection: false,
+            table_alignments,
+            next_table_index: 0,
+            alert_kinds: Rc::new(alert_kinds),
+            next_blockquote_index: Rc::new(Cell::new(0)),
             theme,
+        }
+    }
+
+    fn nested(&self, width: usize) -> Self {
+        Self {
+            width: width.max(1),
+            rows: Vec::new(),
+            current_spans: Vec::new(),
+            current_width: 0,
+            in_table_collection: false,
+            table_alignments: Vec::new(),
+            next_table_index: 0,
+            alert_kinds: Rc::clone(&self.alert_kinds),
+            next_blockquote_index: Rc::clone(&self.next_blockquote_index),
+            theme: self.theme,
         }
     }
 
@@ -452,14 +535,28 @@ impl TerminalMarkdownRenderer {
 
     fn render_blockquote(&mut self, container: &Container, style: TextStyle) {
         self.flush_line();
-        let mut nested = Self::new(
-            u16::try_from(self.width.saturating_sub(2).max(1)).unwrap_or(u16::MAX),
-            self.theme,
-        );
+        let blockquote_index = self.next_blockquote_index.get();
+        let alert_kind = self.alert_kinds.get(blockquote_index).copied().flatten();
+        self.next_blockquote_index
+            .set(blockquote_index.saturating_add(1));
+        let mut nested = self.nested(self.width.saturating_sub(2));
         nested.render_container_children(container, style);
         nested.flush_line();
-        let rows = nested.finish();
-        let border_style = self.theme.blockquote_bar;
+        let mut rows = nested.finish();
+        if let Some(kind) = alert_kind {
+            strip_alert_marker(&mut rows, kind);
+            let alert_style = self.theme.alert_style(kind);
+            rows.insert(
+                0,
+                Line::from_spans(vec![Span::styled(
+                    alert_label(kind),
+                    alert_style.patch(self.theme.strong),
+                )]),
+            );
+        }
+        let border_style = alert_kind.map_or(self.theme.blockquote_bar, |kind| {
+            self.theme.alert_style(kind)
+        });
         for line in rows {
             let mut spans = vec![Span::styled("│ ", border_style)];
             spans.extend(line.spans);
@@ -477,8 +574,8 @@ impl TerminalMarkdownRenderer {
         self.rows
             .push(Line::from_spans(vec![Span::styled(header, border_style)]));
 
-        let nested_width = u16::try_from(self.width.saturating_sub(2).max(1)).unwrap_or(u16::MAX);
-        let mut nested = Self::new(nested_width, self.theme);
+        let nested_width = self.width.saturating_sub(2);
+        let mut nested = self.nested(nested_width);
         nested.render_container_children(
             container,
             TextStyle {
@@ -544,9 +641,8 @@ impl TerminalMarkdownRenderer {
 
     fn render_prefixed_list_item(&mut self, item: &Container, style: TextStyle, marker: &str) {
         let marker_width = text_display_width(marker);
-        let nested_width =
-            u16::try_from(self.width.saturating_sub(marker_width).max(1)).unwrap_or(u16::MAX);
-        let mut nested = Self::new(nested_width, self.theme);
+        let nested_width = self.width.saturating_sub(marker_width);
+        let mut nested = self.nested(nested_width);
         nested.render_container_children(item, style);
         nested.flush_line();
         let mut item_rows = nested.finish();
@@ -582,6 +678,12 @@ impl TerminalMarkdownRenderer {
             return;
         }
 
+        let alignments = self
+            .table_alignments
+            .get(self.next_table_index)
+            .cloned()
+            .unwrap_or_default();
+        self.next_table_index = self.next_table_index.saturating_add(1);
         let widths = table_column_widths(&rows, column_count);
         let total_width = widths.iter().sum::<usize>() + column_count.saturating_mul(3) + 1;
         if total_width > self.width {
@@ -596,6 +698,7 @@ impl TerminalMarkdownRenderer {
             self.rows.push(table_content_line(
                 &row.cells,
                 &widths,
+                &alignments,
                 border_style,
                 row.header.then_some(self.theme.strong),
             ));
@@ -748,7 +851,7 @@ fn inline_spans_for_container(
     style: TextStyle,
     theme: MarkdownTheme,
 ) -> Vec<Span> {
-    let mut renderer = TerminalMarkdownRenderer::new(u16::MAX, theme);
+    let mut renderer = TerminalMarkdownRenderer::new(u16::MAX, theme, Vec::new(), Vec::new());
     renderer.in_table_collection = true;
     renderer.render_container_children(container, style.merge_container(container, theme));
     renderer.flush_line();
@@ -791,6 +894,7 @@ fn table_border_line(
 fn table_content_line(
     row: &[Vec<Span>],
     widths: &[usize],
+    alignments: &[Alignment],
     border_style: Style,
     cell_style: Option<Style>,
 ) -> Line {
@@ -798,15 +902,22 @@ fn table_content_line(
     for (index, width) in widths.iter().enumerate() {
         spans.push(Span::raw(" "));
         if let Some(cell) = row.get(index) {
+            let padding = width.saturating_sub(spans_width(cell));
+            let (left_padding, right_padding) = aligned_padding(
+                padding,
+                alignments.get(index).copied().unwrap_or(Alignment::None),
+            );
+            if left_padding > 0 {
+                spans.push(Span::raw(" ".repeat(left_padding)));
+            }
             spans.extend(cell.iter().cloned().map(|mut span| {
                 if let Some(style) = cell_style {
                     span.style = span.style.patch(style);
                 }
                 span
             }));
-            let padding = width.saturating_sub(spans_width(cell));
-            if padding > 0 {
-                spans.push(Span::raw(" ".repeat(padding)));
+            if right_padding > 0 {
+                spans.push(Span::raw(" ".repeat(right_padding)));
             }
         } else {
             spans.push(Span::raw(" ".repeat(*width)));
@@ -815,6 +926,53 @@ fn table_content_line(
         spans.push(Span::styled("│", border_style));
     }
     Line::from_spans(spans)
+}
+
+const fn aligned_padding(padding: usize, alignment: Alignment) -> (usize, usize) {
+    match alignment {
+        Alignment::Center => {
+            let left = padding / 2;
+            (left, padding - left)
+        }
+        Alignment::Right => (padding, 0),
+        Alignment::None | Alignment::Left => (0, padding),
+    }
+}
+
+const fn alert_label(kind: BlockQuoteKind) -> &'static str {
+    match kind {
+        BlockQuoteKind::Note => "ⓘ NOTE",
+        BlockQuoteKind::Tip => "◆ TIP",
+        BlockQuoteKind::Important => "❗ IMPORTANT",
+        BlockQuoteKind::Warning => "⚠ WARNING",
+        BlockQuoteKind::Caution => "⛔ CAUTION",
+    }
+}
+
+fn strip_alert_marker(rows: &mut Vec<Line>, kind: BlockQuoteKind) {
+    let marker = match kind {
+        BlockQuoteKind::Note => "[!NOTE]",
+        BlockQuoteKind::Tip => "[!TIP]",
+        BlockQuoteKind::Important => "[!IMPORTANT]",
+        BlockQuoteKind::Warning => "[!WARNING]",
+        BlockQuoteKind::Caution => "[!CAUTION]",
+    };
+    let Some(first) = rows.first_mut() else {
+        return;
+    };
+    let mut remaining = marker.len();
+    while remaining > 0 && !first.spans.is_empty() {
+        let span = &mut first.spans[0];
+        let consumed = remaining.min(span.content.len());
+        span.content.replace_range(..consumed, "");
+        remaining -= consumed;
+        if span.content.is_empty() {
+            first.spans.remove(0);
+        }
+    }
+    if first.spans.is_empty() {
+        rows.remove(0);
+    }
 }
 
 fn apply_code_block_syntax_highlighting(
@@ -944,7 +1102,7 @@ mod tests {
     use super::{
         MarkdownRenderOptions, MarkdownTheme, markdown_to_plain_text, render_markdown_lines,
     };
-    use bmux_tui::prelude::{Color, Style};
+    use bmux_tui::prelude::{Color, Modifier, Style};
 
     fn rendered_text(markdown: &str) -> String {
         render_markdown_lines(markdown, MarkdownRenderOptions::new(80))
@@ -1106,6 +1264,30 @@ mod tests {
                 .collect::<String>()
                 .contains("Bcode")
         );
+    }
+
+    #[test]
+    fn custom_theme_styles_alert_label_and_bar() {
+        let alert_style = Style::new().fg(Color::BrightCyan);
+        let theme = MarkdownTheme {
+            alert_note: alert_style,
+            ..MarkdownTheme::default()
+        };
+        let lines = render_markdown_lines(
+            "> [!NOTE]\n> themed",
+            MarkdownRenderOptions::new(80).with_theme(theme),
+        );
+
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| { span.content == "│ " && span.style == alert_style })
+        );
+        assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
+            span.content == "ⓘ NOTE"
+                && span.style == alert_style.patch(Style::new().add_modifier(Modifier::BOLD))
+        }));
     }
 
     #[test]

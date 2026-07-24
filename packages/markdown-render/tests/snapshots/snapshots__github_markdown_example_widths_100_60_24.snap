@@ -1,0 +1,444 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "[100_u16, 60,\n24].into_iter().map(|width|\nformat!(\"== width {width} ==\\n{}\",\nstyled_snapshot(GITHUB_MARKDOWN_EXAMPLE,\nwidth))).collect::<Vec<_>>().join(\"\\n\")"
+---
+== width 100 ==
+00 │ [fg=cyan,bold]🚀 Project Nebula[/]
+01 │ 
+02 │ [fg=bright-black]│ [/]A fictional distributed task engine demonstrating complex, GitHub-compatible Markdown.
+03 │ 
+04 │ [fg=blue,underline][image: Build][/] [fg=blue,underline][image: Coverage][/] [fg=blue,underline][image: License][/]
+05 │ 
+06 │ [fg=cyan,bold]📋 Implementation Status[/]
+07 │ 
+08 │ [fg=bright-black]•  ☑ [/]Define the event protocol
+09 │ [fg=bright-black]•  ☑ [/]Implement retry policies
+10 │ [fg=bright-black]•  ☐ [/]Add distributed tracing
+11 │ [fg=bright-black]   •  ☑ [/]Generate trace IDs
+12 │ [fg=bright-black]   •  ☐ [/]Export OpenTelemetry spans
+13 │ [fg=bright-black]•  ☐ [/]Perform production load testing
+14 │ 
+15 │ [fg=cyan,bold]Architecture[/]
+16 │ 
+17 │ [fg=bright-black]┌─ mermaid[/]
+18 │ [fg=bright-black]│ [/][fg=yellow]flowchart LR[/]
+19 │ [fg=bright-black]│ [/][fg=yellow]    Client["`**Client**[/]
+20 │ [fg=bright-black]│ [/][fg=yellow]    HTTP / WebSocket`"] --> Gateway[/]
+21 │ [fg=bright-black]│ [/][fg=yellow]    Gateway --> Queue[(Task Queue)][/]
+22 │ [fg=bright-black]│ [/][fg=yellow]    Queue --> WorkerA[Worker A][/]
+23 │ [fg=bright-black]│ [/][fg=yellow]    Queue --> WorkerB[Worker B][/]
+24 │ [fg=bright-black]│ [/][fg=yellow]    WorkerA & WorkerB --> Store[(Result Store)][/]
+25 │ [fg=bright-black]└─[/]
+26 │ 
+27 │ [fg=cyan,bold]Component Matrix[/]
+28 │ 
+29 │ [fg=bright-black]┌───────────┬────────────┬───────────┬────────────┐[/]
+30 │ [fg=bright-black]│[/] [bold]Component[/] [fg=bright-black]│[/]  [bold]Language[/]  [fg=bright-black]│[/]     [bold]State[/] [fg=bright-black]│[/] [bold]Throughput[/] [fg=bright-black]│[/]
+31 │ [fg=bright-black]├───────────┼────────────┼───────────┼────────────┤[/]
+32 │ [fg=bright-black]│[/] Gateway   [fg=bright-black]│[/]    Rust    [fg=bright-black]│[/] ✅ Stable [fg=bright-black]│[/]  42k req/s [fg=bright-black]│[/]
+33 │ [fg=bright-black]├───────────┼────────────┼───────────┼────────────┤[/]
+34 │ [fg=bright-black]│[/] Scheduler [fg=bright-black]│[/]     Go     [fg=bright-black]│[/]   🧪 Beta [fg=bright-black]│[/] 18k jobs/s [fg=bright-black]│[/]
+35 │ [fg=bright-black]├───────────┼────────────┼───────────┼────────────┤[/]
+36 │ [fg=bright-black]│[/] Dashboard [fg=bright-black]│[/] TypeScript [fg=bright-black]│[/] 🚧 Active [fg=bright-black]│[/]        N/A [fg=bright-black]│[/]
+37 │ [fg=bright-black]└───────────┴────────────┴───────────┴────────────┘[/]
+38 │ 
+39 │ [fg=cyan,bold]Example Configuration[/]
+40 │ 
+41 │ [fg=bright-black]┌─ yaml[/]
+42 │ [fg=bright-black]│ [/][fg=rgb-191-97-106]server[/][fg=rgb-192-197-206]:[/]
+43 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-191-97-106]address[/][fg=rgb-192-197-206]: "[/][fg=rgb-163-190-140]0.0.0.0:8080[/][fg=rgb-192-197-206]"[/]
+44 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-191-97-106]workers[/][fg=rgb-192-197-206]: [/][fg=rgb-208-135-112]8[/]
+45 │ [fg=bright-black]│ [/][fg=rgb-191-97-106]retry[/][fg=rgb-192-197-206]:[/]
+46 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-191-97-106]strategy[/][fg=rgb-192-197-206]: [/][fg=rgb-163-190-140]exponential[/]
+47 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-191-97-106]maximum_attempts[/][fg=rgb-192-197-206]: [/][fg=rgb-208-135-112]5[/]
+48 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-191-97-106]initial_delay[/][fg=rgb-192-197-206]: [/][fg=rgb-163-190-140]250ms[/]
+49 │ [fg=bright-black]└─[/]
+50 │ 
+51 │ [fg=cyan,bold]API Usage[/]
+52 │ 
+53 │ [fg=bright-black]┌─ rust[/]
+54 │ [fg=bright-black]│ [/][fg=rgb-180-142-173]use[/][fg=rgb-192-197-206] nebula::{Client, Task};[/]
+55 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]async [/][fg=rgb-180-142-173]fn[/][fg=rgb-192-197-206] [/][fg=rgb-143-161-179]dispatch[/][fg=rgb-192-197-206]([/][fg=rgb-191-97-106]client[/][fg=rgb-192-197-206]: &Client) -> anyhow::Result<()> {[/]
+56 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    [/][fg=rgb-180-142-173]let[/][fg=rgb-192-197-206] task = Task::new("[/][fg=rgb-163-190-140]generate-report[/][fg=rgb-192-197-206]")[/]
+57 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]        .[/][fg=rgb-150-181-180]argument[/][fg=rgb-192-197-206]("[/][fg=rgb-163-190-140]format[/][fg=rgb-192-197-206]", "[/][fg=rgb-163-190-140]pdf[/][fg=rgb-192-197-206]")[/]
+58 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]        .[/][fg=rgb-150-181-180]priority[/][fg=rgb-192-197-206]([/][fg=rgb-208-135-112]10[/][fg=rgb-192-197-206]);[/]
+59 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    [/][fg=rgb-180-142-173]let[/][fg=rgb-192-197-206] receipt = client.[/][fg=rgb-150-181-180]submit[/][fg=rgb-192-197-206](task).await?;[/]
+60 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    println!("[/][fg=rgb-163-190-140]Task submitted: [/][fg=rgb-208-135-112]{}[/][fg=rgb-192-197-206]", receipt.[/][fg=rgb-150-181-180]id[/][fg=rgb-192-197-206]());[/]
+61 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    Ok(())[/]
+62 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]}[/]
+63 │ [fg=bright-black]└─[/]
+64 │ 
+65 │ [fg=magenta]│ [/][fg=magenta,bold]❗ IMPORTANT[/]
+66 │ [fg=magenta]│ [/] Task handlers [bold]must be idempotent[/] because workers may retry interrupted jobs.
+67 │ 
+68 │ [fg=yellow]│ [/][fg=yellow,bold]⚠ WARNING[/]
+69 │ [fg=yellow]│ [/] Setting [fg=yellow]maximum_attempts[/] to [fg=yellow]0[/] disables the retry limit and may create a poison-message 
+70 │ [fg=yellow]│ [/]loop.
+71 │ 
+72 │ <details>
+73 │ <summary><strong>View the retry algorithm</strong></summary>
+74 │ For attempt (n), the delay is conceptually:
+75 │ 
+76 │ [fg=bright-black]┌─ text[/]
+77 │ [fg=bright-black]│ [/][fg=yellow]delay(n) = min(initial_delay × 2ⁿ + jitter, maximum_delay)[/]
+78 │ [fg=bright-black]└─[/]
+79 │ 
+80 │ [fg=bright-black]┌─────────┬────────────┬─────────────────────┐[/]
+81 │ [fg=bright-black]│[/] [bold]Attempt[/] [fg=bright-black]│[/] [bold]Base Delay[/] [fg=bright-black]│[/] [bold]Example with Jitter[/] [fg=bright-black]│[/]
+82 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
+83 │ [fg=bright-black]│[/]       1 [fg=bright-black]│[/]     250 ms [fg=bright-black]│[/]              284 ms [fg=bright-black]│[/]
+84 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
+85 │ [fg=bright-black]│[/]       2 [fg=bright-black]│[/]     500 ms [fg=bright-black]│[/]              571 ms [fg=bright-black]│[/]
+86 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
+87 │ [fg=bright-black]│[/]       3 [fg=bright-black]│[/]        1 s [fg=bright-black]│[/]              1.08 s [fg=bright-black]│[/]
+88 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
+89 │ [fg=bright-black]│[/]       4 [fg=bright-black]│[/]        2 s [fg=bright-black]│[/]              2.17 s [fg=bright-black]│[/]
+90 │ [fg=bright-black]└─────────┴────────────┴─────────────────────┘[/]
+91 │ 
+92 │ </details>
+93 │ 
+94 │ [fg=cyan,bold]Sample Event[/]
+95 │ 
+96 │ [fg=bright-black]┌─ json[/]
+97 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]{[/]
+98 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]event[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task.completed[/][fg=rgb-192-197-206]",[/]
+99 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]version[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]2[/][fg=rgb-192-197-206],[/]
+100 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]data[/][fg=rgb-192-197-206]": {[/]
+101 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]task_id[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task_01JABCDEF[/][fg=rgb-192-197-206]",[/]
+102 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]duration_ms[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]1842[/][fg=rgb-192-197-206],[/]
+103 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]result[/][fg=rgb-192-197-206]": {[/]
+104 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]status[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]success[/][fg=rgb-192-197-206]",[/]
+105 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]artifacts[/][fg=rgb-192-197-206]": ["[/][fg=rgb-163-190-140]report.pdf[/][fg=rgb-192-197-206]"][/]
+106 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    }[/]
+107 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  }[/]
+108 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]}[/]
+109 │ [fg=bright-black]└─[/]
+110 │ 
+111 │ [fg=bright-black]────────────────────────────────────────────────────────────────────────────────────────────────────[/]
+112 │ 
+113 │ [fg=cyan,bold]Notes[/]
+114 │ 
+115 │ [fg=bright-black]1.  [/]Events are ordered [bold]per task[/], not globally.
+116 │ [fg=bright-black]2.  [/]Delivery is [italic]at least once[/].
+117 │ [fg=bright-black]3.  [/]Clients should preserve unknown fields for forward compatibility.[^compat]
+118 │ 
+119 │ [^compat]: This enables older clients to safely proxy events created by newer protocol versions.
+120 │ [bold]Next step:[/] review [fg=yellow,underline]docs/protocol.md[/] and open a pull request referencing an issue—for example, [fg=yellow]Closes [/]
+121 │ [fg=yellow]#42[/].
+== width 60 ==
+00 │ [fg=cyan,bold]🚀 Project Nebula[/]
+01 │ 
+02 │ [fg=bright-black]│ [/]A fictional distributed task engine demonstrating complex,
+03 │ [fg=bright-black]│ [/] GitHub-compatible Markdown.
+04 │ 
+05 │ [fg=blue,underline][image: Build][/] [fg=blue,underline][image: Coverage][/] [fg=blue,underline][image: License][/]
+06 │ 
+07 │ [fg=cyan,bold]📋 Implementation Status[/]
+08 │ 
+09 │ [fg=bright-black]•  ☑ [/]Define the event protocol
+10 │ [fg=bright-black]•  ☑ [/]Implement retry policies
+11 │ [fg=bright-black]•  ☐ [/]Add distributed tracing
+12 │ [fg=bright-black]   •  ☑ [/]Generate trace IDs
+13 │ [fg=bright-black]   •  ☐ [/]Export OpenTelemetry spans
+14 │ [fg=bright-black]•  ☐ [/]Perform production load testing
+15 │ 
+16 │ [fg=cyan,bold]Architecture[/]
+17 │ 
+18 │ [fg=bright-black]┌─ mermaid[/]
+19 │ [fg=bright-black]│ [/][fg=yellow]flowchart LR[/]
+20 │ [fg=bright-black]│ [/][fg=yellow]    Client["`**Client**[/]
+21 │ [fg=bright-black]│ [/][fg=yellow]    HTTP / WebSocket`"] --> Gateway[/]
+22 │ [fg=bright-black]│ [/][fg=yellow]    Gateway --> Queue[(Task Queue)][/]
+23 │ [fg=bright-black]│ [/][fg=yellow]    Queue --> WorkerA[Worker A][/]
+24 │ [fg=bright-black]│ [/][fg=yellow]    Queue --> WorkerB[Worker B][/]
+25 │ [fg=bright-black]│ [/][fg=yellow]    WorkerA & WorkerB --> Store[(Result Store)][/]
+26 │ [fg=bright-black]└─[/]
+27 │ 
+28 │ [fg=cyan,bold]Component Matrix[/]
+29 │ 
+30 │ [fg=bright-black]┌───────────┬────────────┬───────────┬────────────┐[/]
+31 │ [fg=bright-black]│[/] [bold]Component[/] [fg=bright-black]│[/]  [bold]Language[/]  [fg=bright-black]│[/]     [bold]State[/] [fg=bright-black]│[/] [bold]Throughput[/] [fg=bright-black]│[/]
+32 │ [fg=bright-black]├───────────┼────────────┼───────────┼────────────┤[/]
+33 │ [fg=bright-black]│[/] Gateway   [fg=bright-black]│[/]    Rust    [fg=bright-black]│[/] ✅ Stable [fg=bright-black]│[/]  42k req/s [fg=bright-black]│[/]
+34 │ [fg=bright-black]├───────────┼────────────┼───────────┼────────────┤[/]
+35 │ [fg=bright-black]│[/] Scheduler [fg=bright-black]│[/]     Go     [fg=bright-black]│[/]   🧪 Beta [fg=bright-black]│[/] 18k jobs/s [fg=bright-black]│[/]
+36 │ [fg=bright-black]├───────────┼────────────┼───────────┼────────────┤[/]
+37 │ [fg=bright-black]│[/] Dashboard [fg=bright-black]│[/] TypeScript [fg=bright-black]│[/] 🚧 Active [fg=bright-black]│[/]        N/A [fg=bright-black]│[/]
+38 │ [fg=bright-black]└───────────┴────────────┴───────────┴────────────┘[/]
+39 │ 
+40 │ [fg=cyan,bold]Example Configuration[/]
+41 │ 
+42 │ [fg=bright-black]┌─ yaml[/]
+43 │ [fg=bright-black]│ [/][fg=rgb-191-97-106]server[/][fg=rgb-192-197-206]:[/]
+44 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-191-97-106]address[/][fg=rgb-192-197-206]: "[/][fg=rgb-163-190-140]0.0.0.0:8080[/][fg=rgb-192-197-206]"[/]
+45 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-191-97-106]workers[/][fg=rgb-192-197-206]: [/][fg=rgb-208-135-112]8[/]
+46 │ [fg=bright-black]│ [/][fg=rgb-191-97-106]retry[/][fg=rgb-192-197-206]:[/]
+47 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-191-97-106]strategy[/][fg=rgb-192-197-206]: [/][fg=rgb-163-190-140]exponential[/]
+48 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-191-97-106]maximum_attempts[/][fg=rgb-192-197-206]: [/][fg=rgb-208-135-112]5[/]
+49 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-191-97-106]initial_delay[/][fg=rgb-192-197-206]: [/][fg=rgb-163-190-140]250ms[/]
+50 │ [fg=bright-black]└─[/]
+51 │ 
+52 │ [fg=cyan,bold]API Usage[/]
+53 │ 
+54 │ [fg=bright-black]┌─ rust[/]
+55 │ [fg=bright-black]│ [/][fg=rgb-180-142-173]use[/][fg=rgb-192-197-206] nebula::{Client, Task};[/]
+56 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]async [/][fg=rgb-180-142-173]fn[/][fg=rgb-192-197-206] [/][fg=rgb-143-161-179]dispatch[/][fg=rgb-192-197-206]([/][fg=rgb-191-97-106]client[/][fg=rgb-192-197-206]: &Client) -> anyhow::Result<()> {[/]
+57 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    [/][fg=rgb-180-142-173]let[/][fg=rgb-192-197-206] task = Task::new("[/][fg=rgb-163-190-140]generate-report[/][fg=rgb-192-197-206]")[/]
+58 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]        .[/][fg=rgb-150-181-180]argument[/][fg=rgb-192-197-206]("[/][fg=rgb-163-190-140]format[/][fg=rgb-192-197-206]", "[/][fg=rgb-163-190-140]pdf[/][fg=rgb-192-197-206]")[/]
+59 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]        .[/][fg=rgb-150-181-180]priority[/][fg=rgb-192-197-206]([/][fg=rgb-208-135-112]10[/][fg=rgb-192-197-206]);[/]
+60 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    [/][fg=rgb-180-142-173]let[/][fg=rgb-192-197-206] receipt = client.[/][fg=rgb-150-181-180]submit[/][fg=rgb-192-197-206](task).await?;[/]
+61 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    println!("[/][fg=rgb-163-190-140]Task submitted: [/][fg=rgb-208-135-112]{}[/][fg=rgb-192-197-206]", receipt.[/][fg=rgb-150-181-180]id[/][fg=rgb-192-197-206]());[/]
+62 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    Ok(())[/]
+63 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]}[/]
+64 │ [fg=bright-black]└─[/]
+65 │ 
+66 │ [fg=magenta]│ [/][fg=magenta,bold]❗ IMPORTANT[/]
+67 │ [fg=magenta]│ [/] Task handlers [bold]must be idempotent[/] because work
+68 │ [fg=magenta]│ [/]ers may retry interrupted jobs.
+69 │ 
+70 │ [fg=yellow]│ [/][fg=yellow,bold]⚠ WARNING[/]
+71 │ [fg=yellow]│ [/] Setting [fg=yellow]maximum_attempts[/] to [fg=yellow]0[/] disables the retr
+72 │ [fg=yellow]│ [/]y limit and may create a poison-message loop.
+73 │ 
+74 │ <details>
+75 │ <summary><strong>View the retry algorithm</strong></summary>
+76 │ For attempt (n), the delay is conceptually:
+77 │ 
+78 │ [fg=bright-black]┌─ text[/]
+79 │ [fg=bright-black]│ [/][fg=yellow]delay(n) = min(initial_delay × 2ⁿ + jitter, maximum_delay)[/]
+80 │ [fg=bright-black]└─[/]
+81 │ 
+82 │ [fg=bright-black]┌─────────┬────────────┬─────────────────────┐[/]
+83 │ [fg=bright-black]│[/] [bold]Attempt[/] [fg=bright-black]│[/] [bold]Base Delay[/] [fg=bright-black]│[/] [bold]Example with Jitter[/] [fg=bright-black]│[/]
+84 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
+85 │ [fg=bright-black]│[/]       1 [fg=bright-black]│[/]     250 ms [fg=bright-black]│[/]              284 ms [fg=bright-black]│[/]
+86 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
+87 │ [fg=bright-black]│[/]       2 [fg=bright-black]│[/]     500 ms [fg=bright-black]│[/]              571 ms [fg=bright-black]│[/]
+88 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
+89 │ [fg=bright-black]│[/]       3 [fg=bright-black]│[/]        1 s [fg=bright-black]│[/]              1.08 s [fg=bright-black]│[/]
+90 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
+91 │ [fg=bright-black]│[/]       4 [fg=bright-black]│[/]        2 s [fg=bright-black]│[/]              2.17 s [fg=bright-black]│[/]
+92 │ [fg=bright-black]└─────────┴────────────┴─────────────────────┘[/]
+93 │ 
+94 │ </details>
+95 │ 
+96 │ [fg=cyan,bold]Sample Event[/]
+97 │ 
+98 │ [fg=bright-black]┌─ json[/]
+99 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]{[/]
+100 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]event[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task.completed[/][fg=rgb-192-197-206]",[/]
+101 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]version[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]2[/][fg=rgb-192-197-206],[/]
+102 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]data[/][fg=rgb-192-197-206]": {[/]
+103 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]task_id[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task_01JABCDEF[/][fg=rgb-192-197-206]",[/]
+104 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]duration_ms[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]1842[/][fg=rgb-192-197-206],[/]
+105 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]result[/][fg=rgb-192-197-206]": {[/]
+106 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]status[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]success[/][fg=rgb-192-197-206]",[/]
+107 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]artifacts[/][fg=rgb-192-197-206]": ["[/][fg=rgb-163-190-140]report.pdf[/][fg=rgb-192-197-206]"][/]
+108 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    }[/]
+109 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  }[/]
+110 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]}[/]
+111 │ [fg=bright-black]└─[/]
+112 │ 
+113 │ [fg=bright-black]────────────────────────────────────────────────────────────[/]
+114 │ 
+115 │ [fg=cyan,bold]Notes[/]
+116 │ 
+117 │ [fg=bright-black]1.  [/]Events are ordered [bold]per task[/], not globally.
+118 │ [fg=bright-black]2.  [/]Delivery is [italic]at least once[/].
+119 │ [fg=bright-black]3.  [/]Clients should preserve unknown fields for forward compa
+120 │ [fg=bright-black]    [/]tibility.[^compat]
+121 │ 
+122 │ [^compat]: This enables older clients to safely proxy events
+123 │  created by newer protocol versions.
+124 │ [bold]Next step:[/] review [fg=yellow,underline]docs/protocol.md[/] and open a pull request r
+125 │ eferencing an issue—for example, [fg=yellow]Closes #42[/].
+== width 24 ==
+00 │ [fg=cyan,bold]🚀 Project Nebula[/]
+01 │ 
+02 │ [fg=bright-black]│ [/]A fictional distribute
+03 │ [fg=bright-black]│ [/]d task engine demonstr
+04 │ [fg=bright-black]│ [/]ating complex, GitHub-
+05 │ [fg=bright-black]│ [/]compatible Markdown.
+06 │ 
+07 │ [fg=blue,underline][image: Build][/] [fg=blue,underline][image: C[/]
+08 │ [fg=blue,underline]overage][/] [fg=blue,underline][image: License[/]
+09 │ [fg=blue,underline]][/]
+10 │ 
+11 │ [fg=cyan,bold]📋 Implementation Status[/]
+12 │ 
+13 │ [fg=bright-black]•  ☑ [/]Define the event pr
+14 │ [fg=bright-black]   [/]otocol
+15 │ [fg=bright-black]•  ☑ [/]Implement retry pol
+16 │ [fg=bright-black]   [/]icies
+17 │ [fg=bright-black]•  ☐ [/]Add distributed tra
+18 │ [fg=bright-black]   [/]cing
+19 │ [fg=bright-black]   •  ☑ [/]Generate trace I
+20 │ [fg=bright-black]      [/]Ds
+21 │ [fg=bright-black]   •  ☐ [/]Export OpenTelem
+22 │ [fg=bright-black]      [/]etry spans
+23 │ [fg=bright-black]•  ☐ [/]Perform production 
+24 │ [fg=bright-black]   [/]load testing
+25 │ 
+26 │ [fg=cyan,bold]Architecture[/]
+27 │ 
+28 │ [fg=bright-black]┌─ mermaid[/]
+29 │ [fg=bright-black]│ [/][fg=yellow]flowchart LR[/]
+30 │ [fg=bright-black]│ [/][fg=yellow]    Client["`**Client*[/]
+31 │ [fg=bright-black]│ [/][fg=yellow]*[/]
+32 │ [fg=bright-black]│ [/][fg=yellow]    HTTP / WebSocket`"[/]
+33 │ [fg=bright-black]│ [/][fg=yellow]] --> Gateway[/]
+34 │ [fg=bright-black]│ [/][fg=yellow]    Gateway --> Queue[[/]
+35 │ [fg=bright-black]│ [/][fg=yellow](Task Queue)][/]
+36 │ [fg=bright-black]│ [/][fg=yellow]    Queue --> WorkerA[[/]
+37 │ [fg=bright-black]│ [/][fg=yellow]Worker A][/]
+38 │ [fg=bright-black]│ [/][fg=yellow]    Queue --> WorkerB[[/]
+39 │ [fg=bright-black]│ [/][fg=yellow]Worker B][/]
+40 │ [fg=bright-black]│ [/][fg=yellow]    WorkerA & WorkerB [/]
+41 │ [fg=bright-black]│ [/][fg=yellow]--> Store[(Result Stor[/]
+42 │ [fg=bright-black]│ [/][fg=yellow]e)][/]
+43 │ [fg=bright-black]└─[/]
+44 │ 
+45 │ [fg=cyan,bold]Component Matrix[/]
+46 │ 
+47 │ [fg=bright-black]Component: [/]Gateway
+48 │ [fg=bright-black]Language: [/]Rust
+49 │ [fg=bright-black]State: [/]✅ Stable
+50 │ [fg=bright-black]Throughput: [/]42k req/s
+51 │ 
+52 │ [fg=bright-black]Component: [/]Scheduler
+53 │ [fg=bright-black]Language: [/]Go
+54 │ [fg=bright-black]State: [/]🧪 Beta
+55 │ [fg=bright-black]Throughput: [/]18k jobs/s
+56 │ 
+57 │ [fg=bright-black]Component: [/]Dashboard
+58 │ [fg=bright-black]Language: [/]TypeScript
+59 │ [fg=bright-black]State: [/]🚧 Active
+60 │ [fg=bright-black]Throughput: [/]N/A
+61 │ 
+62 │ [fg=cyan,bold]Example Configuration[/]
+63 │ 
+64 │ [fg=bright-black]┌─ yaml[/]
+65 │ [fg=bright-black]│ [/][fg=rgb-191-97-106]server[/][fg=rgb-192-197-206]:[/]
+66 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-191-97-106]address[/][fg=rgb-192-197-206]: "[/][fg=rgb-163-190-140]0.0.0.0:80[/]
+67 │ [fg=bright-black]│ [/][fg=rgb-163-190-140]80[/][fg=rgb-192-197-206]"[/]
+68 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-191-97-106]workers[/][fg=rgb-192-197-206]: [/][fg=rgb-208-135-112]8[/]
+69 │ [fg=bright-black]│ [/][fg=rgb-191-97-106]retry[/][fg=rgb-192-197-206]:[/]
+70 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-191-97-106]strategy[/][fg=rgb-192-197-206]: [/][fg=rgb-163-190-140]exponentia[/]
+71 │ [fg=bright-black]│ [/][fg=rgb-163-190-140]l[/]
+72 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-191-97-106]maximum_attempts[/][fg=rgb-192-197-206]: [/][fg=rgb-208-135-112]5[/]
+73 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-191-97-106]initial_delay[/][fg=rgb-192-197-206]: [/][fg=rgb-163-190-140]250ms[/]
+74 │ [fg=bright-black]└─[/]
+75 │ 
+76 │ [fg=cyan,bold]API Usage[/]
+77 │ 
+78 │ [fg=bright-black]┌─ rust[/]
+79 │ [fg=bright-black]│ [/][fg=rgb-180-142-173]use[/][fg=rgb-192-197-206] nebula::{Client, T[/]
+80 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]ask};[/]
+81 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]async [/][fg=rgb-180-142-173]fn[/][fg=rgb-192-197-206] [/][fg=rgb-143-161-179]dispatch[/][fg=rgb-192-197-206](clie[/]
+82 │ [fg=bright-black]│ [/][fg=rgb-191-97-106]nt[/][fg=rgb-192-197-206]: &Client) -> anyhow[/]
+83 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]::Result<()> {[/]
+84 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    [/][fg=rgb-180-142-173]let[/][fg=rgb-192-197-206] task = Task::n[/]
+85 │ [fg=bright-black]│ [/][fg=rgb-150-181-180]ew[/][fg=rgb-192-197-206]("[/][fg=rgb-163-190-140]generate-report[/][fg=rgb-192-197-206]")[/]
+86 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]        .[/][fg=rgb-150-181-180]argument[/][fg=rgb-192-197-206]("[/][fg=rgb-163-190-140]for[/]
+87 │ [fg=bright-black]│ [/][fg=rgb-163-190-140]mat[/][fg=rgb-192-197-206]", "[/][fg=rgb-163-190-140]pdf[/][fg=rgb-192-197-206]")[/]
+88 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]        .[/][fg=rgb-150-181-180]priority[/][fg=rgb-192-197-206]([/][fg=rgb-208-135-112]10[/][fg=rgb-192-197-206]);[/]
+89 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    [/][fg=rgb-180-142-173]let[/][fg=rgb-192-197-206] receipt = clie[/]
+90 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]nt.[/][fg=rgb-150-181-180]submit[/][fg=rgb-192-197-206](task).await?[/]
+91 │ [fg=bright-black]│ [/][fg=rgb-192-197-206];[/]
+92 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    println!("[/][fg=rgb-163-190-140]Task sub[/]
+93 │ [fg=bright-black]│ [/][fg=rgb-163-190-140]mitted: [/][fg=rgb-208-135-112]{}[/][fg=rgb-192-197-206]", receipt.i[/]
+94 │ [fg=bright-black]│ [/][fg=rgb-150-181-180]d[/][fg=rgb-192-197-206]());[/]
+95 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    Ok(())[/]
+96 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]}[/]
+97 │ [fg=bright-black]└─[/]
+98 │ 
+99 │ [fg=magenta]│ [/][fg=magenta,bold]❗ IMPORTANT[/]
+100 │ [fg=magenta]│ [/] Task hand
+101 │ [fg=magenta]│ [/]lers [bold]must be idempoten[/]
+102 │ [fg=magenta]│ [/][bold]t[/] because workers may 
+103 │ [fg=magenta]│ [/]retry interrupted jobs
+104 │ [fg=magenta]│ [/].
+105 │ 
+106 │ [fg=yellow]│ [/][fg=yellow,bold]⚠ WARNING[/]
+107 │ [fg=yellow]│ [/] Setting [fg=yellow]max[/]
+108 │ [fg=yellow]│ imum_attempts[/] to [fg=yellow]0[/] dis
+109 │ [fg=yellow]│ [/]ables the retry limit 
+110 │ [fg=yellow]│ [/]and may create a poiso
+111 │ [fg=yellow]│ [/]n-message loop.
+112 │ 
+113 │ <details>
+114 │ <summary><strong>View th
+115 │ e retry algorithm</stron
+116 │ g></summary>
+117 │ For attempt (n), the del
+118 │ ay is conceptually:
+119 │ 
+120 │ [fg=bright-black]┌─ text[/]
+121 │ [fg=bright-black]│ [/][fg=yellow]delay(n) = min(initial[/]
+122 │ [fg=bright-black]│ [/][fg=yellow]_delay × 2ⁿ + jitter, [/]
+123 │ [fg=bright-black]│ [/][fg=yellow]maximum_delay)[/]
+124 │ [fg=bright-black]└─[/]
+125 │ 
+126 │ [fg=bright-black]Attempt: [/]1
+127 │ [fg=bright-black]Base Delay: [/]250 ms
+128 │ [fg=bright-black]Example with Jitter: [/]284 ms
+129 │ 
+130 │ [fg=bright-black]Attempt: [/]2
+131 │ [fg=bright-black]Base Delay: [/]500 ms
+132 │ [fg=bright-black]Example with Jitter: [/]571 ms
+133 │ 
+134 │ [fg=bright-black]Attempt: [/]3
+135 │ [fg=bright-black]Base Delay: [/]1 s
+136 │ [fg=bright-black]Example with Jitter: [/]1.08 s
+137 │ 
+138 │ [fg=bright-black]Attempt: [/]4
+139 │ [fg=bright-black]Base Delay: [/]2 s
+140 │ [fg=bright-black]Example with Jitter: [/]2.17 s
+141 │ 
+142 │ </details>
+143 │ 
+144 │ [fg=cyan,bold]Sample Event[/]
+145 │ 
+146 │ [fg=bright-black]┌─ json[/]
+147 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]{[/]
+148 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]event[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task.compl[/]
+149 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]eted[/][fg=rgb-192-197-206]"[/][fg=rgb-163-190-140],[/]
+150 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]version[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]2[/][fg=rgb-192-197-206],[/]
+151 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]data[/][fg=rgb-192-197-206]": {[/]
+152 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]task_id[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task_0[/]
+153 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]1JABCDEF[/][fg=rgb-192-197-206]"[/][fg=rgb-163-190-140],[/]
+154 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]duration_ms[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]184[/]
+155 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]2,[/]
+156 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]result[/][fg=rgb-192-197-206]": {[/]
+157 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]status[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]succe[/]
+158 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]ss[/][fg=rgb-192-197-206]"[/][fg=rgb-163-190-140],[/]
+159 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]artifacts[/][fg=rgb-192-197-206]": ["[/][fg=rgb-163-190-140]r[/]
+160 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]eport.pdf[/][fg=rgb-192-197-206]"[/][fg=rgb-163-190-140]][/]
+161 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    [/][fg=rgb-43-48-59]}[/]
+162 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-43-48-59]}[/]
+163 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]}[/]
+164 │ [fg=bright-black]└─[/]
+165 │ 
+166 │ [fg=bright-black]────────────────────────[/]
+167 │ 
+168 │ [fg=cyan,bold]Notes[/]
+169 │ 
+170 │ [fg=bright-black]1.  [/]Events are ordered [bold]p[/]
+171 │ [fg=bright-black]    [/][bold]er task[/], not globall
+172 │ [fg=bright-black]    [/]y.
+173 │ [fg=bright-black]2.  [/]Delivery is [italic]at least[/]
+174 │ [fg=bright-black]    [/][italic] once[/].
+175 │ [fg=bright-black]3.  [/]Clients should prese
+176 │ [fg=bright-black]    [/]rve unknown fields f
+177 │ [fg=bright-black]    [/]or forward compatibi
+178 │ [fg=bright-black]    [/]lity.[^compat]
+179 │ 
+180 │ [^compat]: This enables 
+181 │ older clients to safely 
+182 │ proxy events created by 
+183 │ newer protocol versions.
+184 │ [bold]Next step:[/] review [fg=yellow,underline]docs/p[/]
+185 │ [fg=yellow,underline]rotocol.md[/] and open a pu
+186 │ ll request referencing a
+187 │ n issue—for example, [fg=yellow]Clo[/]
+188 │ [fg=yellow]ses #42[/].

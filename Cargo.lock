@@ -1879,6 +1879,7 @@ dependencies = [
  "hyperchad_transformer",
  "hyperchad_transformer_models",
  "insta",
+ "pulldown-cmark",
  "test-log",
  "unicode-segmentation",
  "unicode-width 0.2.2",

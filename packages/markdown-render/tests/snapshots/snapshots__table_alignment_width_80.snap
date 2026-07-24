@@ -1,0 +1,11 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "visible_snapshot(TABLE_ALIGNMENT, 80)"
+---
+00 │ ┌────────┬────────┬───────┐
+01 │ │ Left   │ Center │ Right │
+02 │ ├────────┼────────┼───────┤
+03 │ │ x      │   y    │   zzz │
+04 │ ├────────┼────────┼───────┤
+05 │ │ longer │   q    │     7 │
+06 │ └────────┴────────┴───────┘

@@ -2,10 +2,13 @@ use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
 use bmux_tui::prelude::{Color, Line, Modifier, Style};
 use unicode_width::UnicodeWidthStr;
 
+const ALERTS: &str = include_str!("fixtures/alerts.md");
+const ALERTS_STREAMING: &str = include_str!("fixtures/alerts_streaming.md");
 const BLOCKQUOTES: &str = include_str!("fixtures/blockquotes.md");
 const BLOCKS: &str = include_str!("fixtures/blocks.md");
 const CODE_BLOCKS: &str = include_str!("fixtures/code_blocks.md");
 const COMPOSITION: &str = include_str!("fixtures/composition.md");
+const GITHUB_MARKDOWN_EXAMPLE: &str = include_str!("../../../github-markdown-example.md");
 const HEADINGS: &str = include_str!("fixtures/headings.md");
 const HTML_XSS: &str = include_str!("fixtures/html_xss.md");
 const IMAGES: &str = include_str!("fixtures/images.md");
@@ -19,6 +22,7 @@ const PARAGRAPHS: &str = include_str!("fixtures/paragraphs.md");
 const STREAMING_CODE: &str = include_str!("fixtures/streaming_code.md");
 const STREAMING_INLINE: &str = include_str!("fixtures/streaming_inline.md");
 const STREAMING_STRUCTURES: &str = include_str!("fixtures/streaming_structures.md");
+const TABLE_ALIGNMENT: &str = include_str!("fixtures/table_alignment.md");
 const TABLE_FORMATTED: &str = include_str!("fixtures/table_formatted.md");
 const TABLE_MULTIPLE_ROWS: &str = include_str!("fixtures/table_multiple_rows.md");
 const TABLE_SINGLE_ROW: &str = include_str!("fixtures/table_single_row.md");
@@ -130,6 +134,97 @@ fn color_label(color: Color) -> String {
         Color::Indexed(index) => format!("indexed-{index}"),
         Color::Rgb(red, green, blue) => format!("rgb-{red}-{green}-{blue}"),
     }
+}
+
+#[test]
+fn snapshots_github_alerts_at_normal_and_narrow_widths() {
+    insta::assert_snapshot!(
+        "alerts_widths_60_24",
+        [60_u16, 24]
+            .into_iter()
+            .map(|width| {
+                format!(
+                    "== complete width {width} ==\n{}\n== streaming width {width} ==\n{}",
+                    styled_snapshot(ALERTS, width),
+                    styled_snapshot(ALERTS_STREAMING, width)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn github_alert_labels_are_semantic_and_unknown_markers_remain_quotes() {
+    let output = visible_snapshot(ALERTS, 60);
+
+    for label in ["ⓘ NOTE", "◆ TIP", "❗ IMPORTANT", "⚠ WARNING", "⛔ CAUTION"] {
+        assert!(output.contains(label), "missing alert label {label:?}");
+    }
+    assert_eq!(output.matches("ⓘ NOTE").count(), 1);
+    assert_eq!(output.matches("◆ TIP").count(), 2);
+    assert_eq!(output.matches("⚠ WARNING").count(), 2);
+    assert!(output.contains("Nested warning."));
+    assert!(output.contains("Alert inside a list item."));
+    assert!(output.contains("東京"));
+    assert!(output.contains("[!UNKNOWN]"));
+    assert!(output.contains("[!NOTE] trailing text"));
+    assert!(output.contains("[!NOTE Incomplete marker"));
+}
+
+#[test]
+fn snapshots_github_markdown_example_at_representative_widths() {
+    insta::assert_snapshot!(
+        "github_markdown_example_widths_100_60_24",
+        [100_u16, 60, 24]
+            .into_iter()
+            .map(|width| format!(
+                "== width {width} ==\n{}",
+                styled_snapshot(GITHUB_MARKDOWN_EXAMPLE, width)
+            ))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn github_markdown_example_documents_current_semantic_gaps() {
+    let output = visible_snapshot(GITHUB_MARKDOWN_EXAMPLE, 100);
+
+    assert!(
+        output.contains("┌─ mermaid"),
+        "Mermaid fence was not preserved"
+    );
+    assert!(
+        output.contains("❗ IMPORTANT"),
+        "IMPORTANT alert label changed"
+    );
+    assert!(output.contains("⚠ WARNING"), "WARNING alert label changed");
+    assert!(output.contains("<details>"), "details HTML changed");
+    assert!(output.contains("<summary>"), "summary HTML changed");
+    assert!(output.contains("(n)"), "inline math degradation changed");
+    assert!(output.contains("[^compat]"), "footnote reference changed");
+    assert!(output.contains("[^compat]:"), "footnote definition changed");
+    assert!(output.contains("[image: Build]"), "badge fallback changed");
+    assert!(output.contains("docs/protocol.md"), "link label changed");
+    assert!(output.contains("Closes"), "issue-closing keyword changed");
+    assert!(output.contains("#42"), "issue reference changed");
+}
+
+#[test]
+fn snapshots_left_center_and_right_table_alignment() {
+    insta::assert_snapshot!(
+        "table_alignment_width_80",
+        visible_snapshot(TABLE_ALIGNMENT, 80)
+    );
+}
+
+#[test]
+fn aligned_table_cells_have_expected_padding() {
+    let output = visible_snapshot(TABLE_ALIGNMENT, 80);
+
+    assert!(output.contains("│ x      │   y    │   zzz │"));
+    assert!(output.contains("│ longer │   q    │     7 │"));
 }
 
 #[test]

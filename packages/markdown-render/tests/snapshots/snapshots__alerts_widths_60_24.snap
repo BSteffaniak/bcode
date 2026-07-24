@@ -1,0 +1,86 @@
+---
+source: packages/markdown-render/tests/snapshots.rs
+expression: "[60_u16,\n24].into_iter().map(|width|\n{\n    format!(\"== complete width {width} ==\\n{}\\n== streaming width {width} ==\\n{}\",\n    styled_snapshot(ALERTS, width), styled_snapshot(ALERTS_STREAMING, width))\n}).collect::<Vec<_>>().join(\"\\n\")"
+---
+== complete width 60 ==
+00 │ [fg=blue]│ [/][fg=blue,bold]ⓘ NOTE[/]
+01 │ [fg=blue]│ [/] A note with [bold]strong[/] text and Unicode 東京.
+02 │ 
+03 │ [fg=green]│ [/][fg=green,bold]◆ TIP[/]
+04 │ [fg=green]│ [/] A useful tip.
+05 │ 
+06 │ [fg=magenta]│ [/][fg=magenta,bold]❗ IMPORTANT[/]
+07 │ [fg=magenta]│ [/] Important [fg=yellow]code[/] wraps across a sufficiently na
+08 │ [fg=magenta]│ [/]rrow terminal width.
+09 │ [fg=magenta]│ [/][fg=bright-black]•  [/]nested list item
+10 │ [fg=magenta]│ [/][fg=bright-black]•  [/][fg=blue,underline]documentation[/]
+11 │ [fg=magenta]│ [/]
+12 │ [fg=magenta]│ [/][fg=yellow]│ [/][fg=yellow,bold]⚠ WARNING[/]
+13 │ [fg=magenta]│ [/][fg=yellow]│ [/] Nested warning.
+14 │ 
+15 │ [fg=yellow]│ [/][fg=yellow,bold]⚠ WARNING[/]
+16 │ [fg=yellow]│ [/] Warning text.
+17 │ 
+18 │ [fg=red]│ [/][fg=red,bold]⛔ CAUTION[/]
+19 │ [fg=red]│ [/] Caution text.
+20 │ 
+21 │ [fg=bright-black]•  [/]List context:
+22 │ [fg=bright-black]   [/][fg=green]│ [/][fg=green,bold]◆ TIP[/]
+23 │ [fg=bright-black]   [/][fg=green]│ [/] Alert inside a list item.
+24 │ 
+25 │ [fg=bright-black]│ [/][!UNKNOWN] This remains an ordinary quote.
+26 │ 
+27 │ [fg=bright-black]│ [/][!NOTE] trailing text is not an alert marker
+28 │ 
+29 │ [fg=bright-black]│ [/][!NOTE Incomplete marker remains an ordinary quote.
+== streaming width 60 ==
+00 │ [fg=yellow]│ [/][fg=yellow,bold]⚠ WARNING[/]
+01 │ [fg=yellow]│ [/] Streaming alert body with **incomplete emphasis
+== complete width 24 ==
+00 │ [fg=blue]│ [/][fg=blue,bold]ⓘ NOTE[/]
+01 │ [fg=blue]│ [/] A note with [bold]st[/]
+02 │ [fg=blue]│ [/][bold]rong[/] text and Unicode 
+03 │ [fg=blue]│ [/]東京.
+04 │ 
+05 │ [fg=green]│ [/][fg=green,bold]◆ TIP[/]
+06 │ [fg=green]│ [/] A useful tip.
+07 │ 
+08 │ [fg=magenta]│ [/][fg=magenta,bold]❗ IMPORTANT[/]
+09 │ [fg=magenta]│ [/] Important
+10 │ [fg=magenta]│ [/] [fg=yellow]code[/] wraps across a s
+11 │ [fg=magenta]│ [/]ufficiently narrow ter
+12 │ [fg=magenta]│ [/]minal width.
+13 │ [fg=magenta]│ [/][fg=bright-black]•  [/]nested list item
+14 │ [fg=magenta]│ [/][fg=bright-black]•  [/][fg=blue,underline]documentation[/]
+15 │ [fg=magenta]│ [/]
+16 │ [fg=magenta]│ [/][fg=yellow]│ [/][fg=yellow,bold]⚠ WARNING[/]
+17 │ [fg=magenta]│ [/][fg=yellow]│ [/] Nested wa
+18 │ [fg=magenta]│ [/][fg=yellow]│ [/]rning.
+19 │ 
+20 │ [fg=yellow]│ [/][fg=yellow,bold]⚠ WARNING[/]
+21 │ [fg=yellow]│ [/] Warning tex
+22 │ [fg=yellow]│ [/]t.
+23 │ 
+24 │ [fg=red]│ [/][fg=red,bold]⛔ CAUTION[/]
+25 │ [fg=red]│ [/] Caution tex
+26 │ [fg=red]│ [/]t.
+27 │ 
+28 │ [fg=bright-black]•  [/]List context:
+29 │ [fg=bright-black]   [/][fg=green]│ [/][fg=green,bold]◆ TIP[/]
+30 │ [fg=bright-black]   [/][fg=green]│ [/] Alert inside
+31 │ [fg=bright-black]   [/][fg=green]│ [/] a list item.
+32 │ 
+33 │ [fg=bright-black]│ [/][!UNKNOWN] This remain
+34 │ [fg=bright-black]│ [/]s an ordinary quote.
+35 │ 
+36 │ [fg=bright-black]│ [/][!NOTE] trailing text 
+37 │ [fg=bright-black]│ [/]is not an alert marker
+38 │ 
+39 │ [fg=bright-black]│ [/][!NOTE Incomplete mark
+40 │ [fg=bright-black]│ [/]er remains an ordinary
+41 │ [fg=bright-black]│ [/] quote.
+== streaming width 24 ==
+00 │ [fg=yellow]│ [/][fg=yellow,bold]⚠ WARNING[/]
+01 │ [fg=yellow]│ [/] Streaming a
+02 │ [fg=yellow]│ [/]lert body with **incom
+03 │ [fg=yellow]│ [/]plete emphasis
