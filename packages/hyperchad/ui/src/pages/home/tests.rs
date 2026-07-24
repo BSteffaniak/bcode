@@ -1,4 +1,6 @@
-use super::activity::unrepresented_active_invocations;
+use std::collections::BTreeSet;
+
+use super::activity::{unrepresented_active_invocations, unrepresented_runtime_work};
 use super::adapters::{ARTIFACT_ADAPTERS, VISUAL_ADAPTERS, json_panel, render_plugin_visual};
 use super::composer::composer;
 use super::interactions::interaction_request;
@@ -6,8 +8,8 @@ use super::navigation::session_navigation;
 use super::permissions::{permission_history, permission_request};
 use super::tools::{render_tool_lifecycle, render_tool_result};
 use super::transcript::{
-    is_superseded_tool_request, item_label, message_content, should_render_transcript_item,
-    transcript_item, transcript_item_body,
+    is_active_interaction_summary, is_superseded_tool_request, item_label, message_content,
+    should_render_transcript_item, transcript_item, transcript_item_body,
 };
 use super::usage::{runtime_usage, usage_transcript_item};
 use super::*;
@@ -26,6 +28,178 @@ fn container_text(container: &hyperchad_transformer::Container, text: &mut Strin
     }
     for child in &container.children {
         container_text(child, text);
+    }
+}
+
+fn transcript_fixture_item(
+    id: &str,
+    streaming: bool,
+    kind: TranscriptViewItemKind,
+) -> TranscriptViewItem {
+    TranscriptViewItem {
+        id: TranscriptViewItemId::new(id),
+        revision: 7,
+        sequence: Some(7),
+        timestamp_ms: Some(1_700_000_000_000),
+        streaming,
+        kind,
+    }
+}
+
+fn non_tool_message_fixture_items() -> Vec<TranscriptViewItem> {
+    vec![
+        transcript_fixture_item(
+            "fixture-user",
+            false,
+            TranscriptViewItemKind::UserMessage {
+                message: ChatMessageView::plain("user fixture"),
+            },
+        ),
+        transcript_fixture_item(
+            "fixture-assistant",
+            true,
+            TranscriptViewItemKind::AssistantMessage {
+                message: ChatMessageView::markdown("**assistant fixture**"),
+            },
+        ),
+        transcript_fixture_item(
+            "fixture-reasoning",
+            true,
+            TranscriptViewItemKind::ReasoningMessage {
+                message: ChatMessageView::markdown("reasoning fixture"),
+            },
+        ),
+        transcript_fixture_item(
+            "fixture-system",
+            false,
+            TranscriptViewItemKind::SystemMessage {
+                message: ChatMessageView::plain("system fixture"),
+            },
+        ),
+    ]
+}
+
+fn non_tool_status_fixture_items() -> Vec<TranscriptViewItem> {
+    use bcode_session_models::RuntimeWorkKind;
+
+    let mut items = Vec::new();
+    for (index, status) in [
+        RuntimeWorkStatus::Queued,
+        RuntimeWorkStatus::Running,
+        RuntimeWorkStatus::Cancelling,
+        RuntimeWorkStatus::Completed,
+        RuntimeWorkStatus::Failed,
+        RuntimeWorkStatus::TimedOut,
+        RuntimeWorkStatus::Cancelled,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        items.push(transcript_fixture_item(
+            &format!("fixture-runtime-{index}"),
+            status == RuntimeWorkStatus::Running,
+            TranscriptViewItemKind::RuntimeWork {
+                work: RuntimeWorkView {
+                    work_id: WorkId::new(format!("work-{index}")),
+                    kind: RuntimeWorkKind::Tool,
+                    label: format!("runtime {status:?}"),
+                    status,
+                    cancellable: true,
+                    message: Some("runtime detail".to_owned()),
+                    completed_units: Some(1),
+                    total_units: Some(2),
+                    updated_at_ms: Some(1),
+                },
+            },
+        ));
+    }
+    items
+}
+
+fn non_tool_notice_fixture_items() -> Vec<TranscriptViewItem> {
+    let mut items = Vec::new();
+    for (index, status) in [
+        SkillViewStatus::Invoked,
+        SkillViewStatus::Suggested,
+        SkillViewStatus::ContextLoaded,
+        SkillViewStatus::Failed,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        items.push(transcript_fixture_item(
+            &format!("fixture-skill-{index}"),
+            false,
+            TranscriptViewItemKind::Skill {
+                skill: SkillView {
+                    skill_id: format!("skill-{index}"),
+                    status,
+                    text: format!("skill {status:?}"),
+                },
+            },
+        ));
+    }
+    for (index, status) in [CompactionViewStatus::Local, CompactionViewStatus::Provider]
+        .into_iter()
+        .enumerate()
+    {
+        items.push(transcript_fixture_item(
+            &format!("fixture-compaction-{index}"),
+            false,
+            TranscriptViewItemKind::Compaction {
+                compaction: CompactionView {
+                    status,
+                    text: format!("compaction {status:?}"),
+                    provider_plugin_id: (status == CompactionViewStatus::Provider)
+                        .then(|| "provider.fixture".to_owned()),
+                    model_id: (status == CompactionViewStatus::Provider)
+                        .then(|| "model-fixture".to_owned()),
+                },
+            },
+        ));
+    }
+    items
+}
+
+fn container_text_all(containers: &hyperchad::template::Containers) -> String {
+    let mut text = String::new();
+    for container in containers {
+        container_text(container, &mut text);
+    }
+    text
+}
+
+fn container_text_outside_details(
+    container: &hyperchad_transformer::Container,
+    inside_details: bool,
+    text: &mut String,
+) {
+    let inside_details = inside_details
+        || matches!(
+            container.element,
+            hyperchad_transformer::Element::Details { .. }
+        );
+    if !inside_details && let hyperchad_transformer::Element::Text { value } = &container.element {
+        text.push_str(value);
+    }
+    for child in &container.children {
+        container_text_outside_details(child, inside_details, text);
+    }
+}
+
+fn collect_resource_urls(container: &hyperchad_transformer::Container, urls: &mut Vec<String>) {
+    match &container.element {
+        hyperchad_transformer::Element::Anchor {
+            href: Some(href), ..
+        } => urls.push(href.clone()),
+        hyperchad_transformer::Element::Image {
+            source: Some(source),
+            ..
+        } => urls.push(source.clone()),
+        _ => {}
+    }
+    for child in &container.children {
+        collect_resource_urls(child, urls);
     }
 }
 
@@ -54,6 +228,311 @@ fn exact_context_occupancy(tokens: u64) -> bcode_session_models::RequestContextO
                 algorithm_version: 1,
             },
         },
+    }
+}
+
+fn non_tool_permission_fixture_items(
+    session_id: bcode_session_models::SessionId,
+) -> Vec<TranscriptViewItem> {
+    let permission = |id: &str, resolved: bool, approved| PermissionView {
+        permission_id: id.to_owned(),
+        session_id: Some(session_id),
+        tool_call_id: format!("call-{id}"),
+        tool_name: "fixture.tool".to_owned(),
+        arguments_json: "{}".to_owned(),
+        batch: None,
+        agent_id: "build".to_owned(),
+        title: Some("Fixture permission".to_owned()),
+        policy_source: None,
+        detail: Some(format!("permission {id}")),
+        resolved,
+        approved,
+        can_remember: true,
+    };
+    [
+        ("requested", false, None),
+        ("approved", true, Some(true)),
+        ("denied", true, Some(false)),
+    ]
+    .into_iter()
+    .map(|(id, resolved, approved)| {
+        transcript_fixture_item(
+            &format!("fixture-permission-{id}"),
+            false,
+            TranscriptViewItemKind::Permission {
+                permission: permission(id, resolved, approved),
+            },
+        )
+    })
+    .collect()
+}
+
+fn non_tool_interaction_fixture_items() -> Vec<TranscriptViewItem> {
+    let interaction = |id: &str, resolved: bool, resolution| InteractionViewSummary {
+        interaction_id: id.to_owned(),
+        kind: "fixture.interaction".to_owned(),
+        surface_kind: "fixture.surface".to_owned(),
+        tool_call_id: Some(format!("call-{id}")),
+        title: Some(format!("Interaction {id}")),
+        required: true,
+        snapshot: Some(serde_json::json!({"state": "pending"})),
+        resolved,
+        resolution,
+    };
+    [
+        interaction("pending", false, None),
+        interaction(
+            "resolved",
+            true,
+            Some(serde_json::json!({"status": "answered"})),
+        ),
+        interaction(
+            "cancelled",
+            true,
+            Some(serde_json::json!({"status": "cancelled"})),
+        ),
+    ]
+    .into_iter()
+    .map(|interaction| {
+        let id = interaction.interaction_id.clone();
+        transcript_fixture_item(
+            &format!("fixture-interaction-{id}"),
+            false,
+            TranscriptViewItemKind::Interaction { interaction },
+        )
+    })
+    .collect()
+}
+
+fn non_tool_usage_and_plugin_fixture_items() -> Vec<TranscriptViewItem> {
+    vec![
+        transcript_fixture_item(
+            "fixture-usage",
+            false,
+            TranscriptViewItemKind::Usage {
+                usage: bcode_session_view_models::UsageView {
+                    turn_id: "turn-fixture".to_owned(),
+                    usage: bcode_session_models::SessionTokenUsage {
+                        input_tokens: Some(10),
+                        output_tokens: Some(5),
+                        total_tokens: Some(15),
+                        cached_input_tokens: None,
+                        cache_write_input_tokens: None,
+                        reasoning_tokens: None,
+                    },
+                },
+            },
+        ),
+        transcript_fixture_item(
+            "fixture-plugin-visual",
+            false,
+            TranscriptViewItemKind::PluginVisual {
+                visual: PluginVisualView::from(PluginVisualDescriptor {
+                    visual_id: Some("fixture-visual".to_owned()),
+                    producer_plugin_id: Some("fixture.plugin".to_owned()),
+                    schema: "fixture.unknown".to_owned(),
+                    schema_version: 1,
+                    title: Some("Fixture visual".to_owned()),
+                    subtitle: None,
+                    payload: serde_json::json!({"message": "plugin fixture"}),
+                }),
+            },
+        ),
+    ]
+}
+
+#[test]
+fn every_non_tool_transcript_state_survives_reconnect_snapshot_and_renders() {
+    let session_id = bcode_session_models::SessionId::new();
+    let mut items = non_tool_message_fixture_items();
+    items.extend(non_tool_status_fixture_items());
+    items.extend(non_tool_notice_fixture_items());
+    items.extend(non_tool_permission_fixture_items(session_id));
+    items.extend(non_tool_interaction_fixture_items());
+    items.extend(non_tool_usage_and_plugin_fixture_items());
+
+    let mut snapshot = SessionViewSnapshot::empty();
+    snapshot.session_id = Some(session_id);
+    snapshot.transcript.revision = 7;
+    snapshot.transcript.source_start_sequence = Some(7);
+    snapshot.transcript.source_end_sequence = Some(7);
+    snapshot.transcript.items = items;
+    let encoded = serde_json::to_vec(&snapshot).expect("serialize reconnect snapshot");
+    let reconnected: SessionViewSnapshot =
+        serde_json::from_slice(&encoded).expect("deserialize reconnect snapshot");
+    assert_eq!(reconnected, snapshot);
+
+    let rendered = format!("{:?}", home(&reconnected, &[], "fixture-token"));
+    let text = reconnected
+        .transcript
+        .items
+        .iter()
+        .map(|item| container_text_all(&transcript_item(item)))
+        .collect::<String>();
+    assert!(rendered.contains(&semantic_dom_id("transcript-item", "fixture-assistant")));
+    assert!(text.contains("live"));
+    for expected in [
+        "user fixture",
+        "assistant fixture",
+        "reasoning fixture",
+        "system fixture",
+        "Queued",
+        "Running",
+        "Cancelling",
+        "Completed",
+        "Failed",
+        "TimedOut",
+        "Cancelled",
+        "skill Invoked",
+        "skill Suggested",
+        "skill ContextLoaded",
+        "skill Failed",
+        "Local context compacted",
+        "Provider context compacted",
+        "provider.fixture",
+        "model-fixture",
+        "requested",
+        "approved",
+        "denied",
+        "pending",
+        "answered",
+        "cancelled",
+        "Model usage",
+        "Fixture visual",
+    ] {
+        assert!(
+            text.contains(expected),
+            "missing rendered state: {expected}"
+        );
+    }
+}
+
+#[test]
+fn semantic_component_identities_are_stable_bounded_and_order_independent() {
+    let long = "plugin-controlled-id".repeat(10_000);
+    let first = semantic_dom_id("component", &long);
+    let repeated = semantic_dom_id("component", &long);
+    let different = semantic_dom_id("component", "different");
+    assert_eq!(first, repeated);
+    assert_ne!(first, different);
+    assert!(first.len() < 64);
+    assert!(
+        first
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-')
+    );
+
+    let session_a = bcode_session_models::SessionId::new();
+    let session_b = bcode_session_models::SessionId::new();
+    let sessions = |reverse: bool| {
+        let mut values = [session_a, session_b]
+            .into_iter()
+            .map(|id| bcode_session_models::SessionSummary {
+                id,
+                name: Some(format!("session {id}")),
+                explicit_name: None,
+                derived_title: None,
+                title_source: bcode_session_models::SessionTitleSource::Explicit,
+                client_count: 0,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                working_directory: "/tmp".into(),
+                import: None,
+                fork: None,
+            })
+            .collect::<Vec<_>>();
+        if reverse {
+            values.reverse();
+        }
+        values
+    };
+    for reverse in [false, true] {
+        let rendered = format!(
+            "{:?}",
+            session_navigation(&sessions(reverse), None, "token")
+        );
+        for id in [session_a, session_b] {
+            assert!(rendered.contains(&semantic_dom_id("session", &id.to_string())));
+        }
+    }
+}
+
+#[test]
+fn repeated_domain_components_use_stable_semantic_identities() {
+    let session_id = bcode_session_models::SessionId::new();
+    let permission_id = "stable-permission";
+    let interaction_id = "stable-interaction";
+    let work_id = "stable-work";
+    let transcript_id = "stable-transcript";
+    let mut snapshot = SessionViewSnapshot::empty();
+    snapshot.session_id = Some(session_id);
+    snapshot.permissions.push(PermissionView {
+        permission_id: permission_id.to_owned(),
+        session_id: Some(session_id),
+        tool_call_id: "call-permission".to_owned(),
+        tool_name: "fixture.tool".to_owned(),
+        arguments_json: "{}".to_owned(),
+        batch: None,
+        agent_id: "build".to_owned(),
+        title: Some("Permission".to_owned()),
+        policy_source: None,
+        detail: None,
+        resolved: false,
+        approved: None,
+        can_remember: false,
+    });
+    snapshot.interactions.push(InteractionViewSummary {
+        interaction_id: interaction_id.to_owned(),
+        kind: "future.interaction".to_owned(),
+        surface_kind: "future.surface".to_owned(),
+        tool_call_id: None,
+        title: Some("Interaction".to_owned()),
+        required: false,
+        snapshot: None,
+        resolved: false,
+        resolution: None,
+    });
+    snapshot.runtime_work.push(RuntimeWorkView {
+        work_id: WorkId::new(work_id),
+        kind: bcode_session_models::RuntimeWorkKind::Tool,
+        label: "Work".to_owned(),
+        status: RuntimeWorkStatus::Running,
+        cancellable: false,
+        message: None,
+        completed_units: None,
+        total_units: None,
+        updated_at_ms: None,
+    });
+    snapshot.transcript.items.push(transcript_fixture_item(
+        transcript_id,
+        false,
+        TranscriptViewItemKind::SystemMessage {
+            message: ChatMessageView::plain("System"),
+        },
+    ));
+
+    let expected = [
+        semantic_dom_id("permission", permission_id),
+        semantic_dom_id("interaction", interaction_id),
+        semantic_dom_id("runtime-work", work_id),
+        semantic_dom_id("transcript-item", transcript_id),
+    ];
+    for revision in [1, 2] {
+        snapshot.revision = revision;
+        snapshot.runtime_work.reverse();
+        snapshot.permissions.reverse();
+        let rendered = format!("{:?}", home(&snapshot, &[], "token"));
+        for id in &expected {
+            assert!(rendered.contains(id));
+        }
+        for static_id in [
+            "bcode-web-shell",
+            "session-navigation",
+            "conversation-timeline",
+            "composer-region",
+        ] {
+            assert!(rendered.contains(static_id));
+        }
     }
 }
 
@@ -139,7 +618,7 @@ fn markdown_messages_use_hyperchad_markdown_with_highlighting_and_xss_protection
     assert!(options.xss_protection);
 
     let message = ChatMessageView {
-        text: "# Heading\n\n```rust\nfn main() {}\n```\n\n<script>alert('unsafe')</script>"
+        text: "# Heading\n\n```rust\nfn main() {}\n```\n\n<script>alert('unsafe')</script>\n\n[unsafe link](javascript:alert(2))\n\n[safe link](https://example.com)"
             .to_owned(),
         display_label: None,
         format: TextFormat::Markdown,
@@ -156,6 +635,8 @@ fn markdown_messages_use_hyperchad_markdown_with_highlighting_and_xss_protection
     assert!(rendered.contains("markdown"));
     assert!(!rendered.contains("Element::Raw"));
     assert!(!text.contains("alert('unsafe')"));
+    assert!(!rendered.contains("javascript:alert"));
+    assert!(rendered.contains("https://example.com"));
 }
 
 #[test]
@@ -196,8 +677,8 @@ fn user_and_assistant_messages_have_distinct_semantic_surfaces() {
 
     let user = format!("{:?}", transcript_item(&user));
     let assistant = format!("{:?}", transcript_item(&assistant));
-    assert!(user.contains("transcript-item-user:surface"));
-    assert!(assistant.contains("transcript-item-assistant:surface"));
+    assert!(user.contains(&semantic_dom_id("transcript-item", "user:surface")));
+    assert!(assistant.contains(&semantic_dom_id("transcript-item", "assistant:surface")));
     assert!(user.contains("margin_left: Some(Integer(48))"));
     assert!(assistant.contains("margin_right: Some(Integer(48))"));
     assert_ne!(user, assistant);
@@ -222,7 +703,7 @@ fn streaming_assistant_item_has_stable_identity_live_state_and_developer_metadat
         container_text(container, &mut text);
     }
     let rendered = format!("{containers:?}");
-    assert!(rendered.contains("transcript-item-assistant:stream"));
+    assert!(rendered.contains(&semantic_dom_id("transcript-item", "assistant:stream")));
     assert!(text.contains("live"));
     assert!(text.contains("developer details"));
     assert!(text.contains("revision 3"));
@@ -277,7 +758,7 @@ fn system_skill_and_compaction_items_render_as_notices() {
     assert!(skill.contains("r: 248"));
     assert!(skill.contains("g: 81"));
     assert!(skill.contains("b: 73"));
-    assert!(compaction.contains("Context compacted"));
+    assert!(compaction.contains("Local context compacted"));
 }
 
 #[test]
@@ -499,6 +980,69 @@ fn transcript_history_controls_render_source_anchored_actions() {
     assert!(rendered.contains("20"));
 }
 
+fn container_by_id<'a>(
+    containers: &'a [hyperchad_transformer::Container],
+    id: &str,
+) -> Option<&'a hyperchad_transformer::Container> {
+    containers.iter().find_map(|container| {
+        (container.str_id.as_deref() == Some(id))
+            .then_some(container)
+            .or_else(|| container_by_id(&container.children, id))
+    })
+}
+
+fn responsive_targets(
+    container: &hyperchad_transformer::Container,
+    targets: &mut BTreeSet<String>,
+) {
+    for config in &container.overrides {
+        let hyperchad_transformer::OverrideCondition::ResponsiveTarget { name } = &config.condition;
+        targets.insert(name.clone());
+    }
+    for child in &container.children {
+        responsive_targets(child, targets);
+    }
+}
+
+#[test]
+fn application_shell_declares_canonical_tablet_and_narrow_layouts() {
+    let snapshot = SessionViewSnapshot::empty();
+    let containers = home(&snapshot, &[], "secret-token");
+    let mut targets = BTreeSet::new();
+    for container in &containers {
+        responsive_targets(container, &mut targets);
+    }
+
+    assert_eq!(
+        targets,
+        BTreeSet::from(["narrow".to_owned(), "tablet".to_owned()])
+    );
+    let main = container_by_id(&containers, "conversation-main").expect("conversation main");
+    assert_eq!(
+        main.max_width,
+        Some(hyperchad_transformer::Number::Integer(960))
+    );
+    let runtime = container_by_id(&containers, "runtime-summary").expect("runtime summary");
+    assert_eq!(
+        runtime.direction,
+        hyperchad_transformer_models::LayoutDirection::Row
+    );
+    assert!(runtime.overrides.iter().any(|config| {
+        matches!(
+            config.condition,
+            hyperchad_transformer::OverrideCondition::ResponsiveTarget { ref name }
+                if name == "narrow"
+        ) && config.overrides.iter().any(|item| {
+            matches!(
+                item,
+                hyperchad_transformer::OverrideItem::Direction(
+                    hyperchad_transformer_models::LayoutDirection::Column
+                )
+            )
+        })
+    }));
+}
+
 #[test]
 fn session_navigation_marks_selected_active_and_idle_sessions() {
     let selected = bcode_session_models::SessionSummary {
@@ -540,6 +1084,8 @@ fn composer_presents_ready_disabled_and_message_placement_states() {
     let mut ready = SessionViewSnapshot::empty();
     ready.composer.can_submit = true;
     ready.composer.draft = "Preserved draft".to_owned();
+    ready.session_id = Some(bcode_session_models::SessionId::new());
+    let session_id = ready.session_id.expect("composer session");
     let mut disabled = ready.clone();
     disabled.composer.can_submit = false;
     disabled.composer.disabled_reason = Some("Wait for the active operation".to_owned());
@@ -551,6 +1097,13 @@ fn composer_presents_ready_disabled_and_message_placement_states() {
     assert!(ready.contains("Steer the active turn"));
     assert!(ready.contains("Queue as a follow-up"));
     assert!(ready.contains("Send message"));
+    assert!(ready.contains("/actions/submit-message?token=secret-token"));
+    assert!(ready.contains(&format!(
+        "/actions/update-draft/{session_id}?token=secret-token"
+    )));
+    assert!(ready.contains("/actions/cancel-turn?token=secret-token"));
+    assert!(ready.contains("clear_queue"));
+    assert!(ready.contains("placement"));
     assert!(disabled.contains("Wait for the active operation"));
     assert!(disabled.contains("Sending unavailable"));
     assert!(disabled.contains("disabled"));
@@ -1229,6 +1782,328 @@ fn every_registered_visual_adapter_has_a_fixture() {
     }
 }
 
+fn complete_session_tool_item(schema: &str, tool_name: &str) -> TranscriptViewItem {
+    let metadata = artifact_adapter_fixture_metadata(schema);
+    transcript_fixture_item(
+        &format!("complete-tool-{schema}"),
+        false,
+        TranscriptViewItemKind::ToolInvocation {
+            tool: Box::new(ToolInvocationView {
+                tool_call_id: format!("complete-call-{schema}"),
+                producer_plugin_id: Some("fixture.plugin".to_owned()),
+                tool_name: Some(tool_name.to_owned()),
+                arguments_json: Some("{}".to_owned()),
+                working_directory: Some("/tmp/complete-session".into()),
+                request_visual: None,
+                status: ToolInvocationViewStatus::Finished,
+                result_text: None,
+                is_error: Some(false),
+                result: Some(ToolResultView::Artifact {
+                    artifact: ToolArtifactView::from(ToolArtifact {
+                        artifact_id: format!("complete-artifact-{schema}"),
+                        producer_plugin_id: "fixture.plugin".to_owned(),
+                        schema: schema.to_owned(),
+                        schema_version: 1,
+                        tool_call_id: Some(format!("complete-call-{schema}")),
+                        title: Some(format!("Complete {tool_name}")),
+                        metadata,
+                        refs: Vec::new(),
+                    }),
+                }),
+                output: None,
+                timing: ToolTimingView {
+                    started_at_ms: Some(1),
+                    finished_at_ms: Some(2),
+                    duration_ms: Some(1),
+                    timed_out: Some(false),
+                    timeout_ms: None,
+                },
+            }),
+        },
+    )
+}
+
+fn add_complete_session_active_state(
+    snapshot: &mut SessionViewSnapshot,
+    session_id: bcode_session_models::SessionId,
+) {
+    snapshot.runtime_work.push(RuntimeWorkView {
+        work_id: WorkId::new("complete-runtime-work"),
+        kind: bcode_session_models::RuntimeWorkKind::Tool,
+        label: "complete runtime work".to_owned(),
+        status: RuntimeWorkStatus::Running,
+        cancellable: true,
+        message: Some("runtime work in progress".to_owned()),
+        completed_units: Some(1),
+        total_units: Some(2),
+        updated_at_ms: Some(11),
+    });
+    snapshot.permissions.push(PermissionView {
+        permission_id: "complete-permission".to_owned(),
+        session_id: Some(session_id),
+        tool_call_id: "complete-permission-call".to_owned(),
+        tool_name: "shell.run".to_owned(),
+        arguments_json: "{\"command\":\"echo complete\"}".to_owned(),
+        batch: None,
+        agent_id: "build".to_owned(),
+        title: Some("Complete permission request".to_owned()),
+        policy_source: Some("fixture policy".to_owned()),
+        detail: Some("Approve complete fixture command".to_owned()),
+        resolved: false,
+        approved: None,
+        can_remember: true,
+    });
+    snapshot.interactions.push(InteractionViewSummary {
+        interaction_id: "complete-question".to_owned(),
+        kind: "bcode.question".to_owned(),
+        surface_kind: "bcode.question.inline".to_owned(),
+        tool_call_id: Some("complete-question-call".to_owned()),
+        title: Some("Complete question".to_owned()),
+        required: true,
+        snapshot: Some(serde_json::json!({
+            "request": {"questions": [{
+                "header": "Complete choice", "question": "Continue complete fixture?",
+                "options": [{"label": "Yes", "value": "yes", "description": "Continue"}],
+                "control": "radio", "selection_mode": "single", "custom": false,
+                "custom_mode": "exclusive", "required": true
+            }]},
+            "answers": []
+        })),
+        resolved: false,
+        resolution: None,
+    });
+}
+
+fn representative_complete_session_snapshot() -> SessionViewSnapshot {
+    let session_id = bcode_session_models::SessionId::new();
+    let mut snapshot = SessionViewSnapshot::empty();
+    snapshot.session_id = Some(session_id);
+    snapshot.title = Some("Representative complete session".to_owned());
+    snapshot.working_directory = Some("/tmp/complete-session".into());
+    snapshot.composer.can_submit = true;
+    snapshot.composer.draft = "preserved complete-session draft".to_owned();
+    snapshot.transcript.revision = 11;
+    snapshot.transcript.source_start_sequence = Some(1);
+    snapshot.transcript.source_end_sequence = Some(11);
+    snapshot.transcript.items.extend([
+        transcript_fixture_item(
+            "complete-markdown",
+            false,
+            TranscriptViewItemKind::AssistantMessage {
+                message: ChatMessageView::markdown(
+                    "# Complete Markdown\n\n```rust\nfn complete_fixture() {}\n```",
+                ),
+            },
+        ),
+        transcript_fixture_item(
+            "complete-reasoning",
+            true,
+            TranscriptViewItemKind::ReasoningMessage {
+                message: ChatMessageView::markdown("complete reasoning stream"),
+            },
+        ),
+    ]);
+    for (schema, tool_name) in [
+        ("bcode.shell.run", "shell.run"),
+        ("bcode.filesystem.read", "filesystem.read"),
+        ("bcode.filesystem.change", "filesystem.edit"),
+        ("bcode.filesystem.image", "filesystem.read_image"),
+        ("bcode.web-search.search_results", "web.search"),
+        ("bcode.web-search.fetch_result", "web.fetch"),
+        ("bcode.document.extract_result", "document.extract"),
+        ("bcode.ocr.extract_result", "ocr.extract"),
+    ] {
+        snapshot
+            .transcript
+            .items
+            .push(complete_session_tool_item(schema, tool_name));
+    }
+    snapshot.transcript.items.push(transcript_fixture_item(
+        "complete-unknown",
+        false,
+        TranscriptViewItemKind::PluginVisual {
+            visual: PluginVisualView::from(PluginVisualDescriptor {
+                visual_id: Some("complete-unknown".to_owned()),
+                producer_plugin_id: Some("future.plugin".to_owned()),
+                schema: "future.unknown.schema".to_owned(),
+                schema_version: 99,
+                title: Some("Future unknown visual".to_owned()),
+                subtitle: None,
+                payload: serde_json::json!({"sentinel": "unknown schema fallback"}),
+            }),
+        },
+    ));
+    add_complete_session_active_state(&mut snapshot, session_id);
+    snapshot
+}
+
+#[test]
+fn internal_metadata_and_raw_payloads_stay_inside_developer_disclosures() {
+    let mut snapshot = SessionViewSnapshot::empty();
+    snapshot.session_id = Some(bcode_session_models::SessionId::new());
+    snapshot.revision = 9_876_543;
+    snapshot.latest_sequence = Some(8_765_432);
+    snapshot.active_invocations.insert(
+        "internal-invocation-sentinel".to_owned(),
+        bcode_session_models::ToolInvocationLifecycleEvent {
+            invocation_id: "internal-invocation-sentinel".to_owned(),
+            sequence: 1,
+            stage: bcode_session_models::ToolInvocationLifecycleStage::Progress,
+            message: Some("Friendly active tool".to_owned()),
+            metadata: serde_json::Value::Null,
+        },
+    );
+    snapshot.runtime_work.push(RuntimeWorkView {
+        work_id: WorkId::new("internal-work-sentinel"),
+        kind: bcode_session_models::RuntimeWorkKind::Tool,
+        label: "Friendly runtime work".to_owned(),
+        status: RuntimeWorkStatus::Running,
+        cancellable: false,
+        message: None,
+        completed_units: None,
+        total_units: None,
+        updated_at_ms: None,
+    });
+    snapshot.transcript.items.push(transcript_fixture_item(
+        "internal-item-sentinel",
+        false,
+        TranscriptViewItemKind::PluginVisual {
+            visual: PluginVisualView::from(PluginVisualDescriptor {
+                visual_id: Some("internal-visual".to_owned()),
+                producer_plugin_id: Some("future.plugin".to_owned()),
+                schema: "internal.schema.sentinel".to_owned(),
+                schema_version: 42,
+                title: Some("Unsupported future visual".to_owned()),
+                subtitle: None,
+                payload: serde_json::json!({"raw_payload_sentinel": true}),
+            }),
+        },
+    ));
+
+    let containers = home(&snapshot, &[], "token");
+    let full_text = container_text_all(&containers);
+    let mut primary_text = String::new();
+    for container in &containers {
+        container_text_outside_details(container, false, &mut primary_text);
+    }
+    for sentinel in [
+        "9876543",
+        "8765432",
+        "internal-invocation-sentinel",
+        "internal-work-sentinel",
+        "internal-item-sentinel",
+        "internal.schema.sentinel",
+        "raw_payload_sentinel",
+    ] {
+        assert!(full_text.contains(sentinel));
+        assert!(!primary_text.contains(sentinel));
+    }
+    assert!(primary_text.contains("Friendly active tool"));
+    assert!(primary_text.contains("Friendly runtime work"));
+}
+
+#[test]
+fn local_artifact_paths_and_storage_uris_never_become_unguarded_resources() {
+    let artifact = ToolArtifactView::from(ToolArtifact {
+        artifact_id: "local-resource-fixture".to_owned(),
+        producer_plugin_id: "bcode.filesystem".to_owned(),
+        schema: "bcode.filesystem.image".to_owned(),
+        schema_version: 1,
+        tool_call_id: Some("local-resource-call".to_owned()),
+        title: Some("Local image".to_owned()),
+        metadata: serde_json::json!({
+            "path": "/tmp/private-image.png",
+            "mime_type": "image/png",
+            "width": 640,
+            "height": 480,
+            "byte_len": 1024
+        }),
+        refs: vec![bcode_session_models::ToolArtifactRef {
+            key: "private-image".to_owned(),
+            content_type: Some("image/png".to_owned()),
+            storage_uri: Some("file:///tmp/private-image.png".to_owned()),
+            byte_len: Some(1024),
+            metadata: None,
+        }],
+    });
+    let containers = render_tool_result(&ToolResultView::Artifact { artifact });
+    let text = container_text_all(&containers);
+    let mut urls = Vec::new();
+    for container in &containers {
+        collect_resource_urls(container, &mut urls);
+    }
+
+    assert!(text.contains("/tmp/private-image.png"));
+    assert!(!text.contains("file:///tmp/private-image.png"));
+    assert!(urls.is_empty());
+}
+
+#[test]
+fn representative_complete_session_survives_reconnect_and_renders_every_domain() {
+    let snapshot = representative_complete_session_snapshot();
+    let encoded = serde_json::to_vec(&snapshot).expect("serialize complete session");
+    let reconnected: SessionViewSnapshot =
+        serde_json::from_slice(&encoded).expect("deserialize complete session");
+    assert_eq!(reconnected, snapshot);
+
+    let containers = home(&reconnected, &[], "complete-token");
+    let text = container_text_all(&containers);
+    let rendered = format!("{containers:?}");
+    for expected in [
+        "Complete Markdown",
+        "complete_fixture",
+        "complete reasoning stream",
+        "fixture shell output",
+        "/tmp/fixture.rs",
+        "fixture change",
+        "/tmp/fixture.png",
+        "fixture result",
+        "fixture body",
+        "fixture document text",
+        "fixture OCR text",
+        "Complete permission request",
+        "Continue complete fixture?",
+        "complete runtime work",
+        "unknown schema fallback",
+        "preserved complete-session draft",
+    ] {
+        assert!(
+            text.contains(expected) || rendered.contains(expected),
+            "missing complete-session semantic: {expected}"
+        );
+    }
+    assert!(rendered.contains(&semantic_dom_id("transcript-item", "complete-markdown")));
+    assert!(rendered.contains("live"));
+    assert!(rendered.contains("future.unknown.schema"));
+}
+
+#[test]
+fn hyperchad_registry_exactly_covers_manifest_owned_visual_schemas() {
+    let inventory =
+        include_str!("../../../../../../scripts/plugin-presentation-manifest-inventory.tsv");
+    let expected = inventory
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .flat_map(|line| {
+            let mut fields = line.split('\t');
+            let _plugin_id = fields.next().expect("inventory plugin id");
+            let schemas = fields.next().expect("inventory schemas");
+            schemas
+                .split(',')
+                .filter(|schema| *schema != "-")
+                .collect::<Vec<_>>()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let actual = VISUAL_ADAPTERS
+        .keys()
+        .chain(ARTIFACT_ADAPTERS.keys())
+        .map(|(schema, _)| *schema)
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(actual, expected);
+    assert_eq!(actual.len(), 39);
+}
+
 #[test]
 fn every_registered_artifact_adapter_has_a_fixture() {
     for ((schema, schema_version), adapter) in ARTIFACT_ADAPTERS.iter() {
@@ -1732,6 +2607,157 @@ fn active_invocations_only_include_operations_missing_from_transcript() {
 }
 
 #[test]
+fn runtime_work_only_includes_operations_missing_from_transcript() {
+    let work = |id: &str| RuntimeWorkView {
+        work_id: WorkId::new(id),
+        kind: bcode_session_models::RuntimeWorkKind::Tool,
+        label: format!("work {id}"),
+        status: RuntimeWorkStatus::Running,
+        cancellable: false,
+        message: None,
+        completed_units: None,
+        total_units: None,
+        updated_at_ms: Some(1),
+    };
+    let mut snapshot = SessionViewSnapshot::empty();
+    snapshot.runtime_work = vec![work("represented"), work("orphan")];
+    snapshot.transcript.items.push(transcript_fixture_item(
+        "runtime:represented",
+        true,
+        TranscriptViewItemKind::RuntimeWork {
+            work: work("represented"),
+        },
+    ));
+
+    let active = unrepresented_runtime_work(&snapshot);
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].work_id, WorkId::new("orphan"));
+}
+
+#[test]
+fn active_interaction_controls_replace_only_matching_pending_timeline_summary() {
+    let interaction = |id: &str, resolved: bool| InteractionViewSummary {
+        interaction_id: id.to_owned(),
+        kind: "fixture.interaction".to_owned(),
+        surface_kind: "fixture.surface".to_owned(),
+        tool_call_id: Some(format!("call-{id}")),
+        title: Some(format!("Interaction {id}")),
+        required: true,
+        snapshot: Some(serde_json::json!({"state": "pending"})),
+        resolved,
+        resolution: resolved.then(|| serde_json::json!({"status": "answered"})),
+    };
+    let active = interaction("matching", false);
+    let matching = transcript_fixture_item(
+        "interaction:matching",
+        false,
+        TranscriptViewItemKind::Interaction {
+            interaction: active.clone(),
+        },
+    );
+    let unmatched = transcript_fixture_item(
+        "interaction:unmatched",
+        false,
+        TranscriptViewItemKind::Interaction {
+            interaction: interaction("unmatched", false),
+        },
+    );
+    let resolved = transcript_fixture_item(
+        "interaction:resolved",
+        false,
+        TranscriptViewItemKind::Interaction {
+            interaction: interaction("matching", true),
+        },
+    );
+
+    assert!(is_active_interaction_summary(&matching, &[active]));
+    assert!(!is_active_interaction_summary(&unmatched, &[]));
+    assert!(!is_active_interaction_summary(&resolved, &[]));
+}
+
+#[test]
+fn session_shell_renders_correlated_tool_runtime_and_interaction_semantics_once() {
+    let mut snapshot = SessionViewSnapshot::empty();
+    snapshot.session_id = Some(bcode_session_models::SessionId::new());
+    let runtime = RuntimeWorkView {
+        work_id: WorkId::new("correlated-work"),
+        kind: bcode_session_models::RuntimeWorkKind::Tool,
+        label: "unique runtime label".to_owned(),
+        status: RuntimeWorkStatus::Running,
+        cancellable: false,
+        message: None,
+        completed_units: None,
+        total_units: None,
+        updated_at_ms: Some(1),
+    };
+    let interaction = InteractionViewSummary {
+        interaction_id: "correlated-interaction".to_owned(),
+        kind: "fixture.interaction".to_owned(),
+        surface_kind: "fixture.surface".to_owned(),
+        tool_call_id: Some("call-interaction".to_owned()),
+        title: Some("Unique interaction label".to_owned()),
+        required: true,
+        snapshot: Some(serde_json::json!({"state": "pending"})),
+        resolved: false,
+        resolution: None,
+    };
+    let tool = ToolInvocationView {
+        tool_call_id: "correlated-tool".to_owned(),
+        producer_plugin_id: None,
+        tool_name: Some("unique.tool".to_owned()),
+        arguments_json: None,
+        working_directory: None,
+        request_visual: None,
+        status: ToolInvocationViewStatus::Running,
+        result_text: None,
+        is_error: None,
+        result: None,
+        output: None,
+        timing: ToolTimingView::default(),
+    };
+    snapshot.runtime_work.push(runtime.clone());
+    snapshot.interactions.push(interaction.clone());
+    snapshot.active_invocations.insert(
+        "correlated-tool".to_owned(),
+        bcode_session_models::ToolInvocationLifecycleEvent {
+            invocation_id: "correlated-tool".to_owned(),
+            sequence: 1,
+            stage: bcode_session_models::ToolInvocationLifecycleStage::Progress,
+            message: Some("unique tool active label".to_owned()),
+            metadata: serde_json::Value::Null,
+        },
+    );
+    snapshot.transcript.items.extend([
+        transcript_fixture_item(
+            "tool:correlated",
+            true,
+            TranscriptViewItemKind::ToolInvocation {
+                tool: Box::new(tool),
+            },
+        ),
+        transcript_fixture_item(
+            "runtime:correlated",
+            true,
+            TranscriptViewItemKind::RuntimeWork { work: runtime },
+        ),
+        transcript_fixture_item(
+            "interaction:correlated",
+            false,
+            TranscriptViewItemKind::Interaction { interaction },
+        ),
+    ]);
+
+    let rendered = format!("{:?}", home(&snapshot, &[], "token"));
+    let text = container_text_all(&home(&snapshot, &[], "token"));
+    assert!(!text.contains("active tool"));
+    assert_eq!(text.matches("runtime work").count(), 1);
+    assert!(text.contains("Unique interaction label"));
+    assert!(!text.contains("interaction matching"));
+    assert!(!text.contains("unique tool active label"));
+    assert!(!rendered.contains("correlated-work · Tool"));
+}
+
+#[test]
 fn empty_terminal_tool_result_remains_an_explicit_finished_card() {
     let containers = render_tool_lifecycle(&ToolInvocationView {
         tool_call_id: "call-empty".to_owned(),
@@ -1873,6 +2899,25 @@ fn tool_lifecycle_card_covers_request_running_success_failure_and_timeout() {
     assert!(cancelled.contains("cancelled by user"));
     assert!(failed.contains("failed"));
     assert!(timed_out.contains("timed out"));
+}
+
+#[test]
+fn direct_text_and_malformed_json_tool_results_are_bounded() {
+    let sentinel = "END-OF-OVERSIZED-RESULT";
+    let oversized = format!("{}{sentinel}", "x".repeat(40_000));
+    let text = render_tool_result(&ToolResultView::Text {
+        text: oversized.clone(),
+    });
+    let malformed = render_tool_result(&ToolResultView::Json {
+        value: format!("{{{oversized}"),
+    });
+    let text = container_text_all(&text);
+    let malformed = container_text_all(&malformed);
+
+    assert!(text.contains("Text result truncated for display."));
+    assert!(malformed.contains("Malformed JSON result truncated for display."));
+    assert!(!text.contains(sentinel));
+    assert!(!malformed.contains(sentinel));
 }
 
 #[test]
@@ -2325,6 +3370,104 @@ fn web_search_result_adapter_renders_results_without_redundant_fallback() {
     assert!(rendered.contains("https://example.com/renderer"));
     assert!(!rendered.contains("semantic result"));
     assert!(!rendered.contains("artifact details"));
+}
+
+#[test]
+fn remaining_request_families_render_semantic_fields_with_generic_fallback() {
+    let visual = |schema: &str, payload| {
+        PluginVisualView::from(PluginVisualDescriptor {
+            visual_id: Some(format!("fixture-{schema}")),
+            producer_plugin_id: Some("fixture.plugin".to_owned()),
+            schema: schema.to_owned(),
+            schema_version: 1,
+            title: None,
+            subtitle: None,
+            payload,
+        })
+    };
+    let filesystem = visual(
+        "bcode.filesystem.grep",
+        serde_json::json!({
+            "operation": "filesystem.grep", "path": "/tmp/source",
+            "pattern": "needle", "glob": "*.rs", "ignore_case": true,
+            "max_matches": 25, "timeout_ms": 1000
+        }),
+    );
+    let extraction = visual(
+        "bcode.ocr.request",
+        serde_json::json!({
+            "operation": "ocr.extract", "path": "/tmp/image.png",
+            "engine": "tesseract", "language": "eng", "max_bytes": 2048,
+            "timeout_ms": 5000
+        }),
+    );
+    let status = visual(
+        "bcode.web-search.status_request",
+        serde_json::json!({"operation": "web.status"}),
+    );
+    let inspect = visual(
+        "bcode.web-search.inspect_request",
+        serde_json::json!({
+            "operation": "web.inspect", "url": "https://example.com/path"
+        }),
+    );
+    let malformed = visual(
+        "bcode.filesystem.read",
+        serde_json::json!({"operation": "filesystem.read", "sentinel": "fallback"}),
+    );
+    let text = |visual: &PluginVisualView| {
+        container_text_all(&render_plugin_visual("developer details", visual))
+    };
+
+    let filesystem = text(&filesystem);
+    for expected in [
+        "filesystem.grep",
+        "/tmp/source",
+        "needle",
+        "*.rs",
+        "ignore case: true",
+        "max matches: 25",
+        "timeout ms: 1000",
+    ] {
+        assert!(filesystem.contains(expected));
+    }
+    let extraction = text(&extraction);
+    for expected in [
+        "ocr.extract",
+        "/tmp/image.png",
+        "tesseract",
+        "eng",
+        "max bytes: 2048",
+        "timeout ms: 5000",
+    ] {
+        assert!(extraction.contains(expected));
+    }
+    assert!(text(&status).contains("Check available search and fetch providers."));
+    assert!(text(&inspect).contains("https://example.com/path"));
+    assert!(text(&malformed).contains("fallback"));
+}
+
+#[test]
+fn outbound_web_url_policy_only_links_clean_http_and_https_urls() {
+    for accepted in [
+        "https://example.com/path?q=1#fragment",
+        "http://localhost:8080/path",
+    ] {
+        assert_eq!(super::adapters::safe_web_url(accepted), Some(accepted));
+    }
+    for rejected in [
+        "javascript:alert(1)",
+        "data:text/html,unsafe",
+        "file:///tmp/private",
+        "HTTPS://example.com",
+        " https://example.com",
+        "https://",
+        "https://example.com/unsafe path",
+        "https://example.com\\@attacker.example",
+        "https://example.com\nattacker.example",
+    ] {
+        assert_eq!(super::adapters::safe_web_url(rejected), None);
+    }
 }
 
 #[test]

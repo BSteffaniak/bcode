@@ -26,8 +26,8 @@ use bcode_session_models::{
 };
 use bcode_session_view::{SessionView, execute_session_view_action};
 use bcode_session_view_models::{
-    ComposerDraftViewScope, InteractionViewSummary, PromptPlacementView, SessionViewAction,
-    SessionViewSnapshot,
+    ComposerDraftViewScope, InteractionViewSummary, MessageAcceptanceDispositionView,
+    PromptPlacementView, SessionViewAction, SessionViewSnapshot,
 };
 use hyperchad::router::{RoutePath, RouteRequest, Router};
 use serde::Deserialize;
@@ -143,6 +143,55 @@ struct InteractionForm {
     #[serde(default)]
     value_is_json: bool,
     direction: Option<String>,
+}
+
+fn permission_action(form: PermissionForm) -> Result<(SessionId, SessionViewAction), &'static str> {
+    let Some(session_id) = parse_session_id(&form.session_id) else {
+        return Err("invalid session id");
+    };
+    Ok((
+        session_id,
+        SessionViewAction::ResolvePermission {
+            permission_id: form.permission_id,
+            approved: form.approved,
+            remember: form.remember,
+        },
+    ))
+}
+
+fn permission_batch_action(
+    form: PermissionBatchForm,
+) -> Result<(SessionId, SessionViewAction), &'static str> {
+    let Some(session_id) = parse_session_id(&form.session_id) else {
+        return Err("invalid session id");
+    };
+    Ok((
+        session_id,
+        SessionViewAction::ResolvePermissionBatch {
+            batch_id: form.batch_id,
+            approved: form.approved,
+        },
+    ))
+}
+
+fn message_acceptance_status(
+    disposition: MessageAcceptanceDispositionView,
+    queue_position: Option<usize>,
+) -> String {
+    match disposition {
+        MessageAcceptanceDispositionView::AppliedSteering => {
+            "message applied to the active turn".to_owned()
+        }
+        MessageAcceptanceDispositionView::QueuedFollowUp => queue_position.map_or_else(
+            || "message queued as a follow-up".to_owned(),
+            |position| format!("message queued as follow-up {position}"),
+        ),
+        MessageAcceptanceDispositionView::QueuedTurn => queue_position.map_or_else(
+            || "message queued for a future turn".to_owned(),
+            |position| format!("message queued for future turn {position}"),
+        ),
+        MessageAcceptanceDispositionView::StartedTurn => "message started a new turn".to_owned(),
+    }
 }
 
 impl HyperChadAppState {
@@ -675,9 +724,12 @@ impl HyperChadAppState {
         match execute_session_view_action(&self.client, action).await {
             Ok(bcode_session_view_models::SessionViewActionOutcome::MessageAccepted {
                 session_id,
+                queue_position,
+                disposition,
                 ..
             }) => {
-                self.render_session_or_initial(Some(session_id), "message accepted")
+                let status = message_acceptance_status(disposition, queue_position);
+                self.render_session_or_initial(Some(session_id), &status)
                     .await
             }
             Ok(_) => {
@@ -757,13 +809,9 @@ impl HyperChadAppState {
             Ok(form) => form,
             Err(error) => return error_page(&error.to_string()),
         };
-        let Some(session_id) = parse_session_id(&form.session_id) else {
-            return error_page("invalid session id");
-        };
-        let action = SessionViewAction::ResolvePermission {
-            permission_id: form.permission_id,
-            approved: form.approved,
-            remember: form.remember,
+        let (session_id, action) = match permission_action(form) {
+            Ok(value) => value,
+            Err(message) => return error_page(message),
         };
         match execute_session_view_action(&self.client, action).await {
             Ok(_) => {
@@ -788,20 +836,23 @@ impl HyperChadAppState {
             Ok(form) => form,
             Err(error) => return error_page(&error.to_string()),
         };
-        let Some(session_id) = parse_session_id(&form.session_id) else {
-            return error_page("invalid session id");
+        let (session_id, action) = match permission_batch_action(form) {
+            Ok(value) => value,
+            Err(message) => return error_page(message),
         };
-        match self
-            .client
-            .resolve_permission_batch(form.batch_id, form.approved)
-            .await
-        {
-            Ok(resolved) => {
+        match execute_session_view_action(&self.client, action).await {
+            Ok(bcode_session_view_models::SessionViewActionOutcome::PermissionBatchResolved {
+                resolved_count,
+            }) => {
                 self.render_session_or_initial(
                     Some(session_id),
-                    &format!("resolved {resolved} batched permissions"),
+                    &format!("resolved {resolved_count} batched permissions"),
                 )
                 .await
+            }
+            Ok(_) => {
+                self.render_session_or_initial(Some(session_id), "permission batch resolved")
+                    .await
             }
             Err(error) => {
                 self.render_session_or_initial(Some(session_id), &error.to_string())
@@ -1664,6 +1715,118 @@ mod tests {
         let snapshot = snapshot_from_attached_history(&attached);
 
         assert_eq!(snapshot.runtime.agent_id.as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn permission_forms_preserve_individual_remember_and_batch_semantics() {
+        let session_id = SessionId::new();
+        for (approved, remember) in [(true, false), (false, false), (true, true), (false, true)] {
+            assert_eq!(
+                permission_action(PermissionForm {
+                    session_id: session_id.to_string(),
+                    permission_id: "permission-1".to_owned(),
+                    approved,
+                    remember,
+                }),
+                Ok((
+                    session_id,
+                    SessionViewAction::ResolvePermission {
+                        permission_id: "permission-1".to_owned(),
+                        approved,
+                        remember,
+                    },
+                ))
+            );
+        }
+        for approved in [true, false] {
+            assert_eq!(
+                permission_batch_action(PermissionBatchForm {
+                    session_id: session_id.to_string(),
+                    batch_id: "batch-1".to_owned(),
+                    approved,
+                }),
+                Ok((
+                    session_id,
+                    SessionViewAction::ResolvePermissionBatch {
+                        batch_id: "batch-1".to_owned(),
+                        approved,
+                    },
+                ))
+            );
+        }
+    }
+
+    #[test]
+    fn message_acceptance_status_preserves_every_authoritative_disposition() {
+        assert_eq!(
+            message_acceptance_status(MessageAcceptanceDispositionView::AppliedSteering, None),
+            "message applied to the active turn"
+        );
+        assert_eq!(
+            message_acceptance_status(MessageAcceptanceDispositionView::QueuedFollowUp, Some(2)),
+            "message queued as follow-up 2"
+        );
+        assert_eq!(
+            message_acceptance_status(MessageAcceptanceDispositionView::QueuedFollowUp, None),
+            "message queued as a follow-up"
+        );
+        assert_eq!(
+            message_acceptance_status(MessageAcceptanceDispositionView::QueuedTurn, Some(3)),
+            "message queued for future turn 3"
+        );
+        assert_eq!(
+            message_acceptance_status(MessageAcceptanceDispositionView::QueuedTurn, None),
+            "message queued for a future turn"
+        );
+        assert_eq!(
+            message_acceptance_status(MessageAcceptanceDispositionView::StartedTurn, None),
+            "message started a new turn"
+        );
+    }
+
+    #[test]
+    fn watched_events_preserve_full_snapshot_resync_fallback() {
+        let session_id = SessionId::new();
+        let event = |sequence, text: &str| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::UserMessage {
+                client_id: bcode_session_models::ClientId::new(),
+                text: text.to_owned(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        };
+        let mut view = SessionView::new();
+        assert!(!apply_watched_event(
+            &mut view,
+            session_id,
+            SessionWatchEvent::Durable(Box::new(event(1, "first"))),
+        ));
+        let applied = view.snapshot().clone();
+        assert_eq!(applied.latest_sequence, Some(1));
+
+        for stale in [event(1, "duplicate"), event(0, "stale")] {
+            assert!(!apply_watched_event(
+                &mut view,
+                session_id,
+                SessionWatchEvent::Durable(Box::new(stale)),
+            ));
+            assert_eq!(view.snapshot(), &applied);
+        }
+        assert!(apply_watched_event(
+            &mut view,
+            session_id,
+            SessionWatchEvent::Durable(Box::new(event(3, "gap"))),
+        ));
+        assert_eq!(view.snapshot(), &applied);
+        assert!(apply_watched_event(
+            &mut view,
+            session_id,
+            SessionWatchEvent::ResyncRequired,
+        ));
     }
 
     #[test]

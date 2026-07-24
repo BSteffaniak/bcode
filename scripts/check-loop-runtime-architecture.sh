@@ -691,7 +691,8 @@ fi
 if ! grep -F 'batched_actions_keep_single_call_and_apply_to_all_distinct' packages/tui/src/permission_dialog.rs >/dev/null ||
    ! grep -F 'batched_remember_actions_never_apply_to_all' packages/tui/src/permission_dialog.rs >/dev/null ||
    ! grep -F 'grouped_permission_renders_per_call_and_apply_to_all_actions' packages/hyperchad/ui/src/pages/home/tests.rs >/dev/null ||
-   ! grep -F 'resolve_permission_batch(form.batch_id, form.approved)' packages/hyperchad/src/lib.rs >/dev/null; then
+   ! grep -F 'SessionViewAction::ResolvePermissionBatch' packages/hyperchad/src/lib.rs >/dev/null ||
+   ! grep -F 'execute_session_view_action(&self.client, action)' packages/hyperchad/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: grouped permission adapter behavior was removed." >&2
   violations=1
 fi

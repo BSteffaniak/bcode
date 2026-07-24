@@ -13,7 +13,7 @@ pub(super) fn composer(snapshot: &SessionViewSnapshot, access_token: &str) -> Co
         }
     });
     container! {
-        div {
+        div #composer-region {
             form hx-post=(action) hx-target="#bcode-web-shell" hx-swap=this background="#0d1117" border="1, #30363d" border-radius=8 padding=12 {
                 @if let Some(session_id) = snapshot.session_id {
                     input type=hidden name="session_id" value=(session_id.to_string());

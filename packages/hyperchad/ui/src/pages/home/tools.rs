@@ -122,12 +122,20 @@ pub(super) fn render_tool_lifecycle(tool: &ToolInvocationView) -> Containers {
 
 pub(super) fn render_tool_result(result: &ToolResultView) -> Containers {
     match result {
-        ToolResultView::Text { text } => container! {
-            div white-space="preserve-wrap" background="#010409" border="1, #30363d" border-radius=6 padding=10 color="#c9d1d9" { (text) }
-        },
+        ToolResultView::Text { text } => {
+            let (text, truncated) = bounded_preview(text, MAX_INLINE_OUTPUT_CHARS);
+            container! {
+                div white-space="preserve-wrap" background="#010409" border="1, #30363d" border-radius=6 padding=10 color="#c9d1d9" { (text) }
+                @if truncated { div color="#f2cc60" font-size=11 margin-top=6 { "Text result truncated for display." } }
+            }
+        }
         ToolResultView::Json { value } => serde_json::from_str(value).map_or_else(
-            |_| container! {
-                div white-space="preserve-wrap" background="#010409" border="1, #30363d" border-radius=6 padding=10 color="#c9d1d9" { (value) }
+            |_| {
+                let (value, truncated) = bounded_preview(value, MAX_INLINE_OUTPUT_CHARS);
+                container! {
+                    div white-space="preserve-wrap" background="#010409" border="1, #30363d" border-radius=6 padding=10 color="#c9d1d9" { (value) }
+                    @if truncated { div color="#f2cc60" font-size=11 margin-top=6 { "Malformed JSON result truncated for display." } }
+                }
             },
             |value| json_panel("result details", &value),
         ),

@@ -9,6 +9,7 @@ use hyperchad::template::{Containers, container};
 
 use super::adapters::{VISUAL_ADAPTERS, json_panel, render_plugin_visual};
 use super::permissions::permission_history;
+use super::semantic_dom_id;
 use super::tools::render_tool_lifecycle;
 use super::usage::usage_transcript_item;
 
@@ -42,7 +43,7 @@ pub(super) fn is_superseded_tool_request(
 
 pub(super) fn transcript_section(snapshot: &SessionViewSnapshot, access_token: &str) -> Containers {
     container! {
-        section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
+        section #conversation-timeline background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
             h2 color="#f0f6fc" font-size=16 margin-bottom=14 { "transcript" }
             @if snapshot.transcript.has_older_history {
                 @if let (Some(session_id), Some(anchor_sequence)) = (snapshot.session_id, snapshot.transcript.source_start_sequence) {
@@ -58,7 +59,9 @@ pub(super) fn transcript_section(snapshot: &SessionViewSnapshot, access_token: &
                 div color="#8b949e" font-size=13 { "Attach or create a session to begin." }
             } @else {
                 @for (index, item) in snapshot.transcript.items.iter().enumerate() {
-                    @if should_render_transcript_item(item, snapshot.thinking.visible) && !is_superseded_tool_request(&snapshot.transcript.items, index) {
+                    @if should_render_transcript_item(item, snapshot.thinking.visible)
+                        && !is_superseded_tool_request(&snapshot.transcript.items, index)
+                        && !is_active_interaction_summary(item, &snapshot.interactions) {
                         (transcript_item(item))
                     }
                 }
@@ -84,6 +87,19 @@ pub(super) const fn should_render_transcript_item(
     reasoning_visible || !matches!(&item.kind, TranscriptViewItemKind::ReasoningMessage { .. })
 }
 
+pub(super) fn is_active_interaction_summary(
+    item: &bcode_session_view_models::TranscriptViewItem,
+    active_interactions: &[bcode_session_view_models::InteractionViewSummary],
+) -> bool {
+    let TranscriptViewItemKind::Interaction { interaction } = &item.kind else {
+        return false;
+    };
+    !interaction.resolved
+        && active_interactions
+            .iter()
+            .any(|active| active.interaction_id == interaction.interaction_id)
+}
+
 pub(super) fn transcript_item(item: &bcode_session_view_models::TranscriptViewItem) -> Containers {
     let (background, accent, margin_left, margin_right) = match &item.kind {
         TranscriptViewItemKind::UserMessage { .. } => ("#0c2d48", "#58a6ff", 48, 0),
@@ -94,7 +110,7 @@ pub(super) fn transcript_item(item: &bcode_session_view_models::TranscriptViewIt
         | TranscriptViewItemKind::Skill { .. } => ("#161b22", "#8b949e", 24, 24),
         _ => ("#0d1117", "#30363d", 0, 0),
     };
-    let item_id = format!("transcript-item-{}", item.id.get());
+    let item_id = semantic_dom_id("transcript-item", item.id.get());
     container! {
         div id=(item_id) background=(background) border-left="2, #30363d" border-radius=8 padding=12 margin-left=(margin_left) margin-right=(margin_right) margin-bottom=10 {
             div justify-content=space-between margin-bottom=8 color=(accent) font-size=11 {
@@ -159,8 +175,39 @@ pub(super) fn message_content(message: &ChatMessageView) -> Containers {
 fn compaction_notice(compaction: &bcode_session_view_models::CompactionView) -> Containers {
     container! {
         aside color="#8b949e" {
-            div font-size=11 margin-bottom=4 { "Context compacted" }
+            div font-size=11 margin-bottom=4 {
+                (match compaction.status {
+                    bcode_session_view_models::CompactionViewStatus::Local => "Local context compacted",
+                    bcode_session_view_models::CompactionViewStatus::Provider => "Provider context compacted",
+                })
+            }
             div white-space="preserve-wrap" margin=0 { (compaction.text) }
+            @if let Some(provider) = &compaction.provider_plugin_id { div font-size=11 margin-top=4 { "provider: " (provider) } }
+            @if let Some(model) = &compaction.model_id { div font-size=11 margin-top=2 { "model: " (model) } }
+        }
+    }
+}
+
+fn interaction_notice(
+    interaction: &bcode_session_view_models::InteractionViewSummary,
+) -> Containers {
+    let status = if interaction.resolved {
+        "resolved"
+    } else {
+        "pending"
+    };
+    container! {
+        aside {
+            div justify-content=space-between gap=8 {
+                div color="#f0f6fc" { (interaction.title.as_deref().unwrap_or("Interactive request")) }
+                div color=(if interaction.resolved { "#8b949e" } else { "#f2cc60" }) font-size=11 { (status) }
+            }
+            div color="#8b949e" font-size=12 { (interaction.kind) @if interaction.required { " · required" } }
+            @if let Some(resolution) = &interaction.resolution {
+                (json_panel("resolution", resolution))
+            } @else if let Some(snapshot) = &interaction.snapshot {
+                (json_panel("snapshot", snapshot))
+            }
         }
     }
 }
@@ -199,15 +246,7 @@ pub(super) fn transcript_item_body(kind: &TranscriptViewItemKind) -> Containers 
                 div color="#8b949e" font-size=12 { (format!("{:?}", work.status)) }
             }
         },
-        TranscriptViewItemKind::Interaction { interaction } => container! {
-            div {
-                div color="#f0f6fc" { (interaction.title.as_deref().unwrap_or("Interactive request")) }
-                div color="#8b949e" font-size=12 { (interaction.kind) }
-                @if let Some(snapshot) = &interaction.snapshot {
-                    (json_panel("snapshot", snapshot))
-                }
-            }
-        },
+        TranscriptViewItemKind::Interaction { interaction } => interaction_notice(interaction),
         TranscriptViewItemKind::PluginVisual { visual } => {
             render_plugin_visual("plugin visual", visual)
         }

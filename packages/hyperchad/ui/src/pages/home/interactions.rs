@@ -5,6 +5,7 @@ use hyperchad::template::{Containers, container};
 use serde::Deserialize;
 
 use super::adapters::json_panel;
+use super::semantic_dom_id;
 
 #[derive(Debug, Deserialize)]
 struct QuestionSnapshot {
@@ -70,8 +71,9 @@ pub(super) fn interaction_request(
     session_id: Option<bcode_session_models::SessionId>,
     access_token: &str,
 ) -> Containers {
+    let item_id = semantic_dom_id("interaction", &interaction.interaction_id);
     container! {
-        div border="1, #58a6ff" border-radius=8 padding=10 margin-bottom=10 {
+        div id=(item_id) border="1, #58a6ff" border-radius=8 padding=10 margin-bottom=10 {
             div color="#58a6ff" margin-bottom=6 {
                 (interaction.title.as_deref().unwrap_or("Interactive request"))
             }

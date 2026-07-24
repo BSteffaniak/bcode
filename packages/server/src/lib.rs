@@ -28419,6 +28419,21 @@ library = "test"
             )
             .await
             .expect("session");
+        let other_session = sessions
+            .create_session(
+                Some("other guarded route".to_owned()),
+                workspace.path().join("other"),
+            )
+            .await
+            .expect("other session");
+        sessions
+            .set_session_composer_draft(session.id, "selected-session-draft".to_owned())
+            .await
+            .expect("selected session draft");
+        sessions
+            .set_session_composer_draft(other_session.id, "other-session-draft".to_owned())
+            .await
+            .expect("other session draft");
         for index in 0..70 {
             sessions
                 .append_user_message(session.id, ClientId::new(), format!("route prompt {index}"))
@@ -28449,7 +28464,7 @@ library = "test"
             }
         });
         let web_state = bcode_hyperchad::HyperChadAppState::new(
-            bcode_client::BcodeClient::new(endpoint),
+            bcode_client::BcodeClient::new(endpoint.clone()),
             "route-token",
         );
         let route_state = web_state.clone();
@@ -28488,7 +28503,69 @@ library = "test"
             .await
             .expect("session route")
             .expect("session content");
-        assert!(format!("{selected:?}").contains("route prompt 69"));
+        let selected = format!("{selected:?}");
+        assert!(selected.contains("route prompt 69"));
+        assert!(selected.contains("selected-session-draft"));
+        assert!(!selected.contains("other-session-draft"));
+
+        let other_selected = router
+            .navigate(hyperchad::router::RouteRequest::from_path(
+                &format!("/session/{}?token=route-token", other_session.id),
+                hyperchad::router::RequestInfo::default(),
+            ))
+            .await
+            .expect("other session route")
+            .expect("other session content");
+        let other_selected = format!("{other_selected:?}");
+        assert!(other_selected.contains("other-session-draft"));
+        assert!(!other_selected.contains("selected-session-draft"));
+
+        let reselected = router
+            .navigate(hyperchad::router::RouteRequest::from_path(
+                &format!("/session/{}?token=route-token", session.id),
+                hyperchad::router::RequestInfo::default(),
+            ))
+            .await
+            .expect("reselected session route")
+            .expect("reselected session content");
+        assert!(format!("{reselected:?}").contains("selected-session-draft"));
+
+        let mut invalid_submit = hyperchad::router::RouteRequest::from_path(
+            "/actions/submit-message?token=route-token",
+            hyperchad::router::RequestInfo::default(),
+        );
+        invalid_submit.headers.insert(
+            "content-type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        );
+        invalid_submit.body = Some(Arc::new(
+            format!("session_id={}&text=%20%20%20", session.id)
+                .into_bytes()
+                .into(),
+        ));
+        let invalid_submit = router
+            .navigate(invalid_submit)
+            .await
+            .expect("invalid submit route")
+            .expect("invalid submit content");
+        let invalid_submit = format!("{invalid_submit:?}");
+        assert!(invalid_submit.contains("prompt cannot be empty"));
+        assert!(invalid_submit.contains("selected-session-draft"));
+
+        let reconnected_router =
+            bcode_hyperchad::router_from_state(bcode_hyperchad::HyperChadAppState::new(
+                bcode_client::BcodeClient::new(endpoint.clone()),
+                "route-token",
+            ));
+        let reconnected = reconnected_router
+            .navigate(hyperchad::router::RouteRequest::from_path(
+                &format!("/session/{}?token=route-token", session.id),
+                hyperchad::router::RequestInfo::default(),
+            ))
+            .await
+            .expect("reconnected session route")
+            .expect("reconnected session content");
+        assert!(format!("{reconnected:?}").contains("selected-session-draft"));
 
         let tail = route_state
             .session_snapshot(session.id)
@@ -28499,6 +28576,31 @@ library = "test"
             .transcript
             .source_start_sequence
             .expect("tail source start");
+        state
+            .sessions
+            .set_session_composer_draft(session.id, "history-preserved-draft".to_owned())
+            .await
+            .expect("history draft");
+        let mut history_connection = bcode_client::BcodeClient::new(endpoint.clone())
+            .connect("history-route-anchor")
+            .await
+            .expect("history anchor connection");
+        let older_attachment = history_connection
+            .attach_session_projection_window_with_input_history(
+                session.id,
+                projection_ipc_window_request(
+                    bcode_session_models::ProjectionWindowAnchor::BeforeSequence(anchor_sequence),
+                    bcode_session_models::ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .expect("older history attachment");
+        let older_end_sequence = older_attachment
+            .projection_window
+            .expect("older window metadata")
+            .source_range
+            .expect("older window range")
+            .end_sequence;
         let mut history = hyperchad::router::RouteRequest::from_path(
             "/actions/history-window?token=route-token",
             hyperchad::router::RequestInfo::default(),
@@ -28520,7 +28622,37 @@ library = "test"
             .await
             .expect("history action route")
             .expect("history action content");
-        assert!(format!("{history:?}").contains("load newer history"));
+        let history = format!("{history:?}");
+        assert!(history.contains("load newer history"));
+        assert!(history.contains("history-preserved-draft"));
+        assert!(history.contains(&session.id.to_string()));
+
+        let mut newer = hyperchad::router::RouteRequest::from_path(
+            "/actions/history-window?token=route-token",
+            hyperchad::router::RequestInfo::default(),
+        );
+        newer.headers.insert(
+            "content-type".to_owned(),
+            "application/x-www-form-urlencoded".to_owned(),
+        );
+        newer.body = Some(Arc::new(
+            format!(
+                "session_id={}&direction=newer&anchor_sequence={older_end_sequence}",
+                session.id
+            )
+            .into_bytes()
+            .into(),
+        ));
+        let newer = router
+            .navigate(newer)
+            .await
+            .expect("newer history action route")
+            .expect("newer history action content");
+        let newer = format!("{newer:?}");
+        assert!(newer.contains("load older history"));
+        assert!(!newer.contains("load newer history"));
+        assert!(newer.contains("history-preserved-draft"));
+        assert!(newer.contains(&session.id.to_string()));
 
         let mut submit = hyperchad::router::RouteRequest::from_path(
             "/actions/submit-message?token=route-token",
@@ -28540,7 +28672,7 @@ library = "test"
             .await
             .expect("submit action route")
             .expect("submit action content");
-        assert!(format!("{submit:?}").contains("message accepted"));
+        assert!(format!("{submit:?}").contains("message started a new turn"));
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 let history = state
@@ -29512,7 +29644,7 @@ library = "test"
                 && pending.request.schema_version == 1
         }));
         let interaction_id = pending.summary.request.exchange_id.clone();
-        let incompatible = bcode_client::BcodeClient::new(endpoint);
+        let incompatible = bcode_client::BcodeClient::new(endpoint.clone());
         let error = incompatible
             .resolve_tool_exchange(
                 interaction_id.clone(),
@@ -29532,52 +29664,48 @@ library = "test"
                 .await
                 .contains_key(&interaction_id)
         );
-        let adapter = bcode_bundled_plugins::interaction_adapter(
-            "bcode.question",
-            "bcode.question.request",
-            1,
-            "tui",
-        )
-        .expect("question interaction adapter");
-        assert!(adapter.supports(
-            &pending.summary.request.schema,
-            pending.summary.request.schema_version
-        ));
-        let mut controller = bcode_bundled_plugins::interaction_registry("bcode.question")
-            .expect("question interaction registry")
-            .open(
-                &adapter.interaction_kind,
-                pending.summary.request.payload.clone(),
-            )
-            .expect("open local question adapter");
-        assert_eq!(
-            controller.snapshot_json()["answers"][0]["selected"],
-            serde_json::json!([])
+        let web_state = bcode_hyperchad::HyperChadAppState::new(
+            bcode_client::BcodeClient::new(endpoint.clone()),
+            "question-route-token",
         );
-        assert!(matches!(
-            controller.handle_input(bcode_tool::InteractionInput::Activate {
-                control_id: bcode_tool::InteractionControlId::new("question-0.option-0"),
-            }),
-            bcode_tool::InteractionOutput::Redraw
-        ));
-        assert_eq!(
-            controller.snapshot_json()["answers"][0]["selected"][0],
-            "yes"
-        );
-        let bcode_tool::InteractionOutput::Submitted { payload } =
-            controller.handle_input(bcode_tool::InteractionInput::Submit)
-        else {
-            panic!("question submit should produce an opaque response payload");
+        let router = bcode_hyperchad::router_from_state(web_state);
+        let route_input = |kind: &str, control_id: Option<&str>| {
+            let mut request = hyperchad::router::RouteRequest::from_path(
+                "/actions/interaction?token=question-route-token",
+                hyperchad::router::RequestInfo::default(),
+            );
+            request.headers.insert(
+                "content-type".to_owned(),
+                "application/x-www-form-urlencoded".to_owned(),
+            );
+            let mut body =
+                format!("session_id={session_id}&interaction_id={interaction_id}&kind={kind}");
+            if let Some(control_id) = control_id {
+                body.push_str("&control_id=");
+                body.push_str(control_id);
+            }
+            request.body = Some(Arc::new(body.into_bytes().into()));
+            request
         };
+        let _activate = router
+            .navigate(route_input("activate", Some("question-0.option-0")))
+            .await
+            .expect("question activate route")
+            .expect("question activate content");
         assert!(
-            client
-                .resolve_tool_exchange(
-                    interaction_id,
-                    bcode_session_models::ToolExchangeResolution::Responded { payload },
-                )
+            state
+                .pending_tool_exchanges
+                .lock()
                 .await
-                .expect("resolve question exchange")
+                .contains_key(&interaction_id),
+            "activate must update local controller state without resolving the exchange"
         );
+
+        let _submitted = router
+            .navigate(route_input("submit", None))
+            .await
+            .expect("question submit route")
+            .expect("question submit content");
 
         let response = tokio::time::timeout(Duration::from_secs(2), task)
             .await

@@ -92,5 +92,20 @@ pub async fn init(state: &HyperChadAppState) -> Result<AppBuilder, ClientError> 
 ///
 /// Returns an error if the application fails to build.
 pub fn build_app(builder: AppBuilder) -> Result<App<DefaultRenderer>, hyperchad::app::Error> {
-    Ok(builder.build_default()?)
+    use hyperchad::renderer::Renderer as _;
+
+    let mut app = builder.build_default()?;
+    app.renderer.add_responsive_trigger(
+        "narrow".to_owned(),
+        hyperchad::renderer::transformer::ResponsiveTrigger::MaxWidth(
+            hyperchad::renderer::transformer::Number::Integer(640),
+        ),
+    );
+    app.renderer.add_responsive_trigger(
+        "tablet".to_owned(),
+        hyperchad::renderer::transformer::ResponsiveTrigger::MaxWidth(
+            hyperchad::renderer::transformer::Number::Integer(960),
+        ),
+    );
+    Ok(app)
 }

@@ -3,11 +3,13 @@
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::SessionSummary;
 use bcode_session_view_models::SessionViewSnapshot;
+use hyperchad::actions::logic::if_responsive;
 use hyperchad::template::{Containers, container};
+use hyperchad::transformer::models::{AlignItems, LayoutDirection};
 
 use super::activity::{
     active_invocations_section, runtime_state_section, runtime_work_section,
-    unrepresented_active_invocations,
+    unrepresented_active_invocations, unrepresented_runtime_work,
 };
 use super::composer::composer;
 use super::interactions::interaction_request;
@@ -38,10 +40,11 @@ pub fn home(
         "daemon connected · no active session"
     };
     let unrepresented_invocations = unrepresented_active_invocations(snapshot);
+    let unrepresented_work = unrepresented_runtime_work(snapshot);
 
     container! {
-        div #bcode-web-shell padding=24 background="#0d1117" color="#c9d1d9" font-family="monospace" {
-            header justify-content=space-between align-items=center margin-bottom=24 {
+        div #bcode-web-shell padding=(if_responsive("narrow").then::<i32>(12).or_else(24)) background="#0d1117" color="#c9d1d9" font-family="system-ui, sans-serif" {
+            header #application-header direction=(if_responsive("narrow").then(LayoutDirection::Column).or_else(LayoutDirection::Row)) justify-content=space-between align-items=(if_responsive("narrow").then(AlignItems::Start).or_else(AlignItems::Center)) gap=12 margin-bottom=24 {
                 div {
                     h1 color="#7ee787" font-size=28 margin-bottom=4 { "bcode web" }
                     div color="#8b949e" font-size=13 { "renderer-neutral session view powered by HyperChad" }
@@ -51,18 +54,21 @@ pub fn home(
                 }
             }
 
-            div gap=18 align-items=start {
+            div #application-layout direction=(if_responsive("tablet").then(LayoutDirection::Column).or_else(LayoutDirection::Row)) gap=18 align-items=start {
                 (session_navigation(sessions, snapshot.session_id, access_token))
 
-                main flex=1 {
+                main #conversation-main flex=1 min-width=0 max-width=(if_responsive("tablet").then::<i32>(10_000).or_else(960)) {
                     section background="#161b22" border="1, #30363d" border-radius=10 padding=16 margin-bottom=18 {
                         div justify-content=space-between gap=12 align-items=start {
                             div {
                                 h2 color="#f0f6fc" font-size=20 margin-bottom=4 { (title) }
-                                div color="#8b949e" font-size=12 {
-                                    "revision " (snapshot.revision.to_string())
-                                    @if let Some(sequence) = snapshot.latest_sequence {
-                                        " · latest event " (sequence.to_string())
+                                details {
+                                    summary color="#8b949e" font-size=11 { "session details" }
+                                    div color="#8b949e" font-size=11 margin-top=4 {
+                                        "revision " (snapshot.revision.to_string())
+                                        @if let Some(sequence) = snapshot.latest_sequence {
+                                            " · latest event " (sequence.to_string())
+                                        }
                                     }
                                 }
                             }
@@ -75,8 +81,8 @@ pub fn home(
                     @if !unrepresented_invocations.is_empty() {
                         (active_invocations_section(&unrepresented_invocations))
                     }
-                    @if !snapshot.runtime_work.is_empty() {
-                        (runtime_work_section(&snapshot.runtime_work))
+                    @if !unrepresented_work.is_empty() {
+                        (runtime_work_section(&unrepresented_work))
                     }
 
                     (runtime_state_section(snapshot))

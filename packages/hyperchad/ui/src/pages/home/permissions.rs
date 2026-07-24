@@ -3,6 +3,8 @@
 use bcode_session_view_models::PermissionView;
 use hyperchad::template::{Containers, container};
 
+use super::semantic_dom_id;
+
 pub(super) fn permission_history(permission: &PermissionView) -> Containers {
     let outcome = match permission.approved {
         Some(true) => "approved",
@@ -37,8 +39,9 @@ pub(super) fn permission_request(
         .batch
         .as_ref()
         .is_some_and(|batch| batch.call_count > 1);
+    let item_id = semantic_dom_id("permission", &permission.permission_id);
     container! {
-        div border="1, #f2cc60" border-radius=8 padding=12 margin-bottom=10 {
+        div id=(item_id) border="1, #f2cc60" border-radius=8 padding=12 margin-bottom=10 {
             div justify-content=space-between gap=12 margin-bottom=6 {
                 div {
                     div color="#f2cc60" { (permission.title.as_deref().unwrap_or("Permission requested")) }

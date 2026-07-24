@@ -118,7 +118,6 @@ pub(super) static ARTIFACT_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), Arti
 
 pub(super) static VISUAL_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), VisualAdapter>> =
     LazyLock::new(|| {
-        let structured = render_structured_visual as VisualAdapter;
         BTreeMap::from([
             (
                 ("bcode.tool.request.shell.run", 1),
@@ -132,18 +131,54 @@ pub(super) static VISUAL_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), Visual
                 ("bcode.filesystem.change", 1),
                 render_filesystem_change as VisualAdapter,
             ),
-            (("bcode.filesystem.read", 1), structured),
-            (("bcode.filesystem.image", 1), structured),
-            (("bcode.filesystem.exists", 1), structured),
-            (("bcode.filesystem.list", 1), structured),
-            (("bcode.filesystem.find", 1), structured),
-            (("bcode.filesystem.grep", 1), structured),
-            (("bcode.filesystem.stat", 1), structured),
-            (("bcode.filesystem.artifact.metadata", 1), structured),
-            (("bcode.filesystem.artifact.read", 1), structured),
-            (("bcode.filesystem.artifact.grep", 1), structured),
-            (("bcode.document.request", 1), structured),
-            (("bcode.ocr.request", 1), structured),
+            (
+                ("bcode.filesystem.read", 1),
+                render_filesystem_request as VisualAdapter,
+            ),
+            (
+                ("bcode.filesystem.image", 1),
+                render_filesystem_request as VisualAdapter,
+            ),
+            (
+                ("bcode.filesystem.exists", 1),
+                render_filesystem_request as VisualAdapter,
+            ),
+            (
+                ("bcode.filesystem.list", 1),
+                render_filesystem_request as VisualAdapter,
+            ),
+            (
+                ("bcode.filesystem.find", 1),
+                render_filesystem_request as VisualAdapter,
+            ),
+            (
+                ("bcode.filesystem.grep", 1),
+                render_filesystem_request as VisualAdapter,
+            ),
+            (
+                ("bcode.filesystem.stat", 1),
+                render_filesystem_request as VisualAdapter,
+            ),
+            (
+                ("bcode.filesystem.artifact.metadata", 1),
+                render_filesystem_request as VisualAdapter,
+            ),
+            (
+                ("bcode.filesystem.artifact.read", 1),
+                render_filesystem_request as VisualAdapter,
+            ),
+            (
+                ("bcode.filesystem.artifact.grep", 1),
+                render_filesystem_request as VisualAdapter,
+            ),
+            (
+                ("bcode.document.request", 1),
+                render_extraction_request as VisualAdapter,
+            ),
+            (
+                ("bcode.ocr.request", 1),
+                render_extraction_request as VisualAdapter,
+            ),
             (
                 ("bcode.web-search.search_request", 1),
                 render_web_search_request as VisualAdapter,
@@ -152,8 +187,14 @@ pub(super) static VISUAL_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), Visual
                 ("bcode.web-search.fetch_request", 1),
                 render_web_fetch_request as VisualAdapter,
             ),
-            (("bcode.web-search.status_request", 1), structured),
-            (("bcode.web-search.inspect_request", 1), structured),
+            (
+                ("bcode.web-search.status_request", 1),
+                render_web_utility_request as VisualAdapter,
+            ),
+            (
+                ("bcode.web-search.inspect_request", 1),
+                render_web_utility_request as VisualAdapter,
+            ),
             (
                 ("bcode.git.clone_request", 1),
                 render_git_clone_request as VisualAdapter,
@@ -908,8 +949,16 @@ fn bounded_fetch_preview(text: &str) -> (Cow<'_, str>, bool) {
     (Cow::Owned(text[..byte_index].to_owned()), true)
 }
 
-fn safe_web_url(url: &str) -> Option<&str> {
-    (url.starts_with("https://") || url.starts_with("http://")).then_some(url)
+pub(super) fn safe_web_url(url: &str) -> Option<&str> {
+    let remainder = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    (!authority.is_empty()
+        && !url.chars().any(|character| {
+            character.is_control() || character.is_whitespace() || character == '\\'
+        }))
+    .then_some(url)
 }
 
 fn fetched_content(preview: &str, content_format: Option<&str>) -> Containers {
@@ -1192,39 +1241,51 @@ pub(super) fn render_plugin_visual(title: &str, visual: &PluginVisualView) -> Co
     }
 }
 
-pub(super) fn render_structured_visual(visual: &PluginVisualView) -> Option<Containers> {
-    let payload = &visual.descriptor.payload;
-    let arguments = payload.get("arguments").unwrap_or(payload);
-    let object = arguments.as_object()?;
-    let fields = object
-        .iter()
-        .filter(|(key, value)| {
-            !key.starts_with('_') && !value.is_null() && !value.is_object() && !value.is_array()
-        })
-        .map(|(key, value)| {
-            let value = value
-                .as_str()
-                .map_or_else(|| value.to_string(), ToOwned::to_owned);
-            (key.replace('_', " "), value)
-        })
-        .collect::<Vec<_>>();
-    if fields.is_empty() {
-        return None;
-    }
-    let title = visual
+pub(super) fn render_extraction_request(visual: &PluginVisualView) -> Option<Containers> {
+    let payload = visual
         .descriptor
-        .title
-        .as_deref()
-        .unwrap_or(visual.descriptor.schema.as_str());
+        .payload
+        .get("arguments")
+        .unwrap_or(&visual.descriptor.payload);
+    let operation = payload
+        .get("operation")
+        .and_then(serde_json::Value::as_str)?;
+    let source = payload
+        .get("path")
+        .or_else(|| payload.get("url"))
+        .and_then(serde_json::Value::as_str);
     Some(container! {
         div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
-            div color="#58a6ff" margin-bottom=8 { (title) }
-            @for (key, value) in fields {
-                div direction=row gap=8 margin-bottom=4 {
-                    span color="#8b949e" min-width=120 { (key) }
-                    span color="#f0f6fc" white-space="preserve-wrap" { (value) }
-                }
+            div color="#58a6ff" margin-bottom=6 { (visual.descriptor.title.as_deref().unwrap_or(operation)) }
+            @if let Some(source) = source { div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (source) } }
+            @if source.is_none() { div color="#8b949e" font-size=12 { "Check configured extraction capabilities." } }
+            @for key in ["engine", "language"] {
+                @if let Some(value) = payload.get(key).and_then(serde_json::Value::as_str) { div color="#8b949e" font-size=12 margin-top=4 { (key) ": " (value) } }
             }
+            @for key in ["max_bytes", "timeout_ms"] {
+                @if let Some(value) = payload.get(key).and_then(serde_json::Value::as_u64) { div color="#8b949e" font-size=12 margin-top=4 { (key.replace('_', " ")) ": " (value.to_string()) } }
+            }
+        }
+    })
+}
+
+pub(super) fn render_web_utility_request(visual: &PluginVisualView) -> Option<Containers> {
+    let payload = visual
+        .descriptor
+        .payload
+        .get("arguments")
+        .unwrap_or(&visual.descriptor.payload);
+    let operation = payload
+        .get("operation")
+        .and_then(serde_json::Value::as_str)?;
+    let url = payload.get("url").and_then(serde_json::Value::as_str);
+    Some(container! {
+        div border="1, #30363d" border-radius=6 background="#010409" padding=10 margin-top=8 {
+            div color="#58a6ff" margin-bottom=6 {
+                (if operation.contains("inspect") { "Inspect URL" } else { "Web capabilities" })
+            }
+            @if let Some(url) = url { div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (url) } }
+            @if url.is_none() { div color="#8b949e" font-size=12 { "Check available search and fetch providers." } }
         }
     })
 }
@@ -1247,9 +1308,19 @@ pub(super) fn render_filesystem_request(visual: &PluginVisualView) -> Option<Con
                 span color="#8b949e" { "filesystem" }
             }
             div color="#f0f6fc" font-family="monospace" white-space="preserve-wrap" { (path) }
-            @for key in ["pattern", "query", "url", "region"] {
+            @for key in ["pattern", "query", "url", "region", "glob", "content_type"] {
                 @if let Some(value) = payload.get(key).and_then(serde_json::Value::as_str) {
-                    div color="#8b949e" font-size=12 margin-top=4 { (key) ": " (value) }
+                    div color="#8b949e" font-size=12 margin-top=4 { (key.replace('_', " ")) ": " (value) }
+                }
+            }
+            @for key in ["offset", "limit", "max_entries", "max_results", "max_matches", "timeout_ms", "offset_bytes", "max_bytes"] {
+                @if let Some(value) = payload.get(key).and_then(serde_json::Value::as_u64) {
+                    div color="#8b949e" font-size=12 margin-top=4 { (key.replace('_', " ")) ": " (value.to_string()) }
+                }
+            }
+            @for key in ["recursive", "ignore_case", "from_end"] {
+                @if let Some(value) = payload.get(key).and_then(serde_json::Value::as_bool) {
+                    div color="#8b949e" font-size=12 margin-top=4 { (key.replace('_', " ")) ": " (value.to_string()) }
                 }
             }
         }
