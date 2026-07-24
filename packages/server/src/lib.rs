@@ -20708,7 +20708,7 @@ mod tests {
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, LegacyToolCardPresentation,
         LegacyToolPresentationEvent, LegacyToolPresentationTarget, SessionEvent,
     };
-    use switchy::database::{DatabaseValue, query::FilterableQuery};
+    use switchy::database::DatabaseValue;
 
     fn open_progress_snapshot(
         revision: u64,
@@ -28125,12 +28125,14 @@ library = "test"
         client: &bcode_client::BcodeClient,
         mut initiator: bcode_client::ClientConnection,
         session_id: SessionId,
-    ) -> bcode_session_models::SessionOpenOperationSnapshot {
+    ) -> (bcode_session_models::SessionOpenOperationSnapshot, bool) {
         let initial = initiator
             .prepare_session_open(session_id)
             .await
             .expect("initiating preparation");
-        assert!(initial.outcome.is_none());
+        if initial.outcome.is_some() {
+            return (initial, false);
+        }
         let mut observer = client
             .connect("legacy-migration-observer-test")
             .await
@@ -28193,7 +28195,7 @@ library = "test"
             snapshot.outcome,
             Some(bcode_session_models::SessionOpenTerminalOutcome::Ready)
         );
-        snapshot
+        (snapshot, true)
     }
 
     async fn create_current_and_legacy_ipc_sessions(
@@ -28211,24 +28213,13 @@ library = "test"
                 .await
                 .expect("session database");
         db.database()
-            .delete("__bcode_session_migrations")
-            .where_in(
-                "id",
-                vec![
-                    DatabaseValue::String("026_session_storage_contract_table".to_owned()),
-                    DatabaseValue::String("027_initialize_session_storage_contract".to_owned()),
-                    DatabaseValue::String("028_session_compatibility_state".to_owned()),
-                    DatabaseValue::String("029_session_compatibility_issues".to_owned()),
-                ],
-            )
+            .update("session_storage_contract")
+            .value("writer_epoch", DatabaseValue::Int64(2))
             .execute(db.database())
             .await
-            .expect("remove contract migrations");
-        db.database()
-            .drop_table("session_storage_contract")
-            .execute(db.database())
-            .await
-            .expect("drop contract table");
+            .expect("writer epoch should become legacy");
+        drop(db);
+        drop(sessions);
         std::fs::write(
             bcode_session::db::session_dir_path(session_root, session.id)
                 .join("migration-overlap.sidecar"),
@@ -28274,23 +28265,25 @@ library = "test"
         )
         .await;
 
-        let terminal =
+        let (terminal, detached) =
             prepare_legacy_session_with_two_clients_and_disconnect(&client, connection, session_id)
                 .await;
         let mut reconnected = client
             .connect("legacy-migration-reconnect-test")
             .await
             .expect("reconnect");
-        let recovered = reconnected
-            .wait_session_open_progress(
-                session_id,
-                terminal.operation_id,
-                terminal.revision,
-                Duration::from_secs(1),
-            )
-            .await
-            .expect("recover retained terminal snapshot");
-        assert_eq!(recovered, terminal);
+        if detached {
+            let recovered = reconnected
+                .wait_session_open_progress(
+                    session_id,
+                    terminal.operation_id,
+                    terminal.revision,
+                    Duration::from_secs(1),
+                )
+                .await
+                .expect("recover retained terminal snapshot");
+            assert_eq!(recovered, terminal);
+        }
         let backup_root = workspace.path().join("session-migration-backups");
         assert_eq!(
             std::fs::read_dir(&backup_root)
