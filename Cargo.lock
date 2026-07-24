@@ -1290,6 +1290,7 @@ dependencies = [
  "bcode_openai_compatible_provider_plugin",
  "bcode_plugin",
  "bcode_plugin_sdk",
+ "bcode_provider_auth",
  "bcode_question_plugin",
  "bcode_session_models",
  "bcode_shell_plugin",

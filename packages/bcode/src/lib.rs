@@ -4244,6 +4244,7 @@ pub struct Bcode {
     mode: BcodeMode,
     runtime: AgentRuntime,
     provider_registry: ProviderRegistry,
+    provider_context: ProviderRequestContext,
     #[cfg(feature = "daemon-client")]
     daemon_client: Option<BcodeClient>,
     #[cfg(feature = "embedded-plugins")]
@@ -4270,6 +4271,33 @@ impl Bcode {
     #[cfg(feature = "config")]
     pub fn configured() -> Result<Self> {
         Ok(Self::builder().load_provider_defaults()?.build())
+    }
+
+    /// Build an embedded SDK handle from layered configuration and caller-provided static plugins.
+    ///
+    /// This is the application-facing setup path for an in-process Bcode runtime. It applies
+    /// Bcode's configured plugin selection, provider/model defaults, and provider authentication
+    /// context without requiring callers to assemble those lower-level pieces themselves.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if configuration, static plugin discovery, or plugin loading fails.
+    #[cfg(all(feature = "config", feature = "embedded-plugins"))]
+    pub fn configured_embedded_with_static_bundled(
+        static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    ) -> Result<Self> {
+        let config = bcode_config::load_config()?;
+        let static_plugin_ids = bcode_plugin::static_bundled_plugin_ids(static_plugins)?;
+        let plugin_selection =
+            bcode_config::plugin_selection_with_default_plugin_ids(&config, &static_plugin_ids);
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &plugin_selection,
+            static_plugins,
+        )?;
+        Ok(Self::builder()
+            .plugin_runtime(plugins)
+            .provider_defaults_from_config(&config)
+            .build())
     }
 
     /// Discover one embedded provider into this SDK's registry.
@@ -4318,9 +4346,12 @@ impl Bcode {
         };
         if let Some(report) = self.provider_registry.default_selection_report() {
             let selector = report.selector.clone();
-            builder.selection_report(report).parallel_tool_capabilities(
-                self.provider_registry.parallel_tool_capabilities(&selector),
-            )
+            builder
+                .provider_context(self.provider_context.clone())
+                .selection_report(report)
+                .parallel_tool_capabilities(
+                    self.provider_registry.parallel_tool_capabilities(&selector),
+                )
         } else {
             builder
         }
@@ -4342,6 +4373,12 @@ impl Bcode {
     #[must_use]
     pub const fn default_selection_provenance(&self) -> Option<&ModelSelectionProvenance> {
         self.provider_registry.default_selection_provenance()
+    }
+
+    /// Return the provider request context inherited by agents built from this handle.
+    #[must_use]
+    pub const fn provider_context(&self) -> &ProviderRequestContext {
+        &self.provider_context
     }
 
     /// Return the configured runtime mode.
@@ -4482,6 +4519,7 @@ pub struct BcodeBuilder {
     mode: BcodeMode,
     runtime: AgentRuntime,
     provider_registry: ProviderRegistry,
+    provider_context: ProviderRequestContext,
     #[cfg(feature = "daemon-client")]
     daemon_client: Option<BcodeClient>,
     #[cfg(feature = "embedded-plugins")]
@@ -4496,6 +4534,7 @@ impl Default for BcodeBuilder {
             mode: BcodeMode::Embedded,
             runtime: AgentRuntime::new(),
             provider_registry: ProviderRegistry::new(),
+            provider_context: ProviderRequestContext::default(),
             #[cfg(feature = "daemon-client")]
             daemon_client: None,
             #[cfg(feature = "embedded-plugins")]
@@ -4536,6 +4575,12 @@ impl BcodeBuilder {
     #[must_use]
     pub fn provider_defaults_from_config(mut self, config: &bcode_config::BcodeConfig) -> Self {
         self.provider_registry = ProviderRegistry::from_config(config);
+        self.provider_context = bcode_provider_auth::resolve_provider_request_context(
+            bcode_provider_auth::ProviderRequestContextResolution {
+                config,
+                selection: config.resolved_model_selection(),
+            },
+        );
         self
     }
 
@@ -4558,7 +4603,8 @@ impl BcodeBuilder {
     /// Returns an error if an existing config layer cannot be read, parsed, or composed.
     #[cfg(feature = "config")]
     pub fn load_provider_defaults(mut self) -> Result<Self> {
-        self.provider_registry = ProviderRegistry::load()?;
+        let config = bcode_config::load_config()?;
+        self = self.provider_defaults_from_config(&config);
         Ok(self)
     }
 
@@ -4609,6 +4655,7 @@ impl BcodeBuilder {
             mode: self.mode,
             runtime: self.runtime,
             provider_registry: self.provider_registry,
+            provider_context: self.provider_context,
         }
     }
 
@@ -4623,6 +4670,7 @@ impl BcodeBuilder {
             mode: self.mode,
             runtime: self.runtime,
             provider_registry: self.provider_registry,
+            provider_context: self.provider_context,
             daemon_client,
         }
     }
@@ -4635,6 +4683,7 @@ impl BcodeBuilder {
             mode: self.mode,
             runtime: self.runtime,
             provider_registry: self.provider_registry,
+            provider_context: self.provider_context,
             provider: self.provider,
             plugins: self.plugins,
         }
@@ -4651,6 +4700,7 @@ impl BcodeBuilder {
             mode: self.mode,
             runtime: self.runtime,
             provider_registry: self.provider_registry,
+            provider_context: self.provider_context,
             daemon_client,
             provider: self.provider,
             plugins: self.plugins,
