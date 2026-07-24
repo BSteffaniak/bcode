@@ -11425,7 +11425,7 @@ fn matching_provider_retry_policy(
     provider_rules: &[bcode_model::ProviderRetryRule],
     remote_catalog_rules: &[bcode_model::ProviderRetryRule],
 ) -> Option<ProviderRetryPolicy> {
-    if !state.model_retry.enabled {
+    if !state.model_retry.enabled || is_context_length_provider_error(error) {
         return None;
     }
     if state.model_retry.overload_enabled && is_overloaded_provider_error(error) {
@@ -25521,6 +25521,45 @@ library = "test"
             &unrelated_error,
             &selection
         ));
+    }
+
+    #[test]
+    fn context_length_errors_never_use_provider_retry_policies() {
+        let mut state = test_server_state(SessionManager::default());
+        state
+            .model_retry
+            .rules
+            .push(bcode_config::ModelRetryRuleConfig {
+                id: "retry-all-provider-errors".to_string(),
+                r#match: bcode_config::ModelRetryRuleMatchConfig {
+                    message_contains: Some("too many tokens".to_string()),
+                    ..bcode_config::ModelRetryRuleMatchConfig::default()
+                },
+                ..bcode_config::ModelRetryRuleConfig::default()
+            });
+        let error = bcode_model::ProviderError {
+            code: "context_length_exceeded".to_string(),
+            category: bcode_model::ProviderErrorCategory::ContextLength,
+            message: "too many tokens".to_string(),
+            retryable: true,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
+            retry: None,
+        };
+
+        assert!(
+            matching_provider_retry_policy(
+                &state,
+                &error,
+                &SessionModelSelection::default(),
+                &[],
+                &[],
+            )
+            .is_none()
+        );
     }
 
     #[test]
