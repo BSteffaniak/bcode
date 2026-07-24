@@ -5027,6 +5027,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::SessionRenamed { .. }
         | SessionEventKind::SessionImported { .. }
         | SessionEventKind::SessionForked { .. }
+        | SessionEventKind::ExecutionSessionCreated { .. }
         | SessionEventKind::SkillActivated { .. }
         | SessionEventKind::SkillDeactivated { .. }
         | SessionEventKind::SkillContextLoaded { .. }

@@ -2029,6 +2029,7 @@ mod tests {
             working_directory: "/tmp/project".into(),
             import: None,
             fork: None,
+            execution: None,
         };
         let rendered = format!(
             "{:?}",

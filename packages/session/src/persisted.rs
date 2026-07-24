@@ -718,6 +718,10 @@ enum PersistedSessionEventKind {
     ToolContributionPlaced {
         envelope: bcode_session_models::ToolContributionEnvelope,
     },
+    ExecutionSessionCreated {
+        provenance: Box<bcode_session_models::ExecutionSessionProvenance>,
+        visibility: bcode_session_models::SessionVisibility,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1074,6 +1078,13 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
             SessionEventKind::ToolContributionPlaced { envelope } => Self::ToolContributionPlaced {
                 envelope: envelope.clone(),
             },
+            SessionEventKind::ExecutionSessionCreated {
+                provenance,
+                visibility,
+            } => Self::ExecutionSessionCreated {
+                provenance: provenance.clone(),
+                visibility: *visibility,
+            },
             SessionEventKind::ToolInvocationStream { event } => Self::ToolInvocationStream {
                 event: event.clone(),
             },
@@ -1423,6 +1434,13 @@ impl PersistedSessionEventKind {
             Self::ToolContributionPlaced { envelope } => {
                 SessionEventKind::ToolContributionPlaced { envelope }
             }
+            Self::ExecutionSessionCreated {
+                provenance,
+                visibility,
+            } => SessionEventKind::ExecutionSessionCreated {
+                provenance,
+                visibility,
+            },
             Self::ToolInvocationStream { event } => {
                 SessionEventKind::ToolInvocationStream { event }
             }
@@ -1869,7 +1887,7 @@ mod tests {
                 "future_event_kind",
             ),
             (
-                include_str!("../fixtures/migrations/future-schema-v39.json"),
+                include_str!("../fixtures/migrations/future-schema-v40.json"),
                 SessionEventCompatibilityKind::FutureSchema,
                 "assistant_message",
             ),

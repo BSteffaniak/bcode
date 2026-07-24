@@ -35,14 +35,14 @@ mod store_executor;
 use actor::{AttachMode, SessionHandle};
 use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProjectionWindow,
-    ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionEventProvenance,
-    SessionForkKind, SessionForkResult, SessionForkSummary, SessionHistoryDirection,
-    SessionHistoryPage, SessionHistoryQuery, SessionId, SessionImportSummary,
-    SessionInputHistoryEntry, SessionLiveEvent, SessionLiveEventKind, SessionMigrationProgress,
-    SessionMigrationStage, SessionOpenFailureKind, SessionOpenOperationId,
-    SessionOpenOperationSnapshot, SessionOpenTerminalOutcome, SessionSummary, SessionTitleSource,
-    SessionTokenUsage, SessionTraceEvent,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ExecutionSessionContextMode,
+    ExecutionSessionProvenance, ModelTurnOutcome, ProjectionWindow, ProjectionWindowRequest,
+    SessionEvent, SessionEventKind, SessionEventProvenance, SessionForkKind, SessionForkResult,
+    SessionForkSummary, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
+    SessionId, SessionImportSummary, SessionInputHistoryEntry, SessionLiveEvent,
+    SessionLiveEventKind, SessionMigrationProgress, SessionMigrationStage, SessionOpenFailureKind,
+    SessionOpenOperationId, SessionOpenOperationSnapshot, SessionOpenTerminalOutcome,
+    SessionSummary, SessionTitleSource, SessionTokenUsage, SessionTraceEvent, SessionVisibility,
 };
 use lease::{SessionLeaseGuard, SessionLeaseOwnerContext};
 use serde::{Deserialize, Serialize};
@@ -662,6 +662,70 @@ pub struct SessionRuntimeSelection {
     pub reasoning_summary: Option<String>,
 }
 
+/// Return a shared-session execution target after enforcing explicitly sequential admission.
+///
+/// # Errors
+///
+/// Returns an error when provenance is not shared-sequential or does not identify `parent`.
+pub fn shared_execution_session(
+    parent: SessionId,
+    provenance: &ExecutionSessionProvenance,
+) -> Result<SessionId, SessionError> {
+    validate_execution_session_provenance(Some(provenance))?;
+    if provenance.context_mode != ExecutionSessionContextMode::SharedSequential
+        || provenance.parent_session_id != parent
+    {
+        return Err(SessionError::InvalidExecutionSessionProvenance(
+            "shared execution must target its declared parent session".to_string(),
+        ));
+    }
+    Ok(parent)
+}
+
+const MAX_EXECUTION_PROVENANCE_ID_BYTES: usize = 512;
+
+fn validate_execution_session_provenance(
+    provenance: Option<&ExecutionSessionProvenance>,
+) -> Result<(), SessionError> {
+    let Some(provenance) = provenance else {
+        return Ok(());
+    };
+    for (label, value) in [
+        ("owner", provenance.owner.as_str()),
+        ("run_id", provenance.run_id.as_str()),
+        ("node_id", provenance.node_id.as_str()),
+    ] {
+        if value.trim().is_empty() || value.len() > MAX_EXECUTION_PROVENANCE_ID_BYTES {
+            return Err(SessionError::InvalidExecutionSessionProvenance(format!(
+                "{label} must contain 1..={MAX_EXECUTION_PROVENANCE_ID_BYTES} bytes"
+            )));
+        }
+    }
+    if provenance.attempt == 0 {
+        return Err(SessionError::InvalidExecutionSessionProvenance(
+            "attempt must be greater than zero".to_string(),
+        ));
+    }
+    match (provenance.context_mode, provenance.parent_generation) {
+        (ExecutionSessionContextMode::FixedGenerationFork, None) => {
+            return Err(SessionError::InvalidExecutionSessionProvenance(
+                "fixed-generation fork requires parent_generation".to_string(),
+            ));
+        }
+        (
+            ExecutionSessionContextMode::FreshIsolated
+            | ExecutionSessionContextMode::SharedSequential,
+            Some(_),
+        ) => {
+            return Err(SessionError::InvalidExecutionSessionProvenance(
+                "parent_generation is valid only for fixed-generation fork".to_string(),
+            ));
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Errors returned by session management operations.
 #[derive(Debug, Error)]
 pub enum SessionError {
@@ -733,6 +797,9 @@ pub enum SessionError {
         expected: u64,
         current: u64,
     },
+    /// Background execution-session provenance is malformed or inconsistent.
+    #[error("invalid execution session provenance: {0}")]
+    InvalidExecutionSessionProvenance(String),
     /// Session is owned by another daemon or cannot be leased.
     #[error(transparent)]
     Lease(#[from] lease::SessionLeaseError),
@@ -892,6 +959,7 @@ impl SessionStore {
                 working_directory: self.root.clone(),
                 import: None,
                 fork: None,
+                execution: None,
             });
         }
         Ok(summaries)
@@ -2371,6 +2439,47 @@ impl SessionManager {
         name: Option<String>,
         working_directory: PathBuf,
     ) -> Result<SessionSummary, SessionError> {
+        self.create_session_with_execution(name, working_directory, None)
+            .await
+    }
+
+    async fn create_session_with_execution(
+        &self,
+        name: Option<String>,
+        working_directory: PathBuf,
+        execution: Option<ExecutionSessionProvenance>,
+    ) -> Result<SessionSummary, SessionError> {
+        validate_execution_session_provenance(execution.as_ref())?;
+        if let Some(provenance) = &execution {
+            match provenance.context_mode {
+                ExecutionSessionContextMode::FreshIsolated => {}
+                ExecutionSessionContextMode::FixedGenerationFork => {
+                    return self
+                        .clone_execution_session_at_generation(
+                            provenance.clone(),
+                            name,
+                            working_directory,
+                        )
+                        .await;
+                }
+                ExecutionSessionContextMode::SharedSequential => {
+                    return Err(SessionError::InvalidExecutionSessionProvenance(
+                        "shared-sequential execution reuses the parent session and must not create a child"
+                            .to_string(),
+                    ));
+                }
+            }
+        }
+        self.create_session_record(name, working_directory, execution)
+            .await
+    }
+
+    async fn create_session_record(
+        &self,
+        name: Option<String>,
+        working_directory: PathBuf,
+        execution: Option<ExecutionSessionProvenance>,
+    ) -> Result<SessionSummary, SessionError> {
         let started_at = std::time::Instant::now();
         self.metrics
             .increment_counter("session.manager.create.total");
@@ -2395,6 +2504,12 @@ impl SessionManager {
             working_directory: working_directory.clone(),
             import: None,
             fork: None,
+            execution: execution.map(|provenance| {
+                Box::new(bcode_session_models::ExecutionSessionSummary {
+                    provenance,
+                    visibility: SessionVisibility::Background,
+                })
+            }),
         };
         let state = SessionState {
             summary: summary.clone(),
@@ -2433,6 +2548,21 @@ impl SessionManager {
                 now_ms,
             )
             .await?;
+        let execution_event = if let Some(execution) = summary.execution.clone() {
+            Some(
+                handle
+                    .append_event(
+                        SessionEventKind::ExecutionSessionCreated {
+                            provenance: Box::new(execution.provenance),
+                            visibility: execution.visibility,
+                        },
+                        now_ms,
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
         {
             let mut inner = self.inner.lock().await;
             inner.sessions.insert(id, handle);
@@ -2442,9 +2572,104 @@ impl SessionManager {
         }
         self.release_persistent_idle_session_resources(id).await;
         self.publish_committed_mutation(event, summary.clone());
+        if let Some(event) = execution_event {
+            self.publish_committed_mutation(event, summary.clone());
+        }
         self.metrics
             .record_histogram("session.manager.create.duration_ms", elapsed_ms(started_at));
         Ok(summary)
+    }
+
+    async fn clone_execution_session_at_generation(
+        &self,
+        provenance: ExecutionSessionProvenance,
+        name: Option<String>,
+        working_directory: PathBuf,
+    ) -> Result<SessionSummary, SessionError> {
+        let expected = provenance
+            .parent_generation
+            .expect("validated fixed-generation provenance has a generation");
+        let source = self.session_summary(provenance.parent_session_id).await?;
+        let expected_working_directory = normalize_working_directory(&working_directory);
+        if normalize_working_directory(&source.working_directory) != expected_working_directory {
+            return Err(SessionError::InvalidExecutionSessionProvenance(
+                "fixed-generation child working directory must match its parent or declared worktree"
+                    .to_string(),
+            ));
+        }
+        let events = self.session_history(provenance.parent_session_id).await?;
+        let current = events.last().map_or(0, |event| event.sequence);
+        if current != expected {
+            return Err(SessionError::CloneGenerationChanged {
+                session_id: provenance.parent_session_id,
+                expected,
+                current,
+            });
+        }
+        let marker = SessionEventKind::SessionForked {
+            source_session_id: provenance.parent_session_id,
+            source_title: Some(source.display_title().to_string()),
+            source_cutoff_sequence: events.last().map(|event| event.sequence),
+            source_prompt_sequence: None,
+            forked_at_ms: self.next_activity_timestamp_ms(),
+            kind: SessionForkKind::Clone,
+        };
+        let session = self
+            .copy_session_events_with_execution(
+                name,
+                working_directory,
+                events,
+                marker,
+                Some(provenance),
+            )
+            .await?;
+        Ok(session)
+    }
+
+    /// Create a fresh isolated background execution session.
+    ///
+    /// The child inherits the parent's normalized working directory unless `working_directory`
+    /// names an explicit worktree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the parent is unavailable, provenance is invalid, or persistence
+    /// fails.
+    pub async fn create_fresh_execution_session(
+        &self,
+        name: Option<String>,
+        mut provenance: ExecutionSessionProvenance,
+        working_directory: Option<PathBuf>,
+    ) -> Result<SessionSummary, SessionError> {
+        provenance.context_mode = ExecutionSessionContextMode::FreshIsolated;
+        provenance.parent_generation = None;
+        let parent = self.session_summary(provenance.parent_session_id).await?;
+        let working_directory =
+            working_directory.unwrap_or_else(|| parent.working_directory.clone());
+        self.create_session_with_execution(name, working_directory, Some(provenance))
+            .await
+    }
+
+    /// Clone a background execution session from one exact parent generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the parent generation changed, provenance is invalid, the requested
+    /// directory is inconsistent, or persistence fails.
+    pub async fn create_fixed_generation_execution_session(
+        &self,
+        name: Option<String>,
+        mut provenance: ExecutionSessionProvenance,
+        parent_generation: u64,
+        working_directory: Option<PathBuf>,
+    ) -> Result<SessionSummary, SessionError> {
+        provenance.context_mode = ExecutionSessionContextMode::FixedGenerationFork;
+        provenance.parent_generation = Some(parent_generation);
+        let parent = self.session_summary(provenance.parent_session_id).await?;
+        let working_directory =
+            working_directory.unwrap_or_else(|| parent.working_directory.clone());
+        self.create_session_with_execution(name, working_directory, Some(provenance))
+            .await
     }
 
     /// Set or clear a persisted composer draft for a session.
@@ -2525,8 +2750,26 @@ impl SessionManager {
 
     /// List known sessions from the session catalog.
     pub async fn list_sessions(&self, working_directory: &Path) -> Vec<SessionSummary> {
+        self.list_sessions_with_background(working_directory, false)
+            .await
+    }
+
+    /// List sessions for a working directory, optionally including background execution sessions.
+    pub async fn list_sessions_with_background(
+        &self,
+        working_directory: &Path,
+        include_background: bool,
+    ) -> Vec<SessionSummary> {
         self.start_catalog_load();
-        self.cached_sessions(working_directory).await
+        let sessions = self.cached_sessions(working_directory).await;
+        if include_background {
+            sessions
+        } else {
+            sessions
+                .into_iter()
+                .filter(SessionSummary::is_picker_visible)
+                .collect()
+        }
     }
 
     /// List already-loaded sessions without touching persistent storage.
@@ -2539,6 +2782,7 @@ impl SessionManager {
         sorted_session_summaries(handles, &working_directory)
     }
 
+    /// List all already-loaded sessions, including inspectable background execution sessions.
     pub async fn all_session_summaries(&self) -> Vec<SessionSummary> {
         self.all_session_catalog_entries()
             .await
@@ -3045,7 +3289,21 @@ impl SessionManager {
         events: Vec<SessionEvent>,
         marker: SessionEventKind,
     ) -> Result<SessionSummary, SessionError> {
-        let session = self.create_session(name, working_directory).await?;
+        self.copy_session_events_with_execution(name, working_directory, events, marker, None)
+            .await
+    }
+
+    async fn copy_session_events_with_execution(
+        &self,
+        name: Option<String>,
+        working_directory: PathBuf,
+        events: Vec<SessionEvent>,
+        marker: SessionEventKind,
+        execution: Option<ExecutionSessionProvenance>,
+    ) -> Result<SessionSummary, SessionError> {
+        let session = self
+            .create_session_record(name, working_directory, execution)
+            .await?;
         let handle = self.session_handle(session.id).await?;
         let mut sequence_map = BTreeMap::new();
         for event in events {
@@ -4161,6 +4419,12 @@ impl SessionState {
                 working_directory: working_directory.clone(),
                 import: None,
                 fork: None,
+                execution: state.execution.map(|provenance| {
+                    Box::new(bcode_session_models::ExecutionSessionSummary {
+                        provenance,
+                        visibility: state.visibility,
+                    })
+                }),
             },
             working_directory,
             clients: BTreeSet::new(),
@@ -4213,6 +4477,16 @@ impl SessionState {
         self.next_sequence += 1;
         self.event_count = self.event_count.saturating_add(1);
         match &event.kind {
+            SessionEventKind::ExecutionSessionCreated {
+                provenance,
+                visibility,
+            } => {
+                self.summary.execution =
+                    Some(Box::new(bcode_session_models::ExecutionSessionSummary {
+                        provenance: (**provenance).clone(),
+                        visibility: *visibility,
+                    }));
+            }
             SessionEventKind::SessionRenamed { name } => {
                 self.summary.name.clone_from(name);
                 self.summary.explicit_name.clone_from(name);
@@ -4573,9 +4847,12 @@ mod tests {
         SessionManager, SessionMigrationStage, SessionOpenFailureKind, SessionOpenOperationId,
         SessionOpenTerminalOutcome, SessionStore, copy_and_hash_backup_files,
         create_verified_migration_backup_blocking, db, lease, migration_backup_files, persisted,
-        verify_backup_files,
+        shared_execution_session, verify_backup_files,
     };
     use bcode_metrics::MetricsRegistry;
+    use bcode_session_models::{
+        ExecutionSessionContextMode, ExecutionSessionProvenance, SessionVisibility,
+    };
     use std::time::Duration;
     use switchy::database::query::FilterableQuery;
 
@@ -4793,11 +5070,25 @@ mod tests {
                     switchy::database::DatabaseValue::String(
                         "029_session_compatibility_issues".to_owned(),
                     ),
+                    switchy::database::DatabaseValue::String(
+                        "030_session_state_visibility_column".to_owned(),
+                    ),
+                    switchy::database::DatabaseValue::String(
+                        "031_session_state_execution_provenance_column".to_owned(),
+                    ),
                 ],
             )
             .execute(db.database())
             .await
             .expect("remove epoch four migrations");
+        db.database()
+            .exec_raw("ALTER TABLE session_state DROP COLUMN execution_provenance")
+            .await
+            .expect("drop execution provenance");
+        db.database()
+            .exec_raw("ALTER TABLE session_state DROP COLUMN visibility")
+            .await
+            .expect("drop visibility");
         db.database()
             .exec_raw("DROP TABLE session_compatibility_issues")
             .await
@@ -7574,11 +7865,25 @@ mod tests {
                         switchy::database::DatabaseValue::String(
                             "029_session_compatibility_issues".to_owned(),
                         ),
+                        switchy::database::DatabaseValue::String(
+                            "030_session_state_visibility_column".to_owned(),
+                        ),
+                        switchy::database::DatabaseValue::String(
+                            "031_session_state_execution_provenance_column".to_owned(),
+                        ),
                     ],
                 )
                 .execute(db.database())
                 .await
                 .expect("contract migrations should be removed");
+            db.database()
+                .exec_raw("ALTER TABLE session_state DROP COLUMN execution_provenance")
+                .await
+                .expect("execution provenance column should be removed");
+            db.database()
+                .exec_raw("ALTER TABLE session_state DROP COLUMN visibility")
+                .await
+                .expect("visibility column should be removed");
             db.database()
                 .exec_raw("DROP TABLE session_storage_contract")
                 .await
@@ -8535,8 +8840,8 @@ mod tests {
         let root = unique_temp_dir();
         let fixtures = [
             (
-                "future-schema-v39.json",
-                include_str!("../fixtures/migrations/future-schema-v39.json"),
+                "future-schema-v40.json",
+                include_str!("../fixtures/migrations/future-schema-v40.json"),
             ),
             (
                 "interactive-tool-request-created-v32.json",
@@ -8779,11 +9084,25 @@ mod tests {
                     switchy::database::DatabaseValue::String(
                         "029_session_compatibility_issues".to_owned(),
                     ),
+                    switchy::database::DatabaseValue::String(
+                        "030_session_state_visibility_column".to_owned(),
+                    ),
+                    switchy::database::DatabaseValue::String(
+                        "031_session_state_execution_provenance_column".to_owned(),
+                    ),
                 ],
             )
             .execute(db.database())
             .await
             .expect("epoch-four migration ledger should clear");
+        db.database()
+            .exec_raw("ALTER TABLE session_state DROP COLUMN execution_provenance")
+            .await
+            .expect("execution provenance column should drop");
+        db.database()
+            .exec_raw("ALTER TABLE session_state DROP COLUMN visibility")
+            .await
+            .expect("visibility column should drop");
         db.database()
             .exec_raw("DROP TABLE session_compatibility_issues")
             .await
@@ -10815,6 +11134,304 @@ mod tests {
                 ),
             ),
         ]
+    }
+
+    #[tokio::test]
+    async fn background_execution_sessions_are_hidden_but_inspectable() {
+        let manager = SessionManager::default();
+        let parent = manager
+            .create_session(Some("parent".to_string()), test_working_directory())
+            .await
+            .expect("parent");
+        let provenance = ExecutionSessionProvenance {
+            owner: "workflow".to_string(),
+            run_id: "run-1".to_string(),
+            node_id: "review-a".to_string(),
+            attempt: 1,
+            parent_session_id: parent.id,
+            context_mode: ExecutionSessionContextMode::FreshIsolated,
+            parent_generation: None,
+        };
+        let child = manager
+            .create_fresh_execution_session(Some("review".to_string()), provenance.clone(), None)
+            .await
+            .expect("child");
+
+        assert_eq!(
+            child.execution.as_ref().expect("execution").visibility,
+            SessionVisibility::Background
+        );
+        assert_eq!(
+            child
+                .execution
+                .as_ref()
+                .map(|execution| &execution.provenance),
+            Some(&provenance)
+        );
+        assert_eq!(child.working_directory, parent.working_directory);
+        assert_eq!(
+            manager.list_sessions(&parent.working_directory).await,
+            vec![parent]
+        );
+        assert!(
+            manager
+                .list_sessions_with_background(&child.working_directory, true)
+                .await
+                .iter()
+                .any(|summary| summary.id == child.id)
+        );
+        assert_eq!(
+            manager
+                .session_summary(child.id)
+                .await
+                .expect("direct inspect")
+                .id,
+            child.id
+        );
+    }
+
+    #[tokio::test]
+    async fn two_fixed_generation_reviewers_have_independent_transcripts() {
+        let manager = SessionManager::default();
+        let parent = manager
+            .create_session(Some("parent".to_string()), test_working_directory())
+            .await
+            .expect("parent");
+        manager
+            .append_event(
+                parent.id,
+                SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "shared snapshot".to_string(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .expect("snapshot prompt");
+        let generation = manager
+            .session_history(parent.id)
+            .await
+            .expect("history")
+            .last()
+            .expect("event")
+            .sequence;
+        let create = |node_id: &str| ExecutionSessionProvenance {
+            owner: "workflow".to_string(),
+            run_id: "run-1".to_string(),
+            node_id: node_id.to_string(),
+            attempt: 1,
+            parent_session_id: parent.id,
+            context_mode: ExecutionSessionContextMode::FixedGenerationFork,
+            parent_generation: Some(generation),
+        };
+        let (left, right) = tokio::join!(
+            manager.create_fixed_generation_execution_session(
+                Some("left".to_string()),
+                create("review-left"),
+                generation,
+                None,
+            ),
+            manager.create_fixed_generation_execution_session(
+                Some("right".to_string()),
+                create("review-right"),
+                generation,
+                None,
+            ),
+        );
+        let left = left.expect("left");
+        let right = right.expect("right");
+        assert_ne!(left.id, right.id);
+        assert_eq!(left.working_directory, right.working_directory);
+        let left_history = manager
+            .session_history(left.id)
+            .await
+            .expect("left history");
+        let right_history = manager
+            .session_history(right.id)
+            .await
+            .expect("right history");
+        let inherited = |events: &[SessionEvent]| {
+            events
+                .iter()
+                .filter_map(|event| match &event.kind {
+                    SessionEventKind::UserMessage { text, .. } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(inherited(&left_history), ["shared snapshot".to_string()]);
+        assert_eq!(inherited(&right_history), ["shared snapshot".to_string()]);
+
+        manager
+            .append_event(
+                left.id,
+                SessionEventKind::SystemMessage {
+                    text: "left-only".to_string(),
+                },
+            )
+            .await
+            .expect("left note");
+        assert!(
+            !manager
+                .session_history(right.id)
+                .await
+                .expect("right history")
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::SystemMessage { text } if text == "left-only"
+                ))
+        );
+    }
+
+    #[tokio::test]
+    async fn background_execution_provenance_survives_persistent_restore() {
+        let root = unique_temp_dir();
+        let child_id;
+        {
+            let manager = SessionManager::persistent(&root).expect("manager");
+            let parent = manager
+                .create_session(Some("parent".to_string()), test_working_directory())
+                .await
+                .expect("parent");
+            let child = manager
+                .create_fresh_execution_session(
+                    Some("review".to_string()),
+                    ExecutionSessionProvenance {
+                        owner: "workflow".to_string(),
+                        run_id: "run-1".to_string(),
+                        node_id: "review".to_string(),
+                        attempt: 1,
+                        parent_session_id: parent.id,
+                        context_mode: ExecutionSessionContextMode::FreshIsolated,
+                        parent_generation: None,
+                    },
+                    None,
+                )
+                .await
+                .expect("child");
+            child_id = child.id;
+        }
+
+        let restored = SessionManager::persistent(&root).expect("restored");
+        let summary = restored
+            .session_summary(child_id)
+            .await
+            .expect("inspect restored child");
+        assert_eq!(
+            summary.execution.as_ref().expect("execution").visibility,
+            SessionVisibility::Background
+        );
+        assert!(summary.execution.as_ref().is_some_and(|execution| {
+            execution.provenance.owner == "workflow"
+                && execution.provenance.run_id == "run-1"
+                && execution.provenance.node_id == "review"
+        }));
+        std::fs::remove_dir_all(root).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn fixed_generation_execution_session_copies_exact_parent_snapshot() {
+        let manager = SessionManager::default();
+        let parent = manager
+            .create_session(Some("parent".to_string()), test_working_directory())
+            .await
+            .expect("parent");
+        manager
+            .append_event(
+                parent.id,
+                SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "snapshot".to_string(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .expect("prompt");
+        let generation = manager
+            .session_history(parent.id)
+            .await
+            .expect("history")
+            .last()
+            .expect("event")
+            .sequence;
+        let provenance = ExecutionSessionProvenance {
+            owner: "workflow".to_string(),
+            run_id: "run-1".to_string(),
+            node_id: "review-a".to_string(),
+            attempt: 1,
+            parent_session_id: parent.id,
+            context_mode: ExecutionSessionContextMode::FixedGenerationFork,
+            parent_generation: Some(generation),
+        };
+        let child = manager
+            .create_fixed_generation_execution_session(
+                Some("review".to_string()),
+                provenance.clone(),
+                generation,
+                None,
+            )
+            .await
+            .expect("fixed clone");
+
+        assert_eq!(
+            child
+                .execution
+                .as_ref()
+                .map(|execution| &execution.provenance),
+            Some(&provenance)
+        );
+        assert_eq!(child.working_directory, parent.working_directory);
+        let child_history = manager
+            .session_history(child.id)
+            .await
+            .expect("child history");
+        assert!(child_history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::UserMessage { text, .. } if text == "snapshot"
+        )));
+
+        manager
+            .append_event(
+                parent.id,
+                SessionEventKind::SystemMessage {
+                    text: "later".to_string(),
+                },
+            )
+            .await
+            .expect("later event");
+        let stale = manager
+            .create_fixed_generation_execution_session(
+                Some("stale".to_string()),
+                ExecutionSessionProvenance {
+                    node_id: "review-b".to_string(),
+                    ..child.execution.expect("execution").provenance
+                },
+                generation,
+                None,
+            )
+            .await
+            .expect_err("stale generation rejected");
+        assert!(matches!(stale, SessionError::CloneGenerationChanged { .. }));
+    }
+
+    #[test]
+    fn shared_execution_requires_declared_parent_and_no_child() {
+        let parent = SessionId::new();
+        let provenance = ExecutionSessionProvenance {
+            owner: "workflow".to_string(),
+            run_id: "run-1".to_string(),
+            node_id: "sequential".to_string(),
+            attempt: 1,
+            parent_session_id: parent,
+            context_mode: ExecutionSessionContextMode::SharedSequential,
+            parent_generation: None,
+        };
+        assert_eq!(
+            shared_execution_session(parent, &provenance).expect("shared parent"),
+            parent
+        );
+        assert!(shared_execution_session(SessionId::new(), &provenance).is_err());
     }
 
     fn encoded_variant_tag(value: &impl Serialize) -> u32 {

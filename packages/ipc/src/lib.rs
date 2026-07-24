@@ -2254,6 +2254,7 @@ mod tests {
                 working_directory: "/tmp/bcode-window-test".into(),
                 import: None,
                 fork: None,
+                execution: None,
             },
             history: Vec::new(),
             input_history: Vec::new(),
@@ -2293,6 +2294,7 @@ mod tests {
             working_directory: "/tmp/bcode-ipc-test".into(),
             import: None,
             fork: None,
+            execution: None,
         };
         let response = Response::Ok(ResponsePayload::Attached {
             session_id,
@@ -2473,6 +2475,7 @@ mod tests {
             working_directory: "/tmp/bcode-ipc-test".into(),
             import: None,
             fork: None,
+            execution: None,
         }
     }
 

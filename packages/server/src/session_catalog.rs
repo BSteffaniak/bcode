@@ -670,6 +670,7 @@ fn importable_to_summary(
             imported_at_ms: 0,
         }),
         fork: None,
+        execution: None,
     }
 }
 

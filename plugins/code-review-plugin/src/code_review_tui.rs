@@ -11910,6 +11910,7 @@ mod tests {
             working_directory: PathBuf::new(),
             import: None,
             fork: None,
+            execution: None,
         }
     }
 

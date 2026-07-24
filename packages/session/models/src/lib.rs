@@ -256,7 +256,7 @@ fn tool_projection_stream_tool_call_id(event: &ToolInvocationStreamEvent) -> &st
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 38;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 39;
 
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
@@ -579,6 +579,56 @@ pub enum SessionTitleSource {
     Imported,
 }
 
+/// Visibility of a session in normal interactive pickers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionVisibility {
+    /// Normal user-created interactive session.
+    #[default]
+    Visible,
+    /// Background execution session hidden from normal pickers but directly inspectable.
+    Background,
+}
+
+/// Context initialization mode for a background execution session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionSessionContextMode {
+    /// Start with no copied transcript history.
+    FreshIsolated,
+    /// Copy the parent transcript at one exact durable generation.
+    FixedGenerationFork,
+    /// Reuse the parent transcript; hosts must serialize this mode.
+    SharedSequential,
+}
+
+/// Generic durable provenance for a background execution session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionSessionProvenance {
+    /// Domain owner that created the execution session.
+    pub owner: String,
+    /// Stable owner-defined run identity.
+    pub run_id: String,
+    /// Stable owner-defined node/unit identity.
+    pub node_id: String,
+    /// Positive attempt number.
+    pub attempt: u32,
+    /// Interactive parent session.
+    pub parent_session_id: SessionId,
+    /// Context initialization mode.
+    pub context_mode: ExecutionSessionContextMode,
+    /// Fixed parent generation for `fixed_generation_fork`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_generation: Option<u64>,
+}
+
+/// Compact background-execution metadata attached to a session summary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecutionSessionSummary {
+    pub provenance: ExecutionSessionProvenance,
+    pub visibility: SessionVisibility,
+}
+
 /// Session summary used by list/select flows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSummary {
@@ -599,6 +649,8 @@ pub struct SessionSummary {
     pub import: Option<SessionImportSummary>,
     #[serde(default)]
     pub fork: Option<SessionForkSummary>,
+    #[serde(default)]
+    pub execution: Option<Box<ExecutionSessionSummary>>,
 }
 
 impl SessionSummary {
@@ -613,6 +665,14 @@ impl SessionSummary {
             .as_deref()
             .or(self.explicit_name.as_deref())
             .or(self.derived_title.as_deref())
+    }
+
+    /// Return whether this session belongs in normal interactive pickers.
+    #[must_use]
+    pub fn is_picker_visible(&self) -> bool {
+        self.execution
+            .as_ref()
+            .is_none_or(|execution| matches!(execution.visibility, SessionVisibility::Visible))
     }
 
     /// Return the best user-visible title for this session.
@@ -2484,6 +2544,11 @@ pub enum SessionEventKind {
     /// Versioned renderer contribution with explicit host composition semantics.
     ToolContributionPlaced {
         envelope: ToolContributionEnvelope,
+    },
+    /// Durable provenance for a background execution session.
+    ExecutionSessionCreated {
+        provenance: Box<ExecutionSessionProvenance>,
+        visibility: SessionVisibility,
     },
 }
 

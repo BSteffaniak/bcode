@@ -1103,7 +1103,7 @@ impl TuiEffect {
         Box::pin(load_session_status(client, session_id)).await
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::large_stack_frames)]
     async fn run(
         self,
         client: BcodeClient,

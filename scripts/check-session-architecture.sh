@@ -28,7 +28,7 @@ for fixture in \
   packages/session/fixtures/migrations/mixed-interactive-history-v32-v35.jsonl \
   packages/session/fixtures/migrations/unknown-old-event-kind-v32.json \
   packages/session/fixtures/migrations/unknown-future-event-kind-v38.json \
-  packages/session/fixtures/migrations/future-schema-v39.json \
+  packages/session/fixtures/migrations/future-schema-v40.json \
   packages/session/fixtures/migrations/malformed-json-v38.json \
   packages/session/fixtures/migrations/mismatched-session-id-v38.json \
   packages/session/fixtures/migrations/sequence-gap-v38.jsonl \

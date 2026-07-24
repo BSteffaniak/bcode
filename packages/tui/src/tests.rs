@@ -1261,6 +1261,7 @@ fn header_uses_attach_summary_title_when_recent_history_lacks_title_events() {
         working_directory: "/tmp/bcode-tui-test".into(),
         import: None,
         fork: None,
+        execution: None,
     });
     let mut buffer = Buffer::empty(Rect::new(0, 0, 120, 10));
     let mut frame = Frame::new(&mut buffer);
@@ -1287,6 +1288,7 @@ fn header_drops_low_priority_segments_in_narrow_panes() {
         working_directory: "/tmp/bcode-tui-test".into(),
         import: None,
         fork: None,
+        execution: None,
     });
     app.apply_model_status(bcode_ipc::SessionModelStatus {
         provider_plugin_id: Some("very-long-provider-plugin-id".to_owned()),
@@ -1450,6 +1452,7 @@ fn live_session_rename_overrides_attach_summary_title() {
         working_directory: "/tmp/bcode-tui-test".into(),
         import: None,
         fork: None,
+        execution: None,
     });
 
     app.absorb_session_event(&event(
@@ -5429,6 +5432,7 @@ fn session_summary(session_id: SessionId) -> SessionSummary {
         working_directory: "/tmp/bcode-tui-test".into(),
         import: None,
         fork: None,
+        execution: None,
     }
 }
 

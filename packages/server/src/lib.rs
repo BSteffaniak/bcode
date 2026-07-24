@@ -19863,6 +19863,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
+        SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
         SessionEventKind::LegacyEvent { .. } => "legacy_event",

@@ -1,6 +1,6 @@
 # Session migration fixtures
 
-Current fixture baseline schema: **38**.
+Current fixture baseline schema: **39**.
 
 When `CURRENT_SESSION_EVENT_SCHEMA_VERSION` changes, update this declared
 baseline and add or update a fixture that records the new schema's compatibility
@@ -28,7 +28,7 @@ lifecycle records before generic tool exchanges replaced them. The
 schema-32 legacy interaction followed by schema-35 history, matching the schema
 boundary structure of session `#1e5587bb` without copying private content.
 These are compatibility inputs only and must never become templates for new
-writes. The `unknown-*-event-kind`, `future-schema-v39`, malformed,
+writes. The `unknown-*-event-kind`, `future-schema-v40`, malformed,
 mismatched-identity, and sequence-gap fixtures separate trustworthy opaque
 semantics from structural corruption and future-build incompatibility.
 

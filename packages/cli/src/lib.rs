@@ -7122,6 +7122,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
+        SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
         SessionEventKind::LegacyEvent { .. } => "legacy_event",
@@ -7761,6 +7762,17 @@ fn print_non_trace_session_event(event: &SessionEvent) {
                 event.sequence, kind
             );
         }
+        SessionEventKind::ExecutionSessionCreated {
+            provenance,
+            visibility,
+        } => println!(
+            "#{} execution session: owner={} run={} node={} attempt={} visibility={visibility:?}",
+            event.sequence,
+            provenance.owner,
+            provenance.run_id,
+            provenance.node_id,
+            provenance.attempt,
+        ),
         SessionEventKind::RalphLifecycle {
             loop_name,
             kind,

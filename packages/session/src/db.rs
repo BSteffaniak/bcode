@@ -22,9 +22,10 @@ use crate::persisted::{
 use bcode_database_observability::ObservedDatabase;
 use bcode_metrics::{DatabaseMetrics, DatabaseOperation, MetricsRegistry};
 use bcode_session_models::{
-    RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventCompatibilityIssue,
-    SessionEventKind, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage,
-    SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionSummary, SessionTitleSource,
+    ExecutionSessionProvenance, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent,
+    SessionEventCompatibilityIssue, SessionEventKind, SessionHistoryCursor,
+    SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionId,
+    SessionInputHistoryEntry, SessionSummary, SessionTitleSource, SessionVisibility,
     ToolInvocationResult, ToolInvocationStreamEvent, WorkId,
 };
 use switchy::{
@@ -345,6 +346,10 @@ pub struct SessionDbState {
     pub has_user_message: bool,
     /// Latest compacted-through canonical sequence, if any.
     pub latest_compaction_sequence: Option<u64>,
+    /// Session picker visibility.
+    pub visibility: SessionVisibility,
+    /// Background execution provenance, when applicable.
+    pub execution: Option<ExecutionSessionProvenance>,
 }
 
 /// Typed transcript projection row stored in a per-session database.
@@ -1121,6 +1126,8 @@ impl SessionDb {
                 "reasoning_effort",
                 "reasoning_summary",
                 "updated_at_ms",
+                "visibility",
+                "execution_provenance",
             ])
             .where_eq("session_id", self.session_id.to_string())
             .execute_first(&**self.db)
@@ -1136,6 +1143,19 @@ impl SessionDb {
         let has_user_message = self.input_message_count().await? > 0;
         let latest_compaction_sequence = self.latest_context_compaction_sequence().await?;
         let current_agent = self.latest_agent_selection().await?;
+        let execution = optional_string(&row, "execution_provenance")
+            .map(|value| serde_json::from_str::<ExecutionSessionProvenance>(&value))
+            .transpose()
+            .map_err(|_| SessionDbError::InvalidRow {
+                column: "execution_provenance".to_string(),
+            })?;
+        let visibility = optional_string(&row, "visibility")
+            .map(|value| serde_json::from_str::<SessionVisibility>(&value))
+            .transpose()
+            .map_err(|_| SessionDbError::InvalidRow {
+                column: "visibility".to_string(),
+            })?
+            .unwrap_or_default();
         Ok(Some(SessionDbState {
             session_id: row_session_id,
             last_event_seq: required_i64(&row, "last_event_seq").map(i64_to_u64)?,
@@ -1155,6 +1175,8 @@ impl SessionDb {
                 .map(i64_to_u64),
             has_user_message,
             latest_compaction_sequence,
+            visibility,
+            execution,
         }))
     }
 
@@ -2692,7 +2714,23 @@ fn session_migrations() -> CodeMigrationSource<'static> {
     let mut source = CodeMigrationSource::new();
     add_session_base_migrations(&mut source);
     add_session_runtime_migrations(&mut source);
+    add_session_execution_migrations(&mut source);
     source
+}
+
+fn add_session_execution_migrations(source: &mut CodeMigrationSource<'static>) {
+    add_sql_migration(
+        source,
+        "030_session_state_visibility_column",
+        "ALTER TABLE session_state ADD COLUMN visibility TEXT",
+        "ALTER TABLE session_state DROP COLUMN visibility",
+    );
+    add_sql_migration(
+        source,
+        "031_session_state_execution_provenance_column",
+        "ALTER TABLE session_state ADD COLUMN execution_provenance TEXT",
+        "ALTER TABLE session_state DROP COLUMN execution_provenance",
+    );
 }
 
 fn add_session_base_migrations(source: &mut CodeMigrationSource<'static>) {
@@ -2764,6 +2802,7 @@ fn add_session_base_migrations(source: &mut CodeMigrationSource<'static>) {
     );
 }
 
+#[allow(clippy::too_many_lines)]
 fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
     add_sql_migration(
         source,
@@ -3456,6 +3495,24 @@ async fn project_event(db: &dyn Database, event: &SessionEvent) -> SessionDbResu
                 .execute(db)
                 .await?;
         }
+        SessionEventKind::ExecutionSessionCreated {
+            provenance,
+            visibility,
+        } => {
+            db.update("session_state")
+                .value(
+                    "execution_provenance",
+                    serde_json::to_string(provenance)
+                        .expect("execution session provenance serializes"),
+                )
+                .value(
+                    "visibility",
+                    serde_json::to_string(visibility).expect("session visibility serializes"),
+                )
+                .where_eq("session_id", event.session_id.to_string())
+                .execute(db)
+                .await?;
+        }
         SessionEventKind::SessionRenamed { name } => {
             db.update("session_state")
                 .value("title", name.clone())
@@ -3913,6 +3970,7 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
+        SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
         SessionEventKind::LegacyEvent { .. } => "legacy_event",
@@ -4059,6 +4117,7 @@ fn session_summary_from_catalog_row(
         working_directory,
         import: None,
         fork: None,
+        execution: None,
     })
 }
 
@@ -4502,6 +4561,10 @@ mod tests {
                     DatabaseValue::String("027_initialize_session_storage_contract".to_owned()),
                     DatabaseValue::String("028_session_compatibility_state".to_owned()),
                     DatabaseValue::String("029_session_compatibility_issues".to_owned()),
+                    DatabaseValue::String("030_session_state_visibility_column".to_owned()),
+                    DatabaseValue::String(
+                        "031_session_state_execution_provenance_column".to_owned(),
+                    ),
                 ],
             )
             .execute(db.database())
@@ -6058,8 +6121,8 @@ mod tests {
 
         let cases = [
             (
-                "future-schema-v39.json",
-                include_str!("../fixtures/migrations/future-schema-v39.json"),
+                "future-schema-v40.json",
+                include_str!("../fixtures/migrations/future-schema-v40.json"),
                 ExpectedHistory::Sequences(&[0]),
             ),
             (
