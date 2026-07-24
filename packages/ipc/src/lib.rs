@@ -281,6 +281,8 @@ pub enum Request {
         session_id: SessionId,
         work_id: WorkId,
     },
+    /// Register one immutable, structurally validated workflow definition.
+    RegisterWorkflowDefinition(WorkflowDefinitionRegistrationRequest),
     /// Start one durable workflow from an existing exact definition.
     StartWorkflowRun(WorkflowRunStartRequest),
     /// List bounded, checksum-verified durable workflow definitions.
@@ -291,6 +293,11 @@ pub enum Request {
     DescribeWorkflowDefinition {
         definition_id: String,
         version: u32,
+    },
+    /// Return one bounded aggregate workflow inspection snapshot.
+    InspectWorkflowRun {
+        run_id: String,
+        limit: usize,
     },
     /// Return one bounded durable workflow run summary.
     WorkflowRunStatus {
@@ -748,6 +755,8 @@ pub struct PluginServiceSummary {
     pub interface_id: String,
     pub name: Option<String>,
     pub description: Option<String>,
+    #[serde(default)]
+    pub workflow_blocks: Vec<bcode_workflow::WorkflowBlockDefinition>,
 }
 
 /// Correlation metadata for one permission checkpoint in a complete tool-call batch.
@@ -1108,6 +1117,28 @@ pub struct RalphRunStatusResponse {
     pub interrupted_runs: Vec<RalphRunSummary>,
 }
 
+/// Request to durably register one compiled workflow definition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowDefinitionRegistrationRequest {
+    pub definition_id: String,
+    pub version: u32,
+    pub definition: bcode_workflow::WorkflowDefinition,
+}
+
+/// Bounded aggregate workflow inspection snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRunInspection {
+    pub run: bcode_workflow_store::WorkflowRunSummary,
+    pub definition: bcode_workflow_store::StoredWorkflowDefinition,
+    pub waits: Vec<bcode_workflow_store::WaitingActivation>,
+    pub attempts: Vec<bcode_workflow_store::AttemptSummary>,
+    pub events: Vec<bcode_workflow_store::WorkflowEventRow>,
+    pub grants: Vec<bcode_workflow_store::WorkflowGrant>,
+    pub resource_leases: Vec<bcode_workflow_store::WorkflowResourceLease>,
+    pub outputs: Vec<bcode_workflow_store::WorkflowOutputSummary>,
+    pub child_sessions: Vec<SessionSummary>,
+}
+
 /// Generic request to start one durable workflow from a registered exact definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunStartRequest {
@@ -1301,12 +1332,18 @@ pub enum ResponsePayload {
     RuntimeWorkCancellationRequested {
         cancelled: bool,
     },
+    WorkflowDefinitionRegistered {
+        definition: bcode_workflow_store::StoredWorkflowDefinition,
+    },
     WorkflowRunStarted(WorkflowRunStartResponse),
     WorkflowDefinitionList {
         definitions: Vec<bcode_workflow_store::StoredWorkflowDefinition>,
     },
     WorkflowDefinitionDescription {
         definition: Option<bcode_workflow_store::StoredWorkflowDefinition>,
+    },
+    WorkflowRunInspection {
+        inspection: Box<WorkflowRunInspection>,
     },
     WorkflowRunStatus {
         run: Option<bcode_workflow_store::WorkflowRunSummary>,
@@ -2155,8 +2192,22 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn workflow_requests_and_responses_round_trip_renderer_neutrally() {
+        let definition = bcode_workflow::WorkflowBuilder::new(
+            "review",
+            bcode_workflow::Step::map("review", |value: u32| Ok(value)),
+        )
+        .build()
+        .expect("workflow")
+        .definition()
+        .clone();
         let requests = [
+            Request::RegisterWorkflowDefinition(WorkflowDefinitionRegistrationRequest {
+                definition_id: "review".to_string(),
+                version: 1,
+                definition: definition.clone(),
+            }),
             Request::StartWorkflowRun(WorkflowRunStartRequest {
                 definition_id: "review".to_string(),
                 definition_version: 1,
@@ -2169,6 +2220,10 @@ mod tests {
             Request::DescribeWorkflowDefinition {
                 definition_id: "review".to_string(),
                 version: 1,
+            },
+            Request::InspectWorkflowRun {
+                run_id: "run-1".to_string(),
+                limit: 25,
             },
             Request::WorkflowRunStatus {
                 run_id: "run-1".to_string(),
@@ -2217,6 +2272,20 @@ mod tests {
             let encoded = encode_request(&request).expect("encode request");
             assert_eq!(decode_request(&encoded).expect("decode request"), request);
         }
+
+        let response = Response::Ok(ResponsePayload::WorkflowDefinitionRegistered {
+            definition: bcode_workflow_store::StoredWorkflowDefinition {
+                definition_id: "review".to_string(),
+                version: 1,
+                checksum_sha256: "checksum".to_string(),
+                definition_json: serde_json::to_string(&definition).expect("definition"),
+            },
+        });
+        let encoded = encode_response(&response).expect("encode response");
+        assert_eq!(
+            decode_response(&encoded).expect("decode response"),
+            response
+        );
 
         let response = Response::Ok(ResponsePayload::WorkflowRunList {
             runs: vec![bcode_workflow_store::WorkflowRunSummary {

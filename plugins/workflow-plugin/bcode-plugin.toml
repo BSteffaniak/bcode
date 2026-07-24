@@ -1,0 +1,31 @@
+id      = "bcode.workflow"
+name    = "Bcode Workflow Plugin"
+version = "0.0.1"
+
+categories = ["workflow", "automation"]
+
+[[services]]
+class        = "service"
+description  = "Workflow discovery and lifecycle commands"
+interface_id = "bcode.command/v1"
+name         = "Workflow Commands"
+
+[[services]]
+class        = "service"
+description  = "Active workflow status for a session"
+interface_id = "bcode.session-status/v1"
+name         = "Workflow Session Status"
+
+[[tui_surfaces]]
+description = "Inspect workflow graph, attempts, waits, grants, artifacts, and child work"
+kind        = "workflow.status"
+title       = "Workflow Status"
+
+[concurrency]
+type = "exclusive"
+
+[runtime]
+abi_version  = 2
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_workflow_plugin.dylib"
+type         = "native"

@@ -2618,9 +2618,11 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::RuntimeWorkHistory { .. } => "runtime_work_history",
         Request::ListRuntimeWork { .. } => "list_runtime_work",
         Request::CancelRuntimeWork { .. } => "cancel_runtime_work",
+        Request::RegisterWorkflowDefinition(_) => "register_workflow_definition",
         Request::StartWorkflowRun(_) => "start_workflow_run",
         Request::ListWorkflowDefinitions { .. } => "list_workflow_definitions",
         Request::DescribeWorkflowDefinition { .. } => "describe_workflow_definition",
+        Request::InspectWorkflowRun { .. } => "inspect_workflow_run",
         Request::WorkflowRunStatus { .. } => "workflow_run_status",
         Request::ListWorkflowRuns { .. } => "list_workflow_runs",
         Request::CancelWorkflowRun { .. } => "cancel_workflow_run",
@@ -3046,6 +3048,9 @@ async fn handle_request_inner(
             handle_cancel_runtime_work(request_id, client_id, state, writer, session_id, work_id)
                 .await
         }
+        Request::RegisterWorkflowDefinition(request) => {
+            handle_register_workflow_definition(request_id, state, writer, request).await
+        }
         Request::StartWorkflowRun(request) => {
             handle_start_workflow_run(request_id, state, writer, request).await
         }
@@ -3058,6 +3063,9 @@ async fn handle_request_inner(
         } => {
             handle_describe_workflow_definition(request_id, state, writer, definition_id, version)
                 .await
+        }
+        Request::InspectWorkflowRun { run_id, limit } => {
+            handle_inspect_workflow_run(request_id, state, writer, run_id, limit).await
         }
         Request::WorkflowRunStatus { run_id } => {
             handle_workflow_run_status(request_id, state, writer, run_id).await
@@ -9871,6 +9879,25 @@ async fn handle_cancel_session_turn(
     .await
 }
 
+async fn handle_register_workflow_definition(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    request: bcode_ipc::WorkflowDefinitionRegistrationRequest,
+) -> Result<(), ServerError> {
+    let definition = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .persist_definition(&request.definition_id, request.version, &request.definition)?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowDefinitionRegistered { definition }),
+    )
+    .await
+}
+
 async fn handle_start_workflow_run(
     request_id: u64,
     state: &Arc<ServerState>,
@@ -9980,6 +10007,74 @@ async fn handle_describe_workflow_definition(
         writer,
         request_id,
         Response::Ok(ResponsePayload::WorkflowDefinitionDescription { definition }),
+    )
+    .await
+}
+
+async fn handle_inspect_workflow_run(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    run_id: String,
+    limit: usize,
+) -> Result<(), ServerError> {
+    let (run, definition, waits, attempts, events, grants, resource_leases, outputs) = {
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let run = store.run_summary(&run_id)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!("workflow run not found: {run_id}"))
+        })?;
+        let definition = store
+            .definition(&run.definition_id, run.definition_version)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "workflow definition not found: {} v{}",
+                    run.definition_id, run.definition_version
+                ))
+            })?;
+        (
+            run,
+            definition,
+            store.waiting_activations(&run_id, limit)?,
+            store.attempt_history(&run_id, None, limit)?,
+            store.event_history(&run_id, None, limit)?,
+            store.grants_for_run(&run_id, limit)?,
+            store.resource_leases_for_run(&run_id, limit)?,
+            store.output_summaries(&run_id, limit)?,
+        )
+    };
+    let child_sessions = state
+        .sessions
+        .all_session_summaries()
+        .await
+        .into_iter()
+        .filter(|session| {
+            session
+                .execution
+                .as_ref()
+                .is_some_and(|execution| execution.provenance.run_id == run_id)
+        })
+        .take(limit)
+        .collect();
+    let inspection = bcode_ipc::WorkflowRunInspection {
+        run,
+        definition,
+        waits,
+        attempts,
+        events,
+        grants,
+        resource_leases,
+        outputs,
+        child_sessions,
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowRunInspection {
+            inspection: Box::new(inspection),
+        }),
     )
     .await
 }
@@ -20439,6 +20534,7 @@ fn plugin_service_summaries(
             interface_id: service.interface_id,
             name: service.name,
             description: service.description,
+            workflow_blocks: service.workflow_blocks,
         })
         .collect()
 }
@@ -21215,6 +21311,86 @@ mod tests {
     use crate::context_compaction::*;
     use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent};
     use switchy::database::DatabaseValue;
+
+    #[derive(Default)]
+    struct DelayedWorkflowBlockPlugin;
+
+    impl bcode_plugin_sdk::RustPlugin for DelayedWorkflowBlockPlugin {
+        fn invoke_service(
+            &mut self,
+            context: bcode_plugin_sdk::NativeServiceContext,
+        ) -> bcode_plugin_sdk::ServiceResponse {
+            let request: serde_json::Value = match context.request.payload_json() {
+                Ok(request) => request,
+                Err(error) => {
+                    return bcode_plugin_sdk::ServiceResponse::error(
+                        "invalid_request",
+                        error.to_string(),
+                    );
+                }
+            };
+            let delay_ms = request
+                .get("delay_ms")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(1_000);
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_millis(delay_ms) {
+                if context.cancellation.is_cancelled() {
+                    return bcode_plugin_sdk::ServiceResponse::error(
+                        "cancelled",
+                        "delayed workflow block cancelled",
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            bcode_plugin_sdk::ServiceResponse::json(&serde_json::json!({"done": true}))
+                .expect("response")
+        }
+    }
+
+    fn delayed_workflow_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
+        bcode_plugin_sdk::static_plugin_vtable!(
+            DelayedWorkflowBlockPlugin,
+            r#"
+id = "bcode.test-workflow-block"
+name = "Test Workflow Block"
+version = "0.0.1"
+
+[[services]]
+interface_id = "bcode.workflow-block/v1"
+
+[[services.workflow_blocks]]
+block_id = "test.delay"
+block_version = 1
+plugin_id = "bcode.test-workflow-block"
+operation = "delay"
+effect = "read_only"
+timeout_ms = 50
+cancellation_supported = true
+reconciliation = "idempotent_replay"
+
+[services.workflow_blocks.input]
+type_name = "test.delay.input/v1"
+schema = { type = "object", required = ["delay_ms"] }
+
+[services.workflow_blocks.output]
+type_name = "test.delay.output/v1"
+schema = { type = "object", required = ["done"] }
+
+[services.workflow_blocks.authorization]
+capability = "read_only"
+
+[concurrency]
+type = "concurrent"
+
+[runtime]
+type = "native"
+abi_version = 2
+library = "libbcode_test_workflow_block.dylib"
+event_symbol = "bcode_plugin_handle_event_v1"
+"#
+        )
+    }
 
     fn open_progress_snapshot(
         revision: u64,
@@ -31560,6 +31736,162 @@ library = "test"
                 .status,
             bcode_workflow_store::RunStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn workflow_plugin_block_timeout_cancels_owner_and_persists_failure() {
+        let sessions = SessionManager::default();
+        let parent = sessions
+            .create_session(Some("parent".to_string()), PathBuf::from("."))
+            .await
+            .expect("parent");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("store");
+        let manifest_toml = r#"
+id = "bcode.test-workflow-block"
+name = "Test Workflow Block"
+version = "0.0.1"
+
+[[services]]
+interface_id = "bcode.workflow-block/v1"
+
+[[services.workflow_blocks]]
+block_id = "test.delay"
+block_version = 1
+plugin_id = "bcode.test-workflow-block"
+operation = "delay"
+effect = "read_only"
+timeout_ms = 50
+cancellation_supported = true
+reconciliation = "idempotent_replay"
+
+[services.workflow_blocks.input]
+type_name = "test.delay.input/v1"
+schema = { type = "object", required = ["delay_ms"] }
+
+[services.workflow_blocks.output]
+type_name = "test.delay.output/v1"
+schema = { type = "object", required = ["done"] }
+
+[services.workflow_blocks.authorization]
+capability = "read_only"
+
+[concurrency]
+type = "concurrent"
+
+[runtime]
+type = "native"
+abi_version = 2
+library = "libbcode_test_workflow_block.dylib"
+event_symbol = "bcode_plugin_handle_event_v1"
+"#;
+        let manifest: bcode_plugin::PluginManifest =
+            toml::from_str(manifest_toml).expect("manifest");
+        let block = manifest.services[0].workflow_blocks[0].clone();
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: 1,
+            name: "delayed-block".to_string(),
+            input: block.input.clone(),
+            output: block.output.clone(),
+            nodes: BTreeMap::from([(
+                "test.delay".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "test.delay".to_string(),
+                    name: "delayed block".to_string(),
+                    kind: bcode_workflow::NodeKind::PluginBlock,
+                    input: block.input.clone(),
+                    output: block.output.clone(),
+                    resources: Vec::new(),
+                    configuration: serde_json::to_value(&block).expect("block"),
+                },
+            )]),
+            entries: vec!["test.delay".to_string()],
+            exits: vec!["test.delay".to_string()],
+            edges: Vec::new(),
+        };
+        store
+            .persist_definition("delayed-block", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "delayed-run".to_string(),
+                definition_id: "delayed-block".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: Some(parent.id.to_string()),
+                input: Some(serde_json::json!({"delay_ms": 5_000})),
+                created_at_ms: 1,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.test-workflow-block".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[bcode_plugin::StaticBundledPlugin::new(
+                manifest_toml,
+                delayed_workflow_plugin(),
+            )],
+        )
+        .expect("plugins");
+        let mut state = test_server_state(sessions);
+        state.plugins = plugins;
+        state.workflow_store = StdMutex::new(store);
+        let state = Arc::new(state);
+        register_workflow_runtime_work(
+            &state,
+            parent.id,
+            "delayed-run",
+            "delayed block".to_string(),
+        )
+        .await;
+        let owner = WorkflowActivationOwner { state: &state };
+        let store_path = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .path()
+            .to_path_buf();
+        let started = std::time::Instant::now();
+        let summary = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
+            .expect("scheduler")
+            .dispatch_pending_activations(&owner, 10, 2)
+            .await
+            .expect("dispatch");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(summary.admitted.len(), 1);
+        let observer = WorkflowTurnReceiptObserver { state: &state };
+        bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
+            .expect("reconcile")
+            .reconcile_receipt_backed_attempts_async(&observer, 10, 3)
+            .await
+            .expect("reconcile");
+        let attempt = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .attempt_history("delayed-run", None, 10)
+            .expect("attempt")
+            .pop()
+            .expect("row");
+        assert_eq!(attempt.status, "failed");
+        let events = state
+            .sessions
+            .session_history(parent.id)
+            .await
+            .expect("history");
+        assert!(events.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::RuntimeWorkFinished {
+                status: RuntimeWorkStatus::TimedOut,
+                ..
+            }
+        )));
     }
 
     #[test]

@@ -629,6 +629,20 @@ pub struct OutputPersistenceResult {
     pub run_status: RunStatus,
 }
 
+/// Bounded persisted output summary for workflow inspection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowOutputSummary {
+    pub output_id: String,
+    pub run_id: String,
+    pub node_id: String,
+    pub activation_id: String,
+    pub schema_id: String,
+    pub schema_version: u32,
+    pub artifact_reference: Option<String>,
+    pub checksum_sha256: String,
+    pub created_at_ms: u64,
+}
+
 /// Durable validated output persisted before downstream activation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ValidatedOutput {
@@ -733,8 +747,9 @@ impl WorkflowStore {
 
     /// Persist an immutable normalized definition and checksum.
     ///
-    /// Re-persisting byte-identical content is idempotent. Reusing one definition/version for
-    /// different content fails closed.
+    /// The compiled definition is structurally validated before serialization. Re-persisting
+    /// byte-identical content is idempotent. Reusing one definition/version for different content
+    /// fails closed.
     ///
     /// # Errors
     ///
@@ -747,6 +762,9 @@ impl WorkflowStore {
         definition: &WorkflowDefinition,
     ) -> Result<StoredWorkflowDefinition, WorkflowStoreError> {
         validate_id("definition_id", definition_id)?;
+        definition.validate().map_err(|error| {
+            WorkflowStoreError::InvalidData(format!("invalid workflow definition: {error}"))
+        })?;
         if version == 0 {
             return Err(WorkflowStoreError::InvalidData(
                 "definition version must be positive".to_string(),
@@ -922,6 +940,137 @@ impl WorkflowStore {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Return bounded persisted output metadata without loading inline output values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when identity/limit validation or the bounded query fails.
+    pub fn output_summaries(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkflowOutputSummary>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT output_id, run_id, node_id, activation_id, schema_id, schema_version, \
+             artifact_reference, checksum_sha256, created_at_ms FROM workflow_outputs \
+             WHERE run_id = ?1 ORDER BY created_at_ms, output_id LIMIT ?2",
+        )?;
+        statement
+            .query_map((run_id, limit), |row| {
+                Ok(WorkflowOutputSummary {
+                    output_id: row.get(0)?,
+                    run_id: row.get(1)?,
+                    node_id: row.get(2)?,
+                    activation_id: row.get(3)?,
+                    schema_id: row.get(4)?,
+                    schema_version: row.get(5)?,
+                    artifact_reference: row.get(6)?,
+                    checksum_sha256: row.get(7)?,
+                    created_at_ms: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(WorkflowStoreError::from)
+    }
+
+    /// Return bounded grants for one run ordered by grant time and identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when identity/limit validation, JSON decoding, or the query fails.
+    pub fn grants_for_run(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkflowGrant>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT grant_id, run_id, node_id, scope_json, granted_at_ms, expires_at_ms \
+             FROM workflow_grants WHERE run_id = ?1 ORDER BY granted_at_ms, grant_id LIMIT ?2",
+        )?;
+        statement
+            .query_map((run_id, limit), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, Option<u64>>(5)?,
+                ))
+            })?
+            .map(|row| {
+                let (grant_id, run_id, node_id, scope_json, granted_at_ms, expires_at_ms) = row?;
+                Ok(WorkflowGrant {
+                    grant_id,
+                    run_id,
+                    node_id,
+                    scope: serde_json::from_str(&scope_json)?,
+                    granted_at_ms,
+                    expires_at_ms,
+                })
+            })
+            .collect()
+    }
+
+    /// Return bounded active resource leases for one run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when identity/limit validation or the bounded query fails.
+    pub fn resource_leases_for_run(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkflowResourceLease>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT lease_id, run_id, node_id, activation_id, resource_key, mode, \
+             acquired_at_ms, expires_at_ms FROM workflow_resource_leases \
+             WHERE run_id = ?1 AND released_at_ms IS NULL ORDER BY acquired_at_ms, lease_id LIMIT ?2",
+        )?;
+        statement
+            .query_map((run_id, limit), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, u64>(6)?,
+                    row.get::<_, Option<u64>>(7)?,
+                ))
+            })?
+            .map(|row| {
+                let (
+                    lease_id,
+                    run_id,
+                    node_id,
+                    activation_id,
+                    resource_key,
+                    mode,
+                    acquired_at_ms,
+                    expires_at_ms,
+                ) = row?;
+                Ok(WorkflowResourceLease {
+                    lease_id,
+                    run_id,
+                    node_id,
+                    activation_id,
+                    resource_key,
+                    mode: parse_resource_lease_mode(&mode)?,
+                    acquired_at_ms,
+                    expires_at_ms,
+                })
+            })
+            .collect()
     }
 
     /// Persist one pending activation.
@@ -3810,6 +3959,13 @@ fn verify_stored_definition(
             stored.definition_id, stored.version
         )));
     }
+    let definition: WorkflowDefinition = serde_json::from_str(&stored.definition_json)?;
+    definition.validate().map_err(|error| {
+        WorkflowStoreError::InvalidData(format!(
+            "invalid stored workflow definition {} v{}: {error}",
+            stored.definition_id, stored.version
+        ))
+    })?;
     Ok(stored)
 }
 
@@ -6491,6 +6647,61 @@ mod tests {
             Some(first.clone())
         );
         assert_eq!(store.list_definitions(10).expect("list"), [first]);
+    }
+
+    #[test]
+    fn bounded_run_inspection_queries_exclude_inline_output_values() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        store.create_run(&new_run()).expect("run");
+        let activation_id = activation_identity("run-1", "review", 0);
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "output-1".to_string(),
+                run_id: "run-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id,
+                schema_id: definition("example").nodes["review"]
+                    .output
+                    .type_name
+                    .clone(),
+                schema_version: 1,
+                value: serde_json::json!(7),
+                artifact_reference: Some("artifact-1".to_string()),
+                created_at_ms: 2,
+            })
+            .expect("output");
+        let outputs = store.output_summaries("run-1", 10).expect("outputs");
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].artifact_reference.as_deref(), Some("artifact-1"));
+        assert!(
+            store
+                .grants_for_run("run-1", 10)
+                .expect("grants")
+                .is_empty()
+        );
+        assert!(
+            store
+                .resource_leases_for_run("run-1", 10)
+                .expect("leases")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn definition_registration_rejects_deserialized_invalid_structure() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let mut definition = definition("example");
+        definition.entries = vec!["missing".to_string()];
+        let error = store
+            .persist_definition("example", 1, &definition)
+            .expect_err("invalid definition");
+        assert!(error.to_string().contains("unknown step 'missing'"));
+        assert!(store.list_definitions(10).expect("list").is_empty());
     }
 
     #[test]

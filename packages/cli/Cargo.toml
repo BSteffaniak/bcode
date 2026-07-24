@@ -106,6 +106,7 @@ static-bundled-plugins = [
     "static-bundled-shell-plugin",
     "static-bundled-web-search-plugin",
     "static-bundled-worktree-plugin",
+    "static-bundled-workflow-plugin",
     "bcode_tui/static-bundled-plugins",
 ]
 static-bundled-question-plugin = [
@@ -118,6 +119,10 @@ static-bundled-ralph-plugin = [
 ]
 static-bundled-shell-plugin = ["_static-bundled"]
 static-bundled-web-search-plugin = ["_static-bundled"]
+static-bundled-workflow-plugin = [
+    "_static-bundled",
+    "bcode_tui/static-bundled-workflow-plugin",
+]
 static-bundled-worktree-plugin = ["_static-bundled"]
 web-renderer = [
     "dep:bcode_hyperchad",

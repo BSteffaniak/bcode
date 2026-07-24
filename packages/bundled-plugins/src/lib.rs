@@ -39,6 +39,8 @@ pub fn tui_registry(plugin_id: &str) -> Option<bcode_plugin_sdk::tui::PluginTuiR
         "bcode.vim-edit" => Some(bcode_vim_edit_plugin::vim_edit_tui_registry()),
         #[cfg(feature = "static-bundled-web-search-plugin")]
         "bcode.web-search" => Some(bcode_web_search_plugin::web_search_tui_registry()),
+        #[cfg(feature = "static-bundled-workflow-plugin")]
+        "bcode.workflow" => Some(bcode_workflow_plugin::tui::tui_registry()),
         #[cfg(feature = "static-bundled-worktree-plugin")]
         "bcode.worktree" => Some(bcode_worktree_plugin::worktree_tui_registry()),
         _ => None,
@@ -154,6 +156,8 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(web_search_plugin());
     #[cfg(feature = "static-bundled-worktree-plugin")]
     plugins.push(worktree_plugin());
+    #[cfg(feature = "static-bundled-workflow-plugin")]
+    plugins.push(workflow_plugin());
 }
 
 #[cfg(feature = "static-bundled-bedrock-provider-plugin")]
@@ -348,8 +352,46 @@ fn worktree_plugin() -> bcode_plugin::StaticBundledPlugin {
     )
 }
 
+#[cfg(feature = "static-bundled-workflow-plugin")]
+fn workflow_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/workflow-plugin/bcode-plugin.toml"),
+        bcode_workflow_plugin::static_plugin(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "static-bundled-workflow-plugin")]
+    #[test]
+    fn disabling_workflow_removes_commands_status_and_tui() {
+        assert!(super::tui_registry("bcode.workflow").is_some());
+        let static_plugins = super::static_bundled_plugins();
+        let disabled = bcode_plugin::PluginSelection {
+            mode: bcode_plugin::PluginSelectionMode::All,
+            enabled: std::collections::BTreeSet::new(),
+            disabled: std::collections::BTreeSet::from(["bcode.workflow".to_string()]),
+        };
+        let selected = bcode_plugin::filter_selected_static_plugins(&static_plugins, &disabled)
+            .expect("manifest selection");
+        assert!(
+            selected
+                .iter()
+                .all(|(manifest, _)| manifest.id != "bcode.workflow")
+        );
+        let host = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &disabled,
+            &static_plugins,
+        )
+        .expect("host");
+        assert!(!host.plugin_ids().iter().any(|id| id == "bcode.workflow"));
+        assert!(
+            host.registered_command_contributions(&bcode_command::CommandSurface::Palette)
+                .iter()
+                .all(|command| !command.id.starts_with("workflow"))
+        );
+    }
+
     #[test]
     fn bundled_plugin_sources_gate_dynamic_abi_exports() {
         let mut offenders = Vec::new();

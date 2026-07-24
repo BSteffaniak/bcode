@@ -212,6 +212,12 @@ static-bundled-web-search-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-web-search-plugin",
 ]
+static-bundled-workflow-plugin = [
+    "bundled-plugins",
+    "cli",
+    "bcode_bundled_plugins/static-bundled-workflow-plugin",
+    "bcode_cli/static-bundled-workflow-plugin",
+]
 static-bundled-worktree-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-worktree-plugin",

@@ -1395,6 +1395,19 @@ impl WorkflowDefinition {
     pub fn node(&self, id: &str) -> Option<&NodeDefinition> {
         self.nodes.get(id)
     }
+
+    /// Validate a deserialized compiled workflow definition.
+    ///
+    /// This applies the same host-neutral structural invariants as SDK compilation so durable
+    /// registration never trusts hand-edited or stale JSON solely because it deserializes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema version, identities, entry/exit sets, edges, bounded
+    /// control-flow configuration, or cycle structure is invalid.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        validate_compiled_definition(self)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2852,7 +2865,7 @@ where
     let mut edges = fragment.edges.clone();
     edges.sort_by(|left, right| (&left.from, &left.to).cmp(&(&right.from, &right.to)));
     edges.dedup();
-    Ok(WorkflowDefinition {
+    let definition = WorkflowDefinition {
         schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
         name: name.to_string(),
         input: ValueSchema::of::<I>(),
@@ -2861,7 +2874,114 @@ where
         entries: fragment.entries.clone(),
         exits: fragment.exits.clone(),
         edges,
-    })
+    };
+    definition.validate()?;
+    Ok(definition)
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_compiled_definition(definition: &WorkflowDefinition) -> Result<(), WorkflowError> {
+    if definition.schema_version != WORKFLOW_DEFINITION_SCHEMA_VERSION {
+        return Err(WorkflowError::Build {
+            path: definition.name.clone(),
+            message: format!(
+                "unsupported workflow definition schema version {}; expected {}",
+                definition.schema_version, WORKFLOW_DEFINITION_SCHEMA_VERSION
+            ),
+        });
+    }
+    if definition.name.trim().is_empty() {
+        return Err(WorkflowError::Build {
+            path: "workflow".to_string(),
+            message: "name must not be empty".to_string(),
+        });
+    }
+    if definition.nodes.is_empty() {
+        return Err(WorkflowError::Build {
+            path: definition.name.clone(),
+            message: "workflow must contain at least one step".to_string(),
+        });
+    }
+    if definition.entries.is_empty() || definition.exits.is_empty() {
+        return Err(WorkflowError::Build {
+            path: definition.name.clone(),
+            message: "workflow must have at least one entry and one exit".to_string(),
+        });
+    }
+    for (id, node) in &definition.nodes {
+        if id.trim().is_empty() || node.id.trim().is_empty() || id != &node.id {
+            return Err(WorkflowError::Build {
+                path: definition.name.clone(),
+                message: format!("node map identity does not match node identity: '{id}'"),
+            });
+        }
+        if node.name.trim().is_empty() {
+            return Err(WorkflowError::Build {
+                path: node.id.clone(),
+                message: "step name must not be empty".to_string(),
+            });
+        }
+        validate_control_node(node)?;
+    }
+    for id in definition.entries.iter().chain(&definition.exits) {
+        if !definition.nodes.contains_key(id) {
+            return Err(WorkflowError::Build {
+                path: definition.name.clone(),
+                message: format!("entry/exit references unknown step '{id}'"),
+            });
+        }
+    }
+    for edge in &definition.edges {
+        if !definition.nodes.contains_key(&edge.from) || !definition.nodes.contains_key(&edge.to) {
+            return Err(WorkflowError::Build {
+                path: definition.name.clone(),
+                message: format!(
+                    "edge references unknown step '{} -> {}'",
+                    edge.from, edge.to
+                ),
+            });
+        }
+        if matches!(
+            edge.kind,
+            EdgeKind::Back {
+                max_iterations: 0,
+                ..
+            }
+        ) {
+            return Err(WorkflowError::Build {
+                path: edge.from.clone(),
+                message: "repeat max_iterations must be greater than zero".to_string(),
+            });
+        }
+    }
+    ensure_acyclic(&definition.name, &definition.nodes, &definition.edges)
+}
+
+fn validate_control_node(node: &NodeDefinition) -> Result<(), WorkflowError> {
+    let invalid = match node.kind {
+        NodeKind::Repeat => node
+            .configuration
+            .get("max_iterations")
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|value| value == 0),
+        NodeKind::Retry => node
+            .configuration
+            .get("max_attempts")
+            .and_then(serde_json::Value::as_u64)
+            .is_none_or(|value| value == 0),
+        _ => false,
+    };
+    if invalid {
+        return Err(WorkflowError::Build {
+            path: node.id.clone(),
+            message: match node.kind {
+                NodeKind::Repeat => "repeat max_iterations must be greater than zero".to_string(),
+                NodeKind::Retry => "retry max_attempts must be greater than zero".to_string(),
+                _ => unreachable!(),
+            },
+        });
+    }
+    Ok(())
 }
 
 fn ensure_acyclic(
@@ -3135,6 +3255,27 @@ mod tests {
             preflight_workflow_policy(&mismatched),
             WorkflowPolicyPreflight::Rejected { reason } if reason.contains("scope")
         ));
+    }
+
+    #[test]
+    fn deserialized_definition_validation_rejects_invalid_structure() {
+        let workflow =
+            WorkflowBuilder::new("validated", Step::map("first", |value: u32| Ok(value)))
+                .build()
+                .expect("workflow");
+        let mut definition = workflow.definition().clone();
+        definition.entries = vec!["missing".to_string()];
+        let error = definition.validate().expect_err("invalid entry");
+        assert!(error.to_string().contains("unknown step 'missing'"));
+
+        let mut definition = workflow.definition().clone();
+        definition.schema_version = WORKFLOW_DEFINITION_SCHEMA_VERSION.saturating_add(1);
+        let error = definition.validate().expect_err("unknown schema version");
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported workflow definition schema version")
+        );
     }
 
     #[test]

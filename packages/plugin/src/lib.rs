@@ -2109,6 +2109,17 @@ impl PluginRegistry {
         &self.service_registry
     }
 
+    /// Return all loaded, validated workflow block declarations in deterministic order.
+    #[must_use]
+    pub fn workflow_blocks(&self) -> Vec<bcode_workflow::WorkflowBlockDefinition> {
+        self.manifests
+            .values()
+            .flat_map(|manifest| &manifest.services)
+            .flat_map(|service| &service.workflow_blocks)
+            .cloned()
+            .collect()
+    }
+
     /// Return declared TUI surfaces for one plugin.
     #[must_use]
     pub fn tui_surfaces(&self, plugin_id: &str) -> Option<&[PluginTuiSurfaceDeclaration]> {
@@ -5010,6 +5021,20 @@ library = "libexample_plugin.dylib"
             error,
             PluginLoadError::ServiceResponseTooLarge { .. }
         ));
+    }
+
+    #[test]
+    fn discovers_and_loads_dynamic_plugin_when_fixture_is_configured() {
+        let Some(root) = std::env::var_os("BCODE_DYNAMIC_PLUGIN_TEST_ROOT") else {
+            return;
+        };
+        let plugins = discover_plugins_in_roots(&[PathBuf::from(root)]).expect("discovery");
+        let plugin = plugins
+            .iter()
+            .find(|plugin| plugin.manifest.id == "bcode.workflow")
+            .expect("workflow manifest");
+        let loaded = load_registered_plugin(plugin).expect("dynamic workflow plugin loads");
+        assert_eq!(loaded.manifest().id, "bcode.workflow");
     }
 
     #[test]

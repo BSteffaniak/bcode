@@ -1887,6 +1887,27 @@ impl BcodeClient {
         }
     }
 
+    /// Durably register one structurally validated compiled workflow definition.
+    ///
+    /// Re-registering byte-identical content is idempotent. Reusing an exact identity/version for
+    /// different content fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the definition contract.
+    pub async fn register_workflow_definition(
+        &self,
+        request: bcode_ipc::WorkflowDefinitionRegistrationRequest,
+    ) -> Result<bcode_workflow_store::StoredWorkflowDefinition, ClientError> {
+        match self
+            .send_request(Request::RegisterWorkflowDefinition(request))
+            .await?
+        {
+            ResponsePayload::WorkflowDefinitionRegistered { definition } => Ok(definition),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Start one durable workflow from a registered exact definition.
     ///
     /// # Errors
@@ -1942,6 +1963,26 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::WorkflowDefinitionDescription { definition } => Ok(definition),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return one bounded aggregate workflow inspection snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, the run is absent, or a bounded
+    /// canonical query fails.
+    pub async fn inspect_workflow_run(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> Result<bcode_ipc::WorkflowRunInspection, ClientError> {
+        match self
+            .send_request(Request::InspectWorkflowRun { run_id, limit })
+            .await?
+        {
+            ResponsePayload::WorkflowRunInspection { inspection } => Ok(*inspection),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

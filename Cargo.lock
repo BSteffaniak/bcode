@@ -1452,6 +1452,7 @@ dependencies = [
  "bcode_skills_plugin",
  "bcode_vim_edit_plugin",
  "bcode_web_search_plugin",
+ "bcode_workflow_plugin",
  "bcode_worktree_plugin",
  "serde_json",
 ]
@@ -1840,6 +1841,7 @@ dependencies = [
  "bcode_session_models",
  "bcode_skill_models",
  "bcode_tool",
+ "bcode_workflow",
  "bcode_workflow_store",
  "bcode_worktree_models",
  "bmux_codec",
@@ -2594,6 +2596,24 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.19",
+ "tokio",
+]
+
+[[package]]
+name = "bcode_workflow_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_client",
+ "bcode_command",
+ "bcode_ipc",
+ "bcode_plugin_sdk",
+ "bcode_session_models",
+ "bcode_workflow_store",
+ "bmux_keyboard",
+ "bmux_tui",
+ "clap",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
