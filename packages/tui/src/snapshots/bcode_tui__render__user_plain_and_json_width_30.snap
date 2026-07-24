@@ -1,0 +1,19 @@
+---
+source: packages/tui/src/render.rs
+expression: "format!(\"== plain ==\\n{}\\n== json ==\\n{}\", visible_rows_snapshot(&plain_rows),\nvisible_rows_snapshot(&json_rows))"
+---
+== plain ==
+00 │ You
+01 │   * literal list
+02 │   # literal heading
+03 │   | literal | pipe |
+04 │ 
+== json ==
+00 │ You
+01 │   {
+02 │     "items": [
+03 │       "one",
+04 │       "two"
+05 │     ]
+06 │   }
+07 │

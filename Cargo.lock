@@ -2507,6 +2507,7 @@ dependencies = [
  "bmux_tui_components",
  "crossterm",
  "image",
+ "insta",
  "png",
  "serde",
  "serde_json",

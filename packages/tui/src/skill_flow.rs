@@ -292,7 +292,7 @@ async fn describe_skill(
             manifest.summary.id.as_str(),
             &manifest.summary.source.label,
             Some(description),
-            &truncate_for_status(&manifest.instructions, 2_000),
+            &truncate_markdown_for_display(&manifest.instructions, 2_000),
         ));
     chat.app.set_status(format!("shown skill {skill_id}"));
     Ok(())
@@ -331,12 +331,72 @@ fn start_skill_action(
     Ok(())
 }
 
-fn truncate_for_status(value: &str, max_chars: usize) -> String {
-    let mut chars = value.chars();
-    let truncated = chars.by_ref().take(max_chars).collect::<String>();
-    if chars.next().is_some() {
-        format!("{truncated}\n…")
+fn truncate_markdown_for_display(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+
+    let mut output = String::new();
+    let mut used = 0_usize;
+    let mut open_fence: Option<String> = None;
+    for line in value.split_inclusive('\n') {
+        let line_chars = line.chars().count();
+        if used.saturating_add(line_chars) > max_chars {
+            break;
+        }
+        output.push_str(line);
+        used = used.saturating_add(line_chars);
+        let trimmed = line.trim_start();
+        if let Some(marker) = fence_marker(trimmed) {
+            if open_fence.as_deref() == Some(marker) {
+                open_fence = None;
+            } else if open_fence.is_none() {
+                open_fence = Some(marker.to_owned());
+            }
+        }
+    }
+    if output.is_empty() {
+        output = value.chars().take(max_chars).collect();
+    }
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    if let Some(marker) = open_fence {
+        output.push_str(&marker);
+        output.push('\n');
+    }
+    output.push_str("\n_… instructions truncated for display …_");
+    output
+}
+
+fn fence_marker(line: &str) -> Option<&'static str> {
+    if line.starts_with("```") {
+        Some("```")
+    } else if line.starts_with("~~~") {
+        Some("~~~")
     } else {
-        truncated
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_markdown_for_display;
+
+    #[test]
+    fn markdown_truncation_closes_open_fence_and_adds_notice() {
+        let input =
+            "# Instructions\n\n```rust\nfn main() {\n    println!(\"long\");\n}\n```\n\nAfter.";
+        let output = truncate_markdown_for_display(input, 40);
+
+        assert!(output.contains("```rust"));
+        assert_eq!(output.matches("```").count(), 2);
+        assert!(output.ends_with("_… instructions truncated for display …_"));
+    }
+
+    #[test]
+    fn short_markdown_is_unchanged() {
+        let input = "## Steps\n\n1. Read\n2. Test";
+        assert_eq!(truncate_markdown_for_display(input, 100), input);
     }
 }

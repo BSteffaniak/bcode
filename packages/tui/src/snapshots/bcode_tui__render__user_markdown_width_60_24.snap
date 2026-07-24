@@ -1,0 +1,46 @@
+---
+source: packages/tui/src/render.rs
+expression: output.trim_end()
+---
+== width 60 ==
+00 │ You
+01 │   Request
+02 │   
+03 │   Please update src/lib.rs with care.
+04 │   1.  Read the file.
+05 │   2.  Run:
+06 │       
+07 │       ┌─ sh
+08 │       │ cargo test
+09 │       └─
+10 │   
+11 │   │ Keep the change focused.
+12 │   
+13 │   ┌───────┬──────────┐
+14 │   │ Check │ State    │
+15 │   ├───────┼──────────┤
+16 │   │ tests │ required │
+17 │   └───────┴──────────┘
+18 │ 
+== width 24 ==
+00 │ You
+01 │   Request
+02 │   
+03 │   Please update src/lib.
+04 │   rs with care.
+05 │   1.  Read the file.
+06 │   2.  Run:
+07 │       
+08 │       ┌─ sh
+09 │       │ cargo test
+10 │       └─
+11 │   
+12 │   │ Keep the change focu
+13 │   │ sed.
+14 │   
+15 │   ┌───────┬──────────┐
+16 │   │ Check │ State    │
+17 │   ├───────┼──────────┤
+18 │   │ tests │ required │
+19 │   └───────┴──────────┘
+20 │

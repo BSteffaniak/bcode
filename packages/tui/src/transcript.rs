@@ -1292,6 +1292,27 @@ mod tests {
     }
 
     #[test]
+    fn working_directory_change_projects_as_markdown() {
+        let session_id = bcode_session_models::SessionId::new();
+        let events = [SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::WorkingDirectoryChanged {
+                old_working_directory: std::path::PathBuf::from("/tmp/old"),
+                new_working_directory: std::path::PathBuf::from("/tmp/new"),
+            },
+        }];
+
+        let items = transcript_items_from_events_with_reasoning(&events, false);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text_format(), TextFormat::Markdown);
+        assert!(items[0].text().contains("`../new`"));
+    }
+
+    #[test]
     fn plugin_status_note_projects_as_compact_plugin_transcript_item() {
         let session_id = bcode_session_models::SessionId::new();
         let events = [SessionEvent {
@@ -1312,6 +1333,7 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].display_role(), "Plugin · bcode.loop");
         assert_eq!(items[0].text(), "Loop completed · evaluator accepted: done");
+        assert_eq!(items[0].text_format(), TextFormat::PlainText);
     }
 
     #[test]

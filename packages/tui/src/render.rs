@@ -1121,9 +1121,131 @@ fn tui_markdown_message_block_preserves_table_borders_after_indent() {
 }
 
 #[cfg(test)]
+fn visible_rows_snapshot(rows: &[Line]) -> String {
+    rows.iter()
+        .enumerate()
+        .map(|(index, line)| {
+            let text = line
+                .spans
+                .iter()
+                .map(|span| span.content.as_str())
+                .collect::<String>();
+            format!("{index:02} │ {text}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+#[test]
+fn snapshots_realistic_user_markdown_at_normal_and_constrained_widths() {
+    const MARKDOWN: &str = "# Request\n\nPlease update `src/lib.rs` with **care**.\n\n1. Read the file.\n2. Run:\n\n   ```sh\n   cargo test\n   ```\n\n> Keep the change focused.\n\n| Check | State |\n| --- | --- |\n| tests | required |";
+    let mut output = String::new();
+    for width in [60_u16, 24] {
+        let item = TranscriptItem::with_format("You", MARKDOWN.to_owned(), TextFormat::Markdown);
+        let rows = transcript_item_rows(&[item], 0, width, None, TuiDiffViewerConfig::default());
+        output.push_str("== width ");
+        output.push_str(&width.to_string());
+        output.push_str(" ==\n");
+        output.push_str(&visible_rows_snapshot(&rows));
+        output.push('\n');
+    }
+    insta::assert_snapshot!("user_markdown_width_60_24", output.trim_end());
+}
+
+#[cfg(test)]
+#[test]
+fn markdown_user_table_switches_to_stacked_layout_when_constrained() {
+    let item = TranscriptItem::with_format(
+        "You",
+        "| Check | State |\n|---|---|\n| tests | required |".to_owned(),
+        TextFormat::Markdown,
+    );
+    let rows = transcript_item_rows(&[item], 0, 18, None, TuiDiffViewerConfig::default());
+    let text = visible_rows_snapshot(&rows);
+
+    assert!(text.contains("Check: tests"));
+    assert!(text.contains("State: required"));
+    assert!(!text.contains('┌'));
+}
+
+#[cfg(test)]
+#[test]
+fn display_role_suffix_remains_plain_title_chrome() {
+    let item = TranscriptItem::with_format("You", "# Body".to_owned(), TextFormat::Markdown)
+        .with_display_label("Plugin **literal**".to_owned());
+    let rows = transcript_item_rows(&[item], 0, 40, None, TuiDiffViewerConfig::default());
+    let text = visible_rows_snapshot(&rows);
+
+    assert!(text.contains("00 │ You · Plugin **literal**"));
+    assert!(text.contains("01 │   Body"));
+}
+
+#[cfg(test)]
+#[test]
+fn shared_system_items_render_markdown_and_plain_text_distinctly() {
+    let markdown =
+        TranscriptItem::with_format("System", "* value".to_owned(), TextFormat::Markdown);
+    let plain = TranscriptItem::with_format("Plugin", "* value".to_owned(), TextFormat::PlainText)
+        .with_display_label("example".to_owned());
+    let markdown_rows =
+        transcript_item_rows(&[markdown], 0, 30, None, TuiDiffViewerConfig::default());
+    let plain_rows = transcript_item_rows(&[plain], 0, 30, None, TuiDiffViewerConfig::default());
+
+    assert!(visible_rows_snapshot(&markdown_rows).contains("  •  value"));
+    let plain_text = visible_rows_snapshot(&plain_rows);
+    assert!(plain_text.contains("00 │ Plugin · example"));
+    assert!(plain_text.contains("01 │   * value"));
+}
+
+#[cfg(test)]
+#[test]
+fn skill_markdown_remains_xss_protected_when_rendered() {
+    let markdown = super::slash_commands::format_skill_details_markdown(
+        "Unsafe",
+        "unsafe",
+        "test",
+        None,
+        "<script>alert(1)</script>",
+    );
+    let item = TranscriptItem::with_format("System", markdown, TextFormat::Markdown);
+    let rows = transcript_item_rows(&[item], 0, 80, None, TuiDiffViewerConfig::default());
+    let text = visible_rows_snapshot(&rows);
+
+    assert!(!text.contains("<script>"));
+    assert!(text.contains("&amp;lt;script&amp;gt;"));
+}
+
+#[cfg(test)]
+#[test]
+fn snapshots_plain_and_json_user_messages() {
+    let plain = TranscriptItem::with_format(
+        "You",
+        "* literal list\n# literal heading\n| literal | pipe |".to_owned(),
+        TextFormat::PlainText,
+    );
+    let json = TranscriptItem::with_format(
+        "You",
+        r#"{"items":["one","two"]}"#.to_owned(),
+        TextFormat::Json,
+    );
+    let plain_rows = transcript_item_rows(&[plain], 0, 30, None, TuiDiffViewerConfig::default());
+    let json_rows = transcript_item_rows(&[json], 0, 30, None, TuiDiffViewerConfig::default());
+    insta::assert_snapshot!(
+        "user_plain_and_json_width_30",
+        format!(
+            "== plain ==\n{}\n== json ==\n{}",
+            visible_rows_snapshot(&plain_rows),
+            visible_rows_snapshot(&json_rows)
+        )
+    );
+}
+
+#[cfg(test)]
 #[test]
 fn tui_help_markdown_renders_at_normal_and_constrained_widths() {
     const HELP: &str = "# TUI help\n\n* Use the command palette for sessions, plugin commands, cancellation, and context compaction.\n* Transcript scrolling, composer history, session picker, and permissions honor configured keybindings where wired.\n* In permission dialogs, approve or deny directly, or move focus and confirm.";
+    let mut snapshot = String::new();
     for width in [80_u16, 24] {
         let mut rows = Vec::new();
         push_markdown_block(&mut rows, "System", HELP, Color::BrightBlack, width, false);
@@ -1143,7 +1265,13 @@ fn tui_help_markdown_renders_at_normal_and_constrained_widths() {
             rows.iter()
                 .all(|line| spans_width(&line.spans) <= usize::from(width))
         );
+        snapshot.push_str("== width ");
+        snapshot.push_str(&width.to_string());
+        snapshot.push_str(" ==\n");
+        snapshot.push_str(&visible_rows_snapshot(&rows));
+        snapshot.push('\n');
     }
+    insta::assert_snapshot!("tui_help_markdown_width_80_24", snapshot.trim_end());
 }
 
 #[cfg(test)]
