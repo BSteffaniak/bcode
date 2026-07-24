@@ -14,6 +14,7 @@ const BLOCKS: &str = include_str!("fixtures/blocks.md");
 const CODE_BLOCKS: &str = include_str!("fixtures/code_blocks.md");
 const COMPOSITION: &str = include_str!("fixtures/composition.md");
 const DETAILS: &str = include_str!("fixtures/details.md");
+const FOOTNOTES_BLOCKS: &str = include_str!("fixtures/footnotes_blocks.md");
 const FOOTNOTES: &str = include_str!("fixtures/footnotes.md");
 const GITHUB_MARKDOWN_EXAMPLE: &str = include_str!("../../../github-markdown-example.md");
 const HEADINGS: &str = include_str!("fixtures/headings.md");
@@ -421,6 +422,69 @@ fn math_uses_unicode_subset_and_preserves_unsupported_source() {
 }
 
 #[test]
+fn footnote_contributions_have_bidirectional_navigation_targets() {
+    let options = MarkdownRenderOptions::new(80).with_document_id("message:7");
+    let rendered = render_markdown(FOOTNOTES, &options);
+    let references = rendered
+        .contributions
+        .iter()
+        .filter_map(|item| match &item.kind {
+            MarkdownContributionKind::FootnoteReference { label, target_id }
+                if label == "alpha" =>
+            {
+                Some((item.id.clone(), target_id.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let definition = rendered
+        .contributions
+        .iter()
+        .find_map(|item| match &item.kind {
+            MarkdownContributionKind::FootnoteDefinition {
+                label,
+                reference_ids,
+            } if label == "alpha" => Some((item.id.clone(), reference_ids.clone())),
+            _ => None,
+        });
+
+    assert_eq!(references.len(), 2);
+    let (definition_id, reference_ids) = definition.expect("alpha definition");
+    assert!(
+        references
+            .iter()
+            .all(|(_, target_id)| target_id == &definition_id)
+    );
+    assert_eq!(
+        reference_ids,
+        references
+            .iter()
+            .map(|(reference_id, _)| reference_id.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn snapshots_footnote_block_content() {
+    insta::assert_snapshot!(
+        "footnotes_blocks_width_50",
+        styled_snapshot(FOOTNOTES_BLOCKS, 50)
+    );
+}
+
+#[test]
+fn footnote_block_content_preserves_lists_quotes_and_code() {
+    let output = visible_snapshot(FOOTNOTES_BLOCKS, 50);
+
+    assert!(output.contains("Opening paragraph with strong text."));
+    assert!(output.contains("•  first item"));
+    assert!(output.contains("•  second item with code"));
+    assert!(output.contains("│ quoted block"));
+    assert!(output.contains("┌─ rust"));
+    assert!(output.contains("fn main() {}"));
+}
+
+#[test]
 fn snapshots_footnotes_at_normal_and_narrow_widths() {
     insta::assert_snapshot!(
         "footnotes_widths_60_24",
@@ -625,7 +689,7 @@ fn github_markdown_fixture_support_contract_is_fully_represented() {
     )));
     assert!(result.contributions.iter().any(|item| matches!(
         &item.kind,
-        MarkdownContributionKind::FootnoteReference { label } if label == "compat"
+        MarkdownContributionKind::FootnoteReference { label, .. } if label == "compat"
     )));
     assert!(result.contributions.iter().any(|item| matches!(
         &item.kind,

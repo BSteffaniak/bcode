@@ -637,15 +637,19 @@ pub enum MarkdownContributionKind {
         /// Classified source; unsafe schemes are inert.
         source: MarkdownDestination,
     },
-    /// Footnote reference.
+    /// Semantic target ID for the matching definition.
     FootnoteReference {
         /// Source footnote label.
         label: String,
+        /// Stable target contribution ID.
+        target_id: String,
     },
     /// Footnote definition.
     FootnoteDefinition {
         /// Source footnote label.
         label: String,
+        /// Stable IDs of references targeting this definition.
+        reference_ids: Vec<String>,
     },
     /// Safe details/disclosure block.
     Details {
@@ -1085,7 +1089,21 @@ fn collect_footnotes(markdown: &str, document: &MarkdownDocument) -> FootnotePro
             }
             MarkdownSemanticEventKind::End(MarkdownSemanticTagEnd::FootnoteDefinition) => {
                 if let Some((label, range, body)) = active_definition.take() {
-                    definition_events.insert(label, (range, body));
+                    let source_body = footnote_definition_markdown(
+                        markdown.get(range.clone()).unwrap_or_default(),
+                        &label,
+                    );
+                    definition_events.insert(
+                        label,
+                        (
+                            range,
+                            if source_body.is_empty() {
+                                body
+                            } else {
+                                source_body
+                            },
+                        ),
+                    );
                 }
             }
             MarkdownSemanticEventKind::Text(text) | MarkdownSemanticEventKind::Code(text) => {
@@ -1146,6 +1164,30 @@ fn collect_footnotes(markdown: &str, document: &MarkdownDocument) -> FootnotePro
             .map(|(_, reference)| reference)
             .collect(),
         definitions,
+    }
+}
+
+fn footnote_definition_markdown(source: &str, label: &str) -> String {
+    let prefix = format!("[^{label}]:");
+    let mut lines = source.lines();
+    let Some(first) = lines.next() else {
+        return String::new();
+    };
+    let Some(first_body) = first.strip_prefix(&prefix) else {
+        return String::new();
+    };
+    let continuation = lines
+        .map(|line| {
+            line.strip_prefix("    ")
+                .or_else(|| line.strip_prefix('\t'))
+                .unwrap_or(line)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if continuation.is_empty() {
+        first_body.trim_start().to_owned()
+    } else {
+        format!("{}\n{}", first_body.trim_start(), continuation)
     }
 }
 
@@ -1258,12 +1300,49 @@ fn markdown_contributions(
         )
     }));
     contributions.sort_by_key(|item| (item.source_range.start, item.source_range.end));
-    if let Some(document_id) = document_id {
-        for item in &mut contributions {
-            item.id = format!("{document_id}:{}", item.id);
+    qualify_contribution_ids(&mut contributions, document_id);
+    link_footnote_contributions(&mut contributions);
+    contributions
+}
+
+fn qualify_contribution_ids(contributions: &mut [MarkdownContribution], document_id: Option<&str>) {
+    let Some(document_id) = document_id else {
+        return;
+    };
+    for item in contributions {
+        item.id = format!("{document_id}:{}", item.id);
+    }
+}
+
+fn link_footnote_contributions(contributions: &mut [MarkdownContribution]) {
+    let definitions = contributions
+        .iter()
+        .filter_map(|item| match &item.kind {
+            MarkdownContributionKind::FootnoteDefinition { label, .. } => {
+                Some((label.clone(), item.id.clone()))
+            }
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut references = BTreeMap::<String, Vec<String>>::new();
+    for item in contributions.iter_mut() {
+        if let MarkdownContributionKind::FootnoteReference { label, target_id } = &mut item.kind {
+            *target_id = definitions.get(label).cloned().unwrap_or_default();
+            references
+                .entry(label.clone())
+                .or_default()
+                .push(item.id.clone());
         }
     }
-    contributions
+    for item in contributions {
+        if let MarkdownContributionKind::FootnoteDefinition {
+            label,
+            reference_ids,
+        } = &mut item.kind
+        {
+            *reference_ids = references.remove(label).unwrap_or_default();
+        }
+    }
 }
 
 fn github_issue_contributions(
@@ -1378,6 +1457,7 @@ fn collect_markdown_contribution(
                 event.source_range.clone(),
                 MarkdownContributionKind::FootnoteDefinition {
                     label: label.clone(),
+                    reference_ids: Vec::new(),
                 },
             ));
         }
@@ -1408,6 +1488,7 @@ fn collect_markdown_contribution(
             event.source_range.clone(),
             MarkdownContributionKind::FootnoteReference {
                 label: label.clone(),
+                target_id: String::new(),
             },
         )),
         MarkdownSemanticEventKind::InlineMath(source) => contributions.push(contribution(
