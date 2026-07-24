@@ -35,10 +35,10 @@ use super::runtime_context::{TuiIo, TuiServices};
 use super::session_flow::{self, ActiveChat};
 use super::terminal_events::TuiInput;
 use super::{
-    TuiError, command_palette_render, composer_flow, input, input::KeyRequest, mouse_flow,
-    palette_flow, permission_dialog_render, permission_flow, render, slash_flow, slash_palette,
-    slash_palette_render, thinking_dialog_render, thinking_flow, timeline_dialog_render,
-    timeline_flow,
+    TuiError, command_palette_render, composer_flow, history_flow, input, input::KeyRequest,
+    mouse_flow, palette_flow, permission_dialog_render, permission_flow, render, slash_flow,
+    slash_palette, slash_palette_render, thinking_dialog_render, thinking_flow,
+    timeline_dialog_render, timeline_flow,
 };
 
 const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -438,8 +438,8 @@ async fn run_chat_loop<W: Write>(
                     Err(error) => return Err(error),
                 }
             }
-            ChatLoopEvent::Bcode(event) => {
-                if absorb_bcode_event(chat, loop_state, *event)
+            ChatLoopEvent::SessionStream(update) => {
+                if absorb_session_stream_update(chat, loop_state, *update)
                     || drain_bcode_events(
                         chat,
                         loop_state,
@@ -479,7 +479,7 @@ async fn run_chat_loop<W: Write>(
 
 enum ChatLoopEvent {
     Terminal(Event),
-    Bcode(Box<BcodeEvent>),
+    SessionStream(Box<history_flow::SessionStreamUpdate>),
     ArtifactFetchCompleted(Box<ActiveArtifactFetchCompletion>),
     TimedInvalidations(Vec<super::invalidation::InvalidationKey>),
     Timer,
@@ -1707,9 +1707,9 @@ fn interactive_surface_area(surface: &mut InteractiveSurfaceState, viewport: Rec
 }
 
 fn take_bcode_events(
-    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<BcodeEvent>,
+    receiver: &mut tokio::sync::mpsc::UnboundedReceiver<history_flow::SessionStreamUpdate>,
     budget: usize,
-) -> Vec<BcodeEvent> {
+) -> Vec<history_flow::SessionStreamUpdate> {
     (0..budget)
         .map_while(|_| receiver.try_recv().ok())
         .collect()
@@ -1721,8 +1721,8 @@ fn drain_bcode_events(
     budget: usize,
 ) -> bool {
     let mut needs_redraw = false;
-    for event in take_bcode_events(&mut chat.event_receiver, budget) {
-        needs_redraw |= absorb_bcode_event(chat, loop_state, event);
+    for update in take_bcode_events(&mut chat.event_receiver, budget) {
+        needs_redraw |= absorb_session_stream_update(chat, loop_state, update);
     }
     needs_redraw
 }
@@ -1756,6 +1756,86 @@ fn drain_artifact_completions(
         needs_redraw |= handle_artifact_completion(chat, loop_state, completion);
     }
     needs_redraw
+}
+
+fn absorb_session_stream_update(
+    chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
+    update: history_flow::SessionStreamUpdate,
+) -> bool {
+    match update {
+        history_flow::SessionStreamUpdate::Event(event) => {
+            absorb_bcode_event(chat, loop_state, *event)
+        }
+        history_flow::SessionStreamUpdate::ResyncStarted { session_id }
+            if chat.session_id == Some(session_id) =>
+        {
+            loop_state
+                .telemetry
+                .add_counter("tui.session_view.resync_started_total", 1);
+            chat.app.set_status("Reconnecting session view…".to_owned());
+            true
+        }
+        history_flow::SessionStreamUpdate::Resynchronized {
+            session_id,
+            attached,
+        } if chat.session_id == Some(session_id) => {
+            apply_session_stream_resynchronization(chat, loop_state, &attached);
+            true
+        }
+        history_flow::SessionStreamUpdate::ResyncStarted { .. }
+        | history_flow::SessionStreamUpdate::Resynchronized { .. } => false,
+    }
+}
+
+fn apply_session_stream_resynchronization(
+    chat: &mut ActiveChat,
+    loop_state: &mut ChatLoopState,
+    attached: &bcode_client::AttachedSessionHistory,
+) {
+    let has_older = attached
+        .projection_window
+        .as_ref()
+        .is_some_and(|window| window.has_older);
+    chat.app
+        .replace_latest_transcript_window(&attached.history, has_older);
+    chat.app.apply_session_summary(&attached.session);
+    chat.app
+        .apply_runtime_selection(attached.runtime_selection.clone());
+
+    loop_state
+        .artifact_stream
+        .reset_session(attached.session.id);
+    let presentation = chat.app.plugin_presentation();
+    for event in &attached.history {
+        loop_state.artifact_stream.observe_finalized_artifact(
+            event.session_id,
+            event.sequence,
+            &event.kind,
+            |producer_plugin_id, schema, schema_version, reference_key, content_type| {
+                presentation.is_some_and(|presentation| {
+                    presentation.accepts_artifact_reference(
+                        producer_plugin_id,
+                        schema,
+                        schema_version,
+                        reference_key,
+                        content_type,
+                    )
+                })
+            },
+        );
+    }
+    loop_state.interactive_surface = None;
+    loop_state.interactive_surface_queue.clear();
+    loop_state.replace_effect(TuiEffect::LoadSessionStatus {
+        session_id: attached.session.id,
+    });
+    loop_state.replace_effect(TuiEffect::ListPermissions);
+    loop_state
+        .telemetry
+        .add_counter("tui.session_view.resync_completed_total", 1);
+    chat.app
+        .set_status("Session view resynchronized".to_owned());
 }
 
 fn absorb_bcode_event(
@@ -1842,11 +1922,6 @@ fn absorb_bcode_event(
             chat.app.absorb_session_event(&event);
             true
         }
-        BcodeEvent::SessionViewResyncRequired { session_id }
-            if Some(session_id) == chat.session_id =>
-        {
-            handle_session_view_resync(loop_state, session_id)
-        }
         BcodeEvent::Session(_)
         | BcodeEvent::SessionLive(_)
         | BcodeEvent::RuntimeWork(_)
@@ -1886,15 +1961,6 @@ fn tool_exchange_surface_request(
         surface_kind,
         request.payload.to_string(),
     ))
-}
-
-fn handle_session_view_resync(
-    loop_state: &mut ChatLoopState,
-    session_id: bcode_session_models::SessionId,
-) -> bool {
-    loop_state.replace_effect(TuiEffect::LoadSessionStatus { session_id });
-    loop_state.replace_effect(TuiEffect::ListPermissions);
-    true
 }
 
 fn apply_session_open_progress(
@@ -2151,7 +2217,7 @@ async fn next_chat_loop_event(
             artifact_event = next_artifact_fetch_event(artifact_stream) => Ok(artifact_event),
             bcode_event = chat.event_receiver.recv() => Ok(bcode_event.map_or_else(
                 || ChatLoopEvent::TimedInvalidations(Vec::new()),
-                |event| ChatLoopEvent::Bcode(Box::new(event)),
+                |update| ChatLoopEvent::SessionStream(Box::new(update)),
             )),
             event = terminal_events.recv() => event.map(|event| {
                 event.map_or_else(
@@ -2174,7 +2240,7 @@ async fn next_chat_loop_event(
         artifact_event = next_artifact_fetch_event(artifact_stream) => Ok(artifact_event),
         bcode_event = chat.event_receiver.recv() => Ok(bcode_event.map_or_else(
             || ChatLoopEvent::TimedInvalidations(Vec::new()),
-            |event| ChatLoopEvent::Bcode(Box::new(event)),
+            |update| ChatLoopEvent::SessionStream(Box::new(update)),
         )),
         event = terminal_events.recv() => event.map(|event| {
             event.map_or_else(
@@ -3084,7 +3150,9 @@ mod scheduler_tests {
         let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
         for revision in 0..100 {
             sender
-                .send(BcodeEvent::SessionCatalogUpdated { revision })
+                .send(history_flow::SessionStreamUpdate::Event(Box::new(
+                    BcodeEvent::SessionCatalogUpdated { revision },
+                )))
                 .expect("daemon event");
         }
 
@@ -3097,7 +3165,9 @@ mod scheduler_tests {
         let mut chat = test_chat();
         for revision in 0..1_000 {
             chat.event_sender
-                .send(BcodeEvent::SessionCatalogUpdated { revision })
+                .send(history_flow::SessionStreamUpdate::Event(Box::new(
+                    BcodeEvent::SessionCatalogUpdated { revision },
+                )))
                 .expect("daemon event");
         }
         let session_id = bcode_session_models::SessionId::new();

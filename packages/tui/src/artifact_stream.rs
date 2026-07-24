@@ -136,6 +136,10 @@ impl ArtifactStreamCoordinator {
         std::mem::take(&mut self.stats)
     }
 
+    pub(crate) fn reset_session(&mut self, session_id: SessionId) {
+        self.artifact_fetches.retain(|key, _| key.0 != session_id);
+    }
+
     pub(crate) fn retain_session(&mut self, session_id: Option<SessionId>) {
         self.artifact_fetches
             .retain(|key, _| Some(key.0) == session_id);

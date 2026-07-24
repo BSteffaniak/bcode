@@ -85,6 +85,9 @@ pub struct PluginSessionEventSubscriptionRequest {
 #[allow(clippy::large_enum_variant)]
 pub enum PluginSessionEvent {
     /// The session was attached and optional persisted history is available.
+    ///
+    /// Hosts may emit this again after event continuity is lost. Consumers must replace their
+    /// replayed bounded view with the newer attachment before applying subsequent events.
     Attached {
         /// Attached session summary.
         session: SessionSummary,

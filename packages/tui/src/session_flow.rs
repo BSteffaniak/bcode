@@ -5,7 +5,7 @@ use std::io::Write;
 
 use bcode_agent_profile::AgentInfo;
 use bcode_client::{AttachedSessionHistory, BcodeClient, SessionCatalogWatcher, SessionList};
-use bcode_ipc::{Event as BcodeEvent, SessionCatalogSourceStatus, SessionCatalogStatus};
+use bcode_ipc::{SessionCatalogSourceStatus, SessionCatalogStatus};
 use bcode_session_models::SessionId;
 use bcode_session_view::execute_session_view_action;
 use bcode_session_view_models::{ComposerDraftViewScope, SessionViewAction};
@@ -32,8 +32,8 @@ pub struct ActiveChat {
     pub app: BmuxApp,
     pub agents: AgentCatalog,
     pub session_id: Option<SessionId>,
-    pub event_sender: mpsc::UnboundedSender<BcodeEvent>,
-    pub event_receiver: mpsc::UnboundedReceiver<BcodeEvent>,
+    pub event_sender: mpsc::UnboundedSender<history_flow::SessionStreamUpdate>,
+    pub event_receiver: mpsc::UnboundedReceiver<history_flow::SessionStreamUpdate>,
     pub event_task: Option<JoinHandle<()>>,
     pub opening_session_id: Option<SessionId>,
     pub opening_session_progress: Option<bcode_session_models::SessionOpenOperationSnapshot>,

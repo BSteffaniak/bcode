@@ -526,6 +526,20 @@ impl BmuxApp {
             .position(|item| item.event_sequence() == Some(sequence))
     }
 
+    /// Replace the resident transcript with a fresh bounded tail snapshot.
+    pub fn replace_latest_transcript_window(
+        &mut self,
+        events: &[SessionEvent],
+        has_older_history: bool,
+    ) {
+        self.latest_history_sequence = events.last().map(|event| event.sequence);
+        self.transcript_window.replace_window(events);
+        self.older_history = OlderHistoryState::new(events, has_older_history);
+        self.rebuild_transcript_from_history();
+        self.reconcile_tool_state_with_resident_transcript();
+        self.pending_visual_overflow_bottom = None;
+    }
+
     /// Replace the resident transcript with a bounded replay window.
     pub fn replace_transcript_window(
         &mut self,
@@ -4277,6 +4291,61 @@ mod tests {
             BTreeSet::from(["call-item".to_owned()])
         );
         assert!(app.drain_elapsed_dirty_visuals().is_empty());
+    }
+
+    #[test]
+    fn replacing_latest_window_discards_stale_live_state_and_preserves_input_history() {
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        let initial = vec![event(
+            1,
+            bcode_session_models::SessionEventKind::UserMessage {
+                client_id: bcode_session_models::ClientId::new(),
+                text: "prompt".to_owned(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        )];
+        let mut app = BmuxApp::new_with_history(Some(session_id), &initial, &[], false);
+        app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::AssistantTextDelta {
+                turn_id: "turn-1".to_owned(),
+                text: "stale partial".to_owned(),
+            },
+        });
+
+        let replacement = vec![
+            initial[0].clone(),
+            event(
+                2,
+                bcode_session_models::SessionEventKind::AssistantMessage {
+                    text: "durable answer".to_owned(),
+                },
+            ),
+        ];
+        app.replace_latest_transcript_window(&replacement, true);
+
+        let transcript = &app.session_view_snapshot().transcript.items;
+        assert_eq!(transcript.len(), 2);
+        assert!(transcript.iter().any(|item| matches!(
+            &item.kind,
+            bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { message }
+                if message.text == "durable answer"
+        )));
+        assert!(!transcript.iter().any(|item| matches!(
+            &item.kind,
+            bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { message }
+                if message.text.contains("stale partial")
+        )));
+        assert_eq!(app.timeline_entries().len(), 1);
+        assert!(app.has_older_history());
     }
 
     #[test]

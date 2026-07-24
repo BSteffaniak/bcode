@@ -12,6 +12,20 @@ use tokio::task::JoinHandle;
 
 use super::TuiError;
 
+/// Update delivered by the resilient TUI session event stream.
+#[derive(Debug)]
+pub enum SessionStreamUpdate {
+    /// Ordinary daemon event for the attached session.
+    Event(Box<BcodeEvent>),
+    /// Event continuity was lost and the stream is reconnecting.
+    ResyncStarted { session_id: SessionId },
+    /// Fresh bounded state installed by a replacement attachment.
+    Resynchronized {
+        session_id: SessionId,
+        attached: Box<bcode_client::AttachedSessionHistory>,
+    },
+}
+
 const INITIAL_TRANSCRIPT_OVERSCAN_VIEWPORTS: usize = 2;
 const INITIAL_TRANSCRIPT_MIN_ITEMS: usize = 12;
 const INITIAL_TRANSCRIPT_MAX_ITEMS: usize = 64;
@@ -90,7 +104,7 @@ pub async fn load_timeline_jump_events(
 pub async fn attach_session_event_stream(
     client: &BcodeClient,
     session_id: SessionId,
-    event_sender: mpsc::UnboundedSender<BcodeEvent>,
+    event_sender: mpsc::UnboundedSender<SessionStreamUpdate>,
 ) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
     attach_session_event_stream_with_window_request(
         client,
@@ -106,7 +120,7 @@ pub async fn attach_session_event_stream(
 pub async fn attach_paused_session_event_stream(
     client: &BcodeClient,
     session_id: SessionId,
-    event_sender: mpsc::UnboundedSender<BcodeEvent>,
+    event_sender: mpsc::UnboundedSender<SessionStreamUpdate>,
 ) -> Result<
     (
         bcode_client::AttachedSessionHistory,
@@ -135,7 +149,6 @@ pub async fn attach_paused_session_event_stream(
                     connection
                         .attach_session_projection_window_with_input_history(session_id, request)
                         .await
-                        .map(resynchronization_events)
                 })
             },
         )
@@ -149,7 +162,7 @@ pub async fn attach_paused_session_event_stream(
 pub async fn attach_session_event_stream_with_limit(
     client: &BcodeClient,
     session_id: SessionId,
-    event_sender: mpsc::UnboundedSender<BcodeEvent>,
+    event_sender: mpsc::UnboundedSender<SessionStreamUpdate>,
     limit: usize,
 ) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
     let mut connection = client.connect("bcode-tui-bmux").await?;
@@ -183,7 +196,7 @@ pub async fn attach_session_event_stream_with_limit(
 pub async fn attach_session_event_stream_with_window_request(
     client: &BcodeClient,
     session_id: SessionId,
-    event_sender: mpsc::UnboundedSender<BcodeEvent>,
+    event_sender: mpsc::UnboundedSender<SessionStreamUpdate>,
     request: ProjectionWindowRequest,
     mut on_progress: impl FnMut(&bcode_session_models::SessionOpenOperationSnapshot),
 ) -> Result<(bcode_client::AttachedSessionHistory, JoinHandle<()>), TuiError> {
@@ -241,7 +254,7 @@ async fn attach_projection_window(
 fn spawn_reconnecting_recent_event_stream(
     client: BcodeClient,
     session_id: SessionId,
-    event_sender: mpsc::UnboundedSender<BcodeEvent>,
+    event_sender: mpsc::UnboundedSender<SessionStreamUpdate>,
     limit: usize,
     connection: bcode_client::ClientConnection,
 ) -> JoinHandle<()> {
@@ -256,7 +269,6 @@ fn spawn_reconnecting_recent_event_stream(
                     connection
                         .attach_session_recent_with_input_history(session_id, limit)
                         .await
-                        .map(resynchronization_events)
                 })
             },
         )
@@ -267,7 +279,7 @@ fn spawn_reconnecting_recent_event_stream(
 fn spawn_reconnecting_window_event_stream(
     client: BcodeClient,
     session_id: SessionId,
-    event_sender: mpsc::UnboundedSender<BcodeEvent>,
+    event_sender: mpsc::UnboundedSender<SessionStreamUpdate>,
     request: ProjectionWindowRequest,
     connection: bcode_client::ClientConnection,
 ) -> JoinHandle<()> {
@@ -283,7 +295,6 @@ fn spawn_reconnecting_window_event_stream(
                     connection
                         .attach_session_projection_window_with_input_history(session_id, request)
                         .await
-                        .map(resynchronization_events)
                 })
             },
         )
@@ -291,34 +302,10 @@ fn spawn_reconnecting_window_event_stream(
     })
 }
 
-fn resynchronization_events(attached: bcode_client::AttachedSessionHistory) -> Vec<BcodeEvent> {
-    attached
-        .history
-        .into_iter()
-        .filter(|event| {
-            matches!(
-                event.kind,
-                bcode_session_models::SessionEventKind::ModelChanged { .. }
-                    | bcode_session_models::SessionEventKind::ReasoningChanged { .. }
-                    | bcode_session_models::SessionEventKind::SkillActivated { .. }
-                    | bcode_session_models::SessionEventKind::SkillDeactivated { .. }
-                    | bcode_session_models::SessionEventKind::RequestContextObserved { .. }
-                    | bcode_session_models::SessionEventKind::PermissionRequested { .. }
-                    | bcode_session_models::SessionEventKind::PermissionResolved { .. }
-                    | bcode_session_models::SessionEventKind::RuntimeWorkStarted { .. }
-                    | bcode_session_models::SessionEventKind::RuntimeWorkCancelRequested { .. }
-                    | bcode_session_models::SessionEventKind::RuntimeWorkProgress { .. }
-                    | bcode_session_models::SessionEventKind::RuntimeWorkFinished { .. }
-            )
-        })
-        .map(BcodeEvent::Session)
-        .collect()
-}
-
 async fn reconnecting_event_stream<F>(
     client: BcodeClient,
     session_id: SessionId,
-    event_sender: mpsc::UnboundedSender<BcodeEvent>,
+    event_sender: mpsc::UnboundedSender<SessionStreamUpdate>,
     mut connection: bcode_client::ClientConnection,
     attach: F,
 ) where
@@ -327,8 +314,12 @@ async fn reconnecting_event_stream<F>(
             SessionId,
         ) -> std::pin::Pin<
             Box<
-                dyn std::future::Future<Output = Result<Vec<BcodeEvent>, bcode_client::ClientError>>
-                    + Send
+                dyn std::future::Future<
+                        Output = Result<
+                            bcode_client::AttachedSessionHistory,
+                            bcode_client::ClientError,
+                        >,
+                    > + Send
                     + 'a,
             >,
         > + Send
@@ -336,40 +327,60 @@ async fn reconnecting_event_stream<F>(
 {
     let mut reconnect_delay = std::time::Duration::from_millis(100);
     loop {
-        match connection.recv_event().await {
+        let needs_resync = match connection.recv_event().await {
+            Ok(BcodeEvent::SessionViewResyncRequired {
+                session_id: required,
+            }) if required == session_id => true,
             Ok(event) => {
                 reconnect_delay = std::time::Duration::from_millis(100);
-                if event_sender.send(event).is_err() {
+                if event_sender
+                    .send(SessionStreamUpdate::Event(Box::new(event)))
+                    .is_err()
+                {
                     return;
                 }
+                false
             }
-            Err(_error) => loop {
-                if event_sender.is_closed() {
-                    return;
-                }
-                match client.connect("bcode-tui-bmux").await {
-                    Ok(mut next_connection) => {
-                        if let Ok(events) = attach(&mut next_connection, session_id).await {
-                            if event_sender
-                                .send(BcodeEvent::SessionViewResyncRequired { session_id })
-                                .is_err()
-                            {
-                                return;
-                            }
-                            for event in events {
-                                if event_sender.send(event).is_err() {
-                                    return;
-                                }
-                            }
-                            connection = next_connection;
-                            break;
+            Err(_error) => true,
+        };
+        if !needs_resync {
+            continue;
+        }
+
+        // Dropping the stale connection detaches its client before replacement attach. This keeps
+        // session client accounting and idle database release semantics accurate.
+        drop(connection);
+        if event_sender
+            .send(SessionStreamUpdate::ResyncStarted { session_id })
+            .is_err()
+        {
+            return;
+        }
+        loop {
+            if event_sender.is_closed() {
+                return;
+            }
+            match client.connect("bcode-tui-bmux").await {
+                Ok(mut next_connection) => {
+                    if let Ok(attached) = attach(&mut next_connection, session_id).await {
+                        if event_sender
+                            .send(SessionStreamUpdate::Resynchronized {
+                                session_id,
+                                attached: Box::new(attached),
+                            })
+                            .is_err()
+                        {
+                            return;
                         }
+                        connection = next_connection;
+                        reconnect_delay = std::time::Duration::from_millis(100);
+                        break;
                     }
-                    Err(_error) => {}
                 }
-                tokio::time::sleep(reconnect_delay).await;
-                reconnect_delay = (reconnect_delay * 2).min(std::time::Duration::from_secs(2));
-            },
+                Err(_error) => {}
+            }
+            tokio::time::sleep(reconnect_delay).await;
+            reconnect_delay = (reconnect_delay * 2).min(std::time::Duration::from_secs(2));
         }
     }
 }

@@ -110,31 +110,35 @@ async fn stream_plugin_session_events(
     }
 }
 
-async fn stream_plugin_session_events_inner(
-    client: BcodeClient,
-    request: PluginSessionEventSubscriptionRequest,
-    sender: mpsc::Sender<PluginSessionEvent>,
-    redraw_sender: mpsc::UnboundedSender<()>,
-) -> Result<(), bcode_client::ClientError> {
-    let session_id = request.session_id;
-    let mut connection = client.connect("bcode-plugin-tui-session-events").await?;
-    let attached = match request.replay {
+async fn attach_plugin_session(
+    connection: &mut bcode_client::ClientConnection,
+    session_id: bcode_session_models::SessionId,
+    replay: &PluginSessionEventReplay,
+) -> Result<bcode_client::AttachedSessionHistory, bcode_client::ClientError> {
+    match replay {
         PluginSessionEventReplay::None => {
             connection
                 .attach_session_recent_with_input_history(session_id, 0)
-                .await?
+                .await
         }
         PluginSessionEventReplay::Recent { limit } => {
             connection
-                .attach_session_recent_with_input_history(session_id, limit)
-                .await?
+                .attach_session_recent_with_input_history(session_id, *limit)
+                .await
         }
         PluginSessionEventReplay::ProjectionWindow { request } => {
             connection
-                .attach_session_projection_window_with_input_history(session_id, request)
-                .await?
+                .attach_session_projection_window_with_input_history(session_id, request.clone())
+                .await
         }
-    };
+    }
+}
+
+async fn send_plugin_attachment(
+    sender: &mpsc::Sender<PluginSessionEvent>,
+    redraw_sender: &mpsc::UnboundedSender<()>,
+    attached: bcode_client::AttachedSessionHistory,
+) -> bool {
     if sender
         .send(PluginSessionEvent::Attached {
             session: attached.session,
@@ -143,32 +147,78 @@ async fn stream_plugin_session_events_inner(
         .await
         .is_err()
     {
-        return Ok(());
+        return false;
     }
     let _ = redraw_sender.send(());
+    true
+}
 
+async fn stream_plugin_session_events_inner(
+    client: BcodeClient,
+    request: PluginSessionEventSubscriptionRequest,
+    sender: mpsc::Sender<PluginSessionEvent>,
+    redraw_sender: mpsc::UnboundedSender<()>,
+) -> Result<(), bcode_client::ClientError> {
+    let session_id = request.session_id;
+    let mut connection = client.connect("bcode-plugin-tui-session-events").await?;
+    let attached = attach_plugin_session(&mut connection, session_id, &request.replay).await?;
+    if !send_plugin_attachment(&sender, &redraw_sender, attached).await {
+        return Ok(());
+    }
+
+    let mut reconnect_delay = std::time::Duration::from_millis(100);
     loop {
-        let event = connection.recv_event().await?;
-        let plugin_event = match event {
-            BcodeEvent::Session(event) if event.session_id == session_id => {
-                Some(PluginSessionEvent::Session(event))
+        let needs_resync = match connection.recv_event().await {
+            Ok(BcodeEvent::SessionViewResyncRequired {
+                session_id: required,
+            }) if required == session_id => true,
+            Ok(event) => {
+                let plugin_event = match event {
+                    BcodeEvent::Session(event) if event.session_id == session_id => {
+                        Some(PluginSessionEvent::Session(event))
+                    }
+                    BcodeEvent::SessionLive(event) if event.session_id == session_id => {
+                        Some(PluginSessionEvent::SessionLive(event))
+                    }
+                    BcodeEvent::Session(_)
+                    | BcodeEvent::SessionLive(_)
+                    | BcodeEvent::RuntimeWork(_)
+                    | BcodeEvent::SessionViewResyncRequired { .. }
+                    | BcodeEvent::SessionCatalogUpdated { .. } => None,
+                };
+                if let Some(plugin_event) = plugin_event {
+                    if sender.send(plugin_event).await.is_err() {
+                        return Ok(());
+                    }
+                    let _ = redraw_sender.send(());
+                }
+                false
             }
-            BcodeEvent::SessionLive(event) if event.session_id == session_id => {
-                Some(PluginSessionEvent::SessionLive(event))
-            }
-            BcodeEvent::Session(_)
-            | BcodeEvent::SessionLive(_)
-            | BcodeEvent::RuntimeWork(_)
-            | BcodeEvent::SessionViewResyncRequired { .. }
-            | BcodeEvent::SessionCatalogUpdated { .. } => None,
+            Err(_error) => true,
         };
-        let Some(plugin_event) = plugin_event else {
+        if !needs_resync {
             continue;
-        };
-        if sender.send(plugin_event).await.is_err() {
-            return Ok(());
         }
-        let _ = redraw_sender.send(());
+
+        drop(connection);
+        loop {
+            if sender.is_closed() {
+                return Ok(());
+            }
+            if let Ok(mut next_connection) = client.connect("bcode-plugin-tui-session-events").await
+                && let Ok(attached) =
+                    attach_plugin_session(&mut next_connection, session_id, &request.replay).await
+            {
+                if !send_plugin_attachment(&sender, &redraw_sender, attached).await {
+                    return Ok(());
+                }
+                connection = next_connection;
+                reconnect_delay = std::time::Duration::from_millis(100);
+                break;
+            }
+            tokio::time::sleep(reconnect_delay).await;
+            reconnect_delay = (reconnect_delay * 2).min(std::time::Duration::from_secs(2));
+        }
     }
 }
 

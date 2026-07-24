@@ -45,7 +45,7 @@ pub struct SubmitMessageRequest {
     /// Reasoning summary to apply before sending.
     pub reasoning_summary: Option<String>,
     /// Event sender for a newly-created session stream.
-    pub event_sender: mpsc::UnboundedSender<bcode_ipc::Event>,
+    pub event_sender: mpsc::UnboundedSender<super::history_flow::SessionStreamUpdate>,
 }
 
 /// Skill action kind requested by the TUI.
@@ -72,7 +72,7 @@ pub struct SkillActionRequest {
     /// Arguments for invocation.
     pub arguments: String,
     /// Event sender for a newly-created session stream.
-    pub event_sender: mpsc::UnboundedSender<bcode_ipc::Event>,
+    pub event_sender: mpsc::UnboundedSender<super::history_flow::SessionStreamUpdate>,
 }
 
 /// Background work requested by local TUI event handling.
@@ -84,7 +84,7 @@ pub enum TuiEffect {
         /// Initial projection window request.
         initial_window_request: ProjectionWindowRequest,
         /// Event sender for the live session stream.
-        event_sender: mpsc::UnboundedSender<bcode_ipc::Event>,
+        event_sender: mpsc::UnboundedSender<super::history_flow::SessionStreamUpdate>,
         /// Whether this explicit open may start the daemon.
         allow_daemon_start: bool,
     },
@@ -1425,7 +1425,7 @@ async fn ensure_session_for_foreground_action(
     client: &BcodeClient,
     session_id: Option<SessionId>,
     launch_working_directory: std::path::PathBuf,
-    event_sender: mpsc::UnboundedSender<bcode_ipc::Event>,
+    event_sender: mpsc::UnboundedSender<super::history_flow::SessionStreamUpdate>,
 ) -> Result<(SessionId, Option<SessionSummary>, Option<JoinHandle<()>>), ClientError> {
     if let Some(session_id) = session_id {
         return Ok((session_id, None, None));
