@@ -480,6 +480,133 @@ mod tests {
     }
 
     #[test]
+    fn every_contract_enum_variant_round_trips() {
+        fn round_trip<T>(value: &T)
+        where
+            T: std::fmt::Debug + PartialEq + serde::Serialize + for<'de> serde::Deserialize<'de>,
+        {
+            let encoded = serde_json::to_string(value).unwrap();
+            assert_eq!(&serde_json::from_str::<T>(&encoded).unwrap(), value);
+        }
+
+        round_trip(&ShellDialect::Posix);
+        for value in [
+            ShellCommandRelation::Root,
+            ShellCommandRelation::Nested,
+            ShellCommandRelation::CommandSubstitution,
+            ShellCommandRelation::ProcessSubstitution,
+            ShellCommandRelation::NestedShell,
+        ] {
+            round_trip(&value);
+        }
+        for value in [
+            ShellExpansionKind::Parameter,
+            ShellExpansionKind::Command,
+            ShellExpansionKind::Arithmetic,
+            ShellExpansionKind::Tilde,
+            ShellExpansionKind::Process,
+            ShellExpansionKind::Pattern,
+        ] {
+            round_trip(&value);
+        }
+        for value in [
+            ShellCommandMatchCandidateKind::Original,
+            ShellCommandMatchCandidateKind::Canonical,
+            ShellCommandMatchCandidateKind::DomainAlias,
+        ] {
+            round_trip(&value);
+        }
+        for value in [
+            ShellRedirectionKind::Input,
+            ShellRedirectionKind::OutputTruncate,
+            ShellRedirectionKind::OutputAppend,
+            ShellRedirectionKind::InputOutput,
+            ShellRedirectionKind::Duplicate,
+            ShellRedirectionKind::Close,
+            ShellRedirectionKind::HereDocument,
+            ShellRedirectionKind::HereString,
+        ] {
+            round_trip(&value);
+        }
+        for value in [
+            ShellAnalysisLimitKind::SourceBytes,
+            ShellAnalysisLimitKind::Nodes,
+            ShellAnalysisLimitKind::NestingDepth,
+            ShellAnalysisLimitKind::Substitutions,
+            ShellAnalysisLimitKind::Commands,
+            ShellAnalysisLimitKind::Redirections,
+        ] {
+            round_trip(&value);
+        }
+        for value in [
+            ShellAnalysisErrorKind::UnsupportedSchema,
+            ShellAnalysisErrorKind::UnsupportedDialect,
+            ShellAnalysisErrorKind::SourceLimitExceeded,
+            ShellAnalysisErrorKind::Syntax,
+            ShellAnalysisErrorKind::Parser,
+        ] {
+            round_trip(&value);
+        }
+    }
+
+    #[test]
+    fn every_tagged_contract_shape_round_trips() {
+        let span = ShellSourceSpan::new(1, 2);
+        for value in [
+            ShellWord::Static {
+                value: "x".to_owned(),
+                span,
+            },
+            ShellWord::Dynamic {
+                expansions: vec![ShellExpansionKind::Parameter],
+                span,
+            },
+        ] {
+            let encoded = serde_json::to_string(&value).unwrap();
+            assert_eq!(serde_json::from_str::<ShellWord>(&encoded).unwrap(), value);
+        }
+        for value in [
+            ShellIncompleteReason::DynamicExecutable { span },
+            ShellIncompleteReason::DynamicShellSource { span },
+            ShellIncompleteReason::UnsupportedConstruct {
+                construct: "test".to_owned(),
+                span: Some(span),
+            },
+            ShellIncompleteReason::LimitExceeded {
+                limit: ShellAnalysisLimitKind::Nodes,
+                maximum: 1,
+            },
+        ] {
+            let encoded = serde_json::to_string(&value).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ShellIncompleteReason>(&encoded).unwrap(),
+                value
+            );
+        }
+        for value in [
+            ShellAnalysisCompleteness::Complete,
+            ShellAnalysisCompleteness::Incomplete {
+                reasons: vec![ShellIncompleteReason::DynamicExecutable { span }],
+            },
+        ] {
+            let encoded = serde_json::to_string(&value).unwrap();
+            assert_eq!(
+                serde_json::from_str::<ShellAnalysisCompleteness>(&encoded).unwrap(),
+                value
+            );
+        }
+    }
+
+    #[test]
+    fn source_span_helpers_cover_empty_and_nonempty_ranges() {
+        let span = ShellSourceSpan::new(2, 7);
+        assert_eq!(span.len(), 5);
+        assert!(!span.is_empty());
+        assert!(ShellSourceSpan::new(4, 4).is_empty());
+        assert!(ShellSourceSpan::new(5, 4).is_empty());
+    }
+
+    #[test]
     fn default_limits_are_bounded() {
         let limits = ShellAnalysisLimits::default();
         assert!(limits.max_source_bytes > 0);

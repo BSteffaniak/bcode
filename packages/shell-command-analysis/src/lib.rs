@@ -534,6 +534,25 @@ impl<'a> Adapter<'a> {
                     assignments.push(self.assignment(assignment)?);
                 }
                 ast::CommandPrefixOrSuffixItem::IoRedirect(redirect) => {
+                    if self.redirections.len().saturating_add(redirects.len())
+                        >= self.request.limits.max_redirections as usize
+                    {
+                        if !self.incomplete.iter().any(|reason| {
+                            matches!(
+                                reason,
+                                ShellIncompleteReason::LimitExceeded {
+                                    limit: ShellAnalysisLimitKind::Redirections,
+                                    ..
+                                }
+                            )
+                        }) {
+                            self.incomplete.push(ShellIncompleteReason::LimitExceeded {
+                                limit: ShellAnalysisLimitKind::Redirections,
+                                maximum: self.request.limits.max_redirections,
+                            });
+                        }
+                        continue;
+                    }
                     let converted = self.convert_redirection(redirect, Some(command_id))?;
                     extend_owned_bounds(bounds, converted.span, &self.char_to_byte);
                     redirects.push(converted);
@@ -1017,7 +1036,9 @@ fn collect_substitutions(pieces: &[word::WordPieceWithSource], substitutions: &m
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_shell_command_analysis_models::{ShellAnalysisLimits, ShellAnalysisRequest};
+    use bcode_shell_command_analysis_models::{
+        ShellAnalysisLimitKind, ShellAnalysisLimits, ShellAnalysisRequest,
+    };
 
     #[test]
     fn rejects_unknown_schema_before_parsing() {
@@ -1096,6 +1117,136 @@ mod tests {
             analysis.redirections[2].kind,
             ShellRedirectionKind::HereDocument
         );
+    }
+
+    #[test]
+    fn traverses_every_posix_control_flow_branch() {
+        for (source, expected) in [
+            ("{ printf brace; }", vec!["printf brace"]),
+            ("(printf subshell)", vec!["printf subshell"]),
+            ("for item in a; do printf loop; done", vec!["printf loop"]),
+            ("case x in x) printf case;; esac", vec!["printf case"]),
+            (
+                "while test -f x; do printf while; done",
+                vec!["test -f x", "printf while"],
+            ),
+            (
+                "until test -f x; do printf until; done",
+                vec!["test -f x", "printf until"],
+            ),
+            (
+                "if true; then printf then; elif false; then printf elif; else printf else; fi",
+                vec!["true", "printf then", "false", "printf elif", "printf else"],
+            ),
+        ] {
+            let analysis = analyze(&ShellAnalysisRequest::posix(source)).unwrap();
+            assert_eq!(
+                analysis
+                    .commands
+                    .iter()
+                    .map(|command| command.source.as_str())
+                    .collect::<Vec<_>>(),
+                expected,
+                "{source}"
+            );
+            assert!(analysis.completeness.is_complete(), "{source}");
+        }
+    }
+
+    #[test]
+    fn marks_every_unsupported_ast_branch_incomplete() {
+        for source in [
+            "name() { printf function; }",
+            "for ((i=0; i<1; i++)); do printf loop; done",
+            "cat <(printf process)",
+            "cat <<< data",
+        ] {
+            let result = analyze(&ShellAnalysisRequest::posix(source));
+            assert!(
+                result.is_err()
+                    || result.is_ok_and(|analysis| !analysis.completeness.is_complete()),
+                "unsupported branch completed: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn converts_every_file_redirection_kind() {
+        for (source, expected) in [
+            ("cat < input", ShellRedirectionKind::Input),
+            ("printf x > output", ShellRedirectionKind::OutputTruncate),
+            ("printf x >| output", ShellRedirectionKind::OutputTruncate),
+            ("printf x >> output", ShellRedirectionKind::OutputAppend),
+            ("cat <> data", ShellRedirectionKind::InputOutput),
+            ("cat 0<&1", ShellRedirectionKind::Duplicate),
+            ("printf x 1>&2", ShellRedirectionKind::Duplicate),
+        ] {
+            let analysis = analyze(&ShellAnalysisRequest::posix(source)).unwrap();
+            assert_eq!(analysis.redirections[0].kind, expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn enforces_each_analysis_limit() {
+        let cases = [
+            (
+                ShellAnalysisLimits {
+                    max_source_bytes: 1,
+                    ..ShellAnalysisLimits::default()
+                },
+                ShellAnalysisLimitKind::SourceBytes,
+            ),
+            (
+                ShellAnalysisLimits {
+                    max_nodes: 1,
+                    ..ShellAnalysisLimits::default()
+                },
+                ShellAnalysisLimitKind::Nodes,
+            ),
+            (
+                ShellAnalysisLimits {
+                    max_nesting_depth: 0,
+                    ..ShellAnalysisLimits::default()
+                },
+                ShellAnalysisLimitKind::NestingDepth,
+            ),
+            (
+                ShellAnalysisLimits {
+                    max_commands: 1,
+                    ..ShellAnalysisLimits::default()
+                },
+                ShellAnalysisLimitKind::Commands,
+            ),
+            (
+                ShellAnalysisLimits {
+                    max_redirections: 0,
+                    ..ShellAnalysisLimits::default()
+                },
+                ShellAnalysisLimitKind::Redirections,
+            ),
+        ];
+        for (limits, kind) in cases {
+            let request = ShellAnalysisRequest {
+                schema_version: SHELL_ANALYSIS_SCHEMA_VERSION,
+                source: "printf a; printf b > output".to_owned(),
+                dialect: ShellDialect::Posix,
+                limits,
+            };
+            match analyze(&request) {
+                Err(error) if kind == ShellAnalysisLimitKind::SourceBytes => {
+                    assert_eq!(error.kind, ShellAnalysisErrorKind::SourceLimitExceeded);
+                }
+                Ok(analysis) => assert!(
+                    matches!(
+                        analysis.completeness,
+                        ShellAnalysisCompleteness::Incomplete { ref reasons }
+                            if reasons.iter().any(|reason| matches!(reason, ShellIncompleteReason::LimitExceeded { limit, .. } if *limit == kind))
+                    ),
+                    "missing {kind:?} result: {analysis:?}"
+                ),
+                result => panic!("unexpected limit result for {kind:?}: {result:?}"),
+            }
+        }
     }
 
     #[test]
