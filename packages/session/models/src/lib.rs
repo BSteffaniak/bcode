@@ -617,6 +617,9 @@ pub struct ExecutionSessionProvenance {
     pub parent_session_id: SessionId,
     /// Context initialization mode.
     pub context_mode: ExecutionSessionContextMode,
+    /// Immutable repository/worktree snapshot identity supplied by its owning domain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_snapshot: Option<String>,
     /// Fixed parent generation for `fixed_generation_fork`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_generation: Option<u64>,

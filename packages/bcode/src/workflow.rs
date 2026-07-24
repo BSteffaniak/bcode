@@ -37,6 +37,7 @@ pub struct AgentStep<I, O> {
     provider: WorkflowProviderFactory,
     strict: bool,
     max_repairs: u32,
+    agent_profile_configured: bool,
     tool_restriction: Option<Vec<String>>,
     read_only_tools: bool,
     resources: Vec<ResourceClaim>,
@@ -51,6 +52,7 @@ impl<I, O> std::fmt::Debug for AgentStep<I, O> {
             .field("name", &self.name)
             .field("strict", &self.strict)
             .field("max_repairs", &self.max_repairs)
+            .field("agent_profile_configured", &self.agent_profile_configured)
             .field("tool_restriction", &self.tool_restriction)
             .field("read_only_tools", &self.read_only_tools)
             .field("resources", &self.resources)
@@ -89,6 +91,7 @@ where
             provider: Arc::new(move || Box::new(provider())),
             strict: true,
             max_repairs: 0,
+            agent_profile_configured: false,
             tool_restriction: None,
             read_only_tools: false,
             resources: Vec::new(),
@@ -101,6 +104,7 @@ where
     #[must_use]
     pub fn agent_id(mut self, agent_id: impl Into<String>) -> Self {
         self.agent = self.agent.agent_id(agent_id);
+        self.agent_profile_configured = true;
         self
     }
 
@@ -181,6 +185,10 @@ where
     }
 
     /// Configure the complete underlying Bcode agent builder.
+    ///
+    /// Prefer [`Self::agent_id`] when the workflow step requires a configured profile for
+    /// mutating authority; this escape hatch intentionally does not assert that a profile was
+    /// explicitly selected.
     #[must_use]
     pub fn configure_agent<F>(mut self, configure: F) -> Self
     where
@@ -188,6 +196,40 @@ where
     {
         self.agent = configure(self.agent);
         self
+    }
+
+    /// Build the policy request for this agent step from immutable execution context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the step requests mutating capability without an explicitly
+    /// configured agent profile or its compiled policy metadata is malformed.
+    pub fn policy_request(
+        &self,
+        initiating: WorkflowToolCapability,
+        requested: WorkflowToolCapability,
+        scope: WorkflowGrantScope,
+        grant: Option<WorkflowPolicyGrant>,
+    ) -> Result<WorkflowPolicyRequest, WorkflowError> {
+        if requested == WorkflowToolCapability::Mutating && !self.agent_profile_configured {
+            return Err(WorkflowError::Build {
+                path: self.name.clone(),
+                message: "mutating workflow nodes require an explicitly configured agent profile"
+                    .to_string(),
+            });
+        }
+        let profile = if self.read_only_tools {
+            WorkflowToolCapability::ReadOnly
+        } else {
+            WorkflowToolCapability::Mutating
+        };
+        Ok(WorkflowPolicyRequest {
+            initiating,
+            profile,
+            node: requested,
+            scope,
+            grant,
+        })
     }
 
     /// Finish this agent step so it can be composed with other typed steps.
@@ -198,6 +240,7 @@ where
         let provider = self.provider;
         let strict = self.strict;
         let max_repairs = self.max_repairs;
+        let agent_profile_configured = self.agent_profile_configured;
         let tool_restriction = self.tool_restriction;
         let read_only_tools = self.read_only_tools;
         let resources = self.resources;
@@ -214,6 +257,7 @@ where
         };
         let configuration = json!({
             "agent_id": agent.profile_id(),
+            "agent_profile_configured": agent_profile_configured,
             "strict": strict,
             "max_repairs": max_repairs,
             "tools": tool_restriction,

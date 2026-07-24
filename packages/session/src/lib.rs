@@ -682,6 +682,24 @@ pub fn shared_execution_session(
     Ok(parent)
 }
 
+/// Owned admission permit for one explicitly shared-sequential execution session.
+///
+/// Holding this value guarantees that no other shared execution admitted through the same
+/// [`SessionManager`] can use the parent session concurrently.
+#[derive(Debug)]
+pub struct SharedExecutionSessionPermit {
+    session_id: SessionId,
+    _permit: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl SharedExecutionSessionPermit {
+    /// Return the serialized parent session target.
+    #[must_use]
+    pub const fn session_id(&self) -> SessionId {
+        self.session_id
+    }
+}
+
 const MAX_EXECUTION_PROVENANCE_ID_BYTES: usize = 512;
 
 fn validate_execution_session_provenance(
@@ -705,6 +723,17 @@ fn validate_execution_session_provenance(
         return Err(SessionError::InvalidExecutionSessionProvenance(
             "attempt must be greater than zero".to_string(),
         ));
+    }
+    if provenance
+        .workspace_snapshot
+        .as_ref()
+        .is_none_or(|snapshot| {
+            snapshot.trim().is_empty() || snapshot.len() > MAX_EXECUTION_PROVENANCE_ID_BYTES
+        })
+    {
+        return Err(SessionError::InvalidExecutionSessionProvenance(format!(
+            "workspace_snapshot must contain 1..={MAX_EXECUTION_PROVENANCE_ID_BYTES} bytes"
+        )));
     }
     match (provenance.context_mode, provenance.parent_generation) {
         (ExecutionSessionContextMode::FixedGenerationFork, None) => {
@@ -1237,6 +1266,7 @@ pub struct SessionManager {
     catalog_status_rx: watch::Receiver<CatalogLoadStatus>,
     mutation_tx: broadcast::Sender<SessionMutationCommitted>,
     migration_operations: migration_operation::SessionMigrationOperations,
+    shared_execution_locks: Arc<Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>>,
     metrics: MetricsRegistry,
 }
 
@@ -1446,6 +1476,7 @@ impl Default for SessionManager {
             catalog_status_rx,
             mutation_tx: broadcast::channel(1024).0,
             migration_operations: migration_operation::SessionMigrationOperations::default(),
+            shared_execution_locks: Arc::new(Mutex::new(BTreeMap::new())),
             metrics: MetricsRegistry::default(),
         }
     }
@@ -1561,6 +1592,7 @@ impl SessionManager {
             catalog_status_rx,
             mutation_tx,
             migration_operations: migration_operation::SessionMigrationOperations::default(),
+            shared_execution_locks: Arc::new(Mutex::new(BTreeMap::new())),
             metrics,
         }
     }
@@ -2626,10 +2658,39 @@ impl SessionManager {
         Ok(session)
     }
 
+    /// Admit one shared-session execution under an exclusive per-parent permit.
+    ///
+    /// The returned permit must remain alive for the full execution. This is the only supported
+    /// admission boundary for `shared_sequential` workflow work.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when provenance is invalid or targets a different parent.
+    pub async fn admit_shared_execution_session(
+        &self,
+        parent: SessionId,
+        provenance: &ExecutionSessionProvenance,
+    ) -> Result<SharedExecutionSessionPermit, SessionError> {
+        let session_id = shared_execution_session(parent, provenance)?;
+        self.session_summary(session_id).await?;
+        let lock = {
+            let mut locks = self.shared_execution_locks.lock().await;
+            Arc::clone(
+                locks
+                    .entry(session_id)
+                    .or_insert_with(|| Arc::new(Mutex::new(()))),
+            )
+        };
+        Ok(SharedExecutionSessionPermit {
+            session_id,
+            _permit: lock.lock_owned().await,
+        })
+    }
+
     /// Create a fresh isolated background execution session.
     ///
-    /// The child inherits the parent's normalized working directory unless `working_directory`
-    /// names an explicit worktree.
+    /// The child inherits the parent's normalized working directory. Call
+    /// [`Self::create_fresh_execution_session_in_worktree`] for an explicitly declared worktree.
     ///
     /// # Errors
     ///
@@ -2644,8 +2705,44 @@ impl SessionManager {
         provenance.context_mode = ExecutionSessionContextMode::FreshIsolated;
         provenance.parent_generation = None;
         let parent = self.session_summary(provenance.parent_session_id).await?;
-        let working_directory =
-            working_directory.unwrap_or_else(|| parent.working_directory.clone());
+        let working_directory = match working_directory {
+            None => parent.working_directory.clone(),
+            Some(working_directory)
+                if normalize_working_directory(&working_directory)
+                    == normalize_working_directory(&parent.working_directory) =>
+            {
+                parent.working_directory.clone()
+            }
+            Some(_) => {
+                return Err(SessionError::InvalidExecutionSessionProvenance(
+                    "fresh child working directory must inherit its parent; use the declared-worktree API for isolation"
+                        .to_string(),
+                ));
+            }
+        };
+        self.create_session_with_execution(name, working_directory, Some(provenance))
+            .await
+    }
+
+    /// Create a fresh isolated execution session in an explicitly declared worktree.
+    ///
+    /// `workspace_snapshot` remains the authoritative immutable snapshot identity, while
+    /// `worktree_directory` is the validated execution location supplied by the worktree owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the parent is unavailable, the worktree directory is not an existing
+    /// directory, provenance is invalid, or persistence fails.
+    pub async fn create_fresh_execution_session_in_worktree(
+        &self,
+        name: Option<String>,
+        mut provenance: ExecutionSessionProvenance,
+        worktree_directory: PathBuf,
+    ) -> Result<SessionSummary, SessionError> {
+        provenance.context_mode = ExecutionSessionContextMode::FreshIsolated;
+        provenance.parent_generation = None;
+        self.session_summary(provenance.parent_session_id).await?;
+        let working_directory = require_declared_worktree_directory(&worktree_directory)?;
         self.create_session_with_execution(name, working_directory, Some(provenance))
             .await
     }
@@ -2666,10 +2763,66 @@ impl SessionManager {
         provenance.context_mode = ExecutionSessionContextMode::FixedGenerationFork;
         provenance.parent_generation = Some(parent_generation);
         let parent = self.session_summary(provenance.parent_session_id).await?;
-        let working_directory =
-            working_directory.unwrap_or_else(|| parent.working_directory.clone());
+        let working_directory = match working_directory {
+            None => parent.working_directory.clone(),
+            Some(working_directory)
+                if normalize_working_directory(&working_directory)
+                    == normalize_working_directory(&parent.working_directory) =>
+            {
+                parent.working_directory.clone()
+            }
+            Some(_) => {
+                return Err(SessionError::InvalidExecutionSessionProvenance(
+                    "fixed-generation child working directory must inherit its parent".to_string(),
+                ));
+            }
+        };
         self.create_session_with_execution(name, working_directory, Some(provenance))
             .await
+    }
+
+    /// Clone a fixed-generation execution session into an explicitly declared worktree.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the parent generation changed, the worktree directory is invalid,
+    /// provenance is invalid, or persistence fails.
+    pub async fn create_fixed_generation_execution_session_in_worktree(
+        &self,
+        name: Option<String>,
+        mut provenance: ExecutionSessionProvenance,
+        parent_generation: u64,
+        worktree_directory: PathBuf,
+    ) -> Result<SessionSummary, SessionError> {
+        provenance.context_mode = ExecutionSessionContextMode::FixedGenerationFork;
+        provenance.parent_generation = Some(parent_generation);
+        let working_directory = require_declared_worktree_directory(&worktree_directory)?;
+        let events = self.session_history(provenance.parent_session_id).await?;
+        let current = events.last().map_or(0, |event| event.sequence);
+        if current != parent_generation {
+            return Err(SessionError::CloneGenerationChanged {
+                session_id: provenance.parent_session_id,
+                expected: parent_generation,
+                current,
+            });
+        }
+        let source = self.session_summary(provenance.parent_session_id).await?;
+        let marker = SessionEventKind::SessionForked {
+            source_session_id: provenance.parent_session_id,
+            source_title: Some(source.display_title().to_string()),
+            source_cutoff_sequence: events.last().map(|event| event.sequence),
+            source_prompt_sequence: None,
+            forked_at_ms: self.next_activity_timestamp_ms(),
+            kind: SessionForkKind::Clone,
+        };
+        self.copy_session_events_with_execution(
+            name,
+            working_directory,
+            events,
+            marker,
+            Some(provenance),
+        )
+        .await
     }
 
     /// Set or clear a persisted composer draft for a session.
@@ -4798,6 +4951,24 @@ fn usize_to_u64(value: usize) -> u64 {
 fn normalize_session_name(name: Option<String>) -> Option<String> {
     name.map(|value| squish_whitespace(&value))
         .filter(|value| !value.is_empty())
+}
+
+fn require_declared_worktree_directory(path: &Path) -> Result<PathBuf, SessionError> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        SessionError::InvalidExecutionSessionProvenance(format!(
+            "declared worktree directory is unavailable: {error}"
+        ))
+    })?;
+    if !metadata.is_dir() {
+        return Err(SessionError::InvalidExecutionSessionProvenance(
+            "declared worktree path is not a directory".to_string(),
+        ));
+    }
+    path.canonicalize().map_err(|error| {
+        SessionError::InvalidExecutionSessionProvenance(format!(
+            "declared worktree directory cannot be canonicalized: {error}"
+        ))
+    })
 }
 
 fn normalize_working_directory(path: &Path) -> PathBuf {
@@ -7739,19 +7910,6 @@ mod tests {
                 .create_session(Some("legacy diff".to_owned()), test_working_directory())
                 .await
                 .expect("session should create");
-            manager
-                .append_event(
-                    session.id,
-                    SessionEventKind::ToolInvocationStream {
-                        event: ToolInvocationStreamEvent::Status {
-                            tool_call_id: "call-1".to_owned(),
-                            sequence: 1,
-                            message: "running".to_owned(),
-                        },
-                    },
-                )
-                .await
-                .expect("durable stream event should append");
             let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
                 .await
                 .expect("fixture database should open");
@@ -7786,12 +7944,18 @@ mod tests {
             })
             .to_string();
             db.database()
-                .update("events")
+                .insert("events")
+                .value("event_seq", switchy::database::DatabaseValue::Int64(1))
+                .value("event_type", "tool_invocation_stream")
+                .value(
+                    "schema_version",
+                    switchy::database::DatabaseValue::Int32(25),
+                )
+                .value("created_at_ms", switchy::database::DatabaseValue::Int64(1))
                 .value("payload", switchy::database::DatabaseValue::String(payload))
-                .where_eq("event_seq", switchy::database::DatabaseValue::Int64(1))
                 .execute(db.database())
                 .await
-                .expect("legacy diff payload should replace status payload");
+                .expect("legacy diff payload should insert");
             db.database()
                 .update("session_storage_contract")
                 .value(
@@ -11149,6 +11313,7 @@ mod tests {
             node_id: "review-a".to_string(),
             attempt: 1,
             parent_session_id: parent.id,
+            workspace_snapshot: Some("snapshot-1".to_string()),
             context_mode: ExecutionSessionContextMode::FreshIsolated,
             parent_generation: None,
         };
@@ -11191,6 +11356,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn two_fixed_generation_reviewers_have_independent_transcripts() {
         let manager = SessionManager::default();
         let parent = manager
@@ -11221,6 +11387,7 @@ mod tests {
             node_id: node_id.to_string(),
             attempt: 1,
             parent_session_id: parent.id,
+            workspace_snapshot: Some("snapshot-1".to_string()),
             context_mode: ExecutionSessionContextMode::FixedGenerationFork,
             parent_generation: Some(generation),
         };
@@ -11242,6 +11409,21 @@ mod tests {
         let right = right.expect("right");
         assert_ne!(left.id, right.id);
         assert_eq!(left.working_directory, right.working_directory);
+        assert_eq!(
+            left.execution
+                .as_ref()
+                .and_then(|execution| execution.provenance.workspace_snapshot.as_deref()),
+            Some("snapshot-1")
+        );
+        assert_eq!(
+            left.execution
+                .as_ref()
+                .and_then(|execution| execution.provenance.workspace_snapshot.as_deref()),
+            right
+                .execution
+                .as_ref()
+                .and_then(|execution| execution.provenance.workspace_snapshot.as_deref())
+        );
         let left_history = manager
             .session_history(left.id)
             .await
@@ -11285,6 +11467,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn undeclared_fresh_directory_is_rejected() {
+        let manager = SessionManager::default();
+        let parent = manager
+            .create_session(Some("parent".to_string()), test_working_directory())
+            .await
+            .expect("parent");
+        let other = unique_temp_dir();
+        std::fs::create_dir_all(&other).expect("other directory");
+        let error = manager
+            .create_fresh_execution_session(
+                Some("invalid".to_string()),
+                ExecutionSessionProvenance {
+                    owner: "workflow".to_string(),
+                    run_id: "run-1".to_string(),
+                    node_id: "review".to_string(),
+                    attempt: 1,
+                    parent_session_id: parent.id,
+                    workspace_snapshot: Some("snapshot-1".to_string()),
+                    context_mode: ExecutionSessionContextMode::FreshIsolated,
+                    parent_generation: None,
+                },
+                Some(other.clone()),
+            )
+            .await
+            .expect_err("undeclared directory rejected");
+        assert!(matches!(
+            error,
+            SessionError::InvalidExecutionSessionProvenance(reason)
+                if reason.contains("declared-worktree")
+        ));
+        std::fs::remove_dir_all(other).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn declared_worktree_execution_uses_canonical_directory() {
+        let manager = SessionManager::default();
+        let parent = manager
+            .create_session(Some("parent".to_string()), test_working_directory())
+            .await
+            .expect("parent");
+        let worktree = unique_temp_dir();
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        let provenance = ExecutionSessionProvenance {
+            owner: "workflow".to_string(),
+            run_id: "run-1".to_string(),
+            node_id: "review".to_string(),
+            attempt: 1,
+            parent_session_id: parent.id,
+            workspace_snapshot: Some("snapshot-1".to_string()),
+            context_mode: ExecutionSessionContextMode::FreshIsolated,
+            parent_generation: None,
+        };
+        let child = manager
+            .create_fresh_execution_session_in_worktree(
+                Some("review".to_string()),
+                provenance,
+                worktree.clone(),
+            )
+            .await
+            .expect("worktree child");
+        assert_eq!(
+            child.working_directory,
+            worktree.canonicalize().expect("canonical worktree")
+        );
+        std::fs::remove_dir_all(worktree).expect("cleanup");
+    }
+
+    #[tokio::test]
+    async fn execution_session_rejects_missing_snapshot_identity() {
+        let manager = SessionManager::default();
+        let parent = manager
+            .create_session(Some("parent".to_string()), test_working_directory())
+            .await
+            .expect("parent");
+        let error = manager
+            .create_fresh_execution_session(
+                Some("invalid".to_string()),
+                ExecutionSessionProvenance {
+                    owner: "workflow".to_string(),
+                    run_id: "run-1".to_string(),
+                    node_id: "review".to_string(),
+                    attempt: 1,
+                    parent_session_id: parent.id,
+                    workspace_snapshot: None,
+                    context_mode: ExecutionSessionContextMode::FreshIsolated,
+                    parent_generation: None,
+                },
+                None,
+            )
+            .await
+            .expect_err("missing snapshot rejected");
+        assert!(matches!(
+            error,
+            SessionError::InvalidExecutionSessionProvenance(reason)
+                if reason.contains("workspace_snapshot")
+        ));
+    }
+
+    #[tokio::test]
     async fn background_execution_provenance_survives_persistent_restore() {
         let root = unique_temp_dir();
         let child_id;
@@ -11303,6 +11584,7 @@ mod tests {
                         node_id: "review".to_string(),
                         attempt: 1,
                         parent_session_id: parent.id,
+                        workspace_snapshot: Some("snapshot-1".to_string()),
                         context_mode: ExecutionSessionContextMode::FreshIsolated,
                         parent_generation: None,
                     },
@@ -11361,6 +11643,7 @@ mod tests {
             node_id: "review-a".to_string(),
             attempt: 1,
             parent_session_id: parent.id,
+            workspace_snapshot: Some("snapshot-1".to_string()),
             context_mode: ExecutionSessionContextMode::FixedGenerationFork,
             parent_generation: Some(generation),
         };
@@ -11415,6 +11698,44 @@ mod tests {
         assert!(matches!(stale, SessionError::CloneGenerationChanged { .. }));
     }
 
+    #[tokio::test]
+    async fn shared_execution_admission_serializes_one_parent() {
+        let manager = SessionManager::default();
+        let parent = manager
+            .create_session(Some("parent".to_string()), test_working_directory())
+            .await
+            .expect("parent");
+        let provenance = ExecutionSessionProvenance {
+            owner: "workflow".to_string(),
+            run_id: "run-1".to_string(),
+            node_id: "sequential".to_string(),
+            attempt: 1,
+            parent_session_id: parent.id,
+            workspace_snapshot: Some("snapshot-1".to_string()),
+            context_mode: ExecutionSessionContextMode::SharedSequential,
+            parent_generation: None,
+        };
+        let first = manager
+            .admit_shared_execution_session(parent.id, &provenance)
+            .await
+            .expect("first permit");
+        assert_eq!(first.session_id(), parent.id);
+        let waiting = {
+            let manager = manager.clone();
+            let provenance = provenance.clone();
+            tokio::spawn(async move {
+                manager
+                    .admit_shared_execution_session(parent.id, &provenance)
+                    .await
+                    .expect("second permit")
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished());
+        drop(first);
+        assert_eq!(waiting.await.expect("join").session_id(), parent.id);
+    }
+
     #[test]
     fn shared_execution_requires_declared_parent_and_no_child() {
         let parent = SessionId::new();
@@ -11424,6 +11745,7 @@ mod tests {
             node_id: "sequential".to_string(),
             attempt: 1,
             parent_session_id: parent,
+            workspace_snapshot: Some("snapshot-1".to_string()),
             context_mode: ExecutionSessionContextMode::SharedSequential,
             parent_generation: None,
         };

@@ -1,6 +1,9 @@
 #![cfg(feature = "testing")]
 
-use bcode::workflow::{WorkflowBuilder, agent};
+use bcode::workflow::{
+    WorkflowApprovalResolver, WorkflowBuilder, WorkflowGrantScope, WorkflowPolicyGrant,
+    WorkflowToolCapability, agent, authorize_workflow_policy,
+};
 
 use bcode::{
     ProviderError, ProviderErrorCategory, ProviderTurnEvent, StopReason, ToolApplicationError,
@@ -150,6 +153,83 @@ async fn agent_step_requests_and_validates_structured_output() {
             .configuration["agent_id"],
         "plan"
     );
+}
+
+#[tokio::test]
+async fn mutating_agent_step_requires_profile_and_bounded_grant() {
+    let scope = WorkflowGrantScope {
+        definition: "commit-flow".to_string(),
+        definition_version: 1,
+        workspace: "snapshot-1".to_string(),
+        node: "commit".to_string(),
+        run: Some("run-1".to_string()),
+    };
+    let unconfigured = agent::<ReviewTask, Review, _, _>("commit", || {
+        bcode::testing::ScriptedProvider::new([ScriptedProviderTurn::complete_text(
+            r#"{"approved":true}"#,
+        )])
+    });
+    let error = unconfigured
+        .policy_request(
+            WorkflowToolCapability::ReadOnly,
+            WorkflowToolCapability::Mutating,
+            scope.clone(),
+            None,
+        )
+        .expect_err("implicit build profile cannot authorize mutation");
+    assert!(error.to_string().contains("configured agent profile"));
+
+    let configured = agent::<ReviewTask, Review, _, _>("commit", || {
+        bcode::testing::ScriptedProvider::new([ScriptedProviderTurn::complete_text(
+            r#"{"approved":true}"#,
+        )])
+    })
+    .agent_id("build");
+    let request = configured
+        .policy_request(
+            WorkflowToolCapability::ReadOnly,
+            WorkflowToolCapability::Mutating,
+            scope.clone(),
+            None,
+        )
+        .expect("configured request");
+    struct Resolver(Option<WorkflowPolicyGrant>);
+    impl WorkflowApprovalResolver for Resolver {
+        fn request_approval<'a>(
+            &'a self,
+            _capability: WorkflowToolCapability,
+            _scope: &'a WorkflowGrantScope,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            Option<WorkflowPolicyGrant>,
+                            bcode::workflow::WorkflowError,
+                        >,
+                    > + Send
+                    + 'a,
+            >,
+        > {
+            let grant = self.0.clone();
+            Box::pin(async move { Ok(grant) })
+        }
+    }
+
+    let denied = authorize_workflow_policy(&request, &Resolver(None))
+        .await
+        .expect_err("approval is mandatory");
+    assert!(denied.to_string().contains("not approved"));
+
+    let grant = WorkflowPolicyGrant {
+        grant_id: "approval-1".to_string(),
+        scope,
+        capability: WorkflowToolCapability::Mutating,
+    };
+    let (effective, audit) = authorize_workflow_policy(&request, &Resolver(Some(grant)))
+        .await
+        .expect("bounded approval");
+    assert_eq!(effective, WorkflowToolCapability::Mutating);
+    assert!(audit.contains("grant=approval-1"));
 }
 
 #[tokio::test]

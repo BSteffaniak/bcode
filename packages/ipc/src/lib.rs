@@ -2164,8 +2164,8 @@ mod tests {
             text: "continue".to_string(),
             admission,
         };
-        let encoded = encode(&request).expect("request should encode");
-        let decoded: Request = decode(&encoded).expect("request should decode");
+        let encoded = encode_request(&request).expect("request should encode");
+        let decoded = decode_request(&encoded).expect("request should decode");
         assert_eq!(decoded, request);
 
         let response = Response::Ok(ResponsePayload::TurnAdmission {
@@ -2173,8 +2173,8 @@ mod tests {
                 bcode_session_models::TurnReceipt::from_accepted_event(session_id, 42),
             ),
         });
-        let encoded = encode(&response).expect("response should encode");
-        let decoded: Response = decode(&encoded).expect("response should decode");
+        let encoded = encode_response(&response).expect("response should encode");
+        let decoded = decode_response(&encoded).expect("response should decode");
         assert_eq!(decoded, response);
     }
 
