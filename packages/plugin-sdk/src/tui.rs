@@ -64,6 +64,9 @@ pub struct PluginWorkflowStartRequest {
     pub definition_id: String,
     pub definition_version: u32,
     pub definition: serde_json::Value,
+    /// Optional stable run identity chosen by the plugin for crash-safe start retries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     pub workspace_snapshot: String,
     pub parent_session_id: SessionId,
     pub input: serde_json::Value,

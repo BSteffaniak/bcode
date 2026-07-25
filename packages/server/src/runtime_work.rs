@@ -162,16 +162,19 @@ impl RuntimeWorkManager {
     }
 
     /// Register active work and return whether it should be advertised as cancellable.
-    pub async fn start(&self, session_id: SessionId, spec: RuntimeWorkSpec) -> bool {
+    ///
+    /// The boolean tuple is `(cancellable, newly_registered)`. Re-registering an existing exact
+    /// identity replaces its cancellation handle without creating another durable start event.
+    pub async fn start(&self, session_id: SessionId, spec: RuntimeWorkSpec) -> (bool, bool) {
         let cancellable = spec.cancellation.is_cancellable();
-        self.active.lock().await.insert(
+        let replaced = self.active.lock().await.insert(
             (session_id, spec.work_id.clone()),
             ActiveRuntimeWork {
                 spec,
                 cancelled: false,
             },
         );
-        cancellable
+        (cancellable, replaced.is_none())
     }
 
     /// Replace the cancellation handle for existing active work.
@@ -391,10 +394,11 @@ mod tests {
         let count = Arc::new(AtomicUsize::new(0));
         let work_id = WorkId::new("work");
 
-        assert!(
+        assert_eq!(
             manager
                 .start(session_id, test_spec("work", Arc::clone(&count)))
-                .await
+                .await,
+            (true, true)
         );
         assert_eq!(manager.active_for_session(session_id).await.len(), 1);
         assert!(

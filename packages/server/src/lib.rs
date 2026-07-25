@@ -10010,30 +10010,47 @@ async fn handle_start_workflow_run(
     writer: &SharedWriter,
     request: bcode_ipc::WorkflowRunStartRequest,
 ) -> Result<(), ServerError> {
+    let started = start_workflow_run(state, request).await?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowRunStarted(started)),
+    )
+    .await
+}
+
+async fn start_workflow_run(
+    state: &Arc<ServerState>,
+    request: bcode_ipc::WorkflowRunStartRequest,
+) -> Result<bcode_ipc::WorkflowRunStartResponse, ServerError> {
     let parent_session = state
         .sessions
         .session_summary(request.parent_session_id)
         .await?;
-    let run_id = uuid::Uuid::new_v4().to_string();
+    let run_id = request
+        .run_id
+        .clone()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let created_at_ms = current_unix_millis();
+    let new_run = bcode_workflow_store::NewWorkflowRun {
+        run_id: run_id.clone(),
+        definition_id: request.definition_id.clone(),
+        definition_version: request.definition_version,
+        workspace_snapshot: request.workspace_snapshot,
+        parent_session_id: Some(request.parent_session_id.to_string()),
+        input: request.input,
+        created_at_ms,
+        limits: request.limits,
+    };
     let run = {
         let mut store = state
             .workflow_store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        store.create_run(&bcode_workflow_store::NewWorkflowRun {
-            run_id: run_id.clone(),
-            definition_id: request.definition_id.clone(),
-            definition_version: request.definition_version,
-            workspace_snapshot: request.workspace_snapshot,
-            parent_session_id: Some(request.parent_session_id.to_string()),
-            input: request.input,
-            created_at_ms,
-            limits: request.limits,
-        })?;
+        let _created = store.create_run_idempotent(&new_run)?;
         store
             .run_summary(&run_id)?
-            .expect("newly created workflow run must be readable")
+            .expect("created or existing workflow run must be readable")
     };
     let runtime_work_id = register_workflow_runtime_work(
         state,
@@ -10046,17 +10063,10 @@ async fn handle_start_workflow_run(
     )
     .await;
     drive_workflow_run(state, &run_id).await?;
-    send_response(
-        writer,
-        request_id,
-        Response::Ok(ResponsePayload::WorkflowRunStarted(
-            bcode_ipc::WorkflowRunStartResponse {
-                run,
-                runtime_work_id,
-            },
-        )),
-    )
-    .await
+    Ok(bcode_ipc::WorkflowRunStartResponse {
+        run,
+        runtime_work_id,
+    })
 }
 
 async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<(), ServerError> {
@@ -20096,18 +20106,21 @@ async fn append_system_event(state: &ServerState, session_id: SessionId, text: S
 async fn register_runtime_work(state: &ServerState, session_id: SessionId, spec: RuntimeWorkSpec) {
     let work_id = spec.work_id.clone();
     let kind = spec.kind;
-    state.metrics.add_counter_with_labels(
-        "runtime_work.started_total",
-        1,
-        runtime_work_metric_labels(kind, None),
-    );
     let label = spec.label.clone();
     let tool_call_id = spec.tool_call_id.clone();
     let plugin_id = spec.plugin_id.clone();
     let service_interface = spec.service_interface.clone();
     let operation = spec.operation.clone();
     let parent_work_id = spec.parent_work_id.clone();
-    let cancellable = state.runtime_work.start(session_id, spec).await;
+    let (cancellable, newly_registered) = state.runtime_work.start(session_id, spec).await;
+    if !newly_registered {
+        return;
+    }
+    state.metrics.add_counter_with_labels(
+        "runtime_work.started_total",
+        1,
+        runtime_work_metric_labels(kind, None),
+    );
     match state
         .sessions
         .append_runtime_work_started(
@@ -20353,12 +20366,49 @@ async fn observe_workflow_turn(
                 },
             })
         }
-        ModelTurnOutcome::Cancelled => Ok(bcode_workflow_store::AttemptObservation::Failed {
-            message: "workflow model turn was cancelled; explicit resume/retry is required"
-                .to_string(),
+        ModelTurnOutcome::Cancelled => {
+            let run = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .run_summary(&request.run_id)?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData("workflow run not found".to_string())
+                })?;
+            if run.cancellation_requested_at_ms.is_some() {
+                Ok(bcode_workflow_store::AttemptObservation::Cancelled)
+            } else {
+                Ok(bcode_workflow_store::AttemptObservation::Paused {
+                    reason: bcode_workflow_store::AttemptPauseReason::Steering,
+                    message: message.unwrap_or_else(|| {
+                        "workflow model turn was cancelled for steering; explicit resume is required"
+                            .to_string()
+                    }),
+                })
+            }
+        }
+        ModelTurnOutcome::ProviderUnavailable => {
+            Ok(bcode_workflow_store::AttemptObservation::Paused {
+                reason: bcode_workflow_store::AttemptPauseReason::ProviderUnavailable,
+                message: message.unwrap_or_else(|| "model provider unavailable".to_string()),
+            })
+        }
+        ModelTurnOutcome::IdleTimeout => Ok(bcode_workflow_store::AttemptObservation::Paused {
+            reason: bcode_workflow_store::AttemptPauseReason::IdleTimeout,
+            message: message
+                .unwrap_or_else(|| "workflow model turn reached its idle timeout".to_string()),
         }),
-        _ => Ok(bcode_workflow_store::AttemptObservation::Failed {
-            message: message.unwrap_or_else(|| format!("workflow model turn ended: {outcome:?}")),
+        ModelTurnOutcome::ToolRoundLimitReached => {
+            Ok(bcode_workflow_store::AttemptObservation::Paused {
+                reason: bcode_workflow_store::AttemptPauseReason::ToolRoundLimitReached,
+                message: message.unwrap_or_else(|| {
+                    "workflow model turn reached its tool-round limit".to_string()
+                }),
+            })
+        }
+        ModelTurnOutcome::Error => Ok(bcode_workflow_store::AttemptObservation::Failed {
+            message: message
+                .unwrap_or_else(|| "workflow model turn ended with an error".to_string()),
         }),
     }
 }
@@ -20974,11 +21024,34 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
     }
     match bcode_workflow_store::WorkflowStore::open_at_path(&store_path) {
         Ok(mut store) => {
-            if let Err(error) = store
+            let reconciliation = store
                 .reconcile_receipt_backed_attempts_async(&observer, 1_000, current_unix_millis())
-                .await
-            {
-                tracing::warn!("failed to reconcile workflow attempts at startup: {error}");
+                .await;
+            match reconciliation {
+                Ok(summary) => {
+                    let resumable_runs = summary
+                        .succeeded
+                        .iter()
+                        .filter_map(|identity| {
+                            attempts
+                                .iter()
+                                .find(|attempt| &attempt.dispatch_identity == identity)
+                                .map(|attempt| attempt.run_id.clone())
+                        })
+                        .collect::<BTreeSet<_>>();
+                    drop(store);
+                    for run_id in resumable_runs {
+                        if let Err(error) = drive_workflow_run(state, &run_id).await {
+                            tracing::warn!(
+                                run_id,
+                                "failed to continue reconciled workflow: {error}"
+                            );
+                        }
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!("failed to reconcile workflow attempts at startup: {error}");
+                }
             }
         }
         Err(error) => tracing::warn!("failed to open workflow store at startup: {error}"),
@@ -34836,6 +34909,236 @@ library = "test"
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn startup_restore_advances_completed_loop_and_does_not_redispatch_paused_outcome() {
+        for paused in [false, true] {
+            let session_root = tempfile::tempdir().expect("session root");
+            let workflow_root = tempfile::tempdir().expect("workflow root");
+            let sessions = SessionManager::persistent_lazy(session_root.path());
+            let parent = sessions
+                .create_session(Some("loop parent".to_string()), PathBuf::from("."))
+                .await
+                .expect("parent");
+            let run_id = if paused {
+                "loop-restore-paused"
+            } else {
+                "loop-restore-completed"
+            };
+            let schema = bcode_workflow::ValueSchema {
+                type_name: "bcode.loop.iteration/v1".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["condition_met"],
+                    "properties": {"condition_met": {"type": "boolean"}}
+                }),
+            };
+            let implementation = bcode_workflow::NodeDefinition {
+                id: "loop.implementation".to_string(),
+                name: "loop implementation".to_string(),
+                kind: bcode_workflow::NodeKind::Agent,
+                input: schema.clone(),
+                output: schema.clone(),
+                resources: Vec::new(),
+                configuration: serde_json::json!({
+                    "prompt_mode": "json_input",
+                    "loop_role": "implementation",
+                    "system_prompt": "test",
+                    "read_only": true,
+                }),
+            };
+            let repeat = bcode_workflow::NodeDefinition {
+                id: "loop.repeat".to_string(),
+                name: "loop repeat".to_string(),
+                kind: bcode_workflow::NodeKind::Repeat,
+                input: schema.clone(),
+                output: schema.clone(),
+                resources: Vec::new(),
+                configuration: serde_json::json!({
+                    "predicate": {
+                        "operation": "equals",
+                        "path": "condition_met",
+                        "value": false
+                    },
+                    "max_iterations": 2
+                }),
+            };
+            let definition = bcode_workflow::WorkflowDefinition {
+                schema_version: 1,
+                name: "bcode.loop".to_string(),
+                input: schema.clone(),
+                output: schema,
+                nodes: BTreeMap::from([
+                    (implementation.id.clone(), implementation),
+                    (repeat.id.clone(), repeat),
+                ]),
+                entries: vec!["loop.implementation".to_string()],
+                exits: vec!["loop.repeat".to_string()],
+                edges: vec![
+                    bcode_workflow::EdgeDefinition {
+                        from: "loop.implementation".to_string(),
+                        to: "loop.repeat".to_string(),
+                        kind: bcode_workflow::EdgeKind::Direct,
+                    },
+                    bcode_workflow::EdgeDefinition {
+                        from: "loop.repeat".to_string(),
+                        to: "loop.implementation".to_string(),
+                        kind: bcode_workflow::EdgeKind::Back {
+                            predicate: bcode_workflow::PredicateExpression::Equals {
+                                path: "condition_met".to_string(),
+                                value: serde_json::json!(false),
+                            },
+                            max_iterations: 2,
+                        },
+                    },
+                ],
+            };
+            let mut store =
+                bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                    .expect("store");
+            store
+                .persist_definition("bcode.loop", 1, &definition)
+                .expect("definition");
+            store
+                .create_run(&bcode_workflow_store::NewWorkflowRun {
+                    run_id: run_id.to_string(),
+                    definition_id: "bcode.loop".to_string(),
+                    definition_version: 1,
+                    workspace_snapshot: "snapshot".to_string(),
+                    parent_session_id: Some(parent.id.to_string()),
+                    input: Some(serde_json::json!({"condition_met": false})),
+                    created_at_ms: 1,
+                    limits: bcode_workflow_store::WorkflowRunLimits::default(),
+                })
+                .expect("run");
+            let pending = store
+                .pending_activations(1)
+                .expect("pending")
+                .pop()
+                .expect("activation");
+            let prepared = store
+                .prepare_pending_activation(
+                    &pending.run_id,
+                    &pending.node_id,
+                    &pending.activation_id,
+                    bcode_workflow_store::DispatchSideEffect::ReadOnly,
+                    serde_json::json!({"owner": "test"}),
+                    2,
+                )
+                .expect("prepare")
+                .expect("prepared");
+            let child = sessions
+                .create_fresh_execution_session(
+                    Some("loop child".to_string()),
+                    ExecutionSessionProvenance {
+                        owner: "bcode.workflow".to_string(),
+                        run_id: run_id.to_string(),
+                        node_id: prepared.activation.node_id.clone(),
+                        attempt: prepared.attempt,
+                        parent_session_id: parent.id,
+                        context_mode:
+                            bcode_session_models::ExecutionSessionContextMode::FreshIsolated,
+                        workspace_snapshot: Some("snapshot".to_string()),
+                        parent_generation: None,
+                    },
+                    None,
+                )
+                .await
+                .expect("child");
+            let turn_id = format!("{}-1", child.id);
+            if !paused {
+                sessions
+                    .append_assistant_message(
+                        child.id,
+                        serde_json::json!({"condition_met": false}).to_string(),
+                    )
+                    .await
+                    .expect("output");
+            }
+            sessions
+                .append_model_turn_finished(
+                    child.id,
+                    turn_id.clone(),
+                    if paused {
+                        ModelTurnOutcome::ProviderUnavailable
+                    } else {
+                        ModelTurnOutcome::Completed
+                    },
+                    None,
+                )
+                .await
+                .expect("terminal");
+            store
+                .persist_dispatch_receipt(&bcode_workflow_store::DispatchReceipt {
+                    run_id: prepared.activation.run_id,
+                    node_id: prepared.activation.node_id,
+                    activation_id: prepared.activation.activation_id,
+                    attempt: prepared.attempt,
+                    dispatch_identity: prepared.dispatch_identity.clone(),
+                    receipt: serde_json::json!({
+                        "session_id": child.id,
+                        "turn_id": turn_id,
+                        "output_schema_id": "bcode.loop.iteration/v1",
+                    }),
+                    admitted_at_ms: 3,
+                })
+                .expect("receipt");
+            let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+                sessions, store,
+            ));
+
+            restore_workflow_runtime_work(&state).await;
+            restore_workflow_runtime_work(&state).await;
+
+            let (run_status, attempts, pending_count) = {
+                let store = state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (
+                    store
+                        .run_summary(run_id)
+                        .expect("summary")
+                        .expect("run")
+                        .status,
+                    store.attempt_history(run_id, None, 10).expect("attempts"),
+                    store.pending_activations(10).expect("pending").len(),
+                )
+            };
+            if paused {
+                assert_eq!(run_status, bcode_workflow_store::RunStatus::Paused);
+                assert_eq!(attempts.len(), 1);
+                assert_eq!(attempts[0].status, "paused");
+                assert_eq!(
+                    pending_count, 0,
+                    "paused runs do not redispatch before explicit resume"
+                );
+            } else {
+                assert!(matches!(
+                    run_status,
+                    bcode_workflow_store::RunStatus::Running
+                        | bcode_workflow_store::RunStatus::Completed
+                ));
+                assert_eq!(attempts.len(), 2);
+                assert!(attempts.iter().all(|attempt| attempt.attempt == 1));
+                assert!(attempts.iter().any(|attempt| attempt.status == "succeeded"));
+                let children = state
+                    .sessions
+                    .all_session_summaries()
+                    .await
+                    .into_iter()
+                    .filter(|session| {
+                        session
+                            .execution
+                            .as_ref()
+                            .is_some_and(|execution| execution.provenance.run_id == run_id)
+                    })
+                    .count();
+                assert_eq!(children, 1);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn existing_admission_does_not_enqueue_duplicate_turn() {
         let sessions = SessionManager::default();
         let session = sessions
@@ -35016,6 +35319,268 @@ library = "test"
                 .status,
             bcode_workflow_store::RunStatus::Completed
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn workflow_turn_observer_preserves_loop_outcome_semantics() {
+        struct Scenario {
+            outcome: ModelTurnOutcome,
+            cancellation_requested: bool,
+            expected_status: &'static str,
+            expected_run_status: bcode_workflow_store::RunStatus,
+            expected_pause_reason: Option<bcode_workflow_store::AttemptPauseReason>,
+        }
+
+        let scenarios = [
+            Scenario {
+                outcome: ModelTurnOutcome::Completed,
+                cancellation_requested: false,
+                expected_status: "succeeded",
+                expected_run_status: bcode_workflow_store::RunStatus::Completed,
+                expected_pause_reason: None,
+            },
+            Scenario {
+                outcome: ModelTurnOutcome::Cancelled,
+                cancellation_requested: false,
+                expected_status: "paused",
+                expected_run_status: bcode_workflow_store::RunStatus::Paused,
+                expected_pause_reason: Some(bcode_workflow_store::AttemptPauseReason::Steering),
+            },
+            Scenario {
+                outcome: ModelTurnOutcome::Cancelled,
+                cancellation_requested: true,
+                expected_status: "cancelled",
+                expected_run_status: bcode_workflow_store::RunStatus::Running,
+                expected_pause_reason: None,
+            },
+            Scenario {
+                outcome: ModelTurnOutcome::ProviderUnavailable,
+                cancellation_requested: false,
+                expected_status: "paused",
+                expected_run_status: bcode_workflow_store::RunStatus::Paused,
+                expected_pause_reason: Some(
+                    bcode_workflow_store::AttemptPauseReason::ProviderUnavailable,
+                ),
+            },
+            Scenario {
+                outcome: ModelTurnOutcome::IdleTimeout,
+                cancellation_requested: false,
+                expected_status: "paused",
+                expected_run_status: bcode_workflow_store::RunStatus::Paused,
+                expected_pause_reason: Some(bcode_workflow_store::AttemptPauseReason::IdleTimeout),
+            },
+            Scenario {
+                outcome: ModelTurnOutcome::Error,
+                cancellation_requested: false,
+                expected_status: "failed",
+                expected_run_status: bcode_workflow_store::RunStatus::Failed,
+                expected_pause_reason: None,
+            },
+            Scenario {
+                outcome: ModelTurnOutcome::ToolRoundLimitReached,
+                cancellation_requested: false,
+                expected_status: "paused",
+                expected_run_status: bcode_workflow_store::RunStatus::Paused,
+                expected_pause_reason: Some(
+                    bcode_workflow_store::AttemptPauseReason::ToolRoundLimitReached,
+                ),
+            },
+        ];
+
+        for (index, scenario) in scenarios.into_iter().enumerate() {
+            let sessions = SessionManager::default();
+            let parent = sessions
+                .create_session(Some("loop parent".to_string()), PathBuf::from("."))
+                .await
+                .expect("parent");
+            let workflow_root = tempfile::tempdir().expect("workflow root");
+            let mut store =
+                bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                    .expect("store");
+            let run_id = format!("loop-outcome-{index}");
+            let schema = bcode_workflow::ValueSchema {
+                type_name: "bcode.loop.iteration/v1".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["condition_met"],
+                    "properties": {"condition_met": {"type": "boolean"}}
+                }),
+            };
+            let definition = bcode_workflow::WorkflowDefinition {
+                schema_version: 1,
+                name: "bcode.loop".to_string(),
+                input: schema.clone(),
+                output: schema.clone(),
+                nodes: BTreeMap::from([(
+                    "loop.implementation".to_string(),
+                    bcode_workflow::NodeDefinition {
+                        id: "loop.implementation".to_string(),
+                        name: "loop implementation".to_string(),
+                        kind: bcode_workflow::NodeKind::Agent,
+                        input: schema.clone(),
+                        output: schema,
+                        resources: Vec::new(),
+                        configuration: serde_json::json!({
+                            "prompt_mode": "json_input",
+                            "loop_role": "implementation",
+                            "system_prompt": "test",
+                            "read_only": true,
+                        }),
+                    },
+                )]),
+                entries: vec!["loop.implementation".to_string()],
+                exits: vec!["loop.implementation".to_string()],
+                edges: Vec::new(),
+            };
+            store
+                .persist_definition("bcode.loop", 1, &definition)
+                .expect("definition");
+            store
+                .create_run(&bcode_workflow_store::NewWorkflowRun {
+                    run_id: run_id.clone(),
+                    definition_id: "bcode.loop".to_string(),
+                    definition_version: 1,
+                    workspace_snapshot: "snapshot".to_string(),
+                    parent_session_id: Some(parent.id.to_string()),
+                    input: Some(serde_json::json!({"condition_met": false})),
+                    created_at_ms: 1,
+                    limits: bcode_workflow_store::WorkflowRunLimits::default(),
+                })
+                .expect("run");
+            let pending = store
+                .pending_activations(1)
+                .expect("pending")
+                .pop()
+                .expect("activation");
+            let prepared = store
+                .prepare_pending_activation(
+                    &pending.run_id,
+                    &pending.node_id,
+                    &pending.activation_id,
+                    bcode_workflow_store::DispatchSideEffect::ReadOnly,
+                    serde_json::json!({"owner": "test"}),
+                    2,
+                )
+                .expect("prepare")
+                .expect("prepared");
+            let provenance = ExecutionSessionProvenance {
+                owner: "bcode.workflow".to_string(),
+                run_id: run_id.clone(),
+                node_id: prepared.activation.node_id.clone(),
+                attempt: prepared.attempt,
+                parent_session_id: parent.id,
+                context_mode: bcode_session_models::ExecutionSessionContextMode::FreshIsolated,
+                workspace_snapshot: Some("snapshot".to_string()),
+                parent_generation: None,
+            };
+            let child = sessions
+                .create_fresh_execution_session(Some("loop child".to_string()), provenance, None)
+                .await
+                .expect("child");
+            let turn_id = format!("{}-1", child.id);
+            if scenario.outcome == ModelTurnOutcome::Completed {
+                sessions
+                    .append_assistant_message(
+                        child.id,
+                        serde_json::json!({"condition_met": true}).to_string(),
+                    )
+                    .await
+                    .expect("output");
+            }
+            sessions
+                .append_model_turn_finished(
+                    child.id,
+                    turn_id.clone(),
+                    scenario.outcome,
+                    Some(format!("test {:?}", scenario.outcome)),
+                )
+                .await
+                .expect("terminal");
+            store
+                .persist_dispatch_receipt(&bcode_workflow_store::DispatchReceipt {
+                    run_id: prepared.activation.run_id,
+                    node_id: prepared.activation.node_id,
+                    activation_id: prepared.activation.activation_id,
+                    attempt: prepared.attempt,
+                    dispatch_identity: prepared.dispatch_identity.clone(),
+                    receipt: serde_json::json!({
+                        "session_id": child.id,
+                        "turn_id": turn_id,
+                        "output_schema_id": "bcode.loop.iteration/v1",
+                    }),
+                    admitted_at_ms: 3,
+                })
+                .expect("receipt");
+            if scenario.cancellation_requested {
+                assert!(store.request_cancellation(&run_id, 4).expect("cancel"));
+            }
+            let mut state = test_server_state(sessions);
+            state.workflow_store = StdMutex::new(
+                bcode_workflow_store::WorkflowStore::open_at_path(store.path())
+                    .expect("observer store"),
+            );
+            let request = store
+                .active_attempts(1)
+                .expect("attempt")
+                .pop()
+                .expect("active attempt");
+            let observation = observe_workflow_turn(
+                &state,
+                child.id,
+                &turn_id,
+                "bcode.loop.iteration/v1",
+                &request,
+            )
+            .await
+            .expect("observe");
+            match (&observation, scenario.expected_pause_reason) {
+                (
+                    bcode_workflow_store::AttemptObservation::Paused { reason, .. },
+                    Some(expected),
+                ) => assert_eq!(*reason, expected),
+                (_, None) => {}
+                _ => panic!("unexpected observation: {observation:?}"),
+            }
+            let summary = store
+                .apply_attempt_observation(&request.dispatch_identity, observation, 5)
+                .expect("persist observation");
+            assert_eq!(
+                store.attempt_history(&run_id, None, 1).expect("history")[0].status,
+                scenario.expected_status
+            );
+            assert_eq!(
+                store
+                    .run_summary(&run_id)
+                    .expect("summary")
+                    .expect("run")
+                    .status,
+                scenario.expected_run_status
+            );
+            if scenario.expected_status == "paused" {
+                assert_eq!(
+                    summary.paused.as_slice(),
+                    std::slice::from_ref(&prepared.dispatch_identity)
+                );
+                assert!(store.resume_run(&run_id, 6).expect("resume"));
+                let resumed = store.pending_activations(1).expect("resumed pending");
+                assert_eq!(resumed.len(), 1);
+                assert_eq!(resumed[0].activation_id, pending.activation_id);
+                let retried = store
+                    .prepare_pending_activation(
+                        &resumed[0].run_id,
+                        &resumed[0].node_id,
+                        &resumed[0].activation_id,
+                        bcode_workflow_store::DispatchSideEffect::ReadOnly,
+                        serde_json::json!({"owner": "test-resume"}),
+                        7,
+                    )
+                    .expect("prepare resumed attempt")
+                    .expect("resumed attempt");
+                assert_eq!(retried.attempt, 2);
+                assert_ne!(retried.dispatch_identity, prepared.dispatch_identity);
+            }
+        }
     }
 
     #[tokio::test]
@@ -35888,6 +36453,84 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     } if started == &work_id
                 ))
         );
+    }
+
+    #[tokio::test]
+    async fn workflow_start_with_stable_identity_is_idempotent_and_conflicts_fail_closed() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("workflow".to_string()), PathBuf::from("."))
+            .await
+            .expect("session");
+        let state = Arc::new(test_server_state(sessions));
+        let definition = bcode_workflow::WorkflowBuilder::new(
+            "stable-start",
+            bcode_workflow::Step::task("node", |value: u32, _context| async move { Ok(value) }),
+        )
+        .build()
+        .expect("workflow")
+        .definition()
+        .clone();
+        state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .persist_definition("stable-start", 1, &definition)
+            .expect("definition");
+        let request = bcode_ipc::WorkflowRunStartRequest {
+            definition_id: "stable-start".to_string(),
+            definition_version: 1,
+            run_id: Some("plugin-stable-run".to_string()),
+            workspace_snapshot: "snapshot-1".to_string(),
+            parent_session_id: session.id,
+            input: Some(serde_json::json!(1)),
+            limits: bcode_workflow_store::WorkflowRunLimits::default(),
+        };
+
+        let first = start_workflow_run(&state, request.clone())
+            .await
+            .expect("first start");
+        let second = start_workflow_run(&state, request.clone())
+            .await
+            .expect("idempotent retry");
+        assert_eq!(first.run, second.run);
+        assert_eq!(first.runtime_work_id, second.runtime_work_id);
+        assert_eq!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .list_runs(10)
+                .expect("runs")
+                .len(),
+            1
+        );
+        let started_events = state
+            .sessions
+            .session_history(session.id)
+            .await
+            .expect("history")
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    &event.kind,
+                    SessionEventKind::RuntimeWorkStarted { work_id, .. }
+                        if work_id == &first.runtime_work_id
+                )
+            })
+            .count();
+        assert_eq!(started_events, 1);
+
+        let conflict = start_workflow_run(
+            &state,
+            bcode_ipc::WorkflowRunStartRequest {
+                workspace_snapshot: "different-snapshot".to_string(),
+                ..request
+            },
+        )
+        .await
+        .expect_err("identity conflict");
+        assert!(conflict.to_string().contains("identity conflicts"));
     }
 
     #[tokio::test]

@@ -379,6 +379,20 @@ pub struct AttemptReconciliationRequest {
     pub receipt: serde_json::Value,
 }
 
+/// Recoverable owner outcome that pauses a workflow attempt without treating it as success.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptPauseReason {
+    /// The selected provider is unavailable and may become available later.
+    ProviderUnavailable,
+    /// The owner reached its idle timeout and requires explicit operator resume.
+    IdleTimeout,
+    /// The owner exhausted its bounded tool-call rounds.
+    ToolRoundLimitReached,
+    /// The work was steered or cancelled independently of whole-run cancellation.
+    Steering,
+}
+
 /// Owner-reported durable external attempt state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
@@ -391,6 +405,13 @@ pub enum AttemptObservation {
     Succeeded { output: ValidatedOutput },
     /// External work failed terminally.
     Failed { message: String },
+    /// External work stopped in a recoverable state and requires explicit run resume.
+    Paused {
+        /// Stable owner-neutral reason for the pause.
+        reason: AttemptPauseReason,
+        /// Human-readable owner diagnostic.
+        message: String,
+    },
     /// External work was cancelled terminally.
     Cancelled,
     /// Owner cannot prove the current or terminal state.
@@ -430,6 +451,7 @@ pub struct ReceiptReconciliationSummary {
     pub running: Vec<String>,
     pub succeeded: Vec<String>,
     pub failed: Vec<String>,
+    pub paused: Vec<String>,
     pub cancelled: Vec<String>,
     pub repair_required: Vec<String>,
     pub unresolved_read_only: Vec<String>,
@@ -862,6 +884,85 @@ impl WorkflowStore {
             )
             .optional()?;
         stored.map(verify_stored_definition).transpose()
+    }
+
+    /// Idempotently create one durable workflow run using a caller-stable identity.
+    ///
+    /// Returns `true` when the run was created and `false` when the exact immutable request was
+    /// already present. Identity reuse with different definition, snapshot, parent, input, or
+    /// limits fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed input, missing definition, conflicting identity, malformed
+    /// stored input, or database failure.
+    pub fn create_run_idempotent(
+        &mut self,
+        run: &NewWorkflowRun,
+    ) -> Result<bool, WorkflowStoreError> {
+        validate_run(run)?;
+        let existing = self
+            .connection
+            .query_row(
+                "SELECT definition_id, definition_version, workspace_snapshot, parent_session_id, \
+                 input_json, deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap \
+                 FROM workflow_runs WHERE run_id = ?1",
+                [&run.run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, u32>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<u64>>(5)?,
+                        row.get::<_, u32>(6)?,
+                        row.get::<_, u32>(7)?,
+                        row.get::<_, u32>(8)?,
+                        row.get::<_, u32>(9)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            definition_id,
+            definition_version,
+            workspace_snapshot,
+            parent_session_id,
+            input_json,
+            deadline_at_ms,
+            node_execution_cap,
+            concurrency_cap,
+            cycle_cap,
+            retry_cap,
+        )) = existing
+        else {
+            self.create_run(run)?;
+            return Ok(true);
+        };
+        let input = input_json
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?;
+        let limits = WorkflowRunLimits {
+            deadline_at_ms,
+            node_execution_cap,
+            concurrency_cap,
+            cycle_cap,
+            retry_cap,
+        };
+        if definition_id == run.definition_id
+            && definition_version == run.definition_version
+            && workspace_snapshot == run.workspace_snapshot
+            && parent_session_id == run.parent_session_id
+            && input == run.input
+            && limits == run.limits
+        {
+            return Ok(false);
+        }
+        Err(WorkflowStoreError::InvalidData(format!(
+            "workflow run identity conflicts with an existing run: {}",
+            run.run_id
+        )))
     }
 
     /// Create one durable workflow run bound to an existing exact definition version.
@@ -3895,6 +3996,16 @@ fn apply_attempt_observation(
             )?;
             summary.failed.push(request.dispatch_identity.clone());
         }
+        AttemptObservation::Paused { reason, message } => {
+            apply_paused_attempt_observation(
+                transaction,
+                request,
+                reason,
+                &message,
+                reconciled_at_ms,
+            )?;
+            summary.paused.push(request.dispatch_identity.clone());
+        }
         AttemptObservation::Cancelled => {
             transition_attempt(transaction, request, "cancelled", Some(reconciled_at_ms))?;
             summary.cancelled.push(request.dispatch_identity.clone());
@@ -3925,6 +4036,53 @@ fn apply_attempt_observation(
             }
         }
     }
+    Ok(())
+}
+
+fn apply_paused_attempt_observation(
+    transaction: &Transaction<'_>,
+    request: &AttemptReconciliationRequest,
+    reason: AttemptPauseReason,
+    message: &str,
+    reconciled_at_ms: u64,
+) -> Result<(), WorkflowStoreError> {
+    transition_attempt(transaction, request, "paused", Some(reconciled_at_ms))?;
+    let activation_changed = transaction.execute(
+        "UPDATE workflow_activations SET status = 'pending' \
+         WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 \
+           AND status = 'running' AND output_id IS NULL",
+        (&request.run_id, &request.node_id, &request.activation_id),
+    )?;
+    if activation_changed != 1 {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "paused workflow attempt has no running output-free activation: {}",
+            request.dispatch_identity
+        )));
+    }
+    let run_changed = transaction.execute(
+        "UPDATE workflow_runs SET status = 'paused', updated_at_ms = ?2 \
+         WHERE run_id = ?1 AND status = 'running' \
+           AND cancellation_requested_at_ms IS NULL",
+        (&request.run_id, reconciled_at_ms),
+    )?;
+    if run_changed != 1 {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "paused workflow attempt has no resumable running run: {}",
+            request.dispatch_identity
+        )));
+    }
+    append_event(
+        transaction,
+        &request.run_id,
+        "attempt_paused",
+        &serde_json::json!({
+            "dispatch_identity": request.dispatch_identity,
+            "reason": reason,
+            "message": message,
+        })
+        .to_string(),
+        reconciled_at_ms,
+    )?;
     Ok(())
 }
 
@@ -5077,6 +5235,40 @@ mod tests {
             created_at_ms: 10,
             limits: WorkflowRunLimits::default(),
         }
+    }
+
+    #[test]
+    fn stable_run_creation_is_idempotent_and_checks_all_immutable_context() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        let run = new_run();
+        assert!(store.create_run_idempotent(&run).expect("create"));
+        assert!(!store.create_run_idempotent(&run).expect("idempotent"));
+        assert_eq!(store.list_runs(10).expect("runs").len(), 1);
+
+        for conflict in [
+            NewWorkflowRun {
+                input: Some(serde_json::json!(2)),
+                ..run.clone()
+            },
+            NewWorkflowRun {
+                limits: WorkflowRunLimits {
+                    retry_cap: run.limits.retry_cap + 1,
+                    ..run.limits.clone()
+                },
+                ..run.clone()
+            },
+            NewWorkflowRun {
+                workspace_snapshot: "snapshot-2".to_string(),
+                ..run.clone()
+            },
+        ] {
+            assert!(store.create_run_idempotent(&conflict).is_err());
+        }
+        assert_eq!(store.list_runs(10).expect("runs").len(), 1);
     }
 
     fn activation_id() -> String {

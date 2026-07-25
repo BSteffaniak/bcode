@@ -1151,6 +1151,9 @@ pub struct WorkflowRunInspection {
 pub struct WorkflowRunStartRequest {
     pub definition_id: String,
     pub definition_version: u32,
+    /// Optional caller-stable identity used to make start retries idempotent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
     /// Immutable repository/worktree snapshot identity required for every durable run.
     pub workspace_snapshot: String,
     /// Session used for compact generic runtime-work presentation.
@@ -2221,6 +2224,7 @@ mod tests {
             Request::StartWorkflowRun(WorkflowRunStartRequest {
                 definition_id: "review".to_string(),
                 definition_version: 1,
+                run_id: Some("review-run".to_string()),
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: SessionId::new(),
                 input: Some(serde_json::json!(1)),

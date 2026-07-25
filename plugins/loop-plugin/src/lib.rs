@@ -518,6 +518,11 @@ impl LoopSurface {
         }
         match load_state_result(session_id) {
             Ok(Some(state)) if !state.state.is_terminal() => {
+                if prepared_workflow_start_matches(&state, &prompt, &condition, max_iterations) {
+                    self.pending_workflow_start = Some(state);
+                    "retrying prepared durable loop workflow start".clone_into(&mut self.status);
+                    return PluginTuiAction::Redraw;
+                }
                 "this session already has an active loop".clone_into(&mut self.status);
                 return PluginTuiAction::Redraw;
             }
@@ -661,6 +666,7 @@ impl PluginTuiSurface for LoopSurface {
                 definition_id: "bcode.loop".to_string(),
                 definition_version: 1,
                 definition: serde_json::to_value(definition).expect("definition serializes"),
+                run_id: Some(state.run_id.clone()),
                 workspace_snapshot,
                 parent_session_id: state.session_id,
                 input: serde_json::to_value(input).expect("input serializes"),
@@ -1130,13 +1136,22 @@ async fn persisted_turn_completion(
     }
 }
 
-async fn reconcile_pending_operation(state: &mut LoopState) -> Result<(), String> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyRecoveryDisposition {
+    Continue,
+    Halt,
+}
+
+async fn reconcile_pending_operation(
+    state: &mut LoopState,
+) -> Result<LegacyRecoveryDisposition, String> {
     let Some(pending) = state.pending_operation.clone() else {
-        return Ok(());
+        return Ok(LegacyRecoveryDisposition::Continue);
     };
     if pending.status == OperationStatus::Prepared {
         state.pending_operation = None;
-        return save_state(state);
+        save_state(state)?;
+        return Ok(LegacyRecoveryDisposition::Continue);
     }
     let accepted_sequence = pending.accepted_sequence.ok_or_else(|| {
         format!(
@@ -1157,8 +1172,44 @@ async fn reconcile_pending_operation(state: &mut LoopState) -> Result<(), String
                 pending.operation_id
             )
         })?;
-    complete_pending_operation(state, completion)?;
-    save_state(state)
+    apply_recovered_operation_completion(state, pending.kind, &completion)
+}
+
+fn apply_recovered_operation_completion(
+    state: &mut LoopState,
+    kind: OperationKind,
+    completion: &TurnCompletion,
+) -> Result<LegacyRecoveryDisposition, String> {
+    complete_pending_operation(state, completion.clone())?;
+    let disposition = match decide_turn_outcome(completion.outcome) {
+        TurnOutcomeDecision::Completed => match kind {
+            OperationKind::Iteration { .. } => LegacyRecoveryDisposition::Continue,
+            OperationKind::Evaluation { .. } => {
+                let evaluation = parse_evaluation(&completion.assistant_text)?;
+                if apply_evaluation(state, evaluation)? {
+                    LegacyRecoveryDisposition::Halt
+                } else {
+                    LegacyRecoveryDisposition::Continue
+                }
+            }
+        },
+        TurnOutcomeDecision::PauseForSteering => {
+            pause_for_steering(state, format!("recovered {kind:?} turn was cancelled"));
+            LegacyRecoveryDisposition::Halt
+        }
+        TurnOutcomeDecision::Pause => {
+            pause_run(
+                state,
+                format!(
+                    "recovered {kind:?} turn ended with {:?}",
+                    completion.outcome
+                ),
+            );
+            LegacyRecoveryDisposition::Halt
+        }
+    };
+    save_state(state)?;
+    Ok(disposition)
 }
 
 struct IterationSubmission {
@@ -1211,9 +1262,13 @@ fn apply_evaluation(state: &mut LoopState, evaluation: Evaluation) -> Result<boo
 
 #[allow(clippy::too_many_lines)]
 async fn run_loop(mut state: LoopState) {
-    if let Err(reason) = reconcile_pending_operation(&mut state).await {
-        pause_run(&mut state, reason);
-        return;
+    match reconcile_pending_operation(&mut state).await {
+        Ok(LegacyRecoveryDisposition::Continue) => {}
+        Ok(LegacyRecoveryDisposition::Halt) => return,
+        Err(reason) => {
+            pause_run(&mut state, reason);
+            return;
+        }
     }
     loop {
         if refresh_cancel(&mut state) {
@@ -1707,6 +1762,22 @@ const fn is_legacy_loop_state(state: &LoopState) -> bool {
     !loop_state_uses_workflow_runtime(state)
 }
 
+fn prepared_workflow_start_matches(
+    state: &LoopState,
+    iteration_prompt: &str,
+    stop_condition: &str,
+    max_iterations: u64,
+) -> bool {
+    loop_state_uses_workflow_runtime(state)
+        && state.workflow_run_id.is_none()
+        && state.state == RunState::Ready
+        && state.current_iteration == 0
+        && state.pending_operation.is_none()
+        && state.iteration_prompt == iteration_prompt
+        && state.stop_condition == stop_condition
+        && state.max_iterations == max_iterations
+}
+
 fn validate_state(state: &LoopState) -> Result<(), String> {
     if state.schema_version != STATE_SCHEMA_VERSION {
         return Err(format!(
@@ -1884,6 +1955,36 @@ mod tests {
     }
 
     #[test]
+    fn prepared_workflow_start_is_retryable_only_for_exact_unchanged_input() {
+        let state = LoopState::new(
+            SessionId::new(),
+            "implement".to_string(),
+            "done".to_string(),
+            2,
+        );
+        assert!(prepared_workflow_start_matches(
+            &state,
+            "implement",
+            "done",
+            2
+        ));
+        assert!(!prepared_workflow_start_matches(
+            &state,
+            "different",
+            "done",
+            2
+        ));
+        let mut started = state;
+        started.workflow_run_id = Some(started.run_id.clone());
+        assert!(!prepared_workflow_start_matches(
+            &started,
+            "implement",
+            "done",
+            2
+        ));
+    }
+
+    #[test]
     fn plugin_tui_host_start_request_is_renderer_neutral_and_serializable() {
         // The adapter's request translation is also exercised by client/IPC workflow tests; this
         // test keeps the plugin-facing contract renderer-neutral and serializable.
@@ -1894,6 +1995,7 @@ mod tests {
             definition_id: "bcode.loop".to_string(),
             definition_version: 1,
             definition: serde_json::to_value(&definition).expect("definition JSON"),
+            run_id: Some("loop-run".to_string()),
             workspace_snapshot: "/repo".to_string(),
             parent_session_id: SessionId::new(),
             input: serde_json::to_value(loop_workflow_initial_value(&input)).expect("input JSON"),
@@ -2214,6 +2316,169 @@ mod tests {
             accepted_sequence: (status != OperationStatus::Prepared).then_some(8),
             completion: None,
         }
+    }
+
+    fn legacy_state(session_id: SessionId) -> LoopState {
+        let mut state = LoopState::new(session_id, "iterate".to_owned(), "complete".to_owned(), 3);
+        state.workflow_definition = None;
+        state.workflow_initial_value = None;
+        state.workflow_run_id = None;
+        state
+    }
+
+    #[test]
+    fn recovered_legacy_iteration_completion_applies_outcome_before_continuing() {
+        let mut state = legacy_state(SessionId::new());
+        state.state = RunState::RunningIteration;
+        state.pending_operation = Some(pending_iteration(&state, OperationStatus::Accepted));
+
+        let disposition = apply_recovered_operation_completion(
+            &mut state,
+            OperationKind::Iteration { iteration: 1 },
+            &TurnCompletion {
+                outcome: ModelTurnOutcome::ProviderUnavailable,
+                assistant_text: String::new(),
+                event_sequence: 12,
+            },
+        )
+        .expect("recover terminal turn");
+
+        assert_eq!(disposition, LegacyRecoveryDisposition::Halt);
+        assert_eq!(state.state, RunState::Paused);
+        assert!(state.pending_operation.is_none());
+        assert_eq!(state.current_iteration, 1);
+        assert!(
+            state
+                .stop_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("ProviderUnavailable"))
+        );
+    }
+
+    #[test]
+    fn marker_free_legacy_restart_reconciles_persisted_turn_receipt_once() {
+        let session_id = SessionId::new();
+        let mut state = legacy_state(session_id);
+        state.state = RunState::RunningIteration;
+        state.pending_operation = Some(PendingOperation {
+            operation_id: "legacy-run:iteration:1".to_owned(),
+            kind: OperationKind::Iteration { iteration: 1 },
+            target_session_id: session_id,
+            _expected_generation: None,
+            status: OperationStatus::Accepted,
+            accepted_turn_id: Some(format!("{session_id}-8")),
+            accepted_sequence: Some(8),
+            completion: None,
+        });
+        let persisted = serde_json::to_vec(&state).expect("persist legacy state");
+        let mut restored = decode_state(&persisted).expect("restore legacy state");
+        assert!(is_legacy_loop_state(&restored));
+        let receipt = bcode_session_models::TurnReceipt::from_accepted_event(session_id, 8);
+        let events = vec![
+            bcode_session_models::SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 9,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::AssistantMessage {
+                    text: "implementation complete".to_owned(),
+                },
+            },
+            bcode_session_models::SessionEvent {
+                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 10,
+                timestamp_ms: 2,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ModelTurnFinished {
+                    turn_id: receipt.turn_id.to_string(),
+                    outcome: ModelTurnOutcome::Completed,
+                    message: None,
+                },
+            },
+        ];
+        let completion = completion_from_events(&events, &receipt).expect("persisted completion");
+        let disposition = apply_recovered_operation_completion(
+            &mut restored,
+            OperationKind::Iteration { iteration: 1 },
+            &completion,
+        )
+        .expect("reconcile persisted receipt");
+        assert_eq!(disposition, LegacyRecoveryDisposition::Continue);
+        assert_eq!(restored.state, RunState::Evaluating);
+        assert_eq!(restored.current_iteration, 1);
+        assert!(restored.pending_operation.is_none());
+        assert_eq!(
+            restored
+                .last_completed_operation
+                .as_ref()
+                .and_then(|operation| operation.completion.as_ref())
+                .map(|completion| completion.event_sequence),
+            Some(10)
+        );
+        let persisted_again = serde_json::to_vec(&restored).expect("persist reconciled state");
+        let mut reopened = decode_state(&persisted_again).expect("reopen reconciled state");
+        assert!(is_legacy_loop_state(&reopened));
+        assert!(
+            apply_recovered_operation_completion(
+                &mut reopened,
+                OperationKind::Iteration { iteration: 1 },
+                &TurnCompletion {
+                    outcome: ModelTurnOutcome::Completed,
+                    assistant_text: "duplicate".to_owned(),
+                    event_sequence: 10,
+                },
+            )
+            .is_err()
+        );
+        assert_eq!(reopened.current_iteration, 1);
+    }
+
+    #[test]
+    fn recovered_legacy_evaluation_completion_is_applied_exactly_once() {
+        let mut state = legacy_state(SessionId::new());
+        state.current_iteration = 1;
+        state.state = RunState::Evaluating;
+        state.pending_operation = Some(PendingOperation {
+            operation_id: "evaluation-1".to_owned(),
+            kind: OperationKind::Evaluation { iteration: 1 },
+            target_session_id: state.session_id,
+            _expected_generation: None,
+            status: OperationStatus::Accepted,
+            accepted_turn_id: Some("turn-1".to_owned()),
+            accepted_sequence: Some(8),
+            completion: None,
+        });
+
+        let disposition = apply_recovered_operation_completion(
+            &mut state,
+            OperationKind::Evaluation { iteration: 1 },
+            &TurnCompletion {
+                outcome: ModelTurnOutcome::Completed,
+                assistant_text: serde_json::json!({
+                    "condition_met": true,
+                    "evidence": ["verified"],
+                    "summary": "done"
+                })
+                .to_string(),
+                event_sequence: 12,
+            },
+        )
+        .expect("recover evaluation");
+
+        assert_eq!(disposition, LegacyRecoveryDisposition::Halt);
+        assert_eq!(state.state, RunState::Completed);
+        assert_eq!(state.stop_reason.as_deref(), Some("done"));
+        assert!(state.pending_operation.is_none());
+        assert_eq!(
+            state
+                .last_completed_operation
+                .as_ref()
+                .and_then(|operation| operation.completion.as_ref())
+                .map(|completion| completion.event_sequence),
+            Some(12)
+        );
     }
 
     #[test]

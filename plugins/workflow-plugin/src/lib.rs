@@ -217,6 +217,7 @@ pub(crate) async fn execute_command(
                 .start_workflow_run(bcode_ipc::WorkflowRunStartRequest {
                     definition_id,
                     definition_version,
+                    run_id: None,
                     workspace_snapshot,
                     parent_session_id,
                     input,

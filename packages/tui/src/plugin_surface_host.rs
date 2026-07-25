@@ -91,6 +91,7 @@ impl PluginTuiHost for BcodePluginTuiHost {
                 .start_workflow_run(bcode_ipc::WorkflowRunStartRequest {
                     definition_id: request.definition_id,
                     definition_version: request.definition_version,
+                    run_id: request.run_id,
                     workspace_snapshot: request.workspace_snapshot,
                     parent_session_id: request.parent_session_id,
                     input: Some(request.input),
