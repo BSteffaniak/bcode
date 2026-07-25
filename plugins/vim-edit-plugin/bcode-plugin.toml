@@ -41,6 +41,26 @@ render_mode        = "full_block"
 surfaces           = ["tui"]
 
 [[visual_adapters]]
+artifact_schema    = "bcode.vim-edit.request-draft.preview"
+id                 = "vim-edit-preview-request-draft"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 110
+producer_default   = true
+render_mode        = "full_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.vim-edit.request-draft.apply"
+id                 = "vim-edit-apply-request-draft"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 110
+producer_default   = true
+render_mode        = "full_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
 artifact_schema    = "bcode.vim-edit.live"
 id                 = "vim-edit-live-card"
 max_schema_version = 1

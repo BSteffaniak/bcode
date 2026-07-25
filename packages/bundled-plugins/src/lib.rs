@@ -589,6 +589,8 @@ mod tests {
         let registry =
             super::tui_registry("bcode.vim-edit").expect("Vim edit TUI registry is available");
         assert!(registry.supports_visual("bcode.vim-edit.playback"));
+        assert!(registry.supports_visual("bcode.vim-edit.request-draft.preview"));
+        assert!(registry.supports_visual("bcode.vim-edit.request-draft.apply"));
         assert!(super::interaction_registry("bcode.vim-edit").is_none());
     }
 

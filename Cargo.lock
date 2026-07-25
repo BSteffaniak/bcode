@@ -2541,6 +2541,7 @@ dependencies = [
  "bcode_syntax_render",
  "bcode_tool",
  "bcode_tui_components",
+ "bcode_vim_edit_plugin",
  "bcode_worktree_models",
  "bmux_keyboard",
  "bmux_terminal_grid",

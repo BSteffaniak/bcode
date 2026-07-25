@@ -4685,6 +4685,20 @@ fn filesystem_plugin_host() -> bcode_plugin::PluginHost {
         .expect("static filesystem plugin should load")
 }
 
+fn vim_edit_plugin_host() -> bcode_plugin::PluginHost {
+    let bundled = [bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/vim-edit-plugin/bcode-plugin.toml"),
+        bcode_vim_edit_plugin::static_plugin(),
+    )];
+    let selected = bcode_plugin::filter_selected_static_plugins(
+        &bundled,
+        &bcode_plugin::PluginSelection::all_enabled(),
+    )
+    .expect("static Vim edit plugin manifest should parse");
+    bcode_plugin::PluginHost::load_static_plugins(&selected)
+        .expect("static Vim edit plugin should load")
+}
+
 #[test]
 fn live_filesystem_request_draft_renders_updates_and_removes() {
     let session_id = SessionId::new();
@@ -4747,6 +4761,151 @@ fn live_filesystem_request_draft_renders_updates_and_removes() {
         !removed.contains("Filesystem write · assembling"),
         "{removed}"
     );
+}
+
+#[test]
+fn live_filesystem_edit_request_draft_renders_progressive_diff_and_removes() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+    let draft = |revision, operation, argument_bytes| bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+            event: bcode_session_models::ToolRequestDraftEvent {
+                turn_id: "turn-edit".to_owned(),
+                tool_call_id: "call-edit".to_owned(),
+                tool_name: "filesystem.edit".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                schema: "bcode.filesystem.request-draft.edit".to_owned(),
+                schema_version: 1,
+                generation: 1,
+                revision,
+                operation,
+                argument_bytes,
+                truncated: false,
+            },
+        },
+    };
+
+    app.absorb_session_live_event(&draft(
+        1,
+        bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+            start_offset: 0,
+            text: r#"{"path":"src/lib.rs","old_text":"before","new_text":"after"}"#.to_owned(),
+        },
+        61,
+    ));
+    let first = render_app_text(&mut app);
+    assert!(first.contains("Filesystem edit · assembling"), "{first}");
+    assert!(first.contains("src/lib.rs"), "{first}");
+    assert!(first.contains("before"), "{first}");
+    assert!(first.contains("after"), "{first}");
+
+    app.absorb_session_live_event(&draft(
+        2,
+        bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+            start_offset: 0,
+            text: r#"{"path":"src/lib.rs","old_text":"before","new_text":"after two"}"#.to_owned(),
+        },
+        65,
+    ));
+    let second = render_app_text(&mut app);
+    assert!(second.contains("after two"), "{second}");
+    assert!(!second.contains("after│"), "{second}");
+    assert_eq!(
+        second.matches("Filesystem edit · assembling").count(),
+        1,
+        "{second}"
+    );
+
+    app.absorb_session_live_event(&draft(
+        3,
+        bcode_session_models::ToolRequestDraftOperation::Remove {
+            reason: bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+        },
+        65,
+    ));
+    let removed = render_app_text(&mut app);
+    assert!(
+        !removed.contains("Filesystem edit · assembling"),
+        "{removed}"
+    );
+    assert!(!removed.contains("after two"), "{removed}");
+}
+
+#[test]
+fn live_vim_execution_frames_render_replace_in_place_and_remove() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(vim_edit_plugin_host()));
+    let progress =
+        |sequence, operation, payload: serde_json::Value| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Progress,
+                    bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call-vim".to_owned(),
+                        contribution_id: "vim-live".to_owned(),
+                        sequence,
+                        producer_id: "bcode.vim-edit".to_owned(),
+                        schema: "bcode.vim-edit.live".to_owned(),
+                        schema_version: 1,
+                        operation,
+                        persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                        artifact: None,
+                        payload,
+                    },
+                ),
+            },
+        };
+    let frame = |line: &str, cursor_column: u64, step_index: u64| {
+        serde_json::json!({
+            "tool_name": "vim_edit.preview",
+            "phase": "running",
+            "path": "src/lib.rs",
+            "step_index": step_index,
+            "step_total": 2,
+            "step": { "keys": "w" },
+            "substep_index": 0,
+            "substep_total": 1,
+            "input_token": "w",
+            "cursor": { "line": 1, "column": cursor_column },
+            "nvim_mode": "n",
+            "context": { "start_line": 1, "lines": [line] },
+            "changed": false,
+        })
+    };
+
+    app.absorb_session_live_event(&progress(
+        1,
+        bcode_session_models::ToolContributionOperation::Upsert,
+        frame("first frame", 2, 0),
+    ));
+    let first = render_app_text(&mut app);
+    assert!(first.contains("nvim live"), "{first}");
+    assert!(first.contains("first frame"), "{first}");
+    assert!(first.contains("1:2"), "{first}");
+
+    app.absorb_session_live_event(&progress(
+        2,
+        bcode_session_models::ToolContributionOperation::Upsert,
+        frame("second frame", 7, 1),
+    ));
+    let second = render_app_text(&mut app);
+    assert!(second.contains("second frame"), "{second}");
+    assert!(second.contains("1:7"), "{second}");
+    assert!(!second.contains("first frame"), "{second}");
+    assert_eq!(second.matches("nvim live").count(), 1, "{second}");
+
+    app.absorb_session_live_event(&progress(
+        3,
+        bcode_session_models::ToolContributionOperation::Remove,
+        serde_json::Value::Null,
+    ));
+    let removed = render_app_text(&mut app);
+    assert!(!removed.contains("nvim live"), "{removed}");
+    assert!(!removed.contains("second frame"), "{removed}");
 }
 
 #[test]

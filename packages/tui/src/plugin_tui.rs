@@ -289,6 +289,7 @@ pub fn tui_registry(plugin_id: &str) -> Option<PluginTuiRegistry> {
         "bcode.git" => Some(bcode_git_plugin::git_tui_registry()),
         "bcode.question" => Some(bcode_question_plugin::question_tui_registry()),
         "bcode.shell" => Some(bcode_shell_plugin::shell_tui_registry()),
+        "bcode.vim-edit" => Some(bcode_vim_edit_plugin::vim_edit_tui_registry()),
         _ => None,
     });
     registry
