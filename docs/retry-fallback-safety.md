@@ -6,12 +6,15 @@ and cleanup.
 
 ## Retry policy
 
-`RetryPolicy` retries legacy pre-output `ProviderInvocation` failures for compatibility. Structured
-provider errors retry only when `ProviderError.retryable` is true. Provider
-`ProviderRetryHint.retry_after_ms` and `retry_at_unix` establish a minimum delay; exponential
-application backoff and the provider hint are capped by configured `max_delay`. Optional jitter is
-deterministic from provider/model/attempt identity and bounded by the remaining delay cap, avoiding
-global RNG/state while preventing identical request schedules.
+`RetryPolicy` retries legacy pre-output `ProviderInvocation` failures for compatibility. Structured provider errors retry only when `ProviderError.retryable` is true or when an explicit
+provider/catalog/user rule classifies the failure as recoverable. Ephemeral retries are indefinite
+by default. Their exponential delay grows to the configured `max_delay` (10 minutes by default),
+then remains at that delay until success or cancellation. Numeric `max_retries` values preserve
+finite retry behavior; set `retry_forever = false` alongside a limit when overriding an inherited
+indefinite rule. Provider `ProviderRetryHint.retry_after_ms` and `retry_at_unix` establish a minimum
+delay and are capped by configured `max_delay`. Optional jitter is deterministic from
+provider/model/attempt identity and bounded by the remaining delay cap, avoiding global RNG/state
+while preventing identical request schedules.
 
 Cancellation, host timeout, tool, permission, middleware, cache, validation, and application errors
 are terminal. Once any model-visible text, reasoning, or tool-call output has been emitted, a later
@@ -25,8 +28,8 @@ provider/model can reasonably help: rate limit, network, timeout, model not foun
 feature, provider internal, and overloaded. Auth, config, invalid-request, context-length, and
 cancelled failures remain terminal and actionable rather than being hidden by routing.
 
-Fallback selectors are ordered and bounded by their finite list. Retry and fallback never run as an
-unbounded implicit policy.
+Fallback selectors are ordered and bounded by their finite list. Fallback never runs as an
+unbounded implicit policy; only errors classified as ephemeral use indefinite retries by default.
 
 ## Tool side effects
 

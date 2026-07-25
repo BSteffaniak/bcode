@@ -2819,9 +2819,12 @@ pub struct ModelRetryConfig {
     /// Enable built-in provider overload retries.
     #[serde(default = "default_overload_retry_enabled")]
     pub overload_enabled: bool,
-    /// Maximum automatic retry attempts for provider overload errors.
-    #[serde(default = "default_max_overload_retries")]
-    pub max_overload_retries: u8,
+    /// Retry provider overload errors indefinitely. Defaults to true when no finite limit is set.
+    #[serde(default)]
+    pub overload_retry_forever: Option<bool>,
+    /// Maximum automatic retry attempts for provider overload errors when indefinite retry is disabled.
+    #[serde(default)]
+    pub max_overload_retries: Option<u64>,
     /// Initial overload retry delay in milliseconds.
     #[serde(default = "default_overload_initial_delay_ms")]
     pub overload_initial_delay_ms: u64,
@@ -2831,9 +2834,12 @@ pub struct ModelRetryConfig {
     /// Enable built-in model no-progress timeout retries.
     #[serde(default = "default_no_progress_timeout_retry_enabled")]
     pub no_progress_timeout_enabled: bool,
-    /// Maximum automatic retry attempts for model no-progress timeouts.
-    #[serde(default = "default_max_no_progress_timeout_retries")]
-    pub max_no_progress_timeout_retries: u8,
+    /// Retry model no-progress timeouts indefinitely. Defaults to true when no finite limit is set.
+    #[serde(default)]
+    pub no_progress_timeout_retry_forever: Option<bool>,
+    /// Maximum automatic retry attempts for model no-progress timeouts when indefinite retry is disabled.
+    #[serde(default)]
+    pub max_no_progress_timeout_retries: Option<u64>,
     /// Initial model no-progress timeout retry delay in milliseconds.
     #[serde(default = "default_no_progress_timeout_initial_delay_ms")]
     pub no_progress_timeout_initial_delay_ms: u64,
@@ -2861,11 +2867,13 @@ impl Default for ModelRetryConfig {
         Self {
             enabled: default_model_retry_enabled(),
             overload_enabled: default_overload_retry_enabled(),
-            max_overload_retries: default_max_overload_retries(),
+            overload_retry_forever: None,
+            max_overload_retries: None,
             overload_initial_delay_ms: default_overload_initial_delay_ms(),
             overload_max_delay_ms: default_overload_max_delay_ms(),
             no_progress_timeout_enabled: default_no_progress_timeout_retry_enabled(),
-            max_no_progress_timeout_retries: default_max_no_progress_timeout_retries(),
+            no_progress_timeout_retry_forever: None,
+            max_no_progress_timeout_retries: None,
             no_progress_timeout_initial_delay_ms: default_no_progress_timeout_initial_delay_ms(),
             no_progress_timeout_max_delay_ms: default_no_progress_timeout_max_delay_ms(),
             remote_catalog_rules_enabled: default_remote_catalog_retry_rules_enabled(),
@@ -2882,24 +2890,16 @@ const fn default_overload_retry_enabled() -> bool {
     true
 }
 
-const fn default_max_overload_retries() -> u8 {
-    5
-}
-
 const fn default_overload_initial_delay_ms() -> u64 {
     2_000
 }
 
 const fn default_overload_max_delay_ms() -> u64 {
-    30_000
+    600_000
 }
 
 const fn default_no_progress_timeout_retry_enabled() -> bool {
     true
-}
-
-const fn default_max_no_progress_timeout_retries() -> u8 {
-    2
 }
 
 const fn default_no_progress_timeout_initial_delay_ms() -> u64 {
@@ -2907,7 +2907,7 @@ const fn default_no_progress_timeout_initial_delay_ms() -> u64 {
 }
 
 const fn default_no_progress_timeout_max_delay_ms() -> u64 {
-    8_000
+    600_000
 }
 
 /// Automatic context compaction configuration.
@@ -4370,12 +4370,14 @@ fn write_model_retry_toml(output: &mut String, retry: &ModelRetryConfig) {
         writeln!(output, "overload_enabled = {}", retry.overload_enabled)
             .expect("writing to string should not fail");
     }
-    writeln!(
-        output,
-        "max_overload_retries = {}",
-        retry.max_overload_retries
-    )
-    .expect("writing to string should not fail");
+    if let Some(retry_forever) = retry.overload_retry_forever {
+        writeln!(output, "overload_retry_forever = {retry_forever}")
+            .expect("writing to string should not fail");
+    }
+    if let Some(max_retries) = retry.max_overload_retries {
+        writeln!(output, "max_overload_retries = {max_retries}")
+            .expect("writing to string should not fail");
+    }
     writeln!(
         output,
         "overload_initial_delay_ms = {}",
@@ -4396,12 +4398,17 @@ fn write_model_retry_toml(output: &mut String, retry: &ModelRetryConfig) {
         )
         .expect("writing to string should not fail");
     }
-    writeln!(
-        output,
-        "max_no_progress_timeout_retries = {}",
-        retry.max_no_progress_timeout_retries
-    )
-    .expect("writing to string should not fail");
+    if let Some(retry_forever) = retry.no_progress_timeout_retry_forever {
+        writeln!(
+            output,
+            "no_progress_timeout_retry_forever = {retry_forever}"
+        )
+        .expect("writing to string should not fail");
+    }
+    if let Some(max_retries) = retry.max_no_progress_timeout_retries {
+        writeln!(output, "max_no_progress_timeout_retries = {max_retries}")
+            .expect("writing to string should not fail");
+    }
     writeln!(
         output,
         "no_progress_timeout_initial_delay_ms = {}",
@@ -4446,6 +4453,10 @@ fn write_model_retry_rule_toml(output: &mut String, rule: &ModelRetryRuleConfig)
     );
     write_optional_string(output, "model_id", rule.model_id.as_ref());
     write_optional_string(output, "model_id_contains", rule.model_id_contains.as_ref());
+    if let Some(retry_forever) = rule.retry_forever {
+        writeln!(output, "retry_forever = {retry_forever}")
+            .expect("writing to string should not fail");
+    }
     if let Some(max_retries) = rule.max_retries {
         writeln!(output, "max_retries = {max_retries}").expect("writing to string should not fail");
     }
@@ -5932,7 +5943,15 @@ mod tests {
             &fields,
             "model",
             "retry",
-            &[("enabled", "true"), ("max_overload_retries", "5")],
+            &[
+                ("enabled", "true"),
+                ("overload_retry_forever", "—"),
+                ("max_overload_retries", "—"),
+                ("overload_max_delay_ms", "600000"),
+                ("no_progress_timeout_retry_forever", "—"),
+                ("max_no_progress_timeout_retries", "—"),
+                ("no_progress_timeout_max_delay_ms", "600000"),
+            ],
         );
         assert_nested_defaults(
             &fields,
@@ -6290,10 +6309,12 @@ auth_pool = "openai"
         let config: BcodeConfig = toml::from_str(
             r#"
 [model.retry]
+overload_retry_forever = false
 max_overload_retries = 3
 overload_initial_delay_ms = 1000
 overload_max_delay_ms = 10000
 no_progress_timeout_enabled = false
+no_progress_timeout_retry_forever = false
 max_no_progress_timeout_retries = 4
 no_progress_timeout_initial_delay_ms = 1500
 no_progress_timeout_max_delay_ms = 12000
@@ -6304,6 +6325,7 @@ id = "unsupported-content-type"
 provider_plugin_id = "bcode.openai-compatible"
 model_id_contains = "claude"
 max_retries = 2
+retry_forever = false
 initial_delay_ms = 500
 max_delay_ms = 4000
 use_provider_retry_hint = false
@@ -6315,11 +6337,16 @@ message_contains = "Unsupported content type"
         )
         .expect("config should parse");
 
-        assert_eq!(config.model.retry.max_overload_retries, 3);
+        assert_eq!(config.model.retry.overload_retry_forever, Some(false));
+        assert_eq!(config.model.retry.max_overload_retries, Some(3));
         assert_eq!(config.model.retry.overload_initial_delay_ms, 1_000);
         assert_eq!(config.model.retry.overload_max_delay_ms, 10_000);
         assert!(!config.model.retry.no_progress_timeout_enabled);
-        assert_eq!(config.model.retry.max_no_progress_timeout_retries, 4);
+        assert_eq!(
+            config.model.retry.no_progress_timeout_retry_forever,
+            Some(false)
+        );
+        assert_eq!(config.model.retry.max_no_progress_timeout_retries, Some(4));
         assert_eq!(
             config.model.retry.no_progress_timeout_initial_delay_ms,
             1_500
@@ -6339,6 +6366,7 @@ message_contains = "Unsupported content type"
         );
         assert_eq!(rule.model_id_contains.as_deref(), Some("claude"));
         assert_eq!(rule.max_retries, Some(2));
+        assert_eq!(rule.retry_forever, Some(false));
         assert_eq!(rule.initial_delay_ms, Some(500));
         assert_eq!(rule.max_delay_ms, Some(4_000));
         assert_eq!(rule.use_provider_retry_hint, Some(false));

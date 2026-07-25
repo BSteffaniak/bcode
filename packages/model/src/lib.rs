@@ -271,9 +271,12 @@ pub struct ProviderRetryRule {
     /// Model id substring scope.
     #[serde(default)]
     pub model_id_contains: Option<String>,
-    /// Maximum retry attempts when this rule matches.
+    /// Retry indefinitely when this rule matches. Defaults to true when no finite limit is set.
     #[serde(default)]
-    pub max_retries: Option<u8>,
+    pub retry_forever: Option<bool>,
+    /// Maximum retry attempts when this rule matches. Omit for the indefinite default.
+    #[serde(default)]
+    pub max_retries: Option<u64>,
     /// Initial retry delay in milliseconds.
     #[serde(default)]
     pub initial_delay_ms: Option<u64>,
@@ -343,6 +346,9 @@ impl ProviderRetryRule {
         }
         if override_rule.model_id_contains.is_some() {
             self.model_id_contains = override_rule.model_id_contains;
+        }
+        if override_rule.retry_forever.is_some() {
+            self.retry_forever = override_rule.retry_forever;
         }
         if override_rule.max_retries.is_some() {
             self.max_retries = override_rule.max_retries;

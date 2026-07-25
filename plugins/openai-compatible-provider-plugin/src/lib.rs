@@ -5199,9 +5199,10 @@ fn unsupported_content_type_retry_rule() -> ProviderRetryRule {
         id: "bcode.openai-compatible.unsupported-content-type".to_string(),
         enabled: Some(true),
         provider_plugin_id: Some(PROVIDER_ID.to_string()),
-        max_retries: Some(3),
+        retry_forever: Some(true),
+        max_retries: None,
         initial_delay_ms: Some(1_000),
-        max_delay_ms: Some(8_000),
+        max_delay_ms: Some(600_000),
         use_provider_retry_hint: Some(true),
         r#match: ProviderRetryRuleMatch {
             code: Some("http_400".to_string()),

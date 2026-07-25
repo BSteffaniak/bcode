@@ -11371,7 +11371,7 @@ fn serialized_tool_argument_len(arguments: &serde_json::Value) -> usize {
 struct ModelTurnRecoveryState {
     retried_after_context_overflow: bool,
     retried_after_malformed_tool_arguments: bool,
-    retry_attempts: BTreeMap<String, u8>,
+    retry_attempts: BTreeMap<String, u64>,
     retry_instruction: Option<&'static str>,
 }
 
@@ -11918,7 +11918,7 @@ async fn maybe_retry_after_provider_error(
             .retry_attempts
             .entry(policy.id.clone())
             .or_default();
-        if *attempts < policy.max_retries {
+        if policy.allows_attempt(*attempts) {
             *attempts = attempts.saturating_add(1);
             return retry_after_provider_error(
                 state,
@@ -11940,7 +11940,7 @@ async fn maybe_retry_after_provider_error(
 struct ProviderRetryPolicy {
     id: String,
     display_name: String,
-    max_retries: u8,
+    max_retries: Option<u64>,
     initial_delay_ms: u64,
     max_delay_ms: u64,
     use_provider_retry_hint: bool,
@@ -11969,7 +11969,12 @@ fn matching_provider_retry_policy(
         return Some(ProviderRetryPolicy {
             id: "builtin.overload".to_string(),
             display_name: "overload".to_string(),
-            max_retries: state.model_retry.max_overload_retries,
+            max_retries: (!state
+                .model_retry
+                .overload_retry_forever
+                .unwrap_or_else(|| state.model_retry.max_overload_retries.is_none()))
+            .then_some(state.model_retry.max_overload_retries)
+            .flatten(),
             initial_delay_ms: state.model_retry.overload_initial_delay_ms,
             max_delay_ms: state.model_retry.overload_max_delay_ms,
             use_provider_retry_hint: true,
@@ -11980,7 +11985,12 @@ fn matching_provider_retry_policy(
         return Some(ProviderRetryPolicy {
             id: "builtin.no_progress_timeout".to_string(),
             display_name: "no-progress timeout".to_string(),
-            max_retries: state.model_retry.max_no_progress_timeout_retries,
+            max_retries: (!state
+                .model_retry
+                .no_progress_timeout_retry_forever
+                .unwrap_or_else(|| state.model_retry.max_no_progress_timeout_retries.is_none()))
+            .then_some(state.model_retry.max_no_progress_timeout_retries)
+            .flatten(),
             initial_delay_ms: state.model_retry.no_progress_timeout_initial_delay_ms,
             max_delay_ms: state.model_retry.no_progress_timeout_max_delay_ms,
             use_provider_retry_hint: false,
@@ -12003,7 +12013,7 @@ fn matching_provider_retry_policy(
     is_transient_provider_error(error).then(|| ProviderRetryPolicy {
         id: "builtin.transient".to_string(),
         display_name: "transient provider error".to_string(),
-        max_retries: default_provider_retry_max_retries(),
+        max_retries: None,
         initial_delay_ms: default_provider_retry_initial_delay_ms(),
         max_delay_ms: default_provider_retry_max_delay_ms(),
         use_provider_retry_hint: default_provider_retry_use_provider_retry_hint(),
@@ -12054,23 +12064,30 @@ fn custom_retry_rule_matches(
     selection: &SessionModelSelection,
 ) -> bool {
     rule.enabled.unwrap_or(true)
-        && rule
-            .max_retries
-            .unwrap_or(default_provider_retry_max_retries())
-            > 0
+        && (rule
+            .retry_forever
+            .unwrap_or_else(|| rule.max_retries.is_none())
+            || rule.max_retries != Some(0))
         && rule.r#match.has_conditions()
         && retry_rule_scope_matches(rule, selection)
         && retry_rule_error_matches(&rule.r#match, error)
 }
 
 impl ProviderRetryPolicy {
+    fn allows_attempt(&self, attempts: u64) -> bool {
+        self.max_retries
+            .is_none_or(|max_retries| attempts < max_retries)
+    }
+
     fn from_rule(rule: &bcode_model::ProviderRetryRule) -> Self {
         Self {
             id: format!("custom.{}", rule.id),
             display_name: rule.id.clone(),
-            max_retries: rule
-                .max_retries
-                .unwrap_or(default_provider_retry_max_retries()),
+            max_retries: (!rule
+                .retry_forever
+                .unwrap_or_else(|| rule.max_retries.is_none()))
+            .then_some(rule.max_retries)
+            .flatten(),
             initial_delay_ms: rule
                 .initial_delay_ms
                 .unwrap_or(default_provider_retry_initial_delay_ms()),
@@ -12085,16 +12102,12 @@ impl ProviderRetryPolicy {
     }
 }
 
-const fn default_provider_retry_max_retries() -> u8 {
-    3
-}
-
 const fn default_provider_retry_initial_delay_ms() -> u64 {
     1_000
 }
 
 const fn default_provider_retry_max_delay_ms() -> u64 {
-    8_000
+    600_000
 }
 
 const fn default_provider_retry_use_provider_retry_hint() -> bool {
@@ -12289,7 +12302,7 @@ async fn retry_after_provider_error(
     turn_id: &str,
     error: &bcode_model::ProviderError,
     policy: &ProviderRetryPolicy,
-    attempt: u8,
+    attempt: u64,
     cancel_state: &TurnCancelState,
 ) -> ModelTurnRetry {
     let delay = provider_retry_delay(policy, error, attempt);
@@ -12299,12 +12312,14 @@ async fn retry_after_provider_error(
         turn_id,
         "recoverable_error_retry",
         Some(format!(
-            "model provider error matched retry policy {} ({}: {}); retrying attempt {}/{} in {}ms",
+            "model provider error matched retry policy {} ({}: {}); retrying {} in {}ms",
             policy.id,
             error.code,
             error.message,
-            attempt,
-            policy.max_retries,
+            policy.max_retries.map_or_else(
+                || format!("attempt {attempt}"),
+                |max_retries| format!("attempt {attempt}/{max_retries}"),
+            ),
             delay.as_millis()
         )),
     )
@@ -12325,7 +12340,7 @@ async fn retry_after_provider_error(
     }
 }
 
-fn provider_retry_message(policy: &ProviderRetryPolicy, delay: Duration, attempt: u8) -> String {
+fn provider_retry_message(policy: &ProviderRetryPolicy, delay: Duration, attempt: u64) -> String {
     let reason = match policy.kind {
         ProviderRetryPolicyKind::Overload => Some("Model provider is overloaded."),
         ProviderRetryPolicyKind::NoProgressTimeout => {
@@ -12334,27 +12349,27 @@ fn provider_retry_message(policy: &ProviderRetryPolicy, delay: Duration, attempt
         ProviderRetryPolicyKind::Transient => Some("Model provider reported a transient error."),
         ProviderRetryPolicyKind::Custom => None,
     };
+    let attempt = policy.max_retries.map_or_else(
+        || format!("attempt {attempt}"),
+        |max_retries| format!("attempt {attempt}/{max_retries}"),
+    );
     if let Some(reason) = reason {
         return format!(
-            "{reason} Retrying automatically in {} (attempt {}/{}).",
+            "{reason} Retrying automatically in {} ({attempt}).",
             format_retry_delay(delay),
-            attempt,
-            policy.max_retries
         );
     }
     format!(
-        "Model provider error matched retry rule {:?}. Retrying automatically in {} (attempt {}/{}).",
+        "Model provider error matched retry rule {:?}. Retrying automatically in {} ({attempt}).",
         policy.display_name,
         format_retry_delay(delay),
-        attempt,
-        policy.max_retries
     )
 }
 
 fn provider_retry_delay(
     policy: &ProviderRetryPolicy,
     error: &bcode_model::ProviderError,
-    attempt: u8,
+    attempt: u64,
 ) -> Duration {
     let max_delay = Duration::from_millis(policy.max_delay_ms);
     if policy.use_provider_retry_hint
@@ -12371,9 +12386,8 @@ fn provider_retry_delay(
         }
     }
 
-    let multiplier = 1_u64
-        .checked_shl(u32::from(attempt.saturating_sub(1)))
-        .unwrap_or(u64::MAX);
+    let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+    let multiplier = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
     Duration::from_millis(policy.initial_delay_ms.saturating_mul(multiplier)).min(max_delay)
 }
 
@@ -12381,12 +12395,16 @@ fn provider_retry_delay(
 fn overload_retry_delay(
     config: &bcode_config::ModelRetryConfig,
     error: &bcode_model::ProviderError,
-    attempt: u8,
+    attempt: u64,
 ) -> Duration {
     let policy = ProviderRetryPolicy {
         id: "builtin.overload".to_string(),
         display_name: "overload".to_string(),
-        max_retries: config.max_overload_retries,
+        max_retries: (!config
+            .overload_retry_forever
+            .unwrap_or_else(|| config.max_overload_retries.is_none()))
+        .then_some(config.max_overload_retries)
+        .flatten(),
         initial_delay_ms: config.overload_initial_delay_ms,
         max_delay_ms: config.overload_max_delay_ms,
         use_provider_retry_hint: true,
@@ -12399,11 +12417,18 @@ fn overload_retry_delay(
 fn should_retry_after_overload_error(
     state: &ServerState,
     error: &bcode_model::ProviderError,
-    attempts: u8,
+    attempts: u64,
 ) -> bool {
     state.model_retry.enabled
         && state.model_retry.overload_enabled
-        && attempts < state.model_retry.max_overload_retries
+        && (state
+            .model_retry
+            .overload_retry_forever
+            .unwrap_or_else(|| state.model_retry.max_overload_retries.is_none())
+            || state
+                .model_retry
+                .max_overload_retries
+                .is_none_or(|max_retries| attempts < max_retries))
         && is_overloaded_provider_error(error)
 }
 
@@ -27670,7 +27695,7 @@ library = "test"
             retry: None,
         };
         let mut state = test_server_state(SessionManager::default());
-        state.model_retry.max_overload_retries = 2;
+        state.model_retry.max_overload_retries = Some(2);
 
         assert!(is_overloaded_provider_error(&error));
         assert!(should_retry_after_overload_error(&state, &error, 0));
@@ -27801,7 +27826,7 @@ library = "test"
             policy.id,
             "custom.bcode.openai-compatible.upstream-retry-buffer-limit"
         );
-        assert_eq!(policy.max_retries, 3);
+        assert_eq!(policy.max_retries, None);
     }
 
     #[test]
@@ -27851,7 +27876,7 @@ library = "test"
             policy.id,
             "custom.bcode.openai-compatible.no-biscuit-no-service"
         );
-        assert_eq!(policy.max_retries, 3);
+        assert_eq!(policy.max_retries, None);
 
         let unrelated_error = bcode_model::ProviderError {
             message: "different stream failure".to_string(),
@@ -27913,7 +27938,7 @@ library = "test"
             policy.id,
             "custom.bcode.openai-compatible.stream-read-decode-failed"
         );
-        assert_eq!(policy.max_retries, 3);
+        assert_eq!(policy.max_retries, None);
 
         let unrelated_error = bcode_model::ProviderError {
             message: "provider stream failed while reading response body: connection reset"
@@ -27967,6 +27992,67 @@ library = "test"
     }
 
     #[test]
+    fn indefinite_retry_delay_caps_at_ten_minutes() {
+        let error = bcode_model::ProviderError {
+            code: "connection_reset".to_string(),
+            category: bcode_model::ProviderErrorCategory::Network,
+            message: "connection reset".to_string(),
+            retryable: true,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
+            retry: None,
+        };
+        let policy = ProviderRetryPolicy {
+            id: "builtin.transient".to_string(),
+            display_name: "transient provider error".to_string(),
+            max_retries: None,
+            initial_delay_ms: 1_000,
+            max_delay_ms: 600_000,
+            use_provider_retry_hint: true,
+            kind: ProviderRetryPolicyKind::Transient,
+        };
+
+        assert!(policy.allows_attempt(u64::MAX));
+        assert_eq!(
+            provider_retry_delay(&policy, &error, 10),
+            Duration::from_secs(512)
+        );
+        assert_eq!(
+            provider_retry_delay(&policy, &error, 11),
+            Duration::from_mins(10)
+        );
+        assert_eq!(
+            provider_retry_delay(&policy, &error, u64::MAX),
+            Duration::from_mins(10)
+        );
+        assert_eq!(
+            provider_retry_message(&policy, Duration::from_mins(10), 42),
+            "Model provider reported a transient error. Retrying automatically in 600s (attempt 42)."
+        );
+    }
+
+    #[test]
+    fn finite_retry_rule_preserves_configured_limit() {
+        let rule = bcode_model::ProviderRetryRule {
+            id: "finite".to_string(),
+            retry_forever: Some(false),
+            max_retries: Some(5),
+            r#match: bcode_model::ProviderRetryRuleMatch {
+                code: Some("temporary".to_string()),
+                ..bcode_model::ProviderRetryRuleMatch::default()
+            },
+            ..bcode_model::ProviderRetryRule::default()
+        };
+        let policy = ProviderRetryPolicy::from_rule(&rule);
+
+        assert!(policy.allows_attempt(4));
+        assert!(!policy.allows_attempt(5));
+    }
+
+    #[test]
     fn retryable_provider_internal_and_network_errors_use_transient_policy() {
         let state = test_server_state(SessionManager::default());
         let selection = SessionModelSelection::default();
@@ -27989,9 +28075,9 @@ library = "test"
                 .expect("retryable server error should use transient policy");
 
             assert_eq!(policy.id, "builtin.transient");
-            assert_eq!(policy.max_retries, 3);
+            assert_eq!(policy.max_retries, None);
             assert_eq!(policy.initial_delay_ms, 1_000);
-            assert_eq!(policy.max_delay_ms, 8_000);
+            assert_eq!(policy.max_delay_ms, 600_000);
         }
 
         let network_error = bcode_model::ProviderError {
@@ -28164,9 +28250,9 @@ library = "test"
         .expect("built-in timeout retry policy should match");
 
         assert_eq!(policy.id, "builtin.no_progress_timeout");
-        assert_eq!(policy.max_retries, 2);
+        assert_eq!(policy.max_retries, None);
         assert_eq!(policy.initial_delay_ms, 1_000);
-        assert_eq!(policy.max_delay_ms, 8_000);
+        assert_eq!(policy.max_delay_ms, 600_000);
         assert!(!policy.use_provider_retry_hint);
     }
 
@@ -28250,7 +28336,7 @@ library = "test"
             .expect("custom retry policy should match");
 
         assert_eq!(policy.id, "custom.unsupported-content-type");
-        assert_eq!(policy.max_retries, 2);
+        assert_eq!(policy.max_retries, Some(2));
         assert_eq!(policy.initial_delay_ms, 500);
     }
 
@@ -28312,7 +28398,7 @@ library = "test"
         let policy = ProviderRetryPolicy {
             id: "custom.unsupported-content-type".to_string(),
             display_name: "unsupported-content-type".to_string(),
-            max_retries: 3,
+            max_retries: Some(3),
             initial_delay_ms: 1_000,
             max_delay_ms: 8_000,
             use_provider_retry_hint: false,
@@ -28344,7 +28430,7 @@ library = "test"
             })),
         };
         let config = bcode_config::ModelRetryConfig {
-            max_overload_retries: 5,
+            max_overload_retries: Some(5),
             overload_initial_delay_ms: 1_000,
             overload_max_delay_ms: 10_000,
             ..bcode_config::ModelRetryConfig::default()
@@ -28371,7 +28457,7 @@ library = "test"
             retry: None,
         };
         let config = bcode_config::ModelRetryConfig {
-            max_overload_retries: 5,
+            max_overload_retries: Some(5),
             overload_initial_delay_ms: 1_000,
             overload_max_delay_ms: 10_000,
             ..bcode_config::ModelRetryConfig::default()
