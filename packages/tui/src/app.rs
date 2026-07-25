@@ -273,6 +273,7 @@ pub struct BmuxApp {
     pending_key_activation: Option<PendingKeyActivation>,
     plugin_presentation: Option<Arc<crate::plugin_tui::PluginTuiPresentation>>,
     markdown_interaction: crate::markdown_interaction::MarkdownInteractionState,
+    markdown_source_view: Option<(String, String)>,
 }
 
 /// Daemon connection state used to describe startup readiness in the status chrome.
@@ -470,6 +471,7 @@ impl BmuxApp {
             pending_key_activation: None,
             plugin_presentation: None,
             markdown_interaction: crate::markdown_interaction::MarkdownInteractionState::default(),
+            markdown_source_view: None,
         };
         app.absorb_history(history);
         app
@@ -522,6 +524,13 @@ impl BmuxApp {
         visible: Vec<crate::markdown_interaction::VisibleMarkdownContribution>,
     ) {
         self.markdown_interaction.reconcile(visible);
+        if self
+            .markdown_source_view
+            .as_ref()
+            .is_some_and(|(id, _)| self.markdown_interaction.contribution(id).is_none())
+        {
+            self.markdown_source_view = None;
+        }
     }
 
     /// Move Markdown focus in visible document order.
@@ -575,7 +584,21 @@ impl BmuxApp {
     pub fn activate_markdown_contribution(&mut self, contribution_id: &str) -> bool {
         use bcode_markdown_render::MarkdownContributionKind;
 
-        let destination = match self.visible_markdown_contribution(contribution_id).cloned() {
+        let contribution = self.visible_markdown_contribution(contribution_id).cloned();
+        if let Some(MarkdownContributionKind::Mermaid { source, .. }) = contribution {
+            if self
+                .markdown_source_view()
+                .is_some_and(|(active_id, _)| active_id == contribution_id)
+            {
+                self.markdown_source_view = None;
+                self.set_status("Mermaid source view closed".to_owned());
+            } else {
+                self.markdown_source_view = Some((contribution_id.to_owned(), source));
+                self.set_status("Mermaid source view opened; activate again to close".to_owned());
+            }
+            return true;
+        }
+        let destination = match contribution {
             Some(
                 MarkdownContributionKind::Link { destination, .. }
                 | MarkdownContributionKind::GitHubIssue { destination, .. },
@@ -605,6 +628,14 @@ impl BmuxApp {
             }
         }
         true
+    }
+
+    /// Return the active Mermaid source-view text.
+    #[must_use]
+    pub fn markdown_source_view(&self) -> Option<(&str, &str)> {
+        self.markdown_source_view
+            .as_ref()
+            .map(|(id, source)| (id.as_str(), source.as_str()))
     }
 
     /// Activate the currently focused Markdown contribution.

@@ -169,6 +169,7 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
     }
     app.reconcile_markdown_interactions(visible);
     render_body(app, layout.body, frame);
+    render_markdown_source_view(app, layout.body, frame);
     if let Some(latest_bar) = layout.latest_bar {
         render_latest_bar(app, latest_bar, frame, Instant::now());
     }
@@ -732,6 +733,47 @@ fn short_session_id(session_id: &str) -> String {
     format!("#{}", session_id.chars().take(8).collect::<String>())
 }
 
+fn render_markdown_source_view(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
+    let Some((_, source)) = app.markdown_source_view() else {
+        return;
+    };
+    let area = area.intersection(Rect::new(
+        area.x.saturating_add(2),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(2),
+    ));
+    if area.is_empty() {
+        return;
+    }
+    frame.fill(area, " ", Style::new().fg(Color::White).bg(Color::Black));
+    let title = Line::from_spans(vec![Span::styled(
+        " Mermaid source · Alt+Enter closes ",
+        Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    )]);
+    frame.write_line(Rect::new(area.x, area.y, area.width, 1), &title);
+    for (offset, line) in source
+        .lines()
+        .take(usize::from(area.height.saturating_sub(1)))
+        .enumerate()
+    {
+        frame.write_line(
+            Rect::new(
+                area.x,
+                area.y
+                    .saturating_add(1)
+                    .saturating_add(u16::try_from(offset).unwrap_or(u16::MAX)),
+                area.width,
+                1,
+            ),
+            &Line::from_spans(vec![Span::styled(
+                truncate_to_display_width(line, usize::from(area.width)),
+                Style::new().fg(Color::White),
+            )]),
+        );
+    }
+}
+
 fn render_body(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
@@ -969,11 +1011,11 @@ const fn markdown_contribution_actionable(kind: &MarkdownContributionKind) -> bo
         ),
         MarkdownContributionKind::Details { .. }
         | MarkdownContributionKind::FootnoteReference { .. }
-        | MarkdownContributionKind::FootnoteDefinition { .. } => true,
+        | MarkdownContributionKind::FootnoteDefinition { .. }
+        | MarkdownContributionKind::Mermaid { .. } => true,
         MarkdownContributionKind::Image { .. }
         | MarkdownContributionKind::InlineMath { .. }
-        | MarkdownContributionKind::DisplayMath { .. }
-        | MarkdownContributionKind::Mermaid { .. } => false,
+        | MarkdownContributionKind::DisplayMath { .. } => false,
     }
 }
 
