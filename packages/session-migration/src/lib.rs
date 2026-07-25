@@ -13,6 +13,7 @@ mod backup;
 mod historical;
 mod operation;
 mod registry;
+mod storage;
 
 pub use audit::SessionMigrationReceipt;
 pub use backup::{
@@ -21,6 +22,13 @@ pub use backup::{
     create_verified_migration_backup,
 };
 pub use operation::{SessionMigrationOperation, SessionMigrationOperations};
+pub use storage::{
+    HistoricalStorageDiagnosis, HistoricalStorageDiagnosisStatus, HistoricalStorageError,
+    HistoricalStorageInspectionReport, HistoricalStorageRecoveryReport,
+    HistoricalStorageRelocation, accidental_epoch_session_root,
+    diagnose_accidental_epoch_session_root, inspect_accidental_epoch_session_root,
+    recover_accidental_epoch_session_root,
+};
 
 pub use historical::{
     HistoricalDecode, HistoricalEventMetadata, HistoricalSessionEventError, decode_for_migration,
@@ -29,4 +37,5 @@ pub use historical::{
 pub use registry::{
     CURRENT_WRITER_EPOCH, MigrationPlan, MigrationPlanError, MigrationPlanService,
     MigrationStepDescriptor, plan_writer_epoch_migration,
+    plan_writer_epoch_migration_with_registry,
 };

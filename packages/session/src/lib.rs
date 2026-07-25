@@ -16,7 +16,8 @@
 
 pub mod legacy_storage;
 pub use legacy_storage::{
-    LegacyStorageInspectionReport, LegacyStorageRecoveryReport,
+    HistoricalStorageDiagnosis, HistoricalStorageDiagnosisStatus, LegacyStorageInspectionReport,
+    LegacyStorageRecoveryReport, diagnose_accidental_epoch_session_root,
     inspect_accidental_epoch_session_root, recover_accidental_epoch_session_root,
 };
 

@@ -124,33 +124,17 @@ pub enum SessionRepairError {
 ///
 /// Returns an error if historical directory or owner inspection fails.
 pub fn doctor_legacy_storage(state_dir: &Path) -> Result<RepairReport, SessionRepairError> {
-    let inspection = crate::inspect_accidental_epoch_session_root(state_dir)?;
-    let historical_root = crate::legacy_storage::accidental_epoch_session_root(state_dir);
-    let mut report = RepairReport::new(RepairTarget::LegacyStorage, historical_root);
-    report.status = if !inspection.destination_conflicts.is_empty() {
-        RepairStatus::ManualRequired
-    } else if !inspection.blocked_by_owner.is_empty() {
-        RepairStatus::RefusedOwnedElsewhere
-    } else if !inspection.pending_relocation.is_empty() {
-        RepairStatus::WouldRepair
-    } else {
-        RepairStatus::Ok
+    let diagnosis = crate::diagnose_accidental_epoch_session_root(state_dir)?;
+    let mut report = RepairReport::new(RepairTarget::LegacyStorage, diagnosis.root);
+    report.status = match diagnosis.status {
+        crate::HistoricalStorageDiagnosisStatus::Ok => RepairStatus::Ok,
+        crate::HistoricalStorageDiagnosisStatus::WouldRecover => RepairStatus::WouldRepair,
+        crate::HistoricalStorageDiagnosisStatus::BlockedByOwner => {
+            RepairStatus::RefusedOwnedElsewhere
+        }
+        crate::HistoricalStorageDiagnosisStatus::ManualRequired => RepairStatus::ManualRequired,
     };
-    for session_id in inspection.pending_relocation {
-        report.notes.push(format!(
-            "historical session {session_id} can be relocated to canonical storage"
-        ));
-    }
-    for session_id in inspection.blocked_by_owner {
-        report.notes.push(format!(
-            "historical session {session_id} is still owned by a live process"
-        ));
-    }
-    for session_id in inspection.destination_conflicts {
-        report.notes.push(format!(
-            "historical session {session_id} conflicts with an existing canonical session; no merge or overwrite is safe"
-        ));
-    }
+    report.notes = diagnosis.notes;
     Ok(report)
 }
 

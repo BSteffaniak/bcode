@@ -266,10 +266,12 @@ if ! rg -q 'pub fn default_session_store_dir\(\)' packages/config/src/lib.rs \
 fi
 
 if rg -n 'join\("session-storage"\)|writer-epoch-' packages/session/src --glob '*.rs' \
-  | rg -v 'packages/session/src/legacy_storage\.rs' \
-  >/tmp/bcode-historical-session-root-violations.txt; then
-  echo "Session historical-root violation: only legacy_storage.rs may recognize the removed epoch root." >&2
-  cat /tmp/bcode-historical-session-root-violations.txt >&2
+  >/tmp/bcode-current-historical-session-root-violations.txt \
+  || ! rg -q 'join\("session-storage"\).*join\("writer-epoch-2"\)' packages/session-migration/src/storage.rs \
+  || ! rg -q 'inspect_historical_root' packages/session/src/legacy_storage.rs \
+  || ! rg -q 'recover_historical_root' packages/session/src/legacy_storage.rs; then
+  echo "Session historical-root violation: historical layout discovery and recovery policy must remain migration-owned." >&2
+  cat /tmp/bcode-current-historical-session-root-violations.txt >&2 2>/dev/null || true
   violations=1
 fi
 

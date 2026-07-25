@@ -100,32 +100,35 @@ impl MigrationPlanService {
     }
 }
 
-/// Resolve the complete monotonic migration path from `source_writer_epoch`.
+/// Resolve a complete monotonic migration path against an explicit registry and target.
+///
+/// This is primarily useful for validating a registry before any migration uses it.
 ///
 /// # Errors
 ///
-/// Returns an error when the source is newer than this build, a required edge
-/// is not registered, or a registered edge is non-monotonic.
-pub fn plan_writer_epoch_migration(
+/// Returns an error for future sources, missing edges, or non-monotonic steps.
+pub fn plan_writer_epoch_migration_with_registry(
     source_writer_epoch: u32,
+    target_writer_epoch: u32,
+    steps_registry: &[MigrationStepDescriptor],
 ) -> Result<MigrationPlan, MigrationPlanError> {
-    if source_writer_epoch > CURRENT_WRITER_EPOCH {
+    if source_writer_epoch > target_writer_epoch {
         return Err(MigrationPlanError::FutureWriter {
             source_writer_epoch,
-            current_writer_epoch: CURRENT_WRITER_EPOCH,
+            current_writer_epoch: target_writer_epoch,
         });
     }
 
     let mut steps = Vec::new();
     let mut writer_epoch = source_writer_epoch;
-    while writer_epoch < CURRENT_WRITER_EPOCH {
-        let step = MIGRATION_STEPS
+    while writer_epoch < target_writer_epoch {
+        let step = steps_registry
             .iter()
             .find(|step| step.source_writer_epoch == writer_epoch)
             .copied()
             .ok_or(MigrationPlanError::MissingStep {
                 writer_epoch,
-                target_writer_epoch: CURRENT_WRITER_EPOCH,
+                target_writer_epoch,
             })?;
         if step.target_writer_epoch <= step.source_writer_epoch {
             return Err(MigrationPlanError::NonMonotonicStep {
@@ -140,9 +143,25 @@ pub fn plan_writer_epoch_migration(
 
     Ok(MigrationPlan {
         source_writer_epoch,
-        target_writer_epoch: CURRENT_WRITER_EPOCH,
+        target_writer_epoch,
         steps,
     })
+}
+
+/// Resolve the complete monotonic migration path from `source_writer_epoch`.
+///
+/// # Errors
+///
+/// Returns an error when the source is newer than this build, a required edge
+/// is not registered, or a registered edge is non-monotonic.
+pub fn plan_writer_epoch_migration(
+    source_writer_epoch: u32,
+) -> Result<MigrationPlan, MigrationPlanError> {
+    plan_writer_epoch_migration_with_registry(
+        source_writer_epoch,
+        CURRENT_WRITER_EPOCH,
+        &MIGRATION_STEPS,
+    )
 }
 
 #[cfg(test)]
@@ -164,6 +183,36 @@ mod tests {
             }
             assert_eq!(expected_source, CURRENT_WRITER_EPOCH);
         }
+    }
+
+    #[test]
+    fn explicit_registry_rejects_missing_and_non_monotonic_edges() {
+        let missing = [MigrationStepDescriptor {
+            id: "one-to-two",
+            source_writer_epoch: 1,
+            target_writer_epoch: 2,
+        }];
+        assert!(matches!(
+            plan_writer_epoch_migration_with_registry(1, 3, &missing),
+            Err(MigrationPlanError::MissingStep {
+                writer_epoch: 2,
+                target_writer_epoch: 3,
+            })
+        ));
+
+        let non_monotonic = [MigrationStepDescriptor {
+            id: "stalled",
+            source_writer_epoch: 1,
+            target_writer_epoch: 1,
+        }];
+        assert!(matches!(
+            plan_writer_epoch_migration_with_registry(1, 2, &non_monotonic),
+            Err(MigrationPlanError::NonMonotonicStep {
+                step_id: "stalled",
+                source_writer_epoch: 1,
+                target_writer_epoch: 1,
+            })
+        ));
     }
 
     #[test]
