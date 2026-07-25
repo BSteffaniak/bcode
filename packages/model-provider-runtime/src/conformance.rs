@@ -146,8 +146,17 @@ pub struct ProviderEventValidator {
     usage_events: usize,
     text_events: usize,
     reasoning_events: usize,
+    reasoning_activities: BTreeMap<String, ConformanceReasoningActivity>,
     open_tool_calls: BTreeMap<String, String>,
     finished_tool_calls: Vec<bcode_model::ToolCall>,
+}
+
+#[derive(Debug, Default)]
+struct ConformanceReasoningActivity {
+    order: u32,
+    started: bool,
+    finished: bool,
+    parts: BTreeMap<String, (bcode_session_models::ReasoningContentKind, u32)>,
 }
 
 impl ProviderEventValidator {
@@ -195,6 +204,16 @@ impl ProviderEventValidator {
         };
         if !self.open_tool_calls.is_empty() {
             return violation(BASE_TURN, "event stream ended with unfinished tool calls");
+        }
+        if self
+            .reasoning_activities
+            .values()
+            .any(|activity| activity.started && !activity.finished)
+        {
+            return violation(
+                BASE_TURN,
+                "event stream ended with unfinished reasoning activity",
+            );
         }
         if self.error_category.is_some() != (stop_reason == StopReason::Error) {
             return violation(
@@ -257,13 +276,7 @@ impl ProviderEventValidator {
                 self.reasoning_events += 1;
             }
             ProviderTurnEvent::ReasoningActivity { event } => {
-                if matches!(
-                    event,
-                    bcode_session_models::ReasoningActivityEvent::PartDelta { text, .. }
-                        if text.is_empty()
-                ) {
-                    return violation(BASE_TURN, "provider emitted an empty reasoning part delta");
-                }
+                self.observe_reasoning_activity(event)?;
                 self.reasoning_events += 1;
             }
             ProviderTurnEvent::ToolCallStarted { call_id, name } => {
@@ -360,6 +373,85 @@ impl ProviderEventValidator {
             return violation(BASE_TURN, "tool call arguments must be a JSON object");
         }
         self.finished_tool_calls.push(call.clone());
+        Ok(())
+    }
+
+    fn observe_reasoning_activity(
+        &mut self,
+        event: &bcode_session_models::ReasoningActivityEvent,
+    ) -> Result<(), ProviderConformanceError> {
+        use bcode_session_models::ReasoningActivityEvent;
+        let id = event.activity_id();
+        let order = event.activity_order();
+        let entry = self.reasoning_activities.entry(id.to_owned()).or_default();
+        if entry.started && entry.order != order {
+            return violation(BASE_TURN, "reasoning activity order changed during stream");
+        }
+        match event {
+            ReasoningActivityEvent::Started { .. } => {
+                if entry.started {
+                    return violation(BASE_TURN, "reasoning activity started more than once");
+                }
+                entry.started = true;
+                entry.order = order;
+            }
+            ReasoningActivityEvent::PartDelta {
+                part_id,
+                kind,
+                part_order,
+                text,
+                ..
+            }
+            | ReasoningActivityEvent::PartCompleted {
+                part_id,
+                kind,
+                part_order,
+                text,
+                ..
+            } => {
+                if !entry.started {
+                    return violation(
+                        BASE_TURN,
+                        "reasoning part was emitted before activity start",
+                    );
+                }
+                if entry.finished {
+                    return violation(
+                        BASE_TURN,
+                        "reasoning part was emitted after activity finish",
+                    );
+                }
+                if matches!(event, ReasoningActivityEvent::PartDelta { .. }) && text.is_empty() {
+                    return violation(BASE_TURN, "provider emitted an empty reasoning part delta");
+                }
+                if let Some((existing_kind, existing_order)) = entry.parts.get(part_id)
+                    && (*existing_kind != *kind || *existing_order != *part_order)
+                {
+                    return violation(
+                        BASE_TURN,
+                        "reasoning part identity changed kind or order during stream",
+                    );
+                }
+                entry.parts.insert(part_id.clone(), (*kind, *part_order));
+            }
+            ReasoningActivityEvent::OpaqueObserved { .. } => {
+                if !entry.started || entry.finished {
+                    return violation(
+                        BASE_TURN,
+                        "opaque reasoning evidence requires an active reasoning activity",
+                    );
+                }
+            }
+            ReasoningActivityEvent::Finished { .. } => {
+                if !entry.started {
+                    return violation(BASE_TURN, "reasoning activity finished before start");
+                }
+                if entry.finished {
+                    return violation(BASE_TURN, "reasoning activity finished more than once");
+                }
+                entry.finished = true;
+            }
+        }
         Ok(())
     }
 
@@ -1528,6 +1620,115 @@ mod tests {
             ])
             .expect("valid events");
         assert_eq!(validator.finish().expect("valid turn").tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn validator_accepts_structured_reasoning_lifecycle() {
+        let mut validator = ProviderEventValidator::default();
+        validator
+            .observe(&[
+                ProviderTurnEvent::TurnStarted,
+                ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::Started {
+                        activity_id: "reasoning-1".to_owned(),
+                        order: 0,
+                    },
+                },
+                ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::PartDelta {
+                        activity_id: "reasoning-1".to_owned(),
+                        activity_order: 0,
+                        part_id: "summary-0".to_owned(),
+                        kind: bcode_session_models::ReasoningContentKind::Summary,
+                        role: bcode_session_models::ReasoningContentRole::Milestone,
+                        part_order: 0,
+                        text: "planning".to_owned(),
+                    },
+                },
+                ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::Finished {
+                        activity_id: "reasoning-1".to_owned(),
+                        activity_order: 0,
+                        status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    },
+                },
+                ProviderTurnEvent::Usage {
+                    usage: TokenUsage::default(),
+                },
+                ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::EndTurn,
+                },
+            ])
+            .expect("structured reasoning lifecycle");
+        assert_eq!(validator.finish().expect("valid turn").reasoning_events, 3);
+    }
+
+    #[test]
+    fn validator_rejects_reasoning_part_identity_changes() {
+        let mut validator = ProviderEventValidator::default();
+        let error = validator
+            .observe(&[
+                ProviderTurnEvent::TurnStarted,
+                ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::Started {
+                        activity_id: "reasoning-1".to_owned(),
+                        order: 0,
+                    },
+                },
+                ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::PartDelta {
+                        activity_id: "reasoning-1".to_owned(),
+                        activity_order: 0,
+                        part_id: "part-0".to_owned(),
+                        kind: bcode_session_models::ReasoningContentKind::Summary,
+                        role: bcode_session_models::ReasoningContentRole::Milestone,
+                        part_order: 0,
+                        text: "summary".to_owned(),
+                    },
+                },
+                ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::PartDelta {
+                        activity_id: "reasoning-1".to_owned(),
+                        activity_order: 0,
+                        part_id: "part-0".to_owned(),
+                        kind: bcode_session_models::ReasoningContentKind::Raw,
+                        role: bcode_session_models::ReasoningContentRole::Detail,
+                        part_order: 1,
+                        text: "raw".to_owned(),
+                    },
+                },
+            ])
+            .expect_err("part identity mutation must fail");
+        assert!(error.to_string().contains("identity changed"));
+    }
+
+    #[test]
+    fn validator_rejects_unfinished_reasoning_activity() {
+        let mut validator = ProviderEventValidator::default();
+        validator
+            .observe(&[
+                ProviderTurnEvent::TurnStarted,
+                ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::Started {
+                        activity_id: "reasoning-1".to_owned(),
+                        order: 0,
+                    },
+                },
+                ProviderTurnEvent::Usage {
+                    usage: TokenUsage::default(),
+                },
+                ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::EndTurn,
+                },
+            ])
+            .expect("ordered events");
+        assert!(
+            validator
+                .finish()
+                .expect_err("unfinished reasoning must fail")
+                .to_string()
+                .contains("unfinished reasoning")
+        );
     }
 
     #[test]

@@ -24,6 +24,64 @@ use bcode_session_view_models::{
 };
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
 
+#[derive(Debug, Clone, Default)]
+struct LiveReasoningActivity {
+    order: u32,
+    parts: BTreeMap<String, bcode_session_models::ReasoningPart>,
+    opaque: bool,
+    finished: bool,
+}
+
+impl LiveReasoningActivity {
+    fn apply(&mut self, event: &bcode_session_models::ReasoningActivityEvent) {
+        use bcode_session_models::ReasoningActivityEvent;
+        self.order = event.activity_order();
+        match event {
+            ReasoningActivityEvent::Started { .. } => {}
+            ReasoningActivityEvent::PartDelta {
+                part_id,
+                kind,
+                role,
+                part_order,
+                text,
+                ..
+            } => {
+                self.parts
+                    .entry(part_id.clone())
+                    .and_modify(|part| part.text.push_str(text))
+                    .or_insert_with(|| bcode_session_models::ReasoningPart {
+                        part_id: part_id.clone(),
+                        kind: *kind,
+                        role: *role,
+                        order: *part_order,
+                        text: text.clone(),
+                    });
+            }
+            ReasoningActivityEvent::PartCompleted {
+                part_id,
+                kind,
+                role,
+                part_order,
+                text,
+                ..
+            } => {
+                self.parts.insert(
+                    part_id.clone(),
+                    bcode_session_models::ReasoningPart {
+                        part_id: part_id.clone(),
+                        kind: *kind,
+                        role: *role,
+                        order: *part_order,
+                        text: text.clone(),
+                    },
+                );
+            }
+            ReasoningActivityEvent::OpaqueObserved { .. } => self.opaque = true,
+            ReasoningActivityEvent::Finished { .. } => self.finished = true,
+        }
+    }
+}
+
 /// Renderer-neutral session view projection.
 #[derive(Debug, Clone)]
 pub struct SessionView {
@@ -40,6 +98,7 @@ pub struct SessionView {
     terminal_runtime_work: BTreeSet<bcode_session_models::WorkId>,
     tool_request_drafts: BTreeMap<String, ToolRequestDraftView>,
     terminal_tool_request_drafts: BTreeMap<String, (u64, u64)>,
+    live_reasoning: BTreeMap<(String, String), LiveReasoningActivity>,
 }
 
 impl Default for SessionView {
@@ -66,6 +125,7 @@ impl SessionView {
             terminal_runtime_work: BTreeSet::new(),
             tool_request_drafts: BTreeMap::new(),
             terminal_tool_request_drafts: BTreeMap::new(),
+            live_reasoning: BTreeMap::new(),
         }
     }
 
@@ -1409,69 +1469,61 @@ impl SessionView {
         turn_id: &str,
         event: &bcode_session_models::ReasoningActivityEvent,
     ) {
-        use bcode_session_models::ReasoningActivityEvent;
+        let key = (turn_id.to_owned(), event.activity_id().to_owned());
+        self.live_reasoning
+            .entry(key.clone())
+            .or_default()
+            .apply(event);
+        let activity = self
+            .live_reasoning
+            .get(&key)
+            .expect("live reasoning activity was inserted");
         let item_id =
             TranscriptViewItemId::new(format!("reasoning-turn:{turn_id}:{}", event.activity_id()));
-        match event {
-            ReasoningActivityEvent::Started { .. }
-            | ReasoningActivityEvent::OpaqueObserved { .. } => {
-                if self
-                    .snapshot
-                    .transcript
-                    .items
-                    .iter()
-                    .all(|item| item.id != item_id)
-                {
-                    self.push_item(
-                        item_id,
-                        0,
-                        None,
-                        true,
-                        StreamingMessageKind::Reasoning.item_kind(String::new()),
-                    );
-                }
-            }
-            ReasoningActivityEvent::PartDelta { text, .. } => {
-                self.push_or_append_streaming_message(
-                    item_id,
-                    0,
-                    None,
-                    StreamingMessageKind::Reasoning,
-                    text,
-                );
-            }
-            ReasoningActivityEvent::PartCompleted { text, .. } => {
-                self.finish_or_push_message(
-                    item_id,
-                    0,
-                    None,
-                    StreamingMessageKind::Reasoning,
-                    text,
-                );
-            }
-            ReasoningActivityEvent::Finished { .. } => {
-                if let Some(item) = self
-                    .snapshot
-                    .transcript
-                    .items
-                    .iter_mut()
-                    .find(|item| item.id == item_id)
-                {
-                    item.streaming = false;
-                    item.revision = item.revision.saturating_add(1);
-                    self.snapshot.transcript.revision =
-                        self.snapshot.transcript.revision.saturating_add(1);
-                    self.bump_revision();
-                } else {
-                    self.push_item(
-                        item_id,
-                        0,
-                        None,
-                        false,
-                        StreamingMessageKind::Reasoning.item_kind(String::new()),
-                    );
-                }
-            }
+        let mut parts = activity.parts.values().collect::<Vec<_>>();
+        parts.sort_by_key(|part| (part.order, part.kind, part.part_id.as_str()));
+        let text = if self.snapshot.thinking.visible {
+            parts
+                .into_iter()
+                .filter(|part| match self.snapshot.thinking.mode {
+                    bcode_session_view_models::ReasoningDisplayMode::All => true,
+                    bcode_session_view_models::ReasoningDisplayMode::Summary => matches!(
+                        part.kind,
+                        bcode_session_models::ReasoningContentKind::Summary
+                            | bcode_session_models::ReasoningContentKind::Legacy
+                    ),
+                    bcode_session_view_models::ReasoningDisplayMode::Raw => {
+                        matches!(part.kind, bcode_session_models::ReasoningContentKind::Raw)
+                    }
+                })
+                .map(|part| part.text.as_str())
+                .filter(|text| !text.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        } else {
+            String::new()
+        };
+        let streaming = !activity.finished;
+        if let Some(item) = self
+            .snapshot
+            .transcript
+            .items
+            .iter_mut()
+            .find(|item| item.id == item_id)
+        {
+            replace_text_in_item(item, &text);
+            item.streaming = streaming;
+            item.revision = item.revision.saturating_add(1);
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+        } else {
+            self.push_item(
+                item_id,
+                0,
+                None,
+                streaming,
+                StreamingMessageKind::Reasoning.item_kind(text),
+            );
         }
     }
 
@@ -3314,6 +3366,94 @@ mod tests {
             }
             other => panic!("unexpected item: {other:?}"),
         }
+    }
+
+    #[test]
+    fn live_reasoning_reconciles_authoritative_parts_and_matches_durable_projection() {
+        let session_id = SessionId::new();
+        let mut live = SessionView::new();
+        for event in [
+            bcode_session_models::ReasoningActivityEvent::Started {
+                activity_id: "reasoning-1".to_owned(),
+                order: 0,
+            },
+            bcode_session_models::ReasoningActivityEvent::PartDelta {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 0,
+                part_id: "summary-0".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: "Fir".to_owned(),
+            },
+            bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 0,
+                part_id: "summary-0".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: "First".to_owned(),
+            },
+            bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 0,
+                part_id: "summary-1".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order: 1,
+                text: "Second".to_owned(),
+            },
+            bcode_session_models::ReasoningActivityEvent::Finished {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 0,
+                status: bcode_session_models::ReasoningActivityStatus::Completed,
+            },
+        ] {
+            live.apply_live_event(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantReasoningActivity {
+                    turn_id: "turn-1".to_owned(),
+                    event,
+                },
+            });
+        }
+        assert_reasoning_text(
+            &live.snapshot().transcript.items[0],
+            "First\n\nSecond",
+            false,
+        );
+
+        let durable = build_session_view_snapshot(&[event(
+            session_id,
+            1,
+            SessionEventKind::AssistantReasoningActivity {
+                turn_id: "turn-1".to_owned(),
+                activity: bcode_session_models::ReasoningActivity {
+                    activity_id: "reasoning-1".to_owned(),
+                    order: 0,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    parts: vec![
+                        bcode_session_models::ReasoningPart {
+                            part_id: "summary-0".to_owned(),
+                            kind: bcode_session_models::ReasoningContentKind::Summary,
+                            role: bcode_session_models::ReasoningContentRole::Milestone,
+                            order: 0,
+                            text: "First".to_owned(),
+                        },
+                        bcode_session_models::ReasoningPart {
+                            part_id: "summary-1".to_owned(),
+                            kind: bcode_session_models::ReasoningContentKind::Summary,
+                            role: bcode_session_models::ReasoningContentRole::Milestone,
+                            order: 1,
+                            text: "Second".to_owned(),
+                        },
+                    ],
+                    opaque: false,
+                },
+            },
+        )]);
+        assert_reasoning_text(&durable.transcript.items[0], "First\n\nSecond", false);
     }
 
     #[test]
