@@ -1723,6 +1723,7 @@ dependencies = [
  "bcode_eval_models",
  "bcode_plugin_sdk",
  "bcode_session_models",
+ "bcode_workflow",
  "bmux_keyboard",
  "bmux_text_edit",
  "bmux_tui",

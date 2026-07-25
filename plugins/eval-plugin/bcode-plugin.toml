@@ -12,6 +12,49 @@ name         = "SDK Eval Artifacts"
 
 [[services]]
 class        = "service"
+description  = "Typed read-only workflow validation blocks"
+interface_id = "bcode.workflow-block/v1"
+name         = "Eval Workflow Blocks"
+
+[[services.workflow_blocks]]
+block_id               = "eval.suite.validate"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "eval.suite.validate"
+plugin_id              = "bcode.eval"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 5000
+
+[services.workflow_blocks.input]
+schema = { type = "object", required = [
+    "schema_version",
+    "id",
+    "name",
+    "variants",
+    "cases",
+] }
+type_name = "bcode.eval.suite/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", required = [
+    "valid",
+    "suite_id",
+    "variant_count",
+    "case_count",
+], properties = { valid = { type = "boolean", const = true }, suite_id = { type = "string" }, variant_count = { type = "integer", minimum = 1 }, case_count = { type = "integer", minimum = 1 } } }
+type_name = "bcode.eval.suite-validation/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "disabled"
+explicit_grant_required = false
+
+[[services.workflow_blocks.resources]]
+access   = "read"
+resource = "eval-suite"
+
+[[services]]
+class        = "service"
 description  = "Eval viewer command contributions"
 interface_id = "bcode.command/v1"
 name         = "Eval Commands"

@@ -10,7 +10,10 @@ for required in \
   'workflow_initial_value: Option<LoopWorkflowIteration>' \
   'host\.start_workflow\(request\)\.await' \
   'fn prepare_legacy_resume' \
-  'fn is_legacy_loop_state'; do
+  'fn is_legacy_loop_state' \
+  'struct WorkflowLoopPresentationState' \
+  'runtime: "workflow".to_string()' \
+  'WorkflowLoopPresentationState::from_loop_state'; do
   if ! rg -q "$required" "$source_file"; then
     echo "Loop workflow migration violation: missing required marker: $required" >&2
     violations=1
@@ -23,6 +26,13 @@ if rg -n 'host\.spawn\(Box::pin\(run_loop\(state\)\)\)' "$source_file" >/tmp/bco
   violations=1
 fi
 rm -f /tmp/bcode-loop-new-start-legacy.txt
+
+if ! rg -q 'for legacy_field in \[' "$source_file" ||
+   ! rg -q '"pending_operation"' "$source_file" ||
+   ! rg -q '"last_completed_operation"' "$source_file"; then
+  echo "Loop workflow migration violation: workflow-backed state lacks legacy-journal exclusion coverage." >&2
+  violations=1
+fi
 
 if rg -n 'workflow\.db|CREATE TABLE.*workflow_(runs|attempts|activations|outputs)' \
   plugins/loop-plugin --glob '*.rs' >/tmp/bcode-loop-workflow-persistence.txt; then

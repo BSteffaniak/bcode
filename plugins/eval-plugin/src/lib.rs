@@ -17,13 +17,14 @@ use bcode_command::{
 };
 use bcode_eval::{
     LoadSdkEvalRunRequest, LoadSdkEvalRunResponse, OP_LOAD_SDK_EVAL_RUN,
-    SDK_EVAL_ARTIFACT_INTERFACE_ID, load_sdk_eval_run,
+    SDK_EVAL_ARTIFACT_INTERFACE_ID, load_sdk_eval_run, validate_suite,
 };
 use bcode_plugin_sdk::prelude::*;
 use serde::Serialize;
 use std::collections::BTreeSet;
 
 const PLUGIN_ID: &str = "bcode.eval";
+const OP_VALIDATE_SUITE: &str = "eval.suite.validate";
 const COMMAND_OPEN_PICKER: &str = "eval.open_picker";
 const COMMAND_OPEN_LATEST: &str = "eval.open_latest";
 const DEFAULT_RUNS_ROOT: &str = "target/bcode-evals/runs";
@@ -46,6 +47,9 @@ impl RustPlugin for EvalPlugin {
         if context.request.interface_id == SDK_EVAL_ARTIFACT_INTERFACE_ID {
             return invoke_sdk_eval_artifact_service(&context.request);
         }
+        if context.request.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID {
+            return invoke_workflow_block(&context.request);
+        }
         if context.request.interface_id != COMMAND_INTERFACE_ID {
             return ServiceResponse::error(
                 "unsupported_interface",
@@ -53,6 +57,28 @@ impl RustPlugin for EvalPlugin {
             );
         }
         invoke_command_service(&context.request)
+    }
+}
+
+fn invoke_workflow_block(request: &ServiceRequest) -> ServiceResponse {
+    if request.operation != OP_VALIDATE_SUITE {
+        return ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported eval workflow block operation",
+        );
+    }
+    let suite = match serde_json::from_slice::<bcode_eval_models::EvalSuite>(&request.payload) {
+        Ok(suite) => suite,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    match validate_suite(&suite) {
+        Ok(()) => json_response(&serde_json::json!({
+            "valid": true,
+            "suite_id": suite.id,
+            "variant_count": suite.variants.len(),
+            "case_count": suite.cases.len(),
+        })),
+        Err(error) => ServiceResponse::error("validation_failed", error.to_string()),
     }
 }
 
@@ -225,6 +251,51 @@ mod tests {
         assert_eq!(
             response.error.as_ref().map(|error| error.code.as_str()),
             Some("unknown_command")
+        );
+    }
+
+    #[test]
+    fn workflow_validation_block_accepts_valid_suite_and_rejects_invalid_suite() {
+        let mut suite: bcode_eval_models::EvalSuite = toml::from_str(
+            r#"
+schema_version = 1
+id = "workflow-validation"
+name = "Workflow validation"
+
+[[variants]]
+id = "variant"
+executor = "agent"
+
+[[cases]]
+id = "case"
+
+[[cases.judges]]
+type = "regex"
+target = "output"
+pattern = "ok"
+"#,
+        )
+        .expect("suite");
+        let request = ServiceRequest {
+            interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.to_string(),
+            operation: OP_VALIDATE_SUITE.to_string(),
+            payload: serde_json::to_vec(&suite).expect("request"),
+        };
+        let response = invoke_workflow_block(&request);
+        assert_eq!(response.error, None);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.payload).expect("response")["valid"],
+            true
+        );
+
+        suite.cases.clear();
+        let invalid = invoke_workflow_block(&ServiceRequest {
+            payload: serde_json::to_vec(&suite).expect("invalid request"),
+            ..request
+        });
+        assert_eq!(
+            invalid.error.as_ref().map(|error| error.code.as_str()),
+            Some("validation_failed")
         );
     }
 

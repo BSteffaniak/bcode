@@ -1007,6 +1007,68 @@ const fn state_schema_version() -> u32 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkflowLoopPresentationState {
+    #[serde(default = "state_schema_version")]
+    schema_version: u32,
+    runtime: String,
+    run_id: String,
+    session_id: SessionId,
+    iteration_prompt: String,
+    stop_condition: String,
+    max_iterations: u64,
+    workflow_definition: bcode_workflow::WorkflowDefinition,
+    workflow_initial_value: LoopWorkflowIteration,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow_run_id: Option<String>,
+}
+
+impl WorkflowLoopPresentationState {
+    fn from_loop_state(state: &LoopState) -> Result<Self, String> {
+        Ok(Self {
+            schema_version: state.schema_version,
+            runtime: "workflow".to_string(),
+            run_id: state.run_id.clone(),
+            session_id: state.session_id,
+            iteration_prompt: state.iteration_prompt.clone(),
+            stop_condition: state.stop_condition.clone(),
+            max_iterations: state.max_iterations,
+            workflow_definition: state.workflow_definition.clone().ok_or_else(|| {
+                "workflow loop presentation is missing its definition".to_string()
+            })?,
+            workflow_initial_value: state.workflow_initial_value.clone().ok_or_else(|| {
+                "workflow loop presentation is missing its initial value".to_string()
+            })?,
+            workflow_run_id: state.workflow_run_id.clone(),
+        })
+    }
+
+    fn into_loop_state(self) -> Result<LoopState, String> {
+        if self.runtime != "workflow" {
+            return Err("unsupported loop presentation runtime".to_string());
+        }
+        Ok(LoopState {
+            schema_version: self.schema_version,
+            run_id: self.run_id,
+            session_id: self.session_id,
+            iteration_prompt: self.iteration_prompt,
+            stop_condition: self.stop_condition,
+            max_iterations: self.max_iterations,
+            workflow_definition: Some(self.workflow_definition),
+            workflow_initial_value: Some(self.workflow_initial_value),
+            workflow_run_id: self.workflow_run_id,
+            current_iteration: 0,
+            state: RunState::Ready,
+            latest_evaluation: None,
+            stop_reason: None,
+            cancel_requested: false,
+            pending_operation: None,
+            last_completed_operation: None,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct LoopState {
     #[serde(default = "state_schema_version")]
     schema_version: u32,
@@ -1835,8 +1897,16 @@ fn decode_state(bytes: &[u8]) -> Result<LoopState, String> {
             "loop state exceeds the {MAX_STATE_BYTES}-byte safety limit"
         ));
     }
-    let state: LoopState =
+    let value: serde_json::Value =
         serde_json::from_slice(bytes).map_err(|error| format!("corrupt loop state: {error}"))?;
+    let state = if value.get("runtime").is_some() {
+        serde_json::from_value::<WorkflowLoopPresentationState>(value)
+            .map_err(|error| format!("corrupt workflow loop presentation: {error}"))?
+            .into_loop_state()?
+    } else {
+        serde_json::from_value::<LoopState>(value)
+            .map_err(|error| format!("corrupt loop state: {error}"))?
+    };
     validate_state(&state)?;
     Ok(state)
 }
@@ -1867,7 +1937,12 @@ fn save_state(state: &LoopState) -> Result<(), String> {
     fs::create_dir_all(&root).map_err(|error| error.to_string())?;
     let path = state_path(state.session_id);
     let temporary = path.with_extension(format!("{}.tmp", state.run_id));
-    let bytes = serde_json::to_vec_pretty(state).map_err(|error| error.to_string())?;
+    let bytes = if loop_state_uses_workflow_runtime(state) {
+        serde_json::to_vec_pretty(&WorkflowLoopPresentationState::from_loop_state(state)?)
+            .map_err(|error| error.to_string())?
+    } else {
+        serde_json::to_vec_pretty(state).map_err(|error| error.to_string())?
+    };
     fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
     fs::rename(temporary, path).map_err(|error| error.to_string())
 }
@@ -2544,6 +2619,39 @@ mod tests {
                 .map(|completion| completion.event_sequence),
             Some(12)
         );
+    }
+
+    #[test]
+    fn workflow_loop_persistence_excludes_legacy_scheduler_journal() {
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "implement".to_owned(),
+            "done".to_owned(),
+            2,
+        );
+        state.pending_operation = Some(pending_iteration(&state, OperationStatus::Accepted));
+        state.last_completed_operation =
+            Some(pending_iteration(&state, OperationStatus::Completed));
+        let presentation =
+            WorkflowLoopPresentationState::from_loop_state(&state).expect("presentation");
+        let encoded = serde_json::to_value(&presentation).expect("encode");
+        assert_eq!(encoded["runtime"], "workflow");
+        for legacy_field in [
+            "pending_operation",
+            "last_completed_operation",
+            "cancel_requested",
+            "current_iteration",
+            "latest_evaluation",
+            "state",
+        ] {
+            assert!(encoded.get(legacy_field).is_none(), "{legacy_field}");
+        }
+        let decoded = decode_state(&serde_json::to_vec(&encoded).expect("bytes"))
+            .expect("decode presentation");
+        assert!(loop_state_uses_workflow_runtime(&decoded));
+        assert!(decoded.pending_operation.is_none());
+        assert!(decoded.last_completed_operation.is_none());
+        assert_eq!(decoded.state, RunState::Ready);
     }
 
     #[test]
