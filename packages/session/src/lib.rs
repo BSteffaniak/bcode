@@ -42,10 +42,9 @@ use bcode_session_models::{
 };
 use lease::{SessionLeaseGuard, SessionLeaseOwnerContext};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
+use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, Mutex as StdMutex,
@@ -241,8 +240,6 @@ fn ensure_loaded_metric_labels(result: &str) -> MetricLabels {
     labels
 }
 
-const MIGRATION_BACKUP_BUFFER_BYTES: usize = 64 * 1024;
-
 async fn create_verified_migration_backup(
     root: &Path,
     session_id: SessionId,
@@ -270,21 +267,29 @@ async fn create_verified_migration_backup(
         reason: error.to_string(),
     })?;
     let backup_destination = destination.clone();
-    let backup_progress = progress.cloned();
-    let result = spawn_blocking(move || {
-        create_verified_migration_backup_blocking(
-            &source,
-            &backup_destination,
-            &manifest,
-            MigrationBackupCopyFault::None,
-            backup_progress.as_ref(),
-        )
-    })
+    let backup_progress = progress.cloned().map(|progress| {
+        Arc::new(move |update: SessionMigrationProgress| {
+            if let (Some(completed), Some(total), Some(unit)) =
+                (update.completed_units, update.total_units, update.unit)
+            {
+                progress.determinate(
+                    update.stage,
+                    completed,
+                    total,
+                    unit,
+                    update.message,
+                    MIGRATION_PROGRESS_BYTE_INTERVAL,
+                );
+            }
+        }) as bcode_session_migration::BackupProgressCallback
+    });
+    let result = bcode_session_migration::create_verified_migration_backup(
+        &source,
+        &backup_destination,
+        &manifest,
+        backup_progress,
+    )
     .await
-    .map_err(|error| SessionError::MigrationBackup {
-        session_id,
-        reason: format!("backup worker failed: {error}"),
-    })?
     .map_err(|error| SessionError::MigrationBackup {
         session_id,
         reason: error.to_string(),
@@ -304,259 +309,6 @@ async fn create_verified_migration_backup(
     metrics.add_counter("session.migration.backup.files_total", result.files);
     metrics.add_counter("session.migration.backup.bytes_total", result.bytes);
     Ok(destination)
-}
-
-#[derive(Debug)]
-struct MigrationBackupResult {
-    files: u64,
-    bytes: u64,
-    plan_duration: std::time::Duration,
-    copy_duration: std::time::Duration,
-    verify_duration: std::time::Duration,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MigrationBackupCopyFault {
-    None,
-    #[cfg(test)]
-    PermissionDenied,
-    #[cfg(test)]
-    ShortWriteAfter(u64),
-}
-
-fn create_verified_migration_backup_blocking(
-    source: &Path,
-    destination: &Path,
-    manifest: &[u8],
-    fault: MigrationBackupCopyFault,
-    progress: Option<&MigrationProgressReporter>,
-) -> std::io::Result<MigrationBackupResult> {
-    if destination.exists() {
-        return Err(std::io::Error::new(
-            ErrorKind::AlreadyExists,
-            format!(
-                "backup destination already exists: {}",
-                destination.display()
-            ),
-        ));
-    }
-    let result = (|| {
-        let started = Instant::now();
-        let files = migration_backup_files(source, source)?;
-        let plan_duration = started.elapsed();
-        let bytes = files
-            .iter()
-            .fold(0_u64, |total, file| total.saturating_add(file.bytes));
-        if let Some(progress) = progress {
-            let file_count = u64::try_from(files.len()).unwrap_or(u64::MAX);
-            progress.determinate(
-                SessionMigrationStage::PlanningBackup,
-                file_count,
-                file_count,
-                bcode_session_models::SessionMigrationProgressUnit::Files,
-                "Planned retained backup",
-                1,
-            );
-            progress.determinate(
-                SessionMigrationStage::CopyingBackup,
-                0,
-                bytes,
-                bcode_session_models::SessionMigrationProgressUnit::Bytes,
-                "Copying retained backup",
-                MIGRATION_PROGRESS_BYTE_INTERVAL,
-            );
-        }
-        fs::create_dir_all(destination)?;
-        let started = Instant::now();
-        let source_hashes =
-            copy_and_hash_backup_files(source, destination, &files, fault, progress, bytes)?;
-        let copy_duration = started.elapsed();
-        if let Some(progress) = progress {
-            progress.determinate(
-                SessionMigrationStage::VerifyingBackup,
-                0,
-                bytes,
-                bcode_session_models::SessionMigrationProgressUnit::Bytes,
-                "Verifying retained backup",
-                MIGRATION_PROGRESS_BYTE_INTERVAL,
-            );
-        }
-        let started = Instant::now();
-        verify_backup_files(destination, &files, &source_hashes, progress, bytes)?;
-        let verify_duration = started.elapsed();
-        fs::write(destination.join("migration-backup.json"), manifest)?;
-        Ok(MigrationBackupResult {
-            files: u64::try_from(files.len()).unwrap_or(u64::MAX),
-            bytes,
-            plan_duration,
-            copy_duration,
-            verify_duration,
-        })
-    })();
-    if result.is_err() && destination.exists() {
-        let _ = fs::remove_dir_all(destination);
-    }
-    result
-}
-
-#[derive(Debug)]
-struct MigrationBackupFile {
-    relative_path: PathBuf,
-    bytes: u64,
-}
-
-fn migration_backup_files(
-    root: &Path,
-    directory: &Path,
-) -> std::io::Result<Vec<MigrationBackupFile>> {
-    let mut files = Vec::new();
-    let mut entries = fs::read_dir(directory)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(std::fs::DirEntry::file_name);
-    for entry in entries {
-        let path = entry.path();
-        if entry.file_type()?.is_dir() {
-            files.extend(migration_backup_files(root, &path)?);
-        } else {
-            files.push(MigrationBackupFile {
-                relative_path: path
-                    .strip_prefix(root)
-                    .map_err(std::io::Error::other)?
-                    .to_path_buf(),
-                bytes: entry.metadata()?.len(),
-            });
-        }
-    }
-    Ok(files)
-}
-
-fn copy_and_hash_backup_files(
-    source: &Path,
-    destination: &Path,
-    files: &[MigrationBackupFile],
-    fault: MigrationBackupCopyFault,
-    progress: Option<&MigrationProgressReporter>,
-    total_bytes: u64,
-) -> std::io::Result<BTreeMap<PathBuf, [u8; 32]>> {
-    #[cfg(not(test))]
-    let _ = fault;
-    #[cfg(test)]
-    if matches!(fault, MigrationBackupCopyFault::PermissionDenied) {
-        return Err(std::io::Error::new(
-            ErrorKind::PermissionDenied,
-            "injected backup permission failure",
-        ));
-    }
-    let mut total_written = 0_u64;
-    let mut source_digests = BTreeMap::new();
-    for file in files {
-        let source_path = source.join(&file.relative_path);
-        let destination_path = destination.join(&file.relative_path);
-        fs::create_dir_all(
-            destination_path
-                .parent()
-                .ok_or_else(|| std::io::Error::other("backup destination file has no parent"))?,
-        )?;
-        let mut reader =
-            BufReader::with_capacity(MIGRATION_BACKUP_BUFFER_BYTES, File::open(&source_path)?);
-        let destination_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&destination_path)?;
-        let mut writer = BufWriter::with_capacity(MIGRATION_BACKUP_BUFFER_BYTES, destination_file);
-        let mut hasher = Sha256::new();
-        let mut buffer = vec![0_u8; MIGRATION_BACKUP_BUFFER_BYTES];
-        loop {
-            let read = reader.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            #[cfg(test)]
-            if let MigrationBackupCopyFault::ShortWriteAfter(limit) = fault
-                && total_written.saturating_add(u64::try_from(read).unwrap_or(u64::MAX)) > limit
-            {
-                let allowed = usize::try_from(limit.saturating_sub(total_written))
-                    .unwrap_or(usize::MAX)
-                    .min(read);
-                if allowed > 0 {
-                    writer.write_all(&buffer[..allowed])?;
-                }
-                writer.flush()?;
-                return Err(std::io::Error::new(
-                    ErrorKind::WriteZero,
-                    "injected short backup write",
-                ));
-            }
-            writer.write_all(&buffer[..read])?;
-            total_written = total_written.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
-            if let Some(progress) = progress {
-                progress.determinate(
-                    SessionMigrationStage::CopyingBackup,
-                    total_written,
-                    total_bytes,
-                    bcode_session_models::SessionMigrationProgressUnit::Bytes,
-                    "Copying retained backup",
-                    MIGRATION_PROGRESS_BYTE_INTERVAL,
-                );
-            }
-            hasher.update(&buffer[..read]);
-        }
-        writer.flush()?;
-        fs::set_permissions(&destination_path, fs::metadata(&source_path)?.permissions())?;
-        source_digests.insert(file.relative_path.clone(), hasher.finalize().into());
-    }
-    Ok(source_digests)
-}
-
-fn verify_backup_files(
-    destination: &Path,
-    files: &[MigrationBackupFile],
-    source_hashes: &BTreeMap<PathBuf, [u8; 32]>,
-    progress: Option<&MigrationProgressReporter>,
-    total_bytes: u64,
-) -> std::io::Result<()> {
-    let mut verified_bytes = 0_u64;
-    for file in files {
-        let destination_path = destination.join(&file.relative_path);
-        if fs::metadata(&destination_path)?.len() != file.bytes {
-            return Err(std::io::Error::other(format!(
-                "backup length verification failed for {}",
-                file.relative_path.display()
-            )));
-        }
-        let actual = hash_file(&destination_path)?;
-        if source_hashes.get(&file.relative_path) != Some(&actual) {
-            return Err(std::io::Error::other(format!(
-                "backup hash verification failed for {}",
-                file.relative_path.display()
-            )));
-        }
-        verified_bytes = verified_bytes.saturating_add(file.bytes);
-        if let Some(progress) = progress {
-            progress.determinate(
-                SessionMigrationStage::VerifyingBackup,
-                verified_bytes,
-                total_bytes,
-                bcode_session_models::SessionMigrationProgressUnit::Bytes,
-                "Verifying retained backup",
-                MIGRATION_PROGRESS_BYTE_INTERVAL,
-            );
-        }
-    }
-    Ok(())
-}
-
-fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
-    let mut reader = BufReader::with_capacity(MIGRATION_BACKUP_BUFFER_BYTES, File::open(path)?);
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; MIGRATION_BACKUP_BUFFER_BYTES];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(hasher.finalize().into())
 }
 
 fn duration_millis(duration: std::time::Duration) -> u64 {
@@ -5030,13 +4782,11 @@ fn truncate_title(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppendToolCallRequestedInput, CURRENT_SESSION_FORMAT_EPOCH, MIGRATION_BACKUP_BUFFER_BYTES,
-        MigrationBackupCopyFault, SESSION_FORMAT_FAMILY, SESSION_MANIFEST_SCHEMA_VERSION,
-        SessionCatalogLoadStatus, SessionError, SessionHealth, SessionLeaseOwnerContext,
-        SessionLoadStatusKind, SessionManager, SessionMigrationStage, SessionOpenFailureKind,
-        SessionOpenOperationId, SessionOpenTerminalOutcome, SessionStore,
-        copy_and_hash_backup_files, create_verified_migration_backup_blocking, db, lease,
-        migration_backup_files, persisted, shared_execution_session, verify_backup_files,
+        AppendToolCallRequestedInput, CURRENT_SESSION_FORMAT_EPOCH, SESSION_FORMAT_FAMILY,
+        SESSION_MANIFEST_SCHEMA_VERSION, SessionCatalogLoadStatus, SessionError, SessionHealth,
+        SessionLeaseOwnerContext, SessionLoadStatusKind, SessionManager, SessionMigrationStage,
+        SessionOpenFailureKind, SessionOpenOperationId, SessionOpenTerminalOutcome, SessionStore,
+        db, lease, persisted, shared_execution_session,
     };
     use bcode_metrics::MetricsRegistry;
     use bcode_session_models::{
@@ -7733,172 +7483,6 @@ mod tests {
             );
             drop(manager);
             std::fs::remove_dir_all(state_root).expect("benchmark cleanup");
-        }
-    }
-
-    #[test]
-    fn streaming_migration_backup_handles_nested_empty_and_large_files() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let source = temp_dir.path().join("source");
-        let destination = temp_dir.path().join("backup");
-        std::fs::create_dir_all(source.join("nested")).expect("nested source");
-        std::fs::write(source.join("empty"), []).expect("empty file");
-        std::fs::write(source.join("nested/small"), b"small").expect("small file");
-        let large = vec![0x5a; MIGRATION_BACKUP_BUFFER_BYTES * 3 + 17];
-        std::fs::write(source.join("large"), &large).expect("large file");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(
-                source.join("nested/small"),
-                std::fs::Permissions::from_mode(0o640),
-            )
-            .expect("source permissions");
-        }
-
-        let result = create_verified_migration_backup_blocking(
-            &source,
-            &destination,
-            br#"{"manifest":true}"#,
-            MigrationBackupCopyFault::None,
-            None,
-        )
-        .expect("backup should succeed");
-
-        assert_eq!(result.files, 3);
-        assert_eq!(
-            result.bytes,
-            u64::try_from(large.len() + b"small".len()).expect("fixture bytes fit")
-        );
-        assert_eq!(
-            std::fs::read(destination.join("large")).expect("large backup"),
-            large
-        );
-        assert_eq!(
-            std::fs::read(destination.join("nested/small")).expect("small backup"),
-            b"small"
-        );
-        assert!(
-            std::fs::read(destination.join("empty"))
-                .expect("empty backup")
-                .is_empty()
-        );
-        assert_eq!(
-            std::fs::read(destination.join("migration-backup.json")).expect("manifest"),
-            br#"{"manifest":true}"#
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                std::fs::metadata(destination.join("nested/small"))
-                    .expect("backup metadata")
-                    .permissions()
-                    .mode()
-                    & 0o777,
-                0o640
-            );
-        }
-    }
-
-    #[test]
-    fn streaming_migration_backup_refuses_conflicts_and_cleans_failed_copy() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let source = temp_dir.path().join("source");
-        let destination = temp_dir.path().join("backup");
-        std::fs::create_dir_all(&source).expect("source");
-        std::fs::write(source.join("file"), b"content").expect("source file");
-        std::fs::create_dir_all(&destination).expect("destination conflict");
-        assert_eq!(
-            create_verified_migration_backup_blocking(
-                &source,
-                &destination,
-                b"manifest",
-                MigrationBackupCopyFault::None,
-                None,
-            )
-            .expect_err("existing destination must fail")
-            .kind(),
-            std::io::ErrorKind::AlreadyExists
-        );
-
-        std::fs::remove_dir_all(&destination).expect("remove conflict");
-        let files = migration_backup_files(&source, &source).expect("backup plan");
-        std::fs::create_dir_all(&destination).expect("destination");
-        let source_hashes = copy_and_hash_backup_files(
-            &source,
-            &destination,
-            &files,
-            MigrationBackupCopyFault::None,
-            None,
-            7,
-        )
-        .expect("copy");
-        std::fs::write(destination.join("file"), b"corrupt").expect("corrupt backup");
-        assert!(
-            verify_backup_files(&destination, &files, &source_hashes, None, 7)
-                .expect_err("hash mismatch must fail")
-                .to_string()
-                .contains("verification failed")
-        );
-
-        std::fs::remove_dir_all(&destination).expect("remove corrupt backup");
-        std::fs::create_dir(source.join("migration-backup.json")).expect("manifest-path directory");
-        std::fs::write(source.join("migration-backup.json/child"), b"child")
-            .expect("manifest-path child");
-        assert!(
-            create_verified_migration_backup_blocking(
-                &source,
-                &destination,
-                b"manifest",
-                MigrationBackupCopyFault::None,
-                None,
-            )
-            .is_err()
-        );
-        assert!(
-            !destination.exists(),
-            "failed backup must clean its incomplete destination"
-        );
-    }
-
-    #[test]
-    fn migration_backup_faults_are_deterministic_and_cleanup_partial_output() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let source = temp_dir.path().join("source");
-        std::fs::create_dir_all(&source).expect("source");
-        std::fs::write(
-            source.join("large"),
-            vec![0x7f; MIGRATION_BACKUP_BUFFER_BYTES * 2],
-        )
-        .expect("source file");
-
-        for (index, fault, expected_kind) in [
-            (
-                0,
-                MigrationBackupCopyFault::PermissionDenied,
-                std::io::ErrorKind::PermissionDenied,
-            ),
-            (
-                1,
-                MigrationBackupCopyFault::ShortWriteAfter(17),
-                std::io::ErrorKind::WriteZero,
-            ),
-        ] {
-            let destination = temp_dir.path().join(format!("backup-{index}"));
-            let error = create_verified_migration_backup_blocking(
-                &source,
-                &destination,
-                b"manifest",
-                fault,
-                None,
-            )
-            .expect_err("injected backup failure");
-            assert_eq!(error.kind(), expected_kind);
-            assert!(
-                !destination.exists(),
-                "injected failure must clean incomplete destination"
-            );
         }
     }
 

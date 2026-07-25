@@ -545,9 +545,9 @@ if ! rg -q 'benchmark_generated_legacy_session_migrations' packages/session/src/
   violations=1
 fi
 
-backup_source="$(sed -n '/const MIGRATION_BACKUP_BUFFER_BYTES/,/fn record_ensure_loaded_duration/p' packages/session/src/lib.rs)"
+backup_source="$(sed -n '/^const BACKUP_BUFFER_BYTES/,/^fn hash_file/p' packages/session-migration/src/backup.rs)"
 if grep -Eq 'fs::read\(&source|fs::read\(&destination' <<<"$backup_source" \
-  || ! grep -q 'spawn_blocking' <<<"$backup_source" \
+  || ! grep -q 'spawn_blocking' packages/session-migration/src/backup.rs \
   || ! grep -q 'BufReader::with_capacity' <<<"$backup_source" \
   || ! grep -q 'BufWriter::with_capacity' <<<"$backup_source" \
   || ! grep -q 'Sha256::new' <<<"$backup_source" \
@@ -556,9 +556,9 @@ if grep -Eq 'fs::read\(&source|fs::read\(&destination' <<<"$backup_source" \
   echo "Session migration backup violation: backups must remain streaming, bounded, hash-verified, conflict-safe, cleanup-safe, and off Tokio workers." >&2
   violations=1
 fi
-if ! rg -q 'streaming_migration_backup_handles_nested_empty_and_large_files' packages/session/src/lib.rs \
-  || ! rg -q 'streaming_migration_backup_refuses_conflicts_and_cleans_failed_copy' packages/session/src/lib.rs \
-  || ! rg -q 'migration_backup_faults_are_deterministic_and_cleanup_partial_output' packages/session/src/lib.rs \
+if ! rg -q 'streaming_backup_handles_nested_empty_and_large_files' packages/session-migration/src/backup.rs \
+  || ! rg -q 'backup_refuses_conflicts_corruption_and_reserved_manifest' packages/session-migration/src/backup.rs \
+  || ! rg -q 'backup_faults_are_deterministic_and_cleanup_partial_output' packages/session-migration/src/backup.rs \
   || ! rg -q 'detached_preparation_migrates_legacy_storage_before_exclusive_load' packages/session/src/lib.rs \
   || ! rg -q 'failed_migration_backup_prevents_every_storage_mutation' packages/session/src/lib.rs; then
   echo "Session migration backup violation: streaming, retained-success, conflict, cleanup, and mutation-fence regressions must remain covered." >&2

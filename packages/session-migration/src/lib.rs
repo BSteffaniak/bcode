@@ -9,11 +9,16 @@
 //! Bcode writers and converts them into the current session domain model.
 
 mod audit;
+mod backup;
 mod historical;
 mod operation;
 mod registry;
 
 pub use audit::SessionMigrationReceipt;
+pub use backup::{
+    BackupProgressCallback, MigrationBackupError, VerifiedMigrationBackup,
+    create_verified_migration_backup,
+};
 pub use operation::{SessionMigrationOperation, SessionMigrationOperations};
 
 pub use historical::{
