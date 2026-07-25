@@ -4835,6 +4835,100 @@ fn live_filesystem_edit_request_draft_renders_progressive_diff_and_removes() {
 }
 
 #[test]
+fn live_vim_frames_preserve_scroll_and_render_in_narrow_layout() {
+    let session_id = SessionId::new();
+    let mut history = Vec::new();
+    for sequence in 1..=80_u64 {
+        history.push(event(
+            session_id,
+            sequence,
+            SessionEventKind::SystemMessage {
+                text: format!("history row {sequence}"),
+            },
+        ));
+    }
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(vim_edit_plugin_host()));
+    let mut narrow_buffer = Buffer::empty(Rect::new(0, 0, 42, 24));
+    render::render(&mut app, &mut Frame::new(&mut narrow_buffer));
+    assert!(app.scroll_transcript_up(12));
+    render::render(&mut app, &mut Frame::new(&mut narrow_buffer));
+    let scroll_before = app.scroll_offset();
+    let anchor = rendered_text(&narrow_buffer)
+        .lines()
+        .find(|line| line.contains("history row"))
+        .expect("visible history anchor")
+        .trim()
+        .to_owned();
+    let progress = |sequence, line: &str| bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolContributionPlaced {
+            envelope: bcode_session_models::ToolContributionEnvelope::new(
+                bcode_session_models::ToolContributionPlacement::Progress,
+                bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call-vim-scroll".to_owned(),
+                    contribution_id: "vim-live".to_owned(),
+                    sequence,
+                    producer_id: "bcode.vim-edit".to_owned(),
+                    schema: "bcode.vim-edit.live".to_owned(),
+                    schema_version: 1,
+                    operation: bcode_session_models::ToolContributionOperation::Upsert,
+                    persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                    artifact: None,
+                    payload: serde_json::json!({
+                        "phase": "running",
+                        "path": "src/lib.rs",
+                        "step_index": sequence.saturating_sub(1),
+                        "step_total": 2,
+                        "step": {"keys": "w"},
+                        "cursor": {"line": 1, "column": sequence},
+                        "nvim_mode": "n",
+                        "context": {"start_line": 1, "lines": [line]}
+                    }),
+                },
+            ),
+        },
+    };
+
+    app.absorb_session_live_event(&progress(1, "first narrow frame"));
+    render::render(&mut app, &mut Frame::new(&mut narrow_buffer));
+    assert!(app.scroll_offset() >= scroll_before);
+    assert!(rendered_text(&narrow_buffer).contains(&anchor));
+    assert_eq!(
+        app.transcript()
+            .iter()
+            .filter(|item| matches!(
+                item.kind(),
+                TranscriptItemKind::ToolContribution { contribution, .. }
+                    if contribution.payload["context"]["lines"][0] == "first narrow frame"
+            ))
+            .count(),
+        1
+    );
+
+    app.absorb_session_live_event(&progress(2, "second narrow frame"));
+    render::render(&mut app, &mut Frame::new(&mut narrow_buffer));
+    assert!(app.scroll_offset() >= scroll_before);
+    assert!(rendered_text(&narrow_buffer).contains(&anchor));
+    assert_eq!(
+        app.transcript()
+            .iter()
+            .filter(|item| matches!(
+                item.kind(),
+                TranscriptItemKind::ToolContribution { contribution, .. }
+                    if contribution.payload["context"]["lines"][0] == "second narrow frame"
+            ))
+            .count(),
+        1
+    );
+    assert!(!app.transcript().iter().any(|item| matches!(
+        item.kind(),
+        TranscriptItemKind::ToolContribution { contribution, .. }
+            if contribution.payload["context"]["lines"][0] == "first narrow frame"
+    )));
+}
+
+#[test]
 fn live_vim_execution_frames_render_replace_in_place_and_remove() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
