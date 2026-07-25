@@ -972,6 +972,13 @@ if rg -n 'ToolInvocationStreamEvent|ToolStreamVisualUpdate|VisualUpdate' \
   violations=1
 fi
 
+if rg -n 'ToolContributionPersistence::Transient' plugins --glob '*.rs' \
+  >/tmp/bcode-manual-transient-plugin-progress.txt; then
+  echo "Runtime architecture violation: bundled plugins must use TransientProgressPublisher instead of manually constructing transient contributions." >&2
+  cat /tmp/bcode-manual-transient-plugin-progress.txt >&2
+  violations=1
+fi
+
 if ! rg -n 'TransientProgressPublisher::(new|with_limits|with_limits_and_cancellation)' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
    ! grep -F 'VIM_EDIT_LIVE_SCHEMA' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
    ! grep -F 'ToolContributionPersistence::Transient' packages/plugin-sdk/src/lib.rs >/dev/null; then

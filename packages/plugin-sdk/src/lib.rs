@@ -501,7 +501,26 @@ impl TransientProgressPublisher {
         payload: &T,
     ) -> Result<u64, TransientProgressError> {
         let payload = serde_json::to_value(payload)?;
-        self.emit(bcode_tool::ToolContributionOperation::Upsert, payload)
+        self.emit(bcode_tool::ToolContributionOperation::Upsert, payload, None)
+    }
+
+    /// Publish a replacement snapshot carrying one host-readable live artifact reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when progress is unavailable, finished, oversized, exhausted, or cannot
+    /// be encoded.
+    pub fn upsert_with_artifact<T: Serialize + ?Sized>(
+        &mut self,
+        payload: &T,
+        artifact: bcode_tool::ToolContributionArtifact,
+    ) -> Result<u64, TransientProgressError> {
+        let payload = serde_json::to_value(payload)?;
+        self.emit(
+            bcode_tool::ToolContributionOperation::Upsert,
+            payload,
+            Some(artifact),
+        )
     }
 
     /// Append one producer-defined bounded payload batch and return its sequence.
@@ -518,7 +537,7 @@ impl TransientProgressPublisher {
         payload: &T,
     ) -> Result<u64, TransientProgressError> {
         let payload = serde_json::to_value(payload)?;
-        self.emit(bcode_tool::ToolContributionOperation::Append, payload)
+        self.emit(bcode_tool::ToolContributionOperation::Append, payload, None)
     }
 
     /// Publish a replacement snapshot only when the configured producer cadence permits it.
@@ -548,6 +567,37 @@ impl TransientProgressPublisher {
         self.upsert(payload).map(Some)
     }
 
+    /// Publish a live artifact snapshot only when the configured producer cadence permits it.
+    ///
+    /// Returns `Ok(None)` when an update is intentionally skipped before serialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when progress is unavailable, cancelled, finished, oversized, exhausted,
+    /// or cannot be encoded.
+    pub fn upsert_with_artifact_if_ready<T: Serialize + ?Sized>(
+        &mut self,
+        payload: &T,
+        artifact: bcode_tool::ToolContributionArtifact,
+    ) -> Result<Option<u64>, TransientProgressError> {
+        if artifact.finalized {
+            return self.upsert_with_artifact(payload, artifact).map(Some);
+        }
+        if !self.is_ready() {
+            if self.finished {
+                return Err(TransientProgressError::Finished);
+            }
+            if self.cancellation.is_cancelled() {
+                return Err(TransientProgressError::Cancelled);
+            }
+            if !self.events.is_available() {
+                return Err(TransientProgressError::Unavailable);
+            }
+            return Ok(None);
+        }
+        self.upsert_with_artifact(payload, artifact).map(Some)
+    }
+
     /// Remove the active progress contribution and return its terminal sequence.
     ///
     /// Repeated calls are idempotent and return the last emitted sequence.
@@ -563,6 +613,7 @@ impl TransientProgressPublisher {
         let sequence = self.emit(
             bcode_tool::ToolContributionOperation::Remove,
             serde_json::Value::Null,
+            None,
         )?;
         self.finished = true;
         Ok(sequence)
@@ -578,6 +629,7 @@ impl TransientProgressPublisher {
         &mut self,
         operation: bcode_tool::ToolContributionOperation,
         payload: serde_json::Value,
+        artifact: Option<bcode_tool::ToolContributionArtifact>,
     ) -> Result<u64, TransientProgressError> {
         if self.finished {
             return Err(TransientProgressError::Finished);
@@ -603,7 +655,7 @@ impl TransientProgressPublisher {
             schema_version: self.schema_version,
             operation,
             persistence: bcode_tool::ToolContributionPersistence::Transient,
-            artifact: None,
+            artifact,
             payload,
         };
         let envelope = bcode_tool::ToolContributionEnvelope::new(

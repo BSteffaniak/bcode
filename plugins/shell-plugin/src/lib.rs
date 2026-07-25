@@ -366,6 +366,7 @@ fn run_shell_tool(
     let response = run_terminal_shell_command(
         events,
         &context.cancellation,
+        context.transient_progress_limits,
         tool_call_id,
         &arguments,
         arguments_json,
@@ -613,6 +614,7 @@ struct TerminalRunPaths<'a> {
 fn run_terminal_shell_command(
     events: ServiceEventEmitter,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    progress_limits: bcode_plugin_sdk::TransientProgressLimits,
     tool_call_id: &str,
     arguments: &ShellRunArguments,
     arguments_json: serde_json::Value,
@@ -621,6 +623,7 @@ fn run_terminal_shell_command(
     run_terminal_shell_command_with_environment(
         events,
         cancellation,
+        progress_limits,
         tool_call_id,
         arguments,
         arguments_json,
@@ -629,9 +632,11 @@ fn run_terminal_shell_command(
     )
 }
 
+#[allow(clippy::too_many_arguments)] // Testable environment boundary keeps execution inputs explicit.
 fn run_terminal_shell_command_with_environment(
     events: ServiceEventEmitter,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    progress_limits: bcode_plugin_sdk::TransientProgressLimits,
     tool_call_id: &str,
     arguments: &ShellRunArguments,
     arguments_json: serde_json::Value,
@@ -641,6 +646,7 @@ fn run_terminal_shell_command_with_environment(
     match run_terminal_shell_command_inner(
         events,
         cancellation,
+        progress_limits,
         tool_call_id,
         arguments,
         arguments_json,
@@ -857,10 +863,11 @@ fn encode_terminal_output(
     Ok((encoded, full_encoded, inline_output))
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_terminal_shell_command_inner(
     events: ServiceEventEmitter,
     cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    progress_limits: bcode_plugin_sdk::TransientProgressLimits,
     tool_call_id: &str,
     arguments: &ShellRunArguments,
     mut arguments_json: serde_json::Value,
@@ -923,6 +930,7 @@ fn run_terminal_shell_command_inner(
     let recording_path = recording_artifact_path(paths.artifact_dir, tool_call_id)?;
     let (recording_ready_tx, recording_ready_rx) = std::sync::mpsc::channel();
     let started = Instant::now();
+    let cancellation_for_reader = cancellation.clone();
     let reader_thread = std::thread::spawn({
         let tool_call_id = tool_call_id.to_owned();
         move || {
@@ -934,6 +942,8 @@ fn run_terminal_shell_command_inner(
                     columns,
                     rows,
                     prelude_markers,
+                    progress_limits,
+                    cancellation: cancellation_for_reader,
                 },
                 TerminalStreamPaths {
                     clean: clean_artifact_path,
@@ -1140,6 +1150,8 @@ struct ShellVisualStreamContext {
     columns: u16,
     rows: u16,
     prelude_markers: PreludeGateMarkers,
+    progress_limits: bcode_plugin_sdk::TransientProgressLimits,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
 }
 
 const PRELUDE_GATE_BUFFER_LIMIT: usize = 4 * 1024 * 1024;
@@ -1316,7 +1328,12 @@ where
                 path,
                 visual_context.columns,
                 visual_context.rows,
-                Some(shell_recording_commit_observer(events, tool_call_id)),
+                Some(shell_recording_commit_observer(
+                    events,
+                    tool_call_id,
+                    visual_context.progress_limits,
+                    visual_context.cancellation.clone(),
+                )),
             )
         })
         .transpose()
@@ -1516,40 +1533,41 @@ fn artifact_writer(path: Option<&Path>) -> Result<Box<dyn Write + Send>, String>
 fn shell_recording_commit_observer(
     events: ServiceEventEmitter,
     tool_call_id: &str,
+    limits: bcode_plugin_sdk::TransientProgressLimits,
+    cancellation: bcode_plugin_sdk::ServiceCancellation,
 ) -> recording::ShellRecordingCommitObserver {
     let tool_call_id = tool_call_id.to_owned();
-    let revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    Arc::new(move |commit| {
-        let revision = revision
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
-            .saturating_add(1);
-        emit_tool_contribution(
+    let progress = Arc::new(StdMutex::new(
+        TransientProgressPublisher::with_limits_and_cancellation(
             events,
-            ToolContributionPlacement::Progress,
-            &ToolContributionEvent {
-                invocation_id: tool_call_id.clone(),
-                contribution_id: "shell-recording".to_owned(),
-                sequence: revision,
-                producer_id: "bcode.shell".to_owned(),
-                schema: SHELL_RUN_SCHEMA.to_owned(),
-                schema_version: SHELL_SCHEMA_VERSION,
-                operation: ToolContributionOperation::Upsert,
-                persistence: ToolContributionPersistence::Transient,
-                artifact: Some(ToolContributionArtifact {
-                    artifact_id: format!("{tool_call_id}-shell-run"),
-                    reference_key: SHELL_RECORDING_REF_KEY.to_owned(),
-                    content_type: Some(SHELL_RECORDING_CONTENT_TYPE.to_owned()),
-                    storage_uri: file_storage_uri(&commit.path)
-                        .unwrap_or_else(|| commit.path.display().to_string()),
-                    committed_bytes: commit.committed_bytes,
-                    revision,
-                    finalized: commit.finalized,
-                    availability: None,
-                }),
-                payload: serde_json::to_value(ShellLiveRecordingPayload { mode: "terminal" })
-                    .unwrap_or(serde_json::Value::Null),
-            },
-        );
+            &tool_call_id,
+            "shell-recording",
+            "bcode.shell",
+            SHELL_RUN_SCHEMA,
+            SHELL_SCHEMA_VERSION,
+            limits,
+            cancellation,
+        ),
+    ));
+    Arc::new(move |commit| {
+        let artifact = ToolContributionArtifact {
+            artifact_id: format!("{tool_call_id}-shell-run"),
+            reference_key: SHELL_RECORDING_REF_KEY.to_owned(),
+            content_type: Some(SHELL_RECORDING_CONTENT_TYPE.to_owned()),
+            storage_uri: file_storage_uri(&commit.path)
+                .unwrap_or_else(|| commit.path.display().to_string()),
+            committed_bytes: commit.committed_bytes,
+            revision: commit.committed_bytes,
+            finalized: commit.finalized,
+            availability: None,
+        };
+        let _ = progress
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .upsert_with_artifact_if_ready(
+                &ShellLiveRecordingPayload { mode: "terminal" },
+                artifact,
+            );
     })
 }
 
@@ -2201,6 +2219,7 @@ mod tests {
         let response = run_terminal_shell_command_with_environment(
             ServiceEventEmitter::default(),
             &bcode_plugin_sdk::ServiceCancellation::default(),
+            bcode_plugin_sdk::TransientProgressLimits::default(),
             "test",
             &ShellRunArguments {
                 command: "sh -c 'trap \"\" HUP TERM; sleep 5' | cat".to_string(),
@@ -2238,6 +2257,7 @@ mod tests {
         let response = run_terminal_shell_command_with_environment(
             ServiceEventEmitter::default(),
             &cancellation,
+            bcode_plugin_sdk::TransientProgressLimits::default(),
             "test-cancellation-process-group",
             &ShellRunArguments {
                 command: "sh -c 'trap \"\" HUP TERM; sleep 5' | cat".to_string(),
@@ -2279,6 +2299,7 @@ mod tests {
         let response = run_terminal_shell_command_with_environment(
             ServiceEventEmitter::default(),
             &bcode_plugin_sdk::ServiceCancellation::default(),
+            bcode_plugin_sdk::TransientProgressLimits::default(),
             "test",
             &ShellRunArguments {
                 command: "false | sed -n '1,1p'".to_string(),
@@ -2317,6 +2338,7 @@ mod tests {
         let response = run_terminal_shell_command_with_environment(
             ServiceEventEmitter::default(),
             &bcode_plugin_sdk::ServiceCancellation::default(),
+            bcode_plugin_sdk::TransientProgressLimits::default(),
             "test-active-resize",
             &ShellRunArguments {
                 command: "sleep 0.15; printf 'resized\\n'".to_owned(),
@@ -2373,6 +2395,7 @@ mod tests {
         let response = run_terminal_shell_command_with_environment(
             ServiceEventEmitter::default(),
             &bcode_plugin_sdk::ServiceCancellation::default(),
+            bcode_plugin_sdk::TransientProgressLimits::default(),
             "test-bounded-large-terminal",
             &ShellRunArguments {
                 command: "head -c 131072 /dev/zero | tr '\\0' x".to_owned(),
@@ -2435,6 +2458,7 @@ mod tests {
         let response = run_terminal_shell_command_with_environment(
             emitter,
             &bcode_plugin_sdk::ServiceCancellation::default(),
+            bcode_plugin_sdk::TransientProgressLimits::default(),
             "test-recording",
             &ShellRunArguments {
                 command: "printf 'recorded output\\n'".to_owned(),
@@ -2590,6 +2614,7 @@ mod tests {
             let response = run_terminal_shell_command_with_environment(
                 ServiceEventEmitter::default(),
                 &cancellation,
+                bcode_plugin_sdk::TransientProgressLimits::default(),
                 name,
                 &ShellRunArguments {
                     command: command.to_owned(),
@@ -2651,6 +2676,7 @@ mod tests {
         let response = run_terminal_shell_command_with_environment(
             ServiceEventEmitter::default(),
             &bcode_plugin_sdk::ServiceCancellation::default(),
+            bcode_plugin_sdk::TransientProgressLimits::default(),
             "test-terminal-semantic",
             &ShellRunArguments {
                 command: "printf 'semantic terminal\\n'".to_string(),
@@ -2696,6 +2722,7 @@ mod tests {
         let response = run_terminal_shell_command(
             ServiceEventEmitter::default(),
             &bcode_plugin_sdk::ServiceCancellation::default(),
+            bcode_plugin_sdk::TransientProgressLimits::default(),
             "test-terminal-ansi",
             &ShellRunArguments {
                 command: "printf '\\033[31mred\\033[0m\\n'".to_string(),
@@ -2865,6 +2892,8 @@ mod tests {
             columns: 120,
             rows: 30,
             prelude_markers: PreludeGateMarkers::default(),
+            progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
         };
         let mut baseline = Vec::with_capacity(ROUNDS);
         let mut recorded = Vec::with_capacity(ROUNDS);
@@ -3104,6 +3133,8 @@ mod tests {
                 columns: 80,
                 rows: 24,
                 prelude_markers: PreludeGateMarkers::default(),
+                progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
             },
             TerminalStreamPaths {
                 clean: None,
@@ -3250,6 +3281,8 @@ mod tests {
             columns: 80,
             rows: 24,
             prelude_markers: PreludeGateMarkers::default(),
+            progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
         };
         let baseline_events = Mutex::new(Vec::<Vec<u8>>::new());
         let baseline_emitter = ServiceEventEmitter::new(
@@ -3329,6 +3362,8 @@ mod tests {
                     replay: vec!["__MARK__".to_owned()],
                     clean: vec!["__MARK__".to_owned()],
                 },
+                progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
             },
             TerminalStreamPaths {
                 clean: None,
@@ -3366,6 +3401,8 @@ mod tests {
                     replay: vec!["__MARK__".to_string()],
                     clean: Vec::new(),
                 },
+                progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
             },
             TerminalStreamPaths {
                 clean: None,
@@ -3395,6 +3432,8 @@ mod tests {
                     replay: Vec::new(),
                     clean: vec!["__MARK__".to_string()],
                 },
+                progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
             },
             TerminalStreamPaths {
                 clean: None,
