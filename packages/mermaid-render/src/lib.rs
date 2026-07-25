@@ -183,6 +183,10 @@ pub enum MermaidRenderError {
     OutputDimensionsExceeded,
     /// Source contains a directive, which Bcode intentionally disallows.
     DirectiveNotAllowed,
+    /// Rendering exceeded the configured wall-clock timeout.
+    TimedOut,
+    /// Backend panicked while rendering untrusted input.
+    BackendPanicked,
     /// Rendering was cancelled.
     Cancelled,
     /// Backend rejected or could not render the diagram.
@@ -209,6 +213,8 @@ impl std::fmt::Display for MermaidRenderError {
                 formatter.write_str("Mermaid output dimensions exceed configured bounds")
             }
             Self::DirectiveNotAllowed => formatter.write_str("Mermaid directives are not allowed"),
+            Self::TimedOut => formatter.write_str("Mermaid rendering timed out"),
+            Self::BackendPanicked => formatter.write_str("Mermaid backend panicked"),
             Self::Cancelled => formatter.write_str("Mermaid rendering was cancelled"),
             Self::InvalidDiagram { message } => {
                 write!(formatter, "invalid Mermaid diagram: {message}")
@@ -234,14 +240,40 @@ impl std::error::Error for MermaidRenderError {}
 /// * source or output exceeds configured byte/dimension bounds;
 /// * requested dimensions or execution limits are invalid;
 /// * source contains a Mermaid directive;
-/// * cancellation is requested;
+/// * cancellation is requested or the deadline expires;
 /// * the backend rejects the diagram.
 pub fn render_mermaid(
     request: &MermaidRenderRequest,
     cancellation: &MermaidCancellationToken,
 ) -> Result<MermaidRendered, MermaidRenderError> {
     validate_request(request, cancellation)?;
-    let svg = backend::render_svg(request.source.as_str())?;
+    let source = request.source.as_str().to_owned();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let rendered = std::panic::catch_unwind(|| backend::render_svg(&source))
+            .unwrap_or(Err(MermaidRenderError::BackendPanicked));
+        let _ = sender.send(rendered);
+    });
+    let deadline = std::time::Instant::now() + request.limits.timeout;
+    let svg = loop {
+        if cancellation.is_cancelled() {
+            return Err(MermaidRenderError::Cancelled);
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return Err(MermaidRenderError::TimedOut);
+        }
+        let wait = deadline
+            .saturating_duration_since(now)
+            .min(Duration::from_millis(10));
+        match receiver.recv_timeout(wait) {
+            Ok(result) => break result?,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(MermaidRenderError::BackendPanicked);
+            }
+        }
+    };
     if cancellation.is_cancelled() {
         return Err(MermaidRenderError::Cancelled);
     }
@@ -392,6 +424,17 @@ mod tests {
         assert_eq!(
             render_mermaid(&request, &token),
             Err(MermaidRenderError::Cancelled)
+        );
+    }
+
+    #[test]
+    fn tiny_deadline_returns_typed_timeout() {
+        let mut request =
+            MermaidRenderRequest::svg("flowchart LR\nA --> B\nB --> C\nC --> D\nD --> E", 800, 600);
+        request.limits.timeout = std::time::Duration::from_nanos(1);
+        assert_eq!(
+            render_mermaid(&request, &MermaidCancellationToken::default()),
+            Err(MermaidRenderError::TimedOut)
         );
     }
 }
