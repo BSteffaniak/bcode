@@ -623,6 +623,13 @@ pub struct WorkflowNodeRetryResult {
     pub next_attempt: u32,
 }
 
+/// Summary of bounded deterministic control-node settlement.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ControlSettlementSummary {
+    pub settled: Vec<String>,
+    pub activated: Vec<NewActivation>,
+}
+
 /// Result of atomically reserving one pending activation for owner dispatch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedActivationDispatch {
@@ -2484,6 +2491,197 @@ impl WorkflowStore {
         Ok(result)
     }
 
+    /// Settle bounded pending deterministic control nodes without external dispatch.
+    ///
+    /// Repeat nodes either complete the run when their predicate clears/limit is reached or create
+    /// the next generation's body entry activations. Other host-neutral control nodes are settled
+    /// by forwarding their input as validated output through the normal atomic successor path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when bounded discovery, control configuration, schemas, cycle limits, or
+    /// persistence invariants are invalid.
+    pub fn settle_pending_control_nodes(
+        &mut self,
+        run_id: &str,
+        limit: usize,
+        settled_at_ms: u64,
+    ) -> Result<ControlSettlementSummary, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let pending = self.pending_activations(limit)?;
+        let mut summary = ControlSettlementSummary::default();
+        for activation in pending
+            .into_iter()
+            .filter(|activation| activation.run_id == run_id)
+            .filter(|activation| {
+                matches!(
+                    activation.node.kind,
+                    bcode_workflow::NodeKind::Branch
+                        | bcode_workflow::NodeKind::Repeat
+                        | bcode_workflow::NodeKind::Retry
+                        | bcode_workflow::NodeKind::Parallel
+                )
+            })
+        {
+            let input = activation.input.clone().ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "workflow control node has no input: {}",
+                    activation.node_id
+                ))
+            })?;
+            if activation.node.kind == bcode_workflow::NodeKind::Repeat {
+                let result = self.settle_repeat_node(&activation, &input, settled_at_ms)?;
+                summary.settled.push(activation.activation_id);
+                summary.activated.extend(result);
+                continue;
+            }
+            let output = ValidatedOutput {
+                output_id: format!("{}:control-output", activation.activation_id),
+                run_id: activation.run_id.clone(),
+                node_id: activation.node_id.clone(),
+                activation_id: activation.activation_id.clone(),
+                schema_id: activation.node.output.type_name.clone(),
+                schema_version: 1,
+                value: input,
+                artifact_reference: None,
+                created_at_ms: settled_at_ms,
+            };
+            let result = self.persist_validated_output(&output)?;
+            summary.settled.push(activation.activation_id);
+            summary.activated.extend(result.activated);
+        }
+        Ok(summary)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn settle_repeat_node(
+        &mut self,
+        activation: &PendingActivation,
+        input: &serde_json::Value,
+        settled_at_ms: u64,
+    ) -> Result<Vec<NewActivation>, WorkflowStoreError> {
+        let transaction = self.connection.transaction()?;
+        let definition_json: String = transaction.query_row(
+            "SELECT definition.definition_json FROM workflow_runs run \
+             JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+               AND definition.version = run.definition_version WHERE run.run_id = ?1",
+            [&activation.run_id],
+            |row| row.get(0),
+        )?;
+        let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+        let predicate: bcode_workflow::PredicateExpression = serde_json::from_value(
+            activation
+                .node
+                .configuration
+                .get("predicate")
+                .cloned()
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(
+                        "workflow repeat configuration is missing predicate".to_string(),
+                    )
+                })?,
+        )?;
+        let max_iterations = activation
+            .node
+            .configuration
+            .get("max_iterations")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "workflow repeat configuration is missing max_iterations".to_string(),
+                )
+            })?;
+        let should_repeat = evaluate_predicate(&predicate, input)?
+            && activation.dependency_generation.saturating_add(1) < max_iterations;
+        transaction.execute(
+            "UPDATE workflow_activations SET status = 'completed', output_id = ?4 \
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND status = 'pending'",
+            (
+                &activation.run_id,
+                &activation.node_id,
+                &activation.activation_id,
+                format!("{}:control-output", activation.activation_id),
+            ),
+        )?;
+        let value_json = serde_json::to_string(&input)?;
+        transaction.execute(
+            "INSERT INTO workflow_outputs \
+             (output_id, run_id, node_id, activation_id, schema_id, schema_version, value_json, \
+              artifact_reference, checksum_sha256, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6, NULL, ?7, ?8)",
+            (
+                format!("{}:control-output", activation.activation_id),
+                &activation.run_id,
+                &activation.node_id,
+                &activation.activation_id,
+                &activation.node.output.type_name,
+                &value_json,
+                sha256_hex(value_json.as_bytes()),
+                settled_at_ms,
+            ),
+        )?;
+        let mut activated = Vec::new();
+        if should_repeat {
+            let next_generation = activation.dependency_generation.saturating_add(1);
+            for edge in definition.edges.iter().filter(|edge| {
+                edge.from == activation.node_id
+                    && matches!(edge.kind, bcode_workflow::EdgeKind::Back { .. })
+            }) {
+                let node = definition.node(&edge.to).ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(format!(
+                        "workflow repeat target is missing: {}",
+                        edge.to
+                    ))
+                })?;
+                let next = NewActivation {
+                    run_id: activation.run_id.clone(),
+                    node_id: edge.to.clone(),
+                    activation_id: activation_identity(
+                        &activation.run_id,
+                        &edge.to,
+                        next_generation,
+                    ),
+                    dependency_generation: next_generation,
+                    input: Some(input.clone()),
+                    created_at_ms: settled_at_ms,
+                };
+                insert_activation_with_status(
+                    &transaction,
+                    &next,
+                    activation_status_for_node(node),
+                )?;
+                activated.push(next);
+            }
+        } else {
+            transaction.execute(
+                "UPDATE workflow_runs SET status = 'completed', updated_at_ms = ?2 \
+                 WHERE run_id = ?1 AND status = 'running'",
+                (&activation.run_id, settled_at_ms),
+            )?;
+            append_event(
+                &transaction,
+                &activation.run_id,
+                "run_completed",
+                "{}",
+                settled_at_ms,
+            )?;
+        }
+        append_event(
+            &transaction,
+            &activation.run_id,
+            "control_node_settled",
+            &serde_json::json!({
+                "node_id": activation.node_id,
+                "activation_id": activation.activation_id,
+                "repeat": should_repeat,
+            })
+            .to_string(),
+            settled_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(activated)
+    }
+
     /// Persist cancellation intent before an executor signals active children.
     ///
     /// The returned value indicates whether this call recorded the first cancellation request.
@@ -3323,6 +3521,14 @@ fn activation_input(
     target: &bcode_workflow::NodeDefinition,
     generation: u64,
 ) -> Result<serde_json::Value, WorkflowStoreError> {
+    if target.kind == bcode_workflow::NodeKind::Repeat {
+        let mut input = output.value.clone();
+        let iteration = input.get("iteration").and_then(serde_json::Value::as_u64);
+        if let Some(iteration) = iteration {
+            input["iteration"] = serde_json::json!(iteration.saturating_add(1));
+        }
+        return Ok(input);
+    }
     if target.kind != bcode_workflow::NodeKind::Parallel {
         return Ok(output.value.clone());
     }
@@ -4809,6 +5015,25 @@ mod tests {
         .clone()
     }
 
+    fn repeat_definition() -> WorkflowDefinition {
+        WorkflowBuilder::new(
+            "repeat",
+            Step::map("body", |mut value: serde_json::Value| {
+                value["condition_met"] = serde_json::json!(false);
+                Ok(value)
+            })
+            .repeat_while(
+                "repeat-control",
+                bcode_workflow::field::<serde_json::Value>("condition_met").eq(false),
+                2,
+            ),
+        )
+        .build()
+        .expect("workflow")
+        .definition()
+        .clone()
+    }
+
     fn parallel_join_definition() -> WorkflowDefinition {
         let left = Step::task("left", |value: u32, _context| async move { Ok(value + 1) });
         let right = Step::task("right", |value: u32, _context| async move { Ok(value + 2) });
@@ -5250,6 +5475,82 @@ mod tests {
         assert_eq!(page[0].event_type, "activation_created");
         assert!(store.list_runs(0).is_err());
         assert!(store.event_history("run-1", None, 1_001).is_err());
+    }
+
+    #[test]
+    fn durable_repeat_control_settlement_advances_generation_then_completes() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let definition = repeat_definition();
+        store
+            .persist_definition("repeat", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "repeat-run".to_string(),
+                definition_id: "repeat".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
+                created_at_ms: 1,
+                limits: WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let body = store
+            .pending_activations(10)
+            .expect("body")
+            .pop()
+            .expect("body");
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "body-0-output".to_string(),
+                run_id: "repeat-run".to_string(),
+                node_id: "body".to_string(),
+                activation_id: body.activation_id,
+                schema_id: definition.nodes["body"].output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::json!({"condition_met": false, "iteration": 1}),
+                artifact_reference: None,
+                created_at_ms: 2,
+            })
+            .expect("body output");
+        let settled = store
+            .settle_pending_control_nodes("repeat-run", 10, 3)
+            .expect("repeat");
+        assert_eq!(settled.activated.len(), 1);
+        assert_eq!(settled.activated[0].dependency_generation, 1);
+        assert_eq!(settled.activated[0].input.as_ref().unwrap()["iteration"], 2);
+        let body = store
+            .pending_activations(10)
+            .expect("body")
+            .pop()
+            .expect("body");
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "body-1-output".to_string(),
+                run_id: "repeat-run".to_string(),
+                node_id: "body".to_string(),
+                activation_id: body.activation_id,
+                schema_id: definition.nodes["body"].output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::json!({"condition_met": false, "iteration": 2}),
+                artifact_reference: None,
+                created_at_ms: 4,
+            })
+            .expect("body output");
+        let settled = store
+            .settle_pending_control_nodes("repeat-run", 10, 5)
+            .expect("complete");
+        assert!(settled.activated.is_empty());
+        assert_eq!(
+            store
+                .run_summary("repeat-run")
+                .expect("run")
+                .expect("run")
+                .status,
+            RunStatus::Completed
+        );
     }
 
     #[test]

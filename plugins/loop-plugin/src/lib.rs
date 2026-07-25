@@ -269,6 +269,11 @@ fn stop_loop(session_id: SessionId) -> InvokeCommandResponse {
         Ok(None) => return status_response("no loop found for this session"),
         Err(error) => return status_response(&format!("loop state unavailable: {error}")),
     };
+    if loop_state_uses_workflow_runtime(&state) {
+        return status_response(
+            "workflow-backed loop cancellation is managed by /workflow cancel using the displayed run id",
+        );
+    }
     if state.state.is_terminal() {
         return status_response(&format_status(Some(&state), None));
     }
@@ -352,6 +357,11 @@ fn resume_loop(session_id: SessionId) -> InvokeCommandResponse {
         Ok(None) => return status_response("no loop found for this session"),
         Err(error) => return status_response(&format!("loop state unavailable: {error}")),
     };
+    if loop_state_uses_workflow_runtime(&state) {
+        return status_response(
+            "workflow-backed loop resume is managed by /workflow resume using the displayed run id",
+        );
+    }
     if let Err(error) = prepare_resume(&mut state) {
         return status_response(&error);
     }
@@ -429,6 +439,7 @@ struct LoopSurface {
     condition: TextInputState,
     limit: TextInputState,
     field: Field,
+    pending_workflow_start: Option<LoopState>,
     status: String,
     prompt_area: Rect,
     condition_area: Rect,
@@ -443,6 +454,7 @@ impl LoopSurface {
             condition: text_state(""),
             limit: text_state(&DEFAULT_MAX_ITERATIONS.to_string()),
             field: Field::Prompt,
+            pending_workflow_start: None,
             status: "Tab changes field · Ctrl+Enter starts · Esc cancels".to_owned(),
             prompt_area: Rect::new(0, 0, 0, 0),
             condition_area: Rect::new(0, 0, 0, 0),
@@ -476,7 +488,7 @@ impl LoopSurface {
         }
     }
 
-    fn start(&mut self, host: &dyn PluginTuiHost) -> PluginTuiAction {
+    fn start(&mut self, _host: &dyn PluginTuiHost) -> PluginTuiAction {
         let Some(session_id) = self.session_id else {
             "an active persisted session is required".clone_into(&mut self.status);
             return PluginTuiAction::Redraw;
@@ -517,16 +529,12 @@ impl LoopSurface {
         }
         let state = LoopState::new(session_id, prompt, condition, max_iterations);
         if let Err(error) = save_state(&state) {
-            self.status = format!("failed to save loop: {error}");
+            self.status = format!("failed to prepare loop state: {error}");
             return PluginTuiAction::Redraw;
         }
-        host.spawn(Box::pin(run_loop(state)));
-        PluginTuiAction::Close {
-            outcome: Some(serde_json::json!({
-                "status": "loop started; normal messages will steer before the next iteration",
-                "append_text": "Loop started. Normal messages remain available for steering. Use /loop status or /loop stop."
-            })),
-        }
+        self.pending_workflow_start = Some(state);
+        "starting durable loop workflow".clone_into(&mut self.status);
+        PluginTuiAction::Redraw
     }
 
     fn render_input(
@@ -627,6 +635,59 @@ impl PluginTuiSurface for LoopSurface {
                 frame,
             );
         }
+    }
+
+    fn drain_effects<'a>(
+        &'a mut self,
+        host: &'a dyn PluginTuiHost,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PluginTuiAction> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(mut state) = self.pending_workflow_start.take() else {
+                return PluginTuiAction::None;
+            };
+            let definition = state
+                .workflow_definition
+                .clone()
+                .expect("new loop state has a workflow definition");
+            let input = state
+                .workflow_initial_value
+                .clone()
+                .expect("new loop state has workflow input");
+            let workspace_snapshot = std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .to_string_lossy()
+                .into_owned();
+            let request = bcode_plugin_sdk::tui::PluginWorkflowStartRequest {
+                definition_id: "bcode.loop".to_string(),
+                definition_version: 1,
+                definition: serde_json::to_value(definition).expect("definition serializes"),
+                workspace_snapshot,
+                parent_session_id: state.session_id,
+                input: serde_json::to_value(input).expect("input serializes"),
+            };
+            match host.start_workflow(request).await {
+                Ok(started) => {
+                    state.run_id.clone_from(&started.run_id);
+                    state.workflow_run_id = Some(started.run_id);
+                    if let Err(error) = save_state(&state) {
+                        self.status =
+                            format!("workflow started but loop state failed to save: {error}");
+                        return PluginTuiAction::Redraw;
+                    }
+                    PluginTuiAction::Close {
+                        outcome: Some(serde_json::json!({
+                            "status": "loop started through durable workflow runtime; normal messages remain available for steering",
+                            "append_text": "Loop started. Normal messages remain available for steering. Use /loop status or /loop stop.",
+                            "runtime_work_id": started.runtime_work_id,
+                        })),
+                    }
+                }
+                Err(error) => {
+                    self.status = format!("failed to start durable loop workflow: {error}");
+                    PluginTuiAction::Redraw
+                }
+            }
+        })
     }
 
     fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
@@ -837,6 +898,7 @@ fn loop_workflow_definition(
         serde_json::json!({
             "agent_id": null,
             "agent_profile_configured": false,
+            "system_prompt": "Execute one loop implementation iteration using implementation_prompt. Preserve stop_condition, max_iterations, and iteration in the structured output; leave condition_met false and provide no evaluation evidence.",
             "prompt_mode": "json_input",
             "read_only": false,
             "tools": null,
@@ -850,6 +912,7 @@ fn loop_workflow_definition(
         serde_json::json!({
             "agent_id": null,
             "agent_profile_configured": false,
+            "system_prompt": "Read-only loop completion evaluation. Inspect repository/session state against stop_condition. Preserve implementation_prompt, stop_condition, max_iterations, and iteration. Return condition_met, non-empty concrete evidence, and a concise non-empty summary in the exact structured schema.",
             "prompt_mode": "json_input",
             "read_only": true,
             "tools": null,
@@ -950,6 +1013,8 @@ struct LoopState {
     workflow_definition: Option<bcode_workflow::WorkflowDefinition>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     workflow_initial_value: Option<LoopWorkflowIteration>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow_run_id: Option<String>,
     current_iteration: u64,
     state: RunState,
     #[serde(default)]
@@ -986,6 +1051,7 @@ impl LoopState {
             max_iterations: u64::from(workflow_input.max_iterations),
             workflow_definition: Some(definition),
             workflow_initial_value: Some(initial_value),
+            workflow_run_id: None,
             current_iteration: 0,
             state: RunState::Ready,
             latest_evaluation: None,
@@ -1602,9 +1668,16 @@ fn format_status(state: Option<&LoopState>, pending_steering: Option<u32>) -> St
                     )
                 },
             );
+            let workflow = state
+                .workflow_run_id
+                .as_deref()
+                .map_or_else(String::new, |run_id| format!(" · workflow {run_id}"));
             format!(
-                "loop {} · phase {:?} · iteration {}/{} · queued steering: {steering} · evaluation: {evaluation} · reason: {reason}",
-                state.run_id, state.state, state.current_iteration, state.max_iterations
+                "loop {}{workflow} · phase {:?} · iteration {}/{} · queued steering: {steering} · evaluation: {evaluation} · reason: {reason}",
+                state.run_id,
+                state.state,
+                state.current_iteration,
+                state.max_iterations
             )
         },
     )
@@ -1659,6 +1732,13 @@ fn validate_state(state: &LoopState) -> Result<(), String> {
                 .map_err(|error| format!("invalid persisted loop workflow definition: {error}"))?;
             if definition.name != "bcode.loop" {
                 return Err("persisted loop workflow definition has the wrong identity".to_string());
+            }
+            if let Some(run_id) = &state.workflow_run_id
+                && run_id != &state.run_id
+            {
+                return Err(
+                    "persisted loop workflow run identity disagrees with loop identity".to_string(),
+                );
             }
             if initial_value.max_iterations != u32::try_from(state.max_iterations).unwrap_or(0)
                 || initial_value.implementation_prompt != state.iteration_prompt
@@ -1754,6 +1834,74 @@ mod tests {
         })
     }
 
+    #[derive(Debug)]
+    struct WorkflowStartTestHost {
+        request: std::sync::Mutex<Option<bcode_plugin_sdk::tui::PluginWorkflowStartRequest>>,
+    }
+
+    impl PluginTuiHost for WorkflowStartTestHost {
+        fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
+        fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+        fn request_redraw(&self) {}
+
+        fn start_workflow(
+            &self,
+            request: bcode_plugin_sdk::tui::PluginWorkflowStartRequest,
+        ) -> bcode_plugin_sdk::tui::PluginWorkflowStartFuture {
+            *self.request.lock().expect("request") = Some(request);
+            Box::pin(async {
+                Ok(bcode_plugin_sdk::tui::PluginWorkflowStartResponse {
+                    run_id: "durable-loop-run".to_string(),
+                    runtime_work_id: "workflow:durable-loop-run".to_string(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn start_surface_routes_new_loop_through_workflow_host() {
+        let host = WorkflowStartTestHost {
+            request: std::sync::Mutex::new(None),
+        };
+        let session_id = SessionId::new();
+        let mut surface = LoopSurface::new(Some(session_id));
+        surface.prompt = text_state("implement");
+        surface.condition = text_state("done");
+        surface.limit = text_state("2");
+        assert_eq!(surface.start(&host), PluginTuiAction::Redraw);
+        let action = surface.drain_effects(&host).await;
+        assert!(matches!(action, PluginTuiAction::Close { .. }));
+        let request = host
+            .request
+            .lock()
+            .expect("request")
+            .clone()
+            .expect("start");
+        assert_eq!(request.definition_id, "bcode.loop");
+        assert_eq!(request.parent_session_id, session_id);
+        assert_eq!(request.input["implementation_prompt"], "implement");
+        assert_eq!(request.input["max_iterations"], 2);
+    }
+
+    #[test]
+    fn plugin_tui_host_start_request_is_renderer_neutral_and_serializable() {
+        // The adapter's request translation is also exercised by client/IPC workflow tests; this
+        // test keeps the plugin-facing contract renderer-neutral and serializable.
+        let input =
+            LoopWorkflowInput::new("implement".to_string(), "done".to_string(), 2).expect("input");
+        let definition = loop_workflow_definition(&input).expect("definition");
+        let request = bcode_plugin_sdk::tui::PluginWorkflowStartRequest {
+            definition_id: "bcode.loop".to_string(),
+            definition_version: 1,
+            definition: serde_json::to_value(&definition).expect("definition JSON"),
+            workspace_snapshot: "/repo".to_string(),
+            parent_session_id: SessionId::new(),
+            input: serde_json::to_value(loop_workflow_initial_value(&input)).expect("input JSON"),
+        };
+        assert_eq!(request.definition_id, definition.name);
+        assert_eq!(request.input["max_iterations"], 2);
+    }
+
     #[test]
     fn new_loop_state_embeds_valid_standard_workflow_definition() {
         let state = LoopState::new(
@@ -1808,6 +1956,7 @@ mod tests {
         );
         state.workflow_definition = None;
         state.workflow_initial_value = None;
+        state.workflow_run_id = None;
         state.state = RunState::Paused;
         assert!(is_legacy_loop_state(&state));
         prepare_resume(&mut state).expect("legacy resume");

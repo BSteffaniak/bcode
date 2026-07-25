@@ -58,6 +58,33 @@ impl fmt::Display for PluginTuiHostError {
 
 impl Error for PluginTuiHostError {}
 
+/// Renderer-neutral request for a plugin surface to start one durable workflow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginWorkflowStartRequest {
+    pub definition_id: String,
+    pub definition_version: u32,
+    pub definition: serde_json::Value,
+    pub workspace_snapshot: String,
+    pub parent_session_id: SessionId,
+    pub input: serde_json::Value,
+}
+
+/// Async workflow-start result returned by a native TUI host.
+pub type PluginWorkflowStartFuture = Pin<
+    Box<
+        dyn Future<Output = Result<PluginWorkflowStartResponse, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// Renderer-neutral durable workflow-start result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginWorkflowStartResponse {
+    pub run_id: String,
+    pub runtime_work_id: String,
+}
+
 /// Session history replay requested when subscribing to session events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PluginSessionEventReplay {
@@ -138,6 +165,20 @@ pub trait PluginTuiHost: Send + Sync {
         Err(PluginTuiHostError::Unsupported(
             "clipboard writes are not available from this host".to_string(),
         ))
+    }
+
+    /// Start one durable workflow through the host's generic workflow service.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the host does not expose workflow start, permission is denied, or the
+    /// daemon rejects registration/run admission.
+    fn start_workflow(&self, _request: PluginWorkflowStartRequest) -> PluginWorkflowStartFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow start is not available from this host".to_string(),
+            ))
+        })
     }
 
     /// Subscribe to events for one explicit Bcode session.

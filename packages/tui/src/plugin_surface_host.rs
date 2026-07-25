@@ -7,7 +7,8 @@ use bcode_ipc::Event as BcodeEvent;
 use bcode_plugin_sdk::tui::{
     PluginSessionEvent, PluginSessionEventReplay, PluginSessionEventSubscription,
     PluginSessionEventSubscriptionRequest, PluginTask, PluginTuiAction, PluginTuiHost,
-    PluginTuiHostError, PluginTuiSurface,
+    PluginTuiHostError, PluginTuiSurface, PluginWorkflowStartFuture, PluginWorkflowStartRequest,
+    PluginWorkflowStartResponse,
 };
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
@@ -71,6 +72,37 @@ impl PluginTuiHost for BcodePluginTuiHost {
         clipboard
             .set_text(text)
             .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+    }
+
+    fn start_workflow(&self, request: PluginWorkflowStartRequest) -> PluginWorkflowStartFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let definition = serde_json::from_value(request.definition)
+                .map_err(|error| PluginTuiHostError::InvalidRequest(error.to_string()))?;
+            client
+                .register_workflow_definition(bcode_ipc::WorkflowDefinitionRegistrationRequest {
+                    definition_id: request.definition_id.clone(),
+                    version: request.definition_version,
+                    definition,
+                })
+                .await
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
+            let started = client
+                .start_workflow_run(bcode_ipc::WorkflowRunStartRequest {
+                    definition_id: request.definition_id,
+                    definition_version: request.definition_version,
+                    workspace_snapshot: request.workspace_snapshot,
+                    parent_session_id: request.parent_session_id,
+                    input: Some(request.input),
+                    limits: bcode_workflow_store::WorkflowRunLimits::default(),
+                })
+                .await
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
+            Ok(PluginWorkflowStartResponse {
+                run_id: started.run.run_id,
+                runtime_work_id: started.runtime_work_id.to_string(),
+            })
+        })
     }
 
     fn subscribe_session_events(

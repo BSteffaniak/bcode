@@ -10045,26 +10045,7 @@ async fn handle_start_workflow_run(
         ),
     )
     .await;
-    let owner = WorkflowActivationOwner { state };
-    let dispatch_summary = {
-        let store_path = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .path()
-            .to_path_buf();
-        let mut store = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?;
-        store
-            .dispatch_pending_activations(&owner, 1_000, current_unix_millis())
-            .await?
-    };
-    if !dispatch_summary.unsupported.is_empty() {
-        tracing::debug!(
-            run_id,
-            unsupported = ?dispatch_summary.unsupported,
-            "workflow run has pending activations without a production owner"
-        );
-    }
+    drive_workflow_run(state, &run_id).await?;
     send_response(
         writer,
         request_id,
@@ -10076,6 +10057,34 @@ async fn handle_start_workflow_run(
         )),
     )
     .await
+}
+
+async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<(), ServerError> {
+    let store_path = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .path()
+        .to_path_buf();
+    loop {
+        let settled = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
+            .settle_pending_control_nodes(run_id, 1_000, current_unix_millis())?;
+        let owner = WorkflowActivationOwner { state };
+        let dispatched = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
+            .dispatch_pending_activations(&owner, 1_000, current_unix_millis())
+            .await?;
+        if !dispatched.unsupported.is_empty() {
+            tracing::debug!(
+                run_id,
+                unsupported = ?dispatched.unsupported,
+                "workflow run has pending activations without a production owner"
+            );
+        }
+        if settled.settled.is_empty() || !dispatched.admitted.is_empty() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 async fn handle_list_workflow_definitions(
@@ -10307,16 +10316,7 @@ async fn handle_retry_workflow_node(
             failed_attempt,
             current_unix_millis(),
         )?;
-    let owner = WorkflowActivationOwner { state };
-    let store_path = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .path()
-        .to_path_buf();
-    bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-        .dispatch_pending_activations(&owner, 1, current_unix_millis())
-        .await?;
+    drive_workflow_run(state, &run_id).await?;
     send_response(
         writer,
         request_id,
@@ -20253,6 +20253,7 @@ fn observe_workflow_plugin_receipt(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn observe_workflow_turn(
     state: &ServerState,
     session_id: SessionId,
@@ -20352,7 +20353,10 @@ async fn observe_workflow_turn(
                 },
             })
         }
-        ModelTurnOutcome::Cancelled => Ok(bcode_workflow_store::AttemptObservation::Cancelled),
+        ModelTurnOutcome::Cancelled => Ok(bcode_workflow_store::AttemptObservation::Failed {
+            message: "workflow model turn was cancelled; explicit resume/retry is required"
+                .to_string(),
+        }),
         _ => Ok(bcode_workflow_store::AttemptObservation::Failed {
             message: message.unwrap_or_else(|| format!("workflow model turn ended: {outcome:?}")),
         }),
@@ -20591,6 +20595,13 @@ impl ActivationDispatchOwner for WorkflowAgentTurnOwner<'_> {
         if activation.node.kind != bcode_workflow::NodeKind::Agent {
             return Ok(None);
         }
+        if activation.node.configuration.get("loop_role").is_some()
+            && activation.node.configuration.get("system_prompt").is_none()
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "loop workflow agent node is missing its plugin-owned prompt contract".to_string(),
+            ));
+        }
         let configuration = &activation.node.configuration;
         if configuration
             .get("prompt_mode")
@@ -20797,6 +20808,7 @@ async fn dispatch_workflow_agent_turn(
     };
     let child_id = child.id;
     let dispatch_identity = request.dispatch_identity.clone();
+    let request_run_id = request.activation.run_id.clone();
     let state_for_completion = Arc::clone(state);
     if let Some(completion_receiver) = completion_receiver {
         tokio::spawn(async move {
@@ -20827,17 +20839,22 @@ async fn dispatch_workflow_agent_turn(
                 .to_path_buf();
             match bcode_workflow_store::WorkflowStore::open_at_path(&store_path) {
                 Ok(mut store) => {
-                    if let Err(error) = store
+                    let reconciled = store
                         .reconcile_receipt_backed_attempts_async(
                             &observer,
                             1_000,
                             current_unix_millis(),
                         )
-                        .await
-                    {
+                        .await;
+                    drop(store);
+                    if let Err(error) = reconciled {
                         tracing::warn!(
                             "failed to reconcile completed workflow agent turn: {error}"
                         );
+                    } else if let Err(error) =
+                        drive_workflow_run(&state_for_completion, &request_run_id).await
+                    {
+                        tracing::warn!("failed to continue workflow after completion: {error}");
                     }
                 }
                 Err(error) => {
