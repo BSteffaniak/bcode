@@ -785,10 +785,11 @@ fn projected_contribution_geometry(
         .iter()
         .filter_map(|item| {
             let prefix = markdown.get(..item.range.start)?;
-            let _target = markdown.get(item.range.clone())?;
+            let target = markdown.get(item.range.clone())?;
+            let through = markdown.get(..item.range.end)?;
             let prefix_lines = render_markdown_projection(prefix, options).0;
-            let through_lines = render_markdown_projection(&markdown[..item.range.end], options).0;
-            let start = rendered_cursor(&prefix_lines);
+            let through_lines = render_markdown_projection(through, options).0;
+            let start = projected_range_start(&prefix_lines, target, through, options);
             let end = rendered_cursor(&through_lines);
             let rects = rects_between(start, end, options.width.max(1));
             (!rects.is_empty()).then(|| MarkdownContributionGeometry {
@@ -802,6 +803,24 @@ fn projected_contribution_geometry(
             })
         })
         .collect()
+}
+
+fn projected_range_start(
+    prefix_lines: &[Line],
+    target: &str,
+    through: &str,
+    options: &MarkdownRenderOptions,
+) -> (u16, u16) {
+    let end = rendered_cursor(&render_markdown_projection(through, options).0);
+    let target_width = text_display_width(target);
+    if end.1 >= u16::try_from(target_width).unwrap_or(u16::MAX) {
+        return (
+            end.0,
+            end.1
+                .saturating_sub(u16::try_from(target_width).unwrap_or(u16::MAX)),
+        );
+    }
+    rendered_cursor(prefix_lines)
 }
 
 fn rendered_cursor(lines: &[Line]) -> (u16, u16) {
@@ -3215,9 +3234,11 @@ mod tests {
     use super::{
         MarkdownRenderOptions, MarkdownTheme, TableRow, aligned_padding, markdown_to_plain_text,
         render_markdown, render_markdown_lines, table_column_widths, table_content_line,
+        text_display_width,
     };
     use bmux_tui::prelude::{Color, Modifier, Span, Style};
     use pulldown_cmark::Alignment;
+    use unicode_segmentation::UnicodeSegmentation;
 
     fn rendered_text(markdown: &str) -> String {
         render_markdown_lines(markdown, MarkdownRenderOptions::new(80))
@@ -3463,6 +3484,38 @@ mod tests {
         }));
     }
 
+    fn geometry_text(result: &super::MarkdownRenderResult, index: usize) -> String {
+        let geometry = &result.geometry[index];
+        geometry
+            .rects
+            .iter()
+            .filter_map(|rect| {
+                result
+                    .lines
+                    .get(usize::from(rect.y))
+                    .map(|line| (line, rect))
+            })
+            .map(|(line, rect)| {
+                let text = line
+                    .spans
+                    .iter()
+                    .map(|span| span.content.as_str())
+                    .collect::<String>();
+                let start = usize::from(rect.x);
+                let end = start.saturating_add(usize::from(rect.width));
+                let mut column = 0_usize;
+                text.graphemes(true)
+                    .filter(|grapheme| {
+                        let grapheme_start = column;
+                        column = column.saturating_add(text_display_width(grapheme));
+                        grapheme_start >= start && column <= end
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn contribution_geometry_tracks_wrapped_unicode_link_cells() {
         let result = render_markdown(
@@ -3520,6 +3573,82 @@ mod tests {
             );
         }
         assert!(result.geometry.iter().all(|item| !item.rects.is_empty()));
+    }
+
+    #[test]
+    fn geometry_is_deterministic_across_widths_and_stream_replacement() {
+        let markdown = "Prefix [nested **label**](https://example.com) suffix";
+        let wide = render_markdown(
+            markdown,
+            &MarkdownRenderOptions::new(80).with_document_id("stream"),
+        );
+        let narrow = render_markdown(
+            markdown,
+            &MarkdownRenderOptions::new(12).with_document_id("stream"),
+        );
+        assert_eq!(
+            wide.geometry[0].contribution_id,
+            narrow.geometry[0].contribution_id
+        );
+        assert_eq!(geometry_text(&wide, 0), "nested label");
+        assert_eq!(geometry_text(&narrow, 0).replace('\n', ""), "nested label");
+        assert_ne!(wide.geometry[0].rects, narrow.geometry[0].rects);
+
+        let appended = render_markdown(
+            &format!("{markdown} trailing stream text"),
+            &MarkdownRenderOptions::new(80)
+                .with_document_id("stream")
+                .with_streaming(true),
+        );
+        assert_eq!(wide.geometry[0], appended.geometry[0]);
+
+        let replaced = render_markdown(
+            "Prefix [changed](https://example.com) suffix",
+            &MarkdownRenderOptions::new(80)
+                .with_document_id("stream")
+                .with_streaming(true),
+        );
+        assert_ne!(
+            wide.geometry[0].contribution_id,
+            replaced.geometry[0].contribution_id
+        );
+        assert_eq!(geometry_text(&replaced, 0), "changed");
+    }
+
+    #[test]
+    fn details_and_footnote_geometry_tracks_projected_visible_cells() {
+        let markdown = "<details><summary>Retry **algorithm**</summary>Body</details>\n\nText[^note].\n\n[^note]: Definition body.";
+        for width in [80, 12] {
+            let result = render_markdown(
+                markdown,
+                &MarkdownRenderOptions::new(width).with_document_id("item"),
+            );
+            let details_index = result
+                .geometry
+                .iter()
+                .position(|item| item.contribution_id.starts_with("item:details:"))
+                .unwrap();
+            let reference_index = result
+                .geometry
+                .iter()
+                .position(|item| item.contribution_id.starts_with("item:footnote-reference:"))
+                .unwrap();
+            let definition_index = result
+                .geometry
+                .iter()
+                .position(|item| {
+                    item.contribution_id
+                        .starts_with("item:footnote-definition:")
+                })
+                .unwrap();
+            let details_text = geometry_text(&result, details_index);
+            assert!(
+                details_text.replace('\n', "").ends_with("try algorithm"),
+                "{details_text:?}"
+            );
+            assert_eq!(geometry_text(&result, reference_index), "[1]");
+            assert_eq!(geometry_text(&result, definition_index), "1");
+        }
     }
 
     #[test]

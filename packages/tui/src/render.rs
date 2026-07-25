@@ -34,7 +34,9 @@ fn plugin_visual_context(
 
 use std::time::{Duration, Instant};
 
-use bcode_markdown_render::{MarkdownRenderOptions, render_markdown, render_markdown_lines};
+use bcode_markdown_render::{
+    MarkdownContributionKind, MarkdownRenderOptions, render_markdown, render_markdown_lines,
+};
 use bcode_plugin_sdk::tui::PluginTuiVisualRenderMode;
 use bcode_session_view_models::TextFormat;
 use bmux_tui::chrome::{Border, Panel};
@@ -741,10 +743,11 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
         return;
     }
 
+    let top_row = app.transcript_top_row(area.height);
     let mut y = area.y;
     for visible in app
         .transcript_layout()
-        .visible_lines_from_top(app.transcript_top_row(area.height), area.height)
+        .visible_lines_from_top(top_row, area.height)
     {
         if y >= area.bottom() {
             break;
@@ -754,6 +757,230 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
             y = y.saturating_add(1);
         }
     }
+    render_transcript_markdown_hits(app, area, top_row, frame);
+}
+
+fn render_transcript_markdown_hits(
+    app: &BmuxApp,
+    area: Rect,
+    top_row: usize,
+    frame: &mut Frame<'_>,
+) {
+    for (index, item) in app.transcript().iter().enumerate() {
+        if item.text_format() != TextFormat::Markdown {
+            continue;
+        }
+        let Some(entry_start) = app.transcript_layout().entry_start_row(
+            super::transcript_layout::VisibleTranscriptSource::Transcript,
+            index,
+        ) else {
+            continue;
+        };
+        let content_offset = transcript_markdown_content_row_offset(item, area.width);
+        let rendered = render_markdown(
+            item.text(),
+            &MarkdownRenderOptions::new(area.width.saturating_sub(2).max(1))
+                .with_document_id(format!("transcript:{}", item.id().get()))
+                .with_streaming(item.streaming()),
+        );
+        for geometry in &rendered.geometry {
+            let Some(contribution) = rendered
+                .contributions
+                .iter()
+                .find(|contribution| contribution.id == geometry.contribution_id)
+            else {
+                continue;
+            };
+            if !markdown_contribution_actionable(&contribution.kind) {
+                continue;
+            }
+            for (rect_index, rect) in geometry.rects.iter().enumerate() {
+                let global_row = entry_start
+                    .saturating_add(content_offset)
+                    .saturating_add(usize::from(rect.y));
+                let Some(viewport_row) = global_row.checked_sub(top_row) else {
+                    continue;
+                };
+                let unclipped = Rect::new(
+                    area.x.saturating_add(2).saturating_add(rect.x),
+                    area.y
+                        .saturating_add(u16::try_from(viewport_row).unwrap_or(u16::MAX)),
+                    rect.width,
+                    rect.height,
+                );
+                let clipped = unclipped.intersection(area);
+                if clipped.is_empty() {
+                    continue;
+                }
+                frame.push_hit(
+                    HitRegion::new(
+                        format!("markdown:{}:{rect_index}", geometry.contribution_id),
+                        clipped,
+                    )
+                    .role(HitRole::Action)
+                    .layer(1),
+                );
+            }
+        }
+    }
+}
+
+fn transcript_markdown_content_row_offset(item: &TranscriptItem, width: u16) -> usize {
+    let rows = transcript_item_rows(
+        std::slice::from_ref(item),
+        0,
+        width,
+        None,
+        TuiDiffViewerConfig::default(),
+    );
+    let rendered = render_markdown_lines(
+        item.text(),
+        MarkdownRenderOptions::new(width.saturating_sub(2).max(1)).with_streaming(item.streaming()),
+    );
+    rows.len().saturating_sub(rendered.len()).saturating_sub(1)
+}
+
+#[cfg(test)]
+fn markdown_hit_regions_for_item(
+    item: &TranscriptItem,
+    item_start_row: usize,
+    top_row: usize,
+    area: Rect,
+) -> Vec<HitRegion> {
+    let rendered = render_markdown(
+        item.text(),
+        &MarkdownRenderOptions::new(area.width.saturating_sub(2).max(1))
+            .with_document_id(format!("transcript:{}", item.id().get()))
+            .with_streaming(item.streaming()),
+    );
+    let content_offset = transcript_markdown_content_row_offset(item, area.width);
+    rendered
+        .geometry
+        .iter()
+        .filter_map(|geometry| {
+            rendered
+                .contributions
+                .iter()
+                .find(|contribution| contribution.id == geometry.contribution_id)
+                .map(|contribution| (geometry, contribution))
+        })
+        .filter(|(_, contribution)| markdown_contribution_actionable(&contribution.kind))
+        .flat_map(|(geometry, _)| {
+            geometry
+                .rects
+                .iter()
+                .enumerate()
+                .filter_map(move |(rect_index, rect)| {
+                    let global_row = item_start_row
+                        .saturating_add(content_offset)
+                        .saturating_add(usize::from(rect.y));
+                    let viewport_row = global_row.checked_sub(top_row)?;
+                    let clipped = Rect::new(
+                        area.x.saturating_add(2).saturating_add(rect.x),
+                        area.y
+                            .saturating_add(u16::try_from(viewport_row).unwrap_or(u16::MAX)),
+                        rect.width,
+                        rect.height,
+                    )
+                    .intersection(area);
+                    (!clipped.is_empty()).then(|| {
+                        HitRegion::new(
+                            format!("markdown:{}:{rect_index}", geometry.contribution_id),
+                            clipped,
+                        )
+                        .role(HitRole::Action)
+                        .layer(1)
+                    })
+                })
+        })
+        .collect()
+}
+
+const fn markdown_contribution_actionable(kind: &MarkdownContributionKind) -> bool {
+    match kind {
+        MarkdownContributionKind::Link { destination, .. }
+        | MarkdownContributionKind::GitHubIssue { destination, .. } => matches!(
+            destination,
+            bcode_markdown_render::MarkdownDestination::Web(_)
+                | bcode_markdown_render::MarkdownDestination::LocalPath(_)
+                | bcode_markdown_render::MarkdownDestination::Fragment(_)
+        ),
+        MarkdownContributionKind::Details { .. }
+        | MarkdownContributionKind::FootnoteReference { .. }
+        | MarkdownContributionKind::FootnoteDefinition { .. } => true,
+        MarkdownContributionKind::Image { .. }
+        | MarkdownContributionKind::InlineMath { .. }
+        | MarkdownContributionKind::DisplayMath { .. }
+        | MarkdownContributionKind::Mermaid { .. } => false,
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn markdown_hit_regions_map_clip_and_filter_actions() {
+    let item = TranscriptItem::with_format(
+        "System",
+        "before [safe](https://example.com) and [unsafe](javascript:alert(1)) after".to_owned(),
+        TextFormat::Markdown,
+    );
+    let area = Rect::new(10, 5, 24, 3);
+    let regions = markdown_hit_regions_for_item(&item, 7, 7, area);
+
+    assert_eq!(regions.len(), 1);
+    assert!(regions[0].id.as_str().contains("link:"));
+    assert_eq!(regions[0].role, HitRole::Action);
+    assert_eq!(regions[0].layer, 1);
+    assert!(regions[0].area.x >= area.x && regions[0].area.right() <= area.right());
+    assert!(regions[0].area.y >= area.y && regions[0].area.bottom() <= area.bottom());
+}
+
+#[cfg(test)]
+#[test]
+fn markdown_hit_regions_follow_scroll_resize_and_replacement() {
+    let original = TranscriptItem::with_format(
+        "System",
+        "[a wrapped contribution](https://example.com)".to_owned(),
+        TextFormat::Markdown,
+    );
+    let area = Rect::new(3, 4, 12, 2);
+    let visible = markdown_hit_regions_for_item(&original, 10, 10, area);
+    let scrolled = markdown_hit_regions_for_item(&original, 10, 11, area);
+    let resized = markdown_hit_regions_for_item(&original, 10, 10, Rect::new(3, 4, 30, 3));
+
+    assert!(!visible.is_empty());
+    assert!(scrolled.iter().all(|region| region.area.y >= area.y));
+    assert_ne!(
+        visible.iter().map(|region| region.area).collect::<Vec<_>>(),
+        scrolled
+            .iter()
+            .map(|region| region.area)
+            .collect::<Vec<_>>()
+    );
+    assert_ne!(
+        visible.iter().map(|region| region.area).collect::<Vec<_>>(),
+        resized.iter().map(|region| region.area).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        visible[0]
+            .id
+            .as_str()
+            .split(':')
+            .take(3)
+            .collect::<Vec<_>>(),
+        resized[0]
+            .id
+            .as_str()
+            .split(':')
+            .take(3)
+            .collect::<Vec<_>>()
+    );
+
+    let replacement = TranscriptItem::with_format(
+        "System",
+        "plain replacement".to_owned(),
+        TextFormat::Markdown,
+    );
+    assert!(markdown_hit_regions_for_item(&replacement, 10, 10, area).is_empty());
 }
 
 pub fn transcript_markdown_contribution_ids(item: &TranscriptItem, width: u16) -> Vec<String> {
