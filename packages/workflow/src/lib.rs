@@ -3050,9 +3050,172 @@ mod tests {
         value: u64,
     }
 
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+    enum BunScenario {
+        Normal,
+        ReviewerFailure,
+        ReviewerDisagreement,
+        CancelDuringReview,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+    struct BunWorkState {
+        fix_round: u32,
+        scenario: BunScenario,
+        accepted: bool,
+        report: ArtifactReference,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+    struct BunReview {
+        reviewer: String,
+        accepted: bool,
+        report: ArtifactReference,
+        state: BunWorkState,
+    }
+
+    fn bun_reference_workflow(
+        reviews_started: Option<&Arc<AtomicUsize>>,
+    ) -> Workflow<BunWorkState, BunWorkState> {
+        let reviews_started = reviews_started.map(Arc::clone);
+        let implement = Step::map("implement", |state: BunWorkState| Ok(state));
+        let reviewer = |name: &'static str, left: bool| {
+            let reviews_started = reviews_started.clone();
+            Step::task(name, move |state: BunWorkState, context| {
+                let reviews_started = reviews_started.clone();
+                async move {
+                    if let Some(started) = reviews_started {
+                        started.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if state.scenario == BunScenario::CancelDuringReview {
+                        context.cancellation().cancel();
+                        context.ensure_active(name)?;
+                    }
+                    if left && state.scenario == BunScenario::ReviewerFailure {
+                        return Err(WorkflowError::step(name, "reviewer failed"));
+                    }
+                    let accepted = if state.scenario == BunScenario::ReviewerDisagreement {
+                        left
+                    } else {
+                        state.fix_round > 0
+                    };
+                    Ok(BunReview {
+                        reviewer: name.to_string(),
+                        accepted,
+                        report: ArtifactReference::new(
+                            format!("{name}-report-{}", state.fix_round),
+                            "bcode.review.report",
+                            1,
+                            "application/json",
+                            format!("{name}.json"),
+                        ),
+                        state,
+                    })
+                }
+            })
+        };
+        let review = parallel_named_with_policy(
+            "parallel-review",
+            ParallelFailurePolicy::WaitAll,
+            reviewer("reviewer-a", true),
+            reviewer("reviewer-b", false),
+        );
+        let adjudicate = Step::map("adjudicate", |(left, right): (BunReview, BunReview)| {
+            let mut state = left.state;
+            state.accepted = left.accepted && right.accepted;
+            state.report = left.report;
+            Ok(state)
+        });
+        let fix = Step::map("fix", |mut state: BunWorkState| {
+            if !state.accepted {
+                state.fix_round = state.fix_round.saturating_add(1);
+                state.scenario = BunScenario::Normal;
+            }
+            Ok(state)
+        });
+        let cycle = review.then(adjudicate).then(fix).repeat_while(
+            "bounded-fix-review",
+            field::<BunWorkState>("accepted").eq(false),
+            2,
+        );
+        WorkflowBuilder::new("bun-reference", implement.then(cycle))
+            .build()
+            .expect("reference workflow")
+    }
+
+    fn bun_state(scenario: BunScenario) -> BunWorkState {
+        BunWorkState {
+            fix_round: 0,
+            scenario,
+            accepted: false,
+            report: ArtifactReference::new(
+                "implementation-report",
+                "bcode.implementation.report",
+                1,
+                "application/json",
+                "implementation.json",
+            ),
+        }
+    }
+
     #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
     struct Labelled {
         label: String,
+    }
+
+    #[tokio::test]
+    async fn bun_reference_workflow_covers_parallel_review_adjudication_fix_and_failures() {
+        let completed = bun_reference_workflow(None)
+            .run(bun_state(BunScenario::Normal))
+            .await
+            .expect("fix then accept");
+        assert!(completed.accepted);
+        assert_eq!(completed.fix_round, 1);
+        assert_eq!(completed.report.schema, "bcode.review.report");
+
+        let disagreed = bun_reference_workflow(None)
+            .run(bun_state(BunScenario::ReviewerDisagreement))
+            .await
+            .expect("disagreement is adjudicated and fixed");
+        assert!(disagreed.accepted);
+        assert_eq!(disagreed.fix_round, 1);
+
+        let failure = bun_reference_workflow(None)
+            .run(bun_state(BunScenario::ReviewerFailure))
+            .await
+            .expect_err("reviewer failure");
+        assert!(failure.to_string().contains("reviewer-a"));
+
+        let exhaustion = WorkflowBuilder::new(
+            "bun-exhausted",
+            Step::map("never-accepted", |mut state: BunWorkState| {
+                state.fix_round = state.fix_round.saturating_add(1);
+                Ok(state)
+            })
+            .repeat_while(
+                "bounded-exhaustion",
+                field::<BunWorkState>("accepted").eq(false),
+                2,
+            ),
+        )
+        .build()
+        .expect("exhaustion workflow")
+        .run(bun_state(BunScenario::Normal))
+        .await
+        .expect_err("bounded fixes exhaust");
+        assert!(
+            exhaustion
+                .to_string()
+                .contains("remained true after 2 iterations")
+        );
+
+        let reviews_started = Arc::new(AtomicUsize::new(0));
+        let cancellation = bun_reference_workflow(Some(&reviews_started))
+            .run(bun_state(BunScenario::CancelDuringReview))
+            .await
+            .expect_err("cancel during parallel review");
+        assert!(matches!(cancellation, WorkflowError::Cancelled { .. }));
+        assert!(reviews_started.load(Ordering::SeqCst) >= 1);
     }
 
     #[tokio::test]
