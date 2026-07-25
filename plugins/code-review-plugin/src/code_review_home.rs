@@ -796,6 +796,11 @@ fn handle_plugin_key_event(
     stroke: KeyStroke,
     pending_action: &mut Option<ReviewHomeAsyncAction>,
 ) -> bool {
+    if is_review_home_exit_key(stroke) {
+        app.outcome = Some(ReviewHomeOutcome::Exit);
+        app.should_exit = true;
+        return true;
+    }
     if stroke.modifiers.ctrl
         || stroke.modifiers.alt
         || stroke.modifiers.super_key
@@ -866,11 +871,6 @@ fn handle_plugin_normal_key(
     pending_action: &mut Option<ReviewHomeAsyncAction>,
 ) -> bool {
     match key {
-        KeyCode::Char('q') | KeyCode::Escape => {
-            app.outcome = Some(ReviewHomeOutcome::Exit);
-            app.should_exit = true;
-            true
-        }
         KeyCode::Char('/') => app.toggle_search(),
         KeyCode::Char('r') => app.start_rename(),
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
@@ -1027,6 +1027,11 @@ async fn handle_key_event(
     app: &mut ReviewHomeApp,
     stroke: KeyStroke,
 ) -> bool {
+    if is_review_home_exit_key(stroke) {
+        app.outcome = Some(ReviewHomeOutcome::Exit);
+        app.should_exit = true;
+        return true;
+    }
     if stroke.modifiers.ctrl
         || stroke.modifiers.alt
         || stroke.modifiers.super_key
@@ -1046,6 +1051,16 @@ async fn handle_key_event(
         return app.handle_search_key(key);
     }
     handle_normal_key(client, app, key).await
+}
+
+fn is_review_home_exit_key(stroke: KeyStroke) -> bool {
+    stroke.key == KeyCode::Char('d')
+        && stroke.modifiers.ctrl
+        && !stroke.modifiers.alt
+        && !stroke.modifiers.shift
+        && !stroke.modifiers.super_key
+        && !stroke.modifiers.hyper
+        && !stroke.modifiers.meta
 }
 
 const fn normalized_home_key(stroke: KeyStroke) -> KeyCode {
@@ -1093,11 +1108,6 @@ async fn handle_rename_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: K
 
 async fn handle_normal_key(client: &BcodeClient, app: &mut ReviewHomeApp, key: KeyCode) -> bool {
     match key {
-        KeyCode::Char('q') | KeyCode::Escape => {
-            app.outcome = Some(ReviewHomeOutcome::Exit);
-            app.should_exit = true;
-            true
-        }
         KeyCode::Char('/') => app.toggle_search(),
         KeyCode::Char('r') => app.start_rename(),
         KeyCode::Char('j') | KeyCode::Down => app.move_down(),
@@ -1649,7 +1659,7 @@ const fn review_home_help_lines() -> &'static [&'static str] {
         " x                   archive selected review",
         " archived             press R to restore before opening",
         " R                   restore selected archived review",
-        " q or esc            exit",
+        " ctrl+d              exit",
     ]
 }
 
@@ -2252,6 +2262,43 @@ mod tests {
             draft_count: 0,
             last_publish: None,
         }
+    }
+
+    #[test]
+    fn escape_never_exits_review_home() {
+        let mut app = ReviewHomeApp::new(PathBuf::from("/repo"), Vec::new());
+        let mut pending_action = None;
+
+        assert!(!handle_plugin_key_event(
+            &mut app,
+            KeyStroke::simple(KeyCode::Escape),
+            &mut pending_action,
+        ));
+
+        assert!(!app.should_exit);
+        assert_eq!(app.outcome, None);
+    }
+
+    #[test]
+    fn control_d_exits_review_home() {
+        let mut app = ReviewHomeApp::new(PathBuf::from("/repo"), Vec::new());
+        let mut pending_action = None;
+        let stroke = KeyStroke {
+            key: KeyCode::Char('d'),
+            modifiers: bmux_keyboard::Modifiers {
+                ctrl: true,
+                ..bmux_keyboard::Modifiers::NONE
+            },
+        };
+
+        assert!(handle_plugin_key_event(
+            &mut app,
+            stroke,
+            &mut pending_action,
+        ));
+
+        assert!(app.should_exit);
+        assert_eq!(app.outcome, Some(ReviewHomeOutcome::Exit));
     }
 
     #[test]

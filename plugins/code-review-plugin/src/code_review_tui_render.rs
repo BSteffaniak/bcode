@@ -2423,7 +2423,7 @@ const BUILD_HELP_LINES: &[&str] = &[
     " M                   jump to next attention item",
     " b                   toggle sidebar",
     " ?                   toggle this help",
-    " q or esc            exit review",
+    " ctrl+d              exit review",
 ];
 
 const REPOSITORY_HELP_LINES: &[&str] = &[
@@ -2449,7 +2449,7 @@ const REPOSITORY_HELP_LINES: &[&str] = &[
     " M                   jump to next attention item",
     " b                   toggle sidebar",
     " ?                   toggle this help",
-    " q or esc            exit review",
+    " ctrl+d              exit review",
 ];
 
 const DIFF_HELP_LINES: &[&str] = &[
@@ -2490,7 +2490,7 @@ const DIFF_HELP_LINES: &[&str] = &[
     " e                   edit selected/latest draft",
     " D                   delete selected/latest draft",
     " ?                   toggle this help",
-    " q or esc            exit review",
+    " ctrl+d              exit review",
 ];
 
 fn render_import_modal(app: &ReviewApp, area: Rect, frame: &mut Frame<'_>) {

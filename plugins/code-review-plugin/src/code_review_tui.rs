@@ -2087,6 +2087,12 @@ fn handle_publish_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
 }
 
 fn handle_event_no_resize(app: &mut ReviewApp, event: &Event) -> bool {
+    if let Event::Key(stroke) = event
+        && is_review_exit_key(*stroke)
+    {
+        app.should_exit = true;
+        return true;
+    }
     if app.prompt_state.is_some() {
         return handle_prompt_event(app, event);
     }
@@ -2262,7 +2268,21 @@ fn handle_build_key(app: &mut ReviewApp, key: KeyCode) -> Option<bool> {
     })
 }
 
+fn is_review_exit_key(stroke: KeyStroke) -> bool {
+    stroke.key == KeyCode::Char('d')
+        && stroke.modifiers.ctrl
+        && !stroke.modifiers.alt
+        && !stroke.modifiers.shift
+        && !stroke.modifiers.super_key
+        && !stroke.modifiers.hyper
+        && !stroke.modifiers.meta
+}
+
 fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
+    if is_review_exit_key(stroke) {
+        app.should_exit = true;
+        return true;
+    }
     if stroke.modifiers.ctrl {
         if stroke.key == KeyCode::Char('p') {
             return app.open_file_picker();
@@ -2281,18 +2301,10 @@ fn handle_key(app: &mut ReviewApp, stroke: KeyStroke) -> bool {
         return handled;
     }
     match key {
-        KeyCode::Char('q') => {
-            app.should_exit = true;
-            true
-        }
         KeyCode::Escape => {
-            let cleared = app.clear_range_selection()
+            app.clear_range_selection()
                 || app.clear_selected_view_target()
-                || app.expand_all_inline_threads();
-            if !cleared {
-                app.should_exit = true;
-            }
-            true
+                || app.expand_all_inline_threads()
         }
         KeyCode::Char('b') => {
             app.sidebar_visible = !app.sidebar_visible;
@@ -12408,6 +12420,30 @@ mod tests {
         assert_eq!(editor.anchor.end_diff_row, Some(2));
         assert_eq!(editor.anchor.new_start, Some(1));
         assert_eq!(editor.anchor.new_end, Some(1));
+    }
+
+    #[test]
+    fn escape_never_exits_review() {
+        let mut app = sample_app();
+
+        assert!(!handle_key(&mut app, KeyStroke::simple(KeyCode::Escape)));
+
+        assert!(!app.should_exit);
+    }
+
+    #[test]
+    fn control_d_exits_review() {
+        let mut app = sample_app();
+        let stroke = KeyStroke {
+            key: KeyCode::Char('d'),
+            modifiers: bmux_keyboard::Modifiers {
+                ctrl: true,
+                ..bmux_keyboard::Modifiers::NONE
+            },
+        };
+
+        assert!(handle_key(&mut app, stroke));
+        assert!(app.should_exit);
     }
 
     #[test]
