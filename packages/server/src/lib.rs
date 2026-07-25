@@ -13532,6 +13532,7 @@ fn provider_metadata_trace_detail(key: &str, value: &str) -> String {
 const MAX_ACTIVE_TOOL_REQUEST_DRAFTS_PER_SESSION: usize = 256;
 const MAX_ACTIVE_TOOL_REQUEST_DRAFT_BYTES_PER_SESSION: usize = 4 * 1024 * 1024;
 
+#[allow(clippy::too_many_lines)] // Registry validation and accounting remain atomic under one mutex guard.
 async fn publish_tool_request_draft_live(
     state: &ServerState,
     session_id: SessionId,
@@ -13542,6 +13543,10 @@ async fn publish_tool_request_draft_live(
         turn_id: event.turn_id.clone(),
         tool_call_id: event.tool_call_id.clone(),
     };
+    let terminal_update = matches!(
+        event.operation,
+        bcode_session_models::ToolRequestDraftOperation::Remove { .. }
+    );
     let accepted = state
         .active_tool_request_drafts
         .lock()
@@ -13554,7 +13559,9 @@ async fn publish_tool_request_draft_live(
             }) || current.is_some_and(|current| {
                 event.generation < current.event.generation
                     || (event.generation == current.event.generation
-                        && event.revision <= current.event.revision)
+                        && (event.revision < current.event.revision
+                            || (event.revision == current.event.revision
+                                && !(terminal_update && event.revision == u64::MAX))))
             }) {
                 return false;
             }
@@ -13588,7 +13595,7 @@ async fn publish_tool_request_draft_live(
                     }
                     registry
                         .terminal_revisions
-                        .insert(key, (event.generation, event.revision));
+                        .insert(key, (event.generation, event.revision.saturating_add(1)));
                     return true;
                 }
             }
@@ -13632,6 +13639,11 @@ async fn publish_tool_request_draft_live(
             .sessions
             .publish_live_event(session_id, SessionLiveEventKind::ToolRequestDraft { event })
             .await;
+    } else if terminal_update {
+        tracing::warn!(
+            %session_id,
+            "request draft terminal revision was stale or overflowed; retained terminal dominance"
+        );
     }
 }
 
@@ -25013,6 +25025,102 @@ library = "test"
         assert_eq!(registry.drafts.len(), 1);
         assert_eq!(registry.session_bytes.get(&session_id), Some(&15));
         assert!(registry.terminal_revisions.is_empty());
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn request_draft_registry_rejects_out_of_order_duplicate_and_generation_mismatch() {
+        let state = test_server_state(SessionManager::default());
+        let session_id = SessionId::new();
+        for (generation, revision, text) in [
+            (2, 1, "latest"),
+            (1, u64::MAX, "older generation"),
+            (2, 1, "duplicate"),
+            (2, 0, "out of order"),
+        ] {
+            publish_tool_request_draft_live(
+                &state,
+                session_id,
+                request_draft_event(
+                    "call-1",
+                    generation,
+                    revision,
+                    bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: text.to_owned(),
+                    },
+                ),
+            )
+            .await;
+        }
+
+        let registry = state
+            .active_tool_request_drafts
+            .lock()
+            .expect("request draft registry");
+        let draft = registry.drafts.values().next().expect("active draft");
+        assert_eq!(draft.event.generation, 2);
+        assert_eq!(draft.event.revision, 1);
+        assert_eq!(draft.preview, "latest");
+        assert_eq!(registry.session_bytes.get(&session_id), Some(&6));
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn request_draft_registry_terminal_dominance_survives_revision_overflow() {
+        let state = test_server_state(SessionManager::default());
+        let session_id = SessionId::new();
+        publish_tool_request_draft_live(
+            &state,
+            session_id,
+            request_draft_event(
+                "call-1",
+                1,
+                u64::MAX,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: "latest".to_owned(),
+                },
+            ),
+        )
+        .await;
+        publish_tool_request_draft_live(
+            &state,
+            session_id,
+            request_draft_event(
+                "call-1",
+                1,
+                u64::MAX,
+                bcode_session_models::ToolRequestDraftOperation::Remove {
+                    reason: bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+                },
+            ),
+        )
+        .await;
+        publish_tool_request_draft_live(
+            &state,
+            session_id,
+            request_draft_event(
+                "call-1",
+                1,
+                u64::MAX,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: "must not revive".to_owned(),
+                },
+            ),
+        )
+        .await;
+
+        let registry = state
+            .active_tool_request_drafts
+            .lock()
+            .expect("request draft registry");
+        assert!(registry.drafts.is_empty());
+        assert_eq!(
+            registry.terminal_revisions.values().next(),
+            Some(&(1, u64::MAX))
+        );
         drop(registry);
     }
 

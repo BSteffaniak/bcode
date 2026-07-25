@@ -1172,6 +1172,7 @@ impl SessionView {
         let key = event.tool_call_id.clone();
         let id = TranscriptViewItemId::tool_request_draft(&key, event.generation);
         let current = self.tool_request_drafts.get(&key).cloned();
+        let terminal_update = matches!(event.operation, ToolRequestDraftOperation::Remove { .. });
         if self
             .terminal_tool_request_drafts
             .get(&key)
@@ -1182,7 +1183,9 @@ impl SessionView {
             || current.as_ref().is_some_and(|current| {
                 event.generation < current.generation
                     || (event.generation == current.generation
-                        && event.revision <= current.revision)
+                        && (event.revision < current.revision
+                            || (event.revision == current.revision
+                                && !(terminal_update && event.revision == u64::MAX))))
             })
         {
             return;
@@ -1205,7 +1208,7 @@ impl SessionView {
         if let ToolRequestDraftOperation::Remove { .. } = event.operation {
             self.tool_request_drafts.remove(&key);
             self.terminal_tool_request_drafts
-                .insert(key, (event.generation, event.revision));
+                .insert(key, (event.generation, event.revision.saturating_add(1)));
             self.snapshot.transcript.items.retain(|item| item.id != id);
             self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
             self.bump_revision();
@@ -2559,7 +2562,7 @@ mod tests {
         assert!(view.tool_request_drafts.is_empty());
         assert_eq!(
             view.terminal_tool_request_drafts.get("call-write"),
-            Some(&(1, 3))
+            Some(&(1, 4))
         );
         assert!(
             !view
