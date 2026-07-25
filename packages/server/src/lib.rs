@@ -31298,6 +31298,28 @@ library = "test"
                 if required == session_id
         ));
 
+        publish_tool_request_draft_live(
+            &state,
+            session_id,
+            request_draft_event(
+                "call-reconnect",
+                1,
+                1,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: "current live draft".to_owned(),
+                },
+            ),
+        )
+        .await;
+        assert!(matches!(
+            next_session_view_event(&mut connection).await,
+            bcode_ipc::Event::SessionLive(bcode_session_models::SessionLiveEvent {
+                kind: SessionLiveEventKind::ToolRequestDraft { .. },
+                ..
+            })
+        ));
+
         drop(connection);
         let mut reconnected = client
             .connect("session-view-reconnect-test")
@@ -31315,6 +31337,19 @@ library = "test"
             .expect("reattach");
         let mut replacement = bcode_session_view::SessionView::new();
         replacement.apply_history(&reattached.history);
+        let reconnect_live = next_session_view_event(&mut reconnected).await;
+        let bcode_ipc::Event::SessionLive(reconnect_live) = reconnect_live else {
+            panic!("expected current live checkpoint after reconnect");
+        };
+        replacement.apply_live_event(&reconnect_live);
+        assert!(replacement.snapshot().transcript.items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                bcode_session_view_models::TranscriptViewItemKind::ToolRequestDraft { draft }
+                    if draft.tool_call_id == "call-reconnect"
+                        && draft.preview == "current live draft"
+            )
+        }));
         assert!(
             replacement
                 .snapshot()
