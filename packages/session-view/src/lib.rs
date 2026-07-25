@@ -1789,54 +1789,7 @@ impl SessionView {
             .tools
             .insert(tool_call_id.to_owned(), tool.clone());
         if is_terminal_tool_status(tool.status) {
-            let result_id = TranscriptViewItemId::tool_presentation_slot(
-                tool_call_id,
-                bcode_session_models::ToolContributionPlacement::Result,
-                None,
-            );
-            if let Some(index) = self
-                .snapshot
-                .transcript
-                .items
-                .iter()
-                .position(|item| item.id == result_id)
-            {
-                self.replace_tool_item(index, tool.clone(), tool_call_id, sequence, timestamp_ms);
-            } else {
-                self.push_item(
-                    result_id,
-                    sequence,
-                    timestamp_ms,
-                    false,
-                    TranscriptViewItemKind::ToolInvocation {
-                        tool: Box::new(tool.clone()),
-                    },
-                );
-            }
-            if let Some(request_id) = self.tool_item_ids.remove(tool_call_id)
-                && let Some(index) = self
-                    .snapshot
-                    .transcript
-                    .items
-                    .iter()
-                    .position(|item| item.id == request_id)
-                && matches!(
-                    self.snapshot.transcript.items[index].kind,
-                    TranscriptViewItemKind::ToolInvocation { .. }
-                )
-            {
-                self.snapshot.transcript.items[index].kind = TranscriptViewItemKind::ToolRequest {
-                    tool: Box::new(tool.clone()),
-                };
-                self.snapshot.transcript.items[index].streaming = false;
-                self.snapshot.transcript.items[index].revision = self.snapshot.transcript.items
-                    [index]
-                    .revision
-                    .saturating_add(1);
-                self.snapshot.transcript.revision =
-                    self.snapshot.transcript.revision.saturating_add(1);
-            }
-            self.sync_contribution_invocation_context(tool_call_id);
+            self.upsert_terminal_tool_item(tool_call_id, sequence, timestamp_ms, tool);
             return;
         }
         match self.tool_item_ids.entry(tool_call_id.to_owned()) {
@@ -1873,6 +1826,62 @@ impl SessionView {
                 }
                 self.tool_item_ids.insert(tool_call_id.to_owned(), id);
             }
+        }
+        self.sync_contribution_invocation_context(tool_call_id);
+    }
+
+    fn upsert_terminal_tool_item(
+        &mut self,
+        tool_call_id: &str,
+        sequence: u64,
+        timestamp_ms: Option<u64>,
+        tool: ToolInvocationView,
+    ) {
+        let request_tool = tool.clone();
+        if let Some(request_id) = self.tool_item_ids.remove(tool_call_id)
+            && let Some(index) = self
+                .snapshot
+                .transcript
+                .items
+                .iter()
+                .position(|item| item.id == request_id)
+            && matches!(
+                self.snapshot.transcript.items[index].kind,
+                TranscriptViewItemKind::ToolInvocation { .. }
+            )
+        {
+            self.snapshot.transcript.items[index].kind = TranscriptViewItemKind::ToolRequest {
+                tool: Box::new(request_tool),
+            };
+            self.snapshot.transcript.items[index].streaming = false;
+            self.snapshot.transcript.items[index].revision = self.snapshot.transcript.items[index]
+                .revision
+                .saturating_add(1);
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        }
+        let result_id = TranscriptViewItemId::tool_presentation_slot(
+            tool_call_id,
+            bcode_session_models::ToolContributionPlacement::Result,
+            None,
+        );
+        if let Some(index) = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|item| item.id == result_id)
+        {
+            self.replace_tool_item(index, tool, tool_call_id, sequence, timestamp_ms);
+        } else {
+            self.push_item(
+                result_id,
+                sequence,
+                timestamp_ms,
+                false,
+                TranscriptViewItemKind::ToolInvocation {
+                    tool: Box::new(tool),
+                },
+            );
         }
         self.sync_contribution_invocation_context(tool_call_id);
     }

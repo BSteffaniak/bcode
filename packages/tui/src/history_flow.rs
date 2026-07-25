@@ -353,7 +353,6 @@ fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
                     contribution_id: envelope.contribution.contribution_id.clone(),
                 })
             }
-            bcode_session_models::SessionLiveEventKind::ToolRequestDraft { .. } => None,
             _ => None,
         },
         BcodeEvent::RuntimeWork(_)
