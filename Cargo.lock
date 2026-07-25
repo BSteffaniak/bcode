@@ -2005,7 +2005,9 @@ dependencies = [
  "bcode_model",
  "bcode_plugin",
  "bcode_plugin_sdk",
+ "bcode_provider_auth",
  "bcode_session_models",
+ "bcode_workflow",
  "bmux_keyboard",
  "bmux_tui",
  "clap",
@@ -2013,6 +2015,8 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "toml 1.1.3+spec-1.1.0",
+ "uuid",
 ]
 
 [[package]]

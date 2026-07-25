@@ -2,6 +2,56 @@ id      = "bcode.model"
 name    = "Bcode Model Plugin"
 version = "0.0.1"
 
+[[services]]
+class        = "service"
+description  = "Typed read-only provider-auth security workflow blocks"
+interface_id = "bcode.workflow-block/v1"
+name         = "Provider Auth Security Workflow Blocks"
+
+[[services.workflow_blocks]]
+block_id               = "provider_auth.security.inspect"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "provider_auth.security.inspect"
+plugin_id              = "bcode.model"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 5000
+
+[services.workflow_blocks.input]
+schema = { type = "object", required = [
+    "vault_path",
+    "profile",
+    "policy",
+], properties = { vault_path = { type = "string" }, profile = { type = "string" }, policy = { type = "string", enum = [
+    "off",
+    "preferred",
+    "required",
+] } } }
+type_name = "bcode.provider-auth.security-inspect-request/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", required = [
+    "vault_path",
+    "profile",
+    "policy",
+    "vault_exists",
+    "profile_keys_enabled",
+    "profile_exists",
+    "profile_device_sealed",
+    "policy_satisfied",
+    "diagnostics",
+] }
+type_name = "bcode.provider-auth.security-status/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "disabled"
+explicit_grant_required = false
+
+[[services.workflow_blocks.resources]]
+access   = "read"
+resource = "provider-auth-vault"
+
 [[tui_surfaces]]
 description = "Plugin-owned model status UI"
 kind        = "model.status"

@@ -21,7 +21,9 @@ bcode_ipc            = { workspace = true }
 bcode_model          = { workspace = true }
 bcode_plugin         = { workspace = true }
 bcode_plugin_sdk     = { workspace = true, features = ["tui"] }
+bcode_provider_auth  = { workspace = true }
 bcode_session_models = { workspace = true }
+bcode_workflow       = { workspace = true }
 bmux_keyboard        = { workspace = true }
 bmux_tui             = { workspace = true }
 clap                 = { workspace = true, features = ["derive", "std"] }
@@ -29,6 +31,10 @@ serde                = { workspace = true }
 serde_json           = { workspace = true }
 thiserror            = { workspace = true }
 tokio                = { workspace = true, features = ["rt"] }
+
+[dev-dependencies]
+toml = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 
 [features]
 default          = []

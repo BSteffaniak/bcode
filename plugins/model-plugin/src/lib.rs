@@ -15,7 +15,51 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text::{Line, Span};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthSecurityInspectRequest {
+    vault_path: PathBuf,
+    profile: String,
+    policy: String,
+}
+
+fn invoke_workflow_block(request: &ServiceRequest) -> ServiceResponse {
+    if request.operation != "provider_auth.security.inspect" {
+        return ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported provider-auth security workflow block operation",
+        );
+    }
+    let request = match request.payload_json::<AuthSecurityInspectRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    if request.profile.trim().is_empty() || !request.vault_path.is_absolute() {
+        return ServiceResponse::error(
+            "invalid_request",
+            "security inspection requires an absolute vault path and non-empty profile",
+        );
+    }
+    let policy = match request.policy.as_str() {
+        "off" => bcode_provider_auth::security::AuthDeviceSealPolicy::Off,
+        "preferred" => bcode_provider_auth::security::AuthDeviceSealPolicy::Preferred,
+        "required" => bcode_provider_auth::security::AuthDeviceSealPolicy::Required,
+        _ => {
+            return ServiceResponse::error(
+                "invalid_request",
+                "security policy must be off, preferred, or required",
+            );
+        }
+    };
+    json_response(&bcode_provider_auth::security::inspect_auth_vault_security(
+        &request.vault_path,
+        &request.profile,
+        policy,
+    ))
+}
 
 /// model command plugin.
 #[derive(Default)]
@@ -32,6 +76,9 @@ impl RustPlugin for ModelPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID {
+            return invoke_workflow_block(&context.request);
+        }
         if context.request.interface_id != COMMAND_INTERFACE_ID {
             return ServiceResponse::error(
                 "unsupported_interface",
@@ -391,6 +438,44 @@ bcode_plugin_sdk::export_plugin!(ModelPlugin, include_str!("../bcode-plugin.toml
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_auth_security_block_is_read_only_and_reports_missing_vault() {
+        let manifest: bcode_plugin::PluginManifest =
+            toml::from_str(include_str!("../bcode-plugin.toml")).expect("manifest");
+        let block = &manifest.services[0].workflow_blocks[0];
+        assert_eq!(block.block_id, "provider_auth.security.inspect");
+        assert_eq!(block.effect, bcode_workflow::WorkflowBlockEffect::ReadOnly);
+        assert_eq!(
+            block.authorization.capability,
+            bcode_workflow::WorkflowToolCapability::Disabled
+        );
+        let missing = std::env::temp_dir().join(format!(
+            "bcode-missing-auth-vault-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let response = invoke_workflow_block(&ServiceRequest {
+            interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.to_string(),
+            operation: "provider_auth.security.inspect".to_string(),
+            payload: serde_json::to_vec(&serde_json::json!({
+                "vault_path": missing,
+                "profile": "openai",
+                "policy": "required",
+            }))
+            .expect("request"),
+        });
+        assert_eq!(response.error, None);
+        let status: bcode_provider_auth::security::AuthSecurityStatus =
+            serde_json::from_slice(&response.payload).expect("status");
+        assert!(!status.vault_exists);
+        assert!(!status.policy_satisfied);
+        assert!(status.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "auth_vault_missing"
+                && diagnostic.severity
+                    == bcode_provider_auth::security::AuthSecurityDiagnosticSeverity::Warning
+        }));
+    }
 
     #[test]
     fn model_plugin_registers_palette_commands_from_plugin_code() {
