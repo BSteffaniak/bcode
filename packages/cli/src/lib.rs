@@ -319,14 +319,12 @@ async fn handle_web_command(
         access_token.clone(),
     );
     let builder = bcode_hyperchad::init(&state).await?;
-    let launch_session_id = initial_web_session_id(&state).await;
     let launch_token = access_token;
     let builder = builder
         .with_actix_bind_address(bind.to_string())
         .with_actix_port(port)
         .with_actix_on_bound(move |address| {
-            let launch_url =
-                bcode_hyperchad::build_launch_url(address, &launch_token, launch_session_id);
+            let launch_url = bcode_hyperchad::build_launch_url(address, &launch_token, None);
             if open::that_detached(&launch_url).is_err() {
                 eprintln!("Bcode could not open the HyperChad application in a browser.");
                 eprintln!(
@@ -346,29 +344,6 @@ async fn handle_web_command(
         })?
         .map_err(|error| CliError::HyperChadRender(error.to_string()))?;
     Ok(())
-}
-
-#[cfg(feature = "web-renderer")]
-async fn initial_web_session_id(
-    state: &bcode_hyperchad::HyperChadAppState,
-) -> Option<bcode_session_models::SessionId> {
-    const ATTEMPTS: usize = 5;
-    for attempt in 0..ATTEMPTS {
-        match state.initial_state().await {
-            Ok((snapshot, sessions)) => {
-                if let Some(session_id) = snapshot.session_id {
-                    return Some(session_id);
-                }
-                if sessions.is_empty() && attempt + 1 == ATTEMPTS {
-                    return None;
-                }
-            }
-            Err(_) if attempt + 1 == ATTEMPTS => return None,
-            Err(_) => {}
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-    }
-    None
 }
 
 fn handle_onboard_flags(

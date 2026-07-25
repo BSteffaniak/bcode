@@ -31,6 +31,7 @@ for required in (
     '#[cfg(feature = "web-renderer")]',
     'Commands::Web',
     'bcode_hyperchad',
+    'build_launch_url(address, &launch_token, None)',
 ):
     if required not in cli_source:
         raise SystemExit(f"CLI web command gating is missing {required}")
