@@ -2344,34 +2344,13 @@ impl BmuxApp {
                 self.apply_live_contribution(&envelope.contribution, envelope.placement);
             }
             SessionLiveEventKind::ToolRequestDraft { event: draft } => {
-                let shared_item = self
-                    .session_view
-                    .snapshot()
-                    .transcript
-                    .items
-                    .iter()
-                    .find(|item| {
-                        matches!(
-                            &item.kind,
-                            bcode_session_view_models::TranscriptViewItemKind::ToolRequestDraft {
-                                draft: item_draft,
-                            } if item_draft.tool_call_id == draft.tool_call_id
-                                && item_draft.generation == draft.generation
-                        )
-                    })
-                    .map(terminal_item_from_shared);
-                let source_id =
+                let item_id =
                     bcode_session_view_models::TranscriptViewItemId::tool_presentation_slot(
                         &draft.tool_call_id,
                         draft.placement,
                         None,
                     );
-                if let Some(item) = shared_item {
-                    self.transcript.upsert_shared_item(item);
-                } else {
-                    self.transcript
-                        .retain(|item| item.source_view_item_id() != Some(&source_id));
-                }
+                self.sync_shared_tool_presentation_slot(&item_id);
             }
             SessionLiveEventKind::RequestContextOccupancyChanged { .. } => {}
             SessionLiveEventKind::ToolInvocationProgress { .. } => {
@@ -2410,7 +2389,7 @@ impl BmuxApp {
         if contribution.operation == bcode_session_models::ToolContributionOperation::Remove
             || placement == bcode_session_models::ToolContributionPlacement::Hidden
         {
-            self.transcript.remove_shared_item(&item_id);
+            self.sync_shared_tool_presentation_slot(&item_id);
             return;
         }
         let backs_existing_contribution = contribution.artifact.as_ref().is_some_and(|artifact| {
@@ -2465,7 +2444,7 @@ impl BmuxApp {
         if contribution.operation == bcode_session_models::ToolContributionOperation::Remove
             || placement == bcode_session_models::ToolContributionPlacement::Hidden
         {
-            self.transcript.remove_shared_item(&item_id);
+            self.sync_shared_tool_presentation_slot(&item_id);
             return;
         }
         self.push_required_shared_terminal_item(event_sequence, "durable tool contribution");
@@ -3055,6 +3034,25 @@ impl BmuxApp {
         self.push_required_shared_terminal_item(sequence, "user message");
     }
 
+    fn sync_shared_tool_presentation_slot(
+        &mut self,
+        item_id: &bcode_session_view_models::TranscriptViewItemId,
+    ) {
+        let item = self
+            .session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| &item.id == item_id)
+            .map(terminal_item_from_shared);
+        if let Some(item) = item {
+            self.transcript.upsert_shared_item(item);
+        } else {
+            self.transcript.remove_shared_item(item_id);
+        }
+    }
+
     fn push_required_shared_terminal_item(&mut self, sequence: u64, event_kind: &str) {
         let item = self.shared_terminal_item(sequence).unwrap_or_else(|| {
             panic!("shared session view must project {event_kind} event sequence {sequence}")
@@ -3561,26 +3559,19 @@ impl BmuxApp {
         tool_call_id: &str,
         _result: &str,
         is_error: bool,
-        semantic_result: Option<&ToolInvocationResult>,
+        _semantic_result: Option<&ToolInvocationResult>,
         application: SessionEventApplication,
     ) {
-        let mut item = self
+        let item = self
             .shared_tool_result_item(tool_call_id)
             .unwrap_or_else(|| {
                 panic!("shared session view must project final tool result for {tool_call_id}")
             });
-        if let Some(tool) = self.session_view.snapshot().tools.get(tool_call_id) {
-            item.set_tool_started_at_ms(tool.timing.started_at_ms);
-            item.set_tool_finished_at_ms(tool.timing.finished_at_ms);
-        }
-        if item
-            .tool_timing()
-            .and_then(|timing| timing.timed_out)
-            .is_none()
-        {
-            item.set_tool_timed_out(semantic_result.and_then(tool_result_timed_out));
-        }
-        self.transcript.push(item);
+        let item_id = item
+            .source_view_item_id()
+            .expect("shared tool result must carry stable identity")
+            .clone();
+        self.sync_shared_tool_presentation_slot(&item_id);
         self.update_tool_result_status(tool_call_id, is_error, application);
         self.finish_tool_request_streaming(tool_call_id);
     }
@@ -3988,16 +3979,6 @@ impl BmuxApp {
             | SessionTracePhase::SkillInvocationFailed => {}
         }
     }
-}
-
-fn tool_result_timed_out(result: &ToolInvocationResult) -> Option<bool> {
-    let ToolInvocationResult::Artifact { artifact } = result else {
-        return None;
-    };
-    artifact
-        .metadata
-        .get("timed_out")
-        .and_then(serde_json::Value::as_bool)
 }
 
 pub const fn composer_policy() -> TextInputPolicy {

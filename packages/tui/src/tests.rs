@@ -4764,6 +4764,91 @@ fn live_filesystem_request_draft_renders_updates_and_removes() {
 }
 
 #[test]
+fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+            event: bcode_session_models::ToolRequestDraftEvent {
+                turn_id: "turn-1".to_owned(),
+                tool_call_id: "call-write".to_owned(),
+                tool_name: "filesystem.write".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                schema: "bcode.filesystem.request-draft.write".to_owned(),
+                schema_version: 1,
+                placement: bcode_session_models::ToolContributionPlacement::Result,
+                generation: 1,
+                revision: 1,
+                operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: r#"{"path":"src/lib.rs","contents":"hello"}"#.to_owned(),
+                },
+                argument_bytes: 40,
+                truncated: false,
+            },
+        },
+    });
+    let draft = render_app_text(&mut app);
+    assert_eq!(draft.matches("Filesystem write · assembling").count(), 1);
+
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-write".to_owned(),
+            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+            tool_name: "filesystem.write".to_owned(),
+            arguments_json: "{}".to_owned(),
+            working_directory: None,
+        },
+    ));
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: "call-write".to_owned(),
+                model_output: "wrote 5 bytes".to_owned(),
+                is_error: false,
+                result: Some(ToolInvocationResult::Artifact {
+                    artifact: Box::new(bcode_session_models::ToolArtifact {
+                        artifact_id: "call-write-filesystem-change".to_owned(),
+                        producer_plugin_id: "bcode.filesystem".to_owned(),
+                        schema: "bcode.filesystem.change".to_owned(),
+                        schema_version: 1,
+                        tool_call_id: Some("call-write".to_owned()),
+                        title: Some("File change".to_owned()),
+                        metadata: serde_json::json!({
+                            "tool_name": "filesystem.write",
+                            "summary": "wrote 5 bytes",
+                            "path": "src/lib.rs",
+                            "old_text": "",
+                            "new_text": "hello",
+                            "old_start_line": 1,
+                            "new_start_line": 1
+                        }),
+                        refs: Vec::new(),
+                    }),
+                }),
+            },
+        },
+    ));
+
+    let final_text = render_app_text(&mut app);
+    assert!(
+        !final_text.contains("Filesystem write · assembling"),
+        "{final_text}"
+    );
+    assert_eq!(
+        final_text.matches("File change · duration").count(),
+        1,
+        "{final_text}"
+    );
+}
+
+#[test]
 fn live_filesystem_edit_request_draft_renders_progressive_diff_and_removes() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
@@ -4778,7 +4863,7 @@ fn live_filesystem_edit_request_draft_renders_progressive_diff_and_removes() {
                 producer_plugin_id: Some("bcode.filesystem".to_owned()),
                 schema: "bcode.filesystem.request-draft.edit".to_owned(),
                 schema_version: 1,
-                placement: bcode_session_models::ToolContributionPlacement::Request,
+                placement: bcode_session_models::ToolContributionPlacement::Result,
                 generation: 1,
                 revision,
                 operation,
