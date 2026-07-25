@@ -21507,6 +21507,222 @@ fn is_expected_disconnect(error: &CodecError) -> bool {
     )
 }
 
+const SESSION_LIVE_FAN_OUT_FLUSH_INTERVAL: Duration = Duration::from_millis(40);
+const MAX_PENDING_LIVE_KEYS_PER_CLIENT: usize = 256;
+const MAX_PENDING_LIVE_BYTES_PER_CLIENT: usize = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum PendingLiveEventKey {
+    Contribution {
+        invocation_id: String,
+        contribution_id: String,
+    },
+    RequestDraft {
+        turn_id: String,
+        tool_call_id: String,
+        generation: u64,
+    },
+}
+
+#[derive(Debug)]
+struct PendingLiveEvent {
+    event: bcode_session_models::SessionLiveEvent,
+    encoded_bytes: usize,
+}
+
+#[derive(Debug, Default)]
+struct PendingLiveEventBuffer {
+    events: BTreeMap<PendingLiveEventKey, PendingLiveEvent>,
+    encoded_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BufferLiveEventError {
+    Gap,
+    KeyLimit,
+    ByteLimit,
+    Encode,
+}
+
+#[derive(Debug)]
+enum BufferLiveEventResult {
+    Buffered { superseded: bool },
+    PassThrough(Box<bcode_session_models::SessionLiveEvent>),
+    Rejected(BufferLiveEventError),
+}
+
+impl PendingLiveEventBuffer {
+    fn is_empty(&self) -> bool {
+        self.events.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.events.len()
+    }
+
+    const fn encoded_bytes(&self) -> usize {
+        self.encoded_bytes
+    }
+
+    fn clear(&mut self) {
+        self.events.clear();
+        self.encoded_bytes = 0;
+    }
+
+    fn take_events(&mut self) -> Vec<bcode_session_models::SessionLiveEvent> {
+        self.encoded_bytes = 0;
+        std::mem::take(&mut self.events)
+            .into_values()
+            .map(|pending| pending.event)
+            .collect()
+    }
+
+    fn push(&mut self, event: bcode_session_models::SessionLiveEvent) -> BufferLiveEventResult {
+        let Some(key) = pending_live_event_key(&event) else {
+            return BufferLiveEventResult::PassThrough(Box::new(event));
+        };
+        let event = if let Some(pending) = self.events.get(&key) {
+            match merge_pending_live_event(&pending.event, &event) {
+                MergePendingLiveEvent::Merged(event) => *event,
+                MergePendingLiveEvent::Replace => event,
+                MergePendingLiveEvent::Gap => {
+                    return BufferLiveEventResult::Rejected(BufferLiveEventError::Gap);
+                }
+            }
+        } else {
+            event
+        };
+        let Ok(encoded_bytes) = serde_json::to_vec(&event).map(|encoded| encoded.len()) else {
+            return BufferLiveEventResult::Rejected(BufferLiveEventError::Encode);
+        };
+        let replaced_bytes = self
+            .events
+            .get(&key)
+            .map_or(0, |pending| pending.encoded_bytes);
+        if !self.events.contains_key(&key) && self.events.len() >= MAX_PENDING_LIVE_KEYS_PER_CLIENT
+        {
+            return BufferLiveEventResult::Rejected(BufferLiveEventError::KeyLimit);
+        }
+        let next_bytes = self
+            .encoded_bytes
+            .saturating_sub(replaced_bytes)
+            .saturating_add(encoded_bytes);
+        if next_bytes > MAX_PENDING_LIVE_BYTES_PER_CLIENT {
+            return BufferLiveEventResult::Rejected(BufferLiveEventError::ByteLimit);
+        }
+        let superseded = self.events.contains_key(&key);
+        self.events.insert(
+            key,
+            PendingLiveEvent {
+                event,
+                encoded_bytes,
+            },
+        );
+        self.encoded_bytes = next_bytes;
+        BufferLiveEventResult::Buffered { superseded }
+    }
+}
+
+fn pending_live_event_key(
+    event: &bcode_session_models::SessionLiveEvent,
+) -> Option<PendingLiveEventKey> {
+    match &event.kind {
+        SessionLiveEventKind::ToolContributionPlaced { envelope }
+            if envelope.contribution.persistence
+                == bcode_session_models::ToolContributionPersistence::Transient
+                && envelope.placement
+                    == bcode_session_models::ToolContributionPlacement::Progress
+                && envelope.contribution.operation
+                    == bcode_session_models::ToolContributionOperation::Upsert =>
+        {
+            Some(PendingLiveEventKey::Contribution {
+                invocation_id: envelope.contribution.invocation_id.clone(),
+                contribution_id: envelope.contribution.contribution_id.clone(),
+            })
+        }
+        SessionLiveEventKind::ToolRequestDraft { event }
+            if !matches!(
+                event.operation,
+                bcode_session_models::ToolRequestDraftOperation::Remove { .. }
+            ) =>
+        {
+            Some(PendingLiveEventKey::RequestDraft {
+                turn_id: event.turn_id.clone(),
+                tool_call_id: event.tool_call_id.clone(),
+                generation: event.generation,
+            })
+        }
+        _ => None,
+    }
+}
+
+enum MergePendingLiveEvent {
+    Merged(Box<bcode_session_models::SessionLiveEvent>),
+    Replace,
+    Gap,
+}
+
+fn merge_pending_live_event(
+    pending: &bcode_session_models::SessionLiveEvent,
+    next: &bcode_session_models::SessionLiveEvent,
+) -> MergePendingLiveEvent {
+    let SessionLiveEventKind::ToolRequestDraft {
+        event: pending_draft,
+    } = &pending.kind
+    else {
+        return MergePendingLiveEvent::Replace;
+    };
+    let SessionLiveEventKind::ToolRequestDraft { event: next_draft } = &next.kind else {
+        return MergePendingLiveEvent::Replace;
+    };
+    let bcode_session_models::ToolRequestDraftOperation::Append {
+        offset: pending_offset,
+        text: pending_text,
+    } = &pending_draft.operation
+    else {
+        return MergePendingLiveEvent::Replace;
+    };
+    let bcode_session_models::ToolRequestDraftOperation::Append {
+        offset: next_offset,
+        text: next_text,
+    } = &next_draft.operation
+    else {
+        return MergePendingLiveEvent::Replace;
+    };
+    if pending_offset.saturating_add(pending_text.len()) != *next_offset {
+        return MergePendingLiveEvent::Gap;
+    }
+    let mut merged = next.clone();
+    let SessionLiveEventKind::ToolRequestDraft { event } = &mut merged.kind else {
+        unreachable!("cloned request draft changed kind");
+    };
+    event.operation = bcode_session_models::ToolRequestDraftOperation::Append {
+        offset: *pending_offset,
+        text: format!("{pending_text}{next_text}"),
+    };
+    MergePendingLiveEvent::Merged(Box::new(merged))
+}
+
+async fn flush_pending_live_events(
+    sink: &ClientEventSink,
+    pending: &mut PendingLiveEventBuffer,
+) -> Result<(), CodecError> {
+    for event in pending.take_events() {
+        sink.send(Event::SessionLive(event)).await?;
+    }
+    Ok(())
+}
+
+async fn send_session_resync_required(
+    sink: &ClientEventSink,
+    session_id: SessionId,
+) -> Result<(), CodecError> {
+    sink.metrics
+        .increment_counter("server.live_state.lag_resync_total");
+    sink.send(Event::SessionViewResyncRequired { session_id })
+        .await
+}
+
 async fn send_active_runtime_snapshots(
     state: &ServerState,
     session_id: SessionId,
@@ -21524,6 +21740,7 @@ async fn send_active_runtime_snapshots(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)] // Durable/live selection, coalescing, bounds, and resync remain one ordered client loop.
 fn forward_session_events(
     sink: ClientEventSink,
     session_id: SessionId,
@@ -21531,101 +21748,196 @@ fn forward_session_events(
     mut live_events: tokio::sync::broadcast::Receiver<bcode_session_models::SessionLiveEvent>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut pending_live = PendingLiveEventBuffer::default();
+        let flush_timer = tokio::time::sleep(SESSION_LIVE_FAN_OUT_FLUSH_INTERVAL);
+        tokio::pin!(flush_timer);
         loop {
-            let event = tokio::select! {
-                durable = events.recv() => match durable {
-                    Ok(event) => Event::Session(event),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(
-                            client_id = %sink.client_id(),
-                            %session_id,
-                            skipped,
-                            "durable session event subscriber lagged; requesting renderer resync"
-                        );
-                        sink.metrics
-                            .increment_counter("server.live_state.lag_resync_total");
-                        if let Err(error) = sink
-                            .send(Event::SessionViewResyncRequired { session_id })
-                            .await
-                            && !is_expected_disconnect(&error)
-                        {
+            tokio::select! {
+                () = &mut flush_timer, if !pending_live.is_empty() => {
+                    if let Err(error) = flush_pending_live_events(&sink, &mut pending_live).await {
+                        if !is_expected_disconnect(&error) {
                             tracing::warn!(
-                                "failed to request session resync from {}: {error}",
+                                "failed to flush session live events to {}: {error}",
                                 sink.client_id()
                             );
                         }
                         break;
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        tracing::warn!(
-                            client_id = %sink.client_id(),
-                            %session_id,
-                            "durable session event broker closed; requesting renderer resync"
-                        );
-                        if let Err(error) = sink
-                            .send(Event::SessionViewResyncRequired { session_id })
-                            .await
-                            && !is_expected_disconnect(&error)
-                        {
-                            tracing::warn!(
-                                "failed to request session resync from {}: {error}",
-                                sink.client_id()
-                            );
-                        }
-                        break;
-                    }
-                },
-                live = live_events.recv() => match live {
-                    Ok(event) => Event::SessionLive(event),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(
-                            client_id = %sink.client_id(),
-                            %session_id,
-                            skipped,
-                            "live session event subscriber lagged; requesting renderer resync"
-                        );
-                        sink.metrics
-                            .increment_counter("server.live_state.lag_resync_total");
-                        if let Err(error) = sink
-                            .send(Event::SessionViewResyncRequired { session_id })
-                            .await
-                            && !is_expected_disconnect(&error)
-                        {
-                            tracing::warn!(
-                                "failed to request session resync from {}: {error}",
-                                sink.client_id()
-                            );
-                        }
-                        break;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        tracing::warn!(
-                            client_id = %sink.client_id(),
-                            %session_id,
-                            "live session event broker closed; requesting renderer resync"
-                        );
-                        if let Err(error) = sink
-                            .send(Event::SessionViewResyncRequired { session_id })
-                            .await
-                            && !is_expected_disconnect(&error)
-                        {
-                            tracing::warn!(
-                                "failed to request session resync from {}: {error}",
-                                sink.client_id()
-                            );
-                        }
-                        break;
-                    }
-                },
-            };
-            if let Err(error) = sink.send(event).await {
-                if !is_expected_disconnect(&error) {
-                    tracing::warn!(
-                        "failed to send session event to {}: {error}",
-                        sink.client_id()
+                    sink.metrics.set_gauge("server.live_state.pending_subscriber_keys", 0);
+                    sink.metrics.set_gauge("server.live_state.pending_subscriber_bytes", 0);
+                    flush_timer.as_mut().reset(
+                        tokio::time::Instant::now() + SESSION_LIVE_FAN_OUT_FLUSH_INTERVAL,
                     );
                 }
-                break;
+                durable = events.recv() => {
+                    if let Err(error) = flush_pending_live_events(&sink, &mut pending_live).await {
+                        if !is_expected_disconnect(&error) {
+                            tracing::warn!(
+                                "failed to flush live events before durable boundary for {}: {error}",
+                                sink.client_id()
+                            );
+                        }
+                        break;
+                    }
+                    sink.metrics.set_gauge("server.live_state.pending_subscriber_keys", 0);
+                    sink.metrics.set_gauge("server.live_state.pending_subscriber_bytes", 0);
+                    match durable {
+                        Ok(event) => {
+                            if let Err(error) = sink.send(Event::Session(event)).await {
+                                if !is_expected_disconnect(&error) {
+                                    tracing::warn!(
+                                        "failed to send session event to {}: {error}",
+                                        sink.client_id()
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(
+                                client_id = %sink.client_id(),
+                                %session_id,
+                                skipped,
+                                "durable session event subscriber lagged; requesting renderer resync"
+                            );
+                            if let Err(error) = send_session_resync_required(&sink, session_id).await
+                                && !is_expected_disconnect(&error)
+                            {
+                                tracing::warn!(
+                                    "failed to request session resync from {}: {error}",
+                                    sink.client_id()
+                                );
+                            }
+                            break;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            tracing::warn!(
+                                client_id = %sink.client_id(),
+                                %session_id,
+                                "durable session event broker closed; requesting renderer resync"
+                            );
+                            if let Err(error) = send_session_resync_required(&sink, session_id).await
+                                && !is_expected_disconnect(&error)
+                            {
+                                tracing::warn!(
+                                    "failed to request session resync from {}: {error}",
+                                    sink.client_id()
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
+                live = live_events.recv() => {
+                    let event = match live {
+                        Ok(event) => event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            pending_live.clear();
+                            tracing::warn!(
+                                client_id = %sink.client_id(),
+                                %session_id,
+                                skipped,
+                                "live session event subscriber lagged; requesting renderer resync"
+                            );
+                            if let Err(error) = send_session_resync_required(&sink, session_id).await
+                                && !is_expected_disconnect(&error)
+                            {
+                                tracing::warn!(
+                                    "failed to request session resync from {}: {error}",
+                                    sink.client_id()
+                                );
+                            }
+                            break;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            pending_live.clear();
+                            tracing::warn!(
+                                client_id = %sink.client_id(),
+                                %session_id,
+                                "live session event broker closed; requesting renderer resync"
+                            );
+                            if let Err(error) = send_session_resync_required(&sink, session_id).await
+                                && !is_expected_disconnect(&error)
+                            {
+                                tracing::warn!(
+                                    "failed to request session resync from {}: {error}",
+                                    sink.client_id()
+                                );
+                            }
+                            break;
+                        }
+                    };
+                    match pending_live.push(event) {
+                        BufferLiveEventResult::Buffered { superseded } => {
+                            if superseded {
+                                sink.metrics.increment_counter(
+                                    "server.live_state.coalesced_updates_total",
+                                );
+                            }
+                            sink.metrics.set_gauge(
+                                "server.live_state.pending_subscriber_keys",
+                                i64::try_from(pending_live.len()).unwrap_or(i64::MAX),
+                            );
+                            sink.metrics.set_gauge(
+                                "server.live_state.pending_subscriber_bytes",
+                                i64::try_from(pending_live.encoded_bytes()).unwrap_or(i64::MAX),
+                            );
+                            if pending_live.len() == 1 {
+                                flush_timer.as_mut().reset(
+                                    tokio::time::Instant::now()
+                                        + SESSION_LIVE_FAN_OUT_FLUSH_INTERVAL,
+                                );
+                            }
+                        }
+                        BufferLiveEventResult::PassThrough(event) => {
+                            let send_result = match flush_pending_live_events(
+                                &sink,
+                                &mut pending_live,
+                            )
+                            .await
+                            {
+                                Ok(()) => sink.send(Event::SessionLive(*event)).await,
+                                Err(error) => Err(error),
+                            };
+                            if let Err(error) = send_result {
+                                if !is_expected_disconnect(&error) {
+                                    tracing::warn!(
+                                        "failed to send session live event to {}: {error}",
+                                        sink.client_id()
+                                    );
+                                }
+                                break;
+                            }
+                            sink.metrics.set_gauge("server.live_state.pending_subscriber_keys", 0);
+                            sink.metrics.set_gauge("server.live_state.pending_subscriber_bytes", 0);
+                        }
+                        BufferLiveEventResult::Rejected(reason) => {
+                            pending_live.clear();
+                            let metric = match reason {
+                                BufferLiveEventError::Gap => {
+                                    "server.live_state.pending_subscriber_gap_total"
+                                }
+                                BufferLiveEventError::KeyLimit
+                                | BufferLiveEventError::ByteLimit => {
+                                    "server.live_state.pending_subscriber_overflow_total"
+                                }
+                                BufferLiveEventError::Encode => {
+                                    "server.live_state.pending_subscriber_encode_error_total"
+                                }
+                            };
+                            sink.metrics.increment_counter(metric);
+                            if let Err(error) = send_session_resync_required(&sink, session_id).await
+                                && !is_expected_disconnect(&error)
+                            {
+                                tracing::warn!(
+                                    "failed to request session resync from {}: {error}",
+                                    sink.client_id()
+                                );
+                            }
+                            break;
+                        }
+                    }
+                }
             }
         }
     })
@@ -31062,24 +31374,6 @@ library = "test"
         }
     }
 
-    async fn next_session_view_event(
-        connection: &mut bcode_client::ClientConnection,
-    ) -> bcode_ipc::Event {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                match connection.recv_event().await.expect("session view event") {
-                    event @ (bcode_ipc::Event::Session(_)
-                    | bcode_ipc::Event::SessionLive(_)
-                    | bcode_ipc::Event::SessionViewResyncRequired { .. }) => break event,
-                    bcode_ipc::Event::RuntimeWork(_)
-                    | bcode_ipc::Event::SessionCatalogUpdated { .. } => {}
-                }
-            }
-        })
-        .await
-        .expect("session view event timeout")
-    }
-
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
@@ -31882,22 +32176,21 @@ library = "test"
         let mut view = bcode_session_view::SessionView::new();
         view.apply_history(&attached.history);
 
-        assert!(
-            state
-                .sessions
-                .release_session_database_resources(session_id)
-                .await
-                .expect("release attached session database")
-        );
+        // Releasing and lazily reopening the attached session database is covered by the
+        // session-manager resource tests. This fixture owns event-stream ordering and reconnect
+        // checkpoints, so begin with the first durable event after attach.
         state
             .sessions
-            .append_user_message(session_id, ClientId::new(), "after idle".to_owned())
+            .append_user_message(session_id, ClientId::new(), "after attach".to_owned())
             .await
-            .expect("append after idle release");
+            .expect("append after attach");
         assert!(matches!(
-            next_session_view_event(&mut connection).await,
+            tokio::time::timeout(Duration::from_secs(2), connection.recv_event())
+                .await
+                .expect("first event after attach timeout")
+                .expect("first event after attach"),
             bcode_ipc::Event::Session(event)
-                if matches!(event.kind, SessionEventKind::UserMessage { ref text, .. } if text == "after idle")
+                if matches!(event.kind, SessionEventKind::UserMessage { ref text, .. } if text == "after attach")
         ));
 
         for text in ["live ", "answer"] {
@@ -31913,7 +32206,10 @@ library = "test"
                 .await
                 .expect("live subscriber");
             let bcode_ipc::Event::SessionLive(event) =
-                next_session_view_event(&mut connection).await
+                tokio::time::timeout(Duration::from_secs(2), connection.recv_event())
+                    .await
+                    .expect("assistant live event timeout")
+                    .expect("assistant live event")
             else {
                 panic!("expected live session event");
             };
@@ -31930,7 +32226,11 @@ library = "test"
             .append_assistant_message(session_id, "durable answer".to_owned())
             .await
             .expect("durable answer");
-        let bcode_ipc::Event::Session(event) = next_session_view_event(&mut connection).await
+        let bcode_ipc::Event::Session(event) =
+            tokio::time::timeout(Duration::from_secs(2), connection.recv_event())
+                .await
+                .expect("durable answer event timeout")
+                .expect("durable answer event")
         else {
             panic!("expected durable session event");
         };
@@ -31958,7 +32258,10 @@ library = "test"
             .await
             .expect("resync event");
         assert!(matches!(
-            next_session_view_event(&mut connection).await,
+            tokio::time::timeout(Duration::from_secs(2), connection.recv_event())
+                .await
+                .expect("resync signal timeout")
+                .expect("resync signal"),
             bcode_ipc::Event::SessionViewResyncRequired { session_id: required }
                 if required == session_id
         ));
@@ -31978,13 +32281,33 @@ library = "test"
         )
         .await;
         assert!(matches!(
-            next_session_view_event(&mut connection).await,
+            tokio::time::timeout(Duration::from_secs(2), connection.recv_event())
+                .await
+                .expect("draft event timeout")
+                .expect("draft event"),
             bcode_ipc::Event::SessionLive(bcode_session_models::SessionLiveEvent {
                 kind: SessionLiveEventKind::ToolRequestDraft { .. },
                 ..
             })
         ));
 
+        let mut keeper = client
+            .connect("session-view-reconnect-keeper")
+            .await
+            .expect("keeper connect");
+        keeper
+            .attach_session_projection_window_with_input_history(
+                session_id,
+                projection_ipc_window_request(
+                    bcode_session_models::ProjectionWindowAnchor::Latest,
+                    bcode_session_models::ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .expect("keeper attach");
+
+        // Keep one attachment alive while replacing the observed connection. A final detach is a
+        // session-unload boundary and correctly clears transient state rather than replaying it.
         drop(connection);
         let mut reconnected = client
             .connect("session-view-reconnect-test")
@@ -32002,7 +32325,10 @@ library = "test"
             .expect("reattach");
         let mut replacement = bcode_session_view::SessionView::new();
         replacement.apply_history(&reattached.history);
-        let reconnect_live = next_session_view_event(&mut reconnected).await;
+        let reconnect_live = tokio::time::timeout(Duration::from_secs(2), reconnected.recv_event())
+            .await
+            .expect("reconnect checkpoint timeout")
+            .expect("reconnect checkpoint");
         let bcode_ipc::Event::SessionLive(reconnect_live) = reconnect_live else {
             panic!("expected current live checkpoint after reconnect");
         };
@@ -32027,6 +32353,7 @@ library = "test"
                         if message.text == "durable answer"
                 ))
         );
+        drop(keeper);
         server.abort();
     }
 
@@ -34894,6 +35221,208 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         == bcode_session_models::ToolContributionOperation::Remove
         ));
         assert!(attachment.live_events.try_recv().is_err());
+    }
+
+    #[test]
+    fn pending_live_event_buffer_coalesces_snapshots_and_contiguous_appends() {
+        let session_id = SessionId::new();
+        let progress = |sequence| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Progress,
+                    bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call-progress".to_owned(),
+                        contribution_id: "screen".to_owned(),
+                        sequence,
+                        producer_id: "test.plugin".to_owned(),
+                        schema: "test.progress".to_owned(),
+                        schema_version: 1,
+                        operation: bcode_session_models::ToolContributionOperation::Upsert,
+                        persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                        artifact: None,
+                        payload: serde_json::json!({"frame": sequence}),
+                    },
+                ),
+            },
+        };
+        let draft = |revision, offset, text: &str| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "call-write".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    generation: 1,
+                    revision,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Append {
+                        offset,
+                        text: text.to_owned(),
+                    },
+                    argument_bytes: offset.saturating_add(text.len()),
+                    truncated: false,
+                },
+            },
+        };
+        let mut pending = PendingLiveEventBuffer::default();
+        for sequence in 1..=10_000 {
+            assert!(matches!(
+                pending.push(progress(sequence)),
+                BufferLiveEventResult::Buffered { .. }
+            ));
+        }
+        assert_eq!(pending.len(), 1);
+        let events = pending.take_events();
+        assert!(matches!(
+            &events[0].kind,
+            SessionLiveEventKind::ToolContributionPlaced { envelope }
+                if envelope.contribution.sequence == 10_000
+        ));
+
+        assert!(matches!(
+            pending.push(draft(1, 0, "hello ")),
+            BufferLiveEventResult::Buffered { superseded: false }
+        ));
+        assert!(matches!(
+            pending.push(draft(2, 6, "world")),
+            BufferLiveEventResult::Buffered { superseded: true }
+        ));
+        let events = pending.take_events();
+        assert!(matches!(
+            &events[0].kind,
+            SessionLiveEventKind::ToolRequestDraft { event }
+                if matches!(
+                    &event.operation,
+                    bcode_session_models::ToolRequestDraftOperation::Append { offset: 0, text }
+                        if text == "hello world"
+                )
+        ));
+
+        assert!(matches!(
+            pending.push(draft(3, 99, "gap")),
+            BufferLiveEventResult::Buffered { superseded: false }
+        ));
+        assert!(matches!(
+            pending.push(draft(4, 100, "still-gapped")),
+            BufferLiveEventResult::Rejected(BufferLiveEventError::Gap)
+        ));
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn pending_live_event_buffer_rejects_key_overflow_without_growth() {
+        let session_id = SessionId::new();
+        let mut pending = PendingLiveEventBuffer::default();
+        for index in 0..MAX_PENDING_LIVE_KEYS_PER_CLIENT {
+            let event = bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::ToolRequestDraft {
+                    event: request_draft_event(
+                        &format!("call-{index}"),
+                        1,
+                        1,
+                        bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                            start_offset: 0,
+                            text: "bounded".to_owned(),
+                        },
+                    ),
+                },
+            };
+            assert!(matches!(
+                pending.push(event),
+                BufferLiveEventResult::Buffered { .. }
+            ));
+        }
+        let before_bytes = pending.encoded_bytes();
+        let overflow = bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: request_draft_event(
+                    "call-overflow",
+                    1,
+                    1,
+                    bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: "rejected".to_owned(),
+                    },
+                ),
+            },
+        };
+        assert!(matches!(
+            pending.push(overflow),
+            BufferLiveEventResult::Rejected(BufferLiveEventError::KeyLimit)
+        ));
+        assert_eq!(pending.len(), MAX_PENDING_LIVE_KEYS_PER_CLIENT);
+        assert_eq!(pending.encoded_bytes(), before_bytes);
+    }
+
+    #[test]
+    fn pending_live_event_buffer_rejects_byte_overflow_without_growth() {
+        let session_id = SessionId::new();
+        let mut pending = PendingLiveEventBuffer::default();
+        for index in 0..32 {
+            let event = bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::ToolContributionPlaced {
+                    envelope: bcode_session_models::ToolContributionEnvelope::new(
+                        bcode_session_models::ToolContributionPlacement::Progress,
+                        bcode_session_models::ToolContributionEvent {
+                            invocation_id: format!("call-{index}"),
+                            contribution_id: "screen".to_owned(),
+                            sequence: 1,
+                            producer_id: "test.plugin".to_owned(),
+                            schema: "test.progress".to_owned(),
+                            schema_version: 1,
+                            operation: bcode_session_models::ToolContributionOperation::Upsert,
+                            persistence:
+                                bcode_session_models::ToolContributionPersistence::Transient,
+                            artifact: None,
+                            payload: serde_json::json!({
+                                "frame": "x".repeat(MAX_ACTIVE_CONTRIBUTION_BYTES - 1024),
+                            }),
+                        },
+                    ),
+                },
+            };
+            assert!(matches!(
+                pending.push(event),
+                BufferLiveEventResult::Buffered { .. }
+            ));
+        }
+        let before_keys = pending.len();
+        let before_bytes = pending.encoded_bytes();
+        let overflow = bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Progress,
+                    bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call-overflow".to_owned(),
+                        contribution_id: "screen".to_owned(),
+                        sequence: 1,
+                        producer_id: "test.plugin".to_owned(),
+                        schema: "test.progress".to_owned(),
+                        schema_version: 1,
+                        operation: bcode_session_models::ToolContributionOperation::Upsert,
+                        persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                        artifact: None,
+                        payload: serde_json::json!({
+                            "frame": "x".repeat(MAX_ACTIVE_CONTRIBUTION_BYTES - 1024),
+                        }),
+                    },
+                ),
+            },
+        };
+        assert!(matches!(
+            pending.push(overflow),
+            BufferLiveEventResult::Rejected(BufferLiveEventError::ByteLimit)
+        ));
+        assert_eq!(pending.len(), before_keys);
+        assert_eq!(pending.encoded_bytes(), before_bytes);
+        assert!(before_bytes <= MAX_PENDING_LIVE_BYTES_PER_CLIENT);
     }
 
     #[tokio::test]
