@@ -1,5 +1,32 @@
 # Bcode
 
+## Reasoning display policy
+
+Reasoning display is a local presentation choice and is separate from provider request controls
+such as reasoning effort or requested summary detail. Fresh configuration defaults to showing all
+readable reasoning exposed by the provider:
+
+```toml
+[tui.thinking]
+show = true
+mode = "all"
+```
+
+Supported modes are:
+
+* `all`: show distinct provider summary/milestone and raw/detail parts;
+* `summary`: show summary, milestone, and deliberate legacy compatibility parts only;
+* `raw`: show raw/detail parts only;
+* `show = false`: hide all readable parts.
+
+Every mode retains neutral reasoning activity chrome when activity evidence exists, including
+opaque-only, interrupted, and failed activities. Filtering is silent: Bcode does not announce
+suppressed or unavailable representations and does not fall back from summary to raw or vice versa.
+Use `/thinking mode all|summary|raw`, `/thinking show|hide`, and `/thinking status` to inspect or
+change the local TUI policy. Provider plugins should follow the structured reasoning mapping rules
+in [`docs/model-provider-contract.md`](docs/model-provider-contract.md).
+
+
 Bcode is a Rust-native, TUI-first, plugin-driven coding agent with a local client/server architecture.
 
 Terminal GitHub Markdown support, browser differences, security boundaries, and rich-content policies are documented in [GitHub Markdown in the transcript TUI](docs/github-markdown-tui.md).
