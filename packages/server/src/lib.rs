@@ -11011,6 +11011,7 @@ struct ReasoningActivityAccumulator {
     order: u32,
     status: Option<bcode_session_models::ReasoningActivityStatus>,
     parts: BTreeMap<String, bcode_session_models::ReasoningPart>,
+    completed_parts: BTreeSet<String>,
     opaque: bool,
 }
 
@@ -11021,6 +11022,7 @@ impl ReasoningActivityAccumulator {
             order,
             status: None,
             parts: BTreeMap::new(),
+            completed_parts: BTreeSet::new(),
             opaque: false,
         }
     }
@@ -11037,6 +11039,9 @@ impl ReasoningActivityAccumulator {
                 text,
                 ..
             } => {
+                if self.completed_parts.contains(part_id) {
+                    return;
+                }
                 let part = self.parts.entry(part_id.clone()).or_insert_with(|| {
                     bcode_session_models::ReasoningPart {
                         part_id: part_id.clone(),
@@ -11059,6 +11064,7 @@ impl ReasoningActivityAccumulator {
                 text,
                 ..
             } => {
+                self.completed_parts.insert(part_id.clone());
                 self.parts.insert(
                     part_id.clone(),
                     bcode_session_models::ReasoningPart {
@@ -11079,12 +11085,25 @@ impl ReasoningActivityAccumulator {
         self,
         fallback_status: bcode_session_models::ReasoningActivityStatus,
     ) -> bcode_session_models::ReasoningActivity {
-        let mut parts = self.parts.into_values().collect::<Vec<_>>();
+        let status = if fallback_status == bcode_session_models::ReasoningActivityStatus::Completed
+        {
+            self.status.unwrap_or(fallback_status)
+        } else {
+            fallback_status
+        };
+        let mut parts = self
+            .parts
+            .into_values()
+            .filter(|part| {
+                status == bcode_session_models::ReasoningActivityStatus::Completed
+                    || self.completed_parts.contains(&part.part_id)
+            })
+            .collect::<Vec<_>>();
         parts.sort_by_key(|part| (part.order, part.kind, part.part_id.clone()));
         bcode_session_models::ReasoningActivity {
             activity_id: self.activity_id,
             order: self.order,
-            status: self.status.unwrap_or(fallback_status),
+            status,
             parts,
             opaque: self.opaque,
         }
@@ -27124,6 +27143,15 @@ library = "test"
                 part_order: 0,
                 text: "Complete summary".to_owned(),
             },
+            bcode_session_models::ReasoningActivityEvent::PartDelta {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 0,
+                part_id: "summary-0".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: " duplicate late delta".to_owned(),
+            },
             bcode_session_models::ReasoningActivityEvent::PartCompleted {
                 activity_id: "reasoning-1".to_owned(),
                 activity_order: 0,
@@ -27141,6 +27169,46 @@ library = "test"
         assert_eq!(activity.parts.len(), 2);
         assert_eq!(activity.parts[0].text, "Complete summary");
         assert_eq!(activity.parts[1].text, "Raw detail");
+    }
+
+    #[test]
+    fn interrupted_reasoning_retains_only_authoritative_completed_parts() {
+        let mut activity = ReasoningActivityAccumulator::new("reasoning-1".to_owned(), 0);
+        for event in [
+            bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 0,
+                part_id: "summary-0".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: "Completed milestone".to_owned(),
+            },
+            bcode_session_models::ReasoningActivityEvent::PartDelta {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 0,
+                part_id: "raw-0".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Raw,
+                role: bcode_session_models::ReasoningContentRole::Detail,
+                part_order: 1,
+                text: "partial detail".to_owned(),
+            },
+            bcode_session_models::ReasoningActivityEvent::Finished {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 0,
+                status: bcode_session_models::ReasoningActivityStatus::Completed,
+            },
+        ] {
+            activity.apply(&event);
+        }
+
+        let activity = activity.finish(bcode_session_models::ReasoningActivityStatus::Interrupted);
+        assert_eq!(
+            activity.status,
+            bcode_session_models::ReasoningActivityStatus::Interrupted
+        );
+        assert_eq!(activity.parts.len(), 1);
+        assert_eq!(activity.parts[0].text, "Completed milestone");
     }
 
     #[test]
