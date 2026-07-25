@@ -1244,11 +1244,27 @@ pub struct ComposerViewState {
     pub disabled_reason: Option<String>,
 }
 
+/// Renderer-selected readable reasoning representation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningDisplayMode {
+    /// Display every readable representation exposed by the provider.
+    #[default]
+    All,
+    /// Display provider summaries and milestones only.
+    Summary,
+    /// Display raw or detailed reasoning only.
+    Raw,
+}
+
 /// Assistant reasoning/thinking display state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThinkingViewState {
-    /// Whether reasoning content should be visible by default.
+    /// Whether readable reasoning content should be visible.
     pub visible: bool,
+    /// Renderer-selected readable reasoning representation.
+    #[serde(default)]
+    pub mode: ReasoningDisplayMode,
     /// Current in-flight reasoning text.
     pub active_text: Option<String>,
     /// Whether the current reasoning text is streaming.
@@ -1259,6 +1275,7 @@ impl Default for ThinkingViewState {
     fn default() -> Self {
         Self {
             visible: true,
+            mode: ReasoningDisplayMode::All,
             active_text: None,
             streaming: false,
         }

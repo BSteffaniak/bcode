@@ -215,8 +215,8 @@ fn draft_thinking_command(parts: &[&str]) -> SlashCommandOutcome {
         Some("summary") if parts.len() == 2 => SlashCommandOutcome::OpenThinkingSettings(
             super::thinking_dialog::ThinkingDialogFocus::Summary,
         ),
-        Some("mode") if parts.len() == 2 => SlashCommandOutcome::Handled(
-            "reasoning display mode requires one of: all, summary, raw".to_owned(),
+        Some("mode") if parts.len() == 2 => SlashCommandOutcome::OpenThinkingSettings(
+            super::thinking_dialog::ThinkingDialogFocus::Mode,
         ),
         Some("mode") if parts.len() > 2 => match parts[2] {
             "all" => SlashCommandOutcome::SetThinkingMode(bcode_config::TuiThinkingMode::All),
@@ -258,8 +258,8 @@ async fn thinking_command(
         Some("summary") if parts.len() == 2 => Ok(SlashCommandOutcome::OpenThinkingSettings(
             super::thinking_dialog::ThinkingDialogFocus::Summary,
         )),
-        Some("mode") if parts.len() == 2 => Ok(SlashCommandOutcome::Handled(
-            "reasoning display mode requires one of: all, summary, raw".to_owned(),
+        Some("mode") if parts.len() == 2 => Ok(SlashCommandOutcome::OpenThinkingSettings(
+            super::thinking_dialog::ThinkingDialogFocus::Mode,
         )),
         Some("mode") if parts.len() > 2 => match parts[2] {
             "all" => Ok(SlashCommandOutcome::SetThinkingMode(

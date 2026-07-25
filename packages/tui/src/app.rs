@@ -389,6 +389,18 @@ impl SessionEventApplication {
     }
 }
 
+const fn reasoning_view_mode(
+    mode: bcode_config::TuiThinkingMode,
+) -> bcode_session_view_models::ReasoningDisplayMode {
+    match mode {
+        bcode_config::TuiThinkingMode::All => bcode_session_view_models::ReasoningDisplayMode::All,
+        bcode_config::TuiThinkingMode::Summary => {
+            bcode_session_view_models::ReasoningDisplayMode::Summary
+        }
+        bcode_config::TuiThinkingMode::Raw => bcode_session_view_models::ReasoningDisplayMode::Raw,
+    }
+}
+
 impl BmuxApp {
     /// Create TUI state with replayed session data.
     #[must_use]
@@ -1523,6 +1535,8 @@ impl BmuxApp {
     /// Apply configured reasoning output visibility.
     pub fn apply_thinking_config(&mut self, config: TuiThinkingConfig) {
         self.reasoning_display_mode = config.mode;
+        self.session_view
+            .set_reasoning_display_mode(reasoning_view_mode(config.mode));
         self.set_reasoning_visible(config.show);
     }
 
@@ -1536,6 +1550,8 @@ impl BmuxApp {
     pub fn set_reasoning_display_mode(&mut self, mode: bcode_config::TuiThinkingMode) {
         if self.reasoning_display_mode != mode {
             self.reasoning_display_mode = mode;
+            self.session_view
+                .set_reasoning_display_mode(reasoning_view_mode(mode));
             self.refresh_thinking_label();
             self.rebuild_transcript_from_history();
         }
@@ -2555,6 +2571,9 @@ impl BmuxApp {
                 {
                     self.set_activity(ActivityState::FinalizingModelTurn);
                 }
+            }
+            SessionEventKind::AssistantReasoningActivity { .. } => {
+                self.push_required_shared_terminal_item(event.sequence, "reasoning activity");
             }
             SessionEventKind::AgentChanged { .. } => {
                 self.apply_shared_agent_changed();

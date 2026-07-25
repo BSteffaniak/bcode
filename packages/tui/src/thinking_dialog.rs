@@ -7,6 +7,8 @@ use bcode_ipc::SessionModelStatus;
 pub enum ThinkingDialogFocus {
     /// Focus the local display toggle.
     Display,
+    /// Focus the local readable reasoning mode.
+    Mode,
     /// Focus the requested reasoning effort.
     Effort,
     /// Focus the requested reasoning summary mode.
@@ -17,8 +19,9 @@ impl ThinkingDialogFocus {
     const fn row(self) -> usize {
         match self {
             Self::Display => 0,
-            Self::Effort => 1,
-            Self::Summary => 2,
+            Self::Mode => 1,
+            Self::Effort => 2,
+            Self::Summary => 3,
         }
     }
 }
@@ -28,6 +31,7 @@ impl ThinkingDialogFocus {
 pub struct ThinkingDialogState {
     supported: bool,
     visible: bool,
+    mode: bcode_config::TuiThinkingMode,
     effort: Option<String>,
     summary: Option<String>,
     effort_values: Vec<String>,
@@ -41,7 +45,11 @@ pub struct ThinkingDialogState {
 impl ThinkingDialogState {
     /// Create state from current UI display and model status.
     #[must_use]
-    pub fn new(visible: bool, status: &SessionModelStatus) -> Self {
+    pub fn new(
+        visible: bool,
+        mode: bcode_config::TuiThinkingMode,
+        status: &SessionModelStatus,
+    ) -> Self {
         let reasoning = status.reasoning.as_ref();
         let source = reasoning.map_or(
             bcode_model::ModelReasoningCapabilitySource::GenericFallback,
@@ -50,6 +58,7 @@ impl ThinkingDialogState {
         Self {
             supported: reasoning.is_some(),
             visible,
+            mode,
             effort: status.reasoning_effort.clone(),
             summary: status.reasoning_summary.clone(),
             effort_values: reasoning
@@ -69,10 +78,11 @@ impl ThinkingDialogState {
     #[must_use]
     pub fn new_focused(
         visible: bool,
+        mode: bcode_config::TuiThinkingMode,
         status: &SessionModelStatus,
         focus: ThinkingDialogFocus,
     ) -> Self {
-        let mut state = Self::new(visible, status);
+        let mut state = Self::new(visible, mode, status);
         state.focused_row = focus.row();
         state
     }
@@ -87,6 +97,22 @@ impl ThinkingDialogState {
     #[must_use]
     pub const fn visible(&self) -> bool {
         self.visible
+    }
+
+    /// Return the selected readable reasoning display mode.
+    #[must_use]
+    pub const fn mode(&self) -> bcode_config::TuiThinkingMode {
+        self.mode
+    }
+
+    /// Return the readable reasoning display-mode label.
+    #[must_use]
+    pub const fn mode_label(&self) -> &'static str {
+        match self.mode {
+            bcode_config::TuiThinkingMode::All => "all",
+            bcode_config::TuiThinkingMode::Summary => "summaries/milestones",
+            bcode_config::TuiThinkingMode::Raw => "raw details",
+        }
     }
 
     /// Return selected effort override.
@@ -167,10 +193,17 @@ impl ThinkingDialogState {
     pub fn cycle_focused(&mut self) {
         match self.focused_row {
             0 => self.visible = !self.visible,
-            1 if self.supported => {
-                self.effort = next_value(self.effort.as_deref(), &self.effort_values);
+            1 => {
+                self.mode = match self.mode {
+                    bcode_config::TuiThinkingMode::All => bcode_config::TuiThinkingMode::Summary,
+                    bcode_config::TuiThinkingMode::Summary => bcode_config::TuiThinkingMode::Raw,
+                    bcode_config::TuiThinkingMode::Raw => bcode_config::TuiThinkingMode::All,
+                };
             }
             2 if self.supported => {
+                self.effort = next_value(self.effort.as_deref(), &self.effort_values);
+            }
+            3 if self.supported => {
                 self.summary = next_value(self.summary.as_deref(), &self.summary_values);
             }
             _ => {}
@@ -178,7 +211,7 @@ impl ThinkingDialogState {
     }
 
     const fn row_count() -> usize {
-        3
+        4
     }
 }
 

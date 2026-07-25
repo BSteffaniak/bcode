@@ -209,6 +209,17 @@ impl SessionView {
         }
     }
 
+    /// Set the renderer-selected readable reasoning representation.
+    pub fn set_reasoning_display_mode(
+        &mut self,
+        mode: bcode_session_view_models::ReasoningDisplayMode,
+    ) {
+        if self.snapshot.thinking.mode != mode {
+            self.snapshot.thinking.mode = mode;
+            self.bump_revision();
+        }
+    }
+
     /// Set whether renderers should expose reasoning transcript content.
     pub const fn set_reasoning_visible(&mut self, visible: bool) {
         if self.snapshot.thinking.visible != visible {
@@ -487,6 +498,7 @@ impl SessionView {
             SessionEventKind::AssistantReasoningDelta { text } => {
                 self.snapshot.thinking = ThinkingViewState {
                     visible: self.snapshot.thinking.visible,
+                    mode: self.snapshot.thinking.mode,
                     active_text: Some(text.clone()),
                     streaming: true,
                 };
@@ -501,6 +513,7 @@ impl SessionView {
             SessionEventKind::AssistantReasoningMessage { text } => {
                 self.snapshot.thinking = ThinkingViewState {
                     visible: self.snapshot.thinking.visible,
+                    mode: self.snapshot.thinking.mode,
                     active_text: Some(text.clone()),
                     streaming: false,
                 };
@@ -515,12 +528,27 @@ impl SessionView {
             SessionEventKind::AssistantReasoningActivity { activity, .. } => {
                 let mut parts = activity.parts.iter().collect::<Vec<_>>();
                 parts.sort_by_key(|part| (part.order, part.kind, part.part_id.as_str()));
-                let text = parts
-                    .into_iter()
-                    .map(|part| part.text.as_str())
-                    .filter(|text| !text.is_empty())
-                    .collect::<Vec<_>>()
-                    .join("\n\n");
+                let text = if self.snapshot.thinking.visible {
+                    parts
+                        .into_iter()
+                        .filter(|part| match self.snapshot.thinking.mode {
+                            bcode_session_view_models::ReasoningDisplayMode::All => true,
+                            bcode_session_view_models::ReasoningDisplayMode::Summary => matches!(
+                                part.kind,
+                                bcode_session_models::ReasoningContentKind::Summary
+                                    | bcode_session_models::ReasoningContentKind::Legacy
+                            ),
+                            bcode_session_view_models::ReasoningDisplayMode::Raw => {
+                                matches!(part.kind, bcode_session_models::ReasoningContentKind::Raw)
+                            }
+                        })
+                        .map(|part| part.text.as_str())
+                        .filter(|text| !text.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                } else {
+                    String::new()
+                };
                 self.push_item(
                     TranscriptViewItemId::event(event.sequence),
                     event.sequence,
@@ -1201,6 +1229,7 @@ impl SessionView {
             SessionLiveEventKind::AssistantReasoningDelta { turn_id, text } => {
                 self.snapshot.thinking = ThinkingViewState {
                     visible: self.snapshot.thinking.visible,
+                    mode: self.snapshot.thinking.mode,
                     active_text: Some(text.clone()),
                     streaming: true,
                 };
@@ -3285,6 +3314,61 @@ mod tests {
             }
             other => panic!("unexpected item: {other:?}"),
         }
+    }
+
+    #[test]
+    fn durable_reasoning_activity_respects_silent_display_modes() {
+        let session_id = SessionId::new();
+        let source = event(
+            session_id,
+            1,
+            SessionEventKind::AssistantReasoningActivity {
+                turn_id: "turn-1".to_owned(),
+                activity: bcode_session_models::ReasoningActivity {
+                    activity_id: "reasoning-1".to_owned(),
+                    order: 0,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    parts: vec![
+                        bcode_session_models::ReasoningPart {
+                            part_id: "summary-0".to_owned(),
+                            kind: bcode_session_models::ReasoningContentKind::Summary,
+                            role: bcode_session_models::ReasoningContentRole::Milestone,
+                            order: 0,
+                            text: "summary".to_owned(),
+                        },
+                        bcode_session_models::ReasoningPart {
+                            part_id: "raw-0".to_owned(),
+                            kind: bcode_session_models::ReasoningContentKind::Raw,
+                            role: bcode_session_models::ReasoningContentRole::Detail,
+                            order: 1,
+                            text: "raw".to_owned(),
+                        },
+                    ],
+                    opaque: false,
+                },
+            },
+        );
+
+        for (mode, expected) in [
+            (
+                bcode_session_view_models::ReasoningDisplayMode::All,
+                "summary\n\nraw",
+            ),
+            (
+                bcode_session_view_models::ReasoningDisplayMode::Summary,
+                "summary",
+            ),
+            (bcode_session_view_models::ReasoningDisplayMode::Raw, "raw"),
+        ] {
+            let mut view = SessionView::new();
+            view.set_reasoning_display_mode(mode);
+            view.apply_event(&source);
+            assert_reasoning_text(&view.snapshot().transcript.items[0], expected, false);
+        }
+        let mut hidden = SessionView::new();
+        hidden.set_reasoning_visible(false);
+        hidden.apply_event(&source);
+        assert_reasoning_text(&hidden.snapshot().transcript.items[0], "", false);
     }
 
     #[test]

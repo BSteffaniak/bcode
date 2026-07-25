@@ -96,6 +96,7 @@ async fn open_thinking_settings(
     Ok(Some(ComposerModalRequest::Thinking(
         thinking_dialog::ThinkingDialogState::new_focused(
             chat.app.reasoning_visible(),
+            chat.app.reasoning_display_mode(),
             &status,
             focus,
         ),

@@ -5931,10 +5931,17 @@ fn thinking_dialog_cycles_supported_values() {
         metadata_source: None,
         pricing: None,
     };
-    let mut dialog = super::thinking_dialog::ThinkingDialogState::new(false, &status);
+    let mut dialog = super::thinking_dialog::ThinkingDialogState::new(
+        false,
+        bcode_config::TuiThinkingMode::All,
+        &status,
+    );
 
     dialog.cycle_focused();
     assert!(dialog.visible());
+    dialog.focus_next();
+    dialog.cycle_focused();
+    assert_eq!(dialog.mode(), bcode_config::TuiThinkingMode::Summary);
     dialog.focus_next();
     dialog.cycle_focused();
     assert_eq!(dialog.effort(), Some("medium"));
@@ -5980,17 +5987,19 @@ fn thinking_dialog_can_start_focused_on_effort_or_summary() {
 
     let effort = super::thinking_dialog::ThinkingDialogState::new_focused(
         false,
+        bcode_config::TuiThinkingMode::All,
         &status,
         super::thinking_dialog::ThinkingDialogFocus::Effort,
     );
     let summary = super::thinking_dialog::ThinkingDialogState::new_focused(
         false,
+        bcode_config::TuiThinkingMode::All,
         &status,
         super::thinking_dialog::ThinkingDialogFocus::Summary,
     );
 
-    assert_eq!(effort.focused_row(), 1);
-    assert_eq!(summary.focused_row(), 2);
+    assert_eq!(effort.focused_row(), 2);
+    assert_eq!(summary.focused_row(), 3);
 }
 
 #[test]
@@ -6019,8 +6028,15 @@ fn thinking_dialog_does_not_cycle_when_reasoning_is_unsupported() {
         metadata_source: None,
         pricing: None,
     };
-    let mut dialog = super::thinking_dialog::ThinkingDialogState::new(false, &status);
+    let mut dialog = super::thinking_dialog::ThinkingDialogState::new(
+        false,
+        bcode_config::TuiThinkingMode::All,
+        &status,
+    );
 
+    dialog.focus_next();
+    dialog.cycle_focused();
+    assert_eq!(dialog.mode(), bcode_config::TuiThinkingMode::Summary);
     dialog.focus_next();
     dialog.cycle_focused();
     assert_eq!(dialog.effort(), None);

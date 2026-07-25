@@ -76,6 +76,13 @@ fn rows(state: &ThinkingDialogState, theme: TuiTheme) -> Vec<Line> {
     ));
     rows.push(setting_row(
         state.focused_row() == 1,
+        "Displayed reasoning",
+        state.mode_label(),
+        Some("local display filter"),
+        theme,
+    ));
+    rows.push(setting_row(
+        state.focused_row() == 2,
         "Reasoning effort",
         if state.supported() {
             state.effective_effort_label()
@@ -89,7 +96,7 @@ fn rows(state: &ThinkingDialogState, theme: TuiTheme) -> Vec<Line> {
         theme,
     ));
     rows.push(setting_row(
-        state.focused_row() == 2,
+        state.focused_row() == 3,
         "Visible reasoning summary",
         if state.supported() {
             state.effective_summary_label()
