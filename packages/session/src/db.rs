@@ -18,7 +18,7 @@ use crate::persisted::{
     CompatibleSessionEvent, PersistedSessionEventError, decode_session_event,
     decode_session_event_compatible, encode_session_event,
 };
-use bcode_session_migration::normalize_canonical_event;
+use bcode_session_migration::{CanonicalNormalizationSummary, normalize_canonical_event};
 use sha2::{Digest as _, Sha256};
 
 use bcode_database_observability::ObservedDatabase;
@@ -952,6 +952,13 @@ impl SessionDb {
         #[cfg(test)]
         abort_at_migration_crash_boundary("before_epoch_update");
         inject_migration_fault(fault, MigrationFaultPhase::WriterEpochFinalization)?;
+        bcode_session_migration::validate_writer_finalization(
+            CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+            true,
+        )
+        .map_err(|error| SessionDbError::MigrationHistoryIncompatible {
+            reason: error.to_string(),
+        })?;
         set_storage_writer_contract(&*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await?;
         #[cfg(test)]
         abort_at_migration_crash_boundary("after_epoch_update_before_commit");
@@ -1463,8 +1470,7 @@ impl SessionDb {
         &self,
     ) -> SessionDbResult<MigrationSourceEvidence> {
         let mut digest = Sha256::new();
-        let mut converted_events = BTreeMap::new();
-        let mut retired_known_events = BTreeMap::new();
+        let mut normalization_summary = CanonicalNormalizationSummary::default();
         let mut classification_error = None;
         let mut cursor = 0_u64;
         let mut event_count = 0_u64;
@@ -1512,20 +1518,7 @@ impl SessionDb {
                             ) {
                                 classification_error = Some(error);
                             } else {
-                                if let Some(metadata) = normalized.historical.as_ref() {
-                                    let counts = if normalized.retired_known {
-                                        &mut retired_known_events
-                                    } else {
-                                        &mut converted_events
-                                    };
-                                    let count = counts
-                                        .entry(format!(
-                                            "{}:{}",
-                                            metadata.source_schema, metadata.source_kind
-                                        ))
-                                        .or_insert(0_u64);
-                                    *count = count.saturating_add(1);
-                                }
+                                normalization_summary.record(&normalized);
                                 classified_event_count = classified_event_count.saturating_add(1);
                             }
                         }
@@ -1547,6 +1540,7 @@ impl SessionDb {
                 break;
             }
         }
+        let (converted_events, retired_known_events) = normalization_summary.into_counts();
         Ok(MigrationSourceEvidence {
             canonical: bcode_session_migration::MigrationBackupCanonicalEvidence {
                 classified_event_count,
@@ -1659,7 +1653,10 @@ impl SessionDb {
                 actual: Some(writer_epoch),
                 expected: u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH),
             })?;
-        if bcode_session_migration::plan_writer_epoch_migration(writer_epoch_u32).is_ok() {
+        if matches!(
+            bcode_session_migration::classify_writer_epoch(writer_epoch_u32),
+            bcode_session_migration::WriterEpochCompatibility::ReleasedHistorical
+        ) {
             return Ok(SessionStorageCompatibility::KnownLegacy { writer_epoch });
         }
         Err(SessionDbError::WriterIncompatible {
@@ -2668,11 +2665,6 @@ async fn write_session_migration_receipt(
             actual: Some(source_writer_epoch),
             expected: u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH),
         })?;
-    let plan = bcode_session_migration::plan_writer_epoch_migration(source_writer_epoch).map_err(
-        |error| SessionDbError::MigrationHistoryIncompatible {
-            reason: error.to_string(),
-        },
-    )?;
     let rows = db
         .select("events")
         .columns(&["event_seq", "payload"])
@@ -2690,22 +2682,29 @@ async fn write_session_migration_receipt(
         .collect::<SessionDbResult<Vec<_>>>()?;
     let digest =
         bcode_session_migration::ordered_payload_digest(payloads.iter().map(String::as_str));
-    let receipt = bcode_session_migration::SessionMigrationReceipt {
-        operation_id: operation_id
-            .map_or_else(|| "explicit-maintenance".to_owned(), |id| id.to_string()),
-        source_writer_epoch,
-        target_writer_epoch: CURRENT_SESSION_STORAGE_WRITER_EPOCH,
-        migration_step_ids: plan.steps.iter().map(|step| step.id.to_owned()).collect(),
-        source_event_count: event_count,
-        source_event_tail: event_tail,
-        source_event_digest_sha256: migration_outcome.source_payload_digest_sha256.clone(),
-        target_event_count: event_count,
-        target_event_tail: event_tail,
-        target_event_digest_sha256: digest,
-        converted_events: migration_outcome.converted_events.clone(),
-        retired_known_events: migration_outcome.retired_known_events.clone(),
-        completed_at_ms: bcode_session_models::current_unix_timestamp_ms(),
-    };
+    let receipt = bcode_session_migration::build_session_migration_receipt(
+        bcode_session_migration::SessionMigrationReceiptRequest {
+            operation_id: operation_id
+                .map_or_else(|| "explicit-maintenance".to_owned(), |id| id.to_string()),
+            source_writer_epoch,
+            source: bcode_session_migration::SessionMigrationCanonicalReceiptEvidence {
+                event_count,
+                event_tail,
+                event_digest_sha256: migration_outcome.source_payload_digest_sha256.clone(),
+            },
+            target: bcode_session_migration::SessionMigrationCanonicalReceiptEvidence {
+                event_count,
+                event_tail,
+                event_digest_sha256: digest,
+            },
+            converted_events: migration_outcome.converted_events.clone(),
+            retired_known_events: migration_outcome.retired_known_events.clone(),
+            completed_at_ms: bcode_session_models::current_unix_timestamp_ms(),
+        },
+    )
+    .map_err(|error| SessionDbError::MigrationHistoryIncompatible {
+        reason: error.to_string(),
+    })?;
     db.insert("session_migration_receipts")
         .value("operation_id", receipt.operation_id.clone())
         .value("session_id", session_id.to_string())
@@ -2901,8 +2900,7 @@ async fn rebuild_migration_projections(
     let replay_timer = metrics.timer();
     let mut state = MigrationProjectionState::new();
     let mut source_digest = Sha256::new();
-    let mut converted_events = BTreeMap::new();
-    let mut retired_known_events = BTreeMap::new();
+    let mut normalization_summary = CanonicalNormalizationSummary::default();
     let mut tail = None;
     let mut completed = 0_u64;
     while completed < event_total {
@@ -2936,37 +2934,9 @@ async fn rebuild_migration_projections(
                 "session.migration.canonical_decode_duration_ms",
                 decode_timer.elapsed_ms(),
             );
-            if let Some(metadata) = normalized.historical.as_ref() {
-                let counts = if normalized.retired_known {
-                    &mut retired_known_events
-                } else {
-                    &mut converted_events
-                };
-                let count = counts
-                    .entry(format!(
-                        "{}:{}",
-                        metadata.source_schema, metadata.source_kind
-                    ))
-                    .or_insert(0_u64);
-                *count = count.saturating_add(1);
-                match (metadata.source_kind.as_str(), normalized.retired_known) {
-                    (concat!("tool_call_", "finished"), false) => {
-                        metrics.increment_counter(
-                            "session.migration.converted_tool_call_finished_events_total",
-                        );
-                    }
-                    ("context_usage_observed", false) => {
-                        metrics.increment_counter(
-                            "session.migration.converted_context_usage_observed_events_total",
-                        );
-                    }
-                    ("tool_invocation_stream", true) => {
-                        metrics.increment_counter(
-                            "session.migration.retired_tool_stream_events_total",
-                        );
-                    }
-                    _ => {}
-                }
+            normalization_summary.record(&normalized);
+            if let Some(counter) = normalized.metric_counter {
+                metrics.increment_counter(counter);
             }
             validate_migration_event_identity(&normalized.event, event_seq, session_id)?;
             let event = normalized.event;
@@ -3011,6 +2981,7 @@ async fn rebuild_migration_projections(
         replay_timer.elapsed_ms(),
     );
     metrics.add_counter("session.migration.projected_events_total", event_total);
+    let (converted_events, retired_known_events) = normalization_summary.into_counts();
     Ok(MigrationReplayOutcome {
         tail,
         source_payload_digest_sha256: format!("{:x}", source_digest.finalize()),

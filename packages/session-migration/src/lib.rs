@@ -23,7 +23,8 @@ mod validation;
 pub use backup::{
     BackupProgressCallback, MigrationBackupCanonicalEvidence, MigrationBackupError,
     MigrationBackupFileEvidence, MigrationBackupManifest, MigrationBackupRequest,
-    RetainedMigrationBackup, RetainedMigrationBackupDiagnosis, VerifiedMigrationBackup,
+    MigrationBackupRequestError, MigrationBackupRequestPlan, RetainedMigrationBackup,
+    RetainedMigrationBackupDiagnosis, VerifiedMigrationBackup, build_migration_backup_request,
     create_retained_migration_backup, create_verified_migration_backup,
     latest_retained_migration_backup,
 };
@@ -36,7 +37,11 @@ pub use storage::{
     diagnose_accidental_epoch_session_root, inspect_accidental_epoch_session_root,
     recover_accidental_epoch_session_root,
 };
-pub use validation::SessionMigrationReceipt;
+pub use validation::{
+    SessionMigrationCanonicalReceiptEvidence, SessionMigrationReceipt,
+    SessionMigrationReceiptRequest, WriterEpochCompatibility, WriterFinalizationError,
+    build_session_migration_receipt, classify_writer_epoch, validate_writer_finalization,
+};
 
 pub use classification::HistoricalEventMetadata;
 pub use diagnosis::{
@@ -44,8 +49,8 @@ pub use diagnosis::{
     SessionMigrationOwnerDiagnosis, classify_session_diagnosis,
 };
 pub use execution::{
-    HistoricalSessionEventError, NormalizedCanonicalEvent, normalize_canonical_event,
-    ordered_payload_digest,
+    CanonicalNormalizationSummary, HistoricalSessionEventError, NormalizedCanonicalEvent, metric,
+    normalize_canonical_event, ordered_payload_digest,
 };
 pub use inventory::{
     CURRENT_EVENT_SCHEMA, CURRENT_WRITER_EPOCH, MIGRATION_STEPS, MigrationStepDescriptor,

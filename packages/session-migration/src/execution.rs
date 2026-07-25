@@ -4,7 +4,6 @@ use crate::classification::{HistoricalDecode, HistoricalEventMetadata};
 use crate::codec::{HistoricalEnvelope, schema_28};
 use bcode_session_models::SessionEvent;
 use sha2::{Digest as _, Sha256};
-#[cfg(test)]
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -42,6 +41,65 @@ pub enum HistoricalSessionEventError {
     },
 }
 
+/// Stable migration metric counters selected by migration-owned historical policy.
+pub mod metric {
+    /// Historical tool completion converted into a current result record.
+    pub const CONVERTED_TOOL_CALL_FINISHED: &str =
+        "session.migration.converted_tool_call_finished_events_total";
+    /// Historical context usage converted into a current request-context observation.
+    pub const CONVERTED_CONTEXT_USAGE_OBSERVED: &str =
+        "session.migration.converted_context_usage_observed_events_total";
+    /// Historical tool invocation stream retained as inert current history.
+    pub const RETIRED_TOOL_INVOCATION_STREAM: &str =
+        "session.migration.retired_tool_stream_events_total";
+}
+
+/// Audit totals accumulated while normalizing canonical migration events.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CanonicalNormalizationSummary {
+    converted_events: BTreeMap<String, u64>,
+    retired_known_events: BTreeMap<String, u64>,
+}
+
+impl CanonicalNormalizationSummary {
+    /// Record one normalized event without exposing historical classification policy to callers.
+    pub fn record(&mut self, normalized: &NormalizedCanonicalEvent) {
+        let Some(metadata) = normalized.historical.as_ref() else {
+            return;
+        };
+        let counts = if normalized.retired_known {
+            &mut self.retired_known_events
+        } else {
+            &mut self.converted_events
+        };
+        let count = counts
+            .entry(format!(
+                "{}:{}",
+                metadata.source_schema, metadata.source_kind
+            ))
+            .or_insert(0_u64);
+        *count = count.saturating_add(1);
+    }
+
+    /// Return converted event counts keyed by stable historical source identity.
+    #[must_use]
+    pub const fn converted_events(&self) -> &BTreeMap<String, u64> {
+        &self.converted_events
+    }
+
+    /// Return retired-known event counts keyed by stable historical source identity.
+    #[must_use]
+    pub const fn retired_known_events(&self) -> &BTreeMap<String, u64> {
+        &self.retired_known_events
+    }
+
+    /// Consume the summary into converted and retired-known count maps.
+    #[must_use]
+    pub fn into_counts(self) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
+        (self.converted_events, self.retired_known_events)
+    }
+}
+
 /// Result of normalizing one canonical payload for migration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedCanonicalEvent {
@@ -51,6 +109,8 @@ pub struct NormalizedCanonicalEvent {
     pub historical: Option<HistoricalEventMetadata>,
     /// Whether the historical event is intentionally inert current history.
     pub retired_known: bool,
+    /// Stable metric counter selected by migration-owned classification policy, when applicable.
+    pub metric_counter: Option<&'static str>,
 }
 
 /// Normalize one canonical payload into the final current representation.
@@ -70,12 +130,21 @@ pub fn normalize_canonical_event(
     let decoded = decode_for_migration(payload, decode_current)?;
     let historical = decoded.metadata().cloned();
     let retired_known = decoded.is_retired_known();
+    let metric_counter = historical.as_ref().and_then(|metadata| {
+        match (metadata.source_kind.as_str(), retired_known) {
+            ("tool_call_finished", false) => Some(metric::CONVERTED_TOOL_CALL_FINISHED),
+            ("context_usage_observed", false) => Some(metric::CONVERTED_CONTEXT_USAGE_OBSERVED),
+            ("tool_invocation_stream", true) => Some(metric::RETIRED_TOOL_INVOCATION_STREAM),
+            _ => None,
+        }
+    });
     let mut event = decoded.into_event();
     event.schema_version = current_schema;
     Ok(NormalizedCanonicalEvent {
         event,
         historical,
         retired_known,
+        metric_counter,
     })
 }
 
@@ -496,6 +565,7 @@ mod tests {
         assert_eq!(normalized.event.schema_version, 40);
         assert!(normalized.historical.is_none());
         assert!(!normalized.retired_known);
+        assert!(normalized.metric_counter.is_none());
 
         let historical_payload = format!(
             r#"{{"schema_version":28,"sequence":8,"timestamp_ms":9,"session_id":"{SESSION_ID}","kind":{{"context_usage_observed":{{"snapshot":{{"provider_plugin_id":"provider","model_id":"model","input_tokens":123,"context_through_sequence":4,"request_id":"request","model_turn_id":"turn","round":0,"request_fingerprint":"fingerprint","auth_profile":"profile","estimated_input_tokens":120,"context_format_version":null,"compatibility_key":null,"source":"estimated"}}}}}}}}"#
@@ -505,6 +575,10 @@ mod tests {
         assert_eq!(normalized.event.schema_version, 40);
         assert_eq!(normalized.historical.expect("metadata").source_schema, 28);
         assert!(!normalized.retired_known);
+        assert_eq!(
+            normalized.metric_counter,
+            Some(metric::CONVERTED_CONTEXT_USAGE_OBSERVED)
+        );
     }
 
     #[test]

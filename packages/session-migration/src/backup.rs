@@ -81,6 +81,61 @@ pub struct MigrationBackupManifest {
     pub verified_at_ms: u64,
 }
 
+/// Inputs used to build a retained backup request from migration-owned writer policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationBackupRequestPlan {
+    /// Canonical sessions storage root.
+    pub sessions_root: PathBuf,
+    /// Session identifier and canonical directory name.
+    pub session_id: SessionId,
+    /// Stable migration operation identity.
+    pub operation_id: String,
+    /// Writer epoch observed before migration.
+    pub source_writer_epoch: u64,
+    /// Canonical source-history evidence captured before backup.
+    pub canonical_source: MigrationBackupCanonicalEvidence,
+    /// Converted event counts keyed by `schema:kind`.
+    pub converted_events: BTreeMap<String, u64>,
+    /// Retired-known event counts keyed by `schema:kind`.
+    pub retired_known_events: BTreeMap<String, u64>,
+}
+
+/// Failure to build a retained backup request from the observed source writer.
+#[derive(Debug, Error)]
+pub enum MigrationBackupRequestError {
+    /// The persisted writer epoch cannot be represented by the migration inventory.
+    #[error("source writer epoch {0} cannot be represented")]
+    WriterEpochOutOfRange(u64),
+    /// No safe monotonic migration plan reaches the current writer.
+    #[error(transparent)]
+    Plan(#[from] crate::MigrationPlanError),
+}
+
+/// Build a retained backup request with migration-owned target epoch and ordered step identities.
+///
+/// # Errors
+///
+/// Returns an error when the source epoch cannot be represented or has no migration path.
+pub fn build_migration_backup_request(
+    input: MigrationBackupRequestPlan,
+) -> Result<MigrationBackupRequest, MigrationBackupRequestError> {
+    let source_writer_epoch = u32::try_from(input.source_writer_epoch).map_err(|_| {
+        MigrationBackupRequestError::WriterEpochOutOfRange(input.source_writer_epoch)
+    })?;
+    let plan = crate::plan_writer_epoch_migration(source_writer_epoch)?;
+    Ok(MigrationBackupRequest {
+        sessions_root: input.sessions_root,
+        session_id: input.session_id,
+        operation_id: input.operation_id,
+        source_writer_epoch: input.source_writer_epoch,
+        target_writer_epoch: u64::from(crate::CURRENT_WRITER_EPOCH),
+        migration_step_ids: plan.steps.iter().map(|step| step.id.to_owned()).collect(),
+        canonical_source: input.canonical_source,
+        converted_events: input.converted_events,
+        retired_known_events: input.retired_known_events,
+    })
+}
+
 /// Request to create a verified retained migration backup using the standard storage layout.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationBackupRequest {
@@ -643,6 +698,34 @@ fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_request_builder_owns_target_epoch_and_plan() {
+        let session_id = SessionId::new();
+        let request = build_migration_backup_request(MigrationBackupRequestPlan {
+            sessions_root: PathBuf::from("sessions"),
+            session_id,
+            operation_id: "operation".to_owned(),
+            source_writer_epoch: 2,
+            canonical_source: MigrationBackupCanonicalEvidence::default(),
+            converted_events: BTreeMap::new(),
+            retired_known_events: BTreeMap::new(),
+        })
+        .expect("request");
+        assert_eq!(
+            request.target_writer_epoch,
+            u64::from(crate::CURRENT_WRITER_EPOCH)
+        );
+        assert_eq!(
+            request.migration_step_ids,
+            [
+                "session-writer-epoch-2-to-3",
+                "session-writer-epoch-3-to-4",
+                "session-writer-epoch-4-to-5",
+            ]
+        );
+        assert_eq!(request.session_id, session_id);
+    }
 
     #[tokio::test]
     async fn retained_backup_owns_layout_and_manifest_policy() {

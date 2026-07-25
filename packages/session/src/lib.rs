@@ -260,36 +260,28 @@ async fn create_verified_migration_backup(
             }
         }) as bcode_session_migration::BackupProgressCallback
     });
-    let source_writer_epoch =
-        u32::try_from(writer_epoch).map_err(|_| SessionError::MigrationBackup {
-            session_id,
-            reason: format!("source writer epoch {writer_epoch} cannot be represented"),
-        })?;
-    let plan = bcode_session_migration::plan_writer_epoch_migration(source_writer_epoch).map_err(
-        |error| SessionError::MigrationBackup {
-            session_id,
-            reason: error.to_string(),
-        },
-    )?;
-    let result = bcode_session_migration::create_retained_migration_backup(
-        bcode_session_migration::MigrationBackupRequest {
+    let request = bcode_session_migration::build_migration_backup_request(
+        bcode_session_migration::MigrationBackupRequestPlan {
             sessions_root: root.to_path_buf(),
             session_id,
             operation_id: operation_id.to_string(),
             source_writer_epoch: writer_epoch,
-            target_writer_epoch: u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
-            migration_step_ids: plan.steps.iter().map(|step| step.id.to_owned()).collect(),
             canonical_source: source_evidence.canonical,
             converted_events: source_evidence.converted_events,
             retired_known_events: source_evidence.retired_known_events,
         },
-        backup_progress,
     )
-    .await
     .map_err(|error| SessionError::MigrationBackup {
         session_id,
         reason: error.to_string(),
     })?;
+    let result =
+        bcode_session_migration::create_retained_migration_backup(request, backup_progress)
+            .await
+            .map_err(|error| SessionError::MigrationBackup {
+                session_id,
+                reason: error.to_string(),
+            })?;
     metrics.record_histogram(
         "session.migration.backup.plan_duration_ms",
         duration_millis(result.plan_duration),

@@ -181,6 +181,9 @@ if ! rg -q 'failed_explicit_migration_preserves_projection_and_writer_contract' 
 fi
 
 if ! rg -q 'create_verified_migration_backup' packages/session/src/lib.rs \
+  || ! rg -q 'build_migration_backup_request' packages/session-migration/src/backup.rs \
+  || ! rg -q 'build_migration_backup_request' packages/session/src/lib.rs \
+  || sed -n '/async fn create_verified_migration_backup(/,/^}/p' packages/session/src/lib.rs | grep -q 'plan_writer_epoch_migration' \
   || ! rg -q 'failed_migration_backup_prevents_every_storage_mutation' packages/session/src/lib.rs \
   || ! rg -q 'migration-backup.json' packages/session/src/lib.rs; then
   echo "Session migration-backup violation: automatic legacy migration must create and verify a retained backup before changing storage." >&2
@@ -216,6 +219,17 @@ if ! rg -q 'historical_codec_never_applies_schema_28_rules_to_other_schemas' pac
   || ! rg -q 'pub enum HistoricalDecode' packages/session-migration/src/classification.rs \
   || ! test -f packages/session-migration/fixtures/manifest.json; then
   echo "Session historical-codec violation: released schema rules and exact fixture classifications must remain explicit." >&2
+  violations=1
+fi
+
+if ! rg -q 'pub struct SessionMigrationReceipt' packages/session-migration/src/validation.rs \
+  || ! rg -q 'pub fn build_session_migration_receipt' packages/session-migration/src/validation.rs \
+  || ! rg -q 'plan_writer_epoch_migration' packages/session-migration/src/validation.rs \
+  || ! rg -q 'pub fn classify_writer_epoch' packages/session-migration/src/validation.rs \
+  || ! rg -q 'pub const fn validate_writer_finalization' packages/session-migration/src/validation.rs \
+  || ! rg -q 'build_session_migration_receipt' packages/session/src/db.rs \
+  || ! rg -q 'validate_writer_finalization' packages/session/src/db.rs; then
+  echo "Session migration validation ownership violation: receipt construction and migration-plan selection must remain migration-owned." >&2
   violations=1
 fi
 
@@ -579,8 +593,9 @@ if ! rg -q 'pub mod schema_28' packages/session-migration/src/codec.rs \
   || ! rg -q 'write_session_migration_receipt' packages/session/src/db.rs \
   || ! sed -n '/let migration_outcome =/,/validate_storage_writer_contract/p' packages/session/src/db.rs | awk '/write_session_migration_receipt/{receipt=NR} /set_storage_writer_contract/{epoch=NR} END {exit !(receipt && epoch && receipt < epoch)}' \
   || ! rg -q 'set_storage_writer_contract\(&\*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH\)' packages/session/src/db.rs \
-  || ! rg -q 'session.migration.converted_tool_call_finished_events_total' packages/session/src/db.rs \
-  || ! rg -q 'session.migration.converted_context_usage_observed_events_total' packages/session/src/db.rs \
+  || ! rg -q 'CONVERTED_TOOL_CALL_FINISHED' packages/session-migration/src/execution.rs \
+  || ! rg -q 'CONVERTED_CONTEXT_USAGE_OBSERVED' packages/session-migration/src/execution.rs \
+  || ! rg -q 'RETIRED_TOOL_INVOCATION_STREAM' packages/session-migration/src/execution.rs \
   || ! rg -q 'report.descriptors\[counter\].label_keys.is_empty' packages/session/src/db.rs \
   || ! rg -q 'expected_backup_bytes' packages/session/src/lib.rs \
   || ! rg -q 'assert_successful_migration_progress' packages/session/src/lib.rs \
