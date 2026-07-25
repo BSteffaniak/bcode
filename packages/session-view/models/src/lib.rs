@@ -41,6 +41,12 @@ impl TranscriptViewItemId {
         Self(format!("event:{sequence}"))
     }
 
+    /// Create an identifier for a provider-reported reasoning activity.
+    #[must_use]
+    pub fn reasoning(turn_id: &str, activity_id: &str) -> Self {
+        Self(format!("reasoning-turn:{turn_id}:{activity_id}"))
+    }
+
     /// Create an identifier for a tool invocation.
     #[must_use]
     pub fn tool(tool_call_id: &str) -> Self {

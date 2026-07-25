@@ -70,7 +70,7 @@ pub(super) fn transcript_section(
                 }))
             } @else {
                 @for (index, item) in snapshot.transcript.items.iter().enumerate() {
-                    @if should_render_transcript_item(item, snapshot.thinking.visible)
+                    @if should_render_transcript_item(item)
                         && !is_superseded_tool_request(&snapshot.transcript.items, index)
                         && !is_active_interaction_summary(item, &snapshot.interactions) {
                         (transcript_item_with_context(item, snapshot.session_id, context))
@@ -91,10 +91,9 @@ pub(super) fn transcript_section(
 }
 
 pub(super) const fn should_render_transcript_item(
-    item: &bcode_session_view_models::TranscriptViewItem,
-    reasoning_visible: bool,
+    _item: &bcode_session_view_models::TranscriptViewItem,
 ) -> bool {
-    reasoning_visible || !matches!(&item.kind, TranscriptViewItemKind::ReasoningMessage { .. })
+    true
 }
 
 pub(super) fn is_active_interaction_summary(
@@ -246,7 +245,9 @@ fn transcript_item_body_with_context(
         TranscriptViewItemKind::ReasoningMessage { message } => container! {
             details {
                 summary color=(color::REASONING) { "Reasoning" }
-                div margin-top=((space::SM)) { (message_content(message)) }
+                @if !message.text.is_empty() {
+                    div margin-top=((space::SM)) { (message_content(message)) }
+                }
             }
         },
         TranscriptViewItemKind::SystemMessage { message } => container! {

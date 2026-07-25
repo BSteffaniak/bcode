@@ -585,7 +585,7 @@ impl SessionView {
                     text,
                 );
             }
-            SessionEventKind::AssistantReasoningActivity { activity, .. } => {
+            SessionEventKind::AssistantReasoningActivity { turn_id, activity } => {
                 let mut parts = activity.parts.iter().collect::<Vec<_>>();
                 parts.sort_by_key(|part| (part.order, part.kind, part.part_id.as_str()));
                 let text = if self.snapshot.thinking.visible {
@@ -609,8 +609,8 @@ impl SessionView {
                 } else {
                     String::new()
                 };
-                self.push_item(
-                    TranscriptViewItemId::event(event.sequence),
+                self.upsert_item(
+                    TranscriptViewItemId::reasoning(turn_id, &activity.activity_id),
                     event.sequence,
                     Some(event.timestamp_ms),
                     false,
@@ -1478,8 +1478,7 @@ impl SessionView {
             .live_reasoning
             .get(&key)
             .expect("live reasoning activity was inserted");
-        let item_id =
-            TranscriptViewItemId::new(format!("reasoning-turn:{turn_id}:{}", event.activity_id()));
+        let item_id = TranscriptViewItemId::reasoning(turn_id, event.activity_id());
         let mut parts = activity.parts.values().collect::<Vec<_>>();
         parts.sort_by_key(|part| (part.order, part.kind, part.part_id.as_str()));
         let text = if self.snapshot.thinking.visible {
@@ -3418,6 +3417,7 @@ mod tests {
                 },
             });
         }
+        let live_item_id = live.snapshot().transcript.items[0].id.clone();
         assert_reasoning_text(
             &live.snapshot().transcript.items[0],
             "First\n\nSecond",
@@ -3453,6 +3453,7 @@ mod tests {
                 },
             },
         )]);
+        assert_eq!(durable.transcript.items[0].id, live_item_id);
         assert_reasoning_text(&durable.transcript.items[0], "First\n\nSecond", false);
     }
 

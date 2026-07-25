@@ -812,7 +812,7 @@ fn system_skill_and_compaction_items_render_as_notices() {
 }
 
 #[test]
-fn reasoning_items_follow_shared_visibility() {
+fn reasoning_activity_chrome_remains_visible_without_readable_text() {
     let item = TranscriptViewItem {
         id: TranscriptViewItemId::new("reasoning:test"),
         sequence: Some(1),
@@ -820,12 +820,14 @@ fn reasoning_items_follow_shared_visibility() {
         revision: 1,
         streaming: false,
         kind: TranscriptViewItemKind::ReasoningMessage {
-            message: ChatMessageView::markdown("hidden"),
+            message: ChatMessageView::markdown(""),
         },
     };
 
-    assert!(!should_render_transcript_item(&item, false));
-    assert!(should_render_transcript_item(&item, true));
+    assert!(should_render_transcript_item(&item));
+    let rendered = format!("{:?}", transcript_item_body(&item.kind));
+    assert!(rendered.contains("Reasoning"));
+    assert!(!rendered.contains("Empty message"));
 }
 
 #[test]
