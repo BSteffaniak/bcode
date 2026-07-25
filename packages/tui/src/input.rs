@@ -131,13 +131,11 @@ fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<K
             redraw: true,
             request: KeyRequest::CycleThinkingEffort,
         },
-        BmuxAction::DiffViewerLayoutCycle => {
-            app.cycle_diff_viewer_layout();
-            KeyOutcome {
-                redraw: true,
-                request: KeyRequest::None,
-            }
-        }
+        BmuxAction::DiffViewerLayoutCycle => diff_viewer_layout_action(app),
+        BmuxAction::MarkdownFocusNext
+        | BmuxAction::MarkdownFocusPrevious
+        | BmuxAction::MarkdownActivate
+        | BmuxAction::MarkdownCopyDestination => markdown_action(app, action?),
         BmuxAction::InputHistoryPrevious => history_previous(app),
         BmuxAction::InputHistoryNext => history_next(app),
         BmuxAction::TranscriptPageUp => KeyOutcome {
@@ -200,6 +198,28 @@ fn handle_chat_action(app: &mut BmuxApp, action: Option<BmuxAction>) -> Option<K
         | BmuxAction::SkillHelp => return None,
     };
     Some(outcome)
+}
+
+fn diff_viewer_layout_action(app: &mut BmuxApp) -> KeyOutcome {
+    app.cycle_diff_viewer_layout();
+    KeyOutcome {
+        redraw: true,
+        request: KeyRequest::None,
+    }
+}
+
+fn markdown_action(app: &mut BmuxApp, action: BmuxAction) -> KeyOutcome {
+    let redraw = match action {
+        BmuxAction::MarkdownFocusNext => app.move_markdown_focus(false),
+        BmuxAction::MarkdownFocusPrevious => app.move_markdown_focus(true),
+        BmuxAction::MarkdownActivate => app.activate_focused_markdown_contribution(),
+        BmuxAction::MarkdownCopyDestination => app.copy_focused_markdown_destination(),
+        _ => false,
+    };
+    KeyOutcome {
+        redraw,
+        request: KeyRequest::None,
+    }
 }
 
 fn history_previous(app: &mut BmuxApp) -> KeyOutcome {

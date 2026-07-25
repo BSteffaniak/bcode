@@ -532,9 +532,21 @@ impl BmuxApp {
             self.markdown_interaction.focus_next()
         };
         if changed && self.markdown_interaction.focused().is_some() {
-            self.set_status(
-                "Markdown contribution focused; Alt+Enter activates, Ctrl/Alt+Tab moves".to_owned(),
-            );
+            let hint = match self.markdown_interaction.focused_contribution() {
+                Some(
+                    bcode_markdown_render::MarkdownContributionKind::Link { destination, .. }
+                    | bcode_markdown_render::MarkdownContributionKind::GitHubIssue {
+                        destination,
+                        ..
+                    },
+                ) if crate::markdown_activation::markdown_destination_text(destination)
+                    .is_some() =>
+                {
+                    "Alt+Enter opens; Ctrl+Alt+C copies; Ctrl/Alt+Tab moves"
+                }
+                _ => "Alt+Enter activates; Ctrl/Alt+Tab moves",
+            };
+            self.set_status(format!("Markdown contribution focused; {hint}"));
         }
         changed
     }
@@ -601,6 +613,31 @@ impl BmuxApp {
             return false;
         };
         self.activate_markdown_contribution(&contribution_id)
+    }
+
+    /// Copy the safe destination of the focused Markdown contribution.
+    pub fn copy_focused_markdown_destination(&mut self) -> bool {
+        use bcode_markdown_render::MarkdownContributionKind;
+
+        let Some(contribution_id) = self.focused_markdown_contribution().map(str::to_owned) else {
+            return false;
+        };
+        let destination = match self.visible_markdown_contribution(&contribution_id) {
+            Some(
+                MarkdownContributionKind::Link { destination, .. }
+                | MarkdownContributionKind::GitHubIssue { destination, .. },
+            ) => destination.clone(),
+            _ => return false,
+        };
+        if crate::markdown_activation::markdown_destination_text(&destination).is_none() {
+            return false;
+        }
+        match crate::markdown_activation::copy_markdown_destination(&destination) {
+            Ok(true) => self.set_status("Copied Markdown destination".to_owned()),
+            Ok(false) => return false,
+            Err(error) => self.set_status(format!("Could not copy Markdown destination: {error}")),
+        }
+        true
     }
 
     /// Return timeline entries for committed user messages.

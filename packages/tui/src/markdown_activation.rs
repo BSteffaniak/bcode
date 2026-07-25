@@ -72,23 +72,31 @@ fn activate_markdown_destination_with(
 pub fn copy_markdown_destination(
     destination: &MarkdownDestination,
 ) -> Result<bool, arboard::Error> {
-    let text = match destination {
-        MarkdownDestination::Web(url) => url.as_str().to_owned(),
-        MarkdownDestination::LocalPath(path) => path.to_string_lossy().into_owned(),
-        MarkdownDestination::Fragment(_)
-        | MarkdownDestination::Inert { .. }
-        | MarkdownDestination::UnresolvedRelative(_) => return Ok(false),
+    let Some(text) = markdown_destination_text(destination) else {
+        return Ok(false);
     };
     let mut clipboard = arboard::Clipboard::new()?;
     clipboard.set_text(text)?;
     Ok(true)
 }
 
+/// Return text suitable for explicit copy from a safe destination.
+#[must_use]
+pub fn markdown_destination_text(destination: &MarkdownDestination) -> Option<String> {
+    match destination {
+        MarkdownDestination::Web(url) => Some(url.as_str().to_owned()),
+        MarkdownDestination::LocalPath(path) => Some(path.to_string_lossy().into_owned()),
+        MarkdownDestination::Fragment(_)
+        | MarkdownDestination::Inert { .. }
+        | MarkdownDestination::UnresolvedRelative(_) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         MarkdownActivation, activate_markdown_destination, activate_markdown_destination_with,
-        copy_markdown_destination,
+        copy_markdown_destination, markdown_destination_text,
     };
     use bcode_markdown_render::{
         MarkdownDestination, MarkdownDestinationRejection, resolve_markdown_destination,
@@ -114,6 +122,14 @@ mod tests {
                 None,
             )),
             MarkdownActivation::External
+        );
+        assert_eq!(
+            markdown_destination_text(&resolve_markdown_destination(
+                "https://example.com/docs",
+                None,
+            ))
+            .as_deref(),
+            Some("https://example.com/docs")
         );
         assert_eq!(
             activate(&MarkdownDestination::LocalPath(std::path::PathBuf::from(

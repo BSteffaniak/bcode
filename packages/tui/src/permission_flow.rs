@@ -69,6 +69,10 @@ pub async fn handle_permission_key(
         | BmuxAction::CommandPaletteOpen
         | BmuxAction::AgentCycle
         | BmuxAction::DiffViewerLayoutCycle
+        | BmuxAction::MarkdownFocusNext
+        | BmuxAction::MarkdownFocusPrevious
+        | BmuxAction::MarkdownActivate
+        | BmuxAction::MarkdownCopyDestination
         | BmuxAction::ThinkingEffortCycle
         | BmuxAction::TranscriptPageUp
         | BmuxAction::TranscriptPageDown

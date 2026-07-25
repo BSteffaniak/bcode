@@ -32,6 +32,10 @@ pub enum BmuxAction {
     AgentCycle,
     ThinkingEffortCycle,
     DiffViewerLayoutCycle,
+    MarkdownFocusNext,
+    MarkdownFocusPrevious,
+    MarkdownActivate,
+    MarkdownCopyDestination,
     TranscriptPageUp,
     TranscriptPageDown,
     TranscriptTop,
@@ -86,6 +90,10 @@ impl BmuxAction {
             "tui.agent.cycle" => Self::AgentCycle,
             "tui.thinking.effort.cycle" => Self::ThinkingEffortCycle,
             "tui.diff_viewer.layout_cycle" => Self::DiffViewerLayoutCycle,
+            "tui.markdown.focusNext" => Self::MarkdownFocusNext,
+            "tui.markdown.focusPrevious" => Self::MarkdownFocusPrevious,
+            "tui.markdown.activate" => Self::MarkdownActivate,
+            "tui.markdown.copyDestination" => Self::MarkdownCopyDestination,
             "transcript.pageUp" => Self::TranscriptPageUp,
             "transcript.pageDown" => Self::TranscriptPageDown,
             "transcript.top" => Self::TranscriptTop,
@@ -307,6 +315,10 @@ impl BmuxKeyMap {
             | BmuxAction::AgentCycle
             | BmuxAction::ThinkingEffortCycle
             | BmuxAction::DiffViewerLayoutCycle
+            | BmuxAction::MarkdownFocusNext
+            | BmuxAction::MarkdownFocusPrevious
+            | BmuxAction::MarkdownActivate
+            | BmuxAction::MarkdownCopyDestination
             | BmuxAction::TranscriptPageUp
             | BmuxAction::TranscriptPageDown
             | BmuxAction::TranscriptTop
@@ -361,6 +373,10 @@ impl BmuxKeyMap {
             | BmuxAction::AgentCycle
             | BmuxAction::ThinkingEffortCycle
             | BmuxAction::DiffViewerLayoutCycle
+            | BmuxAction::MarkdownFocusNext
+            | BmuxAction::MarkdownFocusPrevious
+            | BmuxAction::MarkdownActivate
+            | BmuxAction::MarkdownCopyDestination
             | BmuxAction::TranscriptPageUp
             | BmuxAction::TranscriptPageDown
             | BmuxAction::TranscriptTop
@@ -469,6 +485,10 @@ fn default_bindings() -> BTreeMap<BmuxScope, Vec<BmuxKeyBinding>> {
                 bind("ctrl+p", BmuxAction::CommandPaletteOpen),
                 bind("tab", BmuxAction::AgentCycle),
                 bind("shift+tab", BmuxAction::ThinkingEffortCycle),
+                bind("ctrl+tab", BmuxAction::MarkdownFocusNext),
+                bind("ctrl+shift+tab", BmuxAction::MarkdownFocusPrevious),
+                bind("alt+enter", BmuxAction::MarkdownActivate),
+                bind("ctrl+alt+c", BmuxAction::MarkdownCopyDestination),
                 bind("pageUp", BmuxAction::TranscriptPageUp),
                 bind("pageDown", BmuxAction::TranscriptPageDown),
                 bind("ctrl+home", BmuxAction::TranscriptTop),
@@ -628,6 +648,57 @@ mod tests {
                 None,
                 "plain {key} should not be bound in the session picker"
             );
+        }
+    }
+
+    #[test]
+    fn markdown_actions_have_stable_default_bindings() {
+        let keymap = default_keymap();
+        for (stroke, action) in [
+            (
+                KeyStroke::with_modifiers(
+                    KeyCode::Tab,
+                    Modifiers {
+                        ctrl: true,
+                        ..Modifiers::NONE
+                    },
+                ),
+                BmuxAction::MarkdownFocusNext,
+            ),
+            (
+                KeyStroke::with_modifiers(
+                    KeyCode::Tab,
+                    Modifiers {
+                        ctrl: true,
+                        shift: true,
+                        ..Modifiers::NONE
+                    },
+                ),
+                BmuxAction::MarkdownFocusPrevious,
+            ),
+            (
+                KeyStroke::with_modifiers(
+                    KeyCode::Enter,
+                    Modifiers {
+                        alt: true,
+                        ..Modifiers::NONE
+                    },
+                ),
+                BmuxAction::MarkdownActivate,
+            ),
+            (
+                KeyStroke::with_modifiers(
+                    KeyCode::Char('c'),
+                    Modifiers {
+                        ctrl: true,
+                        alt: true,
+                        ..Modifiers::NONE
+                    },
+                ),
+                BmuxAction::MarkdownCopyDestination,
+            ),
+        ] {
+            assert_eq!(keymap.action_for_key(BmuxScope::Chat, stroke), Some(action));
         }
     }
 

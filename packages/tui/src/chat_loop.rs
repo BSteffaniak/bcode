@@ -12,7 +12,7 @@ use bcode_plugin::PluginRuntimeHost;
 use bcode_session_models::SessionEventKind;
 use bcode_session_view::execute_session_view_action;
 use bcode_session_view_models::{SessionViewAction, SessionViewActionOutcome};
-use bmux_keyboard::{KeyCode, KeyStroke};
+use bmux_keyboard::KeyStroke;
 use bmux_tui::event::{Event, FocusEvent, MouseEventKind};
 use bmux_tui::geometry::Rect;
 use bmux_tui::terminal::Terminal;
@@ -2647,12 +2647,6 @@ async fn handle_chat_key<W: Write>(
         paste_clipboard_image(chat);
         update_slash_palette_async(chat, loop_state);
         return Ok(true);
-    }
-    if stroke.key == KeyCode::Tab && (stroke.modifiers.ctrl || stroke.modifiers.alt) {
-        return Ok(chat.app.move_markdown_focus(stroke.modifiers.shift));
-    }
-    if stroke.key == KeyCode::Enter && stroke.modifiers.alt {
-        return Ok(chat.app.activate_focused_markdown_contribution());
     }
     let outcome = input::handle_key(&mut chat.app, context.services.keymap, stroke);
     if chat.app.should_exit() {

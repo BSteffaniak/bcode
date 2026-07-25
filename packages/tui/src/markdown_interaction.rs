@@ -92,6 +92,14 @@ impl MarkdownInteractionState {
         self.visible.get(contribution_id)
     }
 
+    /// Return the focused typed contribution payload.
+    #[must_use]
+    pub fn focused_contribution(&self) -> Option<&MarkdownContributionKind> {
+        self.focused
+            .as_deref()
+            .and_then(|focused| self.visible.get(focused))
+    }
+
     fn move_focus(&mut self, reverse: bool) -> bool {
         if self.visible_order.is_empty() {
             return self.focused.take().is_some();

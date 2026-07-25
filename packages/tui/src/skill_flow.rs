@@ -214,6 +214,10 @@ fn handle_skill_picker_action(
         | BmuxAction::CommandPaletteOpen
         | BmuxAction::AgentCycle
         | BmuxAction::DiffViewerLayoutCycle
+        | BmuxAction::MarkdownFocusNext
+        | BmuxAction::MarkdownFocusPrevious
+        | BmuxAction::MarkdownActivate
+        | BmuxAction::MarkdownCopyDestination
         | BmuxAction::ThinkingEffortCycle
         | BmuxAction::TranscriptPageUp
         | BmuxAction::TranscriptPageDown
