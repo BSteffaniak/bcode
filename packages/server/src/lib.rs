@@ -31918,6 +31918,34 @@ library = "test"
             .id;
         let mut state = test_server_state_with_shell_plugin(sessions);
         state.trace_store = TraceStore::new(workspace.path().join("traces"));
+        append_tool_contribution_envelope(
+            &state,
+            session_id,
+            "failed-shell",
+            "bcode.shell",
+            bcode_session_models::ToolContributionEnvelope::new(
+                bcode_session_models::ToolContributionPlacement::Progress,
+                bcode_session_models::ToolContributionEvent {
+                    invocation_id: "failed-shell".to_owned(),
+                    contribution_id: "failure-progress".to_owned(),
+                    sequence: 1,
+                    producer_id: "bcode.shell".to_owned(),
+                    schema: "bcode.shell.live".to_owned(),
+                    schema_version: 1,
+                    operation: bcode_session_models::ToolContributionOperation::Upsert,
+                    persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                    artifact: None,
+                    payload: serde_json::json!({"phase": "running"}),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            active_contribution_snapshot_events(&state, session_id)
+                .expect("failure progress snapshot")
+                .len(),
+            1
+        );
         let result = execute_server_tool_for_test(
             &state,
             session_id,
@@ -31933,6 +31961,11 @@ library = "test"
         .await
         .expect("failed shell should produce a tool result");
         assert!(result.is_error);
+        assert!(
+            active_contribution_snapshot_events(&state, session_id)
+                .expect("cleared failure progress snapshot")
+                .is_empty()
+        );
 
         let stages = state
             .sessions
