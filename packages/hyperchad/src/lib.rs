@@ -2016,6 +2016,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn scoped_snapshot_patch_replaces_and_removes_stable_progress_slot() {
+        let session_id = bcode_session_models::SessionId::new();
+        let progress_event =
+            |sequence, operation, frame: &str| bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: bcode_session_models::SessionLiveEventKind::ToolContributionPlaced {
+                    envelope: bcode_session_models::ToolContributionEnvelope::new(
+                        bcode_session_models::ToolContributionPlacement::Progress,
+                        bcode_session_models::ToolContributionEvent {
+                            invocation_id: "call-progress".to_owned(),
+                            contribution_id: "vim-live".to_owned(),
+                            sequence,
+                            producer_id: "bcode.vim-edit".to_owned(),
+                            schema: "bcode.vim-edit.live".to_owned(),
+                            schema_version: 1,
+                            operation,
+                            persistence:
+                                bcode_session_models::ToolContributionPersistence::Transient,
+                            artifact: None,
+                            payload: serde_json::json!({"frame": frame}),
+                        },
+                    ),
+                },
+            };
+        let mut view = SessionView::new();
+        view.apply_live_event(&progress_event(
+            1,
+            bcode_session_models::ToolContributionOperation::Upsert,
+            "first",
+        ));
+        let first = view.snapshot().clone();
+        let item_id = first.transcript.items[0].id.clone();
+        view.apply_live_event(&progress_event(
+            2,
+            bcode_session_models::ToolContributionOperation::Upsert,
+            "second",
+        ));
+        let second = view.snapshot().clone();
+        assert_eq!(second.transcript.items.len(), 1);
+        assert_eq!(second.transcript.items[0].id, item_id);
+        let mut previous = Some(first);
+        let replacement = scoped_snapshot_patch(&mut previous, &second).expect("replacement patch");
+        assert!(replacement.reset.is_none());
+        assert!(matches!(
+            replacement.transcript.as_slice(),
+            [bcode_session_view_models::TranscriptViewPatchOp::Replace { item }]
+                if item.id == item_id
+        ));
+
+        view.apply_live_event(&progress_event(
+            3,
+            bcode_session_models::ToolContributionOperation::Remove,
+            "removed",
+        ));
+        let removed = view.snapshot().clone();
+        assert!(removed.transcript.items.is_empty());
+        let removal = scoped_snapshot_patch(&mut previous, &removed).expect("removal patch");
+        assert!(removal.reset.is_none());
+        assert!(matches!(
+            removal.transcript.as_slice(),
+            [bcode_session_view_models::TranscriptViewPatchOp::Remove { id }]
+                if id == &item_id
+        ));
+    }
+
+    #[test]
     fn scoped_snapshot_patch_replaces_stable_result_slot() {
         let item_id = bcode_session_view_models::TranscriptViewItemId::tool_presentation_slot(
             "call-1",

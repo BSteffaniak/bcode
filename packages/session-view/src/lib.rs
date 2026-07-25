@@ -3071,6 +3071,10 @@ mod tests {
         let mut attached = SessionView::new();
         attached.apply_live_event(&checkpoint);
         assert_eq!(direct.snapshot(), attached.snapshot());
+        assert_eq!(
+            direct.snapshot().transcript.items[0].id,
+            attached.snapshot().transcript.items[0].id
+        );
 
         let cancel = draft(
             2,
