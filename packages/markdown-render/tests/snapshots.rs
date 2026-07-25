@@ -355,11 +355,12 @@ fn image_sources_use_the_same_safe_context_classification_as_links() {
     let result = render_markdown(LINKS_IMAGES, &options);
     assert!(result.contributions.iter().any(|item| matches!(
         &item.kind,
-        MarkdownContributionKind::Image { alt, source, .. }
+        MarkdownContributionKind::Image { alt, source, linked_destination, .. }
             if alt == "Diagram"
                 && source == &MarkdownDestination::LocalPath(
                     std::path::PathBuf::from("/trusted/repository/diagram.png")
                 )
+                && linked_destination.is_none()
     )));
     assert!(result.contributions.iter().any(|item| matches!(
         &item.kind,
@@ -374,6 +375,19 @@ fn image_sources_use_the_same_safe_context_classification_as_links() {
         &item.kind,
         MarkdownContributionKind::Image { alt, source, .. }
             if alt == "Remote" && matches!(source, MarkdownDestination::Web(_))
+    )));
+
+    let badge = render_markdown(
+        "[![Build](https://img.example/build.svg)](https://example.com/build)",
+        &MarkdownRenderOptions::new(80),
+    );
+    assert!(badge.contributions.iter().any(|item| matches!(
+        &item.kind,
+        MarkdownContributionKind::Image {
+            alt,
+            linked_destination: Some(MarkdownDestination::Web(destination)),
+            ..
+        } if alt == "Build" && destination.as_str() == "https://example.com/build"
     )));
 }
 
@@ -685,6 +699,26 @@ fn link_destinations_require_explicit_safe_context() {
     assert_eq!(
         resolve_markdown_destination("./docs/protocol.md", None),
         MarkdownDestination::UnresolvedRelative("./docs/protocol.md".to_owned())
+    );
+    let local_context = MarkdownDocumentContext {
+        base_url: None,
+        base_directory: context.base_directory.clone(),
+        github_repository: None,
+    };
+    assert_eq!(
+        resolve_markdown_destination("../secret.txt", Some(&local_context)),
+        MarkdownDestination::Inert {
+            reason: MarkdownDestinationRejection::OutsideTrustedRoot,
+        }
+    );
+    assert_eq!(
+        resolve_markdown_destination(
+            "file:///trusted/repository/secret.txt",
+            Some(&local_context),
+        ),
+        MarkdownDestination::Inert {
+            reason: MarkdownDestinationRejection::UnsupportedScheme,
+        }
     );
     assert_eq!(
         resolve_markdown_destination("javascript:alert(1)", Some(&context)),

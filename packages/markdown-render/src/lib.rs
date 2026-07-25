@@ -190,6 +190,8 @@ pub enum MarkdownDestination {
 pub enum MarkdownDestinationRejection {
     /// URL scheme is not allowed for activation.
     UnsupportedScheme,
+    /// Local path escapes the explicitly trusted base directory.
+    OutsideTrustedRoot,
     /// File URL does not map to a local path.
     InvalidFileUrl,
 }
@@ -206,12 +208,6 @@ pub fn resolve_markdown_destination(
     if let Ok(url) = Url::parse(destination) {
         return match url.scheme() {
             "http" | "https" => MarkdownDestination::Web(url),
-            "file" => url.to_file_path().map_or_else(
-                |()| MarkdownDestination::Inert {
-                    reason: MarkdownDestinationRejection::InvalidFileUrl,
-                },
-                MarkdownDestination::LocalPath,
-            ),
             _ => MarkdownDestination::Inert {
                 reason: MarkdownDestinationRejection::UnsupportedScheme,
             },
@@ -223,9 +219,31 @@ pub fn resolve_markdown_destination(
         return MarkdownDestination::Web(url);
     }
     if let Some(base_directory) = context.and_then(|context| context.base_directory.as_ref()) {
-        return MarkdownDestination::LocalPath(base_directory.join(destination));
+        return resolve_local_destination(destination, base_directory);
     }
     MarkdownDestination::UnresolvedRelative(destination.to_owned())
+}
+
+fn resolve_local_destination(
+    destination: &str,
+    base_directory: &std::path::Path,
+) -> MarkdownDestination {
+    use std::path::Component;
+
+    let mut relative = std::path::PathBuf::new();
+    for component in std::path::Path::new(destination).components() {
+        match component {
+            Component::Normal(part) => relative.push(part),
+            Component::CurDir => {}
+            Component::ParentDir if relative.pop() => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return MarkdownDestination::Inert {
+                    reason: MarkdownDestinationRejection::OutsideTrustedRoot,
+                };
+            }
+        }
+    }
+    MarkdownDestination::LocalPath(base_directory.join(relative))
 }
 
 /// Options controlling terminal Markdown rendering.
@@ -675,6 +693,8 @@ pub enum MarkdownContributionKind {
         alt: String,
         /// Classified source; unsafe schemes are inert.
         source: MarkdownDestination,
+        /// Safe classified destination when the image is nested in a link.
+        linked_destination: Option<MarkdownDestination>,
     },
     /// Semantic target ID for the matching definition.
     FootnoteReference {
@@ -1871,6 +1891,13 @@ fn collect_markdown_contribution(
                 metadata: image.clone(),
                 source_range: event.source_range.clone(),
                 text: String::new(),
+                linked_destination: containers.iter().rev().find_map(|container| {
+                    if let ContributionContainer::Link { metadata, .. } = container {
+                        Some(resolve_markdown_destination(&metadata.destination, context))
+                    } else {
+                        None
+                    }
+                }),
             });
         }
         MarkdownSemanticEventKind::Start(MarkdownSemanticTag::FootnoteDefinition(label)) => {
@@ -1963,6 +1990,7 @@ fn finish_image_contribution(
         metadata,
         source_range,
         text,
+        linked_destination,
     }) = containers.pop()
     {
         contributions.push(contribution(
@@ -1972,6 +2000,7 @@ fn finish_image_contribution(
                 source: resolve_markdown_destination(&metadata.source, context),
                 image: metadata,
                 alt: normalize_inline_whitespace(&text).trim().to_owned(),
+                linked_destination,
             },
         ));
     }
@@ -2023,6 +2052,7 @@ enum ContributionContainer {
         metadata: MarkdownImage,
         source_range: Range<usize>,
         text: String,
+        linked_destination: Option<MarkdownDestination>,
     },
     Mermaid {
         source_range: Range<usize>,
