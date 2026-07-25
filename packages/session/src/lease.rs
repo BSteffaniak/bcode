@@ -713,6 +713,125 @@ mod tests {
     }
 
     #[test]
+    fn two_current_daemons_racing_for_one_session_yield_one_owner() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let root = temp_dir.path().to_path_buf();
+        let mut joins = Vec::new();
+        for daemon in ["daemon-one", "daemon-two"] {
+            let root = root.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            joins.push(std::thread::spawn(move || {
+                barrier.wait();
+                acquire_session_lease(&root, session_id, &context(daemon, 7))
+            }));
+        }
+        barrier.wait();
+        let results = joins
+            .into_iter()
+            .map(|join| join.join().expect("daemon thread"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(
+                    result,
+                    Err(SessionLeaseError::OwnedByOtherDaemon { .. })
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn different_writer_versions_can_own_different_sessions() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let older_session = SessionId::new();
+        let current_session = SessionId::new();
+        let older = acquire_session_lease(temp_dir.path(), older_session, &context("older", 4))
+            .expect("older writer session");
+        let current =
+            acquire_session_lease(temp_dir.path(), current_session, &context("current", 5))
+                .expect("current writer session");
+        assert_eq!(older.owner().storage_writer_epoch, Some(4));
+        assert_eq!(current.owner().storage_writer_epoch, Some(5));
+    }
+
+    #[test]
+    fn voluntary_release_allows_next_daemon_owner() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let owner = acquire_session_lease(temp_dir.path(), session_id, &context("first", 5))
+            .expect("first owner");
+        drop(owner);
+        let next = acquire_session_lease(temp_dir.path(), session_id, &context("next", 5))
+            .expect("next owner after release");
+        assert_eq!(next.owner().daemon_instance_id.as_deref(), Some("next"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn release_stop_and_killed_owner_workflows_allow_next_owner() {
+        use std::process::Command;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let release_session = SessionId::new();
+        let released = acquire_session_lease(
+            temp_dir.path(),
+            release_session,
+            &context("release-owner", 5),
+        )
+        .expect("release owner");
+        drop(released);
+        acquire_session_lease(
+            temp_dir.path(),
+            release_session,
+            &context("after-release", 5),
+        )
+        .expect("owner after voluntary release");
+
+        let stop_session = SessionId::new();
+        let stopped = vec![
+            acquire_session_lease(
+                temp_dir.path(),
+                stop_session,
+                &same_daemon_context("stop-client-one", "stopping-daemon", 5),
+            )
+            .expect("first stopping-daemon registration"),
+            acquire_session_lease(
+                temp_dir.path(),
+                stop_session,
+                &same_daemon_context("stop-client-two", "stopping-daemon", 5),
+            )
+            .expect("second stopping-daemon registration"),
+        ];
+        drop(stopped);
+        acquire_session_lease(temp_dir.path(), stop_session, &context("after-stop", 5))
+            .expect("owner after graceful daemon stop");
+
+        let killed_session = SessionId::new();
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn killed-owner process");
+        let dead_pid = child.id();
+        assert!(child.wait().expect("wait for killed owner").success());
+        let access_dir = session_owner_dir(temp_dir.path(), killed_session);
+        let dead_owner = SessionLeaseOwner {
+            lease_token: format!("killed-owner-{dead_pid}"),
+            pid: dead_pid,
+            ..SessionLeaseOwner::new(killed_session, &context("killed-daemon", 5))
+        };
+        let dead_path = access_dir.join(format!("{}.json", dead_owner.lease_token));
+        write_owner_metadata(&dead_path, &dead_owner).expect("write killed owner metadata");
+        acquire_session_lease(temp_dir.path(), killed_session, &context("after-kill", 5))
+            .expect("owner after dead process pruning");
+        assert!(!dead_path.exists(), "killed owner metadata must be pruned");
+    }
+
+    #[test]
     fn allows_reentrant_registrations_from_one_daemon_instance() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();

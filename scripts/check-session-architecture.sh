@@ -254,6 +254,26 @@ if rg -n 'incompatible_storage_writer_records|ensure_daemon_storage_compatibilit
   violations=1
 fi
 
+if rg -n 'CURRENT_SESSION_EVENT_SCHEMA_VERSION\s*[-+]|schema_version\s*==\s*(2[0-9]|3[0-8])|writer-epoch-|join\("session-storage"\)' packages/session/src --glob '*.rs' \
+  | rg -v 'packages/session/src/(db|legacy_storage)\.rs' >/tmp/bcode-current-path-historical-format.txt \
+  || rg -n 'decode_for_migration|HistoricalDecode|HistoricalSessionEventError' packages/session/src --glob '*.rs' \
+    | rg -v 'packages/session/src/db\.rs' >/tmp/bcode-current-path-historical-codec.txt; then
+  echo "Session current-boundary violation: historical schema/epoch knowledge escaped explicit migration adapters." >&2
+  cat /tmp/bcode-current-path-historical-format.txt >&2 2>/dev/null || true
+  cat /tmp/bcode-current-path-historical-codec.txt >&2 2>/dev/null || true
+  violations=1
+fi
+
+if sed -n '/pub async fn session_history_page(/,/^    }/p' packages/session/src/lib.rs \
+    | grep -Eq 'migrate_turso|rebuild_|session_history\(' \
+  || sed -n '/fn load_catalog\(&self\)/,/^    }/p' packages/session/src/lib.rs \
+    | grep -Eq 'migrate_turso|rebuild_|session_history\(' \
+  || sed -n '/pub async fn open_existing_turso_in_root/,/^    }/p' packages/session/src/db.rs \
+    | grep -Eq 'migrate_session_storage|rebuild_migration_projections'; then
+  echo "Session current-read violation: catalog, bounded history, and current open paths must not migrate or full replay." >&2
+  violations=1
+fi
+
 if ! rg -q 'pub fn default_session_store_dir\(\)' packages/config/src/lib.rs \
   || rg -n 'default_state_dir\(\)\.join\("sessions"\)' packages/server/src packages/cli/src --glob '*.rs' \
     >/tmp/bcode-default-session-root-violations.txt \
@@ -551,6 +571,10 @@ if ! rg -q 'daemon_instance_id: Some\(format!\("process-' packages/session/src/l
   || ! rg -q 'owner\.daemon_instance_id == context\.daemon_instance_id' packages/session/src/lease.rs \
   || ! rg -q 'owner_error_exposes_actionable_identity_without_database_access' packages/session/src/lease.rs \
   || ! sed -n '/fn owner_error_exposes_actionable_identity_without_database_access/,/^    }/p' packages/session/src/lease.rs | grep -q 'daemon instance owner-build' \
+  || ! rg -q 'two_current_daemons_racing_for_one_session_yield_one_owner' packages/session/src/lease.rs \
+  || ! rg -q 'different_writer_versions_can_own_different_sessions' packages/session/src/lease.rs \
+  || ! rg -q 'release_stop_and_killed_owner_workflows_allow_next_owner' packages/session/src/lease.rs \
+  || ! rg -q 'prunes_dead_owner_before_compatibility_check' packages/session/src/lease.rs \
   || ! rg -q 'rejects_second_daemon_at_same_writer_epoch' packages/session/src/lease.rs \
   || ! rg -q 'allows_reentrant_registrations_from_one_daemon_instance' packages/session/src/lease.rs \
   || ! rg -q 'maintenance_refuses_any_live_session_owner' packages/session/src/lease.rs \
