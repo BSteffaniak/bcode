@@ -155,6 +155,15 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
     let theme = TuiTheme::for_app(app);
     render_header(app, layout.header, frame, theme);
     render_composer(app, layout.composer, frame, theme);
+    let focused_regions = transcript_markdown_regions(app, layout.body);
+    let mut focused_ids = Vec::new();
+    let mut seen_ids = std::collections::BTreeSet::new();
+    for region in focused_regions {
+        if seen_ids.insert(region.contribution_id.clone()) {
+            focused_ids.push(region.contribution_id);
+        }
+    }
+    app.reconcile_markdown_focus(focused_ids);
     render_body(app, layout.body, frame);
     if let Some(latest_bar) = layout.latest_bar {
         render_latest_bar(app, latest_bar, frame, Instant::now());
@@ -760,12 +769,46 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     render_transcript_markdown_hits(app, area, top_row, frame);
 }
 
+#[derive(Debug)]
+struct MarkdownTranscriptRegion {
+    contribution_id: String,
+    rect_index: usize,
+    rect: Rect,
+}
+
 fn render_transcript_markdown_hits(
     app: &BmuxApp,
     area: Rect,
-    top_row: usize,
+    _top_row: usize,
     frame: &mut Frame<'_>,
 ) {
+    for region in transcript_markdown_regions(app, area) {
+        if app.focused_markdown_contribution() == Some(region.contribution_id.as_str()) {
+            for y in region.rect.y..region.rect.bottom() {
+                for x in region.rect.x..region.rect.right() {
+                    if let Some(cell) = frame
+                        .buffer_mut()
+                        .get_mut(bmux_tui::geometry::Point::new(x, y))
+                    {
+                        cell.style = cell.style.add_modifier(Modifier::REVERSED);
+                    }
+                }
+            }
+        }
+        frame.push_hit(
+            HitRegion::new(
+                format!("markdown:{}:{}", region.contribution_id, region.rect_index),
+                region.rect,
+            )
+            .role(HitRole::Action)
+            .layer(1),
+        );
+    }
+}
+
+fn transcript_markdown_regions(app: &BmuxApp, area: Rect) -> Vec<MarkdownTranscriptRegion> {
+    let top_row = app.transcript_top_row(area.height);
+    let mut regions = Vec::new();
     for (index, item) in app.transcript().iter().enumerate() {
         if item.text_format() != TextFormat::Markdown {
             continue;
@@ -812,17 +855,15 @@ fn render_transcript_markdown_hits(
                 if clipped.is_empty() {
                     continue;
                 }
-                frame.push_hit(
-                    HitRegion::new(
-                        format!("markdown:{}:{rect_index}", geometry.contribution_id),
-                        clipped,
-                    )
-                    .role(HitRole::Action)
-                    .layer(1),
-                );
+                regions.push(MarkdownTranscriptRegion {
+                    contribution_id: geometry.contribution_id.clone(),
+                    rect_index,
+                    rect: clipped,
+                });
             }
         }
     }
+    regions
 }
 
 fn transcript_markdown_content_row_offset(item: &TranscriptItem, width: u16) -> usize {

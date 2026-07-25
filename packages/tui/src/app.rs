@@ -274,6 +274,7 @@ pub struct BmuxApp {
     cursor: CursorBlink,
     pending_key_activation: Option<PendingKeyActivation>,
     plugin_presentation: Option<Arc<crate::plugin_tui::PluginTuiPresentation>>,
+    markdown_focus: crate::markdown_interaction::MarkdownFocusState,
 }
 
 /// Daemon connection state used to describe startup readiness in the status chrome.
@@ -471,6 +472,7 @@ impl BmuxApp {
             cursor: CursorBlink::new(),
             pending_key_activation: None,
             plugin_presentation: None,
+            markdown_focus: crate::markdown_interaction::MarkdownFocusState::default(),
         };
         app.absorb_history(history);
         app
@@ -515,6 +517,26 @@ impl BmuxApp {
     #[must_use]
     pub fn plugin_presentation(&self) -> Option<&crate::plugin_tui::PluginTuiPresentation> {
         self.plugin_presentation.as_deref()
+    }
+
+    /// Reconcile keyboard focus with visible actionable Markdown contributions.
+    pub fn reconcile_markdown_focus(&mut self, visible: Vec<String>) {
+        self.markdown_focus.reconcile(visible);
+    }
+
+    /// Move Markdown focus in visible document order.
+    pub fn move_markdown_focus(&mut self, reverse: bool) -> bool {
+        if reverse {
+            self.markdown_focus.focus_previous()
+        } else {
+            self.markdown_focus.focus_next()
+        }
+    }
+
+    /// Return the focused Markdown contribution ID.
+    #[must_use]
+    pub fn focused_markdown_contribution(&self) -> Option<&str> {
+        self.markdown_focus.focused()
     }
 
     /// Return timeline entries for committed user messages.
