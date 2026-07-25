@@ -871,7 +871,6 @@ fn execute_direct_tool_variant(
             name: config.tool_name.clone(),
             arguments: config.arguments.clone(),
             preparation_descriptor: prepared.descriptor,
-            cwd: Some(workspace.to_path_buf()),
         };
         let start = Instant::now();
         let response = client

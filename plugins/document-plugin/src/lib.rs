@@ -108,31 +108,80 @@ fn progress_lifecycle_event(
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct DocumentPreparationDescriptor {
+    #[serde(default)]
+    workspace_root: Option<PathBuf>,
+    #[serde(default)]
+    source_path: Option<PathBuf>,
+}
+
+fn document_workspace_root(
+    request: &bcode_tool::ToolPreparationRequest,
+) -> Result<Option<PathBuf>, String> {
+    let mut matching = request
+        .host_context
+        .iter()
+        .filter(|entry| entry.schema == bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA);
+    let Some(entry) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        return Err("duplicate Document workspace host context".to_owned());
+    }
+    if entry.schema_version != bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported Document workspace host context version {}; expected {}",
+            entry.schema_version,
+            bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION
+        ));
+    }
+    let root = entry
+        .payload
+        .get("working_directory")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Document workspace host context working_directory is missing".to_owned())?;
+    let root = PathBuf::from(root);
+    if !root.is_absolute() {
+        return Err("Document workspace working directory must be absolute".to_owned());
+    }
+    Ok(Some(root))
+}
+
 fn document_policy_operation(
     request: &bcode_tool::ToolPreparationRequest,
     definition: &ToolDefinition,
 ) -> Result<bcode_plugin_sdk::ToolPolicyPreparation, String> {
-    let operation = match definition.name.as_str() {
-        "document.status" => bcode_plugin_sdk::ToolPolicyOperation::ReadOnly,
+    let workspace_root = document_workspace_root(request)?;
+    let (operation, source_path) = match definition.name.as_str() {
+        "document.status" => (bcode_plugin_sdk::ToolPolicyOperation::ReadOnly, None),
         "document.extract" => {
-            let url = request
-                .invocation
-                .arguments
-                .get("url")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string);
-            if url.is_some() {
-                bcode_plugin_sdk::ToolPolicyOperation::Web { url }
-            } else {
-                let paths = request
-                    .invocation
-                    .arguments
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToString::to_string)
-                    .into_iter()
-                    .collect();
-                bcode_plugin_sdk::ToolPolicyOperation::Read { paths }
+            let extract =
+                serde_json::from_value::<ExtractRequest>(request.invocation.arguments.clone())
+                    .map_err(|error| format!("invalid Document extraction request: {error}"))?;
+            match source(&extract).map_err(|error| error.to_string())? {
+                DocumentSource::Url(url) => (
+                    bcode_plugin_sdk::ToolPolicyOperation::Web { url: Some(url) },
+                    None,
+                ),
+                DocumentSource::Path(path) => {
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        workspace_root
+                            .as_ref()
+                            .ok_or_else(|| {
+                                "Document relative path requires workspace host context".to_owned()
+                            })?
+                            .join(path)
+                    };
+                    (
+                        bcode_plugin_sdk::ToolPolicyOperation::Read {
+                            paths: vec![path.display().to_string()],
+                        },
+                        Some(path),
+                    )
+                }
             }
         }
         name => return Err(format!("unsupported document policy operation: {name}")),
@@ -151,7 +200,36 @@ fn document_policy_operation(
         definition.name == "document.extract",
         operation,
     )
-    .with_identity(identity))
+    .with_identity(identity)
+    .with_descriptor(
+        serde_json::to_value(DocumentPreparationDescriptor {
+            workspace_root,
+            source_path,
+        })
+        .map_err(|error| error.to_string())?,
+    ))
+}
+
+fn apply_document_preparation(
+    request: &mut ExtractRequest,
+    descriptor: &DocumentPreparationDescriptor,
+) -> Result<(), String> {
+    match source(request).map_err(|error| error.to_string())? {
+        DocumentSource::Path(_) => {
+            let source_path = descriptor.source_path.clone().ok_or_else(|| {
+                "Document preparation descriptor is missing the local source path".to_owned()
+            })?;
+            request.path = Some(source_path);
+        }
+        DocumentSource::Url(_) if descriptor.source_path.is_some() => {
+            return Err(
+                "Document preparation descriptor contains a source path for a URL request"
+                    .to_owned(),
+            );
+        }
+        DocumentSource::Url(_) => {}
+    }
+    Ok(())
 }
 
 impl DocumentPlugin {
@@ -208,10 +286,22 @@ impl DocumentPlugin {
         invocation: &ToolInvocationRequest,
         events: ServiceEventEmitter,
     ) -> ToolInvocationResponse {
-        let request = match serde_json::from_value::<ExtractRequest>(invocation.arguments.clone()) {
-            Ok(request) => request,
-            Err(error) => return tool_error(error.to_string()),
+        let mut request =
+            match serde_json::from_value::<ExtractRequest>(invocation.arguments.clone()) {
+                Ok(request) => request,
+                Err(error) => return tool_error(error.to_string()),
+            };
+        let descriptor = match serde_json::from_value::<DocumentPreparationDescriptor>(
+            invocation.preparation_descriptor.clone(),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                return tool_error(format!("invalid Document preparation descriptor: {error}"));
+            }
         };
+        if let Err(error) = apply_document_preparation(&mut request, &descriptor) {
+            return tool_error(error);
+        }
         let runtime = match &self.runtime {
             Ok(runtime) => runtime,
             Err(error) => return tool_error(format!("document runtime unavailable: {error}")),
@@ -219,7 +309,9 @@ impl DocumentPlugin {
         let progress = ProgressReporter::new(
             events,
             invocation.tool_call_id.clone(),
-            invocation.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+            descriptor
+                .workspace_root
+                .unwrap_or_else(|| PathBuf::from(".")),
         );
         progress.emit("document extraction started");
         match runtime.block_on(extract_async(request, Some(progress))) {
@@ -725,6 +817,14 @@ mod tests {
         }
     }
 
+    fn workspace_context(path: &Path) -> Vec<bcode_tool::ToolHostContextEntry> {
+        vec![bcode_tool::ToolHostContextEntry {
+            schema: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA.to_owned(),
+            schema_version: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION,
+            payload: serde_json::json!({"working_directory": path}),
+        }]
+    }
+
     #[test]
     fn document_owner_prepares_mixed_permission_policy() {
         for (definition, arguments, expected_permission) in [
@@ -741,11 +841,85 @@ mod tests {
                     tool_name: definition.name.clone(),
                     arguments,
                 },
-                host_context: Vec::new(),
+                host_context: workspace_context(Path::new("/tmp/workspace")),
             };
             let policy = document_policy_operation(&request, &definition).expect("document policy");
             assert_eq!(policy.requires_permission, expected_permission);
+            let descriptor =
+                serde_json::from_value::<DocumentPreparationDescriptor>(policy.descriptor)
+                    .expect("Document descriptor");
+            assert_eq!(
+                descriptor.workspace_root,
+                Some(PathBuf::from("/tmp/workspace"))
+            );
+            if expected_permission {
+                assert_eq!(
+                    descriptor.source_path,
+                    Some(PathBuf::from("/tmp/workspace/report.pdf"))
+                );
+                assert_eq!(
+                    policy.operation,
+                    bcode_plugin_sdk::ToolPolicyOperation::Read {
+                        paths: vec!["/tmp/workspace/report.pdf".to_owned()],
+                    }
+                );
+            }
         }
+    }
+
+    #[test]
+    fn document_relative_source_requires_workspace_context() {
+        let definition = extract_tool_definition();
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "call".to_owned(),
+                tool_name: definition.name.clone(),
+                arguments: serde_json::json!({"path": "report.pdf"}),
+            },
+            host_context: Vec::new(),
+        };
+
+        let error = document_policy_operation(&request, &definition)
+            .expect_err("relative source without workspace");
+
+        assert!(error.contains("requires workspace host context"));
+    }
+
+    #[test]
+    fn document_invocation_uses_prepared_local_source_path() {
+        let mut request = ExtractRequest {
+            url: None,
+            path: Some(PathBuf::from("report.pdf")),
+            max_bytes: None,
+            timeout_ms: None,
+        };
+        let descriptor = DocumentPreparationDescriptor {
+            workspace_root: Some(PathBuf::from("/tmp/workspace")),
+            source_path: Some(PathBuf::from("/tmp/workspace/report.pdf")),
+        };
+
+        apply_document_preparation(&mut request, &descriptor).expect("apply preparation");
+
+        assert_eq!(
+            request.path,
+            Some(PathBuf::from("/tmp/workspace/report.pdf"))
+        );
+    }
+
+    #[test]
+    fn document_invocation_rejects_missing_local_source_descriptor() {
+        let mut request = ExtractRequest {
+            url: None,
+            path: Some(PathBuf::from("report.pdf")),
+            max_bytes: None,
+            timeout_ms: None,
+        };
+
+        let error =
+            apply_document_preparation(&mut request, &DocumentPreparationDescriptor::default())
+                .expect_err("missing prepared source");
+
+        assert!(error.contains("missing the local source path"));
     }
 
     #[test]

@@ -4737,7 +4737,6 @@ library = "libexample_plugin.dylib"
                 }]
             }),
             preparation_descriptor: serde_json::Value::Null,
-            cwd: None,
         };
         let payload = serde_json::to_vec(&request).expect("question request encodes");
         let mut requests = Vec::new();

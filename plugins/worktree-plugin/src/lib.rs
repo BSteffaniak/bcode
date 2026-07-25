@@ -28,7 +28,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::style::{Color, Modifier, Style};
 use bmux_tui::text::{Line, Span};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -108,27 +108,104 @@ fn worktree_command(id: &str, title: &str, description: &str) -> CommandContribu
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct WorktreePreparationDescriptor {
+    #[serde(default)]
+    cwd: Option<PathBuf>,
+    #[serde(default)]
+    remove_path: Option<PathBuf>,
+}
+
+fn worktree_workspace_root(
+    request: &bcode_tool::ToolPreparationRequest,
+) -> Result<Option<PathBuf>, String> {
+    let mut matching = request
+        .host_context
+        .iter()
+        .filter(|entry| entry.schema == bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA);
+    let Some(entry) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        return Err("duplicate Worktree workspace host context".to_owned());
+    }
+    if entry.schema_version != bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported Worktree workspace host context version {}; expected {}",
+            entry.schema_version,
+            bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION
+        ));
+    }
+    let root = entry
+        .payload
+        .get("working_directory")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Worktree workspace host context working_directory is missing".to_owned())?;
+    let root = PathBuf::from(root);
+    if !root.is_absolute() {
+        return Err("Worktree workspace working directory must be absolute".to_owned());
+    }
+    Ok(Some(root))
+}
+
+fn worktree_preparation_descriptor(
+    request: &bcode_tool::ToolPreparationRequest,
+) -> Result<WorktreePreparationDescriptor, String> {
+    let workspace_root = worktree_workspace_root(request)?;
+    let explicit_cwd = request
+        .invocation
+        .arguments
+        .get("cwd")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from);
+    let cwd = match explicit_cwd {
+        Some(path) if path.is_absolute() => Some(path),
+        Some(path) => Some(
+            workspace_root
+                .as_ref()
+                .ok_or_else(|| "Worktree relative cwd requires workspace host context".to_owned())?
+                .join(path),
+        ),
+        None => workspace_root,
+    };
+    let remove_path = request
+        .invocation
+        .arguments
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(PathBuf::from)
+        .map(|path| {
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                cwd.as_ref()
+                    .ok_or_else(|| {
+                        "Worktree relative remove path requires a prepared cwd".to_owned()
+                    })
+                    .map(|cwd| cwd.join(path))
+            }
+        })
+        .transpose()?;
+    Ok(WorktreePreparationDescriptor { cwd, remove_path })
+}
+
 fn worktree_policy_operation(
     request: &bcode_tool::ToolPreparationRequest,
     definition: &ToolDefinition,
 ) -> Result<bcode_plugin_sdk::ToolPolicyPreparation, String> {
+    let descriptor = worktree_preparation_descriptor(request)?;
     let operation = match definition.name.as_str() {
         "worktree.list" => bcode_plugin_sdk::ToolPolicyOperation::ReadOnly,
         "worktree.create" => bcode_plugin_sdk::ToolPolicyOperation::Mutating,
-        "worktree.remove" => {
-            let paths = request
-                .invocation
-                .arguments
-                .get("path")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string)
+        "worktree.remove" => bcode_plugin_sdk::ToolPolicyOperation::Write {
+            paths: descriptor
+                .remove_path
+                .as_ref()
+                .map(|path| path.display().to_string())
                 .into_iter()
-                .collect();
-            bcode_plugin_sdk::ToolPolicyOperation::Write {
-                paths,
-                category: "worktree.remove".to_owned(),
-            }
-        }
+                .collect(),
+            category: "worktree.remove".to_owned(),
+        },
         name => return Err(format!("unsupported worktree policy operation: {name}")),
     };
     let category = match definition.name.as_str() {
@@ -140,11 +217,12 @@ fn worktree_policy_operation(
     Ok(
         bcode_plugin_sdk::ToolPolicyPreparation::new(definition.name != "worktree.list", operation)
             .with_identity(bcode_plugin_sdk::ToolPolicyIdentity {
-                aliases: vec![category.to_string()],
+                aliases: Vec::new(),
                 compatibility_aliases: Vec::new(),
-                capabilities: Vec::new(),
-                permission_category: Some(category.to_string()),
-            }),
+                capabilities: vec![category.to_owned()],
+                permission_category: Some(category.to_owned()),
+            })
+            .with_descriptor(serde_json::to_value(descriptor).map_err(|error| error.to_string())?),
     )
 }
 
@@ -251,6 +329,16 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
         Ok(invocation) => invocation,
         Err(error) => return invalid_request(&error),
     };
+    let descriptor = match serde_json::from_value::<WorktreePreparationDescriptor>(
+        invocation.preparation_descriptor.clone(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return json_response(&tool_error(format!(
+                "invalid Worktree preparation descriptor: {error}"
+            )));
+        }
+    };
     if context.cancellation.is_cancelled() {
         return json_response(&tool_error("worktree tool cancelled".to_string()));
     }
@@ -263,9 +351,9 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
         ),
     );
     let response = match invocation.name.as_str() {
-        "worktree.list" => invoke_list(&invocation),
-        "worktree.create" => invoke_create(&invocation),
-        "worktree.remove" => invoke_remove(&invocation),
+        "worktree.list" => invoke_list(&invocation, &descriptor),
+        "worktree.create" => invoke_create(&invocation, &descriptor),
+        "worktree.remove" => invoke_remove(&invocation, &descriptor),
         _ => ToolInvocationResponse {
             output: format!("unsupported worktree tool: {}", invocation.name),
             is_error: true,
@@ -277,16 +365,19 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
     json_response(&response)
 }
 
-fn invoke_list(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
-    let request = match serde_json::from_value::<WorktreeListRequest>(invocation.arguments.clone())
+fn invoke_list(
+    invocation: &ToolInvocationRequest,
+    descriptor: &WorktreePreparationDescriptor,
+) -> ToolInvocationResponse {
+    let _request = match serde_json::from_value::<WorktreeListRequest>(invocation.arguments.clone())
     {
         Ok(request) => request,
         Err(error) => return tool_error(error.to_string()),
     };
-    let Some(cwd) = request.cwd.or_else(|| invocation.cwd.clone()) else {
-        return tool_error("worktree.list requires an invocation cwd".to_string());
+    let Some(cwd) = descriptor.cwd.as_ref() else {
+        return tool_error("worktree.list preparation descriptor is missing cwd".to_string());
     };
-    match bcode_worktree::list_worktrees(&cwd) {
+    match bcode_worktree::list_worktrees(cwd) {
         Ok(response) => json_tool_response_with_artifact(
             &response,
             &invocation.tool_call_id,
@@ -298,18 +389,19 @@ fn invoke_list(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
     }
 }
 
-fn invoke_create(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
+fn invoke_create(
+    invocation: &ToolInvocationRequest,
+    descriptor: &WorktreePreparationDescriptor,
+) -> ToolInvocationResponse {
     let mut request =
         match serde_json::from_value::<WorktreeCreateRequest>(invocation.arguments.clone()) {
             Ok(request) => request,
             Err(error) => return tool_error(error.to_string()),
         };
-    if request.cwd.is_none() {
-        request.cwd.clone_from(&invocation.cwd);
-    }
-    let Some(cwd) = request.cwd.clone() else {
-        return tool_error("worktree.create requires an invocation cwd".to_string());
+    let Some(cwd) = descriptor.cwd.clone() else {
+        return tool_error("worktree.create preparation descriptor is missing cwd".to_string());
     };
+    request.cwd = Some(cwd.clone());
     let config_paths = bcode_config::default_config_paths_from(&cwd);
     let config = match bcode_config::load_config_from_paths(&config_paths) {
         Ok(config) => config,
@@ -327,15 +419,25 @@ fn invoke_create(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
     }
 }
 
-fn invoke_remove(invocation: &ToolInvocationRequest) -> ToolInvocationResponse {
-    let request =
+fn invoke_remove(
+    invocation: &ToolInvocationRequest,
+    descriptor: &WorktreePreparationDescriptor,
+) -> ToolInvocationResponse {
+    let mut request =
         match serde_json::from_value::<WorktreeRemoveRequest>(invocation.arguments.clone()) {
             Ok(request) => request,
             Err(error) => return tool_error(error.to_string()),
         };
-    let Some(cwd) = request.cwd.clone().or_else(|| invocation.cwd.clone()) else {
-        return tool_error("worktree.remove requires an invocation cwd".to_string());
+    let Some(cwd) = descriptor.cwd.clone() else {
+        return tool_error("worktree.remove preparation descriptor is missing cwd".to_string());
     };
+    let Some(path) = descriptor.remove_path.clone() else {
+        return tool_error(
+            "worktree.remove preparation descriptor is missing remove path".to_string(),
+        );
+    };
+    request.cwd = Some(cwd.clone());
+    request.path = path;
     match bcode_worktree::remove_worktree(&cwd, &request.path, request.force) {
         Ok(response) => json_tool_response_with_artifact(
             &response,
@@ -996,6 +1098,7 @@ bcode_plugin_sdk::export_plugin!(WorktreePlugin, include_str!("../bcode-plugin.t
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn worktree_requests_use_durable_generic_contributions_without_legacy_visuals() {
@@ -1010,6 +1113,14 @@ mod tests {
         );
         assert_eq!(contribution.payload["operation"], "worktree.create");
         assert_eq!(contribution.payload["name"], "feature");
+    }
+
+    fn workspace_context(path: &Path) -> Vec<bcode_tool::ToolHostContextEntry> {
+        vec![bcode_tool::ToolHostContextEntry {
+            schema: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA.to_owned(),
+            schema_version: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION,
+            payload: serde_json::json!({"working_directory": path}),
+        }]
     }
 
     #[test]
@@ -1033,11 +1144,83 @@ mod tests {
                     tool_name: definition.name.clone(),
                     arguments,
                 },
-                host_context: Vec::new(),
+                host_context: workspace_context(Path::new("/tmp/workspace")),
             };
             let policy = worktree_policy_operation(&request, &definition).expect("worktree policy");
             assert_eq!(policy.requires_permission, expected_permission);
+            let descriptor =
+                serde_json::from_value::<WorktreePreparationDescriptor>(policy.descriptor)
+                    .expect("Worktree descriptor");
+            assert_eq!(descriptor.cwd, Some(PathBuf::from("/tmp/workspace")));
+            if definition.name == "worktree.remove" {
+                assert_eq!(descriptor.remove_path, Some(PathBuf::from("/tmp/worktree")));
+                assert_eq!(
+                    policy.operation,
+                    bcode_plugin_sdk::ToolPolicyOperation::Write {
+                        paths: vec!["/tmp/worktree".to_owned()],
+                        category: "worktree.remove".to_owned(),
+                    }
+                );
+            }
         }
+    }
+
+    #[test]
+    fn worktree_preparation_preserves_explicit_cwd_precedence_and_resolves_remove_path() {
+        let definition = remove_definition();
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "call".to_owned(),
+                tool_name: definition.name.clone(),
+                arguments: serde_json::json!({
+                    "cwd": "nested/repository",
+                    "path": "../worktree"
+                }),
+            },
+            host_context: workspace_context(Path::new("/tmp/workspace")),
+        };
+
+        let prepared =
+            worktree_policy_operation(&request, &definition).expect("Worktree preparation");
+        let descriptor =
+            serde_json::from_value::<WorktreePreparationDescriptor>(prepared.descriptor)
+                .expect("Worktree descriptor");
+
+        assert_eq!(
+            descriptor.cwd,
+            Some(PathBuf::from("/tmp/workspace/nested/repository"))
+        );
+        assert_eq!(
+            descriptor.remove_path,
+            Some(PathBuf::from(
+                "/tmp/workspace/nested/repository/../worktree"
+            ))
+        );
+        assert_eq!(
+            prepared.operation,
+            bcode_plugin_sdk::ToolPolicyOperation::Write {
+                paths: vec!["/tmp/workspace/nested/repository/../worktree".to_owned()],
+                category: "worktree.remove".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn worktree_relative_cwd_requires_workspace_context() {
+        let definition = list_definition();
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "call".to_owned(),
+                tool_name: definition.name.clone(),
+                arguments: serde_json::json!({"cwd": "repository"}),
+            },
+            host_context: Vec::new(),
+        };
+
+        let error = worktree_policy_operation(&request, &definition)
+            .expect_err("relative cwd without workspace");
+
+        assert!(error.contains("requires workspace host context"));
     }
 
     #[test]

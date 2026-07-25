@@ -137,21 +137,54 @@ struct VimEditToolError<'a> {
     error: String,
 }
 
-fn vim_edit_policy_operation(
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct VimEditPreparationDescriptor {
+    #[serde(default)]
+    workspace_root: Option<PathBuf>,
+    #[serde(default)]
+    paths: Vec<PathBuf>,
+}
+
+fn vim_edit_workspace_root(
     request: &bcode_tool::ToolPreparationRequest,
-    definition: &ToolDefinition,
-) -> Result<bcode_plugin_sdk::ToolPolicyPreparation, String> {
-    let paths = request
-        .invocation
-        .arguments
+) -> Result<Option<PathBuf>, String> {
+    let mut matching = request
+        .host_context
+        .iter()
+        .filter(|entry| entry.schema == bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA);
+    let Some(entry) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        return Err("duplicate Vim edit workspace host context".to_owned());
+    }
+    if entry.schema_version != bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported Vim edit workspace host context version {}; expected {}",
+            entry.schema_version,
+            bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION
+        ));
+    }
+    let root = entry
+        .payload
+        .get("working_directory")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "Vim edit workspace host context working_directory is missing".to_owned())?;
+    let root = PathBuf::from(root);
+    if !root.is_absolute() {
+        return Err("Vim edit workspace working directory must be absolute".to_owned());
+    }
+    Ok(Some(root))
+}
+
+fn vim_edit_argument_paths(arguments: &serde_json::Value) -> Vec<PathBuf> {
+    arguments
         .get("path")
         .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string)
+        .map(PathBuf::from)
         .into_iter()
         .chain(
-            request
-                .invocation
-                .arguments
+            arguments
                 .get("files")
                 .and_then(serde_json::Value::as_array)
                 .into_iter()
@@ -159,14 +192,42 @@ fn vim_edit_policy_operation(
                 .filter_map(|file| {
                     file.get("path")
                         .and_then(serde_json::Value::as_str)
-                        .map(ToString::to_string)
+                        .map(PathBuf::from)
                 }),
         )
+        .collect()
+}
+
+fn vim_edit_policy_operation(
+    request: &bcode_tool::ToolPreparationRequest,
+    definition: &ToolDefinition,
+) -> Result<bcode_plugin_sdk::ToolPolicyPreparation, String> {
+    let workspace_root = vim_edit_workspace_root(request)?;
+    let paths = vim_edit_argument_paths(&request.invocation.arguments)
+        .into_iter()
+        .map(|path| {
+            if path.is_absolute() {
+                Ok(path)
+            } else {
+                workspace_root
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "Vim edit relative path requires workspace host context".to_owned()
+                    })
+                    .map(|root| root.join(path))
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let policy_paths = paths
+        .iter()
+        .map(|path| path.display().to_string())
         .collect();
     let operation = match definition.name.as_str() {
-        "vim_edit.preview" => bcode_plugin_sdk::ToolPolicyOperation::Read { paths },
+        "vim_edit.preview" => bcode_plugin_sdk::ToolPolicyOperation::Read {
+            paths: policy_paths,
+        },
         "vim_edit.apply" => bcode_plugin_sdk::ToolPolicyOperation::Write {
-            paths,
+            paths: policy_paths,
             category: "write".to_owned(),
         },
         name => return Err(format!("unsupported Vim edit policy operation: {name}")),
@@ -181,8 +242,54 @@ fn vim_edit_policy_operation(
             definition.name == "vim_edit.apply",
             operation,
         )
-        .with_identity(path_policy(category)),
+        .with_identity(path_policy(category))
+        .with_descriptor(
+            serde_json::to_value(VimEditPreparationDescriptor {
+                workspace_root,
+                paths,
+            })
+            .map_err(|error| error.to_string())?,
+        ),
     )
+}
+
+fn apply_vim_edit_preparation(
+    arguments: &mut serde_json::Value,
+    descriptor: &VimEditPreparationDescriptor,
+) -> Result<(), String> {
+    let object = arguments
+        .as_object_mut()
+        .ok_or_else(|| "Vim edit arguments must be an object".to_owned())?;
+    if let Some(path) = object.get_mut("path") {
+        if descriptor.paths.len() != 1 {
+            return Err("Vim edit single-file descriptor must contain exactly one path".to_owned());
+        }
+        *path = serde_json::Value::String(descriptor.paths[0].display().to_string());
+        return Ok(());
+    }
+    if let Some(files) = object
+        .get_mut("files")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        if files.len() != descriptor.paths.len() {
+            return Err(
+                "Vim edit multi-file descriptor path count does not match request".to_owned(),
+            );
+        }
+        for (file, path) in files.iter_mut().zip(&descriptor.paths) {
+            let path_value = file
+                .as_object_mut()
+                .and_then(|file| file.get_mut("path"))
+                .ok_or_else(|| "Vim edit multi-file entry is missing path".to_owned())?;
+            *path_value = serde_json::Value::String(path.display().to_string());
+        }
+        return Ok(());
+    }
+    if descriptor.paths.is_empty() {
+        Ok(())
+    } else {
+        Err("Vim edit descriptor contains paths for a pathless request".to_owned())
+    }
 }
 
 fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
@@ -221,7 +328,25 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
 }
 
 #[cfg(test)]
-fn invoke_tool_request(request: ToolInvocationRequest) -> ToolInvocationResponse {
+fn invoke_tool_request(mut request: ToolInvocationRequest) -> ToolInvocationResponse {
+    let definition = match request.name.as_str() {
+        "vim_edit.preview" => preview_tool_definition(),
+        "vim_edit.apply" => apply_tool_definition(),
+        _ => return vim_edit_error_response(None, "unknown vim edit tool".to_owned()),
+    };
+    let host_context = Vec::new();
+    let preparation = bcode_tool::ToolPreparationRequest {
+        invocation: bcode_tool::ToolInvocationDescriptor {
+            invocation_id: request.tool_call_id.clone(),
+            tool_name: request.name.clone(),
+            arguments: request.arguments.clone(),
+        },
+        host_context,
+    };
+    request.preparation_descriptor = match vim_edit_policy_operation(&preparation, &definition) {
+        Ok(prepared) => prepared.descriptor,
+        Err(error) => return vim_edit_error_response(None, error),
+    };
     invoke_tool_request_with_events(request, ServiceEventEmitter::default())
 }
 
@@ -229,16 +354,32 @@ fn invoke_tool_request_with_events(
     request: ToolInvocationRequest,
     events: ServiceEventEmitter,
 ) -> ToolInvocationResponse {
+    let descriptor = match serde_json::from_value::<VimEditPreparationDescriptor>(
+        request.preparation_descriptor.clone(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return vim_edit_error_response(
+                None,
+                format!("invalid Vim edit preparation descriptor: {error}"),
+            );
+        }
+    };
+
     emit_request_contribution(
         events,
         &request.tool_call_id,
         &request.name,
         &request.arguments,
     );
+    let mut arguments = request.arguments;
+    if let Err(error) = apply_vim_edit_preparation(&mut arguments, &descriptor) {
+        return vim_edit_error_response(None, error);
+    }
     match request.name.as_str() {
         "vim_edit.preview" => tool_vim_edit_with_nvim_executable(
-            request.arguments,
-            request.cwd.as_deref(),
+            arguments,
+            descriptor.workspace_root.as_deref(),
             VimEditMode::Preview,
             &request.tool_call_id,
             "vim_edit.preview",
@@ -246,8 +387,8 @@ fn invoke_tool_request_with_events(
             events,
         ),
         "vim_edit.apply" => tool_vim_edit_with_nvim_executable(
-            request.arguments,
-            request.cwd.as_deref(),
+            arguments,
+            descriptor.workspace_root.as_deref(),
             VimEditMode::Apply,
             &request.tool_call_id,
             "vim_edit.apply",
@@ -1029,6 +1170,14 @@ mod tests {
         }
     }
 
+    fn workspace_context(path: &Path) -> Vec<bcode_tool::ToolHostContextEntry> {
+        vec![bcode_tool::ToolHostContextEntry {
+            schema: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA.to_owned(),
+            schema_version: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION,
+            payload: serde_json::json!({"working_directory": path}),
+        }]
+    }
+
     #[test]
     fn preview_tool_is_read_only_without_permission() {
         let tool = preview_tool_definition();
@@ -1038,14 +1187,14 @@ mod tests {
                 tool_name: tool.name.clone(),
                 arguments: json!({"path": "src/lib.rs", "steps": []}),
             },
-            host_context: Vec::new(),
+            host_context: workspace_context(Path::new("/tmp/workspace")),
         };
         let policy = vim_edit_policy_operation(&request, &tool).expect("preview policy");
         assert!(!policy.requires_permission);
         assert_eq!(
             policy.operation,
             bcode_plugin_sdk::ToolPolicyOperation::Read {
-                paths: vec!["src/lib.rs".to_owned()],
+                paths: vec!["/tmp/workspace/src/lib.rs".to_owned()],
             }
         );
     }
@@ -1064,17 +1213,91 @@ mod tests {
                     ]
                 }),
             },
-            host_context: Vec::new(),
+            host_context: workspace_context(Path::new("/tmp/workspace")),
         };
         let policy = vim_edit_policy_operation(&request, &tool).expect("apply policy");
         assert!(policy.requires_permission);
         assert_eq!(
             policy.operation,
             bcode_plugin_sdk::ToolPolicyOperation::Write {
-                paths: vec!["src/lib.rs".to_owned(), "src/main.rs".to_owned()],
+                paths: vec![
+                    "/tmp/workspace/src/lib.rs".to_owned(),
+                    "/tmp/workspace/src/main.rs".to_owned(),
+                ],
                 category: "write".to_owned(),
             }
         );
+        assert_eq!(
+            serde_json::from_value::<VimEditPreparationDescriptor>(policy.descriptor)
+                .expect("Vim edit descriptor"),
+            VimEditPreparationDescriptor {
+                workspace_root: Some(PathBuf::from("/tmp/workspace")),
+                paths: vec![
+                    PathBuf::from("/tmp/workspace/src/lib.rs"),
+                    PathBuf::from("/tmp/workspace/src/main.rs"),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn vim_edit_relative_path_requires_workspace_context() {
+        let tool = preview_tool_definition();
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "preview".to_owned(),
+                tool_name: tool.name.clone(),
+                arguments: json!({"path": "src/lib.rs", "steps": []}),
+            },
+            host_context: Vec::new(),
+        };
+
+        let error = vim_edit_policy_operation(&request, &tool)
+            .expect_err("relative path without workspace");
+
+        assert!(error.contains("requires workspace host context"));
+    }
+
+    #[test]
+    fn vim_edit_invocation_applies_ordered_prepared_paths() {
+        let mut arguments = json!({
+            "files": [
+                {"path": "src/lib.rs", "steps": []},
+                {"path": "src/main.rs", "steps": []}
+            ]
+        });
+        let descriptor = VimEditPreparationDescriptor {
+            workspace_root: Some(PathBuf::from("/tmp/workspace")),
+            paths: vec![
+                PathBuf::from("/tmp/workspace/src/lib.rs"),
+                PathBuf::from("/tmp/workspace/src/main.rs"),
+            ],
+        };
+
+        apply_vim_edit_preparation(&mut arguments, &descriptor)
+            .expect("apply Vim edit preparation");
+
+        assert_eq!(arguments["files"][0]["path"], "/tmp/workspace/src/lib.rs");
+        assert_eq!(arguments["files"][1]["path"], "/tmp/workspace/src/main.rs");
+    }
+
+    #[test]
+    fn vim_edit_invocation_rejects_descriptor_path_count_mismatch() {
+        let mut arguments = json!({
+            "files": [
+                {"path": "src/lib.rs", "steps": []},
+                {"path": "src/main.rs", "steps": []}
+            ]
+        });
+        let descriptor = VimEditPreparationDescriptor {
+            workspace_root: Some(PathBuf::from("/tmp/workspace")),
+            paths: vec![PathBuf::from("/tmp/workspace/src/lib.rs")],
+        };
+
+        let error = apply_vim_edit_preparation(&mut arguments, &descriptor)
+            .expect_err("descriptor mismatch");
+
+        assert!(error.contains("path count does not match"));
     }
 
     #[test]
@@ -1292,7 +1515,6 @@ mod tests {
                 "steps": [{ "ex": "%s/foo/bar/" }]
             }),
             preparation_descriptor: serde_json::Value::Null,
-            cwd: None,
         });
         assert!(!response.is_error, "{}", response.output);
         assert!(response.output.contains("bar"));
@@ -1318,7 +1540,6 @@ mod tests {
                 "steps": [{ "ex": "%s/foo/bar/" }]
             }),
             preparation_descriptor: serde_json::Value::Null,
-            cwd: None,
         });
         assert!(!response.is_error, "{}", response.output);
         assert_eq!(
@@ -1348,7 +1569,6 @@ mod tests {
                 ]
             }),
             preparation_descriptor: serde_json::Value::Null,
-            cwd: None,
         });
         assert!(!response.is_error, "{}", response.output);
         assert_eq!(
@@ -1384,7 +1604,6 @@ mod tests {
                 ]
             }),
             preparation_descriptor: serde_json::Value::Null,
-            cwd: None,
         });
         assert!(!response.is_error, "{}", response.output);
         assert_eq!(
@@ -1417,7 +1636,6 @@ mod tests {
                 ]
             }),
             preparation_descriptor: serde_json::Value::Null,
-            cwd: None,
         });
         assert!(response.is_error);
         assert_eq!(

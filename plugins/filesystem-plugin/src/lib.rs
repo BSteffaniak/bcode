@@ -326,17 +326,80 @@ fn invoke_filesystem_service(context: &NativeServiceContext) -> ServiceResponse 
     }
 }
 
-fn filesystem_policy_operation(
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct FilesystemPreparationDescriptor {
+    #[serde(default)]
+    workspace_root: Option<PathBuf>,
+    #[serde(default)]
+    path: Option<PathBuf>,
+}
+
+fn filesystem_workspace_root(
     request: &bcode_tool::ToolPreparationRequest,
-    definition: &ToolDefinition,
-) -> Result<bcode_plugin_sdk::ToolPolicyPreparation, String> {
-    let path = request
+) -> Result<Option<PathBuf>, String> {
+    let mut matching = request
+        .host_context
+        .iter()
+        .filter(|entry| entry.schema == bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA);
+    let Some(entry) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        return Err("duplicate Filesystem workspace host context".to_owned());
+    }
+    if entry.schema_version != bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported Filesystem workspace host context version {}; expected {}",
+            entry.schema_version,
+            bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION
+        ));
+    }
+    let root = entry
+        .payload
+        .get("working_directory")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            "Filesystem workspace host context working_directory is missing".to_owned()
+        })?;
+    let root = PathBuf::from(root);
+    if !root.is_absolute() {
+        return Err("Filesystem workspace working directory must be absolute".to_owned());
+    }
+    Ok(Some(root))
+}
+
+fn filesystem_prepared_path(
+    request: &bcode_tool::ToolPreparationRequest,
+    workspace_root: Option<&Path>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(path) = request
         .invocation
         .arguments
         .get("path")
         .and_then(serde_json::Value::as_str)
-        .map(ToString::to_string);
-    let paths = path.into_iter().collect::<Vec<_>>();
+        .map(PathBuf::from)
+    else {
+        return Ok(None);
+    };
+    if path.is_absolute() {
+        return Ok(Some(path));
+    }
+    let root = workspace_root
+        .ok_or_else(|| "Filesystem relative path requires workspace host context".to_owned())?;
+    Ok(Some(root.join(path)))
+}
+
+fn filesystem_policy_operation(
+    request: &bcode_tool::ToolPreparationRequest,
+    definition: &ToolDefinition,
+) -> Result<bcode_plugin_sdk::ToolPolicyPreparation, String> {
+    let workspace_root = filesystem_workspace_root(request)?;
+    let path = filesystem_prepared_path(request, workspace_root.as_deref())?;
+    let paths = path
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .into_iter()
+        .collect::<Vec<_>>();
     let (requires_permission, identity, operation) = match definition.name.as_str() {
         "filesystem.write" => (
             true,
@@ -388,8 +451,36 @@ fn filesystem_policy_operation(
     };
     Ok(
         bcode_plugin_sdk::ToolPolicyPreparation::new(requires_permission, operation)
-            .with_identity(identity),
+            .with_identity(identity)
+            .with_descriptor(
+                serde_json::to_value(FilesystemPreparationDescriptor {
+                    workspace_root,
+                    path,
+                })
+                .map_err(|error| error.to_string())?,
+            ),
     )
+}
+
+fn apply_filesystem_preparation(
+    arguments: &mut serde_json::Value,
+    descriptor: &FilesystemPreparationDescriptor,
+) -> Result<(), String> {
+    let object = arguments
+        .as_object_mut()
+        .ok_or_else(|| "Filesystem tool arguments must be an object".to_owned())?;
+    if !object.contains_key("path") {
+        return Ok(());
+    }
+    let path = descriptor
+        .path
+        .as_ref()
+        .ok_or_else(|| "Filesystem preparation descriptor is missing path".to_owned())?;
+    object.insert(
+        "path".to_owned(),
+        serde_json::Value::String(path.display().to_string()),
+    );
+    Ok(())
 }
 
 fn invoke_tool_service(context: &NativeServiceContext) -> ServiceResponse {
@@ -715,8 +806,7 @@ fn emit_tool_contribution(
 }
 
 fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
-    let request = &context.request;
-    let request = match request.payload_json::<ToolInvocationRequest>() {
+    let request = match context.request.payload_json::<ToolInvocationRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
@@ -729,55 +819,56 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             result: None,
         });
     }
-    let cwd = request.cwd.clone();
+    let descriptor = match serde_json::from_value::<FilesystemPreparationDescriptor>(
+        request.preparation_descriptor.clone(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(error) => {
+            return json_response(&tool_error(format!(
+                "invalid Filesystem preparation descriptor: {error}"
+            )));
+        }
+    };
     emit_tool_contribution(
         context.events,
         ToolContributionPlacement::Request,
         &filesystem_request_contribution(&request.tool_call_id, &request.name, &request.arguments),
     );
+    let mut arguments = request.arguments;
+    if let Err(error) = apply_filesystem_preparation(&mut arguments, &descriptor) {
+        return json_response(&tool_error(error));
+    }
+    let cwd = descriptor.workspace_root.as_deref();
     let response = match request.name.as_str() {
-        "filesystem.read" => tool_read(
-            request.arguments,
-            cwd.as_deref(),
-            &request.tool_call_id,
-            &context.bridge,
-        ),
-        "filesystem.write" => tool_write(request.arguments, cwd.as_deref(), &request.tool_call_id),
-        "filesystem.edit" => tool_edit(request.arguments, cwd.as_deref(), &request.tool_call_id),
-        "filesystem.exists" => {
-            tool_exists(request.arguments, cwd.as_deref(), &request.tool_call_id)
-        }
+        "filesystem.read" => tool_read(arguments, cwd, &request.tool_call_id, &context.bridge),
+        "filesystem.write" => tool_write(arguments, None, &request.tool_call_id),
+        "filesystem.edit" => tool_edit(arguments, None, &request.tool_call_id),
+        "filesystem.exists" => tool_exists(arguments, None, &request.tool_call_id),
         "filesystem.list" => tool_list(
-            request.arguments,
-            cwd.as_deref(),
+            arguments,
+            None,
             &context.cancellation,
             context.events,
             &request.tool_call_id,
         ),
         "filesystem.find" => tool_find(
-            request.arguments,
-            cwd.as_deref(),
+            arguments,
+            None,
             &context.cancellation,
             context.events,
             &request.tool_call_id,
         ),
         "filesystem.grep" => tool_grep(
-            request.arguments,
-            cwd.as_deref(),
+            arguments,
+            None,
             &context.cancellation,
             context.events,
             &request.tool_call_id,
         ),
-        "filesystem.stat" => tool_stat(request.arguments, cwd.as_deref(), &request.tool_call_id),
-        "artifact.metadata" => {
-            tool_artifact_metadata(request.arguments, cwd.as_deref(), &request.tool_call_id)
-        }
-        "artifact.read" => {
-            tool_artifact_read(request.arguments, cwd.as_deref(), &request.tool_call_id)
-        }
-        "artifact.grep" => {
-            tool_artifact_grep(request.arguments, cwd.as_deref(), &request.tool_call_id)
-        }
+        "filesystem.stat" => tool_stat(arguments, None, &request.tool_call_id),
+        "artifact.metadata" => tool_artifact_metadata(arguments, None, &request.tool_call_id),
+        "artifact.read" => tool_artifact_read(arguments, None, &request.tool_call_id),
+        "artifact.grep" => tool_artifact_grep(arguments, None, &request.tool_call_id),
         _ => ToolInvocationResponse {
             output: format!("unknown filesystem tool: {}", request.name),
             is_error: true,
@@ -2364,6 +2455,16 @@ fn io_error(error: &std::io::Error) -> ServiceResponse {
     ServiceResponse::error("io_error", error.to_string())
 }
 
+const fn tool_error(output: String) -> ToolInvocationResponse {
+    ToolInvocationResponse {
+        output,
+        is_error: true,
+        content: Vec::new(),
+        full_output: None,
+        result: None,
+    }
+}
+
 fn tool_io_error(error: &std::io::Error) -> ToolInvocationResponse {
     ToolInvocationResponse {
         output: error.to_string(),
@@ -2513,6 +2614,14 @@ mod tests {
         }
     }
 
+    fn workspace_context(path: &Path) -> Vec<bcode_tool::ToolHostContextEntry> {
+        vec![bcode_tool::ToolHostContextEntry {
+            schema: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA.to_owned(),
+            schema_version: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION,
+            payload: serde_json::json!({"working_directory": path}),
+        }]
+    }
+
     #[test]
     fn filesystem_owner_prepares_path_operations_without_generic_extractors() {
         let operation = |definition: ToolDefinition, arguments| {
@@ -2522,7 +2631,7 @@ mod tests {
                     tool_name: definition.name.clone(),
                     arguments,
                 },
-                host_context: Vec::new(),
+                host_context: workspace_context(Path::new("/tmp/workspace")),
             };
             filesystem_policy_operation(&request, &definition).expect("filesystem policy")
         };
@@ -2534,7 +2643,7 @@ mod tests {
         assert_eq!(
             read.operation,
             bcode_plugin_sdk::ToolPolicyOperation::Read {
-                paths: vec!["src/lib.rs".to_owned()],
+                paths: vec!["/tmp/workspace/src/lib.rs".to_owned()],
             }
         );
         let write = operation(write_tool_definition(), json!({"path": "src/lib.rs"}));
@@ -2545,10 +2654,64 @@ mod tests {
         assert_eq!(
             write.operation,
             bcode_plugin_sdk::ToolPolicyOperation::Write {
-                paths: vec!["src/lib.rs".to_owned()],
+                paths: vec!["/tmp/workspace/src/lib.rs".to_owned()],
                 category: "write".to_owned(),
             }
         );
+        assert_eq!(
+            serde_json::from_value::<FilesystemPreparationDescriptor>(write.descriptor)
+                .expect("Filesystem descriptor"),
+            FilesystemPreparationDescriptor {
+                workspace_root: Some(PathBuf::from("/tmp/workspace")),
+                path: Some(PathBuf::from("/tmp/workspace/src/lib.rs")),
+            }
+        );
+    }
+
+    #[test]
+    fn filesystem_relative_path_requires_workspace_context() {
+        let definition = read_tool_definition();
+        let request = bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "call".to_owned(),
+                tool_name: definition.name.clone(),
+                arguments: json!({"path": "src/lib.rs"}),
+            },
+            host_context: Vec::new(),
+        };
+
+        let error = filesystem_policy_operation(&request, &definition)
+            .expect_err("relative path without workspace");
+
+        assert!(error.contains("requires workspace host context"));
+    }
+
+    #[test]
+    fn filesystem_invocation_replaces_path_with_owner_prepared_path() {
+        let mut arguments = json!({"path": "src/lib.rs", "offset": 2});
+        let descriptor = FilesystemPreparationDescriptor {
+            workspace_root: Some(PathBuf::from("/tmp/workspace")),
+            path: Some(PathBuf::from("/tmp/workspace/src/lib.rs")),
+        };
+
+        apply_filesystem_preparation(&mut arguments, &descriptor)
+            .expect("apply Filesystem preparation");
+
+        assert_eq!(arguments["path"], "/tmp/workspace/src/lib.rs");
+        assert_eq!(arguments["offset"], 2);
+    }
+
+    #[test]
+    fn filesystem_invocation_rejects_missing_path_descriptor() {
+        let mut arguments = json!({"path": "src/lib.rs"});
+
+        let error = apply_filesystem_preparation(
+            &mut arguments,
+            &FilesystemPreparationDescriptor::default(),
+        )
+        .expect_err("missing prepared path");
+
+        assert!(error.contains("missing path"));
     }
 
     #[test]

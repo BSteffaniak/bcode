@@ -15734,7 +15734,6 @@ async fn invoke_server_registered_tool(
         invoker.state,
         invoker.session_id,
         &call,
-        invoker.working_directory,
         plugin_id,
         &policy_metadata,
         invocation.preparation.descriptor.clone(),
@@ -17061,7 +17060,6 @@ async fn invoke_plugin_tool_transport(
     state: &ServerState,
     session_id: SessionId,
     call: &bcode_model::ToolCall,
-    working_directory: &std::path::Path,
     plugin_id: &str,
     policy_metadata: &ToolPolicyAuthorizationMetadata,
     preparation_descriptor: serde_json::Value,
@@ -17107,7 +17105,6 @@ async fn invoke_plugin_tool_transport(
         },
     )
     .await;
-    let working_directory = working_directory.to_path_buf();
     let (input_sender, input_receiver) = mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY);
     let input_receiver = Mutex::new(input_receiver);
     let _action_registration = ActivePluginInvocationRegistration::register(
@@ -17125,7 +17122,6 @@ async fn invoke_plugin_tool_transport(
         name: call.name.clone(),
         arguments: call.arguments.clone(),
         preparation_descriptor,
-        cwd: Some(working_directory),
     };
     let payload = serde_json::to_vec(&request).map_err(|error| error.to_string())?;
     let scope = active_plugin_scope_for_tool_call(state, session_id, &call.id).await;
@@ -27661,7 +27657,6 @@ library = "test"
             &state,
             session_id,
             &call,
-            &working_directory,
             tool,
             preparation,
             &policy_metadata,
@@ -27795,7 +27790,6 @@ library = "test"
         state: &ServerState,
         session_id: SessionId,
         call: &bcode_model::ToolCall,
-        working_directory: &Path,
         tool: RegisteredTool,
         preparation: ToolPreparationResponse,
         policy_metadata: &ToolPolicyAuthorizationMetadata,
@@ -27834,7 +27828,6 @@ library = "test"
             state,
             session_id,
             call,
-            working_directory,
             &plugin_id,
             policy_metadata,
             preparation.descriptor,
@@ -30470,13 +30463,11 @@ library = "test"
                 .expect("tool policy");
         let task_state = Arc::clone(&state);
         let task_call = call.clone();
-        let working_directory = workspace.path().to_path_buf();
         let task = tokio::spawn(async move {
             invoke_prepared_tool_for_test(
                 task_state.as_ref(),
                 session_id,
                 &task_call,
-                &working_directory,
                 tool,
                 preparation,
                 &policy_metadata,
@@ -30593,7 +30584,6 @@ library = "test"
         let policy_metadata =
             tool_policy_authorization_metadata(&preparation.authorization, &call.name)
                 .expect("tool policy fact");
-        let working_directory = test_working_directory();
         let cancel_state = Arc::new(TurnCancelState::default());
         let task_state = Arc::clone(&state);
         let task_call = call.clone();
@@ -30603,7 +30593,6 @@ library = "test"
                 task_state.as_ref(),
                 session_id,
                 &task_call,
-                &working_directory,
                 tool,
                 preparation,
                 &policy_metadata,
@@ -30775,7 +30764,6 @@ library = "test"
         let policy_metadata =
             tool_policy_authorization_metadata(&preparation.authorization, &call.name)
                 .expect("tool policy fact");
-        let working_directory = test_working_directory();
         let cancel_state = Arc::new(TurnCancelState::default());
         let task_state = Arc::clone(&state);
         let task_call = call.clone();
@@ -30785,7 +30773,6 @@ library = "test"
                 task_state.as_ref(),
                 session_id,
                 &task_call,
-                &working_directory,
                 tool,
                 preparation,
                 &policy_metadata,

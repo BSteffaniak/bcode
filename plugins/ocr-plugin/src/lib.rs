@@ -103,9 +103,86 @@ fn progress_lifecycle_event(
     }
 }
 
-fn ocr_policy_preparation(definition: &ToolDefinition) -> bcode_plugin_sdk::ToolPolicyPreparation {
-    let preparation = bcode_plugin_sdk::ToolPolicyPreparation::read_only();
-    if definition.name == "ocr.extract" {
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct OcrPreparationDescriptor {
+    #[serde(default)]
+    workspace_root: Option<PathBuf>,
+    #[serde(default)]
+    source_path: Option<PathBuf>,
+}
+
+fn ocr_workspace_root(
+    request: &bcode_tool::ToolPreparationRequest,
+) -> Result<Option<PathBuf>, String> {
+    let mut matching = request
+        .host_context
+        .iter()
+        .filter(|entry| entry.schema == bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA);
+    let Some(entry) = matching.next() else {
+        return Ok(None);
+    };
+    if matching.next().is_some() {
+        return Err("duplicate OCR workspace host context".to_owned());
+    }
+    if entry.schema_version != bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported OCR workspace host context version {}; expected {}",
+            entry.schema_version,
+            bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION
+        ));
+    }
+    let root = entry
+        .payload
+        .get("working_directory")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "OCR workspace host context working_directory is missing".to_owned())?;
+    let root = PathBuf::from(root);
+    if !root.is_absolute() {
+        return Err("OCR workspace working directory must be absolute".to_owned());
+    }
+    Ok(Some(root))
+}
+
+fn ocr_policy_preparation(
+    request: &bcode_tool::ToolPreparationRequest,
+    definition: &ToolDefinition,
+) -> Result<bcode_plugin_sdk::ToolPolicyPreparation, String> {
+    let workspace_root = ocr_workspace_root(request)?;
+    let (operation, source_path) = match definition.name.as_str() {
+        "ocr.status" => (bcode_plugin_sdk::ToolPolicyOperation::ReadOnly, None),
+        "ocr.extract" => {
+            let extract =
+                serde_json::from_value::<ExtractRequest>(request.invocation.arguments.clone())
+                    .map_err(|error| format!("invalid OCR extraction request: {error}"))?;
+            match source(&extract).map_err(|error| error.to_string())? {
+                OcrSource::Url(url) => (
+                    bcode_plugin_sdk::ToolPolicyOperation::Web { url: Some(url) },
+                    None,
+                ),
+                OcrSource::Path(path) => {
+                    let path = if path.is_absolute() {
+                        path
+                    } else {
+                        workspace_root
+                            .as_ref()
+                            .ok_or_else(|| {
+                                "OCR relative path requires workspace host context".to_owned()
+                            })?
+                            .join(path)
+                    };
+                    (
+                        bcode_plugin_sdk::ToolPolicyOperation::Read {
+                            paths: vec![path.display().to_string()],
+                        },
+                        Some(path),
+                    )
+                }
+            }
+        }
+        name => return Err(format!("unsupported OCR policy operation: {name}")),
+    };
+    let preparation = bcode_plugin_sdk::ToolPolicyPreparation::new(false, operation);
+    let preparation = if definition.name == "ocr.extract" {
         preparation.with_identity(bcode_plugin_sdk::ToolPolicyIdentity {
             aliases: vec!["read".to_string()],
             compatibility_aliases: Vec::new(),
@@ -114,7 +191,35 @@ fn ocr_policy_preparation(definition: &ToolDefinition) -> bcode_plugin_sdk::Tool
         })
     } else {
         preparation
+    };
+    Ok(preparation.with_descriptor(
+        serde_json::to_value(OcrPreparationDescriptor {
+            workspace_root,
+            source_path,
+        })
+        .map_err(|error| error.to_string())?,
+    ))
+}
+
+fn apply_ocr_preparation(
+    request: &mut ExtractRequest,
+    descriptor: &OcrPreparationDescriptor,
+) -> Result<(), String> {
+    match source(request).map_err(|error| error.to_string())? {
+        OcrSource::Path(_) => {
+            let source_path = descriptor.source_path.clone().ok_or_else(|| {
+                "OCR preparation descriptor is missing the local source path".to_owned()
+            })?;
+            request.path = Some(source_path);
+        }
+        OcrSource::Url(_) if descriptor.source_path.is_some() => {
+            return Err(
+                "OCR preparation descriptor contains a source path for a URL request".to_owned(),
+            );
+        }
+        OcrSource::Url(_) => {}
     }
+    Ok(())
 }
 
 impl OcrPlugin {
@@ -125,7 +230,7 @@ impl OcrPlugin {
             bcode_tool::OP_PREPARE_TOOL => prepare_tool_service_response(
                 request,
                 [extract_tool_definition(), status_tool_definition()],
-                |_request, definition| Ok(ocr_policy_preparation(definition)),
+                ocr_policy_preparation,
             ),
             OP_INVOKE_TOOL => self.invoke_tool(request, context.events),
             _ => ServiceResponse::error("unsupported_operation", "unsupported tool operation"),
@@ -166,10 +271,22 @@ impl OcrPlugin {
         invocation: &ToolInvocationRequest,
         events: ServiceEventEmitter,
     ) -> ToolInvocationResponse {
-        let request = match serde_json::from_value::<ExtractRequest>(invocation.arguments.clone()) {
-            Ok(request) => request,
-            Err(error) => return tool_error(error.to_string()),
+        let mut request =
+            match serde_json::from_value::<ExtractRequest>(invocation.arguments.clone()) {
+                Ok(request) => request,
+                Err(error) => return tool_error(error.to_string()),
+            };
+        let descriptor = match serde_json::from_value::<OcrPreparationDescriptor>(
+            invocation.preparation_descriptor.clone(),
+        ) {
+            Ok(descriptor) => descriptor,
+            Err(error) => {
+                return tool_error(format!("invalid OCR preparation descriptor: {error}"));
+            }
         };
+        if let Err(error) = apply_ocr_preparation(&mut request, &descriptor) {
+            return tool_error(error);
+        }
         let runtime = match &self.runtime {
             Ok(runtime) => runtime,
             Err(error) => return tool_error(format!("OCR runtime unavailable: {error}")),
@@ -178,7 +295,9 @@ impl OcrPlugin {
         progress.emit("OCR extraction started");
         match runtime.block_on(extract_async(
             request,
-            invocation.cwd.clone().unwrap_or_else(|| PathBuf::from(".")),
+            descriptor
+                .workspace_root
+                .unwrap_or_else(|| PathBuf::from(".")),
             Some(progress),
         )) {
             Ok(Ok(response)) => ocr_tool_response(&response, &invocation.tool_call_id),
@@ -887,20 +1006,136 @@ mod tests {
         }
     }
 
+    fn preparation_request(
+        definition: &ToolDefinition,
+        arguments: serde_json::Value,
+        host_context: Vec<bcode_tool::ToolHostContextEntry>,
+    ) -> bcode_tool::ToolPreparationRequest {
+        bcode_tool::ToolPreparationRequest {
+            invocation: bcode_tool::ToolInvocationDescriptor {
+                invocation_id: "call".to_owned(),
+                tool_name: definition.name.clone(),
+                arguments,
+            },
+            host_context,
+        }
+    }
+
+    fn workspace_context(path: &Path) -> Vec<bcode_tool::ToolHostContextEntry> {
+        vec![bcode_tool::ToolHostContextEntry {
+            schema: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA.to_owned(),
+            schema_version: bcode_tool::TOOL_WORKSPACE_CONTEXT_SCHEMA_VERSION,
+            payload: serde_json::json!({"working_directory": path}),
+        }]
+    }
+
     #[test]
-    fn ocr_owner_prepares_catalog_policy_identity() {
-        let extract = ocr_policy_preparation(&extract_tool_definition());
-        assert_eq!(extract.identity.aliases, vec!["read"]);
-        assert_eq!(extract.identity.capabilities, vec!["ocr", "read"]);
+    fn ocr_owner_prepares_exact_local_source_and_preserves_permission_behavior() {
+        let definition = extract_tool_definition();
+        let request = preparation_request(
+            &definition,
+            serde_json::json!({"path": "image.png"}),
+            workspace_context(Path::new("/tmp/workspace")),
+        );
+
+        let prepared = ocr_policy_preparation(&request, &definition).expect("OCR preparation");
+
+        assert!(!prepared.requires_permission);
+        assert_eq!(prepared.identity.aliases, vec!["read"]);
+        assert_eq!(prepared.identity.capabilities, vec!["ocr", "read"]);
         assert_eq!(
-            extract.identity.permission_category.as_deref(),
+            prepared.identity.permission_category.as_deref(),
             Some("read")
         );
-        let status = ocr_policy_preparation(&status_tool_definition());
         assert_eq!(
-            status.identity,
+            prepared.operation,
+            bcode_plugin_sdk::ToolPolicyOperation::Read {
+                paths: vec!["/tmp/workspace/image.png".to_owned()],
+            }
+        );
+        assert_eq!(
+            serde_json::from_value::<OcrPreparationDescriptor>(prepared.descriptor)
+                .expect("OCR descriptor"),
+            OcrPreparationDescriptor {
+                workspace_root: Some(PathBuf::from("/tmp/workspace")),
+                source_path: Some(PathBuf::from("/tmp/workspace/image.png")),
+            }
+        );
+    }
+
+    #[test]
+    fn ocr_status_preparation_remains_permission_free_and_read_only() {
+        let definition = status_tool_definition();
+        let request = preparation_request(&definition, serde_json::Value::Null, Vec::new());
+
+        let prepared = ocr_policy_preparation(&request, &definition).expect("OCR status");
+
+        assert!(!prepared.requires_permission);
+        assert_eq!(
+            prepared.identity,
             bcode_plugin_sdk::ToolPolicyIdentity::default()
         );
+        assert_eq!(
+            prepared.operation,
+            bcode_plugin_sdk::ToolPolicyOperation::ReadOnly
+        );
+    }
+
+    #[test]
+    fn ocr_relative_source_requires_workspace_context() {
+        let definition = extract_tool_definition();
+        let request = preparation_request(
+            &definition,
+            serde_json::json!({"path": "image.png"}),
+            Vec::new(),
+        );
+
+        let error = ocr_policy_preparation(&request, &definition)
+            .expect_err("relative source without workspace");
+
+        assert!(error.contains("requires workspace host context"));
+    }
+
+    #[test]
+    fn ocr_invocation_uses_prepared_local_source_path() {
+        let mut request = ExtractRequest {
+            path: Some(PathBuf::from("image.png")),
+            url: None,
+            language: None,
+            engine: None,
+            options: None,
+            max_bytes: None,
+            timeout_ms: None,
+        };
+        let descriptor = OcrPreparationDescriptor {
+            workspace_root: Some(PathBuf::from("/tmp/workspace")),
+            source_path: Some(PathBuf::from("/tmp/workspace/image.png")),
+        };
+
+        apply_ocr_preparation(&mut request, &descriptor).expect("apply preparation");
+
+        assert_eq!(
+            request.path,
+            Some(PathBuf::from("/tmp/workspace/image.png"))
+        );
+    }
+
+    #[test]
+    fn ocr_invocation_rejects_missing_local_source_descriptor() {
+        let mut request = ExtractRequest {
+            path: Some(PathBuf::from("image.png")),
+            url: None,
+            language: None,
+            engine: None,
+            options: None,
+            max_bytes: None,
+            timeout_ms: None,
+        };
+
+        let error = apply_ocr_preparation(&mut request, &OcrPreparationDescriptor::default())
+            .expect_err("missing prepared source");
+
+        assert!(error.contains("missing the local source path"));
     }
 
     #[test]

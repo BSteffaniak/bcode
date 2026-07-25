@@ -28,7 +28,6 @@ pub use interaction::{
     InteractionOutput, InteractionValue,
 };
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 
 /// Plugin service interface for model-callable tools.
 pub const TOOL_SERVICE_INTERFACE_ID: &str = "bcode.tool/v1";
@@ -158,9 +157,6 @@ pub struct ToolInvocationRequest {
     /// Opaque tool-owner-produced descriptor returned by preparation.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub preparation_descriptor: serde_json::Value,
-    /// Canonical session working directory for this invocation.
-    #[serde(default)]
-    pub cwd: Option<PathBuf>,
 }
 
 /// Tool invocation response.

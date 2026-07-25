@@ -3578,7 +3578,6 @@ async fn execute_plugin_tool(
         name: descriptor.tool_name.clone(),
         arguments: descriptor.arguments.clone(),
         preparation_descriptor,
-        cwd: None,
     };
     let payload = serde_json::to_vec(&request).map_err(|error| RuntimeError::ToolExecution {
         tool_name: descriptor.tool_name.clone(),

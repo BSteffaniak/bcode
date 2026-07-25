@@ -883,11 +883,14 @@ if rg -n '\bartifact_dir\b|default_artifact_root|XDG_STATE_HOME' \
   violations=1
 fi
 
-if rg -n '\bpub artifact_dir: Option<PathBuf>|ToolInvocationRequest \{[[:space:][:print:]]*artifact_dir:' \
-   packages/tool/src packages/server/src packages/bcode/src packages/eval/src packages/plugin/src plugins \
-   >/tmp/bcode-tool-invocation-artifact-directory.txt; then
-  echo "Runtime architecture violation: legacy ToolInvocationRequest artifact-directory transport returned." >&2
-  cat /tmp/bcode-tool-invocation-artifact-directory.txt >&2
+tool_invocation_request_fields="$(
+  sed -n '/^pub struct ToolInvocationRequest {/,/^}/p' packages/tool/src/lib.rs
+)"
+if grep -E '\b(cwd|artifact_dir):' <<<"$tool_invocation_request_fields" >/tmp/bcode-tool-invocation-legacy-paths.txt ||
+   rg -n 'invocation\.cwd|invocation\.artifact_dir' plugins packages/server/src packages/bcode/src packages/eval/src packages/plugin/src \
+   --glob '*.rs' >>/tmp/bcode-tool-invocation-legacy-paths.txt; then
+  echo "Runtime architecture violation: legacy ToolInvocationRequest path transport returned." >&2
+  cat /tmp/bcode-tool-invocation-legacy-paths.txt >&2
   violations=1
 fi
 
@@ -919,6 +922,20 @@ if awk '/^#\[cfg\(test\)\]/{exit} {print}' plugins/git-plugin/src/lib.rs |
    ! rg -U 'execute_direct_tool_variant\([\s\S]*OP_PREPARE_TOOL[\s\S]*preparation_descriptor: prepared\.descriptor' packages/eval/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: Git/Eval reintroduced legacy invocation path transport or preparation bypass." >&2
   cat /tmp/bcode-git-legacy-invocation-paths.txt 2>/dev/null >&2 || true
+  violations=1
+fi
+
+if ! grep -F 'document_invocation_uses_prepared_local_source_path' plugins/document-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'document_invocation_rejects_missing_local_source_descriptor' plugins/document-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'ocr_owner_prepares_exact_local_source_and_preserves_permission_behavior' plugins/ocr-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'ocr_invocation_rejects_missing_local_source_descriptor' plugins/ocr-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'filesystem_invocation_replaces_path_with_owner_prepared_path' plugins/filesystem-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'filesystem_invocation_rejects_missing_path_descriptor' plugins/filesystem-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'vim_edit_invocation_applies_ordered_prepared_paths' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'vim_edit_invocation_rejects_descriptor_path_count_mismatch' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'worktree_preparation_preserves_explicit_cwd_precedence_and_resolves_remove_path' plugins/worktree-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'worktree_relative_cwd_requires_workspace_context' plugins/worktree-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: owner-prepared workspace path conformance coverage was removed." >&2
   violations=1
 fi
 
