@@ -2218,6 +2218,10 @@ pub enum ProviderTurnEvent {
     ReasoningDelta {
         text: String,
     },
+    /// Provider-neutral reasoning activity operation.
+    ReasoningActivity {
+        event: bcode_session_models::ReasoningActivityEvent,
+    },
     ToolCallStarted {
         call_id: String,
         name: String,

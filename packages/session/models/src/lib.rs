@@ -1185,6 +1185,170 @@ pub struct SessionLiveEvent {
     pub kind: SessionLiveEventKind,
 }
 
+/// Provider-neutral representation of readable reasoning content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningContentKind {
+    /// Provider-generated summary or milestone content.
+    Summary,
+    /// Provider-exposed raw or detailed reasoning content.
+    Raw,
+    /// Untyped reasoning retained for compatibility with legacy producers.
+    Legacy,
+}
+
+/// Provider-neutral semantic role of one readable reasoning part.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningContentRole {
+    /// A provider-defined reasoning milestone or summary section.
+    Milestone,
+    /// Detailed reasoning content.
+    Detail,
+    /// The provider did not classify the part further.
+    #[default]
+    Unknown,
+}
+
+/// Terminal state of a provider-reported reasoning activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningActivityStatus {
+    /// The provider completed the reasoning activity normally.
+    Completed,
+    /// The activity was interrupted before normal completion.
+    Interrupted,
+    /// The activity failed.
+    Failed,
+}
+
+/// One complete readable part of a provider-reported reasoning activity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningPart {
+    /// Stable provider-neutral identifier within the owning activity.
+    pub part_id: String,
+    /// Whether this is summary, raw, or legacy untyped reasoning.
+    pub kind: ReasoningContentKind,
+    /// Provider-supplied semantic role when known.
+    #[serde(default)]
+    pub role: ReasoningContentRole,
+    /// Stable provider order within the owning activity.
+    pub order: u32,
+    /// Complete readable text.
+    pub text: String,
+}
+
+/// Complete durable semantic state for one provider-reported reasoning activity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningActivity {
+    /// Stable activity identifier scoped to the model turn.
+    pub activity_id: String,
+    /// Provider order within the model turn.
+    pub order: u32,
+    /// Terminal activity state.
+    pub status: ReasoningActivityStatus,
+    /// Ordered readable parts exposed by the provider.
+    #[serde(default)]
+    pub parts: Vec<ReasoningPart>,
+    /// Whether the provider supplied opaque evidence of reasoning.
+    ///
+    /// This records only the fact that opaque state existed. Opaque bytes must never be copied
+    /// into this model.
+    #[serde(default)]
+    pub opaque: bool,
+}
+
+/// Incremental provider-neutral reasoning operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ReasoningActivityEvent {
+    /// A provider supplied evidence that a reasoning activity started.
+    Started {
+        /// Stable activity identifier scoped to the model turn.
+        activity_id: String,
+        /// Provider order within the model turn.
+        order: u32,
+    },
+    /// Append readable text to one reasoning part.
+    PartDelta {
+        /// Stable activity identifier scoped to the model turn.
+        activity_id: String,
+        /// Provider order within the model turn.
+        activity_order: u32,
+        /// Stable part identifier within the activity.
+        part_id: String,
+        /// Whether this is summary, raw, or legacy untyped reasoning.
+        kind: ReasoningContentKind,
+        /// Provider-supplied semantic role when known.
+        #[serde(default)]
+        role: ReasoningContentRole,
+        /// Stable provider order within the activity.
+        part_order: u32,
+        /// Nonempty incremental readable text.
+        text: String,
+    },
+    /// Set authoritative complete text for one reasoning part.
+    PartCompleted {
+        /// Stable activity identifier scoped to the model turn.
+        activity_id: String,
+        /// Provider order within the model turn.
+        activity_order: u32,
+        /// Stable part identifier within the activity.
+        part_id: String,
+        /// Whether this is summary, raw, or legacy untyped reasoning.
+        kind: ReasoningContentKind,
+        /// Provider-supplied semantic role when known.
+        #[serde(default)]
+        role: ReasoningContentRole,
+        /// Stable provider order within the activity.
+        part_order: u32,
+        /// Complete readable text. Empty text is valid when the provider completes an empty part.
+        text: String,
+    },
+    /// Record opaque evidence without exposing provider-owned bytes.
+    OpaqueObserved {
+        /// Stable activity identifier scoped to the model turn.
+        activity_id: String,
+        /// Provider order within the model turn.
+        activity_order: u32,
+    },
+    /// Finish a reasoning activity.
+    Finished {
+        /// Stable activity identifier scoped to the model turn.
+        activity_id: String,
+        /// Provider order within the model turn.
+        activity_order: u32,
+        /// Terminal activity state.
+        status: ReasoningActivityStatus,
+    },
+}
+
+impl ReasoningActivityEvent {
+    /// Return the stable activity identifier.
+    #[must_use]
+    pub fn activity_id(&self) -> &str {
+        match self {
+            Self::Started { activity_id, .. }
+            | Self::PartDelta { activity_id, .. }
+            | Self::PartCompleted { activity_id, .. }
+            | Self::OpaqueObserved { activity_id, .. }
+            | Self::Finished { activity_id, .. } => activity_id,
+        }
+    }
+
+    /// Return the stable provider order of the activity.
+    #[must_use]
+    pub const fn activity_order(&self) -> u32 {
+        match self {
+            Self::Started { order, .. } => *order,
+            Self::PartDelta { activity_order, .. }
+            | Self::PartCompleted { activity_order, .. }
+            | Self::OpaqueObserved { activity_order, .. }
+            | Self::Finished { activity_order, .. } => *activity_order,
+        }
+    }
+}
+
 /// Live-only session event payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1193,6 +1357,13 @@ pub enum SessionLiveEventKind {
     AssistantTextDelta { turn_id: String, text: String },
     /// Coalesced provider-exposed reasoning text produced by an active model turn.
     AssistantReasoningDelta { turn_id: String, text: String },
+    /// Provider-neutral reasoning activity operation produced by an active model turn.
+    AssistantReasoningActivity {
+        /// Model turn associated with the activity.
+        turn_id: String,
+        /// Structured reasoning operation.
+        event: ReasoningActivityEvent,
+    },
     /// Opaque renderer contribution published only to currently attached clients.
     ///
     /// Transient contributions are never persisted, indexed, or replayed.
@@ -2064,6 +2235,28 @@ pub enum SessionEventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_activity_event_round_trips_without_opaque_bytes() {
+        let event = ReasoningActivityEvent::PartCompleted {
+            activity_id: "reasoning-1".to_owned(),
+            activity_order: 2,
+            part_id: "summary-0".to_owned(),
+            kind: ReasoningContentKind::Summary,
+            role: ReasoningContentRole::Milestone,
+            part_order: 0,
+            text: "Planning the change".to_owned(),
+        };
+
+        let encoded = serde_json::to_string(&event).expect("reasoning event should encode");
+        let decoded = serde_json::from_str::<ReasoningActivityEvent>(&encoded)
+            .expect("reasoning event should decode");
+
+        assert_eq!(decoded, event);
+        assert_eq!(decoded.activity_id(), "reasoning-1");
+        assert_eq!(decoded.activity_order(), 2);
+        assert!(!encoded.contains("encrypted_content"));
+    }
 
     #[test]
     fn tool_request_draft_models_round_trip_all_operations() {

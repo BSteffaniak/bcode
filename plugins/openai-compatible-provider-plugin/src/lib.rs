@@ -1095,7 +1095,18 @@ struct ToolCallAccumulator {
 struct ReasoningItemAccumulator {
     id: Option<String>,
     encrypted_content: Option<String>,
-    summary: Vec<String>,
+    summary: BTreeMap<u32, String>,
+    content: BTreeMap<u32, String>,
+    started: bool,
+    finished: bool,
+}
+
+impl ReasoningItemAccumulator {
+    fn activity_id(&self, output_index: u32) -> String {
+        self.id
+            .clone()
+            .unwrap_or_else(|| format!("reasoning-{output_index}"))
+    }
 }
 
 fn push_runtime_error(turn: &TurnState, error: &str) {
@@ -3416,14 +3427,39 @@ fn process_responses_stream_line(
                 });
             }
         }
-        "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
-            if let Some(delta) = event.get("delta").and_then(serde_json::Value::as_str)
-                && !delta.is_empty()
+        "response.reasoning_summary_text.delta" => process_responses_reasoning_delta(
+            &event,
+            processor.turn,
+            reasoning_items,
+            bcode_session_models::ReasoningContentKind::Summary,
+        ),
+        "response.reasoning_text.delta" => process_responses_reasoning_delta(
+            &event,
+            processor.turn,
+            reasoning_items,
+            bcode_session_models::ReasoningContentKind::Raw,
+        ),
+        "response.reasoning_summary_text.done" => process_responses_reasoning_done(
+            &event,
+            processor.turn,
+            reasoning_items,
+            bcode_session_models::ReasoningContentKind::Summary,
+        ),
+        "response.reasoning_text.done" => process_responses_reasoning_done(
+            &event,
+            processor.turn,
+            reasoning_items,
+            bcode_session_models::ReasoningContentKind::Raw,
+        ),
+        "response.reasoning_summary_part.added" => {
+            let output_index = reasoning_output_index(&event, reasoning_items);
+            let item = reasoning_items.entry(output_index).or_default();
+            if item.id.is_none()
+                && let Some(item_id) = event.get("item_id").and_then(serde_json::Value::as_str)
             {
-                processor.turn.push(ProviderTurnEvent::ReasoningDelta {
-                    text: delta.to_string(),
-                });
+                item.id = Some(item_id.to_owned());
             }
+            ensure_reasoning_activity_started(processor.turn, output_index, item);
         }
         "response.output_item.added" => {
             process_responses_output_item(
@@ -3433,7 +3469,7 @@ fn process_responses_stream_line(
                 saw_tool_call,
                 processor.name_map,
             );
-            process_responses_reasoning_output_item(&event, reasoning_items);
+            process_responses_reasoning_output_item(&event, processor.turn, reasoning_items, false);
         }
         "response.output_item.done" => {
             process_responses_output_item(
@@ -3443,7 +3479,7 @@ fn process_responses_stream_line(
                 saw_tool_call,
                 processor.name_map,
             );
-            process_responses_reasoning_output_item(&event, reasoning_items);
+            process_responses_reasoning_output_item(&event, processor.turn, reasoning_items, true);
             context_compaction::process_responses_compaction_output_item(
                 &event,
                 processor.turn,
@@ -3534,6 +3570,170 @@ fn process_responses_stream_line(
     Ok(StreamOutcome::Cancelled)
 }
 
+fn reasoning_output_index(
+    event: &serde_json::Value,
+    reasoning_items: &BTreeMap<u32, ReasoningItemAccumulator>,
+) -> u32 {
+    if let Some(output_index) = event
+        .get("output_index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| u32::try_from(index).ok())
+    {
+        return output_index;
+    }
+    let item_id = event
+        .get("item_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            event
+                .get("item")
+                .and_then(|item| item.get("id"))
+                .and_then(serde_json::Value::as_str)
+        });
+    if let Some((index, _)) = reasoning_items
+        .iter()
+        .find(|(_, item)| item.id.as_deref() == item_id)
+    {
+        return *index;
+    }
+    u32::try_from(reasoning_items.len()).unwrap_or(u32::MAX)
+}
+
+fn ensure_reasoning_activity_started(
+    turn: &TurnState,
+    output_index: u32,
+    item: &mut ReasoningItemAccumulator,
+) {
+    if item.started {
+        return;
+    }
+    item.started = true;
+    turn.push(ProviderTurnEvent::ReasoningActivity {
+        event: bcode_session_models::ReasoningActivityEvent::Started {
+            activity_id: item.activity_id(output_index),
+            order: output_index,
+        },
+    });
+}
+
+fn process_responses_reasoning_delta(
+    event: &serde_json::Value,
+    turn: &TurnState,
+    reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
+    kind: bcode_session_models::ReasoningContentKind,
+) {
+    let Some(delta) = event
+        .get("delta")
+        .and_then(serde_json::Value::as_str)
+        .filter(|delta| !delta.is_empty())
+    else {
+        return;
+    };
+    let output_index = reasoning_output_index(event, reasoning_items);
+    let part_index = match kind {
+        bcode_session_models::ReasoningContentKind::Summary => event.get("summary_index"),
+        bcode_session_models::ReasoningContentKind::Raw
+        | bcode_session_models::ReasoningContentKind::Legacy => event.get("content_index"),
+    }
+    .and_then(serde_json::Value::as_u64)
+    .and_then(|index| u32::try_from(index).ok())
+    .unwrap_or(0);
+    let item = reasoning_items.entry(output_index).or_default();
+    if item.id.is_none()
+        && let Some(item_id) = event.get("item_id").and_then(serde_json::Value::as_str)
+    {
+        item.id = Some(item_id.to_owned());
+    }
+    ensure_reasoning_activity_started(turn, output_index, item);
+    let activity_id = item.activity_id(output_index);
+    let (parts, prefix, role) = match kind {
+        bcode_session_models::ReasoningContentKind::Summary => (
+            &mut item.summary,
+            "summary",
+            bcode_session_models::ReasoningContentRole::Milestone,
+        ),
+        bcode_session_models::ReasoningContentKind::Raw => (
+            &mut item.content,
+            "raw",
+            bcode_session_models::ReasoningContentRole::Detail,
+        ),
+        bcode_session_models::ReasoningContentKind::Legacy => (
+            &mut item.content,
+            "legacy",
+            bcode_session_models::ReasoningContentRole::Unknown,
+        ),
+    };
+    parts.entry(part_index).or_default().push_str(delta);
+    turn.push(ProviderTurnEvent::ReasoningActivity {
+        event: bcode_session_models::ReasoningActivityEvent::PartDelta {
+            activity_id,
+            activity_order: output_index,
+            part_id: format!("{prefix}-{part_index}"),
+            kind,
+            role,
+            part_order: part_index,
+            text: delta.to_owned(),
+        },
+    });
+}
+
+fn process_responses_reasoning_done(
+    event: &serde_json::Value,
+    turn: &TurnState,
+    reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
+    kind: bcode_session_models::ReasoningContentKind,
+) {
+    let Some(text) = event.get("text").and_then(serde_json::Value::as_str) else {
+        return;
+    };
+    let output_index = reasoning_output_index(event, reasoning_items);
+    let part_index = match kind {
+        bcode_session_models::ReasoningContentKind::Summary => event.get("summary_index"),
+        bcode_session_models::ReasoningContentKind::Raw
+        | bcode_session_models::ReasoningContentKind::Legacy => event.get("content_index"),
+    }
+    .and_then(serde_json::Value::as_u64)
+    .and_then(|index| u32::try_from(index).ok())
+    .unwrap_or(0);
+    let item = reasoning_items.entry(output_index).or_default();
+    if item.id.is_none()
+        && let Some(item_id) = event.get("item_id").and_then(serde_json::Value::as_str)
+    {
+        item.id = Some(item_id.to_owned());
+    }
+    ensure_reasoning_activity_started(turn, output_index, item);
+    let activity_id = item.activity_id(output_index);
+    let (parts, prefix, role) = match kind {
+        bcode_session_models::ReasoningContentKind::Summary => (
+            &mut item.summary,
+            "summary",
+            bcode_session_models::ReasoningContentRole::Milestone,
+        ),
+        bcode_session_models::ReasoningContentKind::Raw => (
+            &mut item.content,
+            "raw",
+            bcode_session_models::ReasoningContentRole::Detail,
+        ),
+        bcode_session_models::ReasoningContentKind::Legacy => (
+            &mut item.content,
+            "legacy",
+            bcode_session_models::ReasoningContentRole::Unknown,
+        ),
+    };
+    parts.insert(part_index, text.to_owned());
+    turn.push(ProviderTurnEvent::ReasoningActivity {
+        event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
+            activity_id,
+            activity_order: output_index,
+            part_id: format!("{prefix}-{part_index}"),
+            kind,
+            role,
+            part_order: part_index,
+            text: text.to_owned(),
+        },
+    });
+}
+
 fn process_responses_output_item(
     event: &serde_json::Value,
     turn: &TurnState,
@@ -3574,37 +3774,109 @@ fn process_responses_output_item(
 
 fn process_responses_reasoning_output_item(
     event: &serde_json::Value,
+    turn: &TurnState,
     reasoning_items: &mut BTreeMap<u32, ReasoningItemAccumulator>,
+    completed: bool,
 ) {
-    let Some(item) = event.get("item") else {
+    let Some(item_value) = event.get("item") else {
         return;
     };
-    if item.get("type").and_then(serde_json::Value::as_str) != Some("reasoning") {
+    if item_value.get("type").and_then(serde_json::Value::as_str) != Some("reasoning") {
         return;
     }
     let output_index = event
         .get("output_index")
         .and_then(serde_json::Value::as_u64)
         .and_then(|index| u32::try_from(index).ok())
-        .unwrap_or_else(|| u32::try_from(reasoning_items.len()).unwrap_or(u32::MAX));
-    let entry = reasoning_items.entry(output_index).or_default();
-    if let Some(id) = item.get("id").and_then(serde_json::Value::as_str) {
-        entry.id = Some(id.to_string());
+        .unwrap_or_else(|| reasoning_output_index(event, reasoning_items));
+    let item = reasoning_items.entry(output_index).or_default();
+    if let Some(id) = item_value.get("id").and_then(serde_json::Value::as_str) {
+        item.id = Some(id.to_owned());
     }
-    if let Some(encrypted_content) = item
+    ensure_reasoning_activity_started(turn, output_index, item);
+    let activity_id = item.activity_id(output_index);
+    if let Some(encrypted_content) = item_value
         .get("encrypted_content")
         .and_then(serde_json::Value::as_str)
         .filter(|encrypted_content| !encrypted_content.is_empty())
     {
-        entry.encrypted_content = Some(encrypted_content.to_string());
+        item.encrypted_content = Some(encrypted_content.to_owned());
+        turn.push(ProviderTurnEvent::ReasoningActivity {
+            event: bcode_session_models::ReasoningActivityEvent::OpaqueObserved {
+                activity_id: activity_id.clone(),
+                activity_order: output_index,
+            },
+        });
     }
-    if let Some(summary) = item.get("summary").and_then(serde_json::Value::as_array) {
-        entry.summary = summary
-            .iter()
-            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
-            .filter(|text| !text.is_empty())
-            .map(ToString::to_string)
-            .collect();
+    if let Some(summary) = item_value
+        .get("summary")
+        .and_then(serde_json::Value::as_array)
+    {
+        for (index, part) in summary.iter().enumerate() {
+            let Some(text) = part
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+            else {
+                continue;
+            };
+            let part_order = u32::try_from(index).unwrap_or(u32::MAX);
+            item.summary.insert(part_order, text.to_owned());
+            turn.push(ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                    activity_id: activity_id.clone(),
+                    activity_order: output_index,
+                    part_id: format!("summary-{part_order}"),
+                    kind: bcode_session_models::ReasoningContentKind::Summary,
+                    role: bcode_session_models::ReasoningContentRole::Milestone,
+                    part_order,
+                    text: text.to_owned(),
+                },
+            });
+        }
+    }
+    if let Some(content) = item_value
+        .get("content")
+        .and_then(serde_json::Value::as_array)
+    {
+        for (index, part) in content.iter().enumerate() {
+            if !matches!(
+                part.get("type").and_then(serde_json::Value::as_str),
+                Some("reasoning_text" | "text")
+            ) {
+                continue;
+            }
+            let Some(text) = part
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .filter(|text| !text.is_empty())
+            else {
+                continue;
+            };
+            let part_order = u32::try_from(index).unwrap_or(u32::MAX);
+            item.content.insert(part_order, text.to_owned());
+            turn.push(ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                    activity_id: activity_id.clone(),
+                    activity_order: output_index,
+                    part_id: format!("raw-{part_order}"),
+                    kind: bcode_session_models::ReasoningContentKind::Raw,
+                    role: bcode_session_models::ReasoningContentRole::Detail,
+                    part_order,
+                    text: text.to_owned(),
+                },
+            });
+        }
+    }
+    if completed && !item.finished {
+        item.finished = true;
+        turn.push(ProviderTurnEvent::ReasoningActivity {
+            event: bcode_session_models::ReasoningActivityEvent::Finished {
+                activity_id,
+                activity_order: output_index,
+                status: bcode_session_models::ReasoningActivityStatus::Completed,
+            },
+        });
     }
 }
 
@@ -3618,7 +3890,7 @@ fn push_responses_provider_state(
             .filter_map(|item| {
                 Some(OpenAiReasoningStateItem {
                     id: item.id.clone()?,
-                    summary: item.summary.clone(),
+                    summary: item.summary.values().cloned().collect(),
                     encrypted_content: item.encrypted_content.clone()?,
                 })
             })
@@ -9606,6 +9878,81 @@ mod tests {
     }
 
     #[test]
+    fn responses_stream_preserves_summary_parts_and_raw_reasoning() {
+        let turn = TurnState::default();
+        let mut tool_calls = BTreeMap::new();
+        let mut reasoning_items = BTreeMap::new();
+        let mut saw_tool_call = false;
+        let name_map = BTreeMap::new();
+        let processor = test_responses_stream_processor(&turn, &name_map);
+        let lines = [
+            r#"data: {"type":"response.output_item.added","output_index":0,"item":{"type":"reasoning","id":"rs_1"}}"#,
+            r#"data: {"type":"response.reasoning_summary_part.added","output_index":0,"item_id":"rs_1","summary_index":0}"#,
+            r#"data: {"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"rs_1","summary_index":0,"delta":"First"}"#,
+            r#"data: {"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"rs_1","summary_index":0,"delta":" milestone"}"#,
+            r#"data: {"type":"response.reasoning_summary_part.added","output_index":0,"item_id":"rs_1","summary_index":1}"#,
+            r#"data: {"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"rs_1","summary_index":1,"delta":"Second"}"#,
+            r#"data: {"type":"response.reasoning_text.delta","output_index":0,"item_id":"rs_1","content_index":0,"delta":"raw detail"}"#,
+            r#"data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"First milestone"},{"type":"summary_text","text":"Second"}],"content":[{"type":"reasoning_text","text":"raw detail"}]}}"#,
+        ];
+        for line in lines {
+            process_responses_stream_line(
+                line,
+                &processor,
+                &mut tool_calls,
+                &mut reasoning_items,
+                &mut saw_tool_call,
+            )
+            .expect("reasoning event should process");
+        }
+
+        let events = turn.drain();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::PartDelta {
+                    part_id,
+                    kind: bcode_session_models::ReasoningContentKind::Summary,
+                    text,
+                    ..
+                }
+            } if part_id == "summary-0" && text == "First"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::PartDelta {
+                    part_id,
+                    kind: bcode_session_models::ReasoningContentKind::Summary,
+                    text,
+                    ..
+                }
+            } if part_id == "summary-1" && text == "Second"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::PartDelta {
+                    part_id,
+                    kind: bcode_session_models::ReasoningContentKind::Raw,
+                    text,
+                    ..
+                }
+            } if part_id == "raw-0" && text == "raw detail"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::Finished {
+                    activity_id,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    ..
+                }
+            } if activity_id == "rs_1"
+        )));
+    }
+
+    #[test]
     fn responses_completed_emits_encrypted_reasoning_provider_state() {
         let turn = TurnState::default();
         let mut tool_calls = BTreeMap::new();
@@ -9633,6 +9980,24 @@ mod tests {
 
         let events = turn.drain();
         assert!(matches!(outcome, StreamOutcome::Finished));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::OpaqueObserved {
+                    activity_id,
+                    ..
+                }
+            } if activity_id == "rs_1"
+        )));
+        assert!(
+            events
+                .iter()
+                .filter(|event| !matches!(
+                    event,
+                    ProviderTurnEvent::ProviderMetadata { key, .. } if key == "provider_state"
+                ))
+                .all(|event| !format!("{event:?}").contains("encrypted"))
+        );
         assert!(events.iter().any(|event| matches!(
             event,
             ProviderTurnEvent::ProviderMetadata { key, value }

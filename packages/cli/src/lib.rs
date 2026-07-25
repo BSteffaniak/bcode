@@ -7449,6 +7449,9 @@ fn session_live_event_description(event: &SessionLiveEvent) -> String {
         SessionLiveEventKind::AssistantReasoningDelta { turn_id, text } => {
             format!("live reasoning delta ({turn_id}): {text}")
         }
+        SessionLiveEventKind::AssistantReasoningActivity { turn_id, event } => {
+            format!("live reasoning activity ({turn_id}): {event:?}")
+        }
         SessionLiveEventKind::ProviderStreamProgress { turn_id, event } => {
             format!("live provider progress ({turn_id}): {event:?}")
         }

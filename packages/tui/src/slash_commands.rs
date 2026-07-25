@@ -108,6 +108,8 @@ pub enum SlashCommandOutcome {
     SetThinkingDisplay(bool),
     /// Toggle local reasoning output display.
     ToggleThinkingDisplay,
+    /// Set the local reasoning content display mode.
+    SetThinkingMode(bcode_config::TuiThinkingMode),
     /// Show a Markdown system note.
     SystemMarkdown(String),
     /// Show a plain-text system note.
@@ -213,6 +215,19 @@ fn draft_thinking_command(parts: &[&str]) -> SlashCommandOutcome {
         Some("summary") if parts.len() == 2 => SlashCommandOutcome::OpenThinkingSettings(
             super::thinking_dialog::ThinkingDialogFocus::Summary,
         ),
+        Some("mode") if parts.len() == 2 => SlashCommandOutcome::Handled(
+            "reasoning display mode requires one of: all, summary, raw".to_owned(),
+        ),
+        Some("mode") if parts.len() > 2 => match parts[2] {
+            "all" => SlashCommandOutcome::SetThinkingMode(bcode_config::TuiThinkingMode::All),
+            "summary" => {
+                SlashCommandOutcome::SetThinkingMode(bcode_config::TuiThinkingMode::Summary)
+            }
+            "raw" => SlashCommandOutcome::SetThinkingMode(bcode_config::TuiThinkingMode::Raw),
+            value => SlashCommandOutcome::Handled(format!(
+                "unsupported reasoning display mode '{value}' (supported: all, summary, raw)"
+            )),
+        },
         Some("show") => SlashCommandOutcome::SetThinkingDisplay(true),
         Some("hide") => SlashCommandOutcome::SetThinkingDisplay(false),
         Some("toggle") => SlashCommandOutcome::ToggleThinkingDisplay,
@@ -243,6 +258,23 @@ async fn thinking_command(
         Some("summary") if parts.len() == 2 => Ok(SlashCommandOutcome::OpenThinkingSettings(
             super::thinking_dialog::ThinkingDialogFocus::Summary,
         )),
+        Some("mode") if parts.len() == 2 => Ok(SlashCommandOutcome::Handled(
+            "reasoning display mode requires one of: all, summary, raw".to_owned(),
+        )),
+        Some("mode") if parts.len() > 2 => match parts[2] {
+            "all" => Ok(SlashCommandOutcome::SetThinkingMode(
+                bcode_config::TuiThinkingMode::All,
+            )),
+            "summary" => Ok(SlashCommandOutcome::SetThinkingMode(
+                bcode_config::TuiThinkingMode::Summary,
+            )),
+            "raw" => Ok(SlashCommandOutcome::SetThinkingMode(
+                bcode_config::TuiThinkingMode::Raw,
+            )),
+            value => Ok(SlashCommandOutcome::Handled(format!(
+                "unsupported reasoning display mode '{value}' (supported: all, summary, raw)"
+            ))),
+        },
         Some("effort") if parts.len() > 2 => {
             let effort = parts[2].to_owned();
             if let Some(message) = unsupported_reasoning_value(

@@ -147,6 +147,17 @@ async fn handle_slash_command<W: Write>(
                 "reasoning output hidden".to_owned()
             });
         }
+        slash_commands::SlashCommandOutcome::SetThinkingMode(mode) => {
+            chat.app.clear_pending_submission(message);
+            chat.app.set_reasoning_display_mode(mode);
+            let mode = match mode {
+                bcode_config::TuiThinkingMode::All => "all",
+                bcode_config::TuiThinkingMode::Summary => "summary",
+                bcode_config::TuiThinkingMode::Raw => "raw",
+            };
+            chat.app
+                .set_status(format!("reasoning display mode set to {mode}"));
+        }
         slash_commands::SlashCommandOutcome::SystemMarkdown(note) => {
             chat.app.clear_pending_submission(message);
             chat.app.push_system_markdown(note);

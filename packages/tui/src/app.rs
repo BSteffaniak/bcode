@@ -230,6 +230,7 @@ pub struct BmuxApp {
     theme_transition: ThemeTransitionState,
     thinking_label: String,
     reasoning_support: ReasoningSupport,
+    reasoning_display_mode: bcode_config::TuiThinkingMode,
     reasoning_default_effort: Option<String>,
     reasoning_default_summary: Option<String>,
     token_usage: TokenUsageMeter,
@@ -415,6 +416,7 @@ impl BmuxApp {
             theme_transition: ThemeTransitionState::new(initial_theme.accent, now),
             thinking_label: "reasoning output shown · unsupported".to_owned(),
             reasoning_support: ReasoningSupport::Unsupported,
+            reasoning_display_mode: bcode_config::TuiThinkingMode::All,
             reasoning_default_effort: None,
             reasoning_default_summary: None,
             token_usage: TokenUsageMeter::default(),
@@ -1520,7 +1522,23 @@ impl BmuxApp {
 
     /// Apply configured reasoning output visibility.
     pub fn apply_thinking_config(&mut self, config: TuiThinkingConfig) {
+        self.reasoning_display_mode = config.mode;
         self.set_reasoning_visible(config.show);
+    }
+
+    /// Return the local reasoning content display mode.
+    #[must_use]
+    pub const fn reasoning_display_mode(&self) -> bcode_config::TuiThinkingMode {
+        self.reasoning_display_mode
+    }
+
+    /// Set the local reasoning content display mode.
+    pub fn set_reasoning_display_mode(&mut self, mode: bcode_config::TuiThinkingMode) {
+        if self.reasoning_display_mode != mode {
+            self.reasoning_display_mode = mode;
+            self.refresh_thinking_label();
+            self.rebuild_transcript_from_history();
+        }
     }
 
     fn refresh_thinking_label(&mut self) {
@@ -2155,6 +2173,14 @@ impl BmuxApp {
                 );
                 self.viewport.preserve_for_append();
                 self.push_live_reasoning_delta(text, SessionEventApplication::Live);
+            }
+            SessionLiveEventKind::AssistantReasoningActivity { .. } => {
+                self.pending_visual_overflow_bottom = Some(
+                    self.viewport
+                        .bottom_row(self.transcript_layout.total_rows()),
+                );
+                self.viewport.preserve_for_append();
+                self.sync_shared_message_items();
             }
             SessionLiveEventKind::ToolContribution {
                 event: contribution,

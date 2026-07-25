@@ -1174,6 +1174,9 @@ impl SessionView {
                     text,
                 );
             }
+            SessionLiveEventKind::AssistantReasoningActivity { turn_id, event } => {
+                self.apply_live_reasoning_activity(turn_id, event);
+            }
             SessionLiveEventKind::ToolContribution {
                 event: contribution,
             } => self.apply_contribution_event(
@@ -1322,6 +1325,77 @@ impl SessionView {
             true,
             TranscriptViewItemKind::ToolRequestDraft { draft },
         );
+    }
+
+    fn apply_live_reasoning_activity(
+        &mut self,
+        turn_id: &str,
+        event: &bcode_session_models::ReasoningActivityEvent,
+    ) {
+        use bcode_session_models::ReasoningActivityEvent;
+        let item_id =
+            TranscriptViewItemId::new(format!("reasoning-turn:{turn_id}:{}", event.activity_id()));
+        match event {
+            ReasoningActivityEvent::Started { .. }
+            | ReasoningActivityEvent::OpaqueObserved { .. } => {
+                if self
+                    .snapshot
+                    .transcript
+                    .items
+                    .iter()
+                    .all(|item| item.id != item_id)
+                {
+                    self.push_item(
+                        item_id,
+                        0,
+                        None,
+                        true,
+                        StreamingMessageKind::Reasoning.item_kind(String::new()),
+                    );
+                }
+            }
+            ReasoningActivityEvent::PartDelta { text, .. } => {
+                self.push_or_append_streaming_message(
+                    item_id,
+                    0,
+                    None,
+                    StreamingMessageKind::Reasoning,
+                    text,
+                );
+            }
+            ReasoningActivityEvent::PartCompleted { text, .. } => {
+                self.finish_or_push_message(
+                    item_id,
+                    0,
+                    None,
+                    StreamingMessageKind::Reasoning,
+                    text,
+                );
+            }
+            ReasoningActivityEvent::Finished { .. } => {
+                if let Some(item) = self
+                    .snapshot
+                    .transcript
+                    .items
+                    .iter_mut()
+                    .find(|item| item.id == item_id)
+                {
+                    item.streaming = false;
+                    item.revision = item.revision.saturating_add(1);
+                    self.snapshot.transcript.revision =
+                        self.snapshot.transcript.revision.saturating_add(1);
+                    self.bump_revision();
+                } else {
+                    self.push_item(
+                        item_id,
+                        0,
+                        None,
+                        false,
+                        StreamingMessageKind::Reasoning.item_kind(String::new()),
+                    );
+                }
+            }
+        }
     }
 
     fn apply_contribution_event(

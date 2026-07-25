@@ -256,6 +256,16 @@ impl ProviderEventValidator {
                 }
                 self.reasoning_events += 1;
             }
+            ProviderTurnEvent::ReasoningActivity { event } => {
+                if matches!(
+                    event,
+                    bcode_session_models::ReasoningActivityEvent::PartDelta { text, .. }
+                        if text.is_empty()
+                ) {
+                    return violation(BASE_TURN, "provider emitted an empty reasoning part delta");
+                }
+                self.reasoning_events += 1;
+            }
             ProviderTurnEvent::ToolCallStarted { call_id, name } => {
                 self.observe_tool_call_started(call_id, name)?;
             }

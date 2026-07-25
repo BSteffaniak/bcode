@@ -13058,9 +13058,9 @@ const fn model_event_is_progress(event: &ProviderTurnEvent) -> bool {
         ProviderTurnEvent::TextDelta { text } | ProviderTurnEvent::ReasoningDelta { text } => {
             !text.is_empty()
         }
-        ProviderTurnEvent::ToolCallStarted { .. } | ProviderTurnEvent::ToolCallFinished { .. } => {
-            true
-        }
+        ProviderTurnEvent::ReasoningActivity { .. }
+        | ProviderTurnEvent::ToolCallStarted { .. }
+        | ProviderTurnEvent::ToolCallFinished { .. } => true,
         ProviderTurnEvent::ToolCallDelta { delta, .. } => !delta.is_empty(),
         ProviderTurnEvent::RequestProjection { .. }
         | ProviderTurnEvent::ContextCompacted { .. }
@@ -13437,6 +13437,26 @@ async fn handle_provider_turn_event(
             stream.flush_if_ready(state).await;
             if state.observability.debug_enabled() {
                 append_provider_event_trace(state, session_id, turn_id, "reasoning_delta", None)
+                    .await;
+            }
+        }
+        ProviderTurnEvent::ReasoningActivity { event } => {
+            if let bcode_session_models::ReasoningActivityEvent::PartDelta { text, .. } = &event {
+                stream.push_reasoning(text);
+            }
+            let _ = state
+                .sessions
+                .publish_live_event(
+                    session_id,
+                    SessionLiveEventKind::AssistantReasoningActivity {
+                        turn_id: turn_id.to_owned(),
+                        event,
+                    },
+                )
+                .await;
+            stream.flush_if_ready(state).await;
+            if state.observability.debug_enabled() {
+                append_provider_event_trace(state, session_id, turn_id, "reasoning_activity", None)
                     .await;
             }
         }

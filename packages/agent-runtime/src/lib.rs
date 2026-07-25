@@ -397,8 +397,10 @@ pub enum AgentRuntimeEvent {
     TurnStarted,
     /// Assistant text delta.
     TextDelta(String),
-    /// Reasoning text delta.
+    /// Legacy untyped reasoning text delta.
     ReasoningDelta(String),
+    /// Provider-neutral reasoning activity operation.
+    ReasoningActivity(bcode_session_models::ReasoningActivityEvent),
     /// A tool call started.
     ToolCallStarted {
         /// Provider tool-call ID.
@@ -3808,6 +3810,9 @@ fn normalize_provider_event(
         }
         ProviderTurnEvent::ReasoningDelta { text } => Ok(EventDisposition::Continue(
             AgentRuntimeEvent::ReasoningDelta(text),
+        )),
+        ProviderTurnEvent::ReasoningActivity { event } => Ok(EventDisposition::Continue(
+            AgentRuntimeEvent::ReasoningActivity(event),
         )),
         ProviderTurnEvent::ToolCallStarted { call_id, name } => Ok(EventDisposition::Continue(
             AgentRuntimeEvent::ToolCallStarted { call_id, name },

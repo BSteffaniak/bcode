@@ -1463,6 +1463,7 @@ pub async fn handle_compaction_events(
             ProviderTurnEvent::TurnStarted
             | ProviderTurnEvent::ExactRequestInputTokens { .. }
             | ProviderTurnEvent::ReasoningDelta { .. }
+            | ProviderTurnEvent::ReasoningActivity { .. }
             | ProviderTurnEvent::RequestProjection { .. }
             | ProviderTurnEvent::ContextCompacted { .. }
             | ProviderTurnEvent::ProviderMetadata { .. }

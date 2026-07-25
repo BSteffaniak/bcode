@@ -1882,7 +1882,7 @@ impl Default for TuiThinkingConfig {
     fn default() -> Self {
         Self {
             show: true,
-            mode: TuiThinkingMode::Summary,
+            mode: TuiThinkingMode::All,
         }
     }
 }
@@ -2188,8 +2188,10 @@ pub enum ShellToolEnvAutoFallback {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum TuiThinkingMode {
-    /// Show provider reasoning summaries when available.
+    /// Show every distinct readable reasoning representation exposed by the provider.
     #[default]
+    All,
+    /// Show provider reasoning summaries when available.
     Summary,
     /// Show raw provider reasoning when available.
     Raw,
@@ -4839,6 +4841,7 @@ fn write_tui_toml(output: &mut String, tui: &TuiConfig) {
 
 const fn tui_thinking_mode_name(mode: TuiThinkingMode) -> &'static str {
     match mode {
+        TuiThinkingMode::All => "all",
         TuiThinkingMode::Summary => "summary",
         TuiThinkingMode::Raw => "raw",
     }

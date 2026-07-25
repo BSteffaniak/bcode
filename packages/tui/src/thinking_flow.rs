@@ -143,8 +143,13 @@ async fn apply_thinking_dialog(
     if let Ok(status) = client.session_model_status(session_id).await {
         chat.app.apply_model_status(status);
     }
+    let mode = match chat.app.reasoning_display_mode() {
+        bcode_config::TuiThinkingMode::All => "all",
+        bcode_config::TuiThinkingMode::Summary => "summary",
+        bcode_config::TuiThinkingMode::Raw => "raw",
+    };
     chat.app.set_status(format!(
-        "reasoning output settings applied: {}",
+        "reasoning output settings applied: {} · displayed reasoning: {mode}",
         chat.app.thinking_label()
     ));
     Ok(true)

@@ -4799,6 +4799,8 @@ pub enum FrontendEvent {
     TextDelta(String),
     /// Visible reasoning delta.
     ReasoningDelta(String),
+    /// Provider-neutral reasoning activity operation.
+    ReasoningActivity(bcode_session_models::ReasoningActivityEvent),
     /// Tool call began.
     ToolCallStarted {
         /// Provider call ID.
@@ -4862,6 +4864,7 @@ impl FrontendEvent {
             AgentEvent::TurnStarted => Some(Self::TurnStarted),
             AgentEvent::TextDelta(text) => Some(Self::TextDelta(text.clone())),
             AgentEvent::ReasoningDelta(text) => Some(Self::ReasoningDelta(text.clone())),
+            AgentEvent::ReasoningActivity(event) => Some(Self::ReasoningActivity(event.clone())),
             AgentEvent::ToolCallStarted { call_id, name } => Some(Self::ToolCallStarted {
                 call_id: call_id.clone(),
                 name: name.clone(),
@@ -5029,6 +5032,15 @@ impl FrontendTurnSnapshot {
             | FrontendEvent::ContextCompacted => {}
             FrontendEvent::TextDelta(text) => self.text.push_str(text),
             FrontendEvent::ReasoningDelta(text) => self.reasoning.push_str(text),
+            FrontendEvent::ReasoningActivity(event) => {
+                if let bcode_session_models::ReasoningActivityEvent::PartDelta { text, .. }
+                | bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                    text, ..
+                } = event
+                {
+                    self.reasoning.push_str(text);
+                }
+            }
             FrontendEvent::ToolCallFinished(call) => self.tool_calls.push(call.clone()),
             FrontendEvent::ToolResult(result) => self.tool_results.push(result.clone()),
             FrontendEvent::Usage(usage) => self.usage = Some(usage.clone()),
@@ -8490,6 +8502,13 @@ fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
             AgentEvent::ReasoningDelta(delta) => {
                 model.started = true;
                 model.reasoning.push_str(delta);
+            }
+            AgentEvent::ReasoningActivity(event) => {
+                model.started = true;
+                if let bcode_session_models::ReasoningActivityEvent::PartDelta { text, .. } = event
+                {
+                    model.reasoning.push_str(text);
+                }
             }
             AgentEvent::Usage(usage) => {
                 model.started = true;
