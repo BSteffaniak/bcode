@@ -2114,6 +2114,7 @@ async fn async_session_open_preserves_typed_draft() {
     );
 
     assert_eq!(chat.app.composer().text(), "draft while opening");
+    assert_eq!(chat.app.status(), "session writable and attached");
 }
 
 #[tokio::test]

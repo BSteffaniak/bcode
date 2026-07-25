@@ -2280,6 +2280,12 @@ fn apply_session_open_progress(
 fn session_open_progress_status(
     snapshot: &bcode_session_models::SessionOpenOperationSnapshot,
 ) -> String {
+    if matches!(
+        snapshot.outcome,
+        Some(bcode_session_models::SessionOpenTerminalOutcome::Ready)
+    ) {
+        return "Session storage validated; attaching writable runtime…".to_owned();
+    }
     let epoch = snapshot.source_writer_epoch.map_or_else(
         || format!("epoch {}", snapshot.target_writer_epoch),
         |source| format!("epoch {source} → {}", snapshot.target_writer_epoch),
@@ -3537,6 +3543,31 @@ mod scheduler_tests {
         let status = session_open_progress_status(&snapshot);
         assert!(status.contains("Upgrading session (epoch 3 → 4)"));
         assert!(status.contains("Preparing session backup"));
+    }
+
+    #[test]
+    fn session_open_ready_waits_for_attach_before_reporting_success() {
+        let session_id = bcode_session_models::SessionId::new();
+        let snapshot = bcode_session_models::SessionOpenOperationSnapshot {
+            operation_id: bcode_session_models::SessionOpenOperationId::new(),
+            revision: 2,
+            session_id,
+            source_writer_epoch: Some(3),
+            target_writer_epoch: 5,
+            progress: bcode_session_models::SessionMigrationProgress {
+                stage: bcode_session_models::SessionMigrationStage::Complete,
+                completed_units: None,
+                total_units: None,
+                unit: None,
+                message: "Session storage is ready".to_owned(),
+            },
+            outcome: Some(bcode_session_models::SessionOpenTerminalOutcome::Ready),
+            backup_path: None,
+        };
+        assert_eq!(
+            session_open_progress_status(&snapshot),
+            "Session storage validated; attaching writable runtime…"
+        );
     }
 
     #[test]

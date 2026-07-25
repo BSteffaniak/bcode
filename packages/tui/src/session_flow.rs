@@ -206,7 +206,8 @@ pub fn complete_switch_session(
             chat.app.apply_session_summary(&attached.session);
             chat.app
                 .apply_runtime_selection(attached.runtime_selection.clone());
-            chat.app.set_status("session opened".to_owned());
+            chat.app
+                .set_status("session writable and attached".to_owned());
             chat.replace_effect(super::effects::TuiEffect::LoadSessionStatus { session_id });
             chat.start_effect(super::effects::TuiEffect::ListPermissions);
         }
