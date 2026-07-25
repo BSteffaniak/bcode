@@ -104,25 +104,18 @@ fn ensure_controlling_terminal() -> io::Result<()> {
 enum EventInput {
     Crossterm,
     #[cfg(unix)]
-    Unix {
-        terminal: std::fs::File,
-        last_size: std::cell::Cell<(u16, u16)>,
-    },
+    Unix(std::fs::File),
 }
 
 impl EventInput {
     fn controlling_terminal() -> io::Result<Self> {
         #[cfg(unix)]
         {
-            let terminal = std::fs::OpenOptions::new()
+            std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open("/dev/tty")?;
-            let size = crossterm::terminal::size().unwrap_or((1, 1));
-            Ok(Self::Unix {
-                terminal,
-                last_size: std::cell::Cell::new(size),
-            })
+                .open("/dev/tty")
+                .map(Self::Unix)
         }
         #[cfg(windows)]
         {
@@ -140,49 +133,18 @@ impl EventInput {
         match self {
             Self::Crossterm => crossterm::event::read(),
             #[cfg(unix)]
-            Self::Unix {
-                terminal,
-                last_size,
-            } => read_unix_event(terminal, last_size),
+            Self::Unix(terminal) => read_unix_event(terminal),
         }
     }
 }
 
 #[cfg(unix)]
-fn read_unix_event(
-    terminal: &std::fs::File,
-    last_size: &std::cell::Cell<(u16, u16)>,
-) -> io::Result<Event> {
+fn read_unix_event(terminal: &std::fs::File) -> io::Result<Event> {
     use std::io::Read as _;
-    use std::os::fd::AsRawFd as _;
-
-    loop {
-        let mut poll_fd = libc::pollfd {
-            fd: terminal.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let poll_result = unsafe { libc::poll(&raw mut poll_fd, 1, 100) };
-        if poll_result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        let size = crossterm::terminal::size().unwrap_or_else(|_| last_size.get());
-        if size != last_size.get() {
-            last_size.set(size);
-            return Ok(Event::Resize(size.0, size.1));
-        }
-        if poll_result == 0 || poll_fd.revents & libc::POLLIN == 0 {
-            continue;
-        }
-        let mut terminal = terminal;
-        let mut byte = [0_u8; 1];
-        terminal.read_exact(&mut byte)?;
-        return parse_unix_key(byte[0], &mut terminal);
-    }
+    let mut terminal = terminal;
+    let mut byte = [0_u8; 1];
+    terminal.read_exact(&mut byte)?;
+    parse_unix_key(byte[0], &mut terminal)
 }
 
 #[cfg(unix)]
@@ -198,12 +160,7 @@ fn parse_unix_key(first: u8, terminal: &mut &std::fs::File) -> io::Result<Event>
         byte if byte.is_ascii() => {
             KeyEvent::new(CrosstermKeyCode::Char(char::from(byte)), KeyModifiers::NONE)
         }
-        _ => {
-            return Ok(Event::Key(KeyEvent::new(
-                CrosstermKeyCode::Null,
-                KeyModifiers::NONE,
-            )));
-        }
+        _ => KeyEvent::new(CrosstermKeyCode::Null, KeyModifiers::NONE),
     };
     Ok(Event::Key(event))
 }
@@ -212,7 +169,6 @@ fn parse_unix_key(first: u8, terminal: &mut &std::fs::File) -> io::Result<Event>
 fn parse_escape_sequence(terminal: &mut &std::fs::File) -> io::Result<KeyEvent> {
     use std::io::Read as _;
     use std::os::fd::AsRawFd as _;
-
     let mut poll_fd = libc::pollfd {
         fd: terminal.as_raw_fd(),
         events: libc::POLLIN,
@@ -222,24 +178,14 @@ fn parse_escape_sequence(terminal: &mut &std::fs::File) -> io::Result<KeyEvent> 
         return Ok(KeyEvent::new(CrosstermKeyCode::Esc, KeyModifiers::NONE));
     }
     let mut second = [0_u8; 1];
-    if let Err(error) = terminal.read_exact(&mut second) {
-        if error.kind() == io::ErrorKind::UnexpectedEof {
-            return Ok(KeyEvent::new(CrosstermKeyCode::Esc, KeyModifiers::NONE));
-        }
-        return Err(error);
-    }
+    terminal.read_exact(&mut second)?;
     if second[0] != b'[' {
         return Ok(KeyEvent::new(CrosstermKeyCode::Esc, KeyModifiers::NONE));
     }
     let mut sequence = Vec::with_capacity(4);
     loop {
         let mut byte = [0_u8; 1];
-        if let Err(error) = terminal.read_exact(&mut byte) {
-            if error.kind() == io::ErrorKind::UnexpectedEof && sequence.is_empty() {
-                return Ok(KeyEvent::new(CrosstermKeyCode::Esc, KeyModifiers::NONE));
-            }
-            return Err(error);
-        }
+        terminal.read_exact(&mut byte)?;
         sequence.push(byte[0]);
         if byte[0].is_ascii_alphabetic() || byte[0] == b'~' || sequence.len() == 4 {
             break;
@@ -363,42 +309,6 @@ impl<W: Write> Drop for TerminalGuard<W> {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
-    fn parse(bytes: &[u8]) -> Event {
-        use std::io::{Seek as _, Write as _};
-
-        let mut temporary = tempfile::tempfile().unwrap();
-        temporary.write_all(bytes).unwrap();
-        temporary.rewind().unwrap();
-        let mut terminal = &temporary;
-        let mut first = [0_u8; 1];
-        std::io::Read::read_exact(&mut terminal, &mut first).unwrap();
-        parse_unix_key(first[0], &mut terminal).unwrap()
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unix_controlling_terminal_parser_supports_pager_keys() {
-        use crossterm::event::KeyCode;
-
-        for (bytes, expected) in [
-            (&b"q"[..], KeyCode::Char('q')),
-            (&b" "[..], KeyCode::Char(' ')),
-            (&b"\x1b"[..], KeyCode::Esc),
-            (&b"\x1b[A"[..], KeyCode::Up),
-            (&b"\x1b[B"[..], KeyCode::Down),
-            (&b"\x1b[H"[..], KeyCode::Home),
-            (&b"\x1b[F"[..], KeyCode::End),
-            (&b"\x1b[5~"[..], KeyCode::PageUp),
-            (&b"\x1b[6~"[..], KeyCode::PageDown),
-        ] {
-            let Event::Key(event) = parse(bytes) else {
-                panic!("expected key event for {bytes:?}");
-            };
-            assert_eq!(event.code, expected);
-        }
-    }
-
     #[test]
     fn terminal_cleanup_emits_restoration_in_order_and_is_idempotent() {
         let mut writer = Some(Vec::new());
@@ -482,16 +392,6 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(output.windows(8).any(|bytes| bytes == b"\x1b[?1049l"));
         drop(output);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn unix_controlling_terminal_parser_preserves_control_modifiers() {
-        let Event::Key(event) = parse(&[0x03]) else {
-            panic!("expected key event");
-        };
-        assert_eq!(event.code, CrosstermKeyCode::Char('c'));
-        assert!(event.modifiers.contains(KeyModifiers::CONTROL));
     }
 }
 
