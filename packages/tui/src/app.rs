@@ -241,8 +241,6 @@ pub struct BmuxApp {
     transcript_window: TranscriptResidentWindow,
     latest_history_sequence: Option<u64>,
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
-    transient_contribution_items:
-        BTreeMap<String, (u64, Option<crate::transcript::TranscriptItemId>)>,
     pending_submissions: PendingSubmissions,
     transcript_layout: TranscriptLayoutCache,
     elapsed_layout_revision: u64,
@@ -440,7 +438,6 @@ impl BmuxApp {
             transcript_window: TranscriptResidentWindow::default(),
             latest_history_sequence: None,
             tool_call_contexts: BTreeMap::new(),
-            transient_contribution_items: BTreeMap::new(),
             pending_submissions: PendingSubmissions::default(),
             transcript_layout: TranscriptLayoutCache::default(),
             elapsed_layout_revision: 0,
@@ -2285,20 +2282,16 @@ impl BmuxApp {
         contribution: &bcode_session_models::ToolContributionEvent,
         placement: bcode_session_models::ToolContributionPlacement,
     ) {
-        let key = format!(
-            "{}:{}",
-            contribution.invocation_id, contribution.contribution_id
+        let item_id = bcode_session_view_models::TranscriptViewItemId::tool_presentation_slot(
+            &contribution.invocation_id,
+            placement,
+            (placement == bcode_session_models::ToolContributionPlacement::Supplemental)
+                .then_some(contribution.contribution_id.as_str()),
         );
-        if self
-            .transient_contribution_items
-            .get(&key)
-            .is_some_and(|(sequence, _)| contribution.sequence <= *sequence)
+        if contribution.operation == bcode_session_models::ToolContributionOperation::Remove
+            || placement == bcode_session_models::ToolContributionPlacement::Hidden
         {
-            return;
-        }
-        if placement == bcode_session_models::ToolContributionPlacement::Hidden {
-            self.transient_contribution_items
-                .insert(key, (contribution.sequence, None));
+            self.transcript.remove_shared_item(&item_id);
             return;
         }
         let backs_existing_contribution = contribution.artifact.as_ref().is_some_and(|artifact| {
@@ -2321,65 +2314,21 @@ impl BmuxApp {
                         )
                 })
         });
-        let backs_canonical_visual = backs_existing_contribution;
-        let has_renderer = self.contribution_has_renderer(contribution);
-        match contribution.operation {
-            bcode_session_models::ToolContributionOperation::Remove => {
-                if let Some((_, Some(id))) = self.transient_contribution_items.remove(&key) {
-                    self.transcript.retain(|item| item.id() != id);
-                }
-                self.transient_contribution_items
-                    .insert(key, (contribution.sequence, None));
-            }
-            bcode_session_models::ToolContributionOperation::Upsert
-            | bcode_session_models::ToolContributionOperation::Append
-                if backs_canonical_visual =>
-            {
-                if let Some((_, Some(id))) = self.transient_contribution_items.remove(&key) {
-                    self.transcript.retain(|item| item.id() != id);
-                }
-                self.transient_contribution_items
-                    .insert(key, (contribution.sequence, None));
-            }
-            bcode_session_models::ToolContributionOperation::Upsert
-            | bcode_session_models::ToolContributionOperation::Append
-                if !has_renderer =>
-            {
-                if let Some((_, Some(id))) = self.transient_contribution_items.remove(&key) {
-                    self.transcript.retain(|item| item.id() != id);
-                }
-                self.transient_contribution_items
-                    .insert(key, (contribution.sequence, None));
-            }
-            bcode_session_models::ToolContributionOperation::Upsert
-            | bcode_session_models::ToolContributionOperation::Append => {
-                let shared_item = self
-                    .shared_tool_contribution_item(contribution)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "shared session view must project visible live contribution {}:{} at sequence {}",
-                            contribution.invocation_id,
-                            contribution.contribution_id,
-                            contribution.sequence
-                        )
-                    });
-                if let Some((_, Some(id))) = self.transient_contribution_items.get(&key).copied() {
-                    self.transcript.mutate_rev_find(
-                        |item| item.id() == id,
-                        |item| {
-                            let _ = item.replace_from_shared(shared_item.clone());
-                        },
-                    );
-                    self.transient_contribution_items
-                        .insert(key, (contribution.sequence, Some(id)));
-                } else {
-                    let id = shared_item.id();
-                    self.transient_contribution_items
-                        .insert(key, (contribution.sequence, Some(id)));
-                    self.transcript.push(shared_item);
-                }
-            }
+        if backs_existing_contribution || !self.contribution_has_renderer(contribution) {
+            self.transcript.remove_shared_item(&item_id);
+            return;
         }
+        let shared_item = self
+            .shared_tool_contribution_item(contribution)
+            .unwrap_or_else(|| {
+                panic!(
+                    "shared session view must project visible live contribution {}:{} at sequence {}",
+                    contribution.invocation_id,
+                    contribution.contribution_id,
+                    contribution.sequence
+                )
+            });
+        self.transcript.upsert_shared_item(shared_item);
     }
 
     fn apply_durable_contribution(
@@ -2388,16 +2337,16 @@ impl BmuxApp {
         contribution: &bcode_session_models::ToolContributionEvent,
         placement: bcode_session_models::ToolContributionPlacement,
     ) {
-        let key = format!(
-            "{}:{}",
-            contribution.invocation_id, contribution.contribution_id
+        let item_id = bcode_session_view_models::TranscriptViewItemId::tool_presentation_slot(
+            &contribution.invocation_id,
+            placement,
+            (placement == bcode_session_models::ToolContributionPlacement::Supplemental)
+                .then_some(contribution.contribution_id.as_str()),
         );
-        if let Some((_, Some(id))) = self.transient_contribution_items.remove(&key) {
-            self.transcript.retain(|item| item.id() != id);
-        }
         if contribution.operation == bcode_session_models::ToolContributionOperation::Remove
             || placement == bcode_session_models::ToolContributionPlacement::Hidden
         {
+            self.transcript.remove_shared_item(&item_id);
             return;
         }
         self.push_required_shared_terminal_item(event_sequence, "durable tool contribution");

@@ -36814,6 +36814,45 @@ event_symbol = "bcode_plugin_handle_event_v1"
             progress,
         )
         .await;
+        let artifact_root = default_session_artifact_dir(session.id);
+        std::fs::create_dir_all(&artifact_root).expect("artifact root");
+        let artifact_path = artifact_root.join("unload.bin");
+        std::fs::write(&artifact_path, b"live").expect("artifact bytes");
+        let artifact = artifact_contribution_envelope(
+            "call-artifact",
+            "artifact-unload",
+            "test.plugin",
+            url::Url::from_file_path(&artifact_path)
+                .expect("artifact URL")
+                .to_string(),
+            4,
+            1,
+            false,
+        );
+        state
+            .active_artifacts
+            .lock()
+            .expect("artifact registry")
+            .insert(
+                ActiveArtifactKey {
+                    session_id: session.id,
+                    tool_call_id: "call-artifact".to_owned(),
+                    artifact_id: "artifact-unload".to_owned(),
+                    reference_key: "recording".to_owned(),
+                },
+                ActiveArtifactReference {
+                    producer_plugin_id: "test.plugin".to_owned(),
+                    schema: "fixture.recording".to_owned(),
+                    schema_version: 1,
+                    content_type: Some("application/octet-stream".to_owned()),
+                    path: artifact_path,
+                    committed_bytes: 4,
+                    revision: 1,
+                    finalized: false,
+                    abandoned: false,
+                    contribution_snapshot: artifact,
+                },
+            );
         assert_eq!(
             active_tool_request_draft_snapshot_events(&state, session.id).len(),
             1
@@ -36821,6 +36860,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(
             active_contribution_snapshot_events(&state, session.id)
                 .expect("progress snapshot")
+                .len(),
+            1
+        );
+        assert_eq!(
+            active_artifact_snapshot_events(&state, session.id)
+                .expect("artifact snapshot")
                 .len(),
             1
         );
@@ -36834,6 +36879,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(
             active_contribution_snapshot_events(&state, session.id)
                 .expect("cleared progress snapshot")
+                .is_empty()
+        );
+        assert!(
+            active_artifact_snapshot_events(&state, session.id)
+                .expect("cleared artifact snapshot")
                 .is_empty()
         );
         let drafts = state

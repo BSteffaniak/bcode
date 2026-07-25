@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use super::activity::unrepresented_runtime_work;
-use super::adapters::{ARTIFACT_ADAPTERS, VISUAL_ADAPTERS, json_panel};
+use super::adapters::{ARTIFACT_ADAPTERS, VISUAL_ADAPTERS, json_panel, render_tool_contribution};
 use super::composer::composer;
 use super::interactions::interaction_request;
 use super::navigation::session_navigation;
@@ -1715,6 +1715,58 @@ fn bundled_visual_registry_covers_actual_high_value_request_schemas() {
             VISUAL_ADAPTERS.contains_key(&(schema, 1)),
             "missing {schema}"
         );
+    }
+}
+
+#[test]
+fn hyperchad_request_draft_adapters_render_incomplete_plugin_owned_visuals() {
+    for (schema, expected_title) in [
+        (
+            "bcode.filesystem.request-draft.write",
+            "Filesystem write · assembling…",
+        ),
+        (
+            "bcode.filesystem.request-draft.edit",
+            "Filesystem edit · assembling…",
+        ),
+        (
+            "bcode.vim-edit.request-draft.preview",
+            "Vim edit · assembling…",
+        ),
+        (
+            "bcode.vim-edit.request-draft.apply",
+            "Vim edit · assembling…",
+        ),
+    ] {
+        let contribution = bcode_session_models::ToolContributionEvent {
+            invocation_id: "call-draft".to_owned(),
+            contribution_id: "draft".to_owned(),
+            sequence: 1,
+            producer_id: schema
+                .split(".request-draft")
+                .next()
+                .unwrap_or("fixture")
+                .to_owned(),
+            schema: schema.to_owned(),
+            schema_version: 1,
+            operation: bcode_session_models::ToolContributionOperation::Upsert,
+            persistence: bcode_session_models::ToolContributionPersistence::Transient,
+            artifact: None,
+            payload: serde_json::json!({
+                "preview": "{\"path\":\"src/lib.rs\",\"steps\":[",
+                "argument_bytes": 37,
+                "truncated": false
+            }),
+        };
+        let rendered = render_tool_contribution(
+            &contribution,
+            bcode_session_models::ToolContributionPlacement::Request,
+        );
+        let text = container_text_all(&rendered);
+        assert!(text.contains(expected_title), "{schema}: {text}");
+        assert!(text.contains("incomplete arguments"), "{schema}: {text}");
+        assert!(text.contains("37 argument bytes"), "{schema}: {text}");
+        assert!(!text.contains("preview"), "{schema}: {text}");
     }
 }
 
