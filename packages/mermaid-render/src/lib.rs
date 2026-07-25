@@ -179,6 +179,8 @@ pub enum MermaidRenderError {
     InvalidDimensions,
     /// Configured timeout is zero or concurrency is disabled.
     InvalidExecutionLimits,
+    /// Output pixel count exceeds the configured dimensions.
+    OutputDimensionsExceeded,
     /// Source contains a directive, which Bcode intentionally disallows.
     DirectiveNotAllowed,
     /// Rendering was cancelled.
@@ -203,6 +205,9 @@ impl std::fmt::Display for MermaidRenderError {
             Self::InvalidExecutionLimits => {
                 formatter.write_str("Mermaid timeout and concurrency limits must be non-zero")
             }
+            Self::OutputDimensionsExceeded => {
+                formatter.write_str("Mermaid output dimensions exceed configured bounds")
+            }
             Self::DirectiveNotAllowed => formatter.write_str("Mermaid directives are not allowed"),
             Self::Cancelled => formatter.write_str("Mermaid rendering was cancelled"),
             Self::InvalidDiagram { message } => {
@@ -226,7 +231,7 @@ impl std::error::Error for MermaidRenderError {}
 ///
 /// Returns an error when:
 ///
-/// * source or output exceeds configured bounds;
+/// * source or output exceeds configured byte/dimension bounds;
 /// * requested dimensions or execution limits are invalid;
 /// * source contains a Mermaid directive;
 /// * cancellation is requested;
@@ -239,6 +244,11 @@ pub fn render_mermaid(
     let svg = backend::render_svg(request.source.as_str())?;
     if cancellation.is_cancelled() {
         return Err(MermaidRenderError::Cancelled);
+    }
+    if let Some((width, height)) = svg_dimensions(&svg)
+        && (width > f64::from(request.width) || height > f64::from(request.height))
+    {
+        return Err(MermaidRenderError::OutputDimensionsExceeded);
     }
     if svg.len() > request.limits.max_output_bytes {
         return Err(MermaidRenderError::OutputTooLarge {
@@ -287,6 +297,24 @@ fn validate_request(
         return Err(MermaidRenderError::DirectiveNotAllowed);
     }
     Ok(())
+}
+
+fn svg_dimensions(svg: &str) -> Option<(f64, f64)> {
+    let tag_end = svg.find('>')?;
+    let opening = &svg[..tag_end];
+    let width = svg_attribute_number(opening, "width")?;
+    let height = svg_attribute_number(opening, "height")?;
+    Some((width, height))
+}
+
+fn svg_attribute_number(opening_tag: &str, name: &str) -> Option<f64> {
+    let marker = format!("{name}=\"");
+    let start = opening_tag.find(&marker)?.saturating_add(marker.len());
+    let end = opening_tag[start..].find('"')?.saturating_add(start);
+    let raw = opening_tag[start..end]
+        .trim_end_matches("px")
+        .trim_end_matches("pt");
+    raw.parse().ok()
 }
 
 fn stable_source_hash(source: &str) -> u64 {
@@ -347,6 +375,12 @@ mod tests {
         assert_eq!(
             render_mermaid(&disabled, &MermaidCancellationToken::default()),
             Err(MermaidRenderError::InvalidExecutionLimits)
+        );
+
+        let too_small = MermaidRenderRequest::svg("flowchart LR\nA --> B", 1, 1);
+        assert_eq!(
+            render_mermaid(&too_small, &MermaidCancellationToken::default()),
+            Err(MermaidRenderError::OutputDimensionsExceeded)
         );
     }
 

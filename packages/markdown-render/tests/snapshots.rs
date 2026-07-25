@@ -289,6 +289,83 @@ fn details_contributions_preserve_safe_summary_body_and_default_state() {
 }
 
 #[test]
+fn streamed_semantic_ids_shift_only_at_or_after_changed_source() {
+    let before = render_markdown(
+        "[first](a.md) and [second](b.md)",
+        &MarkdownRenderOptions::new(80).with_document_id("stream:1"),
+    );
+    let after = render_markdown(
+        "prefix [first](a.md) and [second](b.md)",
+        &MarkdownRenderOptions::new(80).with_document_id("stream:1"),
+    );
+    assert_eq!(before.contributions.len(), after.contributions.len());
+    assert_ne!(before.contributions[0].id, after.contributions[0].id);
+    assert!(
+        before
+            .contributions
+            .iter()
+            .zip(&after.contributions)
+            .all(|(before, after)| before.kind == after.kind && before.id != after.id)
+    );
+
+    let append_before = render_markdown(
+        "[first](a.md)",
+        &MarkdownRenderOptions::new(80).with_document_id("stream:1"),
+    );
+    let append_after = render_markdown(
+        "[first](a.md) trailing stream text",
+        &MarkdownRenderOptions::new(80).with_document_id("stream:1"),
+    );
+    assert_eq!(
+        append_before.contributions[0].id,
+        append_after.contributions[0].id
+    );
+}
+
+#[test]
+fn duplicate_semantic_nodes_have_unique_position_qualified_ids() {
+    let rendered = render_markdown(
+        "[same](target.md) [same](target.md)",
+        &MarkdownRenderOptions::new(80).with_document_id("item:duplicates"),
+    );
+    assert_eq!(rendered.contributions.len(), 2);
+    assert_ne!(rendered.contributions[0].id, rendered.contributions[1].id);
+}
+
+#[test]
+fn markdown_layout_signature_tracks_every_renderer_owned_layout_input() {
+    let base = MarkdownRenderOptions::new(80).with_document_id("item:1");
+    let base_result = render_markdown("[link](relative.md)", &base);
+    let variants = [
+        MarkdownRenderOptions::new(40).with_document_id("item:1"),
+        MarkdownRenderOptions::new(80).with_document_id("item:2"),
+        MarkdownRenderOptions::new(80)
+            .with_document_id("item:1")
+            .with_mermaid(800, 600),
+        MarkdownRenderOptions::new(80)
+            .with_document_id("item:1")
+            .with_document_context(MarkdownDocumentContext {
+                base_url: Some(url::Url::parse("https://example.com/base/").unwrap()),
+                ..MarkdownDocumentContext::default()
+            }),
+        MarkdownRenderOptions::new(80).with_theme(bcode_markdown_render::MarkdownTheme {
+            heading: Style::new().fg(Color::Red),
+            ..bcode_markdown_render::MarkdownTheme::default()
+        }),
+    ];
+    for variant in variants {
+        assert_ne!(
+            base_result.layout_signature,
+            render_markdown("[link](relative.md)", &variant).layout_signature
+        );
+    }
+    assert_ne!(
+        base_result.layout_signature,
+        render_markdown("[different](relative.md)", &base).layout_signature
+    );
+}
+
+#[test]
 fn github_issue_references_require_explicit_repository_context() {
     let markdown = "Closes #42, see #7, but not #0 or #abc.";
     let without_context = render_markdown(markdown, &MarkdownRenderOptions::new(80));

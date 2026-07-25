@@ -603,6 +603,8 @@ pub struct MarkdownRenderResult {
     pub lines: Vec<Line>,
     /// Source-order semantic contributions independent of TUI event-loop types.
     pub contributions: Vec<MarkdownContribution>,
+    /// Layout signature including every renderer-owned layout-affecting option.
+    pub layout_signature: String,
 }
 
 /// Stable semantic contribution emitted alongside terminal lines.
@@ -716,10 +718,37 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
         options,
     );
     let projected_markdown = project_semantic_fallbacks(markdown, &document, &details);
+    let layout_signature = markdown_layout_signature(markdown, options, &contributions);
     MarkdownRenderResult {
         lines: render_markdown_lines_internal(&projected_markdown, options),
         contributions,
+        layout_signature,
     }
+}
+
+fn markdown_layout_signature(
+    markdown: &str,
+    options: &MarkdownRenderOptions,
+    contributions: &[MarkdownContribution],
+) -> String {
+    format!(
+        "markdown-layout-v1:{}:{}:{}:{}:{}:{}:{}",
+        options.width,
+        stable_text_hash(markdown),
+        stable_text_hash(&format!("{:?}", options.theme)),
+        stable_text_hash(&format!("{:?}", options.document_context)),
+        options.mermaid_enabled,
+        options.mermaid_width,
+        stable_text_hash(&format!("{}:{:?}", options.mermaid_height, contributions))
+    )
+}
+
+fn stable_text_hash(source: &str) -> u64 {
+    const OFFSET: u64 = 14_695_981_039_346_656_037;
+    const PRIME: u64 = 1_099_511_628_211;
+    source.as_bytes().iter().fold(OFFSET, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(PRIME)
+    })
 }
 
 fn project_semantic_fallbacks<'a>(
