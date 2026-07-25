@@ -309,6 +309,11 @@ pub enum Request {
     AssociatedWorkflowRun {
         key: WorkflowRunBindingLookup,
     },
+    /// Inspect the newest run for one exact generic binding key.
+    InspectAssociatedWorkflowRun {
+        key: WorkflowRunBindingLookup,
+        limit: usize,
+    },
     /// Apply one lifecycle transition to the newest run for one exact binding key.
     ControlAssociatedWorkflowRun {
         key: WorkflowRunBindingLookup,
@@ -1407,6 +1412,9 @@ pub enum ResponsePayload {
     AssociatedWorkflowRun {
         run: Option<bcode_workflow_store::WorkflowRunSummary>,
     },
+    AssociatedWorkflowRunInspection {
+        inspection: Option<Box<WorkflowRunInspection>>,
+    },
     AssociatedWorkflowRunControlled {
         run: Option<bcode_workflow_store::WorkflowRunSummary>,
         changed: bool,
@@ -2321,6 +2329,22 @@ mod tests {
                     workflow_kind: "review".to_string(),
                     scope_key: "session-1".to_string(),
                 },
+            },
+            Request::InspectAssociatedWorkflowRun {
+                key: WorkflowRunBindingLookup {
+                    owner_plugin_id: "bcode.review".to_string(),
+                    workflow_kind: "review".to_string(),
+                    scope_key: "session-1".to_string(),
+                },
+                limit: 25,
+            },
+            Request::ControlAssociatedWorkflowRun {
+                key: WorkflowRunBindingLookup {
+                    owner_plugin_id: "bcode.review".to_string(),
+                    workflow_kind: "review".to_string(),
+                    scope_key: "session-1".to_string(),
+                },
+                action: WorkflowRunControlAction::Pause,
             },
             Request::ListWorkflowRuns { limit: 25 },
             Request::CancelWorkflowRun {

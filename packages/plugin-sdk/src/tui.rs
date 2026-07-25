@@ -78,6 +78,106 @@ pub struct PluginWorkflowBinding {
     pub single_active: bool,
 }
 
+impl PluginWorkflowBinding {
+    /// Return the exact generic lookup key carried across plugin host boundaries.
+    #[must_use]
+    pub fn lookup(&self) -> PluginWorkflowLookup {
+        PluginWorkflowLookup {
+            owner_plugin_id: self.owner_plugin_id.clone(),
+            workflow_kind: self.workflow_kind.clone(),
+            scope_key: self.scope_key.clone(),
+        }
+    }
+}
+
+/// Exact generic workflow association key available to plugin surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginWorkflowLookup {
+    pub owner_plugin_id: String,
+    pub workflow_kind: String,
+    pub scope_key: String,
+}
+
+/// Durable workflow status exposed without coupling the plugin SDK to persistence internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginWorkflowStatus {
+    Running,
+    Paused,
+    Completed,
+    Failed,
+    Cancelled,
+    RepairRequired,
+}
+
+/// Bounded associated workflow summary exposed to plugin-owned surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginWorkflowSummary {
+    pub run_id: String,
+    pub definition_id: String,
+    pub definition_version: u32,
+    pub status: PluginWorkflowStatus,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// Bounded associated workflow inspection exposed to plugin-owned surfaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginWorkflowInspection {
+    pub run: PluginWorkflowSummary,
+    pub definition: bcode_workflow::WorkflowDefinition,
+    pub waits: Vec<serde_json::Value>,
+    pub attempts: Vec<serde_json::Value>,
+    pub events: Vec<serde_json::Value>,
+    pub grants: Vec<serde_json::Value>,
+    pub resource_leases: Vec<serde_json::Value>,
+    pub outputs: Vec<serde_json::Value>,
+    pub child_session_ids: Vec<SessionId>,
+}
+
+/// Lifecycle transition available through generic plugin host workflow routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginWorkflowControlAction {
+    Pause,
+    Resume,
+    Cancel,
+}
+
+/// Result of applying one associated workflow lifecycle transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginWorkflowControlResult {
+    pub run: Option<PluginWorkflowSummary>,
+    pub changed: bool,
+}
+
+/// Async associated workflow lookup result.
+pub type PluginWorkflowLookupFuture = Pin<
+    Box<
+        dyn Future<Output = Result<Option<PluginWorkflowSummary>, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// Async associated workflow inspection result.
+pub type PluginWorkflowInspectionFuture = Pin<
+    Box<
+        dyn Future<Output = Result<Option<PluginWorkflowInspection>, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
+/// Async associated workflow lifecycle result.
+pub type PluginWorkflowControlFuture = Pin<
+    Box<
+        dyn Future<Output = Result<PluginWorkflowControlResult, PluginTuiHostError>>
+            + Send
+            + 'static,
+    >,
+>;
+
 /// Renderer-neutral request for a plugin surface to start one durable workflow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginWorkflowStartRequest {
@@ -227,6 +327,41 @@ pub trait PluginTuiHost: Send + Sync {
         Box::pin(async {
             Err(PluginTuiHostError::Unsupported(
                 "workflow start is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Return the newest workflow associated with one exact generic binding.
+    fn associated_workflow(&self, _lookup: PluginWorkflowLookup) -> PluginWorkflowLookupFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow lookup is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Return a bounded aggregate inspection for the newest associated workflow.
+    fn inspect_associated_workflow(
+        &self,
+        _lookup: PluginWorkflowLookup,
+        _limit: usize,
+    ) -> PluginWorkflowInspectionFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow inspection is not available from this host".to_string(),
+            ))
+        })
+    }
+
+    /// Apply one lifecycle transition to the newest associated workflow.
+    fn control_associated_workflow(
+        &self,
+        _lookup: PluginWorkflowLookup,
+        _action: PluginWorkflowControlAction,
+    ) -> PluginWorkflowControlFuture {
+        Box::pin(async {
+            Err(PluginTuiHostError::Unsupported(
+                "workflow lifecycle control is not available from this host".to_string(),
             ))
         })
     }

@@ -2,14 +2,14 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Deterministic, manually steerable prompt loops for Bcode sessions.
+//! Workflow-native deterministic prompt loops for Bcode sessions.
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use bcode_client::{BcodeClient, SessionWatchEvent};
+use bcode_client::BcodeClient;
 use bcode_command::{
     COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
     CommandSurface, InvokeCommandRequest, InvokeCommandResponse, OP_INVOKE_COMMAND,
@@ -18,8 +18,9 @@ use bcode_plugin_sdk::prelude::*;
 use bcode_plugin_sdk::tui::{
     BoxedPluginTuiSurface, PluginTuiAction, PluginTuiHost, PluginTuiRegistry, PluginTuiSurface,
     PluginTuiSurfaceFactory, PluginTuiSurfaceFuture, PluginTuiSurfaceOpenRequest,
+    PluginWorkflowBinding, PluginWorkflowStartRequest,
 };
-use bcode_session_models::{ModelTurnOutcome, SessionEventKind, SessionId};
+use bcode_session_models::SessionId;
 use bmux_keyboard::KeyCode;
 use bmux_text_edit::TextEditBuffer;
 use bmux_tui::event::{Event, MouseEventKind};
@@ -34,15 +35,15 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 const PLUGIN_ID: &str = "bcode.loop";
+const WORKFLOW_KIND: &str = "bcode.loop";
 const START_COMMAND: &str = "loop";
 const STATUS_COMMAND: &str = "loop.status";
+const PAUSE_COMMAND: &str = "loop.pause";
 const STOP_COMMAND: &str = "loop.stop";
 const RESUME_COMMAND: &str = "loop.resume";
 const SURFACE_KIND: &str = "loop.start";
 const DEFAULT_MAX_ITERATIONS: u64 = 20;
 const HARD_MAX_ITERATIONS: u64 = 1_000;
-const STATE_SCHEMA_VERSION: u32 = 2;
-const MAX_STATE_BYTES: u64 = 1_048_576;
 const MAX_PROMPT_BYTES: usize = 262_144;
 
 #[derive(Default)]
@@ -88,44 +89,21 @@ impl RustPlugin for LoopPlugin {
 
 fn commands() -> Vec<CommandContribution> {
     vec![
-        command(
-            START_COMMAND,
-            "Loop",
-            "Start a deterministic prompt loop",
-            true,
-        ),
-        command(
-            STATUS_COMMAND,
-            "Loop Status",
-            "Show prompt loop status",
-            true,
-        ),
-        command(
-            STOP_COMMAND,
-            "Stop Loop",
-            "Stop the active prompt loop",
-            true,
-        ),
-        command(
-            RESUME_COMMAND,
-            "Resume Loop",
-            "Resume a paused prompt loop",
-            true,
-        ),
+        command(START_COMMAND, "Loop", "Start a deterministic prompt loop"),
+        command(STATUS_COMMAND, "Loop Status", "Show prompt loop status"),
+        command(PAUSE_COMMAND, "Pause Loop", "Pause the active prompt loop"),
+        command(STOP_COMMAND, "Stop Loop", "Stop the active prompt loop"),
+        command(RESUME_COMMAND, "Resume Loop", "Resume a paused prompt loop"),
     ]
 }
 
-fn command(id: &str, title: &str, description: &str, slash: bool) -> CommandContribution {
-    let mut surfaces = BTreeSet::from([CommandSurface::Palette]);
-    if slash {
-        surfaces.insert(CommandSurface::Slash);
-    }
+fn command(id: &str, title: &str, description: &str) -> CommandContribution {
     CommandContribution {
         id: id.to_owned(),
         title: title.to_owned(),
         description: Some(description.to_owned()),
         category: Some("automation".to_owned()),
-        surfaces,
+        surfaces: BTreeSet::from([CommandSurface::Palette, CommandSurface::Slash]),
         execution: bcode_command::CommandExecution::Immediate,
         owner: CommandOwner::Plugin {
             plugin_id: PLUGIN_ID.to_owned(),
@@ -137,62 +115,10 @@ fn command(id: &str, title: &str, description: &str, slash: bool) -> CommandCont
     }
 }
 
-fn active_status_contribution(
-    state: &LoopState,
-    pending_steering: u32,
-) -> Option<bcode_plugin_sdk::SessionStatusContribution> {
-    if state.state.is_terminal() {
-        return None;
-    }
-    let reason = state.stop_reason.clone();
-    let mut metadata = std::collections::BTreeMap::from([
-        ("run_id".to_owned(), serde_json::json!(state.run_id)),
-        (
-            "phase".to_owned(),
-            serde_json::json!(format!("{:?}", state.state)),
-        ),
-        (
-            "iteration".to_owned(),
-            serde_json::json!(state.current_iteration),
-        ),
-        ("limit".to_owned(), serde_json::json!(state.max_iterations)),
-        (
-            "queued_steering".to_owned(),
-            serde_json::json!(pending_steering),
-        ),
-    ]);
-    if let Some(reason) = &reason {
-        metadata.insert("reason".to_owned(), serde_json::json!(reason));
-    }
-    let mut text = format!(
-        "Loop active · {}/{} · {:?} · steering {} · normal messages steer before the next iteration",
-        state.current_iteration, state.max_iterations, state.state, pending_steering
-    );
-    if let Some(reason) = reason {
-        text.push_str(" · ");
-        text.push_str(&reason);
-    }
-    Some(bcode_plugin_sdk::SessionStatusContribution {
-        contribution_id: "active-loop".to_owned(),
-        text,
-        priority: 20,
-        metadata,
-    })
-}
-
-fn session_status_response(session_id: SessionId) -> bcode_plugin_sdk::SessionStatusResponse {
-    let Ok(Some(state)) = load_state_result(session_id) else {
-        return bcode_plugin_sdk::SessionStatusResponse::default();
-    };
-    bcode_plugin_sdk::SessionStatusResponse {
-        contribution: active_status_contribution(&state, 0),
-    }
-}
-
 fn workflow_binding_key(session_id: SessionId) -> bcode_ipc::WorkflowRunBindingLookup {
     bcode_ipc::WorkflowRunBindingLookup {
         owner_plugin_id: PLUGIN_ID.to_string(),
-        workflow_kind: "bcode.loop".to_string(),
+        workflow_kind: WORKFLOW_KIND.to_string(),
         scope_key: session_id.to_string(),
     }
 }
@@ -227,15 +153,66 @@ fn format_workflow_status(run: &bcode_workflow_store::WorkflowRunSummary) -> Str
     )
 }
 
+const fn unsupported_legacy_message() -> &'static str {
+    "legacy loop state is unsupported by this daemon; use the older daemon that created it"
+}
+
 fn status_for_session(session_id: SessionId) -> InvokeCommandResponse {
     match associated_workflow_run(session_id) {
         Ok(Some(run)) => status_response(&format_workflow_status(&run)),
-        Ok(None) => match load_state_result(session_id) {
-            Ok(state) => status_response(&format_status(state.as_ref(), None)),
-            Err(error) => status_response(&format!("loop state unavailable: {error}")),
-        },
+        Ok(None) if legacy_state_exists(session_id) => {
+            status_response(unsupported_legacy_message())
+        }
+        Ok(None) => status_response("no loop found for this session"),
         Err(error) => status_response(&format!("workflow status unavailable: {error}")),
     }
+}
+
+fn control_loop(
+    session_id: SessionId,
+    action: bcode_ipc::WorkflowRunControlAction,
+) -> InvokeCommandResponse {
+    let verb = match action {
+        bcode_ipc::WorkflowRunControlAction::Pause => "paused",
+        bcode_ipc::WorkflowRunControlAction::Resume => "resumed",
+        bcode_ipc::WorkflowRunControlAction::Cancel => "cancellation requested",
+    };
+    match control_associated_workflow_run(session_id, action) {
+        Ok((Some(run), true)) => status_response(&format!("loop workflow {} {verb}", run.run_id)),
+        Ok((Some(run), false)) => status_response(&format_workflow_status(&run)),
+        Ok((None, _)) if legacy_state_exists(session_id) => {
+            status_response(unsupported_legacy_message())
+        }
+        Ok((None, _)) => status_response("no loop found for this session"),
+        Err(error) => status_response(&format!("workflow lifecycle unavailable: {error}")),
+    }
+}
+
+fn session_status_response(session_id: SessionId) -> bcode_plugin_sdk::SessionStatusResponse {
+    let contribution = associated_workflow_run(session_id)
+        .ok()
+        .flatten()
+        .filter(|run| {
+            matches!(
+                run.status,
+                bcode_workflow_store::RunStatus::Running
+                    | bcode_workflow_store::RunStatus::Paused
+                    | bcode_workflow_store::RunStatus::RepairRequired
+            )
+        })
+        .map(|run| bcode_plugin_sdk::SessionStatusContribution {
+            contribution_id: "active-loop".to_owned(),
+            text: format_workflow_status(&run),
+            priority: 20,
+            metadata: std::collections::BTreeMap::from([
+                ("run_id".to_owned(), serde_json::json!(run.run_id)),
+                (
+                    "status".to_owned(),
+                    serde_json::json!(format!("{:?}", run.status)),
+                ),
+            ]),
+        });
+    bcode_plugin_sdk::SessionStatusResponse { contribution }
 }
 
 fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
@@ -249,13 +226,17 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
             || status_response("/loop status requires an active session"),
             status_for_session,
         ),
+        START_COMMAND if arguments == "pause" => session_id.map_or_else(
+            || status_response("/loop pause requires an active session"),
+            |session_id| control_loop(session_id, bcode_ipc::WorkflowRunControlAction::Pause),
+        ),
         START_COMMAND if arguments == "stop" => session_id.map_or_else(
             || status_response("/loop stop requires an active session"),
-            stop_loop,
+            |session_id| control_loop(session_id, bcode_ipc::WorkflowRunControlAction::Cancel),
         ),
         START_COMMAND if arguments == "resume" => session_id.map_or_else(
             || status_response("/loop resume requires an active session"),
-            resume_loop,
+            |session_id| control_loop(session_id, bcode_ipc::WorkflowRunControlAction::Resume),
         ),
         START_COMMAND if arguments.is_empty() => InvokeCommandResponse {
             success: true,
@@ -273,15 +254,21 @@ fn command_response(request: &InvokeCommandRequest) -> ServiceResponse {
             || status_response("/loop status requires an active session"),
             status_for_session,
         ),
+        PAUSE_COMMAND => session_id.map_or_else(
+            || status_response("/loop pause requires an active session"),
+            |session_id| control_loop(session_id, bcode_ipc::WorkflowRunControlAction::Pause),
+        ),
         STOP_COMMAND => session_id.map_or_else(
             || status_response("/loop stop requires an active session"),
-            stop_loop,
+            |session_id| control_loop(session_id, bcode_ipc::WorkflowRunControlAction::Cancel),
         ),
         RESUME_COMMAND => session_id.map_or_else(
             || status_response("/loop resume requires an active session"),
-            resume_loop,
+            |session_id| control_loop(session_id, bcode_ipc::WorkflowRunControlAction::Resume),
         ),
-        START_COMMAND => status_response("unknown /loop action; use status, stop, or resume"),
+        START_COMMAND => {
+            status_response("unknown /loop action; use status, pause, stop, or resume")
+        }
         _ => status_response("unsupported loop command"),
     };
     json_response(&response)
@@ -299,145 +286,6 @@ fn status_response(message: &str) -> InvokeCommandResponse {
             format: bcode_command::CommandTextFormat::PlainText,
         }],
     }
-}
-
-fn stop_confirmation() -> String {
-    "loop cancellation requested; terminal outcome: Canceled · reason: stopped by user".to_owned()
-}
-
-fn stop_loop(session_id: SessionId) -> InvokeCommandResponse {
-    match control_associated_workflow_run(session_id, bcode_ipc::WorkflowRunControlAction::Cancel) {
-        Ok((Some(run), changed)) => {
-            let message = if changed {
-                format!("loop workflow {} cancellation requested", run.run_id)
-            } else {
-                format_workflow_status(&run)
-            };
-            return status_response(&message);
-        }
-        Ok((None, _)) => {}
-        Err(error) => {
-            return status_response(&format!("workflow cancellation unavailable: {error}"));
-        }
-    }
-    let mut state = match load_state_result(session_id) {
-        Ok(Some(state)) => state,
-        Ok(None) => return status_response("no loop found for this session"),
-        Err(error) => return status_response(&format!("loop state unavailable: {error}")),
-    };
-    if loop_state_uses_workflow_runtime(&state) {
-        return status_response(
-            "workflow-backed loop cancellation is managed by /workflow cancel using the displayed run id",
-        );
-    }
-    if state.state.is_terminal() {
-        return status_response(&format_status(Some(&state), None));
-    }
-    state.cancel_requested = true;
-    if let Err(error) = transition(&mut state, RunState::Canceled) {
-        return status_response(&error);
-    }
-    state.stop_reason = Some("stopped by user".to_owned());
-    let pending_work = state.pending_operation.as_ref().and_then(|operation| {
-        operation.accepted_sequence.map(|sequence| {
-            (
-                operation.target_session_id,
-                bcode_session_models::TurnReceipt::from_accepted_event(
-                    operation.target_session_id,
-                    sequence,
-                )
-                .work_id,
-            )
-        })
-    });
-    let message = match save_state(&state) {
-        Ok(()) => {
-            if let Some((pending_session_id, work_id)) = pending_work {
-                let client = BcodeClient::default_endpoint();
-                tokio::spawn(async move {
-                    let _cancelled = client
-                        .cancel_runtime_work(pending_session_id, work_id)
-                        .await;
-                });
-            }
-            stop_confirmation()
-        }
-        Err(error) => format!("failed to stop loop: {error}"),
-    };
-    status_response(&message)
-}
-
-fn prepare_resume(state: &mut LoopState) -> Result<(), String> {
-    if is_legacy_loop_state(state) {
-        return prepare_legacy_resume(state);
-    }
-    prepare_workflow_resume(state)
-}
-
-fn prepare_legacy_resume(state: &mut LoopState) -> Result<(), String> {
-    prepare_resume_state(state)
-}
-
-fn prepare_workflow_resume(state: &mut LoopState) -> Result<(), String> {
-    prepare_resume_state(state)
-}
-
-fn prepare_resume_state(state: &mut LoopState) -> Result<(), String> {
-    if matches!(
-        state.state,
-        RunState::Completed | RunState::LimitReached | RunState::Canceled
-    ) {
-        return Err("this loop is terminal and cannot be resumed".to_owned());
-    }
-    let recoverable_evaluation = state.state == RunState::Evaluating
-        && state.pending_operation.is_none()
-        && state
-            .latest_evaluation
-            .as_ref()
-            .is_some_and(|evaluation| !evaluation.condition_met);
-    if !matches!(state.state, RunState::Paused | RunState::Failed) && !recoverable_evaluation {
-        return Err(
-            "only paused, failed, or completed-incomplete evaluation loops can be resumed"
-                .to_owned(),
-        );
-    }
-    state.cancel_requested = false;
-    transition(state, RunState::Ready)?;
-    state.stop_reason = None;
-    Ok(())
-}
-
-fn resume_loop(session_id: SessionId) -> InvokeCommandResponse {
-    match control_associated_workflow_run(session_id, bcode_ipc::WorkflowRunControlAction::Resume) {
-        Ok((Some(run), changed)) => {
-            let message = if changed {
-                format!("loop workflow {} resumed", run.run_id)
-            } else {
-                format_workflow_status(&run)
-            };
-            return status_response(&message);
-        }
-        Ok((None, _)) => {}
-        Err(error) => return status_response(&format!("workflow resume unavailable: {error}")),
-    }
-    let mut state = match load_state_result(session_id) {
-        Ok(Some(state)) => state,
-        Ok(None) => return status_response("no loop found for this session"),
-        Err(error) => return status_response(&format!("loop state unavailable: {error}")),
-    };
-    if loop_state_uses_workflow_runtime(&state) {
-        return status_response(
-            "workflow-backed loop resume is managed by /workflow resume using the displayed run id",
-        );
-    }
-    if let Err(error) = prepare_resume(&mut state) {
-        return status_response(&error);
-    }
-    if let Err(error) = save_state(&state) {
-        return status_response(&format!("failed to resume loop: {error}"));
-    }
-    tokio::spawn(run_loop(state));
-    status_response("loop resumed")
 }
 
 fn run_async<F, T>(future: F) -> Result<T, String>
@@ -523,7 +371,7 @@ struct LoopSurface {
     condition: TextInputState,
     limit: TextInputState,
     field: Field,
-    pending_workflow_start: Option<LoopState>,
+    pending_workflow_start: Option<PluginWorkflowStartRequest>,
     status: String,
     prompt_area: Rect,
     condition_area: Rect,
@@ -572,11 +420,15 @@ impl LoopSurface {
         }
     }
 
-    fn start(&mut self, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+    fn start(&mut self) -> PluginTuiAction {
         let Some(session_id) = self.session_id else {
             "an active persisted session is required".clone_into(&mut self.status);
             return PluginTuiAction::Redraw;
         };
+        if legacy_state_exists(session_id) {
+            unsupported_legacy_message().clone_into(&mut self.status);
+            return PluginTuiAction::Redraw;
+        }
         let prompt = input_text(&self.prompt);
         let condition = input_text(&self.condition);
         let limit = input_text(&self.limit);
@@ -585,43 +437,41 @@ impl LoopSurface {
             "maximum iterations must be a number".clone_into(&mut self.status);
             return PluginTuiAction::Redraw;
         };
-        if prompt.is_empty() {
-            self.field = Field::Prompt;
-            "iteration prompt is required".clone_into(&mut self.status);
-            return PluginTuiAction::Redraw;
-        }
-        if condition.is_empty() {
-            self.field = Field::Condition;
-            "stop condition is required".clone_into(&mut self.status);
-            return PluginTuiAction::Redraw;
-        }
-        if !(1..=HARD_MAX_ITERATIONS).contains(&max_iterations) {
-            self.field = Field::Limit;
-            self.status = format!("maximum iterations must be 1..={HARD_MAX_ITERATIONS}");
-            return PluginTuiAction::Redraw;
-        }
-        match load_state_result(session_id) {
-            Ok(Some(state)) if !state.state.is_terminal() => {
-                if prepared_workflow_start_matches(&state, &prompt, &condition, max_iterations) {
-                    self.pending_workflow_start = Some(state);
-                    "retrying prepared durable loop workflow start".clone_into(&mut self.status);
-                    return PluginTuiAction::Redraw;
-                }
-                "this session already has an active loop".clone_into(&mut self.status);
-                return PluginTuiAction::Redraw;
-            }
+        let input = match LoopWorkflowInput::new(prompt, condition, max_iterations) {
+            Ok(input) => input,
             Err(error) => {
-                self.status = format!("existing loop state unavailable: {error}");
+                self.status = error;
                 return PluginTuiAction::Redraw;
             }
-            Ok(Some(_) | None) => {}
-        }
-        let state = LoopState::new(session_id, prompt, condition, max_iterations);
-        if let Err(error) = save_state(&state) {
-            self.status = format!("failed to prepare loop state: {error}");
-            return PluginTuiAction::Redraw;
-        }
-        self.pending_workflow_start = Some(state);
+        };
+        let spec = match loop_workflow_spec(&input) {
+            Ok(spec) => spec,
+            Err(error) => {
+                self.status = error;
+                return PluginTuiAction::Redraw;
+            }
+        };
+        let initial = loop_workflow_initial_value(&input);
+        let request = match PluginWorkflowStartRequest::typed(
+            &spec,
+            &initial,
+            session_id,
+            PluginWorkflowBinding {
+                owner_plugin_id: PLUGIN_ID.to_string(),
+                workflow_kind: WORKFLOW_KIND.to_string(),
+                scope_key: session_id.to_string(),
+                display_label: Some("Loop".to_string()),
+                single_active: true,
+            },
+            Some(uuid::Uuid::new_v4().to_string()),
+        ) {
+            Ok(request) => request,
+            Err(error) => {
+                self.status = format!("invalid durable loop request: {error}");
+                return PluginTuiAction::Redraw;
+            }
+        };
+        self.pending_workflow_start = Some(request);
         "starting durable loop workflow".clone_into(&mut self.status);
         PluginTuiAction::Redraw
     }
@@ -695,7 +545,7 @@ impl PluginTuiSurface for LoopSurface {
             "Iteration prompt",
             &mut self.prompt,
             self.field == Field::Prompt,
-            self.prompt_area.height.saturating_sub(2).max(2),
+            self.prompt_area.height,
         );
         Self::render_input(
             self.condition_area,
@@ -703,7 +553,7 @@ impl PluginTuiSurface for LoopSurface {
             "Stop condition",
             &mut self.condition,
             self.field == Field::Condition,
-            self.condition_area.height.saturating_sub(2).max(2),
+            self.condition_area.height,
         );
         Self::render_input(
             self.limit_area,
@@ -731,62 +581,20 @@ impl PluginTuiSurface for LoopSurface {
         host: &'a dyn PluginTuiHost,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PluginTuiAction> + Send + 'a>> {
         Box::pin(async move {
-            let Some(mut state) = self.pending_workflow_start.take() else {
+            let Some(request) = self.pending_workflow_start.take() else {
                 return PluginTuiAction::None;
             };
-            let definition = state
-                .workflow_definition
-                .clone()
-                .expect("new loop state has a workflow definition");
-            let input = state
-                .workflow_initial_value
-                .clone()
-                .expect("new loop state has workflow input");
-            let spec = match bcode_workflow::WorkflowSpec::from_definition("bcode.loop", definition)
-            {
-                Ok(spec) => spec,
-                Err(error) => {
-                    self.status = format!("invalid durable loop workflow: {error}");
-                    return PluginTuiAction::Redraw;
-                }
-            };
-            let request = match bcode_plugin_sdk::tui::PluginWorkflowStartRequest::typed(
-                &spec,
-                &input,
-                state.session_id,
-                bcode_plugin_sdk::tui::PluginWorkflowBinding {
-                    owner_plugin_id: PLUGIN_ID.to_string(),
-                    workflow_kind: "bcode.loop".to_string(),
-                    scope_key: state.session_id.to_string(),
-                    display_label: Some("Loop".to_string()),
-                    single_active: true,
+            match host.start_workflow(request.clone()).await {
+                Ok(started) => PluginTuiAction::Close {
+                    outcome: Some(serde_json::json!({
+                        "status": "loop started through durable workflow runtime",
+                        "append_text": "Loop started. Use /loop status, /loop stop, or /loop resume.",
+                        "run_id": started.run_id,
+                        "runtime_work_id": started.runtime_work_id,
+                    })),
                 },
-                Some(state.run_id.clone()),
-            ) {
-                Ok(request) => request,
                 Err(error) => {
-                    self.status = format!("invalid durable loop input: {error}");
-                    return PluginTuiAction::Redraw;
-                }
-            };
-            match host.start_workflow(request).await {
-                Ok(started) => {
-                    state.run_id.clone_from(&started.run_id);
-                    state.workflow_run_id = Some(started.run_id);
-                    if let Err(error) = save_state(&state) {
-                        self.status =
-                            format!("workflow started but loop state failed to save: {error}");
-                        return PluginTuiAction::Redraw;
-                    }
-                    PluginTuiAction::Close {
-                        outcome: Some(serde_json::json!({
-                            "status": "loop started through durable workflow runtime; normal messages remain available for steering",
-                            "append_text": "Loop started. Normal messages remain available for steering. Use /loop status or /loop stop.",
-                            "runtime_work_id": started.runtime_work_id,
-                        })),
-                    }
-                }
-                Err(error) => {
+                    self.pending_workflow_start = Some(request);
                     self.status = format!("failed to start durable loop workflow: {error}");
                     PluginTuiAction::Redraw
                 }
@@ -794,7 +602,7 @@ impl PluginTuiSurface for LoopSurface {
         })
     }
 
-    fn handle_event(&mut self, event: &Event, host: &dyn PluginTuiHost) -> PluginTuiAction {
+    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
         if let Event::Key(stroke) = event {
             if stroke.key == KeyCode::Escape && stroke.modifiers.is_empty() {
                 return PluginTuiAction::Close { outcome: None };
@@ -808,14 +616,14 @@ impl PluginTuiSurface for LoopSurface {
                 return PluginTuiAction::Redraw;
             }
             if stroke.key == KeyCode::Enter && stroke.modifiers.ctrl {
-                return self.start(host);
+                return self.start();
             }
             if stroke.key == KeyCode::Enter && self.field != Field::Limit {
                 self.active_state_mut().buffer_mut().insert_char('\n');
                 return PluginTuiAction::Redraw;
             }
             if stroke.key == KeyCode::Enter && self.field == Field::Limit {
-                return self.start(host);
+                return self.start();
             }
         }
         self.focus_from_click(event);
@@ -873,81 +681,6 @@ const fn event_click_in(event: &Event, area: Rect) -> bool {
     )
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum RunState {
-    Ready,
-    SubmittingIteration,
-    RunningIteration,
-    DrainingSteering,
-    Evaluating,
-    Completed,
-    LimitReached,
-    Paused,
-    Canceled,
-    Failed,
-}
-
-impl RunState {
-    const fn is_terminal(self) -> bool {
-        matches!(
-            self,
-            Self::Completed | Self::LimitReached | Self::Paused | Self::Canceled | Self::Failed
-        )
-    }
-
-    fn can_transition_to(self, next: Self) -> bool {
-        self == next
-            || (!self.is_terminal() && next == Self::Canceled)
-            || matches!(
-                (self, next),
-                (
-                    Self::Ready,
-                    Self::SubmittingIteration | Self::Evaluating | Self::LimitReached
-                ) | (
-                    Self::SubmittingIteration,
-                    Self::RunningIteration | Self::Paused | Self::Failed
-                ) | (
-                    Self::RunningIteration,
-                    Self::DrainingSteering | Self::Evaluating | Self::Paused | Self::Failed
-                ) | (
-                    Self::DrainingSteering,
-                    Self::Evaluating | Self::Paused | Self::Failed
-                ) | (
-                    Self::Evaluating,
-                    Self::DrainingSteering
-                        | Self::Ready
-                        | Self::Completed
-                        | Self::Paused
-                        | Self::Failed
-                ) | (Self::Paused | Self::Failed, Self::Ready | Self::Evaluating)
-            )
-    }
-}
-
-fn transition(state: &mut LoopState, next: RunState) -> Result<(), String> {
-    if !state.state.can_transition_to(next) {
-        return Err(format!(
-            "invalid loop phase transition: {:?} -> {:?}",
-            state.state, next
-        ));
-    }
-    state.state = next;
-    Ok(())
-}
-
-fn transition_or_fail(state: &mut LoopState, next: RunState) -> bool {
-    match transition(state, next) {
-        Ok(()) => true,
-        Err(error) => {
-            state.state = RunState::Failed;
-            state.stop_reason = Some(error);
-            let _saved = save_state(state);
-            false
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 struct LoopWorkflowInput {
     implementation_prompt: String,
@@ -962,10 +695,16 @@ impl LoopWorkflowInput {
         max_iterations: u64,
     ) -> Result<Self, String> {
         if implementation_prompt.trim().is_empty() {
-            return Err("implementation prompt is required".to_string());
+            return Err("iteration prompt is required".to_string());
         }
         if stop_condition.trim().is_empty() {
             return Err("stop condition is required".to_string());
+        }
+        if implementation_prompt.len() > MAX_PROMPT_BYTES || stop_condition.len() > MAX_PROMPT_BYTES
+        {
+            return Err(format!(
+                "loop prompts must not exceed {MAX_PROMPT_BYTES} bytes"
+            ));
         }
         let max_iterations = u32::try_from(max_iterations)
             .map_err(|_| "maximum iterations exceed the workflow limit".to_string())?;
@@ -1002,7 +741,7 @@ fn loop_workflow_spec(
         serde_json::json!({
             "agent_id": null,
             "agent_profile_configured": false,
-            "system_prompt": "Execute one loop implementation iteration using implementation_prompt. Preserve stop_condition, max_iterations, and iteration in the structured output; leave condition_met false and provide no evaluation evidence.",
+            "system_prompt": "Implement the requested work. Preserve the workflow envelope fields, increment iteration, set condition_met false, and provide no evaluation evidence.",
             "prompt_mode": "json_input",
             "read_only": false,
             "tools": null,
@@ -1029,10 +768,10 @@ fn loop_workflow_spec(
         bcode_workflow::field::<LoopWorkflowIteration>("condition_met").eq(false),
         input.max_iterations,
     );
-    let workflow = bcode_workflow::WorkflowBuilder::new("bcode.loop", cycle)
+    let workflow = bcode_workflow::WorkflowBuilder::new(WORKFLOW_KIND, cycle)
         .build()
         .map_err(|error| error.to_string())?;
-    bcode_workflow::WorkflowSpec::new("bcode.loop", &workflow).map_err(|error| error.to_string())
+    bcode_workflow::WorkflowSpec::new(WORKFLOW_KIND, &workflow).map_err(|error| error.to_string())
 }
 
 fn loop_workflow_initial_value(input: &LoopWorkflowInput) -> LoopWorkflowIteration {
@@ -1047,864 +786,19 @@ fn loop_workflow_initial_value(input: &LoopWorkflowInput) -> LoopWorkflowIterati
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Evaluation {
-    condition_met: bool,
-    #[serde(default)]
-    evidence: Vec<String>,
-    summary: String,
+fn legacy_state_exists(session_id: SessionId) -> bool {
+    legacy_state_exists_at(&legacy_state_path(session_id))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum OperationKind {
-    Iteration {
-        iteration: u64,
-    },
-    Evaluation {
-        #[serde(alias = "source_generation")]
-        iteration: u64,
-    },
+fn legacy_state_exists_at(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum OperationStatus {
-    Prepared,
-    Accepted,
-    Completed,
+fn legacy_state_path(session_id: SessionId) -> PathBuf {
+    legacy_state_root().join(format!("{session_id}.json"))
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct TurnCompletion {
-    outcome: ModelTurnOutcome,
-    #[serde(default)]
-    assistant_text: String,
-    event_sequence: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PendingOperation {
-    operation_id: String,
-    kind: OperationKind,
-    target_session_id: SessionId,
-    #[serde(default, skip_serializing, rename = "expected_generation")]
-    _expected_generation: Option<u64>,
-    status: OperationStatus,
-    #[serde(default)]
-    accepted_turn_id: Option<String>,
-    #[serde(default)]
-    accepted_sequence: Option<u64>,
-    #[serde(default)]
-    completion: Option<TurnCompletion>,
-}
-
-const fn state_schema_version() -> u32 {
-    STATE_SCHEMA_VERSION
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WorkflowLoopPresentationState {
-    #[serde(default = "state_schema_version")]
-    schema_version: u32,
-    runtime: String,
-    run_id: String,
-    session_id: SessionId,
-    iteration_prompt: String,
-    stop_condition: String,
-    max_iterations: u64,
-    workflow_definition: bcode_workflow::WorkflowDefinition,
-    workflow_initial_value: LoopWorkflowIteration,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    workflow_run_id: Option<String>,
-}
-
-impl WorkflowLoopPresentationState {
-    fn from_loop_state(state: &LoopState) -> Result<Self, String> {
-        Ok(Self {
-            schema_version: state.schema_version,
-            runtime: "workflow".to_string(),
-            run_id: state.run_id.clone(),
-            session_id: state.session_id,
-            iteration_prompt: state.iteration_prompt.clone(),
-            stop_condition: state.stop_condition.clone(),
-            max_iterations: state.max_iterations,
-            workflow_definition: state.workflow_definition.clone().ok_or_else(|| {
-                "workflow loop presentation is missing its definition".to_string()
-            })?,
-            workflow_initial_value: state.workflow_initial_value.clone().ok_or_else(|| {
-                "workflow loop presentation is missing its initial value".to_string()
-            })?,
-            workflow_run_id: state.workflow_run_id.clone(),
-        })
-    }
-
-    fn into_loop_state(self) -> Result<LoopState, String> {
-        if self.runtime != "workflow" {
-            return Err("unsupported loop presentation runtime".to_string());
-        }
-        Ok(LoopState {
-            schema_version: self.schema_version,
-            run_id: self.run_id,
-            session_id: self.session_id,
-            iteration_prompt: self.iteration_prompt,
-            stop_condition: self.stop_condition,
-            max_iterations: self.max_iterations,
-            workflow_definition: Some(self.workflow_definition),
-            workflow_initial_value: Some(self.workflow_initial_value),
-            workflow_run_id: self.workflow_run_id,
-            current_iteration: 0,
-            state: RunState::Ready,
-            latest_evaluation: None,
-            stop_reason: None,
-            cancel_requested: false,
-            pending_operation: None,
-            last_completed_operation: None,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LoopState {
-    #[serde(default = "state_schema_version")]
-    schema_version: u32,
-    run_id: String,
-    session_id: SessionId,
-    iteration_prompt: String,
-    stop_condition: String,
-    max_iterations: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    workflow_definition: Option<bcode_workflow::WorkflowDefinition>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    workflow_initial_value: Option<LoopWorkflowIteration>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    workflow_run_id: Option<String>,
-    current_iteration: u64,
-    state: RunState,
-    #[serde(default)]
-    latest_evaluation: Option<Evaluation>,
-    #[serde(default)]
-    stop_reason: Option<String>,
-    #[serde(default)]
-    cancel_requested: bool,
-    #[serde(default)]
-    pending_operation: Option<PendingOperation>,
-    #[serde(default)]
-    last_completed_operation: Option<PendingOperation>,
-}
-
-impl LoopState {
-    fn new(
-        session_id: SessionId,
-        iteration_prompt: String,
-        stop_condition: String,
-        max_iterations: u64,
-    ) -> Self {
-        let workflow_input =
-            LoopWorkflowInput::new(iteration_prompt, stop_condition, max_iterations)
-                .expect("loop state is created only after validated start input");
-        let definition = loop_workflow_spec(&workflow_input)
-            .expect("validated loop input must compile to the standard workflow definition")
-            .definition()
-            .clone();
-        let initial_value = loop_workflow_initial_value(&workflow_input);
-        Self {
-            schema_version: STATE_SCHEMA_VERSION,
-            run_id: uuid::Uuid::new_v4().to_string(),
-            session_id,
-            iteration_prompt: workflow_input.implementation_prompt,
-            stop_condition: workflow_input.stop_condition,
-            max_iterations: u64::from(workflow_input.max_iterations),
-            workflow_definition: Some(definition),
-            workflow_initial_value: Some(initial_value),
-            workflow_run_id: None,
-            current_iteration: 0,
-            state: RunState::Ready,
-            latest_evaluation: None,
-            stop_reason: None,
-            cancel_requested: false,
-            pending_operation: None,
-            last_completed_operation: None,
-        }
-    }
-}
-
-fn update_completion_from_events(
-    events: &[bcode_session_models::SessionEvent],
-    receipt: &bcode_session_models::TurnReceipt,
-    assistant_text: &mut String,
-) -> Option<TurnCompletion> {
-    for event in events
-        .iter()
-        .filter(|event| event.sequence >= receipt.accepted_event_sequence)
-    {
-        match &event.kind {
-            SessionEventKind::AssistantMessage { text } => assistant_text.clone_from(text),
-            SessionEventKind::ModelTurnFinished {
-                turn_id, outcome, ..
-            } if turn_id == &receipt.turn_id.to_string() => {
-                return Some(TurnCompletion {
-                    outcome: *outcome,
-                    assistant_text: assistant_text.clone(),
-                    event_sequence: event.sequence,
-                });
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-fn completion_from_events(
-    events: &[bcode_session_models::SessionEvent],
-    receipt: &bcode_session_models::TurnReceipt,
-) -> Option<TurnCompletion> {
-    update_completion_from_events(events, receipt, &mut String::new())
-}
-
-async fn persisted_turn_completion(
-    client: &BcodeClient,
-    session_id: SessionId,
-    receipt: &bcode_session_models::TurnReceipt,
-) -> Result<Option<TurnCompletion>, String> {
-    let mut cursor = receipt.accepted_event_sequence;
-    let mut assistant_text = String::new();
-    loop {
-        let page = client
-            .session_history_page(
-                session_id,
-                bcode_session_models::SessionHistoryQuery {
-                    cursor: Some(bcode_session_models::SessionHistoryCursor { sequence: cursor }),
-                    limit: 256,
-                    direction: bcode_session_models::SessionHistoryDirection::Forward,
-                },
-            )
-            .await
-            .map_err(|error| error.to_string())?;
-        if let Some(completion) =
-            update_completion_from_events(&page.events, receipt, &mut assistant_text)
-        {
-            return Ok(Some(completion));
-        }
-        let Some(last_sequence) = page.events.last().map(|event| event.sequence) else {
-            return Ok(None);
-        };
-        if !page.has_more {
-            return Ok(None);
-        }
-        cursor = last_sequence.saturating_add(1);
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LegacyRecoveryDisposition {
-    Continue,
-    Halt,
-}
-
-async fn reconcile_pending_operation(
-    state: &mut LoopState,
-) -> Result<LegacyRecoveryDisposition, String> {
-    let Some(pending) = state.pending_operation.clone() else {
-        return Ok(LegacyRecoveryDisposition::Continue);
-    };
-    if pending.status == OperationStatus::Prepared {
-        state.pending_operation = None;
-        save_state(state)?;
-        return Ok(LegacyRecoveryDisposition::Continue);
-    }
-    let accepted_sequence = pending.accepted_sequence.ok_or_else(|| {
-        format!(
-            "turn {} is missing its accepted event sequence",
-            pending.operation_id
-        )
-    })?;
-    let receipt = bcode_session_models::TurnReceipt::from_accepted_event(
-        pending.target_session_id,
-        accepted_sequence,
-    );
-    let client = BcodeClient::default_endpoint();
-    let completion = persisted_turn_completion(&client, pending.target_session_id, &receipt)
-        .await?
-        .ok_or_else(|| {
-            format!(
-                "turn {} is not complete yet; resume after the active turn settles",
-                pending.operation_id
-            )
-        })?;
-    apply_recovered_operation_completion(state, pending.kind, &completion)
-}
-
-fn apply_recovered_operation_completion(
-    state: &mut LoopState,
-    kind: OperationKind,
-    completion: &TurnCompletion,
-) -> Result<LegacyRecoveryDisposition, String> {
-    complete_pending_operation(state, completion.clone())?;
-    let disposition = match decide_turn_outcome(completion.outcome) {
-        TurnOutcomeDecision::Completed => match kind {
-            OperationKind::Iteration { .. } => LegacyRecoveryDisposition::Continue,
-            OperationKind::Evaluation { .. } => {
-                let evaluation = parse_evaluation(&completion.assistant_text)?;
-                if apply_evaluation(state, evaluation)? {
-                    LegacyRecoveryDisposition::Halt
-                } else {
-                    LegacyRecoveryDisposition::Continue
-                }
-            }
-        },
-        TurnOutcomeDecision::PauseForSteering => {
-            pause_for_steering(state, format!("recovered {kind:?} turn was cancelled"));
-            LegacyRecoveryDisposition::Halt
-        }
-        TurnOutcomeDecision::Pause => {
-            pause_run(
-                state,
-                format!(
-                    "recovered {kind:?} turn ended with {:?}",
-                    completion.outcome
-                ),
-            );
-            LegacyRecoveryDisposition::Halt
-        }
-    };
-    save_state(state)?;
-    Ok(disposition)
-}
-
-struct IterationSubmission {
-    operation_id: String,
-    display_label: String,
-    prompt: String,
-}
-
-fn iteration_submission(state: &LoopState, iteration: u64) -> IterationSubmission {
-    IterationSubmission {
-        operation_id: format!("{}:iteration:{iteration}", state.run_id),
-        display_label: format!("Loop iteration {iteration}"),
-        prompt: state.iteration_prompt.clone(),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TurnOutcomeDecision {
-    Completed,
-    PauseForSteering,
-    Pause,
-}
-
-const fn decide_turn_outcome(outcome: ModelTurnOutcome) -> TurnOutcomeDecision {
-    match outcome {
-        ModelTurnOutcome::Completed => TurnOutcomeDecision::Completed,
-        ModelTurnOutcome::Cancelled => TurnOutcomeDecision::PauseForSteering,
-        ModelTurnOutcome::Error
-        | ModelTurnOutcome::IdleTimeout
-        | ModelTurnOutcome::ToolRoundLimitReached
-        | ModelTurnOutcome::ProviderUnavailable => TurnOutcomeDecision::Pause,
-    }
-}
-
-fn next_iteration(state: &LoopState) -> Option<u64> {
-    (state.current_iteration < state.max_iterations)
-        .then(|| state.current_iteration.saturating_add(1))
-}
-
-fn apply_evaluation(state: &mut LoopState, evaluation: Evaluation) -> Result<bool, String> {
-    state.latest_evaluation = Some(evaluation.clone());
-    if evaluation.condition_met {
-        transition(state, RunState::Completed)?;
-        state.stop_reason = Some(evaluation.summary);
-        return Ok(true);
-    }
-    transition(state, RunState::Ready)?;
-    Ok(false)
-}
-
-#[allow(clippy::too_many_lines)]
-async fn run_loop(mut state: LoopState) {
-    match reconcile_pending_operation(&mut state).await {
-        Ok(LegacyRecoveryDisposition::Continue) => {}
-        Ok(LegacyRecoveryDisposition::Halt) => return,
-        Err(reason) => {
-            pause_run(&mut state, reason);
-            return;
-        }
-    }
-    loop {
-        if refresh_cancel(&mut state) {
-            return;
-        }
-        if state.state != RunState::Evaluating {
-            let Some(iteration_number) = next_iteration(&state) else {
-                if !transition_or_fail(&mut state, RunState::LimitReached) {
-                    return;
-                }
-                state.stop_reason = Some("maximum iterations reached".to_owned());
-                let _saved = save_state(&state);
-                return;
-            };
-            if !transition_or_fail(&mut state, RunState::SubmittingIteration) {
-                return;
-            }
-            let _saved = save_state(&state);
-            if !transition_or_fail(&mut state, RunState::RunningIteration) {
-                return;
-            }
-            let _saved = save_state(&state);
-            if refresh_cancel(&mut state) {
-                return;
-            }
-            let session_id = state.session_id;
-            let submission = iteration_submission(&state, iteration_number);
-            let completion = match run_ordinary_turn(
-                &mut state,
-                session_id,
-                OperationKind::Iteration {
-                    iteration: iteration_number,
-                },
-                submission.operation_id,
-                submission.display_label,
-                submission.prompt,
-                bcode_session_models::TurnToolPolicy::Enabled,
-            )
-            .await
-            {
-                Ok(completion) => completion,
-                Err(TurnSubmissionError::Fatal(error)) => {
-                    if refresh_cancel(&mut state) {
-                        return;
-                    }
-                    fail_run(&mut state, error);
-                    return;
-                }
-            };
-            state.current_iteration = iteration_number;
-            match decide_turn_outcome(completion.outcome) {
-                TurnOutcomeDecision::Completed => {}
-                TurnOutcomeDecision::PauseForSteering => {
-                    if refresh_cancel(&mut state) {
-                        return;
-                    }
-                    pause_for_steering(&mut state, "iteration cancelled".to_owned());
-                    return;
-                }
-                TurnOutcomeDecision::Pause => {
-                    if refresh_cancel(&mut state) {
-                        return;
-                    }
-                    pause_run(
-                        &mut state,
-                        format!("iteration ended with {:?}", completion.outcome),
-                    );
-                    return;
-                }
-            }
-            if refresh_cancel(&mut state) {
-                return;
-            }
-        }
-        if refresh_cancel(&mut state) {
-            return;
-        }
-        if state.state != RunState::Evaluating
-            && !transition_or_fail(&mut state, RunState::Evaluating)
-        {
-            return;
-        }
-        let _saved = save_state(&state);
-        let iteration = state.current_iteration;
-        let session_id = state.session_id;
-        let operation_id = format!("{}:evaluation:{iteration}", state.run_id);
-        let stop_condition = state.stop_condition.clone();
-        let evaluation = run_ordinary_turn(
-            &mut state,
-            session_id,
-            OperationKind::Evaluation { iteration },
-            operation_id,
-            format!("Loop evaluation {iteration}"),
-            evaluator_prompt(&stop_condition),
-            bcode_session_models::TurnToolPolicy::ReadOnly,
-        )
-        .await;
-        let evaluation = match evaluation {
-            Ok(completion) => match decide_turn_outcome(completion.outcome) {
-                TurnOutcomeDecision::Completed => {
-                    match parse_evaluation(&completion.assistant_text) {
-                        Ok(evaluation) => evaluation,
-                        Err(error) => {
-                            pause_run(&mut state, error);
-                            return;
-                        }
-                    }
-                }
-                TurnOutcomeDecision::PauseForSteering => {
-                    pause_for_steering(&mut state, "evaluation cancelled".to_owned());
-                    return;
-                }
-                TurnOutcomeDecision::Pause => {
-                    pause_run(
-                        &mut state,
-                        format!("evaluation ended with {:?}", completion.outcome),
-                    );
-                    return;
-                }
-            },
-            Err(error) => {
-                pause_run(&mut state, error.into_message());
-                return;
-            }
-        };
-        let completed = match apply_evaluation(&mut state, evaluation) {
-            Ok(completed) => completed,
-            Err(error) => {
-                fail_run(&mut state, error);
-                return;
-            }
-        };
-        let _saved = save_state(&state);
-        if completed {
-            return;
-        }
-    }
-}
-
-fn pause_for_steering(state: &mut LoopState, reason: String) {
-    pause_run(state, reason);
-    let state = state.clone();
-    tokio::spawn(async move {
-        let _resumed = resume_after_manual_steering(state).await;
-    });
-}
-
-async fn resume_after_manual_steering(state: LoopState) -> Result<(), String> {
-    let baseline_sequence = state
-        .last_completed_operation
-        .as_ref()
-        .and_then(|operation| operation.completion.as_ref())
-        .map_or(0, |completion| completion.event_sequence);
-    let mut watcher = BcodeClient::default_endpoint()
-        .watch_session(state.session_id, 64)
-        .await
-        .map_err(|error| error.to_string())?;
-    let initial_has_manual = watcher.take_initial().is_some_and(|attached| {
-        attached.history.iter().any(|event| {
-            event.sequence > baseline_sequence
-                && matches!(event.kind, SessionEventKind::UserMessage { .. })
-        })
-    });
-    if initial_has_manual {
-        return resume_after_steering_settles(state).await;
-    }
-    loop {
-        let event = watcher
-            .next_event()
-            .await
-            .map_err(|error| error.to_string())?;
-        let SessionWatchEvent::Durable(event) = event else {
-            continue;
-        };
-        if event.sequence <= baseline_sequence
-            || !matches!(event.kind, SessionEventKind::UserMessage { .. })
-        {
-            continue;
-        }
-        return resume_after_steering_settles(state).await;
-    }
-}
-
-fn prepare_steering_resume(state: &mut LoopState) -> Result<(), String> {
-    if state.cancel_requested || state.state != RunState::Paused {
-        return Err("loop is not eligible for steering-assisted resume".to_owned());
-    }
-    transition(state, RunState::Evaluating)?;
-    state.stop_reason = None;
-    Ok(())
-}
-
-async fn resume_after_steering_settles(state: LoopState) -> Result<(), String> {
-    let Some(mut saved) = load_state_result(state.session_id)? else {
-        return Ok(());
-    };
-    if saved.run_id != state.run_id || saved.cancel_requested || saved.state != RunState::Paused {
-        return Ok(());
-    }
-    prepare_steering_resume(&mut saved)?;
-    save_state(&saved)?;
-    run_loop(saved).await;
-    Ok(())
-}
-
-#[cfg(test)]
-fn lifecycle_note(state: &LoopState) -> (String, String) {
-    let reason = state.stop_reason.as_deref().unwrap_or("no reason recorded");
-    let note_id = format!("{}:lifecycle:{:?}", state.run_id, state.state);
-    let text = match state.state {
-        RunState::Completed => format!(
-            "Loop completed after {}/{} iterations · evaluator accepted: {reason}",
-            state.current_iteration, state.max_iterations
-        ),
-        RunState::LimitReached => format!(
-            "Loop reached its {} iteration limit · {reason}",
-            state.max_iterations
-        ),
-        RunState::Paused => format!("Loop paused · {reason}"),
-        RunState::Canceled => format!("Loop canceled · {reason}"),
-        RunState::Failed => format!("Loop failed · {reason}"),
-        _ => format!("Loop {:?} · {reason}", state.state),
-    };
-    (note_id, text)
-}
-
-fn pause_run(state: &mut LoopState, reason: String) {
-    if transition(state, RunState::Paused).is_err() {
-        state.state = RunState::Failed;
-    }
-    state.stop_reason = Some(reason);
-    let _saved = save_state(state);
-}
-
-fn fail_run(state: &mut LoopState, reason: String) {
-    if transition(state, RunState::Failed).is_err() {
-        state.state = RunState::Failed;
-    }
-    state.stop_reason = Some(reason);
-    let _saved = save_state(state);
-}
-
-enum TurnSubmissionError {
-    Fatal(String),
-}
-
-impl TurnSubmissionError {
-    fn into_message(self) -> String {
-        match self {
-            Self::Fatal(message) => message,
-        }
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-async fn run_ordinary_turn(
-    state: &mut LoopState,
-    session_id: SessionId,
-    kind: OperationKind,
-    operation_id: String,
-    display_label: String,
-    text: String,
-    tool_policy: bcode_session_models::TurnToolPolicy,
-) -> Result<TurnCompletion, TurnSubmissionError> {
-    let client = BcodeClient::default_endpoint();
-    let mut watcher = client
-        .watch_session(session_id, 64)
-        .await
-        .map_err(|error| TurnSubmissionError::Fatal(error.to_string()))?;
-    let initial = watcher.take_initial();
-    state.pending_operation = Some(PendingOperation {
-        operation_id: operation_id.clone(),
-        kind,
-        target_session_id: session_id,
-        _expected_generation: None,
-        status: OperationStatus::Prepared,
-        accepted_turn_id: None,
-        accepted_sequence: None,
-        completion: None,
-    });
-    save_state(state).map_err(TurnSubmissionError::Fatal)?;
-    let admission = client
-        .submit_turn(
-            session_id,
-            text,
-            bcode_session_models::TurnAdmissionMetadata {
-                origin: Some(bcode_session_models::TurnOrigin {
-                    producer: PLUGIN_ID.to_owned(),
-                    correlation_id: Some(operation_id.clone()),
-                    display_label: Some(display_label),
-                }),
-                idempotency_key: Some(operation_id.clone()),
-                execution: bcode_session_models::TurnExecutionOptions {
-                    tools: tool_policy,
-                    ..bcode_session_models::TurnExecutionOptions::default()
-                },
-                ..bcode_session_models::TurnAdmissionMetadata::default()
-            },
-        )
-        .await
-        .map_err(|error| TurnSubmissionError::Fatal(error.to_string()))?;
-    let receipt = match admission {
-        bcode_session_models::TurnAdmission::Accepted(receipt)
-        | bcode_session_models::TurnAdmission::Existing(receipt)
-        | bcode_session_models::TurnAdmission::Deferred(receipt) => receipt,
-        bcode_session_models::TurnAdmission::Rejected(reason) => {
-            return Err(TurnSubmissionError::Fatal(format!(
-                "ordinary turn was rejected: {reason:?}"
-            )));
-        }
-        bcode_session_models::TurnAdmission::CancelledBeforeStart(receipt) => {
-            return Ok(TurnCompletion {
-                outcome: ModelTurnOutcome::Cancelled,
-                assistant_text: String::new(),
-                event_sequence: receipt.accepted_event_sequence,
-            });
-        }
-    };
-    if let Some(pending) = state.pending_operation.as_mut() {
-        pending.status = OperationStatus::Accepted;
-        pending.accepted_turn_id = Some(receipt.turn_id.to_string());
-        pending.accepted_sequence = Some(receipt.accepted_event_sequence);
-    }
-    save_state(state).map_err(TurnSubmissionError::Fatal)?;
-
-    if let Some(completion) = initial
-        .as_ref()
-        .and_then(|attached| completion_from_events(&attached.history, &receipt))
-    {
-        complete_pending_operation(state, completion.clone())
-            .map_err(TurnSubmissionError::Fatal)?;
-        return Ok(completion);
-    }
-    if let Some(completion) = persisted_turn_completion(&client, session_id, &receipt)
-        .await
-        .map_err(TurnSubmissionError::Fatal)?
-    {
-        complete_pending_operation(state, completion.clone())
-            .map_err(TurnSubmissionError::Fatal)?;
-        return Ok(completion);
-    }
-
-    let mut assistant_text = String::new();
-    loop {
-        let event = watcher
-            .next_event()
-            .await
-            .map_err(|error| TurnSubmissionError::Fatal(error.to_string()))?;
-        let SessionWatchEvent::Durable(event) = event else {
-            continue;
-        };
-        if event.sequence < receipt.accepted_event_sequence {
-            continue;
-        }
-        match &event.kind {
-            SessionEventKind::AssistantMessage { text } => assistant_text.clone_from(text),
-            SessionEventKind::ModelTurnFinished {
-                turn_id, outcome, ..
-            } if turn_id == &receipt.turn_id.to_string() => {
-                let completion = TurnCompletion {
-                    outcome: *outcome,
-                    assistant_text,
-                    event_sequence: event.sequence,
-                };
-                complete_pending_operation(state, completion.clone())
-                    .map_err(TurnSubmissionError::Fatal)?;
-                return Ok(completion);
-            }
-            _ => {}
-        }
-    }
-}
-
-fn complete_pending_operation(
-    state: &mut LoopState,
-    completion: TurnCompletion,
-) -> Result<(), String> {
-    let Some(mut pending) = state.pending_operation.take() else {
-        return Err("turn completion arrived without a pending operation".to_owned());
-    };
-    pending.status = OperationStatus::Completed;
-    pending.completion = Some(completion);
-    if let OperationKind::Iteration { iteration } = pending.kind {
-        state.current_iteration = state.current_iteration.max(iteration);
-        transition(state, RunState::Evaluating)?;
-    }
-    state.last_completed_operation = Some(pending);
-    save_state(state)
-}
-
-fn evaluator_prompt(condition: &str) -> String {
-    format!(
-        "Read-only loop completion evaluation. Inspect the current repository and conversation state. Do not modify files, implement work, or invoke mutating tools. Evaluate this stop condition:\n\n{condition}\n\nReturn ONLY one JSON object with exactly this shape: {{\"condition_met\":false,\"evidence\":[\"concrete observation\"],\"summary\":\"concise result\"}}. Set condition_met to true only when the condition is positively and completely verified. Ambiguity, missing evidence, unchecked work, tool failure, or inability to inspect means false."
-    )
-}
-
-fn parse_evaluation(text: &str) -> Result<Evaluation, String> {
-    let trimmed = text
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-    let evaluation: Evaluation = serde_json::from_str(trimmed)
-        .map_err(|error| format!("invalid loop evaluation JSON: {error}"))?;
-    if evaluation.summary.trim().is_empty()
-        || evaluation.evidence.is_empty()
-        || evaluation
-            .evidence
-            .iter()
-            .any(|evidence| evidence.trim().is_empty())
-    {
-        return Err("loop evaluation omitted its summary or concrete evidence".to_owned());
-    }
-    Ok(evaluation)
-}
-
-fn refresh_cancel(state: &mut LoopState) -> bool {
-    let cancelled = load_state(state.session_id)
-        .is_some_and(|saved| saved.run_id == state.run_id && saved.cancel_requested);
-    if cancelled {
-        state.cancel_requested = true;
-        if transition(state, RunState::Canceled).is_err() {
-            state.state = RunState::Failed;
-            state.stop_reason = Some("invalid transition while applying cancellation".to_owned());
-            let _saved = save_state(state);
-            return true;
-        }
-        state.stop_reason = Some("stopped by user".to_owned());
-        let _saved = save_state(state);
-    }
-    cancelled
-}
-
-fn format_status(state: Option<&LoopState>, pending_steering: Option<u32>) -> String {
-    state.map_or_else(
-        || "no loop found for this session".to_owned(),
-        |state| {
-            let reason = state.stop_reason.as_deref().unwrap_or("none");
-            let steering = pending_steering.map_or_else(
-                || "unavailable".to_owned(),
-                |count| count.to_string(),
-            );
-            let evaluation = state.latest_evaluation.as_ref().map_or_else(
-                || "none".to_owned(),
-                |evaluation| {
-                    format!(
-                        "{} · {} evidence · {}",
-                        if evaluation.condition_met { "met" } else { "not met" },
-                        evaluation.evidence.len(),
-                        evaluation.summary
-                    )
-                },
-            );
-            let workflow = state
-                .workflow_run_id
-                .as_deref()
-                .map_or_else(String::new, |run_id| format!(" · workflow {run_id}"));
-            format!(
-                "loop {}{workflow} · phase {:?} · iteration {}/{} · queued steering: {steering} · evaluation: {evaluation} · reason: {reason}",
-                state.run_id,
-                state.state,
-                state.current_iteration,
-                state.max_iterations
-            )
-        },
-    )
-}
-
-fn state_path(session_id: SessionId) -> PathBuf {
-    state_root().join(format!("{session_id}.json"))
-}
-
-fn state_root() -> PathBuf {
+fn legacy_state_root() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME").map_or_else(
         || {
             std::env::var_os("HOME").map_or_else(
@@ -1916,183 +810,23 @@ fn state_root() -> PathBuf {
     )
 }
 
-const fn loop_state_uses_workflow_runtime(state: &LoopState) -> bool {
-    state.workflow_definition.is_some() && state.workflow_initial_value.is_some()
-}
-
-const fn is_legacy_loop_state(state: &LoopState) -> bool {
-    !loop_state_uses_workflow_runtime(state)
-}
-
-fn prepared_workflow_start_matches(
-    state: &LoopState,
-    iteration_prompt: &str,
-    stop_condition: &str,
-    max_iterations: u64,
-) -> bool {
-    loop_state_uses_workflow_runtime(state)
-        && state.workflow_run_id.is_none()
-        && state.state == RunState::Ready
-        && state.current_iteration == 0
-        && state.pending_operation.is_none()
-        && state.iteration_prompt == iteration_prompt
-        && state.stop_condition == stop_condition
-        && state.max_iterations == max_iterations
-}
-
-fn validate_state(state: &LoopState) -> Result<(), String> {
-    if state.schema_version != STATE_SCHEMA_VERSION {
-        return Err(format!(
-            "unsupported loop state schema version {}; expected {STATE_SCHEMA_VERSION}",
-            state.schema_version
-        ));
-    }
-    if state.iteration_prompt.len() > MAX_PROMPT_BYTES
-        || state.stop_condition.len() > MAX_PROMPT_BYTES
-    {
-        return Err("loop prompt or stop condition exceeds the persisted size limit".to_owned());
-    }
-    if !(1..=HARD_MAX_ITERATIONS).contains(&state.max_iterations) {
-        return Err("persisted loop maximum iterations is invalid".to_owned());
-    }
-    if state.current_iteration > state.max_iterations {
-        return Err("persisted loop iteration count exceeds its maximum".to_owned());
-    }
-    match (&state.workflow_definition, &state.workflow_initial_value) {
-        (Some(definition), Some(initial_value)) => {
-            definition
-                .validate()
-                .map_err(|error| format!("invalid persisted loop workflow definition: {error}"))?;
-            if definition.name != "bcode.loop" {
-                return Err("persisted loop workflow definition has the wrong identity".to_string());
-            }
-            if let Some(run_id) = &state.workflow_run_id
-                && run_id != &state.run_id
-            {
-                return Err(
-                    "persisted loop workflow run identity disagrees with loop identity".to_string(),
-                );
-            }
-            if initial_value.max_iterations != u32::try_from(state.max_iterations).unwrap_or(0)
-                || initial_value.implementation_prompt != state.iteration_prompt
-                || initial_value.stop_condition != state.stop_condition
-            {
-                return Err("persisted loop workflow input disagrees with loop state".to_string());
-            }
-        }
-        (None, None) => {}
-        _ => {
-            return Err(
-                "persisted loop workflow definition/input must be both present or both absent"
-                    .to_string(),
-            );
-        }
-    }
-    Ok(())
-}
-
-fn decode_state(bytes: &[u8]) -> Result<LoopState, String> {
-    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_STATE_BYTES {
-        return Err(format!(
-            "loop state exceeds the {MAX_STATE_BYTES}-byte safety limit"
-        ));
-    }
-    let value: serde_json::Value =
-        serde_json::from_slice(bytes).map_err(|error| format!("corrupt loop state: {error}"))?;
-    let state = if value.get("runtime").is_some() {
-        serde_json::from_value::<WorkflowLoopPresentationState>(value)
-            .map_err(|error| format!("corrupt workflow loop presentation: {error}"))?
-            .into_loop_state()?
-    } else {
-        serde_json::from_value::<LoopState>(value)
-            .map_err(|error| format!("corrupt loop state: {error}"))?
-    };
-    validate_state(&state)?;
-    Ok(state)
-}
-
-fn load_state_result(session_id: SessionId) -> Result<Option<LoopState>, String> {
-    let path = state_path(session_id);
-    let metadata = match fs::metadata(&path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.to_string()),
-    };
-    if metadata.len() > MAX_STATE_BYTES {
-        return Err(format!(
-            "loop state exceeds the {MAX_STATE_BYTES}-byte safety limit"
-        ));
-    }
-    let bytes = fs::read(path).map_err(|error| error.to_string())?;
-    decode_state(&bytes).map(Some)
-}
-
-fn load_state(session_id: SessionId) -> Option<LoopState> {
-    load_state_result(session_id).ok().flatten()
-}
-
-fn save_state(state: &LoopState) -> Result<(), String> {
-    validate_state(state)?;
-    let root = state_root();
-    fs::create_dir_all(&root).map_err(|error| error.to_string())?;
-    let path = state_path(state.session_id);
-    let temporary = path.with_extension(format!("{}.tmp", state.run_id));
-    let bytes = if loop_state_uses_workflow_runtime(state) {
-        serde_json::to_vec_pretty(&WorkflowLoopPresentationState::from_loop_state(state)?)
-            .map_err(|error| error.to_string())?
-    } else {
-        serde_json::to_vec_pretty(state).map_err(|error| error.to_string())?
-    };
-    fs::write(&temporary, bytes).map_err(|error| error.to_string())?;
-    fs::rename(temporary, path).map_err(|error| error.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bmux_tui::event::{MouseButton, MouseEvent};
-    use bmux_tui::geometry::Point;
 
     #[derive(Debug, Default)]
-    struct TestHost;
+    struct TestHost {
+        request: std::sync::Mutex<Option<PluginWorkflowStartRequest>>,
+    }
 
     impl PluginTuiHost for TestHost {
-        fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
-        fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
-        fn request_redraw(&self) {}
-    }
-
-    fn key(key: KeyCode) -> Event {
-        Event::Key(bmux_keyboard::KeyStroke {
-            key,
-            modifiers: bmux_keyboard::Modifiers::NONE,
-        })
-    }
-
-    fn modified_key(key: KeyCode, ctrl: bool, shift: bool) -> Event {
-        Event::Key(bmux_keyboard::KeyStroke {
-            key,
-            modifiers: bmux_keyboard::Modifiers {
-                ctrl,
-                shift,
-                ..bmux_keyboard::Modifiers::NONE
-            },
-        })
-    }
-
-    #[derive(Debug)]
-    struct WorkflowStartTestHost {
-        request: std::sync::Mutex<Option<bcode_plugin_sdk::tui::PluginWorkflowStartRequest>>,
-    }
-
-    impl PluginTuiHost for WorkflowStartTestHost {
         fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
         fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
         fn request_redraw(&self) {}
 
         fn start_workflow(
             &self,
-            request: bcode_plugin_sdk::tui::PluginWorkflowStartRequest,
+            request: PluginWorkflowStartRequest,
         ) -> bcode_plugin_sdk::tui::PluginWorkflowStartFuture {
             *self.request.lock().expect("request") = Some(request);
             Box::pin(async {
@@ -2104,104 +838,22 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn start_surface_routes_new_loop_through_workflow_host() {
-        let host = WorkflowStartTestHost {
-            request: std::sync::Mutex::new(None),
-        };
-        let session_id = SessionId::new();
-        let mut surface = LoopSurface::new(Some(session_id));
-        surface.prompt = text_state("implement");
-        surface.condition = text_state("done");
-        surface.limit = text_state("2");
-        assert_eq!(surface.start(&host), PluginTuiAction::Redraw);
-        let action = surface.drain_effects(&host).await;
-        assert!(matches!(action, PluginTuiAction::Close { .. }));
-        let request = host
-            .request
-            .lock()
-            .expect("request")
-            .clone()
-            .expect("start");
-        assert_eq!(request.identity.kind, "bcode.loop");
-        assert_eq!(request.binding.owner_plugin_id, PLUGIN_ID);
-        assert_eq!(request.parent_session_id, session_id);
-        assert_eq!(request.input["implementation_prompt"], "implement");
-        assert_eq!(request.input["max_iterations"], 2);
+    #[test]
+    fn commands_cover_the_loop_lifecycle() {
+        let commands = commands();
+        assert_eq!(commands.len(), 5);
+        assert!(commands.iter().all(|command| {
+            command.execution == bcode_command::CommandExecution::Immediate
+                && command.surfaces.contains(&CommandSurface::Slash)
+        }));
     }
 
     #[test]
-    fn prepared_workflow_start_is_retryable_only_for_exact_unchanged_input() {
-        let state = LoopState::new(
-            SessionId::new(),
-            "implement".to_string(),
-            "done".to_string(),
-            2,
-        );
-        assert!(prepared_workflow_start_matches(
-            &state,
-            "implement",
-            "done",
-            2
-        ));
-        assert!(!prepared_workflow_start_matches(
-            &state,
-            "different",
-            "done",
-            2
-        ));
-        let mut started = state;
-        started.workflow_run_id = Some(started.run_id.clone());
-        assert!(!prepared_workflow_start_matches(
-            &started,
-            "implement",
-            "done",
-            2
-        ));
-    }
-
-    #[test]
-    fn plugin_tui_host_start_request_is_renderer_neutral_and_serializable() {
-        // The adapter's request translation is also exercised by client/IPC workflow tests; this
-        // test keeps the plugin-facing contract renderer-neutral and serializable.
+    fn workflow_definition_is_typed_read_only_and_bounded() {
         let input =
-            LoopWorkflowInput::new("implement".to_string(), "done".to_string(), 2).expect("input");
-        let spec = loop_workflow_spec(&input).expect("definition");
-        let request = bcode_plugin_sdk::tui::PluginWorkflowStartRequest::typed(
-            &spec,
-            &loop_workflow_initial_value(&input),
-            SessionId::new(),
-            bcode_plugin_sdk::tui::PluginWorkflowBinding {
-                owner_plugin_id: PLUGIN_ID.to_string(),
-                workflow_kind: "bcode.loop".to_string(),
-                scope_key: "session".to_string(),
-                display_label: Some("Loop".to_string()),
-                single_active: true,
-            },
-            Some("loop-run".to_string()),
-        )
-        .expect("request");
-        assert_eq!(request.identity.kind, "bcode.loop");
-        assert_eq!(request.definition.name, "bcode.loop");
-        assert_eq!(request.input["max_iterations"], 2);
-    }
-
-    #[test]
-    fn new_loop_state_embeds_valid_standard_workflow_definition() {
-        let state = LoopState::new(
-            SessionId::new(),
-            "implement".to_string(),
-            "all checks pass".to_string(),
-            3,
-        );
-        assert!(loop_state_uses_workflow_runtime(&state));
-        assert!(!is_legacy_loop_state(&state));
-        let definition = state.workflow_definition.as_ref().expect("definition");
-        let initial = state.workflow_initial_value.as_ref().expect("input");
-        assert_eq!(initial.implementation_prompt, "implement");
-        assert_eq!(initial.stop_condition, "all checks pass");
-        assert_eq!(initial.max_iterations, 3);
-        assert_eq!(definition.name, "bcode.loop");
+            LoopWorkflowInput::new("implement".to_string(), "done".to_string(), 3).expect("input");
+        let spec = loop_workflow_spec(&input).expect("spec");
+        let definition = spec.definition();
         assert_eq!(
             definition.nodes["loop.implementation"].kind,
             bcode_workflow::NodeKind::Agent
@@ -2215,10 +867,8 @@ mod tests {
             bcode_workflow::NodeKind::Repeat
         );
         assert_eq!(
-            definition.nodes["loop.evaluation"]
-                .configuration
-                .get("read_only"),
-            Some(&serde_json::json!(true))
+            definition.nodes["loop.evaluation"].configuration["read_only"],
+            serde_json::json!(true)
         );
         assert!(definition.edges.iter().any(|edge| matches!(
             edge.kind,
@@ -2227,999 +877,48 @@ mod tests {
                 ..
             }
         )));
-        validate_state(&state).expect("valid state");
     }
 
-    #[test]
-    fn legacy_loop_state_remains_detectable_and_uses_legacy_resume() {
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "implement".to_string(),
-            "done".to_string(),
-            2,
-        );
-        state.workflow_definition = None;
-        state.workflow_initial_value = None;
-        state.workflow_run_id = None;
-        state.state = RunState::Paused;
-        assert!(is_legacy_loop_state(&state));
-        prepare_resume(&mut state).expect("legacy resume");
-        assert_eq!(state.state, RunState::Ready);
-    }
-
-    #[test]
-    fn ctrl_enter_starts_instead_of_inserting_newline() {
-        let host = TestHost;
-        let mut surface = LoopSurface::new(None);
-        surface.prompt = text_state("work");
-        surface.condition = text_state("done");
-        let before = surface.prompt.buffer().text().to_owned();
-        assert_eq!(
-            surface.handle_event(&modified_key(KeyCode::Enter, true, false), &host),
-            PluginTuiAction::Redraw
-        );
-        assert_eq!(surface.prompt.buffer().text(), before);
-        assert!(surface.status.contains("active persisted session"));
-    }
-
-    #[test]
-    fn shift_tab_traverses_fields_backward() {
-        let host = TestHost;
-        let mut surface = LoopSurface::new(Some(SessionId::new()));
-        assert_eq!(
-            surface.handle_event(&modified_key(KeyCode::Tab, false, true), &host),
-            PluginTuiAction::Redraw
-        );
-        assert_eq!(surface.field, Field::Limit);
-    }
-
-    fn mouse(kind: MouseEventKind, x: u16, y: u16) -> Event {
-        Event::Mouse(MouseEvent::new(kind, Point::new(x, y)))
-    }
-
-    #[test]
-    fn modal_mouse_click_focuses_the_clicked_field() {
-        let host = TestHost;
-        let mut surface = LoopSurface::new(Some(SessionId::new()));
-        surface.prompt_area = Rect::new(2, 2, 30, 5);
-        surface.condition_area = Rect::new(2, 8, 30, 5);
-        surface.limit_area = Rect::new(2, 14, 20, 3);
-
-        let _outcome = surface.handle_event(
-            &mouse(MouseEventKind::Down(MouseButton::Left), 4, 10),
-            &host,
-        );
-        assert_eq!(surface.field, Field::Condition);
-        let _outcome = surface.handle_event(
-            &mouse(MouseEventKind::Down(MouseButton::Left), 4, 15),
-            &host,
-        );
-        assert_eq!(surface.field, Field::Limit);
-    }
-
-    #[test]
-    fn modal_mouse_wheel_scrolls_multiline_input() {
-        let host = TestHost;
-        let mut surface = LoopSurface::new(Some(SessionId::new()));
-        surface.prompt = text_state(
-            &(0..20)
-                .map(|line| format!("line {line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        );
-        surface.prompt_area = Rect::new(2, 2, 30, 5);
-        surface
-            .prompt
-            .set_content_area(Rect::new(3, 3, 28, 3), &TextInputPolicy::chat_composer());
-        surface.prompt.buffer_mut().move_cursor_with_selection(
-            bmux_text_edit::TextMotion::Start,
-            bmux_text_edit::SelectionMode::Move,
-        );
-        surface
-            .prompt
-            .sync_scroll_to_cursor(&TextInputPolicy::chat_composer());
-        assert_eq!(surface.prompt.vertical_scroll(), 0);
-
-        assert_eq!(
-            surface.handle_event(&mouse(MouseEventKind::ScrollDown, 4, 4), &host),
-            PluginTuiAction::Redraw
-        );
-        assert!(surface.prompt.vertical_scroll() > 0);
-
-        assert_eq!(
-            surface.handle_event(&mouse(MouseEventKind::ScrollUp, 4, 4), &host),
-            PluginTuiAction::Redraw
-        );
-        assert_eq!(surface.prompt.vertical_scroll(), 0);
-    }
-
-    #[test]
-    fn modal_renders_safely_across_small_and_resized_terminals() {
-        let mut surface = LoopSurface::new(Some(SessionId::new()));
-        surface.prompt = text_state("first line\nsecond line");
-        surface.condition = text_state("all work is complete");
-
-        for area in [Rect::new(0, 0, 24, 10), Rect::new(0, 0, 120, 40)] {
-            let mut buffer = bmux_tui::buffer::Buffer::empty(area);
-            let mut frame = Frame::new(&mut buffer);
-            surface.render(area, &mut frame);
-            assert!(surface.prompt_area.width <= area.width);
-            assert!(surface.condition_area.width <= area.width);
-            assert!(surface.limit_area.width <= area.width);
-        }
-    }
-
-    #[test]
-    fn modal_selection_replaces_selected_text() {
-        let host = TestHost;
-        let mut surface = LoopSurface::new(Some(SessionId::new()));
-        surface.prompt = text_state("replace all of this");
-        surface.prompt.buffer_mut().move_cursor_with_selection(
-            bmux_text_edit::TextMotion::Start,
-            bmux_text_edit::SelectionMode::Extend,
-        );
-
-        assert_eq!(
-            surface.handle_event(&key(KeyCode::Char('x')), &host),
-            PluginTuiAction::Redraw
-        );
-        assert_eq!(surface.prompt.buffer().text(), "x");
-    }
-
-    #[test]
-    fn modal_multiline_and_field_navigation_preserve_text() {
-        let host = TestHost;
-        let mut surface = LoopSurface::new(Some(SessionId::new()));
-        assert_eq!(surface.field, Field::Prompt);
-        assert_eq!(
-            surface.handle_event(&key(KeyCode::Char('a')), &host),
-            PluginTuiAction::Redraw
-        );
-        assert_eq!(
-            surface.handle_event(&key(KeyCode::Enter), &host),
-            PluginTuiAction::Redraw
-        );
-        assert_eq!(
-            surface.handle_event(&Event::Paste("line two".to_owned()), &host),
-            PluginTuiAction::Redraw
-        );
-        assert_eq!(surface.prompt.buffer().text(), "a\nline two");
-
-        assert_eq!(
-            surface.handle_event(&key(KeyCode::Tab), &host),
-            PluginTuiAction::Redraw
-        );
-        assert_eq!(surface.field, Field::Condition);
-    }
-
-    #[test]
-    fn modal_validation_focuses_first_invalid_field() {
-        let host = TestHost;
-        let mut surface = LoopSurface::new(Some(SessionId::new()));
-        assert_eq!(surface.start(&host), PluginTuiAction::Redraw);
-        assert_eq!(surface.field, Field::Prompt);
-
-        surface.prompt = text_state("do work");
-        assert_eq!(surface.start(&host), PluginTuiAction::Redraw);
-        assert_eq!(surface.field, Field::Condition);
-
-        surface.condition = text_state("done");
-        surface.limit = text_state("invalid");
-        assert_eq!(surface.start(&host), PluginTuiAction::Redraw);
-        assert_eq!(surface.field, Field::Limit);
-    }
-
-    #[test]
-    fn maximum_iterations_has_visible_editable_content_row() {
-        let host = TestHost;
-        let area = Rect::new(0, 0, 120, 40);
-        let mut surface = LoopSurface::new(Some(SessionId::new()));
-        surface.field = Field::Limit;
-        surface.limit.buffer_mut().select_all();
-        assert_eq!(
-            surface.handle_event(&key(KeyCode::Char('7')), &host),
-            PluginTuiAction::Redraw
-        );
-
-        let mut buffer = bmux_tui::buffer::Buffer::empty(area);
-        let cursor = {
-            let mut frame = Frame::new(&mut buffer);
-            surface.render(area, &mut frame);
-            frame.cursor()
-        };
-
-        assert!(!surface.limit.content_area().is_empty());
-        assert_eq!(surface.limit.content_area().height, 1);
-        assert!(cursor.is_some_and(|cursor| {
-            cursor.visible && surface.limit.content_area().contains(cursor.position)
-        }));
-        assert!(
-            buffer
-                .row_symbols(surface.limit.content_area().y)
-                .is_some_and(|row| row.contains('7'))
-        );
-    }
-
-    #[test]
-    fn numeric_field_accepts_editing_and_validates_on_submit() {
-        let host = TestHost;
-        let mut surface = LoopSurface::new(Some(SessionId::new()));
-        surface.field = Field::Limit;
-        surface.limit.buffer_mut().select_all();
-        assert_eq!(
-            surface.handle_event(&key(KeyCode::Char('7')), &host),
-            PluginTuiAction::Redraw
-        );
-        assert_eq!(surface.limit.buffer().text(), "7");
-        assert_eq!(
-            surface.handle_event(&Event::Paste("25".to_owned()), &host),
-            PluginTuiAction::Redraw
-        );
-        assert_eq!(surface.limit.buffer().text(), "725");
-        assert_eq!(
-            surface.handle_event(&key(KeyCode::Backspace), &host),
-            PluginTuiAction::Redraw
-        );
-        assert_eq!(surface.limit.buffer().text(), "72");
-
-        surface.limit.buffer_mut().select_all();
-        assert_eq!(
-            surface.handle_event(&key(KeyCode::Char('x')), &host),
-            PluginTuiAction::Redraw
-        );
-        assert_eq!(surface.limit.buffer().text(), "x");
-        surface.prompt = text_state("do work");
-        surface.condition = text_state("done");
-        assert_eq!(surface.start(&host), PluginTuiAction::Redraw);
-        assert_eq!(surface.field, Field::Limit);
-        assert_eq!(surface.status, "maximum iterations must be a number");
-    }
-
-    #[test]
-    fn terminal_loop_states_cannot_be_resumed() {
-        for terminal in [
-            RunState::Completed,
-            RunState::LimitReached,
-            RunState::Canceled,
-        ] {
-            assert!(terminal.is_terminal());
-            assert!(!matches!(terminal, RunState::Paused | RunState::Failed));
-        }
-    }
-
-    fn pending_iteration(state: &LoopState, status: OperationStatus) -> PendingOperation {
-        PendingOperation {
-            operation_id: "operation-1".to_owned(),
-            kind: OperationKind::Iteration { iteration: 1 },
-            target_session_id: state.session_id,
-            _expected_generation: None,
-            status,
-            accepted_turn_id: (status != OperationStatus::Prepared).then(|| "turn-1".to_owned()),
-            accepted_sequence: (status != OperationStatus::Prepared).then_some(8),
-            completion: None,
-        }
-    }
-
-    fn legacy_state(session_id: SessionId) -> LoopState {
-        let mut state = LoopState::new(session_id, "iterate".to_owned(), "complete".to_owned(), 3);
-        state.workflow_definition = None;
-        state.workflow_initial_value = None;
-        state.workflow_run_id = None;
-        state
-    }
-
-    #[test]
-    fn recovered_legacy_iteration_completion_applies_outcome_before_continuing() {
-        let mut state = legacy_state(SessionId::new());
-        state.state = RunState::RunningIteration;
-        state.pending_operation = Some(pending_iteration(&state, OperationStatus::Accepted));
-
-        let disposition = apply_recovered_operation_completion(
-            &mut state,
-            OperationKind::Iteration { iteration: 1 },
-            &TurnCompletion {
-                outcome: ModelTurnOutcome::ProviderUnavailable,
-                assistant_text: String::new(),
-                event_sequence: 12,
-            },
-        )
-        .expect("recover terminal turn");
-
-        assert_eq!(disposition, LegacyRecoveryDisposition::Halt);
-        assert_eq!(state.state, RunState::Paused);
-        assert!(state.pending_operation.is_none());
-        assert_eq!(state.current_iteration, 1);
-        assert!(
-            state
-                .stop_reason
-                .as_deref()
-                .is_some_and(|reason| reason.contains("ProviderUnavailable"))
-        );
-    }
-
-    #[test]
-    fn marker_free_legacy_restart_reconciles_persisted_turn_receipt_once() {
+    #[tokio::test]
+    async fn start_surface_routes_one_typed_request_through_workflow_host() {
         let session_id = SessionId::new();
-        let mut state = legacy_state(session_id);
-        state.state = RunState::RunningIteration;
-        state.pending_operation = Some(PendingOperation {
-            operation_id: "legacy-run:iteration:1".to_owned(),
-            kind: OperationKind::Iteration { iteration: 1 },
-            target_session_id: session_id,
-            _expected_generation: None,
-            status: OperationStatus::Accepted,
-            accepted_turn_id: Some(format!("{session_id}-8")),
-            accepted_sequence: Some(8),
-            completion: None,
-        });
-        let persisted = serde_json::to_vec(&state).expect("persist legacy state");
-        let mut restored = decode_state(&persisted).expect("restore legacy state");
-        assert!(is_legacy_loop_state(&restored));
-        let receipt = bcode_session_models::TurnReceipt::from_accepted_event(session_id, 8);
-        let events = vec![
-            bcode_session_models::SessionEvent {
-                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 9,
-                timestamp_ms: 1,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::AssistantMessage {
-                    text: "implementation complete".to_owned(),
-                },
-            },
-            bcode_session_models::SessionEvent {
-                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 10,
-                timestamp_ms: 2,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::ModelTurnFinished {
-                    turn_id: receipt.turn_id.to_string(),
-                    outcome: ModelTurnOutcome::Completed,
-                    message: None,
-                },
-            },
-        ];
-        let completion = completion_from_events(&events, &receipt).expect("persisted completion");
-        let disposition = apply_recovered_operation_completion(
-            &mut restored,
-            OperationKind::Iteration { iteration: 1 },
-            &completion,
-        )
-        .expect("reconcile persisted receipt");
-        assert_eq!(disposition, LegacyRecoveryDisposition::Continue);
-        assert_eq!(restored.state, RunState::Evaluating);
-        assert_eq!(restored.current_iteration, 1);
-        assert!(restored.pending_operation.is_none());
+        let host = TestHost::default();
+        let mut surface = LoopSurface::new(Some(session_id));
+        surface.prompt = text_state("implement");
+        surface.condition = text_state("done");
+        surface.limit = text_state("2");
+        assert_eq!(surface.start(), PluginTuiAction::Redraw);
+        assert!(matches!(
+            surface.drain_effects(&host).await,
+            PluginTuiAction::Close { .. }
+        ));
+        let request = host
+            .request
+            .lock()
+            .expect("request")
+            .clone()
+            .expect("start");
+        assert_eq!(request.identity.kind, WORKFLOW_KIND);
+        assert_eq!(request.parent_session_id, session_id);
+        assert_eq!(request.input["implementation_prompt"], "implement");
+        assert_eq!(request.input["max_iterations"], 2);
+        assert_eq!(request.binding.scope_key, session_id.to_string());
+    }
+
+    #[test]
+    fn legacy_file_detection_is_read_only() {
+        let temp = tempfile::tempdir().expect("temp");
+        let path = temp.path().join("legacy.json");
+        let bytes = br#"{"run_id":"legacy","pending_operation":{}}"#;
+        fs::write(&path, bytes).expect("write fixture");
+        assert!(legacy_state_exists_at(&path));
+        assert_eq!(fs::read(&path).expect("read fixture"), bytes);
         assert_eq!(
-            restored
-                .last_completed_operation
-                .as_ref()
-                .and_then(|operation| operation.completion.as_ref())
-                .map(|completion| completion.event_sequence),
-            Some(10)
+            unsupported_legacy_message(),
+            "legacy loop state is unsupported by this daemon; use the older daemon that created it"
         );
-        let persisted_again = serde_json::to_vec(&restored).expect("persist reconciled state");
-        let mut reopened = decode_state(&persisted_again).expect("reopen reconciled state");
-        assert!(is_legacy_loop_state(&reopened));
-        assert!(
-            apply_recovered_operation_completion(
-                &mut reopened,
-                OperationKind::Iteration { iteration: 1 },
-                &TurnCompletion {
-                    outcome: ModelTurnOutcome::Completed,
-                    assistant_text: "duplicate".to_owned(),
-                    event_sequence: 10,
-                },
-            )
-            .is_err()
-        );
-        assert_eq!(reopened.current_iteration, 1);
-    }
-
-    #[test]
-    fn recovered_legacy_evaluation_completion_is_applied_exactly_once() {
-        let mut state = legacy_state(SessionId::new());
-        state.current_iteration = 1;
-        state.state = RunState::Evaluating;
-        state.pending_operation = Some(PendingOperation {
-            operation_id: "evaluation-1".to_owned(),
-            kind: OperationKind::Evaluation { iteration: 1 },
-            target_session_id: state.session_id,
-            _expected_generation: None,
-            status: OperationStatus::Accepted,
-            accepted_turn_id: Some("turn-1".to_owned()),
-            accepted_sequence: Some(8),
-            completion: None,
-        });
-
-        let disposition = apply_recovered_operation_completion(
-            &mut state,
-            OperationKind::Evaluation { iteration: 1 },
-            &TurnCompletion {
-                outcome: ModelTurnOutcome::Completed,
-                assistant_text: serde_json::json!({
-                    "condition_met": true,
-                    "evidence": ["verified"],
-                    "summary": "done"
-                })
-                .to_string(),
-                event_sequence: 12,
-            },
-        )
-        .expect("recover evaluation");
-
-        assert_eq!(disposition, LegacyRecoveryDisposition::Halt);
-        assert_eq!(state.state, RunState::Completed);
-        assert_eq!(state.stop_reason.as_deref(), Some("done"));
-        assert!(state.pending_operation.is_none());
-        assert_eq!(
-            state
-                .last_completed_operation
-                .as_ref()
-                .and_then(|operation| operation.completion.as_ref())
-                .map(|completion| completion.event_sequence),
-            Some(12)
-        );
-    }
-
-    #[test]
-    fn completion_matching_is_scoped_to_the_admitted_turn() {
-        let session_id = SessionId::new();
-        let receipt = bcode_session_models::TurnReceipt::from_accepted_event(session_id, 8);
-        let events = vec![
-            bcode_session_models::SessionEvent {
-                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 9,
-                timestamp_ms: 1,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::AssistantMessage {
-                    text: "done".to_owned(),
-                },
-            },
-            bcode_session_models::SessionEvent {
-                schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                sequence: 10,
-                timestamp_ms: 2,
-                session_id,
-                provenance: None,
-                kind: SessionEventKind::ModelTurnFinished {
-                    turn_id: receipt.turn_id.to_string(),
-                    outcome: ModelTurnOutcome::Completed,
-                    message: None,
-                },
-            },
-        ];
-        let completion = completion_from_events(&events, &receipt).expect("completion");
-        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
-        assert_eq!(completion.assistant_text, "done");
-        assert_eq!(completion.event_sequence, 10);
-    }
-
-    #[test]
-    fn completing_pending_operation_moves_the_durable_journal() {
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "iterate".to_owned(),
-            "complete".to_owned(),
-            20,
-        );
-        state.pending_operation = Some(pending_iteration(&state, OperationStatus::Accepted));
-        transition(&mut state, RunState::SubmittingIteration).expect("submitting");
-        transition(&mut state, RunState::RunningIteration).expect("running");
-        complete_pending_operation(
-            &mut state,
-            TurnCompletion {
-                outcome: ModelTurnOutcome::Completed,
-                assistant_text: "done".to_owned(),
-                event_sequence: 12,
-            },
-        )
-        .expect("complete");
-        assert!(state.pending_operation.is_none());
-        assert_eq!(
-            state
-                .last_completed_operation
-                .as_ref()
-                .and_then(|operation| operation.completion.as_ref())
-                .map(|completion| completion.event_sequence),
-            Some(12)
-        );
-    }
-
-    #[test]
-    fn workflow_loop_persistence_excludes_legacy_scheduler_journal() {
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "implement".to_owned(),
-            "done".to_owned(),
-            2,
-        );
-        state.pending_operation = Some(pending_iteration(&state, OperationStatus::Accepted));
-        state.last_completed_operation =
-            Some(pending_iteration(&state, OperationStatus::Completed));
-        let presentation =
-            WorkflowLoopPresentationState::from_loop_state(&state).expect("presentation");
-        let encoded = serde_json::to_value(&presentation).expect("encode");
-        assert_eq!(encoded["runtime"], "workflow");
-        for legacy_field in [
-            "pending_operation",
-            "last_completed_operation",
-            "cancel_requested",
-            "current_iteration",
-            "latest_evaluation",
-            "state",
-        ] {
-            assert!(encoded.get(legacy_field).is_none(), "{legacy_field}");
-        }
-        let decoded = decode_state(&serde_json::to_vec(&encoded).expect("bytes"))
-            .expect("decode presentation");
-        assert!(loop_state_uses_workflow_runtime(&decoded));
-        assert!(decoded.pending_operation.is_none());
-        assert!(decoded.last_completed_operation.is_none());
-        assert_eq!(decoded.state, RunState::Ready);
-    }
-
-    #[test]
-    fn loop_state_round_trip_preserves_pending_operation_journal() {
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "iterate".to_owned(),
-            "complete".to_owned(),
-            20,
-        );
-        state.pending_operation = Some(pending_iteration(&state, OperationStatus::Accepted));
-        let encoded = serde_json::to_vec(&state).expect("encode state");
-        let decoded: LoopState = serde_json::from_slice(&encoded).expect("decode state");
-        validate_state(&decoded).expect("valid state");
-        assert_eq!(
-            decoded
-                .pending_operation
-                .as_ref()
-                .and_then(|operation| operation.accepted_sequence),
-            Some(8)
-        );
-    }
-
-    #[test]
-    fn active_iteration_cannot_submit_a_second_iteration_before_terminal_transition() {
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "iterate".to_owned(),
-            "complete".to_owned(),
-            3,
-        );
-        transition(&mut state, RunState::SubmittingIteration).expect("submit first");
-        transition(&mut state, RunState::RunningIteration).expect("run first");
-
-        assert!(transition(&mut state, RunState::SubmittingIteration).is_err());
-        assert_eq!(state.state, RunState::RunningIteration);
-
-        transition(&mut state, RunState::Evaluating).expect("first terminal completion advances");
-        transition(&mut state, RunState::Ready).expect("incomplete evaluation allows next work");
-        transition(&mut state, RunState::SubmittingIteration)
-            .expect("submit second after terminal");
-    }
-
-    #[test]
-    fn cancellation_outcomes_pause_and_never_continue_automatically() {
-        assert_eq!(
-            decide_turn_outcome(ModelTurnOutcome::Completed),
-            TurnOutcomeDecision::Completed
-        );
-        assert_eq!(
-            decide_turn_outcome(ModelTurnOutcome::Cancelled),
-            TurnOutcomeDecision::PauseForSteering
-        );
-        for outcome in [
-            ModelTurnOutcome::Error,
-            ModelTurnOutcome::IdleTimeout,
-            ModelTurnOutcome::ToolRoundLimitReached,
-            ModelTurnOutcome::ProviderUnavailable,
-        ] {
-            assert_eq!(decide_turn_outcome(outcome), TurnOutcomeDecision::Pause);
-        }
-    }
-
-    #[test]
-    fn steering_resume_enters_evaluation_without_consuming_iteration() {
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "iterate".to_owned(),
-            "complete".to_owned(),
-            3,
-        );
-        state.state = RunState::Paused;
-        state.current_iteration = 1;
-        state.stop_reason = Some("iteration cancelled".to_owned());
-
-        prepare_steering_resume(&mut state).expect("steering may resume paused loop");
-
-        assert_eq!(state.state, RunState::Evaluating);
-        assert_eq!(state.current_iteration, 1);
-        assert!(state.stop_reason.is_none());
-    }
-
-    #[test]
-    fn explicit_resume_and_terminal_stop_semantics_are_strict() {
-        for resumable in [RunState::Paused, RunState::Failed] {
-            let mut state = LoopState::new(
-                SessionId::new(),
-                "iterate".to_owned(),
-                "complete".to_owned(),
-                3,
-            );
-            state.state = resumable;
-            state.cancel_requested = true;
-            state.stop_reason = Some("recoverable".to_owned());
-            prepare_resume(&mut state).expect("recoverable state should resume");
-            assert_eq!(state.state, RunState::Ready);
-            assert!(!state.cancel_requested);
-            assert!(state.stop_reason.is_none());
-        }
-
-        let mut stranded = LoopState::new(
-            SessionId::new(),
-            "iterate".to_owned(),
-            "complete".to_owned(),
-            3,
-        );
-        stranded.state = RunState::Evaluating;
-        stranded.current_iteration = 1;
-        stranded.latest_evaluation = Some(Evaluation {
-            condition_met: false,
-            evidence: vec!["work remains".to_owned()],
-            summary: "not done".to_owned(),
-        });
-        prepare_resume(&mut stranded).expect("completed incomplete evaluation should resume");
-        assert_eq!(stranded.state, RunState::Ready);
-
-        for terminal in [
-            RunState::Completed,
-            RunState::LimitReached,
-            RunState::Canceled,
-        ] {
-            let mut state = LoopState::new(
-                SessionId::new(),
-                "iterate".to_owned(),
-                "complete".to_owned(),
-                3,
-            );
-            state.state = terminal;
-            state.cancel_requested = terminal == RunState::Canceled;
-            assert_eq!(
-                prepare_resume(&mut state).expect_err("terminal loop must not resume"),
-                "this loop is terminal and cannot be resumed"
-            );
-            assert!(prepare_steering_resume(&mut state).is_err());
-            assert_eq!(state.state, terminal);
-        }
-    }
-
-    #[test]
-    fn active_session_status_is_plugin_owned_and_terminal_states_remove_it() {
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "iterate".to_owned(),
-            "complete".to_owned(),
-            3,
-        );
-        state.current_iteration = 1;
-        state.state = RunState::RunningIteration;
-        let contribution = active_status_contribution(&state, 2).expect("active status");
-        assert!(contribution.text.contains("Loop active"));
-        assert!(contribution.text.contains("normal messages steer"));
-        assert_eq!(contribution.metadata["iteration"], serde_json::json!(1));
-        assert_eq!(
-            contribution.metadata["queued_steering"],
-            serde_json::json!(2)
-        );
-
-        for terminal in [
-            RunState::Completed,
-            RunState::LimitReached,
-            RunState::Canceled,
-        ] {
-            state.state = terminal;
-            assert!(active_status_contribution(&state, 0).is_none());
-        }
-    }
-
-    #[test]
-    fn lifecycle_notes_cover_every_terminal_reason_and_accepted_evaluation() {
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "iterate".to_owned(),
-            "complete".to_owned(),
-            3,
-        );
-        state.run_id = "run-1".to_owned();
-        state.current_iteration = 2;
-        for (phase, reason, expected) in [
-            (
-                RunState::Completed,
-                "all checks passed",
-                "evaluator accepted: all checks passed",
-            ),
-            (
-                RunState::LimitReached,
-                "maximum iterations reached",
-                "3 iteration limit",
-            ),
-            (
-                RunState::Paused,
-                "iteration cancelled",
-                "Loop paused · iteration cancelled",
-            ),
-            (
-                RunState::Canceled,
-                "stopped by user",
-                "Loop canceled · stopped by user",
-            ),
-            (
-                RunState::Failed,
-                "provider unavailable",
-                "Loop failed · provider unavailable",
-            ),
-        ] {
-            state.state = phase;
-            state.stop_reason = Some(reason.to_owned());
-            let (note_id, text) = lifecycle_note(&state);
-            assert_eq!(note_id, format!("run-1:lifecycle:{phase:?}"));
-            assert!(text.contains(expected), "{text}");
-        }
-    }
-
-    #[test]
-    fn stop_confirmation_distinguishes_request_from_terminal_outcome() {
-        assert_eq!(
-            stop_confirmation(),
-            "loop cancellation requested; terminal outcome: Canceled · reason: stopped by user"
-        );
-    }
-
-    #[test]
-    fn command_status_and_transition_errors_are_actionable() {
-        assert_eq!(format_status(None, None), "no loop found for this session");
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "iterate".to_owned(),
-            "complete".to_owned(),
-            3,
-        );
-        state.run_id = "run-1".to_owned();
-        state.current_iteration = 2;
-        state.state = RunState::Paused;
-        state.stop_reason = Some("iteration cancelled".to_owned());
-        state.latest_evaluation = Some(Evaluation {
-            condition_met: false,
-            evidence: vec!["one item remains".to_owned()],
-            summary: "not complete".to_owned(),
-        });
-        assert_eq!(
-            format_status(Some(&state), Some(2)),
-            "loop run-1 · phase Paused · iteration 2/3 · queued steering: 2 · evaluation: not met · 1 evidence · not complete · reason: iteration cancelled"
-        );
-
-        state.state = RunState::Completed;
-        let error = transition(&mut state, RunState::Ready)
-            .expect_err("terminal state must reject continuation");
-        assert_eq!(error, "invalid loop phase transition: Completed -> Ready");
-    }
-
-    #[test]
-    fn iteration_submission_reuses_exact_configured_prompt() {
-        let prompt = "line one\n\n  preserve spacing exactly  \nline four";
-        let state = LoopState::new(
-            SessionId::new(),
-            prompt.to_owned(),
-            "complete".to_owned(),
-            20,
-        );
-
-        for iteration in 1..=3 {
-            let submission = iteration_submission(&state, iteration);
-            assert_eq!(submission.prompt, prompt);
-            assert_eq!(
-                submission.operation_id,
-                format!("{}:iteration:{iteration}", state.run_id)
-            );
-            assert_eq!(
-                submission.display_label,
-                format!("Loop iteration {iteration}")
-            );
-        }
-    }
-
-    #[test]
-    fn run_state_transition_table_is_explicit_and_complete() {
-        let states = [
-            RunState::Ready,
-            RunState::SubmittingIteration,
-            RunState::RunningIteration,
-            RunState::DrainingSteering,
-            RunState::Evaluating,
-            RunState::Completed,
-            RunState::LimitReached,
-            RunState::Paused,
-            RunState::Canceled,
-            RunState::Failed,
-        ];
-        for from in states {
-            for to in states {
-                let expected = from == to
-                    || (!from.is_terminal() && to == RunState::Canceled)
-                    || matches!(
-                        (from, to),
-                        (
-                            RunState::Ready,
-                            RunState::SubmittingIteration
-                                | RunState::Evaluating
-                                | RunState::LimitReached
-                        ) | (
-                            RunState::SubmittingIteration,
-                            RunState::RunningIteration | RunState::Paused | RunState::Failed
-                        ) | (
-                            RunState::RunningIteration,
-                            RunState::DrainingSteering
-                                | RunState::Evaluating
-                                | RunState::Paused
-                                | RunState::Failed
-                        ) | (
-                            RunState::DrainingSteering,
-                            RunState::Evaluating | RunState::Paused | RunState::Failed
-                        ) | (
-                            RunState::Evaluating,
-                            RunState::DrainingSteering
-                                | RunState::Ready
-                                | RunState::Completed
-                                | RunState::Paused
-                                | RunState::Failed
-                        ) | (
-                            RunState::Paused | RunState::Failed,
-                            RunState::Ready | RunState::Evaluating
-                        )
-                    );
-                assert_eq!(
-                    from.can_transition_to(to),
-                    expected,
-                    "unexpected transition decision for {from:?} -> {to:?}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn state_decoder_rejects_corrupt_oversized_and_unsupported_state() {
-        let corrupt = decode_state(b"not json").expect_err("corrupt state must fail");
-        assert!(corrupt.contains("corrupt loop state"));
-
-        let oversized = vec![b' '; usize::try_from(MAX_STATE_BYTES).expect("limit fits") + 1];
-        let error = decode_state(&oversized).expect_err("oversized state must fail");
-        assert!(error.contains("safety limit"));
-
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "iterate".to_owned(),
-            "complete".to_owned(),
-            20,
-        );
-        state.schema_version = STATE_SCHEMA_VERSION + 1;
-        let encoded = serde_json::to_vec(&state).expect("encode state");
-        let error = decode_state(&encoded).expect_err("unsupported schema must fail");
-        assert!(error.contains("unsupported loop state schema version"));
-    }
-
-    #[test]
-    fn evaluation_requires_strict_json_and_concrete_evidence() {
-        let evaluation = parse_evaluation(
-            r#"{"condition_met":false,"evidence":["one unchecked item"],"summary":"not done"}"#,
-        )
-        .expect("valid evaluation");
-        assert!(!evaluation.condition_met);
-        assert_eq!(evaluation.summary, "not done");
-
-        let completed = parse_evaluation(
-            r#"{"condition_met":true,"evidence":["all required checks passed"],"summary":"done"}"#,
-        )
-        .expect("positive evaluation with concrete evidence");
-        assert!(completed.condition_met);
-
-        for invalid in [
-            r#"{"condition_met":true,"condition_met":false,"evidence":["conflicting result"],"summary":"ambiguous"}"#,
-            r#"{"condition_met":true,"evidence":[],"summary":"done"}"#,
-            r#"{"condition_met":true,"evidence":["  "],"summary":"done"}"#,
-            r#"{"condition_met":true,"evidence":["verified"],"summary":"  "}"#,
-            r#"{"condition_met":true,"evidence":["verified"],"summary":"done","unexpected":true}"#,
-            "not json",
-        ] {
-            assert!(parse_evaluation(invalid).is_err(), "accepted {invalid}");
-        }
-    }
-
-    #[test]
-    fn incomplete_evaluation_returns_to_ready_for_the_next_iteration() {
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "iterate".to_owned(),
-            "complete".to_owned(),
-            20,
-        );
-        state.current_iteration = 1;
-        state.state = RunState::Evaluating;
-        let completed = apply_evaluation(
-            &mut state,
-            Evaluation {
-                condition_met: false,
-                evidence: vec!["work remains".to_owned()],
-                summary: "not done".to_owned(),
-            },
-        )
-        .expect("evaluation transition");
-
-        assert!(!completed);
-        assert_eq!(state.state, RunState::Ready);
-        assert_eq!(next_iteration(&state), Some(2));
-    }
-
-    #[test]
-    fn completed_evaluation_terminates_the_loop() {
-        let mut state = LoopState::new(
-            SessionId::new(),
-            "iterate".to_owned(),
-            "complete".to_owned(),
-            20,
-        );
-        state.current_iteration = 1;
-        state.state = RunState::Evaluating;
-        let completed = apply_evaluation(
-            &mut state,
-            Evaluation {
-                condition_met: true,
-                evidence: vec!["verified".to_owned()],
-                summary: "done".to_owned(),
-            },
-        )
-        .expect("evaluation transition");
-
-        assert!(completed);
-        assert_eq!(state.state, RunState::Completed);
-        assert_eq!(state.stop_reason.as_deref(), Some("done"));
-    }
-
-    #[test]
-    fn evaluation_requires_valid_json_and_evidence() {
-        let evaluation = parse_evaluation(
-            r#"{"condition_met":false,"evidence":["one unchecked item"],"summary":"not done"}"#,
-        )
-        .expect("valid evaluation");
-        assert!(!evaluation.condition_met);
-        assert_eq!(evaluation.summary, "not done");
-
-        assert!(
-            parse_evaluation(r#"{"condition_met":true,"evidence":[],"summary":"done"}"#).is_err()
-        );
-        assert!(parse_evaluation("not json").is_err());
-    }
-
-    #[test]
-    fn evaluator_prompt_is_conservative_and_read_only() {
-        let prompt = evaluator_prompt("all checkboxes complete");
-        assert!(prompt.contains("Read-only"));
-        assert!(prompt.contains("positively and completely verified"));
-        assert!(prompt.contains("all checkboxes complete"));
-    }
-
-    #[test]
-    fn loop_commands_are_available_and_immediate_on_chat_surfaces() {
-        for command in commands() {
-            assert!(command.supports_surface(&CommandSurface::Slash));
-            assert!(command.supports_surface(&CommandSurface::Palette));
-            assert_eq!(
-                command.execution,
-                bcode_command::CommandExecution::Immediate
-            );
-        }
     }
 }
+
+#[cfg(not(feature = "static-bundled"))]
+bcode_plugin_sdk::export_plugin!(LoopPlugin, include_str!("../bcode-plugin.toml"));

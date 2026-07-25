@@ -2634,6 +2634,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::InspectWorkflowRun { .. } => "inspect_workflow_run",
         Request::WorkflowRunStatus { .. } => "workflow_run_status",
         Request::AssociatedWorkflowRun { .. } => "associated_workflow_run",
+        Request::InspectAssociatedWorkflowRun { .. } => "inspect_associated_workflow_run",
         Request::ControlAssociatedWorkflowRun { .. } => "control_associated_workflow_run",
         Request::ListWorkflowRuns { .. } => "list_workflow_runs",
         Request::CancelWorkflowRun { .. } => "cancel_workflow_run",
@@ -3087,6 +3088,9 @@ async fn handle_request_inner(
         }
         Request::AssociatedWorkflowRun { key } => {
             handle_associated_workflow_run(request_id, state, writer, key).await
+        }
+        Request::InspectAssociatedWorkflowRun { key, limit } => {
+            handle_inspect_associated_workflow_run(request_id, state, writer, key, limit).await
         }
         Request::ControlAssociatedWorkflowRun { key, action } => {
             handle_control_associated_workflow_run(request_id, state, writer, key, action).await
@@ -10019,12 +10023,10 @@ async fn handle_register_workflow_definition(
     .await
 }
 
-async fn handle_start_workflow(
-    request_id: u64,
+async fn start_workflow(
     state: &Arc<ServerState>,
-    writer: &SharedWriter,
     request: bcode_ipc::WorkflowStartRequest,
-) -> Result<(), ServerError> {
+) -> Result<bcode_ipc::WorkflowRunStartResponse, ServerError> {
     if request.identity.kind != request.binding.workflow_kind {
         return Err(WorkflowStoreError::InvalidData(
             "workflow logical identity does not match its binding kind".to_string(),
@@ -10059,7 +10061,7 @@ async fn handle_start_workflow(
         )
         .into());
     }
-    let started = start_workflow_run(
+    start_workflow_run(
         state,
         bcode_ipc::WorkflowRunStartRequest {
             definition_id: request.identity.definition_id,
@@ -10072,7 +10074,16 @@ async fn handle_start_workflow(
             limits: request.limits,
         },
     )
-    .await?;
+    .await
+}
+
+async fn handle_start_workflow(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::WorkflowStartRequest,
+) -> Result<(), ServerError> {
+    let started = start_workflow(state, request).await?;
     send_response(
         writer,
         request_id,
@@ -10222,19 +10233,17 @@ async fn handle_describe_workflow_definition(
     .await
 }
 
-async fn handle_inspect_workflow_run(
-    request_id: u64,
+async fn workflow_run_inspection(
     state: &ServerState,
-    writer: &SharedWriter,
-    run_id: String,
+    run_id: &str,
     limit: usize,
-) -> Result<(), ServerError> {
+) -> Result<bcode_ipc::WorkflowRunInspection, ServerError> {
     let (run, definition, waits, attempts, events, grants, resource_leases, outputs) = {
         let store = state
             .workflow_store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let run = store.run_summary(&run_id)?.ok_or_else(|| {
+        let run = store.run_summary(run_id)?.ok_or_else(|| {
             WorkflowStoreError::InvalidData(format!("workflow run not found: {run_id}"))
         })?;
         let definition = store
@@ -10248,12 +10257,12 @@ async fn handle_inspect_workflow_run(
         (
             run,
             definition,
-            store.waiting_activations(&run_id, limit)?,
-            store.attempt_history(&run_id, None, limit)?,
-            store.event_history(&run_id, None, limit)?,
-            store.grants_for_run(&run_id, limit)?,
-            store.resource_leases_for_run(&run_id, limit)?,
-            store.output_summaries(&run_id, limit)?,
+            store.waiting_activations(run_id, limit)?,
+            store.attempt_history(run_id, None, limit)?,
+            store.event_history(run_id, None, limit)?,
+            store.grants_for_run(run_id, limit)?,
+            store.resource_leases_for_run(run_id, limit)?,
+            store.output_summaries(run_id, limit)?,
         )
     };
     let child_sessions = state
@@ -10269,7 +10278,7 @@ async fn handle_inspect_workflow_run(
         })
         .take(limit)
         .collect();
-    let inspection = bcode_ipc::WorkflowRunInspection {
+    Ok(bcode_ipc::WorkflowRunInspection {
         run,
         definition,
         waits,
@@ -10279,7 +10288,17 @@ async fn handle_inspect_workflow_run(
         resource_leases,
         outputs,
         child_sessions,
-    };
+    })
+}
+
+async fn handle_inspect_workflow_run(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    run_id: String,
+    limit: usize,
+) -> Result<(), ServerError> {
+    let inspection = workflow_run_inspection(state, &run_id, limit).await?;
     send_response(
         writer,
         request_id,
@@ -10328,6 +10347,37 @@ async fn handle_associated_workflow_run(
         writer,
         request_id,
         Response::Ok(ResponsePayload::AssociatedWorkflowRun { run }),
+    )
+    .await
+}
+
+async fn handle_inspect_associated_workflow_run(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    key: bcode_ipc::WorkflowRunBindingLookup,
+    limit: usize,
+) -> Result<(), ServerError> {
+    let run = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .associated_run(&bcode_workflow_store::WorkflowRunBindingKey {
+            owner_plugin_id: key.owner_plugin_id,
+            workflow_kind: key.workflow_kind,
+            scope_key: key.scope_key,
+        })?;
+    let inspection = if let Some(run) = run {
+        Some(Box::new(
+            workflow_run_inspection(state, &run.run_id, limit).await?,
+        ))
+    } else {
+        None
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::AssociatedWorkflowRunInspection { inspection }),
     )
     .await
 }
@@ -36905,6 +36955,90 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         ..
                     } if started == &work_id
                 ))
+        );
+    }
+
+    #[tokio::test]
+    async fn ergonomic_workflow_start_is_retry_safe_and_binding_survives_reopen() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("workflow".to_string()), PathBuf::from("/repo"))
+            .await
+            .expect("session");
+        let state = Arc::new(test_server_state(sessions));
+        let workflow = bcode_workflow::WorkflowBuilder::new(
+            "bound-start",
+            bcode_workflow::Step::task("node", |value: u32, _context| async move { Ok(value) }),
+        )
+        .build()
+        .expect("workflow");
+        let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+            "bcode.test.bound",
+            workflow.definition(),
+        )
+        .expect("identity");
+        let request = bcode_ipc::WorkflowStartRequest {
+            identity,
+            definition: workflow.definition().clone(),
+            run_id: Some("bound-stable-run".to_string()),
+            parent_session_id: session.id,
+            input: serde_json::json!(1),
+            binding: bcode_workflow_store::WorkflowRunBinding {
+                owner_plugin_id: "bcode.test".to_string(),
+                workflow_kind: "bcode.test.bound".to_string(),
+                scope_key: session.id.to_string(),
+                display_label: Some("Bound test".to_string()),
+                single_active: true,
+            },
+            limits: bcode_workflow_store::WorkflowRunLimits::default(),
+        };
+
+        let first = start_workflow(&state, request.clone())
+            .await
+            .expect("first start");
+        let retry = start_workflow(&state, request).await.expect("retry");
+        assert_eq!(first, retry);
+        assert_eq!(first.run.workspace_snapshot, "/repo");
+
+        let key = bcode_workflow_store::WorkflowRunBindingKey {
+            owner_plugin_id: "bcode.test".to_string(),
+            workflow_kind: "bcode.test.bound".to_string(),
+            scope_key: session.id.to_string(),
+        };
+        let path = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .path()
+            .to_path_buf();
+        let reopened = bcode_workflow_store::WorkflowStore::open_at_path(&path).expect("reopen");
+        let associated = reopened.associated_run(&key).expect("lookup").expect("run");
+        assert_eq!(associated.run_id, "bound-stable-run");
+        assert_eq!(associated.binding, first.run.binding);
+
+        drop(reopened);
+        let mut reopened =
+            bcode_workflow_store::WorkflowStore::open_at_path(&path).expect("reopen control");
+        assert!(
+            reopened
+                .pause_run("bound-stable-run", current_unix_millis())
+                .expect("pause after restart")
+        );
+        drop(reopened);
+        let mut reopened =
+            bcode_workflow_store::WorkflowStore::open_at_path(&path).expect("reopen resume");
+        assert!(
+            reopened
+                .resume_run("bound-stable-run", current_unix_millis())
+                .expect("resume after restart")
+        );
+        assert_eq!(
+            reopened
+                .associated_run(&key)
+                .expect("lookup after lifecycle")
+                .expect("run")
+                .status,
+            bcode_workflow_store::RunStatus::Running
         );
     }
 

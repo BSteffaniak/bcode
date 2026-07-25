@@ -1,0 +1,18 @@
+error[E0308]: mismatched types
+  --> tests/ui/fail/plugin_workflow_start_input_must_match.rs:28:9
+   |
+26 |       let _request = PluginWorkflowStartRequest::typed(
+   |                      --------------------------------- arguments to this function are incorrect
+27 |           &spec,
+28 | /         &WrongInput {
+29 | |             value: "wrong".to_string(),
+30 | |         },
+   | |_________^ expected `&WorkflowInput`, found `&WrongInput`
+   |
+   = note: expected reference `&WorkflowInput`
+              found reference `&WrongInput`
+note: associated function defined here
+  --> src/tui.rs
+   |
+   |     pub fn typed<I>(
+   |            ^^^^^

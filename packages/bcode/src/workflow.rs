@@ -11,12 +11,12 @@ pub use bcode_workflow::{
     AbortTaskOnDrop, ArtifactReference, EdgeDefinition, EdgeKind, Field, NodeDefinition, NodeKind,
     NodeRunState, ParallelFailurePolicy, Predicate, PredicateExpression, ResourceAccess,
     ResourceClaim, RetryPolicy, Step, StepContext, ValueSchema, Workflow, WorkflowApprovalResolver,
-    WorkflowBuilder, WorkflowCancellation, WorkflowDefinition, WorkflowError, WorkflowEvent,
-    WorkflowEventReceiver, WorkflowEventSender, WorkflowGrantScope, WorkflowOutcome, WorkflowPlan,
-    WorkflowPolicyGrant, WorkflowPolicyPreflight, WorkflowPolicyRequest, WorkflowRunObserver,
-    WorkflowRunSnapshot, WorkflowToolCapability, authorize_workflow_policy, fan_out, field,
-    parallel, parallel_named, parallel_named_with_policy, preflight_workflow_policy,
-    workflow_event_channel,
+    WorkflowBuilder, WorkflowCancellation, WorkflowDefinition, WorkflowDefinitionIdentity,
+    WorkflowError, WorkflowEvent, WorkflowEventReceiver, WorkflowEventSender, WorkflowGrantScope,
+    WorkflowOutcome, WorkflowPlan, WorkflowPolicyGrant, WorkflowPolicyPreflight,
+    WorkflowPolicyRequest, WorkflowRunObserver, WorkflowRunSnapshot, WorkflowSpec,
+    WorkflowToolCapability, authorize_workflow_policy, fan_out, field, parallel, parallel_named,
+    parallel_named_with_policy, preflight_workflow_policy, workflow_event_channel,
 };
 use schemars::JsonSchema;
 use serde::{Serialize, de::DeserializeOwned};

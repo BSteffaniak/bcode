@@ -2040,6 +2040,27 @@ impl BcodeClient {
         }
     }
 
+    /// Inspect the newest workflow run associated with one exact generic binding key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or a bounded canonical query fails.
+    pub async fn inspect_associated_workflow_run(
+        &self,
+        key: bcode_ipc::WorkflowRunBindingLookup,
+        limit: usize,
+    ) -> Result<Option<bcode_ipc::WorkflowRunInspection>, ClientError> {
+        match self
+            .send_request(Request::InspectAssociatedWorkflowRun { key, limit })
+            .await?
+        {
+            ResponsePayload::AssociatedWorkflowRunInspection { inspection } => {
+                Ok(inspection.map(|inspection| *inspection))
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Apply one lifecycle transition to the newest run for one generic binding key.
     ///
     /// # Errors

@@ -7,8 +7,11 @@ use bcode_ipc::Event as BcodeEvent;
 use bcode_plugin_sdk::tui::{
     PluginSessionEvent, PluginSessionEventReplay, PluginSessionEventSubscription,
     PluginSessionEventSubscriptionRequest, PluginTask, PluginTuiAction, PluginTuiHost,
-    PluginTuiHostError, PluginTuiSurface, PluginWorkflowStartFuture, PluginWorkflowStartRequest,
-    PluginWorkflowStartResponse,
+    PluginTuiHostError, PluginTuiSurface, PluginWorkflowControlAction, PluginWorkflowControlFuture,
+    PluginWorkflowControlResult, PluginWorkflowInspection, PluginWorkflowInspectionFuture,
+    PluginWorkflowLookup, PluginWorkflowLookupFuture, PluginWorkflowStartFuture,
+    PluginWorkflowStartRequest, PluginWorkflowStartResponse, PluginWorkflowStatus,
+    PluginWorkflowSummary,
 };
 use bmux_tui::event::{Event, FocusEvent};
 use bmux_tui::geometry::Rect;
@@ -108,6 +111,63 @@ impl PluginTuiHost for BcodePluginTuiHost {
         })
     }
 
+    fn associated_workflow(&self, lookup: PluginWorkflowLookup) -> PluginWorkflowLookupFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .associated_workflow_run(workflow_lookup(lookup))
+                .await
+                .map(|run| run.map(workflow_summary))
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
+    fn inspect_associated_workflow(
+        &self,
+        lookup: PluginWorkflowLookup,
+        limit: usize,
+    ) -> PluginWorkflowInspectionFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            client
+                .inspect_associated_workflow_run(workflow_lookup(lookup), limit)
+                .await
+                .and_then(|inspection| inspection.map(workflow_inspection).transpose())
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))
+        })
+    }
+
+    fn control_associated_workflow(
+        &self,
+        lookup: PluginWorkflowLookup,
+        action: PluginWorkflowControlAction,
+    ) -> PluginWorkflowControlFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let (run, changed) = client
+                .control_associated_workflow_run(
+                    workflow_lookup(lookup),
+                    match action {
+                        PluginWorkflowControlAction::Pause => {
+                            bcode_ipc::WorkflowRunControlAction::Pause
+                        }
+                        PluginWorkflowControlAction::Resume => {
+                            bcode_ipc::WorkflowRunControlAction::Resume
+                        }
+                        PluginWorkflowControlAction::Cancel => {
+                            bcode_ipc::WorkflowRunControlAction::Cancel
+                        }
+                    },
+                )
+                .await
+                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
+            Ok(PluginWorkflowControlResult {
+                run: run.map(workflow_summary),
+                changed,
+            })
+        })
+    }
+
     fn subscribe_session_events(
         &self,
         request: PluginSessionEventSubscriptionRequest,
@@ -124,6 +184,99 @@ impl PluginTuiHost for BcodePluginTuiHost {
         }));
         Ok(PluginSessionEventSubscription { receiver })
     }
+}
+
+fn workflow_lookup(lookup: PluginWorkflowLookup) -> bcode_ipc::WorkflowRunBindingLookup {
+    bcode_ipc::WorkflowRunBindingLookup {
+        owner_plugin_id: lookup.owner_plugin_id,
+        workflow_kind: lookup.workflow_kind,
+        scope_key: lookup.scope_key,
+    }
+}
+
+const fn workflow_status(status: bcode_workflow_store::RunStatus) -> PluginWorkflowStatus {
+    match status {
+        bcode_workflow_store::RunStatus::Running => PluginWorkflowStatus::Running,
+        bcode_workflow_store::RunStatus::Paused => PluginWorkflowStatus::Paused,
+        bcode_workflow_store::RunStatus::Completed => PluginWorkflowStatus::Completed,
+        bcode_workflow_store::RunStatus::Failed => PluginWorkflowStatus::Failed,
+        bcode_workflow_store::RunStatus::Cancelled => PluginWorkflowStatus::Cancelled,
+        bcode_workflow_store::RunStatus::RepairRequired => PluginWorkflowStatus::RepairRequired,
+    }
+}
+
+fn workflow_summary(run: bcode_workflow_store::WorkflowRunSummary) -> PluginWorkflowSummary {
+    PluginWorkflowSummary {
+        run_id: run.run_id,
+        definition_id: run.definition_id,
+        definition_version: run.definition_version,
+        status: workflow_status(run.status),
+        created_at_ms: run.created_at_ms,
+        updated_at_ms: run.updated_at_ms,
+    }
+}
+
+fn workflow_inspection(
+    inspection: bcode_ipc::WorkflowRunInspection,
+) -> Result<PluginWorkflowInspection, bcode_client::ClientError> {
+    Ok(PluginWorkflowInspection {
+        run: workflow_summary(inspection.run),
+        definition: serde_json::from_str(&inspection.definition.definition_json)
+            .map_err(|_| bcode_client::ClientError::UnexpectedResponse)?,
+        waits: inspection
+            .waits
+            .into_iter()
+            .map(|value| {
+                serde_json::to_value(value)
+                    .map_err(|_| bcode_client::ClientError::UnexpectedResponse)
+            })
+            .collect::<Result<_, _>>()?,
+        attempts: inspection
+            .attempts
+            .into_iter()
+            .map(|value| {
+                serde_json::to_value(value)
+                    .map_err(|_| bcode_client::ClientError::UnexpectedResponse)
+            })
+            .collect::<Result<_, _>>()?,
+        events: inspection
+            .events
+            .into_iter()
+            .map(|value| {
+                serde_json::to_value(value)
+                    .map_err(|_| bcode_client::ClientError::UnexpectedResponse)
+            })
+            .collect::<Result<_, _>>()?,
+        grants: inspection
+            .grants
+            .into_iter()
+            .map(|value| {
+                serde_json::to_value(value)
+                    .map_err(|_| bcode_client::ClientError::UnexpectedResponse)
+            })
+            .collect::<Result<_, _>>()?,
+        resource_leases: inspection
+            .resource_leases
+            .into_iter()
+            .map(|value| {
+                serde_json::to_value(value)
+                    .map_err(|_| bcode_client::ClientError::UnexpectedResponse)
+            })
+            .collect::<Result<_, _>>()?,
+        outputs: inspection
+            .outputs
+            .into_iter()
+            .map(|value| {
+                serde_json::to_value(value)
+                    .map_err(|_| bcode_client::ClientError::UnexpectedResponse)
+            })
+            .collect::<Result<_, _>>()?,
+        child_session_ids: inspection
+            .child_sessions
+            .into_iter()
+            .map(|session| session.id)
+            .collect(),
+    })
 }
 
 async fn stream_plugin_session_events(

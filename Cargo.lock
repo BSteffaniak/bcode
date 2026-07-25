@@ -1886,6 +1886,7 @@ dependencies = [
  "schemars",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "uuid",
 ]
@@ -2162,6 +2163,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "trybuild",
 ]
 
 [[package]]
