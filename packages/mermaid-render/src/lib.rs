@@ -8,12 +8,18 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use std::{
+    collections::BTreeMap,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
+
+/// Maximum successful Mermaid renders retained in memory.
+pub const MAX_CACHE_ENTRIES: usize = 64;
+/// Maximum encoded Mermaid output bytes retained in memory.
+pub const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 /// Version of the stable Bcode Mermaid render contract and cache-key semantics.
 pub const RENDER_CONTRACT_VERSION: u16 = 1;
@@ -148,6 +154,97 @@ pub struct MermaidRendered {
 pub enum MermaidRenderedOutput {
     /// UTF-8 SVG bytes.
     Svg(Vec<u8>),
+}
+
+impl MermaidRenderedOutput {
+    const fn payload_bytes(&self) -> usize {
+        match self {
+            Self::Svg(bytes) => bytes.len(),
+        }
+    }
+}
+
+/// Deterministic bounded least-recently-used cache of successful Mermaid renders.
+#[derive(Debug, Default)]
+pub struct MermaidRenderCache {
+    entries: BTreeMap<String, MermaidCacheEntry>,
+    clock: u64,
+    payload_bytes: usize,
+}
+
+#[derive(Debug)]
+struct MermaidCacheEntry {
+    rendered: MermaidRendered,
+    last_used: u64,
+}
+
+impl MermaidRenderCache {
+    /// Return a cloned cached render and mark it most recently used.
+    pub fn get(&mut self, key: &str) -> Option<MermaidRendered> {
+        self.clock = self.clock.saturating_add(1);
+        let entry = self.entries.get_mut(key)?;
+        entry.last_used = self.clock;
+        Some(entry.rendered.clone())
+    }
+
+    /// Insert a successful render and deterministically evict least-recently-used entries.
+    pub fn insert(&mut self, rendered: MermaidRendered) {
+        let payload_bytes = rendered.output.payload_bytes();
+        if payload_bytes > MAX_CACHE_BYTES {
+            return;
+        }
+        self.clock = self.clock.saturating_add(1);
+        if let Some(previous) = self.entries.remove(&rendered.cache_key) {
+            self.payload_bytes = self
+                .payload_bytes
+                .saturating_sub(previous.rendered.output.payload_bytes());
+        }
+        self.payload_bytes = self.payload_bytes.saturating_add(payload_bytes);
+        self.entries.insert(
+            rendered.cache_key.clone(),
+            MermaidCacheEntry {
+                rendered,
+                last_used: self.clock,
+            },
+        );
+        self.evict_to_limits();
+    }
+
+    /// Return the current number of cached renders.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Return whether no renders are cached.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Return current encoded output bytes.
+    #[must_use]
+    pub const fn payload_bytes(&self) -> usize {
+        self.payload_bytes
+    }
+
+    fn evict_to_limits(&mut self) {
+        while self.entries.len() > MAX_CACHE_ENTRIES || self.payload_bytes > MAX_CACHE_BYTES {
+            let Some(key) = self
+                .entries
+                .iter()
+                .min_by_key(|(key, entry)| (entry.last_used, *key))
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            if let Some(entry) = self.entries.remove(&key) {
+                self.payload_bytes = self
+                    .payload_bytes
+                    .saturating_sub(entry.rendered.output.payload_bytes());
+            }
+        }
+    }
 }
 
 /// Stable renderer diagnostic.
@@ -371,9 +468,18 @@ mod backend {
 #[cfg(test)]
 mod tests {
     use super::{
-        MermaidCancellationToken, MermaidRenderError, MermaidRenderRequest, MermaidRenderedOutput,
+        MAX_CACHE_BYTES, MAX_CACHE_ENTRIES, MermaidCancellationToken, MermaidRenderCache,
+        MermaidRenderError, MermaidRenderRequest, MermaidRendered, MermaidRenderedOutput,
         render_mermaid,
     };
+
+    fn cached_render(key: &str, bytes: usize) -> MermaidRendered {
+        MermaidRendered {
+            output: MermaidRenderedOutput::Svg(vec![b'x'; bytes]),
+            cache_key: key.to_owned(),
+            diagnostics: Vec::new(),
+        }
+    }
 
     #[test]
     fn renders_svg_without_exposing_backend_types() {
@@ -414,6 +520,52 @@ mod tests {
             render_mermaid(&too_small, &MermaidCancellationToken::default()),
             Err(MermaidRenderError::OutputDimensionsExceeded)
         );
+    }
+
+    #[test]
+    fn bounded_cache_evicts_deterministic_least_recently_used_render() {
+        let mut cache = MermaidRenderCache::default();
+        for index in 0..MAX_CACHE_ENTRIES {
+            cache.insert(cached_render(&format!("key-{index:03}"), 4));
+        }
+        assert!(cache.get("key-000").is_some());
+        cache.insert(cached_render("key-new", 4));
+
+        assert_eq!(cache.len(), MAX_CACHE_ENTRIES);
+        assert!(cache.get("key-000").is_some());
+        assert!(cache.get("key-001").is_none());
+        assert!(cache.get("key-new").is_some());
+    }
+
+    #[test]
+    fn bounded_cache_enforces_payload_limit_and_replacement_accounting() {
+        let mut cache = MermaidRenderCache::default();
+        cache.insert(cached_render("large", MAX_CACHE_BYTES));
+        assert_eq!(cache.payload_bytes(), MAX_CACHE_BYTES);
+
+        cache.insert(cached_render("small", 4));
+        assert!(cache.get("large").is_none());
+        assert!(cache.get("small").is_some());
+        assert_eq!(cache.payload_bytes(), 4);
+
+        cache.insert(cached_render("small", 7));
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.payload_bytes(), 7);
+
+        cache.insert(cached_render("oversized", MAX_CACHE_BYTES + 1));
+        assert!(cache.get("oversized").is_none());
+        assert_eq!(cache.payload_bytes(), 7);
+    }
+
+    #[test]
+    fn cache_stores_only_explicit_successes_under_versioned_request_keys() {
+        let request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 800, 600);
+        let rendered = render_mermaid(&request, &MermaidCancellationToken::default()).unwrap();
+        let mut cache = MermaidRenderCache::default();
+        cache.insert(rendered.clone());
+
+        assert_eq!(cache.get(&request.cache_key()), Some(rendered));
+        assert!(cache.get("mermaid-v0:obsolete").is_none());
     }
 
     #[test]

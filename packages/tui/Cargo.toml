@@ -46,12 +46,14 @@ crossterm                 = { workspace = true, features = ["bracketed-paste", "
 image                     = { workspace = true }
 open                      = { workspace = true }
 png                       = { workspace = true }
+reqwest                   = { workspace = true, features = ["rustls-tls", "stream"] }
 serde                     = { workspace = true, features = ["derive", "std"] }
 serde_json                = { workspace = true }
 thiserror                 = { workspace = true }
 tokio                     = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tracing                   = { workspace = true }
 unicode-segmentation      = { workspace = true }
+url                       = { workspace = true }
 uuid                      = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
