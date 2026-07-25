@@ -1487,6 +1487,7 @@ impl ServerState {
                 .active_for_session(session_id)
                 .await
                 .is_empty()
+            || session_has_active_plugin_invocations(self, session_id)
         {
             return;
         }
@@ -1504,7 +1505,9 @@ impl ServerState {
         &self,
         session_id: SessionId,
     ) -> Result<bool, ServerError> {
-        if self.session_has_active_turn(session_id).await {
+        if self.session_has_active_turn(session_id).await
+            || session_has_active_plugin_invocations(self, session_id)
+        {
             return Ok(false);
         }
         if !self
@@ -18360,6 +18363,17 @@ fn clear_all_live_state(state: &ServerState) {
     refresh_active_live_state_metrics(state);
 }
 
+fn session_has_active_plugin_invocations(state: &ServerState, session_id: SessionId) -> bool {
+    state
+        .active_plugin_invocations
+        .lock()
+        .is_ok_and(|invocations| {
+            invocations
+                .keys()
+                .any(|(active_session_id, _)| *active_session_id == session_id)
+        })
+}
+
 fn clear_session_live_state(state: &ServerState, session_id: SessionId) {
     if let Ok(mut registry) = state.active_contributions.lock() {
         registry
@@ -33376,6 +33390,18 @@ library = "test"
                 if required == session_id
         ));
 
+        let (inputs, _receiver) = mpsc::channel(1);
+        let registration = ActivePluginInvocationRegistration::register(
+            Arc::clone(&state.active_plugin_invocations),
+            Arc::clone(&state.active_artifacts),
+            session_id,
+            "call-reconnect",
+            ActivePluginInvocation {
+                producer_plugin_id: "bcode.filesystem".to_owned(),
+                inputs,
+            },
+        )
+        .expect("active invocation");
         publish_tool_request_draft_live(
             &state,
             session_id,
@@ -33473,6 +33499,7 @@ library = "test"
                         if message.text == "durable answer"
                 ))
         );
+        drop(registration);
         drop(keeper);
         server.abort();
     }
@@ -38465,6 +38492,64 @@ event_symbol = "bcode_plugin_handle_event_v1"
             metrics.gauges.get("server.live_state.active_bytes"),
             Some(&0)
         );
+    }
+
+    #[tokio::test]
+    async fn idle_session_detach_preserves_live_state_for_active_plugin_invocation() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(
+                Some("active invocation detach".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let client_id = ClientId::new();
+        sessions
+            .attach_session(session.id, client_id)
+            .await
+            .expect("attach");
+        let state = test_server_state(sessions);
+        state.attach_client_session(client_id, session.id).await;
+        publish_tool_request_draft_live(
+            &state,
+            session.id,
+            request_draft_event(
+                "call-draft",
+                1,
+                1,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: "draft".to_owned(),
+                },
+            ),
+        )
+        .await;
+        let (inputs, _receiver) = mpsc::channel(1);
+        let registration = ActivePluginInvocationRegistration::register(
+            Arc::clone(&state.active_plugin_invocations),
+            Arc::clone(&state.active_artifacts),
+            session.id,
+            "call-draft",
+            ActivePluginInvocation {
+                producer_plugin_id: "bcode.filesystem".to_owned(),
+                inputs,
+            },
+        )
+        .expect("active invocation");
+
+        state
+            .detach_client_session(client_id)
+            .await
+            .expect("detach while invocation remains active");
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, session.id).len(),
+            1
+        );
+
+        drop(registration);
+        state.release_session_resources_if_idle(session.id).await;
+        assert!(active_tool_request_draft_snapshot_events(&state, session.id).is_empty());
     }
 
     #[tokio::test]

@@ -57,6 +57,8 @@ const RECORDING_PUBLICATION_INTERVAL: Duration = Duration::from_millis(16);
 const RECORDING_PUBLICATION_BYTES: u64 = 64 * 1024;
 const RECORDING_HEADER_BYTES: usize = 14;
 const RECORDING_FRAME_HEADER_BYTES: usize = 13;
+/// Bytes committed after writing the version-three header and required start frame.
+pub const RECORDING_HEADER_AND_START_BYTES: u64 = 27;
 
 /// Incremental decoder for ordered committed prefixes of an active version-three recording.
 ///

@@ -1536,6 +1536,7 @@ fn shell_recording_commit_observer(
     cancellation: bcode_plugin_sdk::ServiceCancellation,
 ) -> recording::ShellRecordingCommitObserver {
     let tool_call_id = tool_call_id.to_owned();
+    let publication_state = Arc::new(std::sync::atomic::AtomicU8::new(0));
     let progress = Arc::new(StdMutex::new(
         TransientProgressPublisher::with_limits_and_cancellation(
             events,
@@ -1566,13 +1567,29 @@ fn shell_recording_commit_observer(
             finalized: commit.finalized,
             availability: None,
         };
-        let _ = progress
+        let mut progress = progress
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .upsert_with_artifact_if_ready(
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let publish_immediately = if commit.finalized {
+            true
+        } else if commit.committed_bytes > recording::RECORDING_HEADER_AND_START_BYTES {
+            publication_state.store(2, std::sync::atomic::Ordering::Release);
+            true
+        } else if publication_state.load(std::sync::atomic::Ordering::Acquire) == 0 {
+            publication_state.store(1, std::sync::atomic::Ordering::Release);
+            true
+        } else {
+            false
+        };
+        if publish_immediately {
+            let _ = progress
+                .upsert_with_artifact(&ShellLiveRecordingPayload { mode: "terminal" }, artifact);
+        } else {
+            let _ = progress.upsert_with_artifact_if_ready(
                 &ShellLiveRecordingPayload { mode: "terminal" },
                 artifact,
             );
+        }
     })
 }
 
@@ -2019,6 +2036,53 @@ mod tests {
         events.lock().expect("event lock").push(payload.to_vec());
     }
 
+    #[test]
+    fn shell_recording_publishes_first_output_revision_without_waiting_for_cadence() {
+        let events = Mutex::new(Vec::<Vec<u8>>::new());
+        let emitter = ServiceEventEmitter::new(
+            Some(capture_service_event),
+            std::ptr::from_ref(&events).cast_mut().cast(),
+        );
+        let observer = shell_recording_commit_observer(
+            emitter,
+            "live-recording",
+            bcode_plugin_sdk::TransientProgressLimits {
+                max_encoded_bytes: bcode_plugin_sdk::DEFAULT_TRANSIENT_PROGRESS_MAX_ENCODED_BYTES,
+                min_interval_ms: 60_000,
+            },
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        let path = PathBuf::from("live-recording.bcsr.partial");
+        observer(recording::ShellRecordingCommit {
+            path: path.clone(),
+            committed_bytes: recording::RECORDING_HEADER_AND_START_BYTES,
+            finalized: false,
+        });
+        observer(recording::ShellRecordingCommit {
+            path,
+            committed_bytes: recording::RECORDING_HEADER_AND_START_BYTES + 1,
+            finalized: false,
+        });
+
+        let revisions = events
+            .lock()
+            .expect("events")
+            .iter()
+            .filter_map(|payload| {
+                serde_json::from_slice::<bcode_tool::ToolContributionEnvelope>(payload).ok()
+            })
+            .filter_map(|envelope| envelope.contribution.artifact)
+            .map(|artifact| artifact.revision)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            revisions,
+            vec![
+                recording::RECORDING_HEADER_AND_START_BYTES,
+                recording::RECORDING_HEADER_AND_START_BYTES + 1,
+            ]
+        );
+    }
+
     struct CapturedServiceEvent {
         payload: Vec<u8>,
         observed_at: Instant,
@@ -2452,6 +2516,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)] // One invocation verifies the full recording artifact lifecycle.
     fn terminal_invocation_publishes_one_valid_authoritative_recording() {
         let environment = isolated_config_environment("recording-integration");
         let artifact_dir = tempfile::tempdir().expect("artifact dir");

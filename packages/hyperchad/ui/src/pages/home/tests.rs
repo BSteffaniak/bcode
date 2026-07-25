@@ -1719,6 +1719,8 @@ fn document_and_ocr_results_bound_text_and_show_metadata_and_references() {
 fn bundled_visual_registry_covers_actual_high_value_request_schemas() {
     for schema in [
         "bcode.filesystem.request",
+        "bcode.filesystem.request-draft.write",
+        "bcode.filesystem.request-draft.edit",
         "bcode.filesystem.change",
         "bcode.filesystem.read",
         "bcode.filesystem.image",
@@ -2195,18 +2197,21 @@ fn visual_adapter_fixture(schema: &str) -> serde_json::Value {
             "command": "cargo test",
             "cwd": "/tmp/fixture"
         }),
+        "bcode.filesystem.request-draft.write" => serde_json::json!({
+            "preview": r#"{"path":"/tmp/fixture.rs","contents":"fixture"}"#,
+            "argument_bytes": 55,
+            "truncated": false
+        }),
+        "bcode.filesystem.request-draft.edit" => serde_json::json!({
+            "preview": r#"{"path":"/tmp/fixture.rs","old_text":"old","new_text":"new"}"#,
+            "argument_bytes": 72,
+            "truncated": false
+        }),
         "bcode.filesystem.change" => serde_json::json!({
             "path": "/tmp/fixture.rs",
             "old_text": "old",
             "new_text": "new"
         }),
-        "bcode.filesystem.request-draft.write" | "bcode.filesystem.request-draft.edit" => {
-            return serde_json::json!({
-                "preview": "{\"path\":\"/tmp/fixture.rs\",\"contents\":\"partial",
-                "argument_bytes": 52,
-                "truncated": false
-            });
-        }
         schema if schema.starts_with("bcode.filesystem") => serde_json::json!({
             "operation": schema.rsplit('.').next().unwrap_or("filesystem"),
             "path": "/tmp/fixture.rs"
