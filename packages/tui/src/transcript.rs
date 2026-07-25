@@ -679,6 +679,22 @@ pub fn permission_result_item(permission_id: &str, approved: bool) -> Transcript
     )
 }
 
+fn bounded_tool_request_draft_fallback(
+    draft: &bcode_session_view_models::ToolRequestDraftView,
+) -> String {
+    const MAX_TOOL_NAME_CHARS: usize = 96;
+    let tool_name = draft
+        .tool_name
+        .chars()
+        .take(MAX_TOOL_NAME_CHARS)
+        .collect::<String>();
+    let truncation = if draft.truncated { " · truncated" } else { "" };
+    format!(
+        "{tool_name} request · {} bytes{truncation}",
+        draft.argument_bytes
+    )
+}
+
 /// Adapt one generic shared semantic item into terminal transcript presentation.
 #[must_use]
 pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
@@ -726,7 +742,7 @@ pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
         TranscriptViewItemKind::ToolInvocation { tool } => terminal_tool_item_from_shared(tool),
         TranscriptViewItemKind::ToolRequestDraft { draft } => TranscriptItem::with_kind(
             "Tool request draft",
-            format!("assembling {} arguments", draft.tool_name),
+            bounded_tool_request_draft_fallback(draft),
             true,
             TranscriptItemKind::ToolRequestDraft {
                 draft: Box::new(draft.clone()),
@@ -1190,6 +1206,32 @@ mod tests {
 
             assert_eq!(terminal_item_from_shared(&item).text_format(), format);
         }
+    }
+
+    #[test]
+    fn request_draft_fallback_is_bounded_and_never_exposes_preview_json() {
+        let preview = "{\"secret\":\"value\"}";
+        let draft = bcode_session_view_models::ToolRequestDraftView {
+            turn_id: "turn-1".to_owned(),
+            tool_call_id: "call-1".to_owned(),
+            tool_name: "x".repeat(1_000),
+            producer_plugin_id: None,
+            schema: "unknown.draft".to_owned(),
+            schema_version: 1,
+            placement: bcode_session_models::ToolContributionPlacement::Request,
+            generation: 1,
+            revision: 1,
+            argument_bytes: preview.len(),
+            preview_start_offset: 0,
+            preview: preview.to_owned(),
+            truncated: true,
+        };
+
+        let fallback = bounded_tool_request_draft_fallback(&draft);
+        assert!(fallback.len() < 160);
+        assert!(fallback.contains("request · 18 bytes · truncated"));
+        assert!(!fallback.contains(preview));
+        assert!(!fallback.contains("secret"));
     }
 
     #[test]

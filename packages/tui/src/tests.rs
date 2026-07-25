@@ -4764,6 +4764,7 @@ fn live_filesystem_request_draft_renders_updates_and_removes() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)] // One end-to-end fixture asserts draft/final render identity and cardinality.
 fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
@@ -4792,6 +4793,16 @@ fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
     });
     let draft = render_app_text(&mut app);
     assert_eq!(draft.matches("Filesystem write · assembling").count(), 1);
+    let draft_item = app
+        .transcript()
+        .iter()
+        .find(|item| item.visual_invocation_id() == Some("call-write"))
+        .expect("draft transcript item");
+    let draft_id = draft_item.id();
+    let draft_source_id = draft_item
+        .source_view_item_id()
+        .cloned()
+        .expect("draft shared identity");
 
     app.absorb_session_event(&event(
         session_id,
@@ -4840,6 +4851,22 @@ fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
     assert!(
         !final_text.contains("Filesystem write · assembling"),
         "{final_text}"
+    );
+    let final_item = app
+        .transcript()
+        .iter()
+        .find(|item| {
+            item.source_view_item_id() == Some(&draft_source_id)
+                && item.visual_invocation_id() == Some("call-write")
+        })
+        .expect("final transcript item");
+    assert_eq!(final_item.id(), draft_id);
+    assert_eq!(
+        app.transcript()
+            .iter()
+            .filter(|item| item.source_view_item_id() == Some(&draft_source_id))
+            .count(),
+        1
     );
     assert_eq!(
         final_text.matches("File change · duration").count(),
