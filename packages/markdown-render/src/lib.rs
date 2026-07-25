@@ -783,10 +783,36 @@ fn assign_contribution_geometry(
         matches!(contribution.kind, MarkdownContributionKind::Image { .. })
             .then_some(contribution.id.as_str())
     });
+    let mut details = contributions.iter().filter_map(|contribution| {
+        matches!(contribution.kind, MarkdownContributionKind::Details { .. })
+            .then_some(contribution.id.as_str())
+    });
+    let mut footnote_references = contributions.iter().filter_map(|contribution| {
+        matches!(
+            contribution.kind,
+            MarkdownContributionKind::FootnoteReference { .. }
+        )
+        .then_some(contribution.id.as_str())
+    });
+    let mut footnote_definitions = contributions.iter().filter_map(|contribution| {
+        matches!(
+            contribution.kind,
+            MarkdownContributionKind::FootnoteDefinition { .. }
+        )
+        .then_some(contribution.id.as_str())
+    });
+    let mut mermaid = contributions.iter().filter_map(|contribution| {
+        matches!(contribution.kind, MarkdownContributionKind::Mermaid { .. })
+            .then_some(contribution.id.as_str())
+    });
     geometry.retain_mut(|item| {
         let id = match item.contribution_id.as_str() {
             "link" => links.next(),
             "image" => images.next(),
+            "details" => details.next(),
+            "footnote-reference" => footnote_references.next(),
+            "footnote-definition" => footnote_definitions.next(),
+            "mermaid" => mermaid.next(),
             _ => None,
         };
         if let Some(id) = id {
@@ -853,7 +879,7 @@ fn project_semantic_fallbacks<'a>(
             (
                 details.source_range,
                 format!(
-                    "**{}**\n\n{}",
+                    "**{}<!--bcode-details-start--><!--bcode-details-end-->**\n\n{}",
                     details.summary_markdown.trim(),
                     project_details_markup(&details.body_markdown).trim()
                 ),
@@ -870,7 +896,10 @@ fn project_semantic_fallbacks<'a>(
     for reference in &footnotes.references {
         replacements.push((
             reference.source_range.clone(),
-            format!("[{}]", reference.number),
+            format!(
+                "[{}]<!--bcode-footnote-reference-start--><!--bcode-footnote-reference-end-->",
+                reference.number
+            ),
         ));
     }
     for definition in footnotes.definitions.values() {
@@ -882,7 +911,7 @@ fn project_semantic_fallbacks<'a>(
         for definition in footnotes.definitions.values() {
             let _ = write!(
                 projected,
-                "{}. {}",
+                "{}.  {}<!--bcode-footnote-definition-start--><!--bcode-footnote-definition-end-->",
                 definition.number,
                 definition.body.trim()
             );
@@ -2072,6 +2101,11 @@ impl TextStyle {
             .classes
             .iter()
             .any(|class| class == "markdown-link")
+            && !matches!(
+                &container.element,
+                Element::Anchor { href: Some(href), .. }
+                    if href.starts_with("bcode-contribution:")
+            )
         {
             output.style = output.style.patch(theme.link);
         }
@@ -2120,6 +2154,7 @@ struct TerminalMarkdownRenderer {
     next_table_index: usize,
     alert_kinds: Rc<Vec<Option<BlockQuoteKind>>>,
     next_blockquote_index: Rc<Cell<usize>>,
+    active_markers: BTreeMap<&'static str, (usize, usize, Option<Style>)>,
     theme: MarkdownTheme,
 }
 
@@ -2143,6 +2178,7 @@ impl TerminalMarkdownRenderer {
             next_table_index: 0,
             alert_kinds: Rc::new(alert_kinds),
             next_blockquote_index: Rc::new(Cell::new(0)),
+            active_markers: BTreeMap::new(),
             theme,
         }
     }
@@ -2161,6 +2197,7 @@ impl TerminalMarkdownRenderer {
             next_table_index: 0,
             alert_kinds: Rc::clone(&self.alert_kinds),
             next_blockquote_index: Rc::clone(&self.next_blockquote_index),
+            active_markers: BTreeMap::new(),
             theme: self.theme,
         }
     }
@@ -2220,13 +2257,22 @@ impl TerminalMarkdownRenderer {
         let style = style.merge_container(container, self.theme);
         match &container.element {
             Element::Text { value } | Element::Raw { value } => {
-                self.push_text(value, style);
+                self.push_marker_aware_text(value, style);
             }
             Element::Span | Element::THead | Element::TBody => {
                 self.render_container_children(container, style);
             }
-            Element::Anchor { .. } => {
-                self.render_marked_children(container, style, "link");
+            Element::Anchor { href, .. } => {
+                let kind = match href.as_deref() {
+                    Some("bcode-contribution:details") => "details",
+                    Some("bcode-contribution:footnote-reference") => "footnote-reference",
+                    Some("bcode-contribution:footnote-definition") => "footnote-definition",
+                    _ => "link",
+                };
+                let semantic_only = href
+                    .as_deref()
+                    .is_some_and(|href| href.starts_with("bcode-contribution:"));
+                self.render_anchor_children(container, style, kind, semantic_only);
             }
             Element::TH { .. } | Element::TD { .. } => {
                 if !self.in_table_collection {
@@ -2273,11 +2319,48 @@ impl TerminalMarkdownRenderer {
         }
     }
 
-    fn render_marked_children(&mut self, container: &Container, style: TextStyle, kind: &str) {
+    fn render_anchor_children(
+        &mut self,
+        container: &Container,
+        style: TextStyle,
+        kind: &str,
+        semantic_only: bool,
+    ) {
         let start_row = self.rows.len();
         let start_column = self.current_width;
         self.render_container_children(container, style);
+        if semantic_only {
+            self.restyle_range(start_row, start_column, self.theme.link, style.style);
+        }
         self.record_geometry(kind, start_row, start_column);
+    }
+
+    fn restyle_range(
+        &mut self,
+        start_row: usize,
+        start_column: usize,
+        remove: Style,
+        replacement: Style,
+    ) {
+        let end_row = self.rows.len();
+        for row in start_row..=end_row {
+            let spans = if row == end_row {
+                &mut self.current_spans
+            } else if let Some(line) = self.rows.get_mut(row) {
+                &mut line.spans
+            } else {
+                continue;
+            };
+            let mut column = 0_usize;
+            for span in spans {
+                let width = text_display_width(&span.content);
+                let span_end = column.saturating_add(width);
+                if span_end > start_column || row > start_row {
+                    span.style = strip_style(span.style, remove).patch(replacement);
+                }
+                column = span_end;
+            }
+        }
     }
 
     fn render_marked_text(&mut self, text: &str, style: TextStyle, kind: &str) {
@@ -2315,9 +2398,6 @@ impl TerminalMarkdownRenderer {
             }
         }
         if !rects.is_empty() {
-            let global_start_row = self.origin_y.saturating_add(start_row);
-            let global_start_column = self.origin_x.saturating_add(start_column);
-            let global_end_row = self.origin_y.saturating_add(end_row);
             for rect in &mut rects {
                 rect.x = rect
                     .x
@@ -2326,17 +2406,7 @@ impl TerminalMarkdownRenderer {
                     .y
                     .saturating_add(u16::try_from(self.origin_y).unwrap_or(u16::MAX));
             }
-            debug_assert!(
-                rects
-                    .iter()
-                    .all(|rect| usize::from(rect.y) >= global_start_row)
-                    && rects
-                        .first()
-                        .is_none_or(|rect| usize::from(rect.x) >= global_start_column)
-                    && rects
-                        .last()
-                        .is_none_or(|rect| usize::from(rect.y) <= global_end_row)
-            );
+            debug_assert!(rects.iter().all(|rect| rect.width > 0 && rect.height == 1));
             self.geometry
                 .borrow_mut()
                 .push(MarkdownContributionGeometry {
@@ -2453,6 +2523,13 @@ impl TerminalMarkdownRenderer {
         self.ensure_blank_line();
         let border_style = self.theme.code_block_border;
         let language = container.data.get("language").map(String::as_str);
+        let geometry_start = (language == Some("mermaid")).then(|| {
+            (
+                self.rows.len(),
+                self.current_width,
+                self.geometry.borrow().len(),
+            )
+        });
         let header = language.map_or_else(|| "┌─".to_owned(), |language| format!("┌─ {language}"));
         self.rows
             .push(Line::from_spans(vec![Span::styled(header, border_style)]));
@@ -2486,6 +2563,10 @@ impl TerminalMarkdownRenderer {
         self.rows
             .push(Line::from_spans(vec![Span::styled("└─", border_style)]));
         self.ensure_blank_line();
+        if let Some((start_row, start_column, geometry_start)) = geometry_start {
+            self.geometry.borrow_mut().truncate(geometry_start);
+            self.record_geometry("mermaid", start_row, start_column);
+        }
     }
 
     fn render_horizontal_rule(&mut self) {
@@ -2678,6 +2759,67 @@ impl TerminalMarkdownRenderer {
         self.current_width = 0;
     }
 
+    fn push_marker_aware_text(&mut self, text: &str, style: TextStyle) {
+        let markers = [
+            ("<!--bcode-details-start-->", "details", true),
+            ("<!--bcode-details-end-->", "details", false),
+            (
+                "<!--bcode-footnote-reference-start-->",
+                "footnote-reference",
+                true,
+            ),
+            (
+                "<!--bcode-footnote-reference-end-->",
+                "footnote-reference",
+                false,
+            ),
+            (
+                "<!--bcode-footnote-definition-start-->",
+                "footnote-definition",
+                true,
+            ),
+            (
+                "<!--bcode-footnote-definition-end-->",
+                "footnote-definition",
+                false,
+            ),
+        ];
+        let mut remaining = text;
+        while let Some((index, marker, kind, start)) = markers
+            .iter()
+            .filter_map(|(marker, kind, start)| {
+                remaining
+                    .find(marker)
+                    .map(|index| (index, *marker, *kind, *start))
+            })
+            .min_by_key(|(index, _, _, _)| *index)
+        {
+            self.push_text(&remaining[..index], style);
+            if start {
+                let (row, column) = self.previous_token_start();
+                self.active_markers.insert(kind, (row, column, None));
+            } else if let Some((start_row, start_column, _)) = self.active_markers.remove(kind) {
+                self.record_geometry(kind, start_row, start_column);
+            }
+            remaining = &remaining[index + marker.len()..];
+        }
+        self.push_text(remaining, style);
+    }
+
+    fn previous_token_start(&self) -> (usize, usize) {
+        let text = self
+            .current_spans
+            .iter()
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        let trailing = text.trim_end();
+        let token = trailing.split_whitespace().next_back().unwrap_or(trailing);
+        (
+            self.rows.len(),
+            self.current_width.saturating_sub(text_display_width(token)),
+        )
+    }
+
     fn push_text(&mut self, text: &str, style: TextStyle) {
         for segment in text.split_inclusive('\n') {
             let without_newline = segment.strip_suffix('\n').unwrap_or(segment);
@@ -2704,6 +2846,22 @@ impl TerminalMarkdownRenderer {
                 .push(Span::styled(grapheme.to_owned(), style));
             self.current_width = self.current_width.saturating_add(grapheme_width);
         }
+    }
+}
+
+fn strip_style(style: Style, remove: Style) -> Style {
+    Style {
+        fg: if style.fg == remove.fg {
+            None
+        } else {
+            style.fg
+        },
+        bg: if style.bg == remove.bg {
+            None
+        } else {
+            style.bg
+        },
+        modifiers: style.modifiers.difference(remove.modifiers),
     }
 }
 
@@ -3302,6 +3460,48 @@ mod tests {
             result.geometry[0].contribution_id,
             result.geometry[1].contribution_id
         );
+    }
+
+    #[test]
+    fn contribution_geometry_tracks_details_footnotes_and_mermaid() {
+        let result = render_markdown(
+            "<details><summary>More</summary>Body</details>\n\nText[^note].\n\n[^note]: Definition.\n\n```mermaid\nflowchart LR\nA --> B\n```",
+            &MarkdownRenderOptions::new(40).with_document_id("item"),
+        );
+        let ids = result
+            .geometry
+            .iter()
+            .map(|geometry| geometry.contribution_id.as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.iter().any(|id| id.starts_with("item:details:")));
+        assert!(
+            ids.iter()
+                .any(|id| id.starts_with("item:footnote-reference:"))
+        );
+        assert!(
+            ids.iter()
+                .any(|id| id.starts_with("item:footnote-definition:"))
+        );
+        assert!(ids.iter().any(|id| id.starts_with("item:mermaid:")));
+        assert!(result.geometry.iter().all(|geometry| {
+            !geometry.rects.is_empty()
+                && geometry
+                    .rects
+                    .iter()
+                    .all(|rect| rect.width > 0 && rect.height == 1)
+        }));
+    }
+
+    #[test]
+    fn nested_link_geometry_uses_document_relative_list_and_blockquote_offsets() {
+        let result = render_markdown(
+            "* before [list](https://example.com/list)\n\n  > [quote](https://example.com/quote)",
+            &MarkdownRenderOptions::new(40),
+        );
+        assert_eq!(result.geometry.len(), 2);
+        assert!(result.geometry[0].rects[0].x >= 3);
+        assert!(result.geometry[1].rects[0].x >= 5);
+        assert!(result.geometry[1].rects[0].y > result.geometry[0].rects[0].y);
     }
 
     #[test]
