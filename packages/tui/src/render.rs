@@ -937,7 +937,7 @@ fn markdown_hit_regions_map_clip_and_filter_actions() {
 #[cfg(test)]
 #[test]
 fn markdown_hit_regions_follow_scroll_resize_and_replacement() {
-    let original = TranscriptItem::with_format(
+    let mut original = TranscriptItem::with_format(
         "System",
         "[a wrapped contribution](https://example.com)".to_owned(),
         TextFormat::Markdown,
@@ -975,12 +975,55 @@ fn markdown_hit_regions_follow_scroll_resize_and_replacement() {
             .collect::<Vec<_>>()
     );
 
+    let cached_again = markdown_hit_regions_for_item(&original, 10, 10, area);
+    assert_eq!(visible, cached_again);
+
+    original.append_text(" trailing stream text");
+    let appended = markdown_hit_regions_for_item(&original, 10, 10, area);
+    assert_eq!(visible, appended);
+
+    let reconstructed =
+        TranscriptItem::with_format("System", original.text().to_owned(), TextFormat::Markdown);
+    let reconstructed_regions = markdown_hit_regions_for_item(&reconstructed, 10, 10, area);
+    assert_eq!(
+        appended
+            .iter()
+            .map(|region| region.area)
+            .collect::<Vec<_>>(),
+        reconstructed_regions
+            .iter()
+            .map(|region| region.area)
+            .collect::<Vec<_>>()
+    );
+
     let replacement = TranscriptItem::with_format(
         "System",
         "plain replacement".to_owned(),
         TextFormat::Markdown,
     );
     assert!(markdown_hit_regions_for_item(&replacement, 10, 10, area).is_empty());
+
+    let details = TranscriptItem::with_format(
+        "System",
+        "<details><summary>More</summary>Body</details>".to_owned(),
+        TextFormat::Markdown,
+    );
+    assert!(
+        markdown_hit_regions_for_item(&details, 10, 10, area)
+            .iter()
+            .any(|region| region.id.as_str().contains(":details:"))
+    );
+    let changed_details = TranscriptItem::with_format(
+        "System",
+        "<details><summary>Changed</summary>Body</details>".to_owned(),
+        TextFormat::Markdown,
+    );
+    let changed_regions = markdown_hit_regions_for_item(&changed_details, 10, 10, area);
+    assert!(changed_regions.iter().all(|region| {
+        !visible
+            .iter()
+            .any(|old| old.id == region.id && old.area == region.area)
+    }));
 }
 
 pub fn transcript_markdown_contribution_ids(item: &TranscriptItem, width: u16) -> Vec<String> {
