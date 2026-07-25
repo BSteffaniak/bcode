@@ -11,6 +11,9 @@ use bmux_tui::image::{
     ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat, ImagePlacement,
 };
 
+/// Maximum resident off-screen Mermaid contributions eligible for prefetch.
+pub const MAX_MERMAID_PREFETCH: usize = 4;
+
 /// Fixed rows reserved before and after Mermaid rendering.
 pub const RESERVED_MERMAID_ROWS: u16 = 8;
 
@@ -146,8 +149,10 @@ pub struct MarkdownMermaidInput {
     pub cache_key: String,
     /// Source retained for fallback/source-view activation.
     pub source: String,
-    /// Whether the contribution is visible or in bounded prefetch.
-    pub may_render: bool,
+    /// Whether the contribution currently intersects the viewport.
+    pub visible: bool,
+    /// Whether the contribution is in the caller's bounded prefetch projection.
+    pub prefetch: bool,
 }
 
 #[derive(Debug)]
@@ -211,7 +216,17 @@ impl MarkdownMermaidPresentationStore {
     #[must_use]
     pub fn schedule(&mut self, inputs: &[MarkdownMermaidInput]) -> Vec<MarkdownMermaidWork> {
         let mut work = Vec::new();
-        for input in inputs.iter().filter(|input| input.may_render) {
+        let mut prefetched = 0_usize;
+        for input in inputs.iter().filter(|input| {
+            if input.visible {
+                true
+            } else if input.prefetch && prefetched < MAX_MERMAID_PREFETCH {
+                prefetched = prefetched.saturating_add(1);
+                true
+            } else {
+                false
+            }
+        }) {
             let Some(entry) = self.entries.get_mut(&input.contribution_id) else {
                 continue;
             };
@@ -303,6 +318,24 @@ impl MarkdownMermaidPresentationStore {
         self.entries.get(contribution_id).map(|entry| &entry.state)
     }
 
+    /// Return the number of active worker cache keys.
+    #[must_use]
+    pub fn active_worker_count(&self) -> usize {
+        self.workers.len()
+    }
+
+    /// Return the number of retained contribution states.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Return whether no contribution state is retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     /// Return source for source-view activation.
     #[must_use]
     pub fn source(&self, contribution_id: &str) -> Option<&str> {
@@ -355,8 +388,8 @@ mod tests {
     use bmux_tui::image::{ImageContribution, ImagePayload, ImagePixelFormat};
 
     use super::{
-        MarkdownMermaidInput, MarkdownMermaidPresentationState, MarkdownMermaidPresentationStore,
-        RESERVED_MERMAID_ROWS,
+        MAX_MERMAID_PREFETCH, MarkdownMermaidInput, MarkdownMermaidPresentationState,
+        MarkdownMermaidPresentationStore, RESERVED_MERMAID_ROWS,
     };
 
     fn input(id: &str, key: &str, may_render: bool) -> MarkdownMermaidInput {
@@ -364,7 +397,8 @@ mod tests {
             contribution_id: id.to_owned(),
             cache_key: key.to_owned(),
             source: "flowchart LR\nA --> B".to_owned(),
-            may_render,
+            visible: may_render,
+            prefetch: false,
         }
     }
 
@@ -376,6 +410,56 @@ mod tests {
             cache_key: key.to_owned(),
             diagnostics: Vec::new(),
         }
+    }
+
+    #[test]
+    fn large_history_metrics_and_trimming_keep_workers_state_and_cache_bounded() {
+        let inputs = (0..1_000)
+            .map(|index| MarkdownMermaidInput {
+                contribution_id: format!("diagram-{index}"),
+                cache_key: format!("key-{index}"),
+                source: "flowchart LR\nA --> B".to_owned(),
+                visible: false,
+                prefetch: true,
+            })
+            .collect::<Vec<_>>();
+        let mut store = MarkdownMermaidPresentationStore::default();
+        let mut cache = MermaidRenderCache::default();
+        store.reconcile(&inputs, true);
+        let work = store.schedule(&inputs);
+        for request in &work {
+            cache.insert(rendered(&request.cache_key));
+        }
+        assert_eq!(store.active_worker_count(), MAX_MERMAID_PREFETCH);
+        assert_eq!(store.len(), 1_000);
+        assert!(cache.len() <= bcode_mermaid_render::MAX_CACHE_ENTRIES);
+        assert!(cache.payload_bytes() <= bcode_mermaid_render::MAX_CACHE_BYTES);
+
+        let retained = &inputs[900..];
+        store.reconcile(retained, true);
+        assert!(
+            work.iter()
+                .all(|request| request.cancellation.is_cancelled())
+        );
+        assert_eq!(store.active_worker_count(), 0);
+        assert_eq!(store.len(), retained.len());
+    }
+
+    #[test]
+    fn mermaid_prefetch_is_bounded_independently_of_resident_history_size() {
+        let inputs = (0..1_000)
+            .map(|index| MarkdownMermaidInput {
+                contribution_id: format!("diagram-{index}"),
+                cache_key: format!("key-{index}"),
+                source: "flowchart LR\nA --> B".to_owned(),
+                visible: false,
+                prefetch: true,
+            })
+            .collect::<Vec<_>>();
+        let mut store = MarkdownMermaidPresentationStore::default();
+        store.reconcile(&inputs, true);
+
+        assert_eq!(store.schedule(&inputs).len(), MAX_MERMAID_PREFETCH);
     }
 
     #[test]

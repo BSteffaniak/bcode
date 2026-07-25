@@ -29,6 +29,8 @@ pub const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_REDIRECTS: usize = 5;
 /// Maximum wall-clock duration for one Markdown image request.
 pub const LOAD_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum resident off-screen image contributions eligible for prefetch.
+pub const MAX_PREFETCH_CONTRIBUTIONS: usize = 8;
 /// Maximum simultaneous Markdown image loads.
 pub const MAX_CONCURRENT_LOADS: usize = 4;
 
@@ -103,12 +105,6 @@ pub enum MarkdownImageResidency {
     Visible,
     /// Included in the caller's bounded prefetch window.
     Prefetch,
-}
-
-impl MarkdownImageResidency {
-    const fn may_load(self) -> bool {
-        matches!(self, Self::Visible | Self::Prefetch)
-    }
 }
 
 /// One newly scheduled image load.
@@ -197,7 +193,15 @@ impl MarkdownImagePresentationStore {
         inflight: &mut MarkdownImageInflight,
     ) -> Vec<MarkdownImageLoadRequest> {
         let mut requests = Vec::new();
-        for input in inputs.iter().filter(|input| input.residency.may_load()) {
+        let mut prefetched = 0_usize;
+        for input in inputs.iter().filter(|input| match input.residency {
+            MarkdownImageResidency::Visible => true,
+            MarkdownImageResidency::Prefetch if prefetched < MAX_PREFETCH_CONTRIBUTIONS => {
+                prefetched = prefetched.saturating_add(1);
+                true
+            }
+            MarkdownImageResidency::Hidden | MarkdownImageResidency::Prefetch => false,
+        }) {
             let Some(entry) = self.entries.get_mut(&input.contribution_id) else {
                 continue;
             };
@@ -1108,14 +1112,14 @@ fn validate_dimensions(width: u32, height: u32) -> Result<(), MarkdownImageError
 mod tests {
     use super::{
         DecodedMarkdownImage, MAX_CACHE_BYTES, MAX_CACHE_ENTRIES, MAX_DECODED_PIXELS,
-        MAX_DIMENSION, MAX_ENCODED_BYTES, MAX_REDIRECTS, MarkdownImageCache, MarkdownImageCacheKey,
-        MarkdownImageCancellationToken, MarkdownImageError, MarkdownImageInflight,
-        MarkdownImageLoadDecision, MarkdownImageLoadError, MarkdownImageLoadFailure,
-        MarkdownImageLoadGuard, MarkdownImageLoader, MarkdownImagePresentationInput,
-        MarkdownImagePresentationPolicy, MarkdownImagePresentationState,
-        MarkdownImagePresentationStore, MarkdownImageResidency, RESERVED_IMAGE_ROWS,
-        decode_markdown_image, markdown_image_load_decision, markdown_image_reserved_rows,
-        validate_dimensions,
+        MAX_DIMENSION, MAX_ENCODED_BYTES, MAX_PREFETCH_CONTRIBUTIONS, MAX_REDIRECTS,
+        MarkdownImageCache, MarkdownImageCacheKey, MarkdownImageCancellationToken,
+        MarkdownImageError, MarkdownImageInflight, MarkdownImageLoadDecision,
+        MarkdownImageLoadError, MarkdownImageLoadFailure, MarkdownImageLoadGuard,
+        MarkdownImageLoader, MarkdownImagePresentationInput, MarkdownImagePresentationPolicy,
+        MarkdownImagePresentationState, MarkdownImagePresentationStore, MarkdownImageResidency,
+        RESERVED_IMAGE_ROWS, decode_markdown_image, markdown_image_load_decision,
+        markdown_image_reserved_rows, validate_dimensions,
     };
     use bcode_markdown_render::{
         MarkdownDestination, MarkdownDestinationRejection, resolve_markdown_destination,
@@ -1445,6 +1449,74 @@ mod tests {
             frame.images().last(),
             Some(ImageContribution::Remove(key)) if key.as_str() == "markdown:owner:image:1"
         ));
+    }
+
+    #[test]
+    fn large_history_metrics_remain_bounded_and_trimming_cancels_rich_work() {
+        let local = MarkdownDestination::LocalPath(std::path::PathBuf::from("/trusted/image.png"));
+        let policy = MarkdownImagePresentationPolicy {
+            interactive_resident_frame: true,
+            network_enabled: true,
+            terminal_supported: true,
+        };
+        let inputs = (0..1_000)
+            .map(|index| MarkdownImagePresentationInput {
+                contribution_id: format!("image-{index}"),
+                cache_key: MarkdownImageCacheKey::new(&format!("image-{index}.png"), "document"),
+                destination: local.clone(),
+                residency: MarkdownImageResidency::Prefetch,
+            })
+            .collect::<Vec<_>>();
+        let mut store = MarkdownImagePresentationStore::default();
+        let mut inflight = MarkdownImageInflight::default();
+        let mut cache = MarkdownImageCache::default();
+        store.reconcile_with_inflight(&inputs, policy, &mut inflight);
+        let work = store.schedule_loads(&inputs, policy, &mut inflight);
+        for (index, request) in work.iter().enumerate() {
+            cache.insert(
+                request.cache_key.clone(),
+                image(u8::try_from(index).unwrap_or(0), 4),
+            );
+        }
+        assert_eq!(inflight.len(), MAX_PREFETCH_CONTRIBUTIONS);
+        assert_eq!(store.len(), 1_000);
+        assert!(cache.len() <= MAX_CACHE_ENTRIES);
+        assert!(cache.payload_bytes() <= MAX_CACHE_BYTES);
+
+        let retained = &inputs[900..];
+        store.reconcile_with_inflight(retained, policy, &mut inflight);
+        assert!(
+            work.iter()
+                .all(|request| request.cancellation.is_cancelled())
+        );
+        assert!(inflight.is_empty());
+        assert_eq!(store.len(), retained.len());
+    }
+
+    #[test]
+    fn prefetch_scheduling_is_bounded_independently_of_resident_history_size() {
+        let local = MarkdownDestination::LocalPath(std::path::PathBuf::from("/trusted/image.png"));
+        let inputs = (0..1_000)
+            .map(|index| MarkdownImagePresentationInput {
+                contribution_id: format!("image-{index}"),
+                cache_key: MarkdownImageCacheKey::new(&format!("image-{index}.png"), "document"),
+                destination: local.clone(),
+                residency: MarkdownImageResidency::Prefetch,
+            })
+            .collect::<Vec<_>>();
+        let policy = MarkdownImagePresentationPolicy {
+            interactive_resident_frame: true,
+            network_enabled: true,
+            terminal_supported: true,
+        };
+        let mut store = MarkdownImagePresentationStore::default();
+        let mut inflight = MarkdownImageInflight::default();
+        store.reconcile_with_inflight(&inputs, policy, &mut inflight);
+
+        let requests = store.schedule_loads(&inputs, policy, &mut inflight);
+
+        assert_eq!(requests.len(), MAX_PREFETCH_CONTRIBUTIONS);
+        assert_eq!(store.len(), 1_000);
     }
 
     #[test]
