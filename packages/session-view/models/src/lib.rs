@@ -941,6 +941,10 @@ pub enum TextFormat {
     Json,
 }
 
+const fn default_tool_request_draft_placement() -> bcode_session_models::ToolContributionPlacement {
+    bcode_session_models::ToolContributionPlacement::Request
+}
+
 /// Renderer-neutral live tool request draft.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRequestDraftView {
@@ -957,7 +961,7 @@ pub struct ToolRequestDraftView {
     /// Version of `schema` used by the preview.
     pub schema_version: u32,
     /// Semantic transcript slot updated by this draft.
-    #[serde(default)]
+    #[serde(default = "default_tool_request_draft_placement")]
     pub placement: bcode_session_models::ToolContributionPlacement,
     /// Monotonic draft generation.
     pub generation: u64,

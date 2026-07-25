@@ -177,6 +177,30 @@ fn permission_view_deserializes_legacy_shape() {
 }
 
 #[test]
+fn legacy_tool_request_draft_view_defaults_to_request_placement() {
+    let draft: ToolRequestDraftView = serde_json::from_value(serde_json::json!({
+        "turn_id": "turn-1",
+        "tool_call_id": "call-1",
+        "tool_name": "third_party.tool",
+        "producer_plugin_id": null,
+        "schema": "third-party.draft",
+        "schema_version": 1,
+        "generation": 1,
+        "revision": 1,
+        "argument_bytes": 2,
+        "preview_start_offset": 0,
+        "preview": "{}",
+        "truncated": false
+    }))
+    .expect("legacy request draft view should decode");
+
+    assert_eq!(
+        draft.placement,
+        bcode_session_models::ToolContributionPlacement::Request
+    );
+}
+
+#[test]
 fn transcript_patch_replaces_tool_slot_across_draft_and_final_schemas() {
     let id = TranscriptViewItemId::tool_presentation_slot(
         "call-1",

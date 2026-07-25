@@ -672,6 +672,26 @@ impl SessionView {
                                 event.sequence,
                                 Some(event.timestamp_ms),
                             );
+                            self.tool_request_drafts.remove(&lifecycle.invocation_id);
+                            let result_id = TranscriptViewItemId::tool_presentation_slot(
+                                &lifecycle.invocation_id,
+                                bcode_session_models::ToolContributionPlacement::Result,
+                                None,
+                            );
+                            if !matches!(
+                                self.snapshot
+                                    .transcript
+                                    .items
+                                    .iter()
+                                    .find(|item| item.id == result_id)
+                                    .map(|item| &item.kind),
+                                Some(TranscriptViewItemKind::ToolInvocation { .. })
+                            ) {
+                                self.snapshot
+                                    .transcript
+                                    .items
+                                    .retain(|item| item.id != result_id);
+                            }
                         } else if self
                             .tool_invocation_projections
                             .get(&lifecycle.invocation_id)
@@ -3552,6 +3572,68 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn successful_lifecycle_completion_keeps_result_draft_until_result_arrives() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                tool_name: "filesystem.write".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Result,
+                    generation: 1,
+                    revision: 1,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: "{}".to_owned(),
+                    },
+                    argument_bytes: 2,
+                    truncated: false,
+                },
+            },
+        });
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "call-1".to_owned(),
+                    sequence: 2,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Completed,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        ));
+
+        let result_id = TranscriptViewItemId::tool_presentation_slot(
+            "call-1",
+            bcode_session_models::ToolContributionPlacement::Result,
+            None,
+        );
+        assert!(view.snapshot().transcript.items.iter().any(|item| {
+            item.id == result_id
+                && matches!(item.kind, TranscriptViewItemKind::ToolRequestDraft { .. })
+        }));
     }
 
     #[test]

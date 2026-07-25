@@ -1394,6 +1394,10 @@ pub enum SessionLiveEventKind {
     ToolRequestDraft { event: ToolRequestDraftEvent },
 }
 
+const fn default_tool_request_draft_placement() -> ToolContributionPlacement {
+    ToolContributionPlacement::Request
+}
+
 /// One live-only provider tool-request draft update.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRequestDraftEvent {
@@ -1411,7 +1415,7 @@ pub struct ToolRequestDraftEvent {
     /// Version of `schema` used by the draft payload.
     pub schema_version: u32,
     /// Semantic transcript slot updated by this draft.
-    #[serde(default)]
+    #[serde(default = "default_tool_request_draft_placement")]
     pub placement: ToolContributionPlacement,
     /// Monotonic draft generation. A new provider start for the same call advances it.
     pub generation: u64,
@@ -2367,6 +2371,25 @@ mod tests {
                 serde_json::from_slice(&encoded).expect("decode live request draft");
             assert_eq!(decoded, live);
         }
+    }
+
+    #[test]
+    fn legacy_tool_request_draft_defaults_to_request_placement() {
+        let decoded: ToolRequestDraftEvent = serde_json::from_value(serde_json::json!({
+            "turn_id": "turn-1",
+            "tool_call_id": "call-1",
+            "tool_name": "third_party.tool",
+            "schema": "third-party.draft",
+            "schema_version": 1,
+            "generation": 1,
+            "revision": 1,
+            "operation": {"type": "checkpoint", "start_offset": 0, "text": "{}"},
+            "argument_bytes": 2,
+            "truncated": false
+        }))
+        .expect("legacy request draft should decode");
+
+        assert_eq!(decoded.placement, ToolContributionPlacement::Request);
     }
 
     #[test]
