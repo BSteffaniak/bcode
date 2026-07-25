@@ -954,7 +954,20 @@ impl BmuxApp {
         self.transcript.revision()
     }
 
-    /// Drain transcript invocation identifiers whose elapsed-time label changed.
+    /// Drain at most `limit` transcript invocation identifiers whose elapsed-time label changed.
+    pub fn drain_elapsed_dirty_visuals_bounded(&mut self, limit: usize) -> BTreeSet<String> {
+        let mut drained = BTreeSet::new();
+        for _ in 0..limit {
+            let Some(invocation_id) = self.elapsed_dirty_visuals.pop_first() else {
+                break;
+            };
+            drained.insert(invocation_id);
+        }
+        drained
+    }
+
+    /// Drain all transcript invocation identifiers whose elapsed-time label changed.
+    #[cfg(test)]
     pub fn drain_elapsed_dirty_visuals(&mut self) -> BTreeSet<String> {
         std::mem::take(&mut self.elapsed_dirty_visuals)
     }
@@ -2243,10 +2256,12 @@ impl BmuxApp {
                         )
                     })
                     .map(terminal_item_from_shared);
-                let source_id = bcode_session_view_models::TranscriptViewItemId::tool_request_draft(
-                    &draft.tool_call_id,
-                    draft.generation,
-                );
+                let source_id =
+                    bcode_session_view_models::TranscriptViewItemId::tool_presentation_slot(
+                        &draft.tool_call_id,
+                        draft.placement,
+                        None,
+                    );
                 if let Some(item) = shared_item {
                     self.transcript.upsert_shared_item(item);
                 } else {
@@ -4389,6 +4404,19 @@ mod tests {
             BTreeSet::from(["call-item".to_owned()])
         );
         assert!(app.drain_elapsed_dirty_visuals().is_empty());
+    }
+
+    #[test]
+    fn elapsed_dirty_visual_drain_is_bounded_and_retains_overflow() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.elapsed_dirty_visuals = (0..100).map(|index| format!("call-{index:03}")).collect();
+        let first = app.drain_elapsed_dirty_visuals_bounded(64);
+        assert_eq!(first.len(), 64);
+        assert_eq!(first.first().map(String::as_str), Some("call-000"));
+        assert_eq!(first.last().map(String::as_str), Some("call-063"));
+        let second = app.drain_elapsed_dirty_visuals_bounded(64);
+        assert_eq!(second.len(), 36);
+        assert!(app.drain_elapsed_dirty_visuals_bounded(64).is_empty());
     }
 
     #[test]

@@ -113,7 +113,26 @@ impl PluginTuiPresentation {
         }
     }
 
-    /// Drain invocation identifiers whose retained adapter state changed.
+    /// Drain at most `limit` invocation identifiers whose retained adapter state changed.
+    ///
+    /// Identifiers beyond the limit remain dirty for a later render tick.
+    pub fn drain_dirty_visuals_bounded(&self, limit: usize) -> BTreeSet<String> {
+        self.dirty_visuals.lock().map_or_else(
+            |_| BTreeSet::new(),
+            |mut dirty| {
+                let mut drained = BTreeSet::new();
+                for _ in 0..limit {
+                    let Some(invocation_id) = dirty.pop_first() else {
+                        break;
+                    };
+                    drained.insert(invocation_id);
+                }
+                drained
+            },
+        )
+    }
+
+    /// Drain all invocation identifiers whose retained adapter state changed.
     pub fn drain_dirty_visuals(&self) -> BTreeSet<String> {
         self.dirty_visuals
             .lock()
@@ -439,6 +458,23 @@ mod tests {
         .expect("select test plugin");
         let host = PluginHost::load_static_plugins(&selected).expect("load test plugin");
         PluginTuiPresentation::new(host)
+    }
+
+    #[test]
+    fn dirty_visual_drain_is_bounded_and_retains_overflow_for_next_tick() {
+        let presentation = test_presentation();
+        for index in 0..100 {
+            presentation.bump_visual_revision_for_test(&format!("call-{index:03}"));
+        }
+        let first = presentation.drain_dirty_visuals_bounded(64);
+        assert_eq!(first.len(), 64);
+        assert_eq!(first.first().map(String::as_str), Some("call-000"));
+        assert_eq!(first.last().map(String::as_str), Some("call-063"));
+        let second = presentation.drain_dirty_visuals_bounded(64);
+        assert_eq!(second.len(), 36);
+        assert_eq!(second.first().map(String::as_str), Some("call-064"));
+        assert_eq!(second.last().map(String::as_str), Some("call-099"));
+        assert!(presentation.drain_dirty_visuals_bounded(64).is_empty());
     }
 
     #[test]

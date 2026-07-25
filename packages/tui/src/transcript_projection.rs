@@ -12,6 +12,8 @@ use super::transcript_layout::{
 use bcode_config::TuiDiffViewerConfig;
 use std::time::Instant;
 
+const MAX_DIRTY_VISUALS_PER_LAYOUT_SYNC: usize = 64;
+
 /// Prepare transcript layout and viewport projections for a frame body.
 pub fn prepare_for_body(app: &mut BmuxApp, body: Rect) {
     let initial_transcript_area = render::transcript_area_for_body(app, body);
@@ -57,7 +59,8 @@ fn max_bottom_overscroll(area: Rect) -> usize {
 
 fn sync_layout(app: &mut BmuxApp, width: u16) {
     let started = Instant::now();
-    let elapsed_dirty_visuals = app.drain_elapsed_dirty_visuals();
+    let elapsed_dirty_visuals =
+        app.drain_elapsed_dirty_visuals_bounded(MAX_DIRTY_VISUALS_PER_LAYOUT_SYNC);
     let mut transcript_layout = std::mem::take(app.transcript_layout_mut());
     let input = TranscriptLayoutInput::from_app(app, width);
     let fingerprint = input.fingerprint();
@@ -68,10 +71,14 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
         *app.transcript_layout_mut() = transcript_layout;
         return;
     }
-    let mut dirty_visuals = input.plugin_host.map_or_else(
-        std::collections::BTreeSet::new,
-        crate::plugin_tui::PluginTuiPresentation::drain_dirty_visuals,
-    );
+    let mut dirty_visuals =
+        input
+            .plugin_host
+            .map_or_else(std::collections::BTreeSet::new, |host| {
+                host.drain_dirty_visuals_bounded(
+                    MAX_DIRTY_VISUALS_PER_LAYOUT_SYNC.saturating_sub(elapsed_dirty_visuals.len()),
+                )
+            });
     dirty_visuals.extend(elapsed_dirty_visuals);
     if !dirty_visuals.is_empty() && transcript_layout.structure_is_current(&structural_fingerprint)
     {
