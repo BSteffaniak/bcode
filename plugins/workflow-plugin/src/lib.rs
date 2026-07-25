@@ -88,6 +88,11 @@ fn command_contributions() -> Vec<CommandContribution> {
             "Inspect workflow graph and history",
         ),
         (
+            "workflow.retry-node",
+            "Workflow: Retry Node",
+            "Retry one exact latest failed node attempt",
+        ),
+        (
             "workflow.provide-input",
             "Workflow: Provide Input",
             "Resolve a waiting input",
@@ -264,6 +269,18 @@ pub(crate) async fn execute_command(
             ]);
             format!("workflow run {run_id}")
         }
+        "workflow.retry-node" => {
+            let run_id = required_arg(&request, "run_id")?;
+            let node_id = required_arg(&request, "node_id")?;
+            let activation_id = required_arg(&request, "activation_id")?;
+            let failed_attempt = parse_arg::<u32>(&request, "failed_attempt")?;
+            let result = client
+                .retry_workflow_node(run_id, node_id, activation_id, failed_attempt)
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert("retry".to_string(), serde_json::json!(result));
+            "workflow node retry admitted".to_string()
+        }
         "workflow.provide-input" => {
             let run_id = required_arg(&request, "run_id")?;
             let node_id = required_arg(&request, "node_id")?;
@@ -427,6 +444,7 @@ mod tests {
             "workflow.resume",
             "workflow.cancel",
             "workflow.inspect",
+            "workflow.retry-node",
             "workflow.provide-input",
         ] {
             assert!(ids.contains(expected));

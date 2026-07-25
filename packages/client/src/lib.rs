@@ -2068,6 +2068,33 @@ impl BcodeClient {
         }
     }
 
+    /// Explicitly retry one exact latest failed workflow node attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the exact activation/attempt is stale,
+    /// unsafe, cancelled, or outside its retry budget.
+    pub async fn retry_workflow_node(
+        &self,
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        failed_attempt: u32,
+    ) -> Result<bcode_workflow_store::WorkflowNodeRetryResult, ClientError> {
+        match self
+            .send_request(Request::RetryWorkflowNode {
+                run_id,
+                node_id,
+                activation_id,
+                failed_attempt,
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowNodeRetried { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// List bounded durable input/approval waits for one run.
     ///
     /// # Errors

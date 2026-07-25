@@ -190,6 +190,9 @@ fn surface_lines(options: &serde_json::Value) -> Vec<String> {
             text(value, "event_type")
         )
     });
+    if options.get("retry").is_some() {
+        lines.push("Exact failed node retry admitted".to_string());
+    }
     if options.get("resolution").is_some() {
         lines.push("Input resolution committed".to_string());
     }

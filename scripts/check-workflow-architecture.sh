@@ -38,4 +38,23 @@ if ! rg -q 'Persist prepared intent before an external operation is dispatched' 
   violations=1
 fi
 
+if rg -n 'bcode_workflow|workflow-store|workflow_store|WorkflowDefinition|WorkflowRun' \
+  packages/agent-runtime --glob '*.rs' >/tmp/bcode-workflow-agent-runtime-violations 2>/dev/null; then
+  echo "Workflow domain-isolation violation: agent-runtime must not own workflow coordination." >&2
+  cat /tmp/bcode-workflow-agent-runtime-violations >&2
+  violations=1
+fi
+rm -f /tmp/bcode-workflow-agent-runtime-violations
+
+{
+  awk '/^#\[cfg\(test\)\]/{exit} {print}' packages/server/src/lib.rs
+  find packages/agent-runtime/src -name '*.rs' -type f -exec cat {} +
+} | rg -n 'code_review\.bundle|security\.(scan|audit)|git\.(commit|push)|workflow_template' \
+  >/tmp/bcode-workflow-domain-policy-violations 2>/dev/null && {
+  echo "Workflow domain-isolation violation: generic runtimes contain product workflow policy." >&2
+  cat /tmp/bcode-workflow-domain-policy-violations >&2
+  violations=1
+}
+rm -f /tmp/bcode-workflow-domain-policy-violations
+
 exit "$violations"

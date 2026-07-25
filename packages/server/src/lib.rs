@@ -2628,6 +2628,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::CancelWorkflowRun { .. } => "cancel_workflow_run",
         Request::PauseWorkflowRun { .. } => "pause_workflow_run",
         Request::ResumeWorkflowRun { .. } => "resume_workflow_run",
+        Request::RetryWorkflowNode { .. } => "retry_workflow_node",
         Request::ListWorkflowWaits { .. } => "list_workflow_waits",
         Request::ProvideWorkflowInput { .. } => "provide_workflow_input",
         Request::ResolveWorkflowApproval { .. } => "resolve_workflow_approval",
@@ -3081,6 +3082,23 @@ async fn handle_request_inner(
         }
         Request::ResumeWorkflowRun { run_id } => {
             handle_resume_workflow_run(request_id, state, writer, run_id).await
+        }
+        Request::RetryWorkflowNode {
+            run_id,
+            node_id,
+            activation_id,
+            failed_attempt,
+        } => {
+            handle_retry_workflow_node(
+                request_id,
+                state,
+                writer,
+                run_id,
+                node_id,
+                activation_id,
+                failed_attempt,
+            )
+            .await
         }
         Request::ListWorkflowWaits { run_id, limit } => {
             handle_list_workflow_waits(request_id, state, writer, run_id, limit).await
@@ -10176,6 +10194,45 @@ async fn handle_resume_workflow_run(
         writer,
         request_id,
         Response::Ok(ResponsePayload::WorkflowRunResumed { changed }),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_retry_workflow_node(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    run_id: String,
+    node_id: String,
+    activation_id: String,
+    failed_attempt: u32,
+) -> Result<(), ServerError> {
+    let result = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retry_failed_node(
+            &run_id,
+            &node_id,
+            &activation_id,
+            failed_attempt,
+            current_unix_millis(),
+        )?;
+    let owner = WorkflowActivationOwner { state };
+    let store_path = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .path()
+        .to_path_buf();
+    bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
+        .dispatch_pending_activations(&owner, 1, current_unix_millis())
+        .await?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowNodeRetried { result }),
     )
     .await
 }
@@ -31892,6 +31949,156 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 ..
             }
         )));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn workflow_failed_plugin_node_retries_exact_next_attempt_through_owner() {
+        let sessions = SessionManager::default();
+        let parent = sessions
+            .create_session(Some("parent".to_string()), PathBuf::from("."))
+            .await
+            .expect("parent");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("store");
+        let manifest_toml = r#"
+id = "bcode.test-workflow-block"
+name = "Test Workflow Block"
+version = "0.0.1"
+
+[[services]]
+interface_id = "bcode.workflow-block/v1"
+
+[[services.workflow_blocks]]
+block_id = "test.delay"
+block_version = 1
+plugin_id = "bcode.test-workflow-block"
+operation = "delay"
+effect = "read_only"
+timeout_ms = 50
+cancellation_supported = true
+reconciliation = "idempotent_replay"
+
+[services.workflow_blocks.input]
+type_name = "test.delay.input/v1"
+schema = { type = "object", required = ["delay_ms"] }
+
+[services.workflow_blocks.output]
+type_name = "test.delay.output/v1"
+schema = { type = "object", required = ["done"] }
+
+[services.workflow_blocks.authorization]
+capability = "read_only"
+
+[concurrency]
+type = "concurrent"
+
+[runtime]
+type = "native"
+abi_version = 2
+library = "libbcode_test_workflow_block.dylib"
+event_symbol = "bcode_plugin_handle_event_v1"
+"#;
+        let manifest: bcode_plugin::PluginManifest =
+            toml::from_str(manifest_toml).expect("manifest");
+        let block = manifest.services[0].workflow_blocks[0].clone();
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: 1,
+            name: "retry-block".to_string(),
+            input: block.input.clone(),
+            output: block.output.clone(),
+            nodes: BTreeMap::from([(
+                "test.delay".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "test.delay".to_string(),
+                    name: "retry block".to_string(),
+                    kind: bcode_workflow::NodeKind::PluginBlock,
+                    input: block.input.clone(),
+                    output: block.output.clone(),
+                    resources: Vec::new(),
+                    configuration: serde_json::to_value(&block).expect("block"),
+                },
+            )]),
+            entries: vec!["test.delay".to_string()],
+            exits: vec!["test.delay".to_string()],
+            edges: Vec::new(),
+        };
+        store
+            .persist_definition("retry-block", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "retry-run".to_string(),
+                definition_id: "retry-block".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: Some(parent.id.to_string()),
+                input: Some(serde_json::json!({"delay_ms": 5_000})),
+                created_at_ms: 1,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.test-workflow-block".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[bcode_plugin::StaticBundledPlugin::new(
+                manifest_toml,
+                delayed_workflow_plugin(),
+            )],
+        )
+        .expect("plugins");
+        let mut state = test_server_state(sessions);
+        state.plugins = plugins;
+        state.workflow_store = StdMutex::new(store);
+        let state = Arc::new(state);
+        let owner = WorkflowActivationOwner { state: &state };
+        let store_path = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .path()
+            .to_path_buf();
+        bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
+            .expect("dispatch")
+            .dispatch_pending_activations(&owner, 10, 2)
+            .await
+            .expect("dispatch");
+        let observer = WorkflowTurnReceiptObserver { state: &state };
+        bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
+            .expect("reconcile")
+            .reconcile_receipt_backed_attempts_async(&observer, 10, 3)
+            .await
+            .expect("reconcile");
+        let activation_id = bcode_workflow_store::activation_identity("retry-run", "test.delay", 0);
+        let result = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retry_failed_node("retry-run", "test.delay", &activation_id, 1, 4)
+            .expect("retry");
+        assert_eq!(result.next_attempt, 2);
+        bcode_workflow_store::WorkflowStore::open_at_path(&store_path)
+            .expect("redispatch")
+            .dispatch_pending_activations(&owner, 10, 5)
+            .await
+            .expect("redispatch");
+        let attempts = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .attempt_history("retry-run", None, 10)
+            .expect("attempts");
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].attempt, 2);
+        assert_eq!(attempts[0].status, "admitted");
+        assert_eq!(attempts[1].attempt, 1);
+        assert_eq!(attempts[1].status, "failed");
+        assert_ne!(attempts[0].dispatch_identity, attempts[1].dispatch_identity);
     }
 
     #[test]

@@ -613,6 +613,16 @@ pub trait ActivationDispatchOwner: Sync {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, WorkflowStoreError>> + Send + 'a>>;
 }
 
+/// Result of an explicit operator retry transition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowNodeRetryResult {
+    pub run_id: String,
+    pub node_id: String,
+    pub activation_id: String,
+    pub previous_attempt: u32,
+    pub next_attempt: u32,
+}
+
 /// Result of atomically reserving one pending activation for owner dispatch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreparedActivationDispatch {
@@ -1580,8 +1590,8 @@ impl WorkflowStore {
     /// Atomically reserve one exact pending activation and persist its dispatch intent.
     ///
     /// This is the scheduler admission boundary: only one caller can transition a pending
-    /// activation to running and create attempt one. External dispatch must happen only after this
-    /// method commits. Repeated admission returns `Ok(None)` without creating another attempt.
+    /// activation to running and create its next attempt. External dispatch must happen only after
+    /// this method commits. Repeated admission returns `Ok(None)` without creating another attempt.
     ///
     /// # Errors
     ///
@@ -1609,7 +1619,12 @@ impl WorkflowStore {
         let Some(activation) = activation else {
             return Ok(None);
         };
-        let attempt = 1;
+        let attempt: u32 = transaction.query_row(
+            "SELECT COALESCE(MAX(attempt), 0) + 1 FROM workflow_attempts \
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
+            (run_id, node_id, activation_id),
+            |row| row.get(0),
+        )?;
         let prepared = PreparedAttempt {
             run_id: run_id.to_string(),
             node_id: node_id.to_string(),
@@ -2333,6 +2348,140 @@ impl WorkflowStore {
             "run_resumed",
             resumed_at_ms,
         )
+    }
+
+    /// Explicitly requeue one exact failed activation for its next bounded attempt.
+    ///
+    /// Retry is accepted only when the run and activation are failed, the selected attempt is the
+    /// latest terminal failed attempt, no output or downstream activation exists, no cancellation
+    /// was requested, and the persisted retry cap permits another attempt. The transition is
+    /// atomic and idempotently rejects stale operator requests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed/stale identity, unsafe downstream state, exhausted retry
+    /// budget, cancellation, or database failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn retry_failed_node(
+        &mut self,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+        failed_attempt: u32,
+        retried_at_ms: u64,
+    ) -> Result<WorkflowNodeRetryResult, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        validate_id("node_id", node_id)?;
+        validate_id("activation_id", activation_id)?;
+        if failed_attempt == 0 {
+            return Err(WorkflowStoreError::InvalidData(
+                "failed attempt must be positive".to_string(),
+            ));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (run_status, cancellation_requested, retry_cap): (String, bool, u32) = transaction
+            .query_row(
+                "SELECT status, cancellation_requested_at_ms IS NOT NULL, retry_cap \
+                 FROM workflow_runs WHERE run_id = ?1",
+                [run_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        if cancellation_requested || parse_run_status(&run_status)? != RunStatus::Failed {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow run is not eligible for node retry".to_string(),
+            ));
+        }
+        let (activation_status, output_id): (String, Option<String>) = transaction.query_row(
+            "SELECT status, output_id FROM workflow_activations \
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
+            (run_id, node_id, activation_id),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if activation_status != "failed" || output_id.is_some() {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow activation is not an output-free failed activation".to_string(),
+            ));
+        }
+        let (latest_attempt, attempt_status): (u32, String) = transaction.query_row(
+            "SELECT attempt, status FROM workflow_attempts \
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 \
+             ORDER BY attempt DESC LIMIT 1",
+            (run_id, node_id, activation_id),
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if latest_attempt != failed_attempt || attempt_status != "failed" {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow retry requires the latest failed attempt identity".to_string(),
+            ));
+        }
+        let next_attempt = failed_attempt.saturating_add(1);
+        if next_attempt > retry_cap.saturating_add(1) {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow retry cap exceeded".to_string(),
+            ));
+        }
+        let definition_json: String = transaction.query_row(
+            "SELECT definition.definition_json FROM workflow_runs run \
+             JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+               AND definition.version = run.definition_version WHERE run.run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )?;
+        let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+        let direct_targets = definition
+            .edges
+            .iter()
+            .filter(|edge| {
+                edge.from == node_id
+                    && !matches!(
+                        edge.kind,
+                        bcode_workflow::EdgeKind::Retry { .. }
+                            | bcode_workflow::EdgeKind::Back { .. }
+                    )
+            })
+            .map(|edge| edge.to.as_str())
+            .collect::<Vec<_>>();
+        for target in direct_targets {
+            let downstream_exists: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_activations \
+                 WHERE run_id = ?1 AND node_id = ?2)",
+                (run_id, target),
+                |row| row.get(0),
+            )?;
+            if downstream_exists {
+                return Err(WorkflowStoreError::InvalidData(
+                    "workflow retry is unsafe after downstream activation".to_string(),
+                ));
+            }
+        }
+        transaction.execute(
+            "UPDATE workflow_activations SET status = 'pending' \
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND status = 'failed'",
+            (run_id, node_id, activation_id),
+        )?;
+        transaction.execute(
+            "UPDATE workflow_runs SET status = 'running', updated_at_ms = ?2 \
+             WHERE run_id = ?1 AND status = 'failed'",
+            (run_id, retried_at_ms),
+        )?;
+        let result = WorkflowNodeRetryResult {
+            run_id: run_id.to_string(),
+            node_id: node_id.to_string(),
+            activation_id: activation_id.to_string(),
+            previous_attempt: failed_attempt,
+            next_attempt,
+        };
+        append_event(
+            &transaction,
+            run_id,
+            "node_retry_requested",
+            &serde_json::to_string(&result)?,
+            retried_at_ms,
+        )?;
+        transaction.commit()?;
+        Ok(result)
     }
 
     /// Persist cancellation intent before an executor signals active children.
@@ -3510,6 +3659,23 @@ fn apply_attempt_observation(
         }
         AttemptObservation::Failed { message } => {
             transition_attempt(transaction, request, "failed", Some(reconciled_at_ms))?;
+            let activation_changed = transaction.execute(
+                "UPDATE workflow_activations SET status = 'failed' \
+                 WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 \
+                   AND status = 'running' AND output_id IS NULL",
+                (&request.run_id, &request.node_id, &request.activation_id),
+            )?;
+            if activation_changed != 1 {
+                return Err(WorkflowStoreError::InvalidData(format!(
+                    "failed workflow attempt has no running output-free activation: {}",
+                    request.dispatch_identity
+                )));
+            }
+            transaction.execute(
+                "UPDATE workflow_runs SET status = 'failed', updated_at_ms = ?2 \
+                 WHERE run_id = ?1 AND status = 'running'",
+                (&request.run_id, reconciled_at_ms),
+            )?;
             append_event(
                 transaction,
                 &request.run_id,
@@ -5084,6 +5250,85 @@ mod tests {
         assert_eq!(page[0].event_type, "activation_created");
         assert!(store.list_runs(0).is_err());
         assert!(store.event_history("run-1", None, 1_001).is_err());
+    }
+
+    #[test]
+    fn explicit_failed_node_retry_is_bounded_exact_and_reuses_activation() {
+        struct FailedObserver;
+        impl AttemptStatusObserver for FailedObserver {
+            fn observe(
+                &self,
+                _request: &AttemptReconciliationRequest,
+            ) -> Result<AttemptObservation, WorkflowStoreError> {
+                Ok(AttemptObservation::Failed {
+                    message: "review failed".to_string(),
+                })
+            }
+        }
+
+        let (_temp, mut store) = initialized_store();
+        let prepared = store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect("prepare")
+            .expect("prepared");
+        store
+            .persist_dispatch_receipt(&DispatchReceipt {
+                run_id: "run-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id: activation_id(),
+                attempt: prepared.attempt,
+                dispatch_identity: prepared.dispatch_identity,
+                receipt: serde_json::json!({"turn_id": "turn-1"}),
+                admitted_at_ms: 13,
+            })
+            .expect("receipt");
+        store
+            .reconcile_receipt_backed_attempts(&FailedObserver, 10, 20)
+            .expect("failed reconciliation");
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("run")
+                .expect("run")
+                .status,
+            RunStatus::Failed
+        );
+        let result = store
+            .retry_failed_node("run-1", "review", &activation_id(), 1, 21)
+            .expect("retry");
+        assert_eq!(result.next_attempt, 2);
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("run")
+                .expect("run")
+                .status,
+            RunStatus::Running
+        );
+        let prepared = store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                22,
+            )
+            .expect("prepare")
+            .expect("prepared");
+        assert_eq!(prepared.attempt, 2);
+        assert!(
+            store
+                .retry_failed_node("run-1", "review", &activation_id(), 1, 23)
+                .is_err()
+        );
     }
 
     #[test]

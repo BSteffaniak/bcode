@@ -307,6 +307,13 @@ pub enum Request {
     ListWorkflowRuns {
         limit: usize,
     },
+    /// Explicitly retry one exact latest failed workflow node attempt.
+    RetryWorkflowNode {
+        run_id: String,
+        node_id: String,
+        activation_id: String,
+        failed_attempt: u32,
+    },
     /// Request durable cancellation of one workflow run.
     CancelWorkflowRun {
         run_id: String,
@@ -1360,6 +1367,9 @@ pub enum ResponsePayload {
     WorkflowRunResumed {
         changed: bool,
     },
+    WorkflowNodeRetried {
+        result: bcode_workflow_store::WorkflowNodeRetryResult,
+    },
     WorkflowWaitList {
         waits: Vec<bcode_workflow_store::WaitingActivation>,
     },
@@ -2237,6 +2247,12 @@ mod tests {
             },
             Request::ResumeWorkflowRun {
                 run_id: "run-1".to_string(),
+            },
+            Request::RetryWorkflowNode {
+                run_id: "run-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id: "activation-1".to_string(),
+                failed_attempt: 1,
             },
             Request::ListWorkflowWaits {
                 run_id: "run-1".to_string(),
