@@ -20,6 +20,9 @@ use bcode_session_import::{
     ListImportSourcesResponse, OP_DISCOVER_IMPORTABLE_SESSIONS, OP_LIST_IMPORT_SOURCES,
     SESSION_IMPORT_INTERFACE_ID,
 };
+use bcode_session_migration::{
+    SessionDiagnosisClassification, SessionDiagnosisCompatibility, classify_session_diagnosis,
+};
 use bcode_session_models::{
     SessionEvent, SessionEventCompatibilityIssue, SessionEventCompatibilityKind, SessionEventKind,
     SessionHistoryCursor, SessionHistoryDirection, SessionHistoryQuery, SessionId,
@@ -68,6 +71,8 @@ pub enum CliError {
     Session(#[from] bcode_session::SessionError),
     #[error("session migration backup error: {0}")]
     SessionMigrationBackup(#[from] bcode_session_migration::MigrationBackupError),
+    #[error("session migration storage error: {0}")]
+    SessionMigrationStorage(#[from] bcode_session::migration_adapter::SessionStorageRecoveryError),
     #[error("session repair error: {0}")]
     SessionRepair(#[from] bcode_session::repair::SessionRepairError),
     #[error("JSON error: {0}")]
@@ -6909,29 +6914,6 @@ async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliEr
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionDiagnosisClassification {
-    CurrentReady,
-    Migratable,
-    BlockedOwner,
-    UnsupportedFuture,
-    StructurallyCorrupt,
-    RepairRequired,
-}
-
-impl SessionDiagnosisClassification {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::CurrentReady => "current_ready",
-            Self::Migratable => "migratable",
-            Self::BlockedOwner => "blocked_owner",
-            Self::UnsupportedFuture => "unsupported_future",
-            Self::StructurallyCorrupt => "structurally_corrupt",
-            Self::RepairRequired => "repair_required",
-        }
-    }
-}
-
 fn session_diagnosis_classification(
     compatibility: Result<
         &bcode_session::db::SessionStorageCompatibility,
@@ -6941,34 +6923,25 @@ fn session_diagnosis_classification(
     strict_history_error: Option<&str>,
     waiting_for_owner: bool,
 ) -> SessionDiagnosisClassification {
-    match compatibility {
-        Ok(bcode_session::db::SessionStorageCompatibility::KnownLegacy { .. })
-            if waiting_for_owner =>
-        {
-            SessionDiagnosisClassification::BlockedOwner
-        }
+    let compatibility = match compatibility {
         Ok(bcode_session::db::SessionStorageCompatibility::KnownLegacy { .. }) => {
-            SessionDiagnosisClassification::Migratable
+            SessionDiagnosisCompatibility::ReleasedHistorical
         }
         Err(bcode_session::db::SessionDbError::WriterIncompatible {
             actual: Some(actual),
             expected,
-        }) if actual > expected => SessionDiagnosisClassification::UnsupportedFuture,
-        Err(_) => SessionDiagnosisClassification::StructurallyCorrupt,
-        Ok(bcode_session::db::SessionStorageCompatibility::Current { .. })
-            if strict_history_error.is_some() =>
-        {
-            SessionDiagnosisClassification::StructurallyCorrupt
-        }
-        Ok(bcode_session::db::SessionStorageCompatibility::Current { .. })
-            if write_readiness == "ready" =>
-        {
-            SessionDiagnosisClassification::CurrentReady
-        }
+        }) if actual > expected => SessionDiagnosisCompatibility::UnknownFuture,
+        Err(_) => SessionDiagnosisCompatibility::StructurallyCorrupt,
         Ok(bcode_session::db::SessionStorageCompatibility::Current { .. }) => {
-            SessionDiagnosisClassification::RepairRequired
+            SessionDiagnosisCompatibility::Current
         }
-    }
+    };
+    classify_session_diagnosis(
+        compatibility,
+        write_readiness == "ready",
+        strict_history_error.is_some(),
+        waiting_for_owner,
+    )
 }
 
 struct SessionRepairCliOptions {
@@ -7069,9 +7042,7 @@ async fn run_session_repair_command(options: SessionRepairCliOptions) -> Result<
     let mut reports = Vec::new();
     match options.target {
         SessionRepairCliTarget::Scan => {
-            reports.push(bcode_session::repair::doctor_legacy_storage(
-                root.parent().unwrap_or(&root),
-            )?);
+            reports.push(doctor_historical_storage(root.parent().unwrap_or(&root))?);
             reports.push(repair_catalog_report(&root, dry_run).await?);
             for session_id in discover_session_ids(&root)? {
                 reports.push(repair_session_report(&root, session_id, dry_run).await?);
@@ -7102,6 +7073,34 @@ async fn run_session_repair_command(options: SessionRepairCliOptions) -> Result<
         }
     }
     Ok(())
+}
+
+fn doctor_historical_storage(
+    state_dir: &Path,
+) -> Result<bcode_session::repair::RepairReport, CliError> {
+    let diagnosis = bcode_session_migration::diagnose_accidental_epoch_session_root(
+        state_dir,
+        bcode_session::migration_adapter::historical_session_has_active_owner,
+    )
+    .map_err(bcode_session::migration_adapter::map_historical_storage_error)?;
+    Ok(bcode_session::repair::RepairReport::historical_storage(
+        diagnosis.root,
+        match diagnosis.status {
+            bcode_session_migration::HistoricalStorageDiagnosisStatus::Ok => {
+                bcode_session::repair::RepairStatus::Ok
+            }
+            bcode_session_migration::HistoricalStorageDiagnosisStatus::WouldRecover => {
+                bcode_session::repair::RepairStatus::WouldRepair
+            }
+            bcode_session_migration::HistoricalStorageDiagnosisStatus::BlockedByOwner => {
+                bcode_session::repair::RepairStatus::RefusedOwnedElsewhere
+            }
+            bcode_session_migration::HistoricalStorageDiagnosisStatus::ManualRequired => {
+                bcode_session::repair::RepairStatus::ManualRequired
+            }
+        },
+        diagnosis.notes,
+    ))
 }
 
 async fn repair_session_report(

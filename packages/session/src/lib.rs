@@ -14,16 +14,10 @@
 //! Normal model-context reads return that marker plus later semantic events without replaying or
 //! repairing the complete event log.
 
-pub mod legacy_storage;
-pub use legacy_storage::{
-    HistoricalStorageDiagnosis, HistoricalStorageDiagnosisStatus, LegacyStorageInspectionReport,
-    LegacyStorageRecoveryReport, diagnose_accidental_epoch_session_root,
-    inspect_accidental_epoch_session_root, recover_accidental_epoch_session_root,
-};
-
 mod actor;
 pub mod db;
 pub mod lease;
+pub mod migration_adapter;
 pub mod persisted;
 pub mod projection;
 pub mod repair;

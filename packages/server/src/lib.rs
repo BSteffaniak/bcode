@@ -170,6 +170,8 @@ pub enum ServerError {
     Session(#[from] bcode_session::SessionError),
     #[error("session event store error: {0}")]
     SessionStore(#[from] bcode_session::SessionStoreError),
+    #[error("historical session recovery error: {0}")]
+    Migration(#[from] bcode_session::migration_adapter::SessionStorageRecoveryError),
     #[error("session database error: {0}")]
     SessionDb(#[from] bcode_session::db::SessionDbError),
     /// Registry I/O error: {0}
@@ -2260,8 +2262,11 @@ async fn run_with_static_bundled_inner(
         plugin_configs,
     )?;
     tracing::debug!(target: "bcode_server::startup", "plugins loaded");
-    let legacy_recovery =
-        bcode_session::recover_accidental_epoch_session_root(&bcode_config::default_state_dir())?;
+    let legacy_recovery = bcode_session_migration::recover_accidental_epoch_session_root(
+        &bcode_config::default_state_dir(),
+        bcode_session::migration_adapter::relocate_historical_session,
+    )
+    .map_err(bcode_session::migration_adapter::map_historical_storage_error)?;
     if !legacy_recovery.relocated.is_empty() {
         tracing::info!(
             target: "bcode_server::startup",

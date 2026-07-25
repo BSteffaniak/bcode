@@ -11,6 +11,7 @@
 mod backup;
 mod classification;
 mod codec;
+mod diagnosis;
 mod historical;
 mod inventory;
 mod operation;
@@ -38,6 +39,9 @@ pub use storage::{
 pub use validation::SessionMigrationReceipt;
 
 pub use classification::{HistoricalDecode, HistoricalEventMetadata};
+pub use diagnosis::{
+    SessionDiagnosisClassification, SessionDiagnosisCompatibility, classify_session_diagnosis,
+};
 pub use historical::{
     HistoricalSessionEventError, decode_for_migration, historical_conversion_counts,
     ordered_payload_digest,

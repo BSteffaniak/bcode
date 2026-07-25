@@ -91,6 +91,25 @@ impl RepairReport {
             notes: Vec::new(),
         }
     }
+
+    /// Create a report for migration-owned historical storage diagnosis.
+    #[must_use]
+    pub const fn historical_storage(
+        root: PathBuf,
+        status: RepairStatus,
+        notes: Vec<String>,
+    ) -> Self {
+        Self {
+            target: RepairTarget::LegacyStorage,
+            db_path: root,
+            status,
+            backup_path: None,
+            initial_error: None,
+            final_error: None,
+            actions: Vec::new(),
+            notes,
+        }
+    }
 }
 
 /// Errors returned by explicit repair operations.
@@ -116,26 +135,6 @@ pub enum SessionRepairError {
     /// Report serialization failed.
     #[error(transparent)]
     Serialize(#[from] serde_json::Error),
-}
-
-/// Diagnose the removed historical writer-epoch root without mutating files.
-///
-/// # Errors
-///
-/// Returns an error if historical directory or owner inspection fails.
-pub fn doctor_legacy_storage(state_dir: &Path) -> Result<RepairReport, SessionRepairError> {
-    let diagnosis = crate::diagnose_accidental_epoch_session_root(state_dir)?;
-    let mut report = RepairReport::new(RepairTarget::LegacyStorage, diagnosis.root);
-    report.status = match diagnosis.status {
-        crate::HistoricalStorageDiagnosisStatus::Ok => RepairStatus::Ok,
-        crate::HistoricalStorageDiagnosisStatus::WouldRecover => RepairStatus::WouldRepair,
-        crate::HistoricalStorageDiagnosisStatus::BlockedByOwner => {
-            RepairStatus::RefusedOwnedElsewhere
-        }
-        crate::HistoricalStorageDiagnosisStatus::ManualRequired => RepairStatus::ManualRequired,
-    };
-    report.notes = diagnosis.notes;
-    Ok(report)
 }
 
 /// Diagnose a per-session database without mutating files.

@@ -242,8 +242,10 @@ An earlier, reverted implementation briefly wrote sessions beneath:
 <state-dir>/session-storage/writer-epoch-2/
 ```
 
-Only `bcode_session::legacy_storage` may recognize this exact historical path. It is migration input,
-never an active session store.
+Only `bcode_session_migration` may recognize this exact historical path or decide which entries are
+recoverable. Current `bcode_session::migration_adapter` code supplies lease coordination and the
+canonical atomic rename primitive without owning historical-layout policy. The path is migration
+input, never an active session store.
 
 Recovery rules:
 
