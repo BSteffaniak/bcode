@@ -761,6 +761,59 @@ fn validate_fake_parallel_tool_policy(request: &ModelTurnRequest) -> Option<Serv
     })
 }
 
+#[cfg(test)]
+fn fake_reasoning_events(
+    activity_id: &str,
+    status: bcode_session_models::ReasoningActivityStatus,
+) -> Vec<ProviderTurnEvent> {
+    use bcode_session_models::{
+        ReasoningActivityEvent, ReasoningContentKind, ReasoningContentRole,
+    };
+    vec![
+        ProviderTurnEvent::ReasoningActivity {
+            event: ReasoningActivityEvent::Started {
+                activity_id: activity_id.to_owned(),
+                order: 0,
+            },
+        },
+        ProviderTurnEvent::ReasoningActivity {
+            event: ReasoningActivityEvent::PartCompleted {
+                activity_id: activity_id.to_owned(),
+                activity_order: 0,
+                part_id: "summary-0".to_owned(),
+                kind: ReasoningContentKind::Summary,
+                role: ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: "fake summary".to_owned(),
+            },
+        },
+        ProviderTurnEvent::ReasoningActivity {
+            event: ReasoningActivityEvent::PartCompleted {
+                activity_id: activity_id.to_owned(),
+                activity_order: 0,
+                part_id: "raw-0".to_owned(),
+                kind: ReasoningContentKind::Raw,
+                role: ReasoningContentRole::Detail,
+                part_order: 1,
+                text: "fake raw detail".to_owned(),
+            },
+        },
+        ProviderTurnEvent::ReasoningActivity {
+            event: ReasoningActivityEvent::OpaqueObserved {
+                activity_id: activity_id.to_owned(),
+                activity_order: 0,
+            },
+        },
+        ProviderTurnEvent::ReasoningActivity {
+            event: ReasoningActivityEvent::Finished {
+                activity_id: activity_id.to_owned(),
+                activity_order: 0,
+                status,
+            },
+        },
+    ]
+}
+
 fn finish_fake_turn(turn: &FakeTurn, text: String, request_input_tokens: u64) {
     let output_tokens = u32::try_from(text.split_whitespace().count()).unwrap_or(u32::MAX);
     turn.push(ProviderTurnEvent::TextDelta { text });
@@ -1211,6 +1264,50 @@ mod tests {
     use bcode_model::{
         CapabilitySupport, ModelParameterKey, RequestedModelFeature, StructuredOutputMode,
     };
+
+    #[test]
+    fn fake_reasoning_fixture_drives_every_neutral_signal_and_terminal_state() {
+        for status in [
+            bcode_session_models::ReasoningActivityStatus::Completed,
+            bcode_session_models::ReasoningActivityStatus::Interrupted,
+            bcode_session_models::ReasoningActivityStatus::Failed,
+        ] {
+            let events = fake_reasoning_events("reasoning-1", status);
+            assert!(events.iter().any(|event| matches!(
+                event,
+                ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                        kind: bcode_session_models::ReasoningContentKind::Summary,
+                        ..
+                    }
+                }
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                        kind: bcode_session_models::ReasoningContentKind::Raw,
+                        ..
+                    }
+                }
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::OpaqueObserved { .. }
+                }
+            )));
+            assert!(events.iter().any(|event| matches!(
+                event,
+                ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::Finished {
+                        status: actual,
+                        ..
+                    }
+                } if *actual == status
+            )));
+        }
+    }
 
     #[test]
     fn fake_capability_contract_matches_request_validation() {
