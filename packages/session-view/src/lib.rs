@@ -39,6 +39,7 @@ pub struct SessionView {
     terminal_invocation_statuses: BTreeMap<String, ToolInvocationViewStatus>,
     terminal_runtime_work: BTreeSet<bcode_session_models::WorkId>,
     tool_request_drafts: BTreeMap<String, ToolRequestDraftView>,
+    terminal_tool_request_drafts: BTreeMap<String, (u64, u64)>,
 }
 
 impl Default for SessionView {
@@ -64,6 +65,7 @@ impl SessionView {
             terminal_invocation_statuses: BTreeMap::new(),
             terminal_runtime_work: BTreeSet::new(),
             tool_request_drafts: BTreeMap::new(),
+            terminal_tool_request_drafts: BTreeMap::new(),
         }
     }
 
@@ -533,6 +535,23 @@ impl SessionView {
                 self.bump_revision();
             }
             SessionEventKind::ToolCallRequested { tool_call_id, .. } => {
+                if self.tool_request_drafts.remove(tool_call_id).is_some()
+                    || self
+                        .terminal_tool_request_drafts
+                        .remove(tool_call_id)
+                        .is_some()
+                {
+                    let prefix = format!("tool-draft:{tool_call_id}:");
+                    let item_count = self.snapshot.transcript.items.len();
+                    self.snapshot
+                        .transcript
+                        .items
+                        .retain(|item| !item.id.get().starts_with(&prefix));
+                    if self.snapshot.transcript.items.len() != item_count {
+                        self.snapshot.transcript.revision =
+                            self.snapshot.transcript.revision.saturating_add(1);
+                    }
+                }
                 self.upsert_tool_item(tool_call_id, event.sequence, Some(event.timestamp_ms));
             }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
@@ -1153,10 +1172,19 @@ impl SessionView {
         let key = event.tool_call_id.clone();
         let id = TranscriptViewItemId::tool_request_draft(&key, event.generation);
         let current = self.tool_request_drafts.get(&key).cloned();
-        if current.as_ref().is_some_and(|current| {
-            event.generation < current.generation
-                || (event.generation == current.generation && event.revision <= current.revision)
-        }) {
+        if self
+            .terminal_tool_request_drafts
+            .get(&key)
+            .is_some_and(|(generation, revision)| {
+                event.generation < *generation
+                    || (event.generation == *generation && event.revision <= *revision)
+            })
+            || current.as_ref().is_some_and(|current| {
+                event.generation < current.generation
+                    || (event.generation == current.generation
+                        && event.revision <= current.revision)
+            })
+        {
             return;
         }
         if current
@@ -1175,29 +1203,15 @@ impl SessionView {
             self.tool_request_drafts.remove(&key);
         }
         if let ToolRequestDraftOperation::Remove { .. } = event.operation {
-            let mut terminal = current.unwrap_or_else(|| ToolRequestDraftView {
-                turn_id: event.turn_id.clone(),
-                tool_call_id: event.tool_call_id.clone(),
-                tool_name: event.tool_name.clone(),
-                producer_plugin_id: event.producer_plugin_id.clone(),
-                schema: event.schema.clone(),
-                schema_version: event.schema_version,
-                generation: event.generation,
-                revision: event.revision,
-                argument_bytes: event.argument_bytes,
-                preview_start_offset: 0,
-                preview: String::new(),
-                truncated: event.truncated,
-            });
-            terminal.revision = event.revision;
-            terminal.argument_bytes = event.argument_bytes;
-            terminal.truncated = event.truncated;
-            self.tool_request_drafts.insert(key, terminal);
+            self.tool_request_drafts.remove(&key);
+            self.terminal_tool_request_drafts
+                .insert(key, (event.generation, event.revision));
             self.snapshot.transcript.items.retain(|item| item.id != id);
             self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
             self.bump_revision();
             return;
         }
+        self.terminal_tool_request_drafts.remove(&key);
         let mut draft = current
             .filter(|current| current.generation == event.generation)
             .unwrap_or_else(|| ToolRequestDraftView {
@@ -2535,6 +2549,18 @@ mod tests {
                 text: "stale".to_owned(),
             },
         ));
+        view.apply_live_event(&draft(
+            3,
+            bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                start_offset: 0,
+                text: "post-terminal".to_owned(),
+            },
+        ));
+        assert!(view.tool_request_drafts.is_empty());
+        assert_eq!(
+            view.terminal_tool_request_drafts.get("call-write"),
+            Some(&(1, 3))
+        );
         assert!(
             !view
                 .snapshot()
@@ -2543,6 +2569,40 @@ mod tests {
                 .iter()
                 .any(|item| matches!(item.kind, TranscriptViewItemKind::ToolRequestDraft { .. }))
         );
+    }
+
+    #[test]
+    fn request_draft_flood_keeps_one_item_and_latest_preview() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        for revision in 1..=10_000 {
+            view.apply_live_event(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::ToolRequestDraft {
+                    event: bcode_session_models::ToolRequestDraftEvent {
+                        turn_id: "turn-1".to_owned(),
+                        tool_call_id: "call-write".to_owned(),
+                        tool_name: "filesystem.write".to_owned(),
+                        producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                        schema: "bcode.filesystem.request-draft.write".to_owned(),
+                        schema_version: 1,
+                        generation: 1,
+                        revision,
+                        operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                            start_offset: 0,
+                            text: revision.to_string(),
+                        },
+                        argument_bytes: usize::try_from(revision).expect("bounded revision"),
+                        truncated: false,
+                    },
+                },
+            });
+            assert_eq!(view.tool_request_drafts.len(), 1);
+            assert_eq!(view.snapshot().transcript.items.len(), 1);
+        }
+
+        assert_eq!(view.tool_request_drafts["call-write"].preview, "10000");
+        assert_eq!(view.snapshot().transcript.items.len(), 1);
     }
 
     #[test]
@@ -2614,6 +2674,64 @@ mod tests {
         ));
         assert!(view.snapshot().contributions.is_empty());
         assert_eq!(view.snapshot().transcript.items.len(), 0);
+    }
+
+    #[test]
+    fn durable_tool_request_reconciles_live_draft_without_duplicate_rows() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    generation: 1,
+                    revision: 1,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: r#"{"path":"README.md"}"#.to_owned(),
+                    },
+                    argument_bytes: 20,
+                    truncated: false,
+                },
+            },
+        });
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                tool_name: "filesystem.write".to_owned(),
+                arguments_json: r#"{"path":"README.md"}"#.to_owned(),
+                working_directory: None,
+            },
+        ));
+
+        assert!(view.tool_request_drafts.is_empty());
+        assert!(view.terminal_tool_request_drafts.is_empty());
+        assert_eq!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .filter(|item| matches!(item.kind, TranscriptViewItemKind::ToolInvocation { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !view
+                .snapshot()
+                .transcript
+                .items
+                .iter()
+                .any(|item| matches!(item.kind, TranscriptViewItemKind::ToolRequestDraft { .. }))
+        );
     }
 
     #[test]

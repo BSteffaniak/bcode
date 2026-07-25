@@ -653,6 +653,56 @@ mod tests {
     }
 
     #[test]
+    fn request_draft_flood_bounds_256_concurrent_keys_and_keeps_latest_updates() {
+        let session_id = SessionId::new();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut pending = BTreeMap::new();
+        for revision in 1..=10_000 {
+            let mut event = request_draft_event(
+                session_id,
+                revision,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: usize::try_from(revision).expect("bounded revision"),
+                    text: revision.to_string(),
+                },
+            );
+            let BcodeEvent::SessionLive(live) = &mut event else {
+                unreachable!("request draft is live");
+            };
+            let bcode_session_models::SessionLiveEventKind::ToolRequestDraft { event: draft } =
+                &mut live.kind
+            else {
+                unreachable!("request draft event");
+            };
+            draft.tool_call_id = format!("call-{}", revision % 256);
+            pending.insert(supersedable_event_key(&event).expect("draft key"), event);
+            assert!(pending.len() <= 256);
+        }
+
+        assert!(flush_superseded_progress(&sender, &mut pending));
+        assert!(pending.is_empty());
+        let events = std::iter::from_fn(|| receiver.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(events.len(), 256);
+        let latest = events
+            .into_iter()
+            .filter_map(|update| match update {
+                SessionStreamUpdate::Event(event) => Some(event),
+                SessionStreamUpdate::ResyncStarted { .. }
+                | SessionStreamUpdate::Resynchronized { .. } => None,
+            })
+            .filter_map(|event| match *event {
+                BcodeEvent::SessionLive(bcode_session_models::SessionLiveEvent {
+                    kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft { event },
+                    ..
+                }) => Some((event.tool_call_id, event.revision)),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(latest.get("call-16"), Some(&10_000));
+        assert_eq!(latest.get("call-15"), Some(&9_999));
+    }
+
+    #[test]
     fn placed_progress_flood_collapses_to_latest_update() {
         let session_id = SessionId::new();
         let (sender, mut receiver) = mpsc::unbounded_channel();

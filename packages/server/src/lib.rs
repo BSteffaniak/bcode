@@ -231,8 +231,7 @@ pub struct ServerState {
     active_plugin_invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
     active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
     active_contributions: Arc<StdMutex<ActiveContributionRegistry>>,
-    active_tool_request_drafts:
-        Arc<StdMutex<BTreeMap<ActiveToolRequestDraftKey, ActiveToolRequestDraft>>>,
+    active_tool_request_drafts: Arc<StdMutex<ActiveToolRequestDraftRegistry>>,
     next_permission_id: Mutex<u64>,
     next_permission_batch_id: Mutex<u64>,
     clients: Mutex<BTreeSet<ClientId>>,
@@ -5883,6 +5882,13 @@ struct ActiveToolRequestDraft {
     event: bcode_session_models::ToolRequestDraftEvent,
     preview: String,
     preview_start_offset: usize,
+}
+
+#[derive(Debug, Default)]
+struct ActiveToolRequestDraftRegistry {
+    drafts: BTreeMap<ActiveToolRequestDraftKey, ActiveToolRequestDraft>,
+    terminal_revisions: BTreeMap<ActiveToolRequestDraftKey, (u64, u64)>,
+    session_bytes: BTreeMap<SessionId, usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -13523,6 +13529,9 @@ fn provider_metadata_trace_detail(key: &str, value: &str) -> String {
     key.to_string()
 }
 
+const MAX_ACTIVE_TOOL_REQUEST_DRAFTS_PER_SESSION: usize = 256;
+const MAX_ACTIVE_TOOL_REQUEST_DRAFT_BYTES_PER_SESSION: usize = 4 * 1024 * 1024;
+
 async fn publish_tool_request_draft_live(
     state: &ServerState,
     session_id: SessionId,
@@ -13536,9 +13545,13 @@ async fn publish_tool_request_draft_live(
     let accepted = state
         .active_tool_request_drafts
         .lock()
-        .is_ok_and(|mut drafts| {
-            let current = drafts.get(&key);
-            if current.is_some_and(|current| {
+        .is_ok_and(|mut registry| {
+            let current = registry.drafts.get(&key);
+            let terminal = registry.terminal_revisions.get(&key).copied();
+            if terminal.is_some_and(|(generation, revision)| {
+                event.generation < generation
+                    || (event.generation == generation && event.revision <= revision)
+            }) || current.is_some_and(|current| {
                 event.generation < current.event.generation
                     || (event.generation == current.event.generation
                         && event.revision <= current.event.revision)
@@ -13566,11 +13579,42 @@ async fn publish_tool_request_draft_live(
                     preview.clone_from(text);
                 }
                 bcode_session_models::ToolRequestDraftOperation::Remove { .. } => {
-                    drafts.remove(&key);
+                    if let Some(removed) = registry.drafts.remove(&key) {
+                        let bytes = registry.session_bytes.entry(session_id).or_default();
+                        *bytes = bytes.saturating_sub(removed.preview.len());
+                        if *bytes == 0 {
+                            registry.session_bytes.remove(&session_id);
+                        }
+                    }
+                    registry
+                        .terminal_revisions
+                        .insert(key, (event.generation, event.revision));
                     return true;
                 }
             }
-            drafts.insert(
+
+            let previous_bytes = current.map_or(0, |current| current.preview.len());
+            let session_count = registry
+                .drafts
+                .keys()
+                .filter(|draft_key| draft_key.session == session_id)
+                .count();
+            if current.is_none() && session_count >= MAX_ACTIVE_TOOL_REQUEST_DRAFTS_PER_SESSION {
+                return false;
+            }
+            registry.terminal_revisions.remove(&key);
+            let next_session_bytes = registry
+                .session_bytes
+                .get(&session_id)
+                .copied()
+                .unwrap_or_default()
+                .saturating_sub(previous_bytes)
+                .saturating_add(preview.len());
+            if next_session_bytes > MAX_ACTIVE_TOOL_REQUEST_DRAFT_BYTES_PER_SESSION {
+                return false;
+            }
+
+            registry.drafts.insert(
                 key,
                 ActiveToolRequestDraft {
                     event: event.clone(),
@@ -13578,6 +13622,9 @@ async fn publish_tool_request_draft_live(
                     preview_start_offset,
                 },
             );
+            registry
+                .session_bytes
+                .insert(session_id, next_session_bytes);
             true
         });
     if accepted {
@@ -13616,8 +13663,9 @@ fn active_tool_request_draft_snapshot_events(
 ) -> Vec<bcode_session_models::SessionLiveEvent> {
     state.active_tool_request_drafts.lock().map_or_else(
         |_| Vec::new(),
-        |drafts| {
-            drafts
+        |registry| {
+            registry
+                .drafts
                 .iter()
                 .filter(|(key, _)| key.session == session_id)
                 .map(|(_, draft)| bcode_session_models::SessionLiveEvent {
@@ -24874,6 +24922,187 @@ library = "test"
             requested_reasoning_summary(&selection, &reasoning),
             Some("auto")
         );
+    }
+
+    fn request_draft_event(
+        tool_call_id: &str,
+        generation: u64,
+        revision: u64,
+        operation: bcode_session_models::ToolRequestDraftOperation,
+    ) -> bcode_session_models::ToolRequestDraftEvent {
+        bcode_session_models::ToolRequestDraftEvent {
+            turn_id: "turn-1".to_owned(),
+            tool_call_id: tool_call_id.to_owned(),
+            tool_name: "filesystem.write".to_owned(),
+            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+            schema: "bcode.filesystem.request-draft.write".to_owned(),
+            schema_version: 1,
+            generation,
+            revision,
+            operation,
+            argument_bytes: 0,
+            truncated: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn request_draft_registry_rejects_stale_and_post_terminal_updates() {
+        let state = test_server_state(SessionManager::default());
+        let session_id = SessionId::new();
+        publish_tool_request_draft_live(
+            &state,
+            session_id,
+            request_draft_event(
+                "call-1",
+                1,
+                1,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: "latest".to_owned(),
+                },
+            ),
+        )
+        .await;
+        publish_tool_request_draft_live(
+            &state,
+            session_id,
+            request_draft_event(
+                "call-1",
+                1,
+                2,
+                bcode_session_models::ToolRequestDraftOperation::Remove {
+                    reason: bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+                },
+            ),
+        )
+        .await;
+        publish_tool_request_draft_live(
+            &state,
+            session_id,
+            request_draft_event(
+                "call-1",
+                1,
+                2,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: "must not return".to_owned(),
+                },
+            ),
+        )
+        .await;
+
+        publish_tool_request_draft_live(
+            &state,
+            session_id,
+            request_draft_event(
+                "call-1",
+                2,
+                1,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: "next generation".to_owned(),
+                },
+            ),
+        )
+        .await;
+
+        let registry = state
+            .active_tool_request_drafts
+            .lock()
+            .expect("request draft registry");
+        assert_eq!(registry.drafts.len(), 1);
+        assert_eq!(registry.session_bytes.get(&session_id), Some(&15));
+        assert!(registry.terminal_revisions.is_empty());
+        drop(registry);
+    }
+
+    #[tokio::test]
+    async fn request_draft_registry_bounds_keys_and_bytes_per_session() {
+        let state = test_server_state(SessionManager::default());
+        let session_id = SessionId::new();
+        let second_session_id = SessionId::new();
+        for index in 0..=MAX_ACTIVE_TOOL_REQUEST_DRAFTS_PER_SESSION {
+            publish_tool_request_draft_live(
+                &state,
+                session_id,
+                request_draft_event(
+                    &format!("call-{index}"),
+                    1,
+                    1,
+                    bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: "x".to_owned(),
+                    },
+                ),
+            )
+            .await;
+        }
+        publish_tool_request_draft_live(
+            &state,
+            second_session_id,
+            request_draft_event(
+                "call-0",
+                1,
+                1,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: "second".to_owned(),
+                },
+            ),
+        )
+        .await;
+        publish_tool_request_draft_live(
+            &state,
+            session_id,
+            request_draft_event(
+                "call-0",
+                1,
+                2,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: "x".repeat(MAX_ACTIVE_TOOL_REQUEST_DRAFT_BYTES_PER_SESSION),
+                },
+            ),
+        )
+        .await;
+
+        let registry = state
+            .active_tool_request_drafts
+            .lock()
+            .expect("request draft registry");
+        assert_eq!(
+            registry
+                .drafts
+                .keys()
+                .filter(|key| key.session == session_id)
+                .count(),
+            MAX_ACTIVE_TOOL_REQUEST_DRAFTS_PER_SESSION
+        );
+        assert_eq!(
+            registry.session_bytes.get(&session_id),
+            Some(&MAX_ACTIVE_TOOL_REQUEST_DRAFTS_PER_SESSION)
+        );
+        assert_eq!(
+            registry.session_bytes.get(&second_session_id),
+            Some(&"second".len())
+        );
+        assert_eq!(
+            registry
+                .drafts
+                .keys()
+                .filter(|key| key.session == second_session_id)
+                .count(),
+            1
+        );
+        assert_eq!(
+            registry
+                .drafts
+                .iter()
+                .find(|(key, _)| key.session == session_id && key.tool_call_id == "call-0")
+                .map(|(_, draft)| draft.preview.as_str()),
+            Some("x")
+        );
+        drop(registry);
     }
 
     #[test]

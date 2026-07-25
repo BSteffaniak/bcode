@@ -2098,6 +2098,62 @@ mod tests {
             let decoded: ToolRequestDraftEvent =
                 serde_json::from_slice(&encoded).expect("decode request draft");
             assert_eq!(decoded, event);
+
+            let live = SessionLiveEvent {
+                session_id: SessionId::new(),
+                kind: SessionLiveEventKind::ToolRequestDraft {
+                    event: event.clone(),
+                },
+            };
+            let encoded = serde_json::to_vec(&live).expect("encode live request draft");
+            let decoded: SessionLiveEvent =
+                serde_json::from_slice(&encoded).expect("decode live request draft");
+            assert_eq!(decoded, live);
+        }
+    }
+
+    #[test]
+    fn tool_request_draft_models_reject_malformed_operations() {
+        let malformed = [
+            serde_json::json!({
+                "turn_id": "turn-1",
+                "tool_call_id": "call-1",
+                "tool_name": "filesystem.write",
+                "schema": "bcode.filesystem.request-draft.write",
+                "schema_version": 1,
+                "generation": 1,
+                "revision": 1,
+                "argument_bytes": 0,
+                "truncated": false
+            }),
+            serde_json::json!({
+                "turn_id": "turn-1",
+                "tool_call_id": "call-1",
+                "tool_name": "filesystem.write",
+                "schema": "bcode.filesystem.request-draft.write",
+                "schema_version": 1,
+                "generation": 1,
+                "revision": 1,
+                "operation": {"type": "append", "offset": "not-a-number", "text": "x"},
+                "argument_bytes": 1,
+                "truncated": false
+            }),
+            serde_json::json!({
+                "turn_id": "turn-1",
+                "tool_call_id": "call-1",
+                "tool_name": "filesystem.write",
+                "schema": "bcode.filesystem.request-draft.write",
+                "schema_version": 1,
+                "generation": 1,
+                "revision": 1,
+                "operation": {"type": "unknown"},
+                "argument_bytes": 0,
+                "truncated": false
+            }),
+        ];
+
+        for value in malformed {
+            assert!(serde_json::from_value::<ToolRequestDraftEvent>(value).is_err());
         }
     }
 
