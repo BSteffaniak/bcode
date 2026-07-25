@@ -35,12 +35,19 @@ textarea {
     resize: vertical;
 }
 html, body {
+    margin: 0;
     max-width: 100%;
     overflow-x: hidden;
 }
-#bcode-web-shell, #bcode-application-content, #application-layout, #conversation-main {
+*, *::before, *::after {
     box-sizing: border-box;
+}
+#bcode-web-shell, #bcode-application-content, #application-layout, #conversation-main {
     max-width: 100%;
+    min-width: 0;
+}
+#application-layout > *, #conversation-main > * {
+    min-width: 0;
 }
 @media (max-width: 900px) {
     #application-layout {
@@ -62,6 +69,8 @@ html, body {
     max-width: 100%;
     overflow-x: auto;
     overflow-wrap: anywhere;
+    white-space: pre-wrap;
+    word-break: break-word;
 }
 :where(p, li, dd, blockquote, a) {
     overflow-wrap: anywhere;
@@ -166,6 +175,21 @@ pub async fn init(state: &HyperChadAppState) -> Result<AppBuilder, ClientError> 
             .with_viewport(VIEWPORT.clone())
             .with_size(1200.0, 800.0),
     ))
+}
+
+/// Build the selected HTML/Actix application with an owned renderer runtime.
+///
+/// The returned runtime must remain alive until the application runner exits.
+///
+/// # Errors
+///
+/// Returns an error if the runtime or application fails to build.
+pub fn build_app_with_runtime(
+    builder: AppBuilder,
+) -> Result<(App<DefaultRenderer>, switchy::unsync::runtime::Runtime), hyperchad::app::Error> {
+    let runtime = switchy::unsync::runtime::Builder::new().build()?;
+    let app = build_app(builder.with_runtime_handle(runtime.handle()))?;
+    Ok((app, runtime))
 }
 
 /// Build the selected HTML/Actix application from the provided builder.

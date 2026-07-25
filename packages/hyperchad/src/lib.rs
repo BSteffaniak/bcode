@@ -9,8 +9,8 @@ mod html_actix;
 
 #[cfg(feature = "renderer-html-actix")]
 pub use html_actix::{
-    DEFAULT_BIND_ADDRESS, VIEWPORT, build_app, build_launch_url, init, init_with_snapshot,
-    validate_bind_address,
+    DEFAULT_BIND_ADDRESS, VIEWPORT, build_app, build_app_with_runtime, build_launch_url, init,
+    init_with_snapshot, validate_bind_address,
 };
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -2502,6 +2502,9 @@ mod tests {
         assert!(html_actix::accessibility_css().contains("min-width: 44px"));
         assert!(html_actix::accessibility_css().contains("overflow-x: hidden"));
         assert!(html_actix::accessibility_css().contains("overflow-wrap: anywhere"));
+        assert!(html_actix::accessibility_css().contains("white-space: pre-wrap"));
+        assert!(html_actix::accessibility_css().contains("word-break: break-word"));
+        assert!(html_actix::accessibility_css().contains("min-width: 0"));
         assert!(html_actix::accessibility_css().contains("overflow-x: auto"));
         assert!(html_actix::accessibility_css().contains("max-width: 100%"));
         assert!(html_actix::accessibility_css().contains("height: auto"));
@@ -2994,6 +2997,16 @@ mod tests {
                 .is_some()
         );
         drop(app);
+    }
+
+    #[cfg(feature = "renderer-html-actix")]
+    #[test]
+    fn html_actix_owned_runtime_app_build_smoke_test() {
+        let builder = init_with_snapshot(SessionViewSnapshot::empty(), Vec::new());
+        let (app, runtime) =
+            build_app_with_runtime(builder).expect("HTML/Actix application runtime should build");
+        drop(app);
+        drop(runtime);
     }
 
     #[test]

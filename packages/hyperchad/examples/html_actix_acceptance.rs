@@ -71,8 +71,7 @@ fn acceptance_session(session_id: SessionId) -> SessionSummary {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let session_id = SessionId::new();
     let snapshot = acceptance_snapshot(session_id);
     let sessions = vec![acceptance_session(session_id)];
@@ -90,7 +89,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bcode_hyperchad::build_launch_url(address, &token, Some(session_id))
             );
         });
-    let app: App<DefaultRenderer> = bcode_hyperchad::build_app(builder)?;
-    tokio::task::spawn_blocking(move || app.handle_serve()).await??;
+    let (app, renderer_runtime): (App<DefaultRenderer>, _) =
+        bcode_hyperchad::build_app_with_runtime(builder)?;
+    app.handle_serve()?;
+    drop(renderer_runtime);
     Ok(())
 }

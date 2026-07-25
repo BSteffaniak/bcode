@@ -334,16 +334,17 @@ async fn handle_web_command(
                 println!("Bcode HyperChad application opened at http://{address}/");
             }
         });
-    let app = bcode_hyperchad::build_app(builder)
+    let (app, renderer_runtime) = bcode_hyperchad::build_app_with_runtime(builder)
         .map_err(|error| CliError::HyperChadRender(error.to_string()))?;
     bcode_hyperchad::configure_live_updates(&app.renderer, &state);
-    tokio::task::spawn_blocking(move || app.handle_serve())
+    let result = tokio::task::spawn_blocking(move || app.handle_serve())
         .await
         .map_err(|error| {
             CliError::HyperChadRender(format!("HyperChad web renderer task failed: {error}"))
         })?
-        .map_err(|error| CliError::HyperChadRender(error.to_string()))?;
-    Ok(())
+        .map_err(|error| CliError::HyperChadRender(error.to_string()));
+    drop(renderer_runtime);
+    result
 }
 
 fn handle_onboard_flags(

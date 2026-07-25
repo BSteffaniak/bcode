@@ -1805,6 +1805,7 @@ dependencies = [
  "hyperchad_renderer_html",
  "serde",
  "serde_json",
+ "switchy",
  "tempfile",
  "tokio",
  "tracing",
