@@ -12,6 +12,10 @@ version     = { workspace = true }
 
 [lib]
 
+[[example]]
+name              = "html_actix_acceptance"
+required-features = ["renderer-html-actix"]
+
 [dependencies]
 bcode_bundled_plugins = { workspace = true, optional = true }
 bcode_client = { workspace = true }
