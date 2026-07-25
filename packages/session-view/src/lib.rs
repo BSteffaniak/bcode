@@ -2990,6 +2990,80 @@ mod tests {
     }
 
     #[test]
+    fn shared_live_delivery_attach_checkpoint_cancellation_and_finalization_are_equivalent() {
+        let session_id = SessionId::new();
+        let draft = |revision, operation| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-parity".to_owned(),
+                    tool_call_id: "call-parity".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Request,
+                    generation: 1,
+                    revision,
+                    operation,
+                    argument_bytes: usize::try_from(revision).unwrap_or(usize::MAX),
+                    truncated: false,
+                },
+            },
+        };
+        let append = draft(
+            1,
+            bcode_session_models::ToolRequestDraftOperation::Append {
+                offset: 0,
+                text: r#"{"path":"src/lib.rs","contents":"partial"}"#.to_owned(),
+            },
+        );
+        let checkpoint = draft(
+            1,
+            bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                start_offset: 0,
+                text: r#"{"path":"src/lib.rs","contents":"partial"}"#.to_owned(),
+            },
+        );
+        let mut direct = SessionView::new();
+        direct.apply_live_event(&append);
+        let mut attached = SessionView::new();
+        attached.apply_live_event(&checkpoint);
+        assert_eq!(direct.snapshot(), attached.snapshot());
+
+        let cancel = draft(
+            2,
+            bcode_session_models::ToolRequestDraftOperation::Remove {
+                reason: bcode_session_models::ToolRequestDraftTerminalReason::Cancelled,
+            },
+        );
+        direct.apply_live_event(&cancel);
+        attached.apply_live_event(&cancel);
+        assert_eq!(direct.snapshot(), attached.snapshot());
+        assert!(direct.snapshot().transcript.items.is_empty());
+
+        let request = event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-parity".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                tool_name: "filesystem.write".to_owned(),
+                arguments_json: r#"{"path":"src/lib.rs","contents":"partial"}"#.to_owned(),
+                working_directory: None,
+            },
+        );
+        direct.apply_event(&request);
+        attached.apply_event(&request);
+        assert_eq!(direct.snapshot(), attached.snapshot());
+        assert!(
+            direct.snapshot().transcript.items.iter().all(|item| {
+                !matches!(item.kind, TranscriptViewItemKind::ToolRequestDraft { .. })
+            })
+        );
+    }
+
+    #[test]
     fn request_draft_live_updates_apply_append_checkpoint_and_terminal_dominance() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
