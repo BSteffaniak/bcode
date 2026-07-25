@@ -22,7 +22,10 @@ use bcode_model::{
 use bcode_plugin_sdk::path::display_from_current_dir;
 #[cfg(feature = "embedded-plugins")]
 use bcode_plugin_sdk::{ServiceBridgeRequest, ServiceBridgeResponse};
-pub use bcode_session_models::SessionId;
+pub use bcode_session_models::{
+    ReasoningActivityEvent, ReasoningActivityStatus, ReasoningContentKind, ReasoningContentRole,
+    SessionId,
+};
 /// Optional OpenTelemetry and in-process metrics adapters.
 pub mod telemetry;
 /// Typed workflow composition and Bcode agent-step adapters.
@@ -4985,8 +4988,14 @@ pub struct FrontendTurnSnapshot {
     pub status: FrontendTurnStatus,
     /// Concatenated visible assistant text.
     pub text: String,
-    /// Concatenated visible reasoning text.
+    /// Concatenated compatibility projection of visible reasoning text.
+    ///
+    /// Distinct structured parts are separated by blank lines. This field is lossy; use
+    /// [`Self::reasoning_events`] when identity, representation, or lifecycle matters.
     pub reasoning: String,
+    /// Provider-neutral reasoning operations in provider order.
+    #[serde(default)]
+    pub reasoning_events: Vec<ReasoningActivityEvent>,
     /// Latest cumulative provider usage.
     pub usage: Option<TokenUsage>,
     /// Provider-confirmed exact input context for the request.
@@ -5005,6 +5014,68 @@ pub struct FrontendTurnSnapshot {
     pub last_error: Option<String>,
 }
 
+fn project_reasoning_text(events: &[ReasoningActivityEvent]) -> String {
+    #[derive(Default)]
+    struct ActivityProjection {
+        order: u32,
+        parts: BTreeMap<String, (u32, ReasoningContentKind, String)>,
+    }
+
+    let mut activities = BTreeMap::<String, ActivityProjection>::new();
+    for event in events {
+        let activity = activities
+            .entry(event.activity_id().to_owned())
+            .or_default();
+        activity.order = event.activity_order();
+        match event {
+            ReasoningActivityEvent::PartDelta {
+                part_id,
+                kind,
+                part_order,
+                text,
+                ..
+            } => {
+                let part = activity
+                    .parts
+                    .entry(part_id.clone())
+                    .or_insert_with(|| (*part_order, *kind, String::new()));
+                part.0 = *part_order;
+                part.1 = *kind;
+                part.2.push_str(text);
+            }
+            ReasoningActivityEvent::PartCompleted {
+                part_id,
+                kind,
+                part_order,
+                text,
+                ..
+            } => {
+                activity
+                    .parts
+                    .insert(part_id.clone(), (*part_order, *kind, text.clone()));
+            }
+            ReasoningActivityEvent::Started { .. }
+            | ReasoningActivityEvent::OpaqueObserved { .. }
+            | ReasoningActivityEvent::Finished { .. } => {}
+        }
+    }
+
+    let mut activities = activities.into_iter().collect::<Vec<_>>();
+    activities.sort_by_key(|(activity_id, activity)| (activity.order, activity_id.clone()));
+    activities
+        .into_iter()
+        .flat_map(|(_, activity)| {
+            let mut parts = activity.parts.into_iter().collect::<Vec<_>>();
+            parts.sort_by_key(|(part_id, (order, kind, _))| (*order, *kind, part_id.clone()));
+            parts
+                .into_iter()
+                .map(|(_, (_, _, text))| text)
+                .filter(|text| !text.is_empty())
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 impl FrontendTurnSnapshot {
     const fn new(turn_id: String) -> Self {
         Self {
@@ -5012,6 +5083,7 @@ impl FrontendTurnSnapshot {
             status: FrontendTurnStatus::Active,
             text: String::new(),
             reasoning: String::new(),
+            reasoning_events: Vec::new(),
             usage: None,
             exact_request_input_tokens: None,
             stop_reason: None,
@@ -5033,13 +5105,8 @@ impl FrontendTurnSnapshot {
             FrontendEvent::TextDelta(text) => self.text.push_str(text),
             FrontendEvent::ReasoningDelta(text) => self.reasoning.push_str(text),
             FrontendEvent::ReasoningActivity(event) => {
-                if let bcode_session_models::ReasoningActivityEvent::PartDelta { text, .. }
-                | bcode_session_models::ReasoningActivityEvent::PartCompleted {
-                    text, ..
-                } = event
-                {
-                    self.reasoning.push_str(text);
-                }
+                self.reasoning_events.push(event.clone());
+                self.reasoning = project_reasoning_text(&self.reasoning_events);
             }
             FrontendEvent::ToolCallFinished(call) => self.tool_calls.push(call.clone()),
             FrontendEvent::ToolResult(result) => self.tool_results.push(result.clone()),
@@ -8368,8 +8435,12 @@ pub enum GenerationStep {
         round: u32,
         /// Assistant text emitted during this model round.
         text: String,
-        /// Reasoning text emitted during this model round.
+        /// Lossy compatibility projection of reasoning emitted during this model round.
+        /// Distinct structured parts are separated by blank lines.
         reasoning: String,
+        /// Provider-neutral reasoning operations emitted during this model round.
+        #[serde(default)]
+        reasoning_events: Vec<ReasoningActivityEvent>,
         /// Latest token usage emitted during this model round.
         usage: Option<TokenUsage>,
         /// Ordered non-content runtime metadata emitted during this model round.
@@ -8448,35 +8519,42 @@ impl From<AgentTurnResponse> for GenerateTextResponse {
     }
 }
 
+struct GenerationModelRound {
+    round: u32,
+    started: bool,
+    text: String,
+    reasoning: String,
+    reasoning_events: Vec<ReasoningActivityEvent>,
+    usage: Option<TokenUsage>,
+    metadata: Vec<AgentEvent>,
+}
+
+fn flush_generation_model(steps: &mut Vec<GenerationStep>, model: &mut GenerationModelRound) {
+    if model.started {
+        steps.push(GenerationStep::Model {
+            round: model.round,
+            text: std::mem::take(&mut model.text),
+            reasoning: if model.reasoning_events.is_empty() {
+                std::mem::take(&mut model.reasoning)
+            } else {
+                project_reasoning_text(&model.reasoning_events)
+            },
+            reasoning_events: std::mem::take(&mut model.reasoning_events),
+            usage: model.usage.take(),
+            metadata: std::mem::take(&mut model.metadata),
+        });
+        model.started = false;
+    }
+}
+
 fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
-    struct ModelRound {
-        round: u32,
-        started: bool,
-        text: String,
-        reasoning: String,
-        usage: Option<TokenUsage>,
-        metadata: Vec<AgentEvent>,
-    }
-
-    fn flush_model(steps: &mut Vec<GenerationStep>, model: &mut ModelRound) {
-        if model.started {
-            steps.push(GenerationStep::Model {
-                round: model.round,
-                text: std::mem::take(&mut model.text),
-                reasoning: std::mem::take(&mut model.reasoning),
-                usage: model.usage.take(),
-                metadata: std::mem::take(&mut model.metadata),
-            });
-            model.started = false;
-        }
-    }
-
     let mut steps = Vec::new();
-    let mut model = ModelRound {
+    let mut model = GenerationModelRound {
         round: 0,
         started: false,
         text: String::new(),
         reasoning: String::new(),
+        reasoning_events: Vec::new(),
         usage: None,
         metadata: Vec::new(),
     };
@@ -8505,17 +8583,14 @@ fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
             }
             AgentEvent::ReasoningActivity(event) => {
                 model.started = true;
-                if let bcode_session_models::ReasoningActivityEvent::PartDelta { text, .. } = event
-                {
-                    model.reasoning.push_str(text);
-                }
+                model.reasoning_events.push(event.clone());
             }
             AgentEvent::Usage(usage) => {
                 model.started = true;
                 model.usage = Some(usage.clone());
             }
             AgentEvent::ToolCallFinished(call) => {
-                flush_model(&mut steps, &mut model);
+                flush_generation_model(&mut steps, &mut model);
                 steps.push(GenerationStep::ToolCall {
                     round: model.round,
                     call: call.clone(),
@@ -8541,7 +8616,7 @@ fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
             | AgentEvent::Cancelled => {}
         }
     }
-    flush_model(&mut steps, &mut model);
+    flush_generation_model(&mut steps, &mut model);
     steps.push(GenerationStep::FinalResponse {
         text: runtime.text.clone(),
         stop_reason: runtime.stop_reason,

@@ -22,8 +22,10 @@ pub enum TextStreamEventKind {
     TurnStarted,
     /// Assistant text delta.
     TextDelta,
-    /// Reasoning delta.
+    /// Legacy untyped reasoning delta.
     ReasoningDelta,
+    /// Provider-neutral structured reasoning operation.
+    ReasoningActivity,
     /// Tool call started.
     ToolCallStarted,
     /// Tool-call argument delta.
@@ -60,6 +62,7 @@ impl From<&AgentEvent> for TextStreamEventKind {
             AgentEvent::TurnStarted => Self::TurnStarted,
             AgentEvent::TextDelta(_) => Self::TextDelta,
             AgentEvent::ReasoningDelta(_) => Self::ReasoningDelta,
+            AgentEvent::ReasoningActivity(_) => Self::ReasoningActivity,
             AgentEvent::ToolCallStarted { .. } => Self::ToolCallStarted,
             AgentEvent::ToolCallDelta { .. } => Self::ToolCallDelta,
             AgentEvent::ToolCallFinished(_) => Self::ToolCallFinished,

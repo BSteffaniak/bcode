@@ -1,6 +1,7 @@
 use bcode::{
     AgentEvent, AgentLoopTerminationReason, AgentTurnResponse, GenerateTextResponse,
-    GenerationStep, StopReason, TokenUsage, ToolCall, ToolResult,
+    GenerationStep, ReasoningActivityEvent, ReasoningActivityStatus, ReasoningContentKind,
+    ReasoningContentRole, StopReason, TokenUsage, ToolCall, ToolResult,
 };
 
 #[test]
@@ -35,6 +36,42 @@ fn generation_response_exposes_ordered_model_tool_and_final_steps() {
             AgentEvent::ToolCallFinished(call.clone()),
             AgentEvent::ToolResult(result.clone()),
             AgentEvent::TurnStarted,
+            AgentEvent::ReasoningActivity(ReasoningActivityEvent::Started {
+                activity_id: "reasoning-1".to_string(),
+                order: 0,
+            }),
+            AgentEvent::ReasoningActivity(ReasoningActivityEvent::PartDelta {
+                activity_id: "reasoning-1".to_string(),
+                activity_order: 0,
+                part_id: "summary-0".to_string(),
+                kind: ReasoningContentKind::Summary,
+                role: ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: "first".to_string(),
+            }),
+            AgentEvent::ReasoningActivity(ReasoningActivityEvent::PartCompleted {
+                activity_id: "reasoning-1".to_string(),
+                activity_order: 0,
+                part_id: "summary-0".to_string(),
+                kind: ReasoningContentKind::Summary,
+                role: ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: "first complete".to_string(),
+            }),
+            AgentEvent::ReasoningActivity(ReasoningActivityEvent::PartCompleted {
+                activity_id: "reasoning-1".to_string(),
+                activity_order: 0,
+                part_id: "raw-0".to_string(),
+                kind: ReasoningContentKind::Raw,
+                role: ReasoningContentRole::Detail,
+                part_order: 1,
+                text: "raw detail".to_string(),
+            }),
+            AgentEvent::ReasoningActivity(ReasoningActivityEvent::Finished {
+                activity_id: "reasoning-1".to_string(),
+                activity_order: 0,
+                status: ReasoningActivityStatus::Completed,
+            }),
             AgentEvent::TextDelta("final answer".to_string()),
         ],
     });
@@ -46,6 +83,7 @@ fn generation_response_exposes_ordered_model_tool_and_final_steps() {
                 round: 0,
                 text: "checking".to_string(),
                 reasoning: String::new(),
+                reasoning_events: Vec::new(),
                 usage: Some(TokenUsage {
                     input_tokens: Some(10),
                     output_tokens: Some(2),
@@ -59,7 +97,45 @@ fn generation_response_exposes_ordered_model_tool_and_final_steps() {
             GenerationStep::Model {
                 round: 1,
                 text: "final answer".to_string(),
-                reasoning: String::new(),
+                reasoning: "first complete\n\nraw detail".to_string(),
+                reasoning_events: vec![
+                    ReasoningActivityEvent::Started {
+                        activity_id: "reasoning-1".to_string(),
+                        order: 0,
+                    },
+                    ReasoningActivityEvent::PartDelta {
+                        activity_id: "reasoning-1".to_string(),
+                        activity_order: 0,
+                        part_id: "summary-0".to_string(),
+                        kind: ReasoningContentKind::Summary,
+                        role: ReasoningContentRole::Milestone,
+                        part_order: 0,
+                        text: "first".to_string(),
+                    },
+                    ReasoningActivityEvent::PartCompleted {
+                        activity_id: "reasoning-1".to_string(),
+                        activity_order: 0,
+                        part_id: "summary-0".to_string(),
+                        kind: ReasoningContentKind::Summary,
+                        role: ReasoningContentRole::Milestone,
+                        part_order: 0,
+                        text: "first complete".to_string(),
+                    },
+                    ReasoningActivityEvent::PartCompleted {
+                        activity_id: "reasoning-1".to_string(),
+                        activity_order: 0,
+                        part_id: "raw-0".to_string(),
+                        kind: ReasoningContentKind::Raw,
+                        role: ReasoningContentRole::Detail,
+                        part_order: 1,
+                        text: "raw detail".to_string(),
+                    },
+                    ReasoningActivityEvent::Finished {
+                        activity_id: "reasoning-1".to_string(),
+                        activity_order: 0,
+                        status: ReasoningActivityStatus::Completed,
+                    },
+                ],
                 usage: None,
                 metadata: Vec::new(),
             },

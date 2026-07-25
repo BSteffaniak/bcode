@@ -2249,6 +2249,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn all_reasoning_activity_events_round_trip_without_provider_payload_fields() {
+        let events = [
+            ReasoningActivityEvent::Started {
+                activity_id: "reasoning-1".to_owned(),
+                order: 2,
+            },
+            ReasoningActivityEvent::PartDelta {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 2,
+                part_id: "summary-0".to_owned(),
+                kind: ReasoningContentKind::Summary,
+                role: ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: "Planning".to_owned(),
+            },
+            ReasoningActivityEvent::PartCompleted {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 2,
+                part_id: "raw-0".to_owned(),
+                kind: ReasoningContentKind::Raw,
+                role: ReasoningContentRole::Detail,
+                part_order: 1,
+                text: "Complete detail".to_owned(),
+            },
+            ReasoningActivityEvent::OpaqueObserved {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 2,
+            },
+            ReasoningActivityEvent::Finished {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 2,
+                status: ReasoningActivityStatus::Interrupted,
+            },
+        ];
+
+        for event in events {
+            let encoded = serde_json::to_string(&event).expect("reasoning event should encode");
+            let decoded = serde_json::from_str::<ReasoningActivityEvent>(&encoded)
+                .expect("reasoning event should decode");
+            assert_eq!(decoded, event);
+            assert_eq!(decoded.activity_id(), "reasoning-1");
+            assert_eq!(decoded.activity_order(), 2);
+            assert!(!encoded.contains("encrypted_content"));
+            assert!(!encoded.contains("provider_state"));
+        }
+    }
+
+    #[test]
     fn reasoning_activity_event_round_trips_without_opaque_bytes() {
         let event = ReasoningActivityEvent::PartCompleted {
             activity_id: "reasoning-1".to_owned(),

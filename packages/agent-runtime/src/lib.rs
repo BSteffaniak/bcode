@@ -2330,6 +2330,7 @@ fn terminal_after_visible_output(
             event,
             AgentRuntimeEvent::TextDelta(_)
                 | AgentRuntimeEvent::ReasoningDelta(_)
+                | AgentRuntimeEvent::ReasoningActivity(_)
                 | AgentRuntimeEvent::ToolCallStarted { .. }
                 | AgentRuntimeEvent::ToolCallDelta { .. }
                 | AgentRuntimeEvent::ToolCallFinished(_)
@@ -6693,6 +6694,64 @@ mod tests {
         assert_eq!(response.text, "hello world");
         assert_eq!(response.stop_reason, Some(StopReason::EndTurn));
         assert!(provider.finished);
+    }
+
+    #[tokio::test]
+    async fn streaming_text_turn_preserves_structured_reasoning_activity() {
+        let reasoning_events = [
+            bcode_session_models::ReasoningActivityEvent::Started {
+                activity_id: "reasoning-1".to_string(),
+                order: 0,
+            },
+            bcode_session_models::ReasoningActivityEvent::PartDelta {
+                activity_id: "reasoning-1".to_string(),
+                activity_order: 0,
+                part_id: "summary-0".to_string(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: "planning".to_string(),
+            },
+            bcode_session_models::ReasoningActivityEvent::OpaqueObserved {
+                activity_id: "reasoning-1".to_string(),
+                activity_order: 0,
+            },
+            bcode_session_models::ReasoningActivityEvent::Finished {
+                activity_id: "reasoning-1".to_string(),
+                activity_order: 0,
+                status: bcode_session_models::ReasoningActivityStatus::Completed,
+            },
+        ];
+        let mut provider_events = reasoning_events
+            .iter()
+            .cloned()
+            .map(|event| ProviderTurnEvent::ReasoningActivity { event })
+            .collect::<Vec<_>>();
+        provider_events.push(ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::EndTurn,
+        });
+        let provider = FakeProvider::new(provider_events);
+        let runtime = AgentRuntime::new();
+        let mut stream =
+            runtime.run_streaming_text_turn(provider, AgentTurnRequest::new("test-model", "hello"));
+        let mut observed = Vec::new();
+        let mut final_events = None;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                AgentRuntimeStreamItem::Event(AgentRuntimeEvent::ReasoningActivity(event)) => {
+                    observed.push(event);
+                }
+                AgentRuntimeStreamItem::Finished(response) => final_events = Some(response.events),
+                AgentRuntimeStreamItem::Event(_) | AgentRuntimeStreamItem::Error(_) => {}
+            }
+        }
+
+        assert_eq!(observed, reasoning_events);
+        let retained = final_events.expect("final response");
+        assert!(reasoning_events.iter().all(|expected| {
+            retained.contains(&AgentRuntimeEvent::ReasoningActivity(expected.clone()))
+        }));
     }
 
     #[tokio::test]

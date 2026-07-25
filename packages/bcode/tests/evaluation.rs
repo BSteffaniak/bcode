@@ -24,6 +24,7 @@ fn response() -> GenerateTextResponse {
                 round: 0,
                 text: "".to_string(),
                 reasoning: String::new(),
+                reasoning_events: Vec::new(),
                 usage: Some(usage.clone()),
                 metadata: Vec::new(),
             },

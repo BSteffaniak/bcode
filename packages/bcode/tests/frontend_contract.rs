@@ -1,8 +1,9 @@
 use bcode::{
     AgentEvent, FrontendContentBlock, FrontendEventCursor, FrontendSessionSnapshot,
     FrontendSnapshotApplyOutcome, FrontendSnapshotError, FrontendTurnStatus, MessageRole,
-    ModelContentBlock, ModelMessage, ProviderRequestProjection, SessionId, StopReason, TokenUsage,
-    ToolCall, ToolResult,
+    ModelContentBlock, ModelMessage, ProviderRequestProjection, ReasoningActivityEvent,
+    ReasoningActivityStatus, ReasoningContentKind, ReasoningContentRole, SessionId, StopReason,
+    TokenUsage, ToolCall, ToolResult,
 };
 
 fn transcript() -> Vec<ModelMessage> {
@@ -96,6 +97,42 @@ fn snapshot_materializes_complete_neutral_turn_and_round_trips() {
         AgentEvent::TurnStarted,
         AgentEvent::TextDelta("hello".to_string()),
         AgentEvent::ReasoningDelta("thinking".to_string()),
+        AgentEvent::ReasoningActivity(ReasoningActivityEvent::Started {
+            activity_id: "reasoning-1".to_string(),
+            order: 0,
+        }),
+        AgentEvent::ReasoningActivity(ReasoningActivityEvent::PartDelta {
+            activity_id: "reasoning-1".to_string(),
+            activity_order: 0,
+            part_id: "summary-0".to_string(),
+            kind: ReasoningContentKind::Summary,
+            role: ReasoningContentRole::Milestone,
+            part_order: 0,
+            text: "first heading".to_string(),
+        }),
+        AgentEvent::ReasoningActivity(ReasoningActivityEvent::PartCompleted {
+            activity_id: "reasoning-1".to_string(),
+            activity_order: 0,
+            part_id: "summary-0".to_string(),
+            kind: ReasoningContentKind::Summary,
+            role: ReasoningContentRole::Milestone,
+            part_order: 0,
+            text: "first heading complete".to_string(),
+        }),
+        AgentEvent::ReasoningActivity(ReasoningActivityEvent::PartCompleted {
+            activity_id: "reasoning-1".to_string(),
+            activity_order: 0,
+            part_id: "summary-1".to_string(),
+            kind: ReasoningContentKind::Summary,
+            role: ReasoningContentRole::Milestone,
+            part_order: 1,
+            text: "second heading".to_string(),
+        }),
+        AgentEvent::ReasoningActivity(ReasoningActivityEvent::Finished {
+            activity_id: "reasoning-1".to_string(),
+            activity_order: 0,
+            status: ReasoningActivityStatus::Completed,
+        }),
         AgentEvent::ToolCallFinished(call.clone()),
         AgentEvent::ToolResult(result.clone()),
         AgentEvent::Usage(usage.clone()),
@@ -118,7 +155,8 @@ fn snapshot_materializes_complete_neutral_turn_and_round_trips() {
     let turn = snapshot.active_turn.as_ref().expect("active turn snapshot");
     assert_eq!(turn.status, FrontendTurnStatus::Completed);
     assert_eq!(turn.text, "hello");
-    assert_eq!(turn.reasoning, "thinking");
+    assert_eq!(turn.reasoning, "first heading complete\n\nsecond heading");
+    assert_eq!(turn.reasoning_events.len(), 5);
     assert_eq!(turn.tool_calls, [call]);
     assert_eq!(turn.tool_results, [result]);
     assert_eq!(turn.usage, Some(usage));

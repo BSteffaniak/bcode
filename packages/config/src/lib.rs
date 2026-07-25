@@ -5764,6 +5764,26 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn thinking_defaults_to_all_and_preserves_explicit_legacy_modes() {
+        let default = BcodeConfig::default();
+        assert_eq!(default.tui.thinking.mode, super::TuiThinkingMode::All);
+        let rendered = super::config_to_toml(&default);
+        assert!(rendered.contains("[tui.thinking]\nshow = true\nmode = \"all\""));
+
+        for (name, expected) in [
+            ("summary", super::TuiThinkingMode::Summary),
+            ("raw", super::TuiThinkingMode::Raw),
+        ] {
+            let value: toml::Value =
+                toml::from_str(&format!("[tui.thinking]\nshow = true\nmode = \"{name}\"\n"))
+                    .expect("thinking config should parse");
+            let config = super::validate_config_value(value, "thinking config")
+                .expect("thinking config should validate");
+            assert_eq!(config.tui.thinking.mode, expected);
+        }
+    }
+
+    #[test]
     fn tool_execution_concurrency_is_unlimited_by_default_and_optionally_bounded() {
         let default = super::ToolExecutionConfig::default();
         assert_eq!(default.max_concurrency, None);
