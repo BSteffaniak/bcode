@@ -8,6 +8,15 @@ use bcode_skill_models::SkillId;
 use bcode_worktree_models::WorktreeListRequest;
 use std::path::PathBuf;
 
+/// Local execution context for backend-agnostic slash commands.
+#[derive(Debug, Clone, Copy)]
+pub struct SlashExecutionContext<'a> {
+    pub working_directory: &'a std::path::Path,
+    pub current_agent_id: &'a str,
+    pub reasoning_display_mode: bcode_config::TuiThinkingMode,
+    pub reasoning_visible: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommandOutcome {
     /// Command was handled in-place.
@@ -244,11 +253,17 @@ async fn thinking_command(
     client: &BcodeClient,
     session_id: SessionId,
     parts: &[&str],
+    display_mode: bcode_config::TuiThinkingMode,
+    display_visible: bool,
 ) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
     let status = client.session_model_status(session_id).await?;
     match parts.get(1).copied() {
         Some("capabilities") => Ok(SlashCommandOutcome::Handled(thinking_capabilities(&status))),
-        Some("status") => Ok(SlashCommandOutcome::Handled(thinking_status(&status))),
+        Some("status") => Ok(SlashCommandOutcome::Handled(thinking_status(
+            &status,
+            display_mode,
+            display_visible,
+        ))),
         None => Ok(SlashCommandOutcome::OpenThinkingSettings(
             super::thinking_dialog::ThinkingDialogFocus::Display,
         )),
@@ -352,7 +367,19 @@ fn unsupported_reasoning_value(
     ))
 }
 
-fn thinking_status(status: &bcode_ipc::SessionModelStatus) -> String {
+const fn thinking_mode_label(mode: bcode_config::TuiThinkingMode) -> &'static str {
+    match mode {
+        bcode_config::TuiThinkingMode::All => "all",
+        bcode_config::TuiThinkingMode::Summary => "summary",
+        bcode_config::TuiThinkingMode::Raw => "raw",
+    }
+}
+
+fn thinking_status(
+    status: &bcode_ipc::SessionModelStatus,
+    display_mode: bcode_config::TuiThinkingMode,
+    display_visible: bool,
+) -> String {
     let effort = status
         .reasoning_effort
         .as_deref()
@@ -374,7 +401,8 @@ fn thinking_status(status: &bcode_ipc::SessionModelStatus) -> String {
         })
         .unwrap_or("not requested");
     format!(
-        "reasoning output: effort={effort}, visible_summary={summary}{}",
+        "reasoning request: effort={effort}, provider_summary={summary}\nlocal display: visible={display_visible}, mode={}{}",
+        thinking_mode_label(display_mode),
         status
             .reasoning
             .as_ref()
@@ -626,24 +654,14 @@ fn slash_client_issue(label: &str, error: &bcode_client::ClientError) -> SlashCo
 pub async fn execute_resolved(
     client: &BcodeClient,
     session_id: Option<SessionId>,
-    working_directory: &std::path::Path,
-    current_agent_id: &str,
+    context: SlashExecutionContext<'_>,
     message: &str,
     resolution: slash_registry::SlashResolution,
 ) -> Result<SlashCommandOutcome, bcode_client::ClientError> {
     let parts = message.split_whitespace().collect::<Vec<_>>();
     let outcome = match resolution {
         slash_registry::SlashResolution::Builtin(command) => {
-            execute_builtin(
-                client,
-                session_id,
-                working_directory,
-                current_agent_id,
-                message,
-                &parts,
-                command.name(),
-            )
-            .await
+            execute_builtin(client, session_id, context, message, &parts, command.name()).await
         }
         slash_registry::SlashResolution::SkillAlias {
             skill_id,
@@ -673,8 +691,7 @@ pub async fn execute_resolved(
 async fn execute_builtin(
     client: &BcodeClient,
     session_id: Option<SessionId>,
-    working_directory: &std::path::Path,
-    current_agent_id: &str,
+    context: SlashExecutionContext<'_>,
     message: &str,
     parts: &[&str],
     command: &str,
@@ -690,7 +707,7 @@ async fn execute_builtin(
         }),
         "new" => Ok(SlashCommandOutcome::NewDraftSession),
         "plan" | "build" | "agent" => {
-            handle_agent_command(client, session_id, current_agent_id, parts).await
+            handle_agent_command(client, session_id, context.current_agent_id, parts).await
         }
         "compact" => {
             let Some(session_id) = session_id else {
@@ -774,7 +791,7 @@ async fn execute_builtin(
             Ok(cwd_command(session_id, parts))
         }
         "worktree" | "worktrees" => {
-            worktree_command(client, session_id, working_directory, parts).await
+            worktree_command(client, session_id, context.working_directory, parts).await
         }
         "fork" => {
             if session_id.is_none() {
@@ -820,7 +837,14 @@ async fn execute_builtin(
             let Some(session_id) = session_id else {
                 return Ok(draft_thinking_command(parts));
             };
-            thinking_command(client, session_id, parts).await
+            thinking_command(
+                client,
+                session_id,
+                parts,
+                context.reasoning_display_mode,
+                context.reasoning_visible,
+            )
+            .await
         }
         "timeline" => Ok(SlashCommandOutcome::OpenTimeline),
         "stop" => {
@@ -855,6 +879,56 @@ async fn execute_builtin(
 mod tests {
     use super::*;
     use bcode_ralph::RalphPromptKind;
+
+    #[test]
+    fn thinking_mode_slash_parser_covers_every_local_mode() {
+        for (value, mode) in [
+            ("all", bcode_config::TuiThinkingMode::All),
+            ("summary", bcode_config::TuiThinkingMode::Summary),
+            ("raw", bcode_config::TuiThinkingMode::Raw),
+        ] {
+            assert_eq!(
+                draft_thinking_command(&["/thinking", "mode", value]),
+                SlashCommandOutcome::SetThinkingMode(mode)
+            );
+        }
+        assert!(matches!(
+            draft_thinking_command(&["/thinking", "mode", "other"]),
+            SlashCommandOutcome::Handled(message) if message.contains("supported: all, summary, raw")
+        ));
+    }
+
+    #[test]
+    fn thinking_status_distinguishes_provider_request_from_local_display() {
+        let status = bcode_ipc::SessionModelStatus {
+            provider_plugin_id: Some("provider".to_owned()),
+            requested_model_id: Some("model".to_owned()),
+            effective_model_id: Some("model".to_owned()),
+            model_id: Some("model".to_owned()),
+            context_window: None,
+            context_occupancy: None,
+            request_context_error: None,
+            auth_profile: None,
+            context_format_version: None,
+            compatibility_key: None,
+            max_output_tokens: None,
+            reasoning: None,
+            reasoning_effort: Some("high".to_owned()),
+            reasoning_summary: Some("detailed".to_owned()),
+            prompt_cache_mode: None,
+            conversation_reuse_mode: None,
+            compaction_mode: None,
+            compaction_backend: None,
+            proactive_compaction_threshold_percent: None,
+            cache: None,
+            metadata_source: None,
+            pricing: None,
+        };
+
+        let text = thinking_status(&status, bcode_config::TuiThinkingMode::Raw, false);
+        assert!(text.contains("reasoning request: effort=high, provider_summary=detailed"));
+        assert!(text.contains("local display: visible=false, mode=raw"));
+    }
 
     #[test]
     fn skill_details_formatter_preserves_markdown_instructions() {

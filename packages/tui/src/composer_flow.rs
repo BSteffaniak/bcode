@@ -115,10 +115,15 @@ async fn handle_slash_command<W: Write>(
     match slash_commands::execute_resolved(
         services.passive_client,
         session_id,
-        chat.app
-            .working_directory()
-            .unwrap_or(services.launch_working_directory),
-        chat.app.current_agent_id(),
+        slash_commands::SlashExecutionContext {
+            working_directory: chat
+                .app
+                .working_directory()
+                .unwrap_or(services.launch_working_directory),
+            current_agent_id: chat.app.current_agent_id(),
+            reasoning_display_mode: chat.app.reasoning_display_mode(),
+            reasoning_visible: chat.app.reasoning_visible(),
+        },
         message,
         resolution,
     )
