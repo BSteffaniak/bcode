@@ -1548,7 +1548,13 @@ fn shell_recording_commit_observer(
             cancellation,
         ),
     ));
+    let skip_initial_empty_commit = Arc::new(std::sync::atomic::AtomicBool::new(true));
     Arc::new(move |commit| {
+        if skip_initial_empty_commit.swap(false, std::sync::atomic::Ordering::Relaxed)
+            && !commit.finalized
+        {
+            return;
+        }
         let artifact = ToolContributionArtifact {
             artifact_id: format!("{tool_call_id}-shell-run"),
             reference_key: SHELL_RECORDING_REF_KEY.to_owned(),
@@ -2533,7 +2539,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        assert!(artifact_updates.len() >= 2);
+        assert!(!artifact_updates.is_empty());
         assert!(
             artifact_updates
                 .windows(2)

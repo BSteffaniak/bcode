@@ -561,8 +561,8 @@ if ! grep -F 'server_question_exchange_completes_original_plugin_invocation' pac
   violations=1
 fi
 
-if ! grep -F 'server_persists_filesystem_progress_as_neutral_lifecycle_only' packages/server/src/lib.rs >/dev/null; then
-  echo "Runtime architecture violation: production neutral plugin progress persistence coverage was removed." >&2
+if ! grep -F 'server_keeps_filesystem_progress_live_and_persists_terminal_lifecycle' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: live plugin progress and terminal lifecycle coverage was removed." >&2
   violations=1
 fi
 
@@ -664,7 +664,7 @@ if ! grep -F 'orchestration_emits_exactly_one_started_and_terminal_lifecycle_per
    ! grep -F 'generic_lifecycle_drives_tui_activity_until_terminal_event' packages/tui/src/app.rs >/dev/null ||
    ! grep -F 'hyperchad_preserves_compact_single_tool_activity_until_terminal_event' packages/hyperchad/src/lib.rs >/dev/null ||
    ! grep -F 'session_invocation_sink_flushes_accepted_events_in_order_and_then_closes' packages/server/src/lib.rs >/dev/null ||
-   ! grep -F 'server_persists_filesystem_progress_as_neutral_lifecycle_only' packages/server/src/lib.rs >/dev/null; then
+   ! grep -F 'server_keeps_filesystem_progress_live_and_persists_terminal_lifecycle' packages/server/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: orchestration-owned lifecycle coverage was removed." >&2
   violations=1
 fi

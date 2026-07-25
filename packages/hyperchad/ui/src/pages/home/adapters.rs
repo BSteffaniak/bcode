@@ -126,6 +126,14 @@ pub(super) static VISUAL_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), Visual
                 render_filesystem_request as VisualAdapter,
             ),
             (
+                ("bcode.filesystem.request-draft.write", 1),
+                render_filesystem_request_draft as VisualAdapter,
+            ),
+            (
+                ("bcode.filesystem.request-draft.edit", 1),
+                render_filesystem_request_draft as VisualAdapter,
+            ),
+            (
                 ("bcode.filesystem.change", 1),
                 render_filesystem_change as VisualAdapter,
             ),
@@ -208,6 +216,14 @@ pub(super) static VISUAL_ADAPTERS: LazyLock<BTreeMap<(&'static str, u32), Visual
             (
                 ("bcode.vim-edit.request.apply", 1),
                 render_vim_edit_request as VisualAdapter,
+            ),
+            (
+                ("bcode.vim-edit.request-draft.preview", 1),
+                render_vim_edit_request_draft as VisualAdapter,
+            ),
+            (
+                ("bcode.vim-edit.request-draft.apply", 1),
+                render_vim_edit_request_draft as VisualAdapter,
             ),
             (
                 ("bcode.vim-edit.live", 1),
@@ -1354,6 +1370,47 @@ pub(super) fn render_filesystem_request(
     })
 }
 
+pub(super) fn render_filesystem_request_draft(
+    visual: &bcode_session_models::ToolContributionEvent,
+) -> Option<Containers> {
+    let preview = visual.payload.get("preview")?.as_str()?;
+    let arguments = serde_json::from_str::<serde_json::Value>(preview).ok();
+    let path = arguments
+        .as_ref()
+        .and_then(|value| value.get("path"))
+        .and_then(serde_json::Value::as_str);
+    let operation = if visual.schema == "bcode.filesystem.request-draft.edit" {
+        "edit"
+    } else {
+        "write"
+    };
+    let argument_bytes = visual
+        .payload
+        .get("argument_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let truncated = visual
+        .payload
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Some(container! {
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { (format!("Filesystem {operation} · assembling…")) }
+            @if let Some(path) = path {
+                div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
+            }
+            div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { (argument_bytes.to_string()) " argument bytes" }
+            @if arguments.is_none() && !preview.is_empty() {
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "incomplete arguments" }
+            }
+            @if truncated {
+                div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::XS)) { "Preview truncated." }
+            }
+        }
+    })
+}
+
 pub(super) fn render_filesystem_change(
     visual: &bcode_session_models::ToolContributionEvent,
 ) -> Option<Containers> {
@@ -1452,6 +1509,49 @@ pub(super) fn render_vim_edit_playback(
             @if let Some(diff) = diff { (vim_diff_panel(diff, diff_truncated)) }
             @if let Some(error) = error { div color=(color::ERROR) font-size=((typeface::LABEL)) margin-top=((space::S6)) white-space="preserve-wrap" { (error) } }
             @if payload.get("frames_truncated").and_then(serde_json::Value::as_bool) == Some(true) { div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "Playback frames were truncated." } }
+        }
+    })
+}
+
+pub(super) fn render_vim_edit_request_draft(
+    visual: &bcode_session_models::ToolContributionEvent,
+) -> Option<Containers> {
+    let preview = visual.payload.get("preview")?.as_str()?;
+    let arguments = serde_json::from_str::<serde_json::Value>(preview).ok();
+    let single_path = arguments
+        .as_ref()
+        .and_then(|value| value.get("path"))
+        .and_then(serde_json::Value::as_str);
+    let files = arguments
+        .as_ref()
+        .and_then(|value| value.get("files"))
+        .and_then(serde_json::Value::as_array);
+    let argument_bytes = visual
+        .payload
+        .get("argument_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_default();
+    let truncated = visual
+        .payload
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    Some(container! {
+        div border=((1, surface::BORDER)) border-radius=((radius::CONTROL)) background=(surface::INSET) padding=((space::S10)) margin-top=((space::SM)) {
+            div color=(color::INFO) margin-bottom=((space::S6)) { "Vim edit · assembling…" }
+            @if let Some(path) = single_path {
+                div color=(color::STRONG) font-family="monospace" white-space="preserve-wrap" { (path) }
+            }
+            @if let Some(files) = files {
+                div color=(color::STRONG) { (files.len().to_string()) " files" }
+            }
+            div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { (argument_bytes.to_string()) " argument bytes" }
+            @if arguments.is_none() && !preview.is_empty() {
+                div color=(color::MUTED) font-size=((typeface::LABEL)) margin-top=((space::XS)) { "incomplete arguments" }
+            }
+            @if truncated {
+                div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::XS)) { "Preview truncated." }
+            }
         }
     })
 }

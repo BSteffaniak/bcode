@@ -2116,6 +2116,13 @@ fn visual_adapter_fixture(schema: &str) -> serde_json::Value {
             "old_text": "old",
             "new_text": "new"
         }),
+        "bcode.filesystem.request-draft.write" | "bcode.filesystem.request-draft.edit" => {
+            return serde_json::json!({
+                "preview": "{\"path\":\"/tmp/fixture.rs\",\"contents\":\"partial",
+                "argument_bytes": 52,
+                "truncated": false
+            });
+        }
         schema if schema.starts_with("bcode.filesystem") => serde_json::json!({
             "operation": schema.rsplit('.').next().unwrap_or("filesystem"),
             "path": "/tmp/fixture.rs"
@@ -2154,6 +2161,13 @@ fn visual_adapter_fixture(schema: &str) -> serde_json::Value {
                 "path": "/tmp/fixture.rs",
                 "steps": [{"insert": "fixture"}]
             })
+        }
+        "bcode.vim-edit.request-draft.preview" | "bcode.vim-edit.request-draft.apply" => {
+            return serde_json::json!({
+                "preview": "{\"path\":\"/tmp/fixture.rs\",\"steps\":[",
+                "argument_bytes": 42,
+                "truncated": false
+            });
         }
         "bcode.vim-edit.live" => serde_json::json!({
             "phase": "running",
@@ -2203,7 +2217,7 @@ fn hyperchad_registry_exactly_covers_manifest_owned_visual_schemas() {
         .collect::<std::collections::BTreeSet<_>>();
 
     assert_eq!(actual, expected);
-    assert_eq!(actual.len(), 39);
+    assert_eq!(actual.len(), 43);
 }
 
 #[test]

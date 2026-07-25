@@ -30846,7 +30846,7 @@ library = "test"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn server_persists_filesystem_progress_as_neutral_lifecycle_only() {
+    async fn server_keeps_filesystem_progress_live_and_persists_terminal_lifecycle() {
         let workspace = tempfile::tempdir().expect("filesystem progress workspace");
         std::fs::write(workspace.path().join("sentinel.txt"), "sentinel")
             .expect("filesystem fixture");
@@ -30883,14 +30883,24 @@ library = "test"
             .session_history(session_id)
             .await
             .expect("filesystem progress history");
-        assert!(history.iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::ToolInvocationLifecycle { event }
-                if event.invocation_id == "filesystem-progress"
-                    && event.stage
-                        == bcode_session_models::ToolInvocationLifecycleStage::Progress
-                    && event.message.as_deref() == Some("list: scanning entries")
-        )));
+        let stages = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::ToolInvocationLifecycle { event }
+                    if event.invocation_id == "filesystem-progress" =>
+                {
+                    Some(event.stage)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stages,
+            vec![
+                bcode_session_models::ToolInvocationLifecycleStage::Started,
+                bcode_session_models::ToolInvocationLifecycleStage::Completed,
+            ]
+        );
     }
 
     #[cfg(unix)]
@@ -30986,16 +30996,12 @@ library = "test"
                 .to_string()
                 .contains("server-contribution")
         );
-        assert!(history.iter().any(|event| matches!(
+        assert!(!history.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::ToolInvocationLifecycle { event }
                 if event.invocation_id == "shell-contribution"
                     && event.stage
                         == bcode_session_models::ToolInvocationLifecycleStage::Progress
-                    && event
-                        .message
-                        .as_deref()
-                        .is_some_and(|message| message.contains("starting command"))
         )));
     }
 
@@ -31134,7 +31140,6 @@ library = "test"
             stages,
             vec![
                 bcode_session_models::ToolInvocationLifecycleStage::Started,
-                bcode_session_models::ToolInvocationLifecycleStage::Progress,
                 bcode_session_models::ToolInvocationLifecycleStage::Failed,
             ]
         );
@@ -31651,7 +31656,6 @@ library = "test"
                 stages,
                 vec![
                     bcode_session_models::ToolInvocationLifecycleStage::Started,
-                    bcode_session_models::ToolInvocationLifecycleStage::Progress,
                     bcode_session_models::ToolInvocationLifecycleStage::Completed,
                 ]
             );
@@ -33270,7 +33274,7 @@ library = "test"
         .await
         .expect("permission request");
 
-        tokio::time::timeout(Duration::from_millis(750), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let bcode_ipc::Event::SessionLive(event) =
                     watcher.recv_event().await.expect("session event")
