@@ -452,6 +452,15 @@ if [[ "$migration_call_count" != "2" ]]; then
   violations=1
 fi
 
+if ! rg -q 'db\.validate_write_readiness\(\)\.await\?' packages/session/src/lib.rs \
+  || ! sed -n '/async fn load_persistent_session/,/async fn release_persistent_idle_session_resources/p' packages/session/src/lib.rs | grep -q 'acquire_session_lease_for_load' \
+  || ! sed -n '/async fn load_persistent_session/,/async fn release_persistent_idle_session_resources/p' packages/session/src/lib.rs | grep -q 'validate_write_readiness' \
+  || ! sed -n '/async fn ensure_cached_session_loaded/,/async fn acquire_session_lease_for_load/p' packages/session/src/lib.rs | grep -q 'validate_write_readiness' \
+  || ! rg -q 'write_readiness_uses_actor_connection_before_followup_append' packages/session/src/lib.rs; then
+  echo "Session runtime-readiness violation: current attach/load must acquire runtime ownership before validating write readiness, including lease reacquisition." >&2
+  violations=1
+fi
+
 if rg -n 'open_turso_in_root\(session_id, root\)' packages/session/src/repair.rs >/tmp/bcode-repair-mutating-open-violations.txt; then
   echo "Session repair violation: doctor/validation paths must use existing non-migrating opens." >&2
   cat /tmp/bcode-repair-mutating-open-violations.txt >&2

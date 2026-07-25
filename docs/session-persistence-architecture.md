@@ -325,7 +325,9 @@ BCODE_MIGRATION_BENCHMARK_PROFILE=large cargo test -p bcode_session benchmark_ge
 The same host measured current-session preparation over 100 runs at 5,768 µs median, 6,433 µs
 p95, and 6,911 µs maximum. The enforced release gate is p95 at or below 25 ms. Migration release
 gates are 1,000 / 30,000 / 240,000 ms total duration and 1 / 8 / 32 MiB database growth for the
-100 / 5,000 / 50,000-event profiles, with final WAL required to be zero after checkpoint. These
+100 / 5,000 / 50,000-event profiles, with final WAL required to be zero after checkpoint. Peak RSS
+must remain effectively event-count-independent across those profiles; the recorded release
+baseline range is 220.7–221.4 MB. These
 ceilings deliberately provide headroom over the measured debug-build results while still catching
 order-of-magnitude regressions:
 
@@ -394,7 +396,9 @@ retained backup before running maintenance.
 
 A stalled or failed migration must remain visible as a classified terminal state. Retrying,
 leaving the picker, or disconnecting an observer must never silently downgrade the failure or
-remove its retained backup path.
+remove its retained backup path. `WaitingForOwnership` is reserved for non-terminal acquisition
+progress. A concrete live-owner refusal terminates as `Failed` with `OwnedByOtherDaemon`; after the
+owner releases, retry starts a fresh operation rather than rewriting the terminal result.
 
 ## Finalized artifact references
 
