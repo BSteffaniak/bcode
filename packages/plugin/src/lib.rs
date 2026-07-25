@@ -1130,6 +1130,8 @@ pub enum PluginLoadError {
         tool_name: String,
         plugin_ids: Vec<String>,
     },
+    #[error("plugin '{plugin_id}' tool catalog validation failed: {message}")]
+    ToolCatalogValidation { plugin_id: String, message: String },
     #[error("plugin is not loaded: {0}")]
     PluginNotLoaded(String),
     #[error("no loaded plugin declares service interface '{0}'")]
@@ -3481,6 +3483,7 @@ impl PluginHost {
         host.load_static_plugins_into(&static_plugins)?;
         host.load_registered_plugins_into(&plugins)?;
         validate_tool_presentation_declarations(host.loaded.iter().map(LoadedPlugin::manifest))?;
+        host.validate_tool_presentation_ownership()?;
         Ok(host)
     }
 
@@ -3493,6 +3496,7 @@ impl PluginHost {
         validate_tool_presentation_declarations(plugins.iter().map(|plugin| &plugin.manifest))?;
         let mut host = Self::default();
         host.load_registered_plugins_into(plugins)?;
+        host.validate_tool_presentation_ownership()?;
         Ok(host)
     }
 
@@ -3507,6 +3511,7 @@ impl PluginHost {
         validate_tool_presentation_declarations(plugins.iter().map(|(manifest, _)| manifest))?;
         let mut host = Self::default();
         host.load_static_plugins_into(plugins)?;
+        host.validate_tool_presentation_ownership()?;
         Ok(host)
     }
 
@@ -3569,6 +3574,69 @@ impl PluginHost {
             loaded.register_commands(&mut self.command_registry)?;
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "plugin activated");
             self.loaded.push(loaded);
+        }
+        Ok(())
+    }
+
+    fn validate_loaded_tool_presentation_ownership(
+        &self,
+        plugin_id: &str,
+        tools: &bcode_tool::ToolList,
+    ) -> Result<(), PluginLoadError> {
+        let names = tools
+            .tools
+            .iter()
+            .map(|definition| definition.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let manifest = self
+            .loaded
+            .iter()
+            .find(|plugin| plugin.manifest().id == plugin_id)
+            .map(LoadedPlugin::manifest)
+            .ok_or_else(|| PluginLoadError::PluginNotLoaded(plugin_id.to_owned()))?;
+        for presentation in &manifest.tool_presentations {
+            if !names.contains(presentation.tool_name.as_str()) {
+                return Err(PluginLoadError::InvalidToolPresentation {
+                    plugin_id: plugin_id.to_owned(),
+                    tool_name: presentation.tool_name.clone(),
+                    reason: "the plugin does not expose this exact name from list_tools".to_owned(),
+                });
+            }
+        }
+        for tool_name in names {
+            if let Some(owner) = self.loaded.iter().find(|plugin| {
+                plugin.manifest().id != plugin_id
+                    && plugin
+                        .manifest()
+                        .tool_presentations
+                        .iter()
+                        .any(|presentation| presentation.tool_name == tool_name)
+            }) {
+                return Err(PluginLoadError::AmbiguousToolPresentation {
+                    tool_name: tool_name.to_owned(),
+                    plugin_ids: vec![plugin_id.to_owned(), owner.manifest().id.clone()],
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_tool_presentation_ownership(&self) -> Result<(), PluginLoadError> {
+        for plugin in &self.loaded {
+            if plugin.manifest().tool_presentations.is_empty() {
+                continue;
+            }
+            let tools = plugin
+                .invoke_service_json::<_, bcode_tool::ToolList>(
+                    bcode_tool::TOOL_SERVICE_INTERFACE_ID,
+                    bcode_tool::OP_LIST_TOOLS,
+                    &bcode_tool::ListToolsRequest::default(),
+                )
+                .map_err(|error| PluginLoadError::ToolCatalogValidation {
+                    plugin_id: plugin.manifest().id.clone(),
+                    message: error.to_string(),
+                })?;
+            self.validate_loaded_tool_presentation_ownership(&plugin.manifest().id, &tools)?;
         }
         Ok(())
     }
@@ -4706,6 +4774,47 @@ library = "libexample_plugin.dylib"
             error,
             PluginLoadError::AmbiguousToolPresentation { tool_name, .. }
                 if tool_name == "duplicate.tool"
+        ));
+    }
+
+    #[test]
+    fn validates_tool_presentation_catalog_ownership() {
+        let mut manifest = test_manifest("bcode.catalog-owner");
+        manifest.tool_presentations = vec![PluginToolPresentationDeclaration {
+            tool_name: "expected.tool".to_owned(),
+            request_draft_schema: "test.draft".to_owned(),
+            request_draft_schema_version: 1,
+            request_draft_placement: PluginToolPresentationPlacement::Result,
+        }];
+        let loaded = LoadedPlugin {
+            config: ResolvedPluginConfig::default(),
+            manifest,
+            backend: LoadedPluginBackend::Static {
+                vtable: test_streaming_vtable(),
+            },
+        };
+        let host = PluginHost {
+            loaded: vec![loaded],
+            configs: BTreeMap::new(),
+            command_registry: bcode_command::CommandRegistry::new(),
+        };
+
+        let error = host
+            .validate_loaded_tool_presentation_ownership(
+                "bcode.catalog-owner",
+                &bcode_tool::ToolList {
+                    tools: vec![bcode_tool::ToolDefinition {
+                        name: "different.tool".to_owned(),
+                        description: String::new(),
+                        input_schema: serde_json::json!({}),
+                    }],
+                },
+            )
+            .expect_err("manifest tool names must match the runtime catalog");
+        assert!(matches!(
+            error,
+            PluginLoadError::InvalidToolPresentation { reason, .. }
+                if reason == "the plugin does not expose this exact name from list_tools"
         ));
     }
 
