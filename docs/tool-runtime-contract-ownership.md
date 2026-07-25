@@ -89,6 +89,25 @@ This shape is intentional:
 
 Allocation and finalize operations are therefore not part of the stable bounded v1 API.
 
+### High-rate transient progress
+
+Execution progress is plugin-owned, live-only presentation state. Plugins publish it as placed
+`Progress` contribution envelopes with transient persistence and monotonic sequence identity.
+High-rate schemas must support bounded latest-state materialization: each accepted `Upsert` must be
+independently renderable from one bounded envelope, and any `Append` schema must let the host retain
+or synthesize one bounded checkpoint without preserving append history. A schema that requires
+replaying every prior append is not valid for high-rate progress.
+
+The scoped plugin SDK publisher is the default extension point because it fixes invocation,
+contribution, producer, schema, placement, persistence, sequence, host byte limits, cadence,
+cancellation, and terminal removal. The low-level envelope API remains available for advanced
+bounded schemas, but server validation and accounting remain authoritative.
+
+Terminal removal dominates its sequence: duplicate, stale, and same-generation post-terminal
+updates cannot recreate state. A later monotonic sequence may begin a new active generation. The
+server retains only the current bounded envelope for attach/resynchronization and never writes
+these updates to durable history.
+
 ## Detached cleanup completion
 
 Local cancellation changes active runtime work to `Cancelling` before cleanup begins. Detached cleanup completion does not remove or finish that work item; only termination of the owning operation does. Cleanup completion and failure are emitted as diagnostic tracing with session/work or provider/turn identity. Failures never reverse local cancellation and are never returned through the cancellation acknowledgement.

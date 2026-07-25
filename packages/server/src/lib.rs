@@ -5858,23 +5858,85 @@ async fn handle_rename_session(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ActiveContributionKey {
-    session: SessionId,
-    invocation: String,
-    contribution: String,
+enum ActiveLiveStateKey {
+    Contribution {
+        session: SessionId,
+        invocation: String,
+        contribution: String,
+    },
+    ToolRequestDraft {
+        session: SessionId,
+        turn_id: String,
+        tool_call_id: String,
+    },
+}
+
+impl ActiveLiveStateKey {
+    fn contribution(
+        session: SessionId,
+        invocation: impl Into<String>,
+        contribution: impl Into<String>,
+    ) -> Self {
+        Self::Contribution {
+            session,
+            invocation: invocation.into(),
+            contribution: contribution.into(),
+        }
+    }
+
+    fn tool_request_draft(
+        session: SessionId,
+        turn_id: impl Into<String>,
+        tool_call_id: impl Into<String>,
+    ) -> Self {
+        Self::ToolRequestDraft {
+            session,
+            turn_id: turn_id.into(),
+            tool_call_id: tool_call_id.into(),
+        }
+    }
+
+    const fn session(&self) -> SessionId {
+        match self {
+            Self::Contribution { session, .. } | Self::ToolRequestDraft { session, .. } => *session,
+        }
+    }
+
+    fn is_contribution_for(&self, session_id: SessionId, invocation_id: &str) -> bool {
+        matches!(
+            self,
+            Self::Contribution {
+                session,
+                invocation,
+                ..
+            } if *session == session_id && invocation == invocation_id
+        )
+    }
+
+    #[cfg(test)]
+    fn is_tool_request_draft_for(&self, session_id: SessionId, tool_call_id: &str) -> bool {
+        matches!(
+            self,
+            Self::ToolRequestDraft {
+                session,
+                tool_call_id: current,
+                ..
+            } if *session == session_id && current == tool_call_id
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ActiveContribution {
+    envelope: bcode_session_models::ToolContributionEnvelope,
+    encoded_bytes: usize,
 }
 
 #[derive(Debug, Default)]
 struct ActiveContributionRegistry {
-    envelopes: BTreeMap<ActiveContributionKey, bcode_session_models::ToolContributionEnvelope>,
+    envelopes: BTreeMap<ActiveLiveStateKey, ActiveContribution>,
+    terminal_sequences: BTreeMap<ActiveLiveStateKey, u64>,
     session_bytes: BTreeMap<SessionId, usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ActiveToolRequestDraftKey {
-    session: SessionId,
-    turn_id: String,
-    tool_call_id: String,
 }
 
 #[derive(Debug, Clone)]
@@ -5886,8 +5948,8 @@ struct ActiveToolRequestDraft {
 
 #[derive(Debug, Default)]
 struct ActiveToolRequestDraftRegistry {
-    drafts: BTreeMap<ActiveToolRequestDraftKey, ActiveToolRequestDraft>,
-    terminal_revisions: BTreeMap<ActiveToolRequestDraftKey, (u64, u64)>,
+    drafts: BTreeMap<ActiveLiveStateKey, ActiveToolRequestDraft>,
+    terminal_revisions: BTreeMap<ActiveLiveStateKey, (u64, u64)>,
     session_bytes: BTreeMap<SessionId, usize>,
 }
 
@@ -13552,11 +13614,11 @@ async fn publish_tool_request_draft_live(
     session_id: SessionId,
     event: bcode_session_models::ToolRequestDraftEvent,
 ) {
-    let key = ActiveToolRequestDraftKey {
-        session: session_id,
-        turn_id: event.turn_id.clone(),
-        tool_call_id: event.tool_call_id.clone(),
-    };
+    let key = ActiveLiveStateKey::tool_request_draft(
+        session_id,
+        event.turn_id.clone(),
+        event.tool_call_id.clone(),
+    );
     let terminal_update = matches!(
         event.operation,
         bcode_session_models::ToolRequestDraftOperation::Remove { .. }
@@ -13618,7 +13680,7 @@ async fn publish_tool_request_draft_live(
             let session_count = registry
                 .drafts
                 .keys()
-                .filter(|draft_key| draft_key.session == session_id)
+                .filter(|draft_key| draft_key.session() == session_id)
                 .count();
             if current.is_none() && session_count >= MAX_ACTIVE_TOOL_REQUEST_DRAFTS_PER_SESSION {
                 return false;
@@ -13693,7 +13755,7 @@ fn active_tool_request_draft_snapshot_events(
             registry
                 .drafts
                 .iter()
-                .filter(|(key, _)| key.session == session_id)
+                .filter(|(key, _)| key.session() == session_id)
                 .map(|(_, draft)| bcode_session_models::SessionLiveEvent {
                     session_id,
                     kind: SessionLiveEventKind::ToolRequestDraft {
@@ -17756,6 +17818,7 @@ const MAX_ACTIVE_CONTRIBUTION_BYTES: usize = 256 * 1024;
 const MAX_ACTIVE_CONTRIBUTIONS_PER_SESSION: usize = 256;
 const MAX_ACTIVE_CONTRIBUTION_BYTES_PER_SESSION: usize = 8 * 1024 * 1024;
 
+#[allow(clippy::too_many_lines)] // Validation, terminal dominance, and accounting remain atomic under one lock.
 fn update_active_contribution(
     state: &ServerState,
     session_id: SessionId,
@@ -17785,17 +17848,24 @@ fn update_active_contribution(
             "active contribution exceeds {MAX_ACTIVE_CONTRIBUTION_BYTES} bytes"
         ));
     }
-    let key = ActiveContributionKey {
-        session: session_id,
-        invocation: event.invocation_id.clone(),
-        contribution: event.contribution_id.clone(),
-    };
+    let key = ActiveLiveStateKey::contribution(
+        session_id,
+        event.invocation_id.clone(),
+        event.contribution_id.clone(),
+    );
     let mut registry = state
         .active_contributions
         .lock()
         .map_err(|_| "active contribution registry poisoned".to_owned())?;
+    if registry
+        .terminal_sequences
+        .get(&key)
+        .is_some_and(|sequence| event.sequence <= *sequence)
+    {
+        return Ok(false);
+    }
     let replaced_bytes = if let Some(current) = registry.envelopes.get(&key) {
-        let current_event = &current.contribution;
+        let current_event = &current.envelope.contribution;
         if event.sequence <= current_event.sequence {
             return Ok(false);
         }
@@ -17803,13 +17873,11 @@ fn update_active_contribution(
             || event.schema != current_event.schema
             || event.schema_version != current_event.schema_version
             || event.persistence != current_event.persistence
-            || envelope.placement != current.placement
+            || envelope.placement != current.envelope.placement
         {
             return Err("active contribution immutable identity changed".to_owned());
         }
-        serde_json::to_vec(current)
-            .map_err(|error| format!("failed to measure active contribution envelope: {error}"))?
-            .len()
+        current.encoded_bytes
     } else {
         0
     };
@@ -17821,12 +17889,14 @@ fn update_active_contribution(
                 registry.session_bytes.remove(&session_id);
             }
         }
+        registry.terminal_sequences.insert(key, event.sequence);
         return Ok(true);
     }
+    registry.terminal_sequences.remove(&key);
     let session_count = registry
         .envelopes
         .keys()
-        .filter(|existing| existing.session == session_id)
+        .filter(|existing| existing.session() == session_id)
         .count();
     if !registry.envelopes.contains_key(&key)
         && session_count >= MAX_ACTIVE_CONTRIBUTIONS_PER_SESSION
@@ -17848,7 +17918,13 @@ fn update_active_contribution(
             "active contributions exceed the per-session {MAX_ACTIVE_CONTRIBUTION_BYTES_PER_SESSION} byte limit"
         ));
     }
-    registry.envelopes.insert(key, envelope.clone());
+    registry.envelopes.insert(
+        key,
+        ActiveContribution {
+            envelope: envelope.clone(),
+            encoded_bytes,
+        },
+    );
     registry
         .session_bytes
         .insert(session_id, next_session_bytes);
@@ -17867,11 +17943,11 @@ fn active_contribution_snapshot_events(
     Ok(registry
         .envelopes
         .iter()
-        .filter(|(key, _)| key.session == session_id)
-        .map(|(_, envelope)| bcode_session_models::SessionLiveEvent {
+        .filter(|(key, _)| key.session() == session_id)
+        .map(|(_, active)| bcode_session_models::SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::ToolContributionPlaced {
-                envelope: envelope.clone(),
+                envelope: active.envelope.clone(),
             },
         })
         .collect())
@@ -17888,17 +17964,18 @@ async fn clear_active_contributions(
             let keys = registry
                 .envelopes
                 .keys()
-                .filter(|key| key.session == session_id && key.invocation == invocation_id)
+                .filter(|key| key.is_contribution_for(session_id, invocation_id))
                 .cloned()
                 .collect::<Vec<_>>();
             let mut removed = Vec::with_capacity(keys.len());
             let mut removed_bytes = 0usize;
             for key in keys {
-                if let Some(envelope) = registry.envelopes.remove(&key) {
-                    removed_bytes = removed_bytes.saturating_add(
-                        serde_json::to_vec(&envelope).map_or(0, |encoded| encoded.len()),
-                    );
-                    removed.push(envelope);
+                if let Some(active) = registry.envelopes.remove(&key) {
+                    removed_bytes = removed_bytes.saturating_add(active.encoded_bytes);
+                    registry
+                        .terminal_sequences
+                        .insert(key, active.envelope.contribution.sequence.saturating_add(1));
+                    removed.push(active.envelope);
                 }
             }
             if removed_bytes != 0 {
@@ -25196,7 +25273,7 @@ library = "test"
             registry
                 .drafts
                 .keys()
-                .filter(|key| key.session == session_id)
+                .filter(|key| key.session() == session_id)
                 .count(),
             MAX_ACTIVE_TOOL_REQUEST_DRAFTS_PER_SESSION
         );
@@ -25212,7 +25289,7 @@ library = "test"
             registry
                 .drafts
                 .keys()
-                .filter(|key| key.session == second_session_id)
+                .filter(|key| key.session() == second_session_id)
                 .count(),
             1
         );
@@ -25220,7 +25297,7 @@ library = "test"
             registry
                 .drafts
                 .iter()
-                .find(|(key, _)| key.session == session_id && key.tool_call_id == "call-0")
+                .find(|(key, _)| { key.is_tool_request_draft_for(session_id, "call-0") })
                 .map(|(_, draft)| draft.preview.as_str()),
             Some("x")
         );
@@ -34062,6 +34139,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One lifecycle fixture verifies attach, cleanup, stale rejection, and restart.
     async fn placed_transient_progress_preserves_placement_in_active_snapshots_and_cleanup() {
         let sessions = SessionManager::default();
         let session_id = sessions
@@ -34146,10 +34224,53 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         == bcode_session_models::ToolContributionOperation::Remove
                     && envelope.contribution.sequence == 2
         ));
+
+        append_tool_contribution_envelope(
+            &state,
+            session_id,
+            "call-progress",
+            "test.plugin",
+            envelope.clone(),
+        )
+        .await;
+        assert!(attachment.live_events.try_recv().is_err());
         assert!(
             active_contribution_snapshot_events(&state, session_id)
-                .expect("cleared snapshots")
+                .expect("post-terminal snapshot")
                 .is_empty()
+        );
+
+        let mut next_generation = envelope;
+        next_generation.contribution.sequence = 3;
+        next_generation.contribution.payload = serde_json::json!({"frame": 3});
+        append_tool_contribution_envelope(
+            &state,
+            session_id,
+            "call-progress",
+            "test.plugin",
+            next_generation.clone(),
+        )
+        .await;
+        assert_eq!(
+            attachment
+                .live_events
+                .recv()
+                .await
+                .expect("new contribution generation")
+                .kind,
+            SessionLiveEventKind::ToolContributionPlaced {
+                envelope: next_generation.clone(),
+            }
+        );
+        assert_eq!(
+            active_contribution_snapshot_events(&state, session_id)
+                .expect("new generation snapshot"),
+            vec![bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::ToolContributionPlaced {
+                    envelope: next_generation,
+                },
+            }]
         );
     }
 
