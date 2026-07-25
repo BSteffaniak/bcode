@@ -13771,6 +13771,25 @@ fn provider_metadata_trace_detail(key: &str, value: &str) -> String {
     key.to_string()
 }
 
+fn provider_request_context_has_sensitive_values(
+    context: &bcode_model::ProviderRequestContext,
+) -> bool {
+    !context.env.is_empty()
+        || context.auth.as_ref().is_some_and(|auth| {
+            auth.credentials
+                .values()
+                .any(|credential| !credential.value.is_empty())
+        })
+        || context.auth_candidates.iter().any(|candidate| {
+            !candidate.env.is_empty()
+                || candidate
+                    .auth
+                    .credentials
+                    .values()
+                    .any(|credential| !credential.value.is_empty())
+        })
+}
+
 const MAX_ACTIVE_TOOL_REQUEST_DRAFTS_PER_SESSION: usize = 256;
 const MAX_ACTIVE_TOOL_REQUEST_DRAFT_BYTES_PER_SESSION: usize = 4 * 1024 * 1024;
 
@@ -13789,6 +13808,14 @@ async fn publish_tool_request_draft_live(
         event.operation,
         bcode_session_models::ToolRequestDraftOperation::Remove { .. }
     );
+    if !terminal_update
+        && provider_request_context_has_sensitive_values(&state.selected_provider_context)
+    {
+        state
+            .metrics
+            .increment_counter("server.live_state.request_draft_redacted_total");
+        return;
+    }
     let accepted = state
         .active_tool_request_drafts
         .lock()
@@ -25992,6 +26019,50 @@ library = "test"
         assert_eq!(streamed_history, non_streamed_history);
         assert_eq!(streamed_history.len(), 3);
         assert!(active_tool_request_draft_snapshot_events(&state, streamed.id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn request_draft_is_suppressed_when_provider_context_contains_secrets() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("secret draft".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let mut attachment = sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("attach");
+        let mut state = test_server_state(sessions);
+        state
+            .selected_provider_context
+            .env
+            .insert("API_TOKEN".to_owned(), "secret-value".to_owned());
+        publish_tool_request_draft_live(
+            &state,
+            session_id,
+            request_draft_event(
+                "call-secret",
+                1,
+                1,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: r#"{"token":"secret-value"}"#.to_owned(),
+                },
+            ),
+        )
+        .await;
+
+        assert!(active_tool_request_draft_snapshot_events(&state, session_id).is_empty());
+        assert!(attachment.live_events.try_recv().is_err());
+        assert_eq!(
+            state
+                .metrics
+                .snapshot()
+                .counters
+                .get("server.live_state.request_draft_redacted_total"),
+            Some(&1)
+        );
     }
 
     #[tokio::test]
