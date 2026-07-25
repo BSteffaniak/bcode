@@ -8,6 +8,51 @@ description  = "Model-callable Git repository access tools"
 interface_id = "bcode.tool/v1"
 name         = "Git Tools"
 
+[[services]]
+class        = "service"
+description  = "Typed mutating Git workflow blocks"
+interface_id = "bcode.workflow-block/v1"
+name         = "Git Workflow Blocks"
+
+[[services.workflow_blocks]]
+block_id               = "git.commit"
+block_version          = 1
+cancellation_supported = true
+effect                 = "mutating"
+operation              = "git.commit"
+plugin_id              = "bcode.git"
+reconciliation         = "repair_required"
+timeout_ms             = 30000
+
+[services.workflow_blocks.input]
+schema = { type = "object", required = [
+    "repo_path",
+    "expected_head",
+    "message",
+    "paths",
+], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, message = { type = "string" }, paths = { type = "array", minItems = 1, uniqueItems = true, items = { type = "string" } } } }
+type_name = "bcode.git.commit-request/v1"
+
+[services.workflow_blocks.output]
+schema = { type = "object", required = [
+    "previous_head",
+    "commit_hash",
+    "paths",
+], properties = { previous_head = { type = "string" }, commit_hash = { type = "string" }, paths = { type = "array", items = { type = "string" } } } }
+type_name = "bcode.git.commit-result/v1"
+
+[services.workflow_blocks.authorization]
+capability              = "mutating"
+explicit_grant_required = true
+
+[[services.workflow_blocks.resources]]
+access   = "write"
+resource = "repository"
+
+[[services.workflow_blocks.resources]]
+access   = "write"
+resource = "git-ref"
+
 [[visual_adapters]]
 artifact_schema    = "bcode.git.clone_request"
 id                 = "git-clone-request-card"

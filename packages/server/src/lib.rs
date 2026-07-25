@@ -20413,6 +20413,60 @@ async fn observe_workflow_turn(
     }
 }
 
+fn authorize_workflow_plugin_block(
+    state: &ServerState,
+    activation: &bcode_workflow_store::PendingActivation,
+    block: &bcode_workflow::WorkflowBlockDefinition,
+) -> Result<(), WorkflowStoreError> {
+    if block.authorization.capability == bcode_workflow::WorkflowToolCapability::ReadOnly
+        && !block.authorization.explicit_grant_required
+    {
+        return Ok(());
+    }
+    if block.authorization.capability != bcode_workflow::WorkflowToolCapability::Mutating
+        || !block.authorization.explicit_grant_required
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow plugin block has an unsupported authorization contract".to_string(),
+        ));
+    }
+    let store = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let run = store.run_summary(&activation.run_id)?.ok_or_else(|| {
+        WorkflowStoreError::InvalidData(
+            "workflow run not found during block authorization".to_string(),
+        )
+    })?;
+    let approved = store
+        .grants_for_run(&activation.run_id, 1_000)?
+        .into_iter()
+        .any(|grant| {
+            grant.node_id == activation.node_id
+                && grant
+                    .expires_at_ms
+                    .is_none_or(|expires| expires >= current_unix_millis())
+                && serde_json::from_value::<bcode_workflow::WorkflowPolicyGrant>(grant.scope)
+                    .is_ok_and(|grant| {
+                        grant.capability >= bcode_workflow::WorkflowToolCapability::Mutating
+                            && grant.scope.definition == run.definition_id
+                            && grant.scope.definition_version == run.definition_version
+                            && grant.scope.workspace == run.workspace_snapshot
+                            && grant.scope.node == activation.node_id
+                            && grant.scope.run.as_deref() == Some(activation.run_id.as_str())
+                    })
+        });
+    drop(store);
+    if approved {
+        Ok(())
+    } else {
+        Err(WorkflowStoreError::InvalidData(
+            "workflow plugin block requires an exact persisted mutating grant".to_string(),
+        ))
+    }
+}
+
 struct WorkflowActivationOwner<'a> {
     state: &'a Arc<ServerState>,
 }
@@ -20457,15 +20511,7 @@ impl ActivationDispatchOwner for WorkflowActivationOwner<'_> {
                         block.plugin_id, block.block_id, block.block_version
                     )));
                 }
-                if block.authorization.capability
-                    != bcode_workflow::WorkflowToolCapability::ReadOnly
-                    || block.authorization.explicit_grant_required
-                {
-                    return Err(WorkflowStoreError::InvalidData(
-                        "workflow plugin block requires unsupported authorization elevation"
-                            .to_string(),
-                    ));
-                }
+                authorize_workflow_plugin_block(self.state, activation, &block)?;
                 Ok(Some(bcode_workflow_store::ActivationDispatchPlan {
                     side_effect: match block.effect {
                         bcode_workflow::WorkflowBlockEffect::ReadOnly => {
@@ -34345,6 +34391,29 @@ library = "test"
         state
     }
 
+    fn test_server_state_with_git_and_workflow_store(
+        sessions: SessionManager,
+        workflow_store: bcode_workflow_store::WorkflowStore,
+    ) -> ServerState {
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/git-plugin/bcode-plugin.toml"),
+            bcode_git_plugin::static_plugin(),
+        );
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from(["bcode.git".to_string()]),
+                disabled: BTreeSet::new(),
+            },
+            &[plugin],
+        )
+        .expect("load Git plugin");
+        let mut state = test_server_state(sessions);
+        state.plugins = plugins;
+        state.workflow_store = StdMutex::new(workflow_store);
+        state
+    }
+
     fn test_server_state_with_fake_provider_and_workflow_store(
         sessions: SessionManager,
         workflow_store: bcode_workflow_store::WorkflowStore,
@@ -36082,6 +36151,164 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .pop()
             .expect("row");
         assert_eq!(attempt.status, "succeeded");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn git_commit_workflow_block_requires_exact_grant_and_completes() {
+        let repository = tempfile::tempdir().expect("repository");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(repository.path())
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "bcode@example.invalid"]);
+        git(&["config", "user.name", "Bcode Test"]);
+        std::fs::write(repository.path().join("tracked.txt"), "before\n").expect("file");
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-m", "initial"]);
+        let head = git(&["rev-parse", "HEAD"]);
+        std::fs::write(repository.path().join("tracked.txt"), "after\n").expect("change");
+
+        let sessions = SessionManager::default();
+        let parent = sessions
+            .create_session(
+                Some("Git workflow".to_string()),
+                repository.path().to_path_buf(),
+            )
+            .await
+            .expect("parent");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("store");
+        let manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/git-plugin/bcode-plugin.toml"
+        ))
+        .expect("manifest");
+        let block = manifest.services[1].workflow_blocks[0].clone();
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: 1,
+            name: "git-commit".to_string(),
+            input: block.input.clone(),
+            output: block.output.clone(),
+            nodes: BTreeMap::from([(
+                "git.commit".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "git.commit".to_string(),
+                    name: "Git commit".to_string(),
+                    kind: bcode_workflow::NodeKind::PluginBlock,
+                    input: block.input.clone(),
+                    output: block.output.clone(),
+                    resources: block.resources.clone(),
+                    configuration: serde_json::to_value(&block).expect("block"),
+                },
+            )]),
+            entries: vec!["git.commit".to_string()],
+            exits: vec!["git.commit".to_string()],
+            edges: Vec::new(),
+        };
+        store
+            .persist_definition("git-commit", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "git-commit-run".to_string(),
+                definition_id: "git-commit".to_string(),
+                definition_version: 1,
+                workspace_snapshot: head.clone(),
+                parent_session_id: Some(parent.id.to_string()),
+                input: Some(serde_json::json!({
+                    "repo_path": repository.path(),
+                    "expected_head": head,
+                    "message": "workflow commit",
+                    "paths": ["tracked.txt"],
+                })),
+                created_at_ms: 1,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let state = Arc::new(test_server_state_with_git_and_workflow_store(
+            sessions, store,
+        ));
+        let pending = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_activations(1)
+            .expect("pending")
+            .pop()
+            .expect("activation");
+        let owner = WorkflowActivationOwner { state: &state };
+        assert!(owner.plan(&pending).is_err(), "grant is mandatory");
+        let grant = bcode_workflow::WorkflowPolicyGrant {
+            grant_id: "git-grant".to_string(),
+            scope: bcode_workflow::WorkflowGrantScope {
+                definition: "git-commit".to_string(),
+                definition_version: 1,
+                workspace: pending
+                    .input
+                    .as_ref()
+                    .and_then(|value| value.get("expected_head"))
+                    .and_then(serde_json::Value::as_str)
+                    .expect("head")
+                    .to_string(),
+                node: "git.commit".to_string(),
+                run: Some("git-commit-run".to_string()),
+            },
+            capability: bcode_workflow::WorkflowToolCapability::Mutating,
+        };
+        state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .persist_grant(&bcode_workflow_store::WorkflowGrant {
+                grant_id: grant.grant_id.clone(),
+                run_id: "git-commit-run".to_string(),
+                node_id: "git.commit".to_string(),
+                scope: serde_json::to_value(grant).expect("grant"),
+                granted_at_ms: 2,
+                expires_at_ms: None,
+            })
+            .expect("persist grant");
+        let path = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .path()
+            .to_path_buf();
+        bcode_workflow_store::WorkflowStore::open_at_path(&path)
+            .expect("dispatch store")
+            .dispatch_pending_activations(&owner, 10, 3)
+            .await
+            .expect("dispatch");
+        let observer = WorkflowTurnReceiptObserver { state: &state };
+        bcode_workflow_store::WorkflowStore::open_at_path(&path)
+            .expect("reconcile store")
+            .reconcile_receipt_backed_attempts_async(&observer, 10, 4)
+            .await
+            .expect("reconcile");
+        assert_eq!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .run_summary("git-commit-run")
+                .expect("summary")
+                .expect("run")
+                .status,
+            bcode_workflow_store::RunStatus::Completed
+        );
+        assert_ne!(git(&["rev-parse", "HEAD"]), head);
     }
 
     #[tokio::test]

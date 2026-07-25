@@ -31,6 +31,7 @@ impl RustPlugin for GitPlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         match context.request.interface_id.as_str() {
             TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(&context),
+            bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID => invoke_workflow_block(&context),
             _ => ServiceResponse::error(
                 "unsupported_interface",
                 "unsupported Git plugin service interface",
@@ -238,6 +239,148 @@ fn decode_optional_owner_context<T: serde::de::DeserializeOwned>(
     serde_json::from_value(entry.payload.clone())
         .map(Some)
         .map_err(|error| format!("invalid host context {schema}@{version}: {error}"))
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CommitRequest {
+    repo_path: PathBuf,
+    expected_head: String,
+    message: String,
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CommitResponse {
+    previous_head: String,
+    commit_hash: String,
+    paths: Vec<PathBuf>,
+}
+
+fn invoke_workflow_block(context: &NativeServiceContext) -> ServiceResponse {
+    if context.request.operation != "git.commit" {
+        return ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported Git workflow block operation",
+        );
+    }
+    if context.cancellation.is_cancelled() {
+        return ServiceResponse::error("cancelled", "Git commit cancelled");
+    }
+    let request = match context.request.payload_json::<CommitRequest>() {
+        Ok(request) => request,
+        Err(error) => return invalid_request(&error),
+    };
+    match commit_repository(&request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("commit_failed", error.to_string()),
+    }
+}
+
+fn commit_repository(request: &CommitRequest) -> Result<CommitResponse, GitError> {
+    let repo = request.repo_path.canonicalize()?;
+    if !repo.is_dir() || request.message.trim().is_empty() || request.paths.is_empty() {
+        return Err(GitError::InvalidRequest(
+            "commit requires a repository, non-empty message, and bounded paths".to_string(),
+        ));
+    }
+    let actual_head = git_stdout(&repo, ["rev-parse", "HEAD"])?;
+    if actual_head != request.expected_head {
+        return Err(GitError::InvalidRequest(format!(
+            "repository HEAD changed: expected {}, found {actual_head}",
+            request.expected_head
+        )));
+    }
+    let mut normalized = Vec::with_capacity(request.paths.len());
+    let mut seen = std::collections::BTreeSet::new();
+    for path in &request.paths {
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(GitError::InvalidRequest(format!(
+                "commit path must be repository-relative without traversal: {}",
+                path.display()
+            )));
+        }
+        let text = path.to_string_lossy().into_owned();
+        if text.is_empty() || !seen.insert(text.clone()) {
+            return Err(GitError::InvalidRequest(
+                "commit paths must be non-empty and unique".to_string(),
+            ));
+        }
+        normalized.push(text);
+    }
+    let mut add = Command::new("git");
+    add.current_dir(&repo).arg("add").arg("--");
+    add.args(&normalized);
+    run_git(&mut add, "git add")?;
+
+    let staged = git_stdout(&repo, ["diff", "--cached", "--name-only", "--"])?;
+    let staged = staged.lines().map(str::to_string).collect::<Vec<_>>();
+    let expected = normalized
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let actual = staged
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    if actual != expected {
+        return Err(GitError::InvalidRequest(format!(
+            "staged paths differ from the bounded request: expected {expected:?}, found {actual:?}"
+        )));
+    }
+    let mut commit = Command::new("git");
+    commit
+        .current_dir(&repo)
+        .arg("commit")
+        .arg("--only")
+        .arg("-m")
+        .arg(&request.message)
+        .arg("--")
+        .args(&normalized);
+    run_git(&mut commit, "git commit")?;
+    let commit_hash = git_stdout(&repo, ["rev-parse", "HEAD"])?;
+    if commit_hash == actual_head {
+        return Err(GitError::InvalidRequest(
+            "Git commit did not advance HEAD".to_string(),
+        ));
+    }
+    Ok(CommitResponse {
+        previous_head: actual_head,
+        commit_hash,
+        paths: normalized.into_iter().map(PathBuf::from).collect(),
+    })
+}
+
+fn git_stdout<const N: usize>(repo: &Path, args: [&str; N]) -> Result<String, GitError> {
+    let output = Command::new("git").current_dir(repo).args(args).output()?;
+    if !output.status.success() {
+        return Err(GitError::CloneFailed {
+            status: output.status.to_string(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn run_git(command: &mut Command, operation: &str) -> Result<(), GitError> {
+    let output = command.output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(GitError::CloneFailed {
+            status: format!("{operation}: {}", output.status),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -612,6 +755,114 @@ bcode_plugin_sdk::export_plugin!(GitPlugin, include_str!("../bcode-plugin.toml")
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_commit_enforces_snapshot_paths_and_returns_commit_hash() {
+        let directory = tempfile::tempdir().expect("repo");
+        run_git(
+            Command::new("git")
+                .current_dir(directory.path())
+                .arg("init"),
+            "git init",
+        )
+        .expect("init");
+        run_git(
+            Command::new("git").current_dir(directory.path()).args([
+                "config",
+                "user.email",
+                "bcode@example.invalid",
+            ]),
+            "email",
+        )
+        .expect("email");
+        run_git(
+            Command::new("git").current_dir(directory.path()).args([
+                "config",
+                "user.name",
+                "Bcode Test",
+            ]),
+            "name",
+        )
+        .expect("name");
+        std::fs::write(directory.path().join("tracked.txt"), "before\n").expect("file");
+        run_git(
+            Command::new("git")
+                .current_dir(directory.path())
+                .args(["add", "tracked.txt"]),
+            "add initial",
+        )
+        .expect("add");
+        run_git(
+            Command::new("git")
+                .current_dir(directory.path())
+                .args(["commit", "-m", "initial"]),
+            "commit initial",
+        )
+        .expect("commit");
+        let head = git_stdout(directory.path(), ["rev-parse", "HEAD"]).expect("head");
+        std::fs::write(directory.path().join("tracked.txt"), "after\n").expect("change");
+        std::fs::write(directory.path().join("other.txt"), "not committed\n").expect("other");
+
+        let response = commit_repository(&CommitRequest {
+            repo_path: directory.path().to_path_buf(),
+            expected_head: head.clone(),
+            message: "bounded change".to_string(),
+            paths: vec![PathBuf::from("tracked.txt")],
+        })
+        .expect("commit");
+        assert_eq!(response.previous_head, head);
+        assert_ne!(response.commit_hash, response.previous_head);
+        assert_eq!(response.paths, [PathBuf::from("tracked.txt")]);
+        assert_eq!(
+            git_stdout(
+                directory.path(),
+                ["show", "--pretty=", "--name-only", "HEAD"]
+            )
+            .expect("show"),
+            "tracked.txt"
+        );
+        assert!(directory.path().join("other.txt").exists());
+
+        assert!(
+            commit_repository(&CommitRequest {
+                repo_path: directory.path().to_path_buf(),
+                expected_head: response.previous_head,
+                message: "stale".to_string(),
+                paths: vec![PathBuf::from("other.txt")],
+            })
+            .is_err()
+        );
+        assert!(
+            commit_repository(&CommitRequest {
+                repo_path: directory.path().to_path_buf(),
+                expected_head: response.commit_hash,
+                message: "escape".to_string(),
+                paths: vec![PathBuf::from("../outside")],
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn commit_manifest_declares_mutating_repair_and_write_resources() {
+        let manifest: bcode_plugin::PluginManifest =
+            toml::from_str(include_str!("../bcode-plugin.toml")).expect("manifest");
+        let block = &manifest.services[1].workflow_blocks[0];
+        assert_eq!(block.block_id, "git.commit");
+        assert_eq!(block.effect, bcode_workflow::WorkflowBlockEffect::Mutating);
+        assert_eq!(
+            block.reconciliation,
+            bcode_workflow::WorkflowBlockReconciliation::RepairRequired
+        );
+        assert!(block.authorization.explicit_grant_required);
+        assert_eq!(
+            block.resources,
+            [
+                bcode_workflow::ResourceClaim::write("repository"),
+                bcode_workflow::ResourceClaim::write("git-ref"),
+            ]
+        );
+    }
 
     #[test]
     fn clone_request_uses_durable_generic_contribution_without_legacy_visual() {
