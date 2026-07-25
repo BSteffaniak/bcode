@@ -3145,6 +3145,99 @@ mod tests {
     }
 
     #[test]
+    fn final_result_dominates_late_result_draft_and_cleanup() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let draft = |revision, operation| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Result,
+                    generation: 1,
+                    revision,
+                    operation,
+                    argument_bytes: 32,
+                    truncated: false,
+                },
+            },
+        };
+        view.apply_live_event(&draft(
+            1,
+            bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                start_offset: 0,
+                text: r#"{"path":"README.md","contents":"new"}"#.to_owned(),
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                tool_name: "filesystem.write".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-1".to_owned(),
+                    model_output: "written".to_owned(),
+                    is_error: false,
+                    result: Some(ToolInvocationResult::Text {
+                        text: "written".to_owned(),
+                    }),
+                },
+            },
+        ));
+        view.apply_live_event(&draft(
+            2,
+            bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                start_offset: 0,
+                text: "must not replace final".to_owned(),
+            },
+        ));
+        view.apply_live_event(&draft(
+            3,
+            bcode_session_models::ToolRequestDraftOperation::Remove {
+                reason: bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+            },
+        ));
+
+        let result_id = TranscriptViewItemId::tool_presentation_slot(
+            "call-1",
+            bcode_session_models::ToolContributionPlacement::Result,
+            None,
+        );
+        let result_items = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .filter(|item| item.id == result_id)
+            .collect::<Vec<_>>();
+        assert_eq!(result_items.len(), 1);
+        assert!(matches!(
+            result_items[0].kind,
+            TranscriptViewItemKind::ToolInvocation { .. }
+        ));
+        assert!(
+            !view.snapshot().transcript.items.iter().any(|item| {
+                matches!(item.kind, TranscriptViewItemKind::ToolRequestDraft { .. })
+            })
+        );
+    }
+
+    #[test]
     fn session_view_projects_generic_final_result_without_legacy_finish_event() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
