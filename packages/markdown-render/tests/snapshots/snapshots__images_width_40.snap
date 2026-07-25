@@ -3,5 +3,7 @@ source: packages/markdown-render/tests/snapshots.rs
 expression: "visible_snapshot(IMAGES, 40)"
 ---
 00 │ [image: Alt text]
-01 │ [image: fallback.png]
-02 │ [image: image]
+01 │ 
+02 │ [image: fallback.png]
+03 │ 
+04 │ [image: image]

@@ -10,11 +10,12 @@ expression: "visible_snapshot(LISTS_NUMBERING, 28)"
 05 │     th
 06 │ 4.  ten
 07 │ 5.  ordered parent
-08 │     •  unordered child
-09 │        1.  ordered grandchil
-10 │            d
-11 │ 
-12 │ •  unordered parent
-13 │    1.  ordered child
-14 │        •  unordered grandchi
-15 │           ld
+08 │     
+09 │     •  unordered child
+10 │        1.  ordered grandchil
+11 │            d
+12 │ 
+13 │ •  unordered parent
+14 │    1.  ordered child
+15 │        •  unordered grandchi
+16 │           ld

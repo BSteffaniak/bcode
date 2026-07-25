@@ -2076,6 +2076,12 @@ impl TerminalMarkdownRenderer {
     }
 
     fn render_special_block_container(&mut self, container: &Container, style: TextStyle) {
+        if container.classes.iter().any(|class| class == "markdown-p") {
+            self.ensure_blank_line();
+            self.render_container_children(container, style);
+            self.ensure_blank_line();
+            return;
+        }
         if container.classes.iter().any(|class| class == "markdown-hr") {
             self.render_horizontal_rule();
             return;

@@ -10,7 +10,8 @@ expression: "[60_u16,\n24].into_iter().map(|width|\nformat!(\"== width {width} =
 04 │ [fg=bright-black]└─[/]
 05 │ 
 06 │ Unsupported [fg=yellow]\frac{a}{b} + q^{word}[/] remains faithful.
-07 │ Malformed $unterminated math remains source text.
+07 │ 
+08 │ Malformed $unterminated math remains source text.
 == width 24 ==
 00 │ Inline [fg=yellow]x² + α × y₁ ≤ ∞[/] a
 01 │ nd escaped [fg=yellow]n²[/].
@@ -22,6 +23,7 @@ expression: "[60_u16,\n24].into_iter().map(|width|\nformat!(\"== width {width} =
 07 │ Unsupported [fg=yellow]\frac{a}{b} [/]
 08 │ [fg=yellow]+ q^{word}[/] remains faith
 09 │ ful.
-10 │ Malformed $unterminated 
-11 │ math remains source text
-12 │ .
+10 │ 
+11 │ Malformed $unterminated 
+12 │ math remains source text
+13 │ .

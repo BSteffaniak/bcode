@@ -16,9 +16,10 @@ expression: "styled_snapshot(LISTS, 30)"
 11 │ [fg=bright-black]•  ☐ [/]incomplete
 12 │ 
 13 │ [fg=bright-black]1.  [/]item with quote
-14 │ [fg=bright-black]    │ [/]quoted inside list
-15 │ [fg=bright-black]2.  [/]item with code
-16 │ [fg=bright-black]    [/]
-17 │ [fg=bright-black]    ┌─ text[/]
-18 │ [fg=bright-black]    │ [/][fg=yellow]preserved[/]
-19 │ [fg=bright-black]    └─[/]
+14 │ [fg=bright-black]    [/]
+15 │ [fg=bright-black]    │ [/]quoted inside list
+16 │ [fg=bright-black]2.  [/]item with code
+17 │ [fg=bright-black]    [/]
+18 │ [fg=bright-black]    ┌─ text[/]
+19 │ [fg=bright-black]    │ [/][fg=yellow]preserved[/]
+20 │ [fg=bright-black]    └─[/]

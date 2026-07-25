@@ -7,14 +7,15 @@ expression: "styled_snapshot(FOOTNOTES_BLOCKS, 50)"
 02 │ [fg=bright-black]──────────────────────────────────────────────────[/]
 03 │ 
 04 │ Footnotes
-05 │ [fg=bright-black]1.  [/]Opening paragraph with [bold]strong[/] text.
-06 │ 
-07 │ [fg=bright-black]•  [/]first item
-08 │ [fg=bright-black]•  [/]second item with [fg=yellow]code[/]
-09 │ 
-10 │ [fg=bright-black]│ [/]quoted block
-11 │ 
-12 │ [fg=bright-black]┌─ rust[/]
-13 │ [fg=bright-black]│ [/][fg=rgb-180-142-173]fn[/][fg=rgb-192-197-206] [/][fg=rgb-143-161-179]main[/][fg=rgb-192-197-206]() {}[/]
-14 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]``` ↩[/]
-15 │ [fg=bright-black]└─[/]
+05 │ 
+06 │ [fg=bright-black]1.  [/]Opening paragraph with [bold]strong[/] text.
+07 │ 
+08 │ [fg=bright-black]•  [/]first item
+09 │ [fg=bright-black]•  [/]second item with [fg=yellow]code[/]
+10 │ 
+11 │ [fg=bright-black]│ [/]quoted block
+12 │ 
+13 │ [fg=bright-black]┌─ rust[/]
+14 │ [fg=bright-black]│ [/][fg=rgb-180-142-173]fn[/][fg=rgb-192-197-206] [/][fg=rgb-143-161-179]main[/][fg=rgb-192-197-206]() {}[/]
+15 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]``` ↩[/]
+16 │ [fg=bright-black]└─[/]

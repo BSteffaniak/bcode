@@ -76,54 +76,56 @@ expression: "[100_u16, 60,\n24].into_iter().map(|width|\nformat!(\"== width {wid
 70 │ [fg=yellow]│ [/]loop.
 71 │ 
 72 │ [bold]View the retry algorithm[/]
-73 │ For attempt (n), the delay is conceptually:
-74 │ 
-75 │ [fg=bright-black]┌─ text[/]
-76 │ [fg=bright-black]│ [/][fg=yellow]delay(n) = min(initial_delay × 2ⁿ + jitter, maximum_delay)[/]
-77 │ [fg=bright-black]└─[/]
-78 │ 
-79 │ [fg=bright-black]┌─────────┬────────────┬─────────────────────┐[/]
-80 │ [fg=bright-black]│[/] [bold]Attempt[/] [fg=bright-black]│[/] [bold]Base Delay[/] [fg=bright-black]│[/] [bold]Example with Jitter[/] [fg=bright-black]│[/]
-81 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
-82 │ [fg=bright-black]│[/]       1 [fg=bright-black]│[/]     250 ms [fg=bright-black]│[/]              284 ms [fg=bright-black]│[/]
-83 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
-84 │ [fg=bright-black]│[/]       2 [fg=bright-black]│[/]     500 ms [fg=bright-black]│[/]              571 ms [fg=bright-black]│[/]
-85 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
-86 │ [fg=bright-black]│[/]       3 [fg=bright-black]│[/]        1 s [fg=bright-black]│[/]              1.08 s [fg=bright-black]│[/]
-87 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
-88 │ [fg=bright-black]│[/]       4 [fg=bright-black]│[/]        2 s [fg=bright-black]│[/]              2.17 s [fg=bright-black]│[/]
-89 │ [fg=bright-black]└─────────┴────────────┴─────────────────────┘[/]
-90 │ 
-91 │ [fg=bright-black]┌─ json[/]
-92 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]{[/]
-93 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]event[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task.completed[/][fg=rgb-192-197-206]",[/]
-94 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]version[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]2[/][fg=rgb-192-197-206],[/]
-95 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]data[/][fg=rgb-192-197-206]": {[/]
-96 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]task_id[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task_01JABCDEF[/][fg=rgb-192-197-206]",[/]
-97 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]duration_ms[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]1842[/][fg=rgb-192-197-206],[/]
-98 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]result[/][fg=rgb-192-197-206]": {[/]
-99 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]status[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]success[/][fg=rgb-192-197-206]",[/]
-100 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]artifacts[/][fg=rgb-192-197-206]": ["[/][fg=rgb-163-190-140]report.pdf[/][fg=rgb-192-197-206]"][/]
-101 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    }[/]
-102 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  }[/]
-103 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]}[/]
-104 │ [fg=bright-black]└─[/]
-105 │ 
-106 │ [fg=bright-black]────────────────────────────────────────────────────────────────────────────────────────────────────[/]
-107 │ 
-108 │ [fg=cyan,bold]Notes[/]
-109 │ 
-110 │ [fg=bright-black]1.  [/]Events are ordered [bold]per task[/], not globally.
-111 │ [fg=bright-black]2.  [/]Delivery is [italic]at least once[/].
-112 │ [fg=bright-black]3.  [/]Clients should preserve unknown fields for forward compatibility.[1]
-113 │ 
-114 │ [bold]Next step:[/] review [fg=yellow,underline]docs/protocol.md[/] and open a pull request referencing an issue—for example, [fg=yellow]Closes [/]
-115 │ [fg=yellow]#42[/].
-116 │ 
-117 │ [fg=bright-black]────────────────────────────────────────────────────────────────────────────────────────────────────[/]
-118 │ 
-119 │ Footnotes
-120 │ [fg=bright-black]1.  [/]This enables older clients to safely proxy events created by newer protocol versions. ↩
+73 │ 
+74 │ For attempt (n), the delay is conceptually:
+75 │ 
+76 │ [fg=bright-black]┌─ text[/]
+77 │ [fg=bright-black]│ [/][fg=yellow]delay(n) = min(initial_delay × 2ⁿ + jitter, maximum_delay)[/]
+78 │ [fg=bright-black]└─[/]
+79 │ 
+80 │ [fg=bright-black]┌─────────┬────────────┬─────────────────────┐[/]
+81 │ [fg=bright-black]│[/] [bold]Attempt[/] [fg=bright-black]│[/] [bold]Base Delay[/] [fg=bright-black]│[/] [bold]Example with Jitter[/] [fg=bright-black]│[/]
+82 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
+83 │ [fg=bright-black]│[/]       1 [fg=bright-black]│[/]     250 ms [fg=bright-black]│[/]              284 ms [fg=bright-black]│[/]
+84 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
+85 │ [fg=bright-black]│[/]       2 [fg=bright-black]│[/]     500 ms [fg=bright-black]│[/]              571 ms [fg=bright-black]│[/]
+86 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
+87 │ [fg=bright-black]│[/]       3 [fg=bright-black]│[/]        1 s [fg=bright-black]│[/]              1.08 s [fg=bright-black]│[/]
+88 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
+89 │ [fg=bright-black]│[/]       4 [fg=bright-black]│[/]        2 s [fg=bright-black]│[/]              2.17 s [fg=bright-black]│[/]
+90 │ [fg=bright-black]└─────────┴────────────┴─────────────────────┘[/]
+91 │ 
+92 │ [fg=bright-black]┌─ json[/]
+93 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]{[/]
+94 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]event[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task.completed[/][fg=rgb-192-197-206]",[/]
+95 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]version[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]2[/][fg=rgb-192-197-206],[/]
+96 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]data[/][fg=rgb-192-197-206]": {[/]
+97 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]task_id[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task_01JABCDEF[/][fg=rgb-192-197-206]",[/]
+98 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]duration_ms[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]1842[/][fg=rgb-192-197-206],[/]
+99 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]result[/][fg=rgb-192-197-206]": {[/]
+100 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]status[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]success[/][fg=rgb-192-197-206]",[/]
+101 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]artifacts[/][fg=rgb-192-197-206]": ["[/][fg=rgb-163-190-140]report.pdf[/][fg=rgb-192-197-206]"][/]
+102 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    }[/]
+103 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  }[/]
+104 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]}[/]
+105 │ [fg=bright-black]└─[/]
+106 │ 
+107 │ [fg=bright-black]────────────────────────────────────────────────────────────────────────────────────────────────────[/]
+108 │ 
+109 │ [fg=cyan,bold]Notes[/]
+110 │ 
+111 │ [fg=bright-black]1.  [/]Events are ordered [bold]per task[/], not globally.
+112 │ [fg=bright-black]2.  [/]Delivery is [italic]at least once[/].
+113 │ [fg=bright-black]3.  [/]Clients should preserve unknown fields for forward compatibility.[1]
+114 │ 
+115 │ [bold]Next step:[/] review [fg=yellow,underline]docs/protocol.md[/] and open a pull request referencing an issue—for example, [fg=yellow]Closes [/]
+116 │ [fg=yellow]#42[/].
+117 │ 
+118 │ [fg=bright-black]────────────────────────────────────────────────────────────────────────────────────────────────────[/]
+119 │ 
+120 │ Footnotes
+121 │ 
+122 │ [fg=bright-black]1.  [/]This enables older clients to safely proxy events created by newer protocol versions. ↩
 == width 60 ==
 00 │ [fg=cyan,bold]🚀 Project Nebula[/]
 01 │ 
@@ -200,56 +202,58 @@ expression: "[100_u16, 60,\n24].into_iter().map(|width|\nformat!(\"== width {wid
 72 │ [fg=yellow]│ [/]y limit and may create a poison-message loop.
 73 │ 
 74 │ [bold]View the retry algorithm[/]
-75 │ For attempt (n), the delay is conceptually:
-76 │ 
-77 │ [fg=bright-black]┌─ text[/]
-78 │ [fg=bright-black]│ [/][fg=yellow]delay(n) = min(initial_delay × 2ⁿ + jitter, maximum_delay)[/]
-79 │ [fg=bright-black]└─[/]
-80 │ 
-81 │ [fg=bright-black]┌─────────┬────────────┬─────────────────────┐[/]
-82 │ [fg=bright-black]│[/] [bold]Attempt[/] [fg=bright-black]│[/] [bold]Base Delay[/] [fg=bright-black]│[/] [bold]Example with Jitter[/] [fg=bright-black]│[/]
-83 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
-84 │ [fg=bright-black]│[/]       1 [fg=bright-black]│[/]     250 ms [fg=bright-black]│[/]              284 ms [fg=bright-black]│[/]
-85 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
-86 │ [fg=bright-black]│[/]       2 [fg=bright-black]│[/]     500 ms [fg=bright-black]│[/]              571 ms [fg=bright-black]│[/]
-87 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
-88 │ [fg=bright-black]│[/]       3 [fg=bright-black]│[/]        1 s [fg=bright-black]│[/]              1.08 s [fg=bright-black]│[/]
-89 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
-90 │ [fg=bright-black]│[/]       4 [fg=bright-black]│[/]        2 s [fg=bright-black]│[/]              2.17 s [fg=bright-black]│[/]
-91 │ [fg=bright-black]└─────────┴────────────┴─────────────────────┘[/]
-92 │ 
-93 │ [fg=bright-black]┌─ json[/]
-94 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]{[/]
-95 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]event[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task.completed[/][fg=rgb-192-197-206]",[/]
-96 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]version[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]2[/][fg=rgb-192-197-206],[/]
-97 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]data[/][fg=rgb-192-197-206]": {[/]
-98 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]task_id[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task_01JABCDEF[/][fg=rgb-192-197-206]",[/]
-99 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]duration_ms[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]1842[/][fg=rgb-192-197-206],[/]
-100 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]result[/][fg=rgb-192-197-206]": {[/]
-101 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]status[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]success[/][fg=rgb-192-197-206]",[/]
-102 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]artifacts[/][fg=rgb-192-197-206]": ["[/][fg=rgb-163-190-140]report.pdf[/][fg=rgb-192-197-206]"][/]
-103 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    }[/]
-104 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  }[/]
-105 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]}[/]
-106 │ [fg=bright-black]└─[/]
-107 │ 
-108 │ [fg=bright-black]────────────────────────────────────────────────────────────[/]
-109 │ 
-110 │ [fg=cyan,bold]Notes[/]
-111 │ 
-112 │ [fg=bright-black]1.  [/]Events are ordered [bold]per task[/], not globally.
-113 │ [fg=bright-black]2.  [/]Delivery is [italic]at least once[/].
-114 │ [fg=bright-black]3.  [/]Clients should preserve unknown fields for forward compa
-115 │ [fg=bright-black]    [/]tibility.[1]
-116 │ 
-117 │ [bold]Next step:[/] review [fg=yellow,underline]docs/protocol.md[/] and open a pull request r
-118 │ eferencing an issue—for example, [fg=yellow]Closes #42[/].
-119 │ 
-120 │ [fg=bright-black]────────────────────────────────────────────────────────────[/]
-121 │ 
-122 │ Footnotes
-123 │ [fg=bright-black]1.  [/]This enables older clients to safely proxy events create
-124 │ [fg=bright-black]    [/]d by newer protocol versions. ↩
+75 │ 
+76 │ For attempt (n), the delay is conceptually:
+77 │ 
+78 │ [fg=bright-black]┌─ text[/]
+79 │ [fg=bright-black]│ [/][fg=yellow]delay(n) = min(initial_delay × 2ⁿ + jitter, maximum_delay)[/]
+80 │ [fg=bright-black]└─[/]
+81 │ 
+82 │ [fg=bright-black]┌─────────┬────────────┬─────────────────────┐[/]
+83 │ [fg=bright-black]│[/] [bold]Attempt[/] [fg=bright-black]│[/] [bold]Base Delay[/] [fg=bright-black]│[/] [bold]Example with Jitter[/] [fg=bright-black]│[/]
+84 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
+85 │ [fg=bright-black]│[/]       1 [fg=bright-black]│[/]     250 ms [fg=bright-black]│[/]              284 ms [fg=bright-black]│[/]
+86 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
+87 │ [fg=bright-black]│[/]       2 [fg=bright-black]│[/]     500 ms [fg=bright-black]│[/]              571 ms [fg=bright-black]│[/]
+88 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
+89 │ [fg=bright-black]│[/]       3 [fg=bright-black]│[/]        1 s [fg=bright-black]│[/]              1.08 s [fg=bright-black]│[/]
+90 │ [fg=bright-black]├─────────┼────────────┼─────────────────────┤[/]
+91 │ [fg=bright-black]│[/]       4 [fg=bright-black]│[/]        2 s [fg=bright-black]│[/]              2.17 s [fg=bright-black]│[/]
+92 │ [fg=bright-black]└─────────┴────────────┴─────────────────────┘[/]
+93 │ 
+94 │ [fg=bright-black]┌─ json[/]
+95 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]{[/]
+96 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]event[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task.completed[/][fg=rgb-192-197-206]",[/]
+97 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]version[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]2[/][fg=rgb-192-197-206],[/]
+98 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]data[/][fg=rgb-192-197-206]": {[/]
+99 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]task_id[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task_01JABCDEF[/][fg=rgb-192-197-206]",[/]
+100 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]duration_ms[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]1842[/][fg=rgb-192-197-206],[/]
+101 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]result[/][fg=rgb-192-197-206]": {[/]
+102 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]status[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]success[/][fg=rgb-192-197-206]",[/]
+103 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]artifacts[/][fg=rgb-192-197-206]": ["[/][fg=rgb-163-190-140]report.pdf[/][fg=rgb-192-197-206]"][/]
+104 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    }[/]
+105 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  }[/]
+106 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]}[/]
+107 │ [fg=bright-black]└─[/]
+108 │ 
+109 │ [fg=bright-black]────────────────────────────────────────────────────────────[/]
+110 │ 
+111 │ [fg=cyan,bold]Notes[/]
+112 │ 
+113 │ [fg=bright-black]1.  [/]Events are ordered [bold]per task[/], not globally.
+114 │ [fg=bright-black]2.  [/]Delivery is [italic]at least once[/].
+115 │ [fg=bright-black]3.  [/]Clients should preserve unknown fields for forward compa
+116 │ [fg=bright-black]    [/]tibility.[1]
+117 │ 
+118 │ [bold]Next step:[/] review [fg=yellow,underline]docs/protocol.md[/] and open a pull request r
+119 │ eferencing an issue—for example, [fg=yellow]Closes #42[/].
+120 │ 
+121 │ [fg=bright-black]────────────────────────────────────────────────────────────[/]
+122 │ 
+123 │ Footnotes
+124 │ 
+125 │ [fg=bright-black]1.  [/]This enables older clients to safely proxy events create
+126 │ [fg=bright-black]    [/]d by newer protocol versions. ↩
 == width 24 ==
 00 │ [fg=cyan,bold]🚀 Project Nebula[/]
 01 │ 
@@ -365,76 +369,78 @@ expression: "[100_u16, 60,\n24].into_iter().map(|width|\nformat!(\"== width {wid
 111 │ [fg=yellow]│ [/]n-message loop.
 112 │ 
 113 │ [bold]View the retry algorithm[/]
-114 │ For attempt (n), the del
-115 │ ay is conceptually:
-116 │ 
-117 │ [fg=bright-black]┌─ text[/]
-118 │ [fg=bright-black]│ [/][fg=yellow]delay(n) = min(initial[/]
-119 │ [fg=bright-black]│ [/][fg=yellow]_delay × 2ⁿ + jitter, [/]
-120 │ [fg=bright-black]│ [/][fg=yellow]maximum_delay)[/]
-121 │ [fg=bright-black]└─[/]
-122 │ 
-123 │ [fg=bright-black]Attempt: [/]1
-124 │ [fg=bright-black]Base Delay: [/]250 ms
-125 │ [fg=bright-black]Example with Jitter: [/]284 ms
-126 │ 
-127 │ [fg=bright-black]Attempt: [/]2
-128 │ [fg=bright-black]Base Delay: [/]500 ms
-129 │ [fg=bright-black]Example with Jitter: [/]571 ms
-130 │ 
-131 │ [fg=bright-black]Attempt: [/]3
-132 │ [fg=bright-black]Base Delay: [/]1 s
-133 │ [fg=bright-black]Example with Jitter: [/]1.08 s
-134 │ 
-135 │ [fg=bright-black]Attempt: [/]4
-136 │ [fg=bright-black]Base Delay: [/]2 s
-137 │ [fg=bright-black]Example with Jitter: [/]2.17 s
-138 │ 
-139 │ [fg=bright-black]┌─ json[/]
-140 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]{[/]
-141 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]event[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task.compl[/]
-142 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]eted[/][fg=rgb-192-197-206]"[/][fg=rgb-163-190-140],[/]
-143 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]version[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]2[/][fg=rgb-192-197-206],[/]
-144 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]data[/][fg=rgb-192-197-206]": {[/]
-145 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]task_id[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task_0[/]
-146 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]1JABCDEF[/][fg=rgb-192-197-206]"[/][fg=rgb-163-190-140],[/]
-147 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]duration_ms[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]184[/]
-148 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]2,[/]
-149 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]result[/][fg=rgb-192-197-206]": {[/]
-150 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]status[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]succe[/]
-151 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]ss[/][fg=rgb-192-197-206]"[/][fg=rgb-163-190-140],[/]
-152 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]artifacts[/][fg=rgb-192-197-206]": ["[/][fg=rgb-163-190-140]r[/]
-153 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]eport.pdf[/][fg=rgb-192-197-206]"[/][fg=rgb-163-190-140]][/]
-154 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    [/][fg=rgb-43-48-59]}[/]
-155 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-43-48-59]}[/]
-156 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]}[/]
-157 │ [fg=bright-black]└─[/]
-158 │ 
-159 │ [fg=bright-black]────────────────────────[/]
-160 │ 
-161 │ [fg=cyan,bold]Notes[/]
-162 │ 
-163 │ [fg=bright-black]1.  [/]Events are ordered [bold]p[/]
-164 │ [fg=bright-black]    [/][bold]er task[/], not globall
-165 │ [fg=bright-black]    [/]y.
-166 │ [fg=bright-black]2.  [/]Delivery is [italic]at least[/]
-167 │ [fg=bright-black]    [/][italic] once[/].
-168 │ [fg=bright-black]3.  [/]Clients should prese
-169 │ [fg=bright-black]    [/]rve unknown fields f
-170 │ [fg=bright-black]    [/]or forward compatibi
-171 │ [fg=bright-black]    [/]lity.[1]
-172 │ 
-173 │ [bold]Next step:[/] review [fg=yellow,underline]docs/p[/]
-174 │ [fg=yellow,underline]rotocol.md[/] and open a pu
-175 │ ll request referencing a
-176 │ n issue—for example, [fg=yellow]Clo[/]
-177 │ [fg=yellow]ses #42[/].
-178 │ 
-179 │ [fg=bright-black]────────────────────────[/]
-180 │ 
-181 │ Footnotes
-182 │ [fg=bright-black]1.  [/]This enables older c
-183 │ [fg=bright-black]    [/]lients to safely pro
-184 │ [fg=bright-black]    [/]xy events created by
-185 │ [fg=bright-black]    [/] newer protocol vers
-186 │ [fg=bright-black]    [/]ions. ↩
+114 │ 
+115 │ For attempt (n), the del
+116 │ ay is conceptually:
+117 │ 
+118 │ [fg=bright-black]┌─ text[/]
+119 │ [fg=bright-black]│ [/][fg=yellow]delay(n) = min(initial[/]
+120 │ [fg=bright-black]│ [/][fg=yellow]_delay × 2ⁿ + jitter, [/]
+121 │ [fg=bright-black]│ [/][fg=yellow]maximum_delay)[/]
+122 │ [fg=bright-black]└─[/]
+123 │ 
+124 │ [fg=bright-black]Attempt: [/]1
+125 │ [fg=bright-black]Base Delay: [/]250 ms
+126 │ [fg=bright-black]Example with Jitter: [/]284 ms
+127 │ 
+128 │ [fg=bright-black]Attempt: [/]2
+129 │ [fg=bright-black]Base Delay: [/]500 ms
+130 │ [fg=bright-black]Example with Jitter: [/]571 ms
+131 │ 
+132 │ [fg=bright-black]Attempt: [/]3
+133 │ [fg=bright-black]Base Delay: [/]1 s
+134 │ [fg=bright-black]Example with Jitter: [/]1.08 s
+135 │ 
+136 │ [fg=bright-black]Attempt: [/]4
+137 │ [fg=bright-black]Base Delay: [/]2 s
+138 │ [fg=bright-black]Example with Jitter: [/]2.17 s
+139 │ 
+140 │ [fg=bright-black]┌─ json[/]
+141 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]{[/]
+142 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]event[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task.compl[/]
+143 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]eted[/][fg=rgb-192-197-206]"[/][fg=rgb-163-190-140],[/]
+144 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]version[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]2[/][fg=rgb-192-197-206],[/]
+145 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  "[/][fg=rgb-163-190-140]data[/][fg=rgb-192-197-206]": {[/]
+146 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]task_id[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]task_0[/]
+147 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]1JABCDEF[/][fg=rgb-192-197-206]"[/][fg=rgb-163-190-140],[/]
+148 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]duration_ms[/][fg=rgb-192-197-206]": [/][fg=rgb-208-135-112]184[/]
+149 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]2,[/]
+150 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    "[/][fg=rgb-163-190-140]result[/][fg=rgb-192-197-206]": {[/]
+151 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]status[/][fg=rgb-192-197-206]": "[/][fg=rgb-163-190-140]succe[/]
+152 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]ss[/][fg=rgb-192-197-206]"[/][fg=rgb-163-190-140],[/]
+153 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]      "[/][fg=rgb-163-190-140]artifacts[/][fg=rgb-192-197-206]": ["[/][fg=rgb-163-190-140]r[/]
+154 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]eport.pdf[/][fg=rgb-192-197-206]"[/][fg=rgb-163-190-140]][/]
+155 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]    [/][fg=rgb-43-48-59]}[/]
+156 │ [fg=bright-black]│ [/][fg=rgb-192-197-206]  [/][fg=rgb-43-48-59]}[/]
+157 │ [fg=bright-black]│ [/][fg=rgb-43-48-59]}[/]
+158 │ [fg=bright-black]└─[/]
+159 │ 
+160 │ [fg=bright-black]────────────────────────[/]
+161 │ 
+162 │ [fg=cyan,bold]Notes[/]
+163 │ 
+164 │ [fg=bright-black]1.  [/]Events are ordered [bold]p[/]
+165 │ [fg=bright-black]    [/][bold]er task[/], not globall
+166 │ [fg=bright-black]    [/]y.
+167 │ [fg=bright-black]2.  [/]Delivery is [italic]at least[/]
+168 │ [fg=bright-black]    [/][italic] once[/].
+169 │ [fg=bright-black]3.  [/]Clients should prese
+170 │ [fg=bright-black]    [/]rve unknown fields f
+171 │ [fg=bright-black]    [/]or forward compatibi
+172 │ [fg=bright-black]    [/]lity.[1]
+173 │ 
+174 │ [bold]Next step:[/] review [fg=yellow,underline]docs/p[/]
+175 │ [fg=yellow,underline]rotocol.md[/] and open a pu
+176 │ ll request referencing a
+177 │ n issue—for example, [fg=yellow]Clo[/]
+178 │ [fg=yellow]ses #42[/].
+179 │ 
+180 │ [fg=bright-black]────────────────────────[/]
+181 │ 
+182 │ Footnotes
+183 │ 
+184 │ [fg=bright-black]1.  [/]This enables older c
+185 │ [fg=bright-black]    [/]lients to safely pro
+186 │ [fg=bright-black]    [/]xy events created by
+187 │ [fg=bright-black]    [/] newer protocol vers
+188 │ [fg=bright-black]    [/]ions. ↩

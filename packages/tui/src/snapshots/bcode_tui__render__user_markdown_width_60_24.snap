@@ -7,27 +7,7 @@ expression: output.trim_end()
 01 │   Request
 02 │   
 03 │   Please update src/lib.rs with care.
-04 │   1.  Read the file.
-05 │   2.  Run:
-06 │       
-07 │       ┌─ sh
-08 │       │ cargo test
-09 │       └─
-10 │   
-11 │   │ Keep the change focused.
-12 │   
-13 │   ┌───────┬──────────┐
-14 │   │ Check │ State    │
-15 │   ├───────┼──────────┤
-16 │   │ tests │ required │
-17 │   └───────┴──────────┘
-18 │ 
-== width 24 ==
-00 │ You
-01 │   Request
-02 │   
-03 │   Please update src/lib.
-04 │   rs with care.
+04 │   
 05 │   1.  Read the file.
 06 │   2.  Run:
 07 │       
@@ -35,12 +15,34 @@ expression: output.trim_end()
 09 │       │ cargo test
 10 │       └─
 11 │   
-12 │   │ Keep the change focu
-13 │   │ sed.
-14 │   
-15 │   ┌───────┬──────────┐
-16 │   │ Check │ State    │
-17 │   ├───────┼──────────┤
-18 │   │ tests │ required │
-19 │   └───────┴──────────┘
-20 │
+12 │   │ Keep the change focused.
+13 │   
+14 │   ┌───────┬──────────┐
+15 │   │ Check │ State    │
+16 │   ├───────┼──────────┤
+17 │   │ tests │ required │
+18 │   └───────┴──────────┘
+19 │ 
+== width 24 ==
+00 │ You
+01 │   Request
+02 │   
+03 │   Please update src/lib.
+04 │   rs with care.
+05 │   
+06 │   1.  Read the file.
+07 │   2.  Run:
+08 │       
+09 │       ┌─ sh
+10 │       │ cargo test
+11 │       └─
+12 │   
+13 │   │ Keep the change focu
+14 │   │ sed.
+15 │   
+16 │   ┌───────┬──────────┐
+17 │   │ Check │ State    │
+18 │   ├───────┼──────────┤
+19 │   │ tests │ required │
+20 │   └───────┴──────────┘
+21 │

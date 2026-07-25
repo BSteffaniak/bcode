@@ -8,10 +8,11 @@ expression: "[60_u16,\n24].into_iter().map(|width|\nformat!(\"== width {width} =
 02 │ [fg=bright-black]────────────────────────────────────────────────────────────[/]
 03 │ 
 04 │ Footnotes
-05 │ [fg=bright-black]1.  [/]First definition over multiple lines. ↩×2
-06 │ [fg=bright-black]2.  [/]Second definition with [bold]strong[/] text, [italic]emphasis[/], [fg=yellow]code[/], and 
-07 │ [fg=bright-black]    [/]Unicode 東京 🧪. ↩
-08 │ [fg=bright-black]3.  [/]Unreferenced definition.
+05 │ 
+06 │ [fg=bright-black]1.  [/]First definition over multiple lines. ↩×2
+07 │ [fg=bright-black]2.  [/]Second definition with [bold]strong[/] text, [italic]emphasis[/], [fg=yellow]code[/], and 
+08 │ [fg=bright-black]    [/]Unicode 東京 🧪. ↩
+09 │ [fg=bright-black]3.  [/]Unreferenced definition.
 == width 24 ==
 00 │ First[1], repeated[1], a
 01 │ nd second[2]. Missing[3]
@@ -20,12 +21,13 @@ expression: "[60_u16,\n24].into_iter().map(|width|\nformat!(\"== width {width} =
 04 │ [fg=bright-black]────────────────────────[/]
 05 │ 
 06 │ Footnotes
-07 │ [fg=bright-black]1.  [/]First definition ove
-08 │ [fg=bright-black]    [/]r multiple lines. ↩×
-09 │ [fg=bright-black]    [/]2
-10 │ [fg=bright-black]2.  [/]Second definition wi
-11 │ [fg=bright-black]    [/]th [bold]strong[/] text, [italic]emph[/]
-12 │ [fg=bright-black]    [/][italic]asis[/], [fg=yellow]code[/], and Unic
-13 │ [fg=bright-black]    [/]ode 東京 🧪. ↩
-14 │ [fg=bright-black]3.  [/]Unreferenced definit
-15 │ [fg=bright-black]    [/]ion.
+07 │ 
+08 │ [fg=bright-black]1.  [/]First definition ove
+09 │ [fg=bright-black]    [/]r multiple lines. ↩×
+10 │ [fg=bright-black]    [/]2
+11 │ [fg=bright-black]2.  [/]Second definition wi
+12 │ [fg=bright-black]    [/]th [bold]strong[/] text, [italic]emph[/]
+13 │ [fg=bright-black]    [/][italic]asis[/], [fg=yellow]code[/], and Unic
+14 │ [fg=bright-black]    [/]ode 東京 🧪. ↩
+15 │ [fg=bright-black]3.  [/]Unreferenced definit
+16 │ [fg=bright-black]    [/]ion.

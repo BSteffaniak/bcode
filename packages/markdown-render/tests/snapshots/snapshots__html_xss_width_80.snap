@@ -3,5 +3,7 @@ source: packages/markdown-render/tests/snapshots.rs
 expression: "visible_snapshot(HTML_XSS, 80)"
 ---
 00 │ Safe <span>text</span>.
-01 │ &amp;lt;script&amp;gt;alert(&amp;quot;unsafe&amp;quot;)&amp;lt;/script&amp;gt;
-02 │ unsafe link
+01 │ 
+02 │ &amp;lt;script&amp;gt;alert(&amp;quot;unsafe&amp;quot;)&amp;lt;/script&amp;gt;
+03 │ 
+04 │ unsafe link

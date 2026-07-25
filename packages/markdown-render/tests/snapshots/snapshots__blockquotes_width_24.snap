@@ -6,8 +6,10 @@ expression: "visible_snapshot(BLOCKQUOTES, 24)"
 01 │ │ because it is delibera
 02 │ │ tely long for the cons
 03 │ │ trained width
-04 │ │ second paragraph
-05 │ │ │ nested quote
+04 │ │ 
+05 │ │ second paragraph
 06 │ │ 
-07 │ │ •  quoted list one
-08 │ │ •  quoted list two
+07 │ │ │ nested quote
+08 │ │ 
+09 │ │ •  quoted list one
+10 │ │ •  quoted list two

@@ -14,10 +14,11 @@ expression: "visible_snapshot(BLOCKS, 40)"
 09 │ ────────────────────────────────────────
 10 │ 
 11 │ │ quoted line
-12 │ │ │ nested quote
-13 │ 
-14 │ ┌─ rust
-15 │ │ fn main() {
-16 │ │     println!("hello");
-17 │ │ }
-18 │ └─
+12 │ │ 
+13 │ │ │ nested quote
+14 │ 
+15 │ ┌─ rust
+16 │ │ fn main() {
+17 │ │     println!("hello");
+18 │ │ }
+19 │ └─

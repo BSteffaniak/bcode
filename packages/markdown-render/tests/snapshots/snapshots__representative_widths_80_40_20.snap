@@ -6,48 +6,51 @@ expression: "[\"== width 80 ==\", &visible_snapshot(COMPOSITION, 80), \"== width
 00 │ Summary
 01 │ 
 02 │ Read the guide before continuing.
-03 │ •  Review important details
-04 │ •  Run cargo test
-05 │ 
-06 │ │ Keep output readable.
-07 │ 
-08 │ ┌───────────┬────────┐
-09 │ │ Item      │ State  │
-10 │ ├───────────┼────────┤
-11 │ │ renderer  │ ready  │
-12 │ ├───────────┼────────┤
-13 │ │ snapshots │ active │
-14 │ └───────────┴────────┘
+03 │ 
+04 │ •  Review important details
+05 │ •  Run cargo test
+06 │ 
+07 │ │ Keep output readable.
+08 │ 
+09 │ ┌───────────┬────────┐
+10 │ │ Item      │ State  │
+11 │ ├───────────┼────────┤
+12 │ │ renderer  │ ready  │
+13 │ ├───────────┼────────┤
+14 │ │ snapshots │ active │
+15 │ └───────────┴────────┘
 == width 40 ==
 00 │ Summary
 01 │ 
 02 │ Read the guide before continuing.
-03 │ •  Review important details
-04 │ •  Run cargo test
-05 │ 
-06 │ │ Keep output readable.
-07 │ 
-08 │ ┌───────────┬────────┐
-09 │ │ Item      │ State  │
-10 │ ├───────────┼────────┤
-11 │ │ renderer  │ ready  │
-12 │ ├───────────┼────────┤
-13 │ │ snapshots │ active │
-14 │ └───────────┴────────┘
+03 │ 
+04 │ •  Review important details
+05 │ •  Run cargo test
+06 │ 
+07 │ │ Keep output readable.
+08 │ 
+09 │ ┌───────────┬────────┐
+10 │ │ Item      │ State  │
+11 │ ├───────────┼────────┤
+12 │ │ renderer  │ ready  │
+13 │ ├───────────┼────────┤
+14 │ │ snapshots │ active │
+15 │ └───────────┴────────┘
 == width 20 ==
 00 │ Summary
 01 │ 
 02 │ Read the guide befor
 03 │ e continuing.
-04 │ •  Review important 
-05 │    details
-06 │ •  Run cargo test
-07 │ 
-08 │ │ Keep output readab
-09 │ │ le.
-10 │ 
-11 │ Item: renderer
-12 │ State: ready
-13 │ 
-14 │ Item: snapshots
-15 │ State: active
+04 │ 
+05 │ •  Review important 
+06 │    details
+07 │ •  Run cargo test
+08 │ 
+09 │ │ Keep output readab
+10 │ │ le.
+11 │ 
+12 │ Item: renderer
+13 │ State: ready
+14 │ 
+15 │ Item: snapshots
+16 │ State: active
