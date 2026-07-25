@@ -1613,6 +1613,29 @@ fn display_role_suffix_remains_plain_title_chrome() {
 
 #[cfg(test)]
 #[test]
+fn reasoning_renders_completed_neutral_chrome_and_multipart_boundaries() {
+    let item = TranscriptItem::with_identity(
+        "Reasoning summary",
+        "Designing invocation context\n\nRefactoring lifecycle metadata\n\nPlanning timing integration"
+            .to_owned(),
+        false,
+        TextFormat::Markdown,
+        TranscriptItemKind::ReasoningMessage,
+    );
+    let rows = transcript_item_rows(&[item], 0, 40, None, TuiDiffViewerConfig::default());
+    let text = visible_rows_snapshot(&rows);
+
+    assert!(text.contains("00 │ Reasoning"));
+    assert!(!text.contains("Reasoning …"));
+    assert!(text.contains("Designing invocation context"));
+    assert!(text.contains("Refactoring lifecycle metadata"));
+    assert!(text.contains("Planning timing integration"));
+    assert!(!text.contains("contextRefactoring"));
+    assert!(!text.contains("metadataPlanning"));
+}
+
+#[cfg(test)]
+#[test]
 fn assistant_and_reasoning_keep_markdown_body_and_streaming_chrome() {
     let assistant = TranscriptItem::with_identity(
         "Assistant",
