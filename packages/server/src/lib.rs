@@ -11022,6 +11022,7 @@ struct ToolArgumentStreamProgress {
     preview_start_offset: usize,
     pending_text: String,
     pending_offset: usize,
+    pending_checkpoint: bool,
     truncated: bool,
     last_emitted_argument_bytes: usize,
     last_emitted_at: Option<Instant>,
@@ -11168,6 +11169,7 @@ impl ModelStreamProgress {
                 preview_start_offset: 0,
                 pending_text: String::new(),
                 pending_offset: 0,
+                pending_checkpoint: false,
                 truncated: false,
                 last_emitted_argument_bytes: 0,
                 last_emitted_at: None,
@@ -11200,10 +11202,6 @@ impl ModelStreamProgress {
             return;
         };
         active.argument_bytes = active.argument_bytes.saturating_add(delta.len());
-        if active.pending_text.is_empty() {
-            active.pending_offset = active.argument_bytes.saturating_sub(delta.len());
-        }
-        active.pending_text.push_str(delta);
         active.retained_preview.push_str(delta);
         if active.retained_preview.len() > Self::MAX_TOOL_REQUEST_DRAFT_PREVIEW_BYTES {
             let overflow = active
@@ -11218,7 +11216,13 @@ impl ModelStreamProgress {
                 .unwrap_or(active.retained_preview.len());
             active.retained_preview.drain(..split);
             active.preview_start_offset = active.preview_start_offset.saturating_add(split);
+            active.pending_checkpoint = true;
             active.truncated = true;
+        } else if !active.pending_checkpoint {
+            if active.pending_text.is_empty() {
+                active.pending_offset = active.argument_bytes.saturating_sub(delta.len());
+            }
+            active.pending_text.push_str(delta);
         }
     }
 
@@ -11231,11 +11235,24 @@ impl ModelStreamProgress {
             return None;
         }
         let active = self.active_tool_calls.get_mut(call_id)?;
-        let text = std::mem::take(&mut active.pending_text);
-        if text.is_empty() {
-            return None;
-        }
         active.revision = active.revision.saturating_add(1);
+        let operation = if active.pending_checkpoint {
+            active.pending_checkpoint = false;
+            active.pending_text.clear();
+            bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                start_offset: active.preview_start_offset,
+                text: active.retained_preview.clone(),
+            }
+        } else {
+            let text = std::mem::take(&mut active.pending_text);
+            if text.is_empty() {
+                return None;
+            }
+            bcode_session_models::ToolRequestDraftOperation::Append {
+                offset: active.pending_offset,
+                text,
+            }
+        };
         Some(bcode_session_models::ToolRequestDraftEvent {
             turn_id: turn_id.to_owned(),
             tool_call_id: active.call_id.clone(),
@@ -11245,10 +11262,7 @@ impl ModelStreamProgress {
             schema_version: active.schema_version,
             generation: active.generation,
             revision: active.revision,
-            operation: bcode_session_models::ToolRequestDraftOperation::Append {
-                offset: active.pending_offset,
-                text,
-            },
+            operation,
             argument_bytes: active.argument_bytes,
             truncated: active.truncated,
         })
@@ -25103,6 +25117,84 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn request_draft_registry_rejects_append_gaps_until_checkpoint() {
+        let state = test_server_state(SessionManager::default());
+        let session_id = SessionId::new();
+        publish_tool_request_draft_live(
+            &state,
+            session_id,
+            request_draft_event(
+                "call-1",
+                1,
+                1,
+                bcode_session_models::ToolRequestDraftOperation::Append {
+                    offset: 0,
+                    text: "λ".to_owned(),
+                },
+            ),
+        )
+        .await;
+        publish_tool_request_draft_live(
+            &state,
+            session_id,
+            request_draft_event(
+                "call-1",
+                1,
+                2,
+                bcode_session_models::ToolRequestDraftOperation::Append {
+                    offset: "λ".chars().count(),
+                    text: "gap".to_owned(),
+                },
+            ),
+        )
+        .await;
+        let (revision, preview) = {
+            let registry = state
+                .active_tool_request_drafts
+                .lock()
+                .expect("request draft registry");
+            let draft = registry.drafts.values().next().expect("active draft");
+            let result = (draft.event.revision, draft.preview.clone());
+            drop(registry);
+            result
+        };
+        assert_eq!(revision, 1);
+        assert_eq!(preview, "λ");
+
+        publish_tool_request_draft_live(
+            &state,
+            session_id,
+            request_draft_event(
+                "call-1",
+                1,
+                3,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 4,
+                    text: "latest".to_owned(),
+                },
+            ),
+        )
+        .await;
+        let (revision, start_offset, preview) = {
+            let registry = state
+                .active_tool_request_drafts
+                .lock()
+                .expect("request draft registry");
+            let draft = registry.drafts.values().next().expect("active draft");
+            let result = (
+                draft.event.revision,
+                draft.preview_start_offset,
+                draft.preview.clone(),
+            );
+            drop(registry);
+            result
+        };
+        assert_eq!(revision, 3);
+        assert_eq!(start_offset, 4);
+        assert_eq!(preview, "latest");
+    }
+
+    #[tokio::test]
     async fn request_draft_registry_rejects_stale_and_post_terminal_updates() {
         let state = test_server_state(SessionManager::default());
         let session_id = SessionId::new();
@@ -25544,15 +25636,62 @@ library = "test"
         let checkpoint = progress
             .tool_request_draft_checkpoint("turn-1", "call-write")
             .expect("bounded checkpoint");
+        let emitted = progress
+            .take_tool_request_draft_event("turn-1", "call-write")
+            .expect("bounded emitted checkpoint");
+        let bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+            start_offset: emitted_start_offset,
+            text: emitted_text,
+        } = emitted.operation
+        else {
+            panic!("expected emitted checkpoint after truncation");
+        };
         let bcode_session_models::ToolRequestDraftOperation::Checkpoint { start_offset, text } =
             checkpoint.operation
         else {
             panic!("expected checkpoint");
         };
+        assert_eq!(emitted_start_offset, start_offset);
+        assert_eq!(emitted_text, text);
         assert!(text.len() <= ModelStreamProgress::MAX_TOOL_REQUEST_DRAFT_PREVIEW_BYTES);
         assert!(start_offset > 0);
         assert!(checkpoint.truncated);
         assert!(std::str::from_utf8(text.as_bytes()).is_ok());
+        let active = &progress.active_tool_calls["call-write"];
+        assert!(active.pending_text.is_empty());
+        assert!(!active.pending_checkpoint);
+    }
+
+    #[test]
+    fn tool_request_draft_append_offsets_count_utf8_bytes() {
+        let mut progress = ModelStreamProgress::default();
+        progress.start_tool_call(
+            "call-write".to_owned(),
+            "filesystem.write".to_owned(),
+            Some("bcode.filesystem".to_owned()),
+        );
+        let delta = "λ".repeat(256);
+        progress.record_tool_call_delta("call-write", &delta);
+
+        let event = progress
+            .take_tool_request_draft_event("turn-1", "call-write")
+            .expect("first UTF-8 append");
+        assert_eq!(event.argument_bytes, delta.len());
+        assert!(matches!(
+            event.operation,
+            bcode_session_models::ToolRequestDraftOperation::Append { offset: 0, ref text }
+                if text == &delta
+        ));
+        let checkpoint = progress
+            .tool_request_draft_checkpoint("turn-1", "call-write")
+            .expect("UTF-8 checkpoint");
+        assert!(matches!(
+            checkpoint.operation,
+            bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                start_offset: 0,
+                ref text,
+            } if text == &delta
+        ));
     }
 
     #[test]
@@ -34325,6 +34464,96 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     envelope: next_generation,
                 },
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn host_terminal_failure_clears_progress_without_producer_cleanup() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("failed progress cleanup".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created")
+            .id;
+        let mut attachment = sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("session should attach");
+        let state = test_server_state(sessions);
+        let envelope = bcode_session_models::ToolContributionEnvelope::new(
+            bcode_session_models::ToolContributionPlacement::Progress,
+            bcode_session_models::ToolContributionEvent {
+                invocation_id: "call-failed".to_owned(),
+                contribution_id: "screen".to_owned(),
+                sequence: 1,
+                producer_id: "test.plugin".to_owned(),
+                schema: "test.progress".to_owned(),
+                schema_version: 1,
+                operation: bcode_session_models::ToolContributionOperation::Upsert,
+                persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                artifact: None,
+                payload: serde_json::json!({"frame": 1}),
+            },
+        );
+        append_tool_contribution_envelope(
+            &state,
+            session_id,
+            "call-failed",
+            "test.plugin",
+            envelope,
+        )
+        .await;
+        assert!(matches!(
+            attachment.live_events.recv().await.expect("live progress").kind,
+            SessionLiveEventKind::ToolContributionPlaced { envelope }
+                if envelope.contribution.operation
+                    == bcode_session_models::ToolContributionOperation::Upsert
+        ));
+
+        append_tool_invocation_terminal_event(
+            &state,
+            session_id,
+            "call-failed",
+            bcode_session_models::ToolInvocationLifecycleStage::Failed,
+        )
+        .await;
+
+        assert!(
+            active_contribution_snapshot_events(&state, session_id)
+                .expect("active contribution snapshot")
+                .is_empty()
+        );
+        assert!(matches!(
+            attachment
+                .live_events
+                .recv()
+                .await
+                .expect("host-owned terminal removal")
+                .kind,
+            SessionLiveEventKind::ToolContributionPlaced { envelope }
+                if envelope.placement
+                    == bcode_session_models::ToolContributionPlacement::Progress
+                    && envelope.contribution.operation
+                        == bcode_session_models::ToolContributionOperation::Remove
+                    && envelope.contribution.sequence == 2
+        ));
+        assert!(
+            state
+                .sessions
+                .session_history(session_id)
+                .await
+                .expect("durable history")
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::ToolInvocationLifecycle { event }
+                        if event.invocation_id == "call-failed"
+                            && event.stage
+                                == bcode_session_models::ToolInvocationLifecycleStage::Failed
+                ))
         );
     }
 

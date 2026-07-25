@@ -2618,6 +2618,42 @@ mod tests {
     }
 
     #[test]
+    fn request_draft_append_offsets_are_utf8_byte_offsets() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let draft = |revision, offset, text: &str| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "call-write".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    generation: 1,
+                    revision,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Append {
+                        offset,
+                        text: text.to_owned(),
+                    },
+                    argument_bytes: offset.saturating_add(text.len()),
+                    truncated: false,
+                },
+            },
+        };
+        let unicode = "λ🙂";
+        view.apply_live_event(&draft(1, 0, unicode));
+        view.apply_live_event(&draft(2, unicode.len(), "ok"));
+        assert_eq!(view.tool_request_drafts["call-write"].preview, "λ🙂ok");
+
+        let character_offset = "λ🙂ok".chars().count();
+        assert_ne!(character_offset, "λ🙂ok".len());
+        view.apply_live_event(&draft(3, character_offset, "wrong-unit"));
+        assert_eq!(view.tool_request_drafts["call-write"].preview, "λ🙂ok");
+    }
+
+    #[test]
     fn request_draft_flood_keeps_one_item_and_latest_preview() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
