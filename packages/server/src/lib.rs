@@ -6824,10 +6824,12 @@ async fn handle_prepare_session_open(
     session_id: SessionId,
 ) -> Result<(), ServerError> {
     let source_writer_epoch = match state.sessions.session_health(session_id).await {
-        bcode_session::SessionHealth::WriterIncompatible {
-            actual: Some(actual),
+        bcode_session::SessionHealth::Migratable { source, .. }
+        | bcode_session::SessionHealth::BlockedOwner { source, .. }
+        | bcode_session::SessionHealth::WriterIncompatible {
+            actual: Some(source),
             ..
-        } => u32::try_from(actual).ok(),
+        } => u32::try_from(source).ok(),
         _ => None,
     };
     if let Some(source_writer_epoch) = source_writer_epoch

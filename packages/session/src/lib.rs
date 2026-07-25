@@ -1076,6 +1076,14 @@ pub enum SessionHealth {
     Ready,
     /// Session is inspectable but contains semantically opaque history and is read-only.
     DegradedReadOnly { issue_count: u64 },
+    /// A known historical writer can be migrated by this build.
+    Migratable { source: u64, target: u64 },
+    /// A known historical writer is migratable but a live owner blocks exclusive maintenance.
+    BlockedOwner {
+        source: u64,
+        target: u64,
+        owners: Vec<lease::SessionLeaseOwner>,
+    },
     /// Session storage requires a different writer epoch.
     WriterIncompatible { actual: Option<u64>, expected: u64 },
     /// A DB read model is missing or stale.
@@ -1261,6 +1269,45 @@ struct OwnedLegacyMigration<'a> {
     write: &'a lease::SessionWriteGuard,
     started: &'a bcode_metrics::MetricsTimer,
     progress: Option<&'a MigrationProgressReporter>,
+}
+
+async fn classify_known_current_session_open(
+    session_id: SessionId,
+    db: &db::SessionDb,
+) -> Result<SessionOpenOperationSnapshot, SessionError> {
+    match db.current_open_readiness_known_current().await {
+        Ok(db::SessionCompatibilityStatus::Compatible { .. }) => {
+            Ok(ready_session_open_snapshot(session_id))
+        }
+        Ok(db::SessionCompatibilityStatus::Degraded { issue_count, .. }) => {
+            Ok(terminal_session_open_snapshot(
+                session_id,
+                SessionOpenTerminalOutcome::DegradedReadOnly { issue_count },
+                "Session history contains unsupported event(s) and is read-only".to_owned(),
+            ))
+        }
+        Ok(
+            db::SessionCompatibilityStatus::Missing
+            | db::SessionCompatibilityStatus::Stale { .. }
+            | db::SessionCompatibilityStatus::Incompatible { .. },
+        ) => unreachable!("current-open readiness rejects non-ready projection states"),
+        Err(db::SessionDbError::WriterIncompatible { actual, expected }) => {
+            Ok(terminal_session_open_snapshot(
+                session_id,
+                SessionOpenTerminalOutcome::WriterIncompatible { actual, expected },
+                format!(
+                    "Session writer epoch {actual:?} is incompatible with expected epoch {expected}"
+                ),
+            ))
+        }
+        Err(error) => Ok(terminal_session_open_snapshot(
+            session_id,
+            SessionOpenTerminalOutcome::RepairRequired {
+                reason: error.to_string(),
+            },
+            "Session storage requires repair".to_owned(),
+        )),
+    }
 }
 
 impl SessionManager {
@@ -1456,6 +1503,9 @@ impl SessionManager {
         if !db::session_db_path(&root, session_id).exists() {
             return Err(SessionError::NotFound(session_id));
         }
+        if self.inner.lock().await.leases.contains_key(&session_id) {
+            return Ok(ready_session_open_snapshot(session_id));
+        }
         let db = db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
         let compatibility = match db.storage_compatibility().await {
             Ok(compatibility) => compatibility,
@@ -1496,39 +1546,7 @@ impl SessionManager {
                 .await;
             return Ok(operation.snapshot());
         }
-        match db.current_open_readiness_known_current().await {
-            Ok(db::SessionCompatibilityStatus::Compatible { .. }) => {
-                Ok(ready_session_open_snapshot(session_id))
-            }
-            Ok(db::SessionCompatibilityStatus::Degraded { issue_count, .. }) => {
-                Ok(terminal_session_open_snapshot(
-                    session_id,
-                    SessionOpenTerminalOutcome::DegradedReadOnly { issue_count },
-                    "Session history contains unsupported event(s) and is read-only".to_owned(),
-                ))
-            }
-            Ok(
-                db::SessionCompatibilityStatus::Missing
-                | db::SessionCompatibilityStatus::Stale { .. }
-                | db::SessionCompatibilityStatus::Incompatible { .. },
-            ) => unreachable!("current-open readiness rejects non-ready projection states"),
-            Err(db::SessionDbError::WriterIncompatible { actual, expected }) => {
-                Ok(terminal_session_open_snapshot(
-                    session_id,
-                    SessionOpenTerminalOutcome::WriterIncompatible { actual, expected },
-                    format!(
-                        "Session writer epoch {actual:?} is incompatible with expected epoch {expected}"
-                    ),
-                ))
-            }
-            Err(error) => Ok(terminal_session_open_snapshot(
-                session_id,
-                SessionOpenTerminalOutcome::RepairRequired {
-                    reason: error.to_string(),
-                },
-                "Session storage requires repair".to_owned(),
-            )),
-        }
+        classify_known_current_session_open(session_id, &db).await
     }
 
     /// Return one operation snapshot when both session and operation identities match.
@@ -2207,6 +2225,7 @@ impl SessionManager {
     }
 
     /// Return first-class health for one session without event-log replay or repair.
+    #[allow(clippy::too_many_lines)]
     pub async fn session_health(&self, session_id: SessionId) -> SessionHealth {
         let Some(store) = &self.store else {
             return if self.inner.lock().await.sessions.contains_key(&session_id) {
@@ -2232,9 +2251,24 @@ impl SessionManager {
         match db.storage_compatibility().await {
             Ok(db::SessionStorageCompatibility::Current { .. }) => {}
             Ok(db::SessionStorageCompatibility::KnownLegacy { writer_epoch }) => {
-                return SessionHealth::WriterIncompatible {
-                    actual: Some(writer_epoch),
-                    expected: expected_writer_epoch,
+                let owners = match lease::active_session_owners(&root, session_id) {
+                    Ok(owners) => owners,
+                    Err(error) => {
+                        return SessionHealth::RepairRequired {
+                            reason: error.to_string(),
+                        };
+                    }
+                };
+                if owners.is_empty() {
+                    return SessionHealth::Migratable {
+                        source: writer_epoch,
+                        target: expected_writer_epoch,
+                    };
+                }
+                return SessionHealth::BlockedOwner {
+                    source: writer_epoch,
+                    target: expected_writer_epoch,
+                    owners,
                 };
             }
             Err(db::SessionDbError::WriterIncompatible { actual, expected }) => {
@@ -2353,6 +2387,7 @@ impl SessionManager {
             .await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn create_session_record(
         &self,
         name: Option<String>,
@@ -5160,7 +5195,9 @@ mod tests {
         );
         assert!(matches!(
             manager.session_health(session_id).await,
-            SessionHealth::WriterIncompatible { .. }
+            SessionHealth::Migratable { .. }
+                | SessionHealth::BlockedOwner { .. }
+                | SessionHealth::WriterIncompatible { .. }
                 | SessionHealth::RepairRequired { .. }
                 | SessionHealth::ProjectionStale { .. }
         ));
@@ -5178,6 +5215,50 @@ mod tests {
         assert_eq!(page.events.len(), 2);
         assert_eq!(page.compatibility_issues.len(), 1);
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn session_health_composes_migratable_and_owner_blocked_historical_state() {
+        let root = unique_temp_dir();
+        let session_id =
+            generate_legacy_migration_benchmark_store(&root, MigrationBenchmarkProfile::Small)
+                .await;
+        let manager = SessionManager::persistent(&root).expect("manager");
+
+        assert_eq!(
+            manager.session_health(session_id).await,
+            SessionHealth::Migratable {
+                source: 3,
+                target: u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+            }
+        );
+        let owner = lease::acquire_session_lease(
+            &root,
+            session_id,
+            &lease::SessionLeaseOwnerContext {
+                daemon_namespace: Some("older-daemon".to_owned()),
+                build_fingerprint: Some("older-build".to_owned()),
+                storage_writer_epoch: Some(3),
+                daemon_instance_id: Some("older-instance".to_owned()),
+                endpoint: Some("older.sock".to_owned()),
+                ..lease::SessionLeaseOwnerContext::default()
+            },
+        )
+        .expect("older owner");
+        let health = manager.session_health(session_id).await;
+        let SessionHealth::BlockedOwner {
+            source,
+            target,
+            owners,
+        } = health
+        else {
+            panic!("expected blocked-owner health");
+        };
+        assert_eq!(source, 3);
+        assert_eq!(target, u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH));
+        assert_eq!(owners, vec![owner.owner().clone()]);
+        drop(owner);
+        std::fs::remove_dir_all(root).expect("temp dir cleanup");
     }
 
     #[tokio::test]
@@ -7577,6 +7658,12 @@ mod tests {
             let root = unique_temp_dir();
             let session_id = generate_current_migration_benchmark_store(&root, profile).await;
             let manager = SessionManager::persistent(&root).expect("manager");
+            let store = manager.store.as_ref().expect("persistent store");
+            let lease = manager
+                .acquire_session_lease_for_load(session_id, store, None)
+                .await
+                .expect("current runtime lease");
+            manager.inner.lock().await.leases.insert(session_id, lease);
             let mut durations = Vec::with_capacity(RUNS);
             for _ in 0..RUNS {
                 let started = std::time::Instant::now();
@@ -7590,6 +7677,12 @@ mod tests {
             }
             durations.sort_unstable();
             let p95_us = durations[RUNS * 95 / 100];
+            assert!(
+                p95_us <= CURRENT_SESSION_PREPARE_P95_BUDGET_MS * 1_000,
+                "{} current-open p95 {p95_us} us exceeds {} ms gate",
+                profile.name(),
+                CURRENT_SESSION_PREPARE_P95_BUDGET_MS
+            );
             eprintln!(
                 "current_session_prepare_by_events profile={} events={} p95_us={p95_us}",
                 profile.name(),

@@ -330,18 +330,23 @@ order-of-magnitude regressions:
 cargo test -p bcode_session benchmark_current_session_preparation_latency -- --ignored --nocapture
 ```
 
+The current daemon also enforces a 25 ms p95 gate for preparation after runtime ownership has
+already established the store as current. Across 30 runs per profile, the 100 / 5,000 / 50,000-event
+stores measured 6 / 5 / 7 µs p95. The fast path is keyed by the live runtime lease itself rather
+than an independent cache, so it cannot outlive ownership or bypass first-open writer/ledger
+classification:
+
+```text
+cargo test -p bcode_session benchmark_current_session_preparation_is_event_count_independent -- --ignored --nocapture
+```
+
 The table's peak RSS is `/usr/bin/time -l` maximum resident set size for the complete isolated test
 process, so it is a conservative process high-water mark rather than migration-only allocation.
 Across these profiles it remained effectively flat (220.7–221.4 MB). DB growth and peak RSS are
 now measured, and explicit post-commit checkpointing leaves the final WAL at zero bytes for every
-profile. No release limits are set until the bounded-current-open regression below is corrected.
-Switchy's Turso `Database::exec_raw` rejects row-producing pragmas with `unexpected row during
-execution`; `Database::query_raw("PRAGMA wal_checkpoint(TRUNCATE)")` is therefore the supported
-abstraction and is timed separately. A direct current-store event-count probe measured preparation
-p95 at 6,370 µs for 100 events, 35,540 µs for 5,000 events, and
-469,714 µs for 50,000 events. This fails the bounded-current-open acceptance requirement and is not
-a release gate; current preparation must stop doing event-count-proportional work before that item
-can be closed.
+profile. Switchy's Turso `Database::exec_raw` rejects row-producing pragmas with `unexpected row
+during execution`; `Database::query_raw("PRAGMA wal_checkpoint(TRUNCATE)")` is therefore the
+supported abstraction and is timed separately.
 
 Storage speed, canonical payload size, projection mix, retained sidecars, and host load all affect
 elapsed time. During healthy work, the TUI reports the active stage and stage-local natural units. A
