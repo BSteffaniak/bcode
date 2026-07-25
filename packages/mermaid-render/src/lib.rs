@@ -429,40 +429,76 @@ pub fn render_mermaid_with_worker(
             message: error.to_string(),
         });
     }
+    let stdout = child.stdout.take().ok_or_else(|| {
+        terminate_worker(&mut child);
+        MermaidRenderError::InvalidWorkerResponse {
+            message: "worker stdout unavailable".to_owned(),
+        }
+    })?;
+    let response_limit = u64::try_from(request.limits.max_output_bytes)
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(WORKER_RESPONSE_HEADER_BYTES).unwrap_or(11))
+        .saturating_add(1);
+    let reader = std::thread::spawn(move || {
+        let mut response = Vec::new();
+        let result = stdout.take(response_limit).read_to_end(&mut response);
+        (result, response)
+    });
     let started = std::time::Instant::now();
-    loop {
+    let status = loop {
         if cancellation.is_cancelled() {
             terminate_worker(&mut child);
+            let _ = reader.join();
             return Err(MermaidRenderError::Cancelled);
         }
         if started.elapsed() >= request.limits.timeout {
             terminate_worker(&mut child);
+            let _ = reader.join();
             return Err(MermaidRenderError::TimedOut);
         }
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => break status,
             Ok(None) => std::thread::sleep(Duration::from_millis(5)),
             Err(error) => {
                 terminate_worker(&mut child);
+                let _ = reader.join();
                 return Err(MermaidRenderError::WorkerUnavailable {
                     message: error.to_string(),
                 });
             }
         }
+    };
+    let (read_result, response) =
+        reader
+            .join()
+            .map_err(|_| MermaidRenderError::InvalidWorkerResponse {
+                message: "worker response reader panicked".to_owned(),
+            })?;
+    read_result.map_err(|error| MermaidRenderError::InvalidWorkerResponse {
+        message: error.to_string(),
+    })?;
+    if response.len()
+        > request
+            .limits
+            .max_output_bytes
+            .saturating_add(WORKER_RESPONSE_HEADER_BYTES)
+    {
+        return Err(MermaidRenderError::InvalidWorkerResponse {
+            message: "worker response exceeds output limit".to_owned(),
+        });
     }
-    let mut response = Vec::new();
-    child
-        .stdout
-        .take()
-        .ok_or_else(|| MermaidRenderError::InvalidWorkerResponse {
-            message: "worker stdout unavailable".to_owned(),
-        })?
-        .take(u64::try_from(request.limits.max_output_bytes).unwrap_or(u64::MAX) + 4096)
-        .read_to_end(&mut response)
-        .map_err(|error| MermaidRenderError::InvalidWorkerResponse {
-            message: error.to_string(),
-        })?;
-    decode_worker_response(request, &response)
+    decode_worker_response(request, &response).map_err(|error| {
+        if status.success() {
+            error
+        } else {
+            match error {
+                MermaidRenderError::InvalidDiagram { .. } => error,
+                _ => MermaidRenderError::InvalidWorkerResponse {
+                    message: format!("worker exited with {status}: {error}"),
+                },
+            }
+        }
+    })
 }
 
 fn encode_worker_request(request: &MermaidRenderRequest) -> Result<Vec<u8>, MermaidRenderError> {

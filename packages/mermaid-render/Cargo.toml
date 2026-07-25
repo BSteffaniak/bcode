@@ -13,6 +13,9 @@ version     = { workspace = true }
 [dependencies]
 mermaid-rs-renderer = { workspace = true }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [[bin]]
 name = "bcode-mermaid-worker"
 path = "src/bin/worker.rs"

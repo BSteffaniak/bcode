@@ -1,5 +1,7 @@
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Barrier};
+use std::time::Duration;
 
 use bcode_mermaid_render::{
     MermaidCancellationToken, MermaidRenderError, MermaidRenderRequest, MermaidRenderedOutput,
@@ -58,6 +60,90 @@ fn response(mut child: std::process::Child, request: &[u8]) -> (bool, Vec<u8>, b
     let length = u32::from_be_bytes(response[7..11].try_into().unwrap()) as usize;
     assert_eq!(response.len(), 11 + length);
     (success, response[11..].to_vec(), status.success())
+}
+
+fn scripted_worker(script: &str) -> tempfile::NamedTempFile {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut worker = tempfile::NamedTempFile::new().unwrap();
+    worker.write_all(script.as_bytes()).unwrap();
+    let mut permissions = worker.as_file().metadata().unwrap().permissions();
+    permissions.set_mode(0o700);
+    worker.as_file().set_permissions(permissions).unwrap();
+    worker
+}
+
+#[test]
+#[cfg(unix)]
+fn public_worker_adapter_forcefully_terminates_timed_out_worker() {
+    let worker = scripted_worker("#!/bin/sh\nsleep 30\n");
+    let mut request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 800, 600);
+    request.limits.timeout = Duration::from_millis(50);
+    let started = std::time::Instant::now();
+
+    assert_eq!(
+        render_mermaid_with_worker(
+            worker.path(),
+            &request,
+            &MermaidCancellationToken::default()
+        ),
+        Err(MermaidRenderError::TimedOut)
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+#[cfg(unix)]
+fn public_worker_adapter_forcefully_terminates_cancelled_worker() {
+    let worker = scripted_worker("#!/bin/sh\nsleep 30\n");
+    let request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 800, 600);
+    let cancellation = MermaidCancellationToken::default();
+    let barrier = Arc::new(Barrier::new(2));
+    let cancelling = cancellation.clone();
+    let cancelling_barrier = Arc::clone(&barrier);
+    let thread = std::thread::spawn(move || {
+        cancelling_barrier.wait();
+        std::thread::sleep(Duration::from_millis(50));
+        cancelling.cancel();
+    });
+    barrier.wait();
+    let started = std::time::Instant::now();
+
+    assert_eq!(
+        render_mermaid_with_worker(worker.path(), &request, &cancellation),
+        Err(MermaidRenderError::Cancelled)
+    );
+    thread.join().unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+#[cfg(unix)]
+fn public_worker_adapter_rejects_malformed_and_oversized_responses() {
+    let malformed = scripted_worker("#!/bin/sh\nprintf 'garbage'\n");
+    let request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 800, 600);
+    assert!(matches!(
+        render_mermaid_with_worker(
+            malformed.path(),
+            &request,
+            &MermaidCancellationToken::default()
+        ),
+        Err(MermaidRenderError::InvalidWorkerResponse { .. })
+    ));
+
+    let oversized = scripted_worker(
+        "#!/bin/sh\nprintf 'BCMR\\000\\001\\001\\000\\000\\020\\000'; dd if=/dev/zero bs=4096 count=2 2>/dev/null\n",
+    );
+    let mut request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 800, 600);
+    request.limits.max_output_bytes = 4096;
+    assert!(matches!(
+        render_mermaid_with_worker(
+            oversized.path(),
+            &request,
+            &MermaidCancellationToken::default()
+        ),
+        Err(MermaidRenderError::InvalidWorkerResponse { .. })
+    ));
 }
 
 #[test]

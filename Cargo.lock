@@ -1897,6 +1897,7 @@ name = "bcode_mermaid_render"
 version = "0.0.1-alpha.0"
 dependencies = [
  "mermaid-rs-renderer",
+ "tempfile",
 ]
 
 [[package]]
