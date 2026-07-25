@@ -146,6 +146,8 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(loop_plugin());
     #[cfg(feature = "static-bundled-ralph-plugin")]
     plugins.push(ralph_plugin());
+    #[cfg(feature = "static-bundled-read-plugin")]
+    plugins.push(read_plugin());
     #[cfg(feature = "static-bundled-shell-plugin")]
     plugins.push(shell_plugin());
     #[cfg(feature = "static-bundled-skills-plugin")]
@@ -309,6 +311,14 @@ fn ralph_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/ralph-plugin/bcode-plugin.toml"),
         bcode_ralph_plugin::static_plugin(),
+    )
+}
+
+#[cfg(feature = "static-bundled-read-plugin")]
+fn read_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/read-plugin/bcode-plugin.toml"),
+        bcode_read_plugin::static_plugin(),
     )
 }
 
@@ -535,6 +545,7 @@ mod tests {
         feature = "static-bundled-pi-session-import-plugin",
         feature = "static-bundled-question-plugin",
         feature = "static-bundled-ralph-plugin",
+        feature = "static-bundled-read-plugin",
         feature = "static-bundled-shell-plugin",
         feature = "static-bundled-skills-plugin",
         feature = "static-bundled-vim-edit-plugin",
@@ -579,6 +590,22 @@ mod tests {
             super::tui_registry("bcode.vim-edit").expect("Vim edit TUI registry is available");
         assert!(registry.supports_visual("bcode.vim-edit.playback"));
         assert!(super::interaction_registry("bcode.vim-edit").is_none());
+    }
+
+    #[cfg(feature = "static-bundled-read-plugin")]
+    #[test]
+    fn read_bundle_contributes_local_cli_command() {
+        let static_plugins = super::static_bundled_plugins();
+        let plugin = static_plugins
+            .iter()
+            .find(|plugin| plugin.manifest_toml.contains("bcode.read"))
+            .expect("read plugin is included in the static bundle");
+        let registration = plugin
+            .cli_registration()
+            .expect("read plugin contributes a CLI command");
+
+        assert_eq!((registration.command)().get_name(), "read");
+        assert!(!registration.requires_daemon);
     }
 
     #[cfg(feature = "static-bundled-filesystem-plugin")]

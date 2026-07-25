@@ -198,6 +198,12 @@ static-bundled-ralph-plugin = [
     "bcode_bundled_plugins/static-bundled-ralph-plugin",
     "bcode_cli/static-bundled-ralph-plugin",
 ]
+static-bundled-read-plugin = [
+    "bundled-plugins",
+    "cli",
+    "bcode_bundled_plugins/static-bundled-read-plugin",
+    "bcode_cli/static-bundled-read-plugin",
+]
 static-bundled-shell-plugin = [
     "bundled-plugins",
     "cli",

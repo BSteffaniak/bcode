@@ -1448,6 +1448,7 @@ dependencies = [
  "bcode_plugin_sdk",
  "bcode_question_plugin",
  "bcode_ralph_plugin",
+ "bcode_read_plugin",
  "bcode_shell_plugin",
  "bcode_skills_plugin",
  "bcode_vim_edit_plugin",
@@ -2201,6 +2202,22 @@ dependencies = [
  "clap",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "bcode_read_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bcode_markdown_render",
+ "bcode_plugin_sdk",
+ "bmux_keyboard",
+ "bmux_tui",
+ "clap",
+ "crossterm",
+ "insta",
+ "libc",
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3766,12 +3783,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
 dependencies = [
  "bitflags 2.13.1",
+ "crossterm_winapi",
  "document-features",
  "mio",
  "parking_lot",
  "rustix 1.1.4",
  "signal-hook",
  "signal-hook-mio",
+ "winapi",
+]
+
+[[package]]
+name = "crossterm_winapi"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acdd7c62a3665c7f6830a51635d9ac9b23ed385797f70a83bb8bafe9c572ab2b"
+dependencies = [
+ "winapi",
 ]
 
 [[package]]

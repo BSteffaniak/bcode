@@ -9,6 +9,7 @@ members = [
     "plugins/eval-plugin",
     "plugins/metrics-plugin",
     "plugins/ralph-plugin",
+    "plugins/read-plugin",
     "plugins/loop-plugin",
     "plugins/github-review-publisher-plugin",
     "plugins/document-plugin",
@@ -155,6 +156,7 @@ bcode_question_dynamic_plugin           = { version = "0.0.1-alpha.0", default-f
 bcode_question_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/question-plugin" }
 bcode_ralph                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ralph" }
 bcode_ralph_plugin                      = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/ralph-plugin" }
+bcode_read_plugin                       = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/read-plugin" }
 bcode_server                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
 bcode_session                           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
 bcode_session_import                    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session-import" }
@@ -256,6 +258,7 @@ image = { version = "0.25.10", default-features = false, features = [
 ] }
 insta = { version = "1.48.0", default-features = false }
 jsonschema = { version = "0.47.0", default-features = false }
+libc = { version = "0.2.189", default-features = false }
 libloading = { version = "0.9.0", default-features = false }
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }
 nvim-rs = { version = "0.9.2", default-features = false }
@@ -346,6 +349,7 @@ unicode-width = { version = "0.2.2", default-features = false }
 url = { version = "2.5.7", default-features = false, features = ["std"] }
 uuid = { version = "1.21.0", default-features = false }
 vte = { version = "0.15.0", default-features = false, features = ["std"] }
+windows-sys = { version = "0.61.2", default-features = false }
 worktree_setup_config = { version = "0.4.0", default-features = false }
 worktree_setup_git = { version = "0.4.0", default-features = false }
 worktree_setup_operations = { version = "0.4.0", default-features = false }

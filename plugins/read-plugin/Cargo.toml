@@ -1,0 +1,41 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-utilities", "text-processing"]
+description = "Terminal Markdown reader plugin for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "markdown", "pager", "plugin"]
+license     = { workspace = true }
+name        = "bcode_read_plugin"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bcode_markdown_render = { workspace = true }
+bcode_plugin_sdk      = { workspace = true }
+bmux_keyboard         = { workspace = true }
+bmux_tui              = { workspace = true, features = ["crossterm"] }
+clap                  = { workspace = true, features = ["derive", "std"] }
+crossterm             = { workspace = true, features = ["events", "windows"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+] }
+
+[dev-dependencies]
+insta    = { workspace = true }
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
+static-bundled   = []

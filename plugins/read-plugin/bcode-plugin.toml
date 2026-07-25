@@ -1,0 +1,11 @@
+id      = "bcode.read"
+name    = "Bcode Read Plugin"
+version = "0.0.1"
+
+categories = ["markdown", "terminal"]
+
+[runtime]
+abi_version  = 2
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_read_plugin.dylib"
+type         = "native"
