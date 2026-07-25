@@ -7425,17 +7425,16 @@ fn session_live_event_description(event: &SessionLiveEvent) -> String {
         SessionLiveEventKind::ToolContribution {
             event: contribution,
         } => format!(
-            "live contribution {}:{} sequence={} schema={}@{} operation={:?} payload={}",
+            "live contribution {}:{} sequence={} schema={}@{} operation={:?}",
             contribution.invocation_id,
             contribution.contribution_id,
             contribution.sequence,
             contribution.schema,
             contribution.schema_version,
             contribution.operation,
-            contribution.payload
         ),
         SessionLiveEventKind::ToolContributionPlaced { envelope } => format!(
-            "live contribution {:?} {}:{} sequence={} schema={}@{} operation={:?} payload={}",
+            "live contribution {:?} {}:{} sequence={} schema={}@{} operation={:?}",
             envelope.placement,
             envelope.contribution.invocation_id,
             envelope.contribution.contribution_id,
@@ -7443,7 +7442,6 @@ fn session_live_event_description(event: &SessionLiveEvent) -> String {
             envelope.contribution.schema,
             envelope.contribution.schema_version,
             envelope.contribution.operation,
-            envelope.contribution.payload
         ),
         SessionLiveEventKind::AssistantTextDelta { turn_id, text } => {
             format!("live assistant delta ({turn_id}): {text}")
@@ -8269,29 +8267,68 @@ mod context_compaction_tests {
     use super::*;
 
     #[test]
-    fn generic_live_contribution_description_preserves_opaque_identity_and_payload() {
-        let event = SessionLiveEvent {
-            session_id: SessionId::new(),
-            kind: SessionLiveEventKind::ToolContribution {
-                event: bcode_session_models::ToolContributionEvent {
-                    invocation_id: "call-1".to_owned(),
-                    contribution_id: "surface".to_owned(),
-                    sequence: 7,
-                    producer_id: "future.producer".to_owned(),
-                    schema: "future.unknown/schema".to_owned(),
-                    schema_version: 42,
-                    operation: bcode_session_models::ToolContributionOperation::Append,
-                    persistence: bcode_session_models::ToolContributionPersistence::Transient,
-                    artifact: None,
-                    payload: serde_json::json!({"opaque_cli": [1, 2, 3]}),
-                },
-            },
+    fn live_progress_descriptions_are_compact_and_omit_opaque_payloads() {
+        let session_id = SessionId::new();
+        let contribution = bcode_session_models::ToolContributionEvent {
+            invocation_id: "call-1".to_owned(),
+            contribution_id: "surface".to_owned(),
+            sequence: 7,
+            producer_id: "future.producer".to_owned(),
+            schema: "future.unknown/schema".to_owned(),
+            schema_version: 42,
+            operation: bcode_session_models::ToolContributionOperation::Append,
+            persistence: bcode_session_models::ToolContributionPersistence::Transient,
+            artifact: None,
+            payload: serde_json::json!({"opaque_cli": [1, 2, 3]}),
         };
+        let descriptions = [
+            session_live_event_description(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::ToolContribution {
+                    event: contribution.clone(),
+                },
+            }),
+            session_live_event_description(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::ToolContributionPlaced {
+                    envelope: bcode_session_models::ToolContributionEnvelope::new(
+                        bcode_session_models::ToolContributionPlacement::Progress,
+                        contribution,
+                    ),
+                },
+            }),
+            session_live_event_description(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::ToolRequestDraft {
+                    event: bcode_session_models::ToolRequestDraftEvent {
+                        turn_id: "turn-1".to_owned(),
+                        tool_call_id: "call-1".to_owned(),
+                        tool_name: "filesystem.write".to_owned(),
+                        producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                        schema: "bcode.filesystem.request-draft.write".to_owned(),
+                        schema_version: 1,
+                        generation: 1,
+                        revision: 2,
+                        operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                            start_offset: 0,
+                            text: "private_draft_cli".to_owned(),
+                        },
+                        argument_bytes: 17,
+                        truncated: false,
+                    },
+                },
+            }),
+        ];
 
-        let description = session_live_event_description(&event);
-        assert!(description.contains("call-1:surface"));
-        assert!(description.contains("future.unknown/schema@42"));
-        assert!(description.contains("opaque_cli"));
+        assert!(descriptions[0].contains("call-1:surface"));
+        assert!(descriptions[0].contains("future.unknown/schema@42"));
+        assert!(descriptions[1].contains("Progress"));
+        assert!(descriptions[2].contains("generation=1"));
+        for description in descriptions {
+            assert!(!description.contains("opaque_cli"));
+            assert!(!description.contains("private_draft_cli"));
+            assert!(description.len() < 512);
+        }
     }
 }
 

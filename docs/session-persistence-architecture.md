@@ -22,6 +22,38 @@ The default production session root is resolved only by
 tests, imports, and isolated stores, but all production default paths use the same canonical root.
 `bcode_session::db::session_dir_path` and `session_db_path` own per-session path construction.
 
+## Live-only progress boundary
+
+Intermediate provider argument fragments, request previews, execution frames, and replaceable progress
+are not session facts. They use `SessionLiveEvent` and are retained only in bounded in-memory
+registries while the owning turn or invocation is active. They never receive a durable event
+sequence and must not be written to `session.db`, projection indexes, catalogs, manifests,
+finalized artifact metadata, trace blobs, workflow state, crash reports, or structured log fields.
+Daemon restart intentionally discards this state.
+
+The durable boundary begins with complete semantic facts: a validated tool request, required
+permission request/resolution, lifecycle facts that remain meaningful after reload, and the terminal
+result or finalized artifact. Session append validation rejects transient contributions and any new
+durable contribution with `Progress` placement. Persistence decoding retains historical durable or
+unplaced contributions for compatibility, but those decoded paths are not writable extension
+points.
+
+```text
+provider/plugin intermediate update
+  -> bounded server live-state registry
+  -> SessionLiveEvent checkpoint/delta
+  -> SessionView transient projection
+  -> renderer-native presentation
+
+complete request / permission / terminal result
+  -> SessionEvent append
+  -> canonical session.db history and durable projections
+```
+
+Reconnect may restore only the current bounded active checkpoint. It does not replay missed live
+deltas. Terminal completion, failure, timeout, cancellation, or host-owned invocation teardown
+removes active state before stale revisions can revive it.
+
 ## On-disk layout
 
 ```text

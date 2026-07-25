@@ -114,6 +114,32 @@ Local cancellation changes active runtime work to `Cancelling` before cleanup be
 
 This separation keeps runtime-work state truthful: `Cancelling` means the owning operation has not yet reported terminal completion, regardless of whether its best-effort cleanup signal succeeded.
 
+### Live progress ownership
+
+Incomplete provider arguments and execution visuals have separate live-only contracts:
+
+* Provider request drafts are bounded session transport facts keyed by turn/tool call. The host
+  batches contiguous UTF-8 byte appends and uses replacement checkpoints after gaps, reconnect, or
+  truncation. Draft bytes are observational only: they never enter preparation, authorization, or
+  invocation.
+* Execution progress is plugin-owned opaque data published with
+  `TransientProgressPublisher`. The SDK owns identity, sequence, transient/progress classification,
+  host limits, cadence, cancellation, and cleanup ergonomics; the server remains authoritative for
+  validation, accounting, terminal dominance, and teardown.
+* Plugins own schema interpretation and presentation. Generic runtime and host code route opaque
+  payloads and must not add filesystem-, Vim-, shell-, or provider-specific rendering branches.
+* Complete validated requests, permission decisions, terminal lifecycle outcomes, and final
+  results/artifacts remain the canonical durable semantics.
+
+```text
+provider draft -> server live registry -> SessionView draft -> plugin presentation adapter
+plugin publisher -> server live registry -> SessionView progress slot -> renderer adapter
+host terminal boundary -> live removal + canonical durable result
+```
+
+See [`plugin-live-progress.md`](plugin-live-progress.md) for producer examples, limits, privacy
+requirements, and troubleshooting.
+
 ## Dependency direction
 
 Allowed direction:

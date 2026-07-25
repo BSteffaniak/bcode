@@ -812,7 +812,7 @@ if ! scripts/check-plugin-presentation-manifests.sh; then
   violations=1
 fi
 
-if ! grep -F 'generic_live_contribution_description_preserves_opaque_identity_and_payload' packages/cli/src/lib.rs >/dev/null ||
+if ! grep -F 'live_progress_descriptions_are_compact_and_omit_opaque_payloads' packages/cli/src/lib.rs >/dev/null ||
    ! grep -F 'SessionWatchEvent::ResyncRequired' packages/cli/src/lib.rs >/dev/null ||
    ! grep -F 'Event::Session(event) | Event::RuntimeWork(event)' packages/client/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: generic client/CLI session event handling was removed." >&2
@@ -1245,6 +1245,28 @@ if ! grep -F 'question_exchange_payload_runs_entirely_in_local_tui_surface' pack
    ! grep -F 'hyperchad_runs_question_adapter_locally_from_opaque_exchange' packages/hyperchad/src/lib.rs >/dev/null ||
    ! grep -F 'question_exchange_stays_in_one_invocation_and_validates_response' packages/bcode/tests/question_exchange.rs >/dev/null; then
   echo "Runtime architecture violation: cross-host Question exchange parity coverage was removed." >&2
+  violations=1
+fi
+
+if rg -n 'ProviderTurnEvent|active_tool_request_drafts|ActiveContributionRegistry' \
+  packages/tui/src/render.rs packages/tui/src/transcript.rs packages/hyperchad/ui/src --glob '*.rs' \
+  >/tmp/bcode-renderer-live-source-bypass.txt; then
+  echo "Runtime architecture violation: renderers must consume SessionView semantics, not provider events or server live registries." >&2
+  cat /tmp/bcode-renderer-live-source-bypass.txt >&2
+  violations=1
+fi
+
+if rg -n 'SessionLiveEvent|SessionEventKind' packages/hyperchad/ui/src --glob '*.rs' \
+  >/tmp/bcode-hyperchad-session-view-bypass.txt; then
+  echo "Runtime architecture violation: portable HyperChad UI must render SessionView models instead of raw session events." >&2
+  cat /tmp/bcode-hyperchad-session-view-bypass.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'TranscriptViewItemKind::ToolRequestDraft' packages/tui/src/transcript.rs >/dev/null \
+  || ! grep -F 'TranscriptViewItemKind::ToolRequestDraft' packages/hyperchad/ui/src/pages/home/transcript.rs >/dev/null \
+  || ! grep -F 'TranscriptViewItemKind::ToolContribution' packages/hyperchad/ui/src/pages/home/transcript.rs >/dev/null; then
+  echo "Runtime architecture violation: renderer consumption of shared SessionView draft/progress items was removed." >&2
   violations=1
 fi
 

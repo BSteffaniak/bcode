@@ -9,6 +9,33 @@ if rg -n 'publish_transient_event|PublishTransient' packages/session/src --glob 
   violations=1
 fi
 
+if rg -n 'SessionEventKind::ToolRequestDraft|ToolRequestDraftEvent' packages/session/src --glob '*.rs' \
+  >/tmp/bcode-session-durable-request-draft.txt; then
+  echo "Session architecture violation: request drafts must remain SessionLiveEvent-only and absent from durable session implementation." >&2
+  cat /tmp/bcode-session-durable-request-draft.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'ToolContributionPersistence::Transient' packages/session/src/lib.rs >/dev/null \
+  || ! grep -F 'ToolContributionPlacement::Progress' packages/session/src/lib.rs >/dev/null \
+  || ! grep -F 'historical_progress_contribution_decodes_for_compatibility' packages/session/src/persisted.rs >/dev/null; then
+  echo "Session architecture violation: transient/progress durable rejection or historical decode compatibility coverage was removed." >&2
+  violations=1
+fi
+
+live_cli_description="$(sed -n '/fn session_live_event_description(/,/^}/p' packages/cli/src/lib.rs)"
+if grep -Eq 'contribution\.payload|ToolRequestDraftOperation::(Append|Checkpoint).*text|payload=\{' \
+  <<<"$live_cli_description"; then
+  echo "Session architecture violation: raw draft/progress payload CLI rendering was introduced." >&2
+  violations=1
+fi
+
+if ! grep -F 'live_progress_descriptions_are_compact_and_omit_opaque_payloads' packages/cli/src/lib.rs >/dev/null \
+  || ! grep -F 'oversized_request_draft_is_rejected_without_payload_in_history_traces_or_logs' packages/server/src/lib.rs >/dev/null; then
+  echo "Session architecture violation: live payload privacy regression coverage was removed." >&2
+  violations=1
+fi
+
 current_event_schema="$(sed -n 's/.*CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = \([0-9][0-9]*\).*/\1/p' packages/session/models/src/lib.rs)"
 fixture_baseline_schema="$(sed -n 's/Current fixture baseline schema: \*\*\([0-9][0-9]*\)\*\*.*/\1/p' packages/session/fixtures/migrations/README.md)"
 if [[ -z "$current_event_schema" || "$current_event_schema" != "$fixture_baseline_schema" ]]; then

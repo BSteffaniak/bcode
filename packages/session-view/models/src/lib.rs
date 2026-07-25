@@ -291,6 +291,9 @@ impl SessionViewSnapshot {
         }
 
         self.transcript.apply_patch(patch)?;
+        for key in &patch.removed_contributions {
+            self.contributions.remove(key);
+        }
         self.contributions.extend(patch.contributions.clone());
         self.active_exchanges.extend(patch.active_exchanges.clone());
         self.active_invocations
@@ -335,6 +338,9 @@ pub struct SessionViewPatch {
     pub transcript: Vec<TranscriptViewPatchOp>,
     /// Opaque contribution updates keyed by invocation and contribution identity.
     pub contributions: BTreeMap<String, bcode_session_models::ToolContributionEvent>,
+    /// Opaque contribution keys removed from current transient state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub removed_contributions: Vec<String>,
     /// Active exchange updates keyed by invocation and exchange identity.
     pub active_exchanges: BTreeMap<String, bcode_session_models::ToolExchangeRequest>,
     /// Invocation lifecycle updates keyed by invocation identifier.
@@ -374,6 +380,7 @@ impl SessionViewPatch {
             reset: None,
             transcript: Vec::new(),
             contributions: BTreeMap::new(),
+            removed_contributions: Vec::new(),
             active_exchanges: BTreeMap::new(),
             active_invocations: BTreeMap::new(),
             tools: BTreeMap::new(),
@@ -428,6 +435,7 @@ impl SessionViewPatch {
             return patch;
         }
         patch.contributions = changed_map_entries(&base.contributions, &next.contributions);
+        patch.removed_contributions = removed_map_keys(&base.contributions, &next.contributions);
         patch.active_exchanges =
             changed_map_entries(&base.active_exchanges, &next.active_exchanges);
         patch.active_invocations =
@@ -608,6 +616,16 @@ where
         .collect()
 }
 
+fn removed_map_keys<K, V>(base: &BTreeMap<K, V>, next: &BTreeMap<K, V>) -> Vec<K>
+where
+    K: Clone + Ord,
+{
+    base.keys()
+        .filter(|key| !next.contains_key(*key))
+        .cloned()
+        .collect()
+}
+
 fn map_has_removals<K, V>(base: &BTreeMap<K, V>, next: &BTreeMap<K, V>) -> bool
 where
     K: Ord,
@@ -621,7 +639,6 @@ fn snapshot_requires_reset(base: &SessionViewSnapshot, next: &SessionViewSnapsho
         || base.title != next.title
         || base.working_directory != next.working_directory
         || base.latest_sequence != next.latest_sequence
-        || map_has_removals(&base.contributions, &next.contributions)
         || map_has_removals(&base.active_exchanges, &next.active_exchanges)
         || map_has_removals(&base.active_invocations, &next.active_invocations)
         || map_has_removals(&base.tools, &next.tools)

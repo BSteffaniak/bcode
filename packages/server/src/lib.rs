@@ -1490,6 +1490,7 @@ impl ServerState {
         {
             return;
         }
+        clear_session_live_state(self, session_id);
         if let Err(error) = self
             .sessions
             .release_idle_session_resources(session_id)
@@ -1517,6 +1518,7 @@ impl ServerState {
         if self.sessions.active_session_migration_count().await > 0 {
             return Ok(false);
         }
+        clear_session_live_state(self, session_id);
         Ok(self
             .sessions
             .release_session_database_resources(session_id)
@@ -11193,10 +11195,6 @@ impl ModelStreamProgress {
         self.active_tool_calls.remove(call_id);
     }
 
-    fn supersede_tool_calls(&mut self) {
-        self.active_tool_calls.clear();
-    }
-
     fn record_tool_call_delta(&mut self, call_id: &str, delta: &str) {
         let Some(active) = self.active_tool_calls.get_mut(call_id) else {
             return;
@@ -13010,19 +13008,18 @@ async fn poll_model_turn_events(
             idle_for = next_idle_for;
         }
     }
-    for draft in stream_progress.tool_request_draft_checkpoints(turn_id) {
-        remove_tool_request_draft_live(
-            state,
-            session_id,
-            &draft,
-            if cancel_state.is_cancelled() {
-                bcode_session_models::ToolRequestDraftTerminalReason::Cancelled
-            } else {
-                bcode_session_models::ToolRequestDraftTerminalReason::Invalid
-            },
-        )
-        .await;
-    }
+    finish_all_tool_request_drafts(
+        state,
+        session_id,
+        turn_id,
+        &mut stream_progress,
+        if cancel_state.is_cancelled() {
+            bcode_session_models::ToolRequestDraftTerminalReason::Cancelled
+        } else {
+            bcode_session_models::ToolRequestDraftTerminalReason::Invalid
+        },
+    )
+    .await;
     stream.flush(state).await;
     (stream.finish(), outcome)
 }
@@ -13159,6 +13156,19 @@ async fn poll_model_turn(
     .await
 }
 
+async fn finish_all_tool_request_drafts(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    stream_progress: &mut ModelStreamProgress,
+    reason: bcode_session_models::ToolRequestDraftTerminalReason,
+) {
+    for draft in stream_progress.tool_request_draft_checkpoints(turn_id) {
+        remove_tool_request_draft_live(state, session_id, &draft, reason).await;
+        stream_progress.finish_tool_call(&draft.tool_call_id);
+    }
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn handle_provider_turn_event(
     state: &ServerState,
@@ -13176,6 +13186,14 @@ async fn handle_provider_turn_event(
         .await
         .is_some_and(|turn| turn.cancel_state.is_cancelled())
     {
+        finish_all_tool_request_drafts(
+            state,
+            session_id,
+            turn_id,
+            stream_progress,
+            bcode_session_models::ToolRequestDraftTerminalReason::Cancelled,
+        )
+        .await;
         outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
         outcome.completion = Some(ModelTurnCompletion::with_message(
             ModelTurnOutcome::Cancelled,
@@ -13196,16 +13214,14 @@ async fn handle_provider_turn_event(
             stream.flush_if_ready(state).await;
         }
         ProviderTurnEvent::Error { error } => {
-            for draft in stream_progress.tool_request_draft_checkpoints(turn_id) {
-                remove_tool_request_draft_live(
-                    state,
-                    session_id,
-                    &draft,
-                    bcode_session_models::ToolRequestDraftTerminalReason::Invalid,
-                )
-                .await;
-                stream_progress.finish_tool_call(&draft.tool_call_id);
-            }
+            finish_all_tool_request_drafts(
+                state,
+                session_id,
+                turn_id,
+                stream_progress,
+                bcode_session_models::ToolRequestDraftTerminalReason::Invalid,
+            )
+            .await;
             handle_provider_error_event(state, session_id, turn_id, error, outcome).await;
         }
         ProviderTurnEvent::TurnFinished { stop_reason } => {
@@ -13213,16 +13229,14 @@ async fn handle_provider_turn_event(
                 .await;
         }
         ProviderTurnEvent::Cancelled => {
-            for draft in stream_progress.tool_request_draft_checkpoints(turn_id) {
-                remove_tool_request_draft_live(
-                    state,
-                    session_id,
-                    &draft,
-                    bcode_session_models::ToolRequestDraftTerminalReason::Cancelled,
-                )
-                .await;
-                stream_progress.finish_tool_call(&draft.tool_call_id);
-            }
+            finish_all_tool_request_drafts(
+                state,
+                session_id,
+                turn_id,
+                stream_progress,
+                bcode_session_models::ToolRequestDraftTerminalReason::Cancelled,
+            )
+            .await;
             handle_provider_cancelled_event(state, session_id, turn_id, outcome).await;
         }
         ProviderTurnEvent::ToolCallFinished { call } => {
@@ -13260,16 +13274,14 @@ async fn handle_provider_turn_event(
             message,
             retry_at_unix,
         } => {
-            for draft in stream_progress.tool_request_draft_checkpoints(turn_id) {
-                remove_tool_request_draft_live(
-                    state,
-                    session_id,
-                    &draft,
-                    bcode_session_models::ToolRequestDraftTerminalReason::Superseded,
-                )
-                .await;
-            }
-            stream_progress.supersede_tool_calls();
+            finish_all_tool_request_drafts(
+                state,
+                session_id,
+                turn_id,
+                stream_progress,
+                bcode_session_models::ToolRequestDraftTerminalReason::Superseded,
+            )
+            .await;
             append_provider_event_trace(
                 state,
                 session_id,
@@ -13725,11 +13737,24 @@ async fn publish_tool_request_draft_live(
             true
         });
     if accepted {
+        if terminal_update {
+            state
+                .metrics
+                .increment_counter("server.live_state.terminal_cleanup_total");
+        } else {
+            state
+                .metrics
+                .increment_counter("server.live_state.accepted_updates_total");
+        }
+        refresh_active_live_state_metrics(state);
         let _ = state
             .sessions
             .publish_live_event(session_id, SessionLiveEventKind::ToolRequestDraft { event })
             .await;
     } else if terminal_update {
+        state
+            .metrics
+            .increment_counter("server.live_state.stale_updates_total");
         tracing::warn!(
             %session_id,
             "request draft terminal revision was stale or overflowed; retained terminal dominance"
@@ -17832,6 +17857,45 @@ const MAX_ACTIVE_CONTRIBUTION_BYTES: usize = 256 * 1024;
 const MAX_ACTIVE_CONTRIBUTIONS_PER_SESSION: usize = 256;
 const MAX_ACTIVE_CONTRIBUTION_BYTES_PER_SESSION: usize = 8 * 1024 * 1024;
 
+fn set_active_live_state_metrics(state: &ServerState, active_keys: usize, active_bytes: usize) {
+    state.metrics.set_gauge(
+        "server.live_state.active_keys",
+        i64::try_from(active_keys).unwrap_or(i64::MAX),
+    );
+    state.metrics.set_gauge(
+        "server.live_state.active_bytes",
+        i64::try_from(active_bytes).unwrap_or(i64::MAX),
+    );
+}
+
+fn refresh_active_live_state_metrics(state: &ServerState) {
+    let contribution_metrics = state.active_contributions.lock().ok().map(|registry| {
+        (
+            registry.envelopes.len(),
+            registry.session_bytes.values().copied().sum::<usize>(),
+        )
+    });
+    let draft_metrics = state
+        .active_tool_request_drafts
+        .lock()
+        .ok()
+        .map(|registry| {
+            (
+                registry.drafts.len(),
+                registry.session_bytes.values().copied().sum::<usize>(),
+            )
+        });
+    if let (Some((contribution_keys, contribution_bytes)), Some((draft_keys, draft_bytes))) =
+        (contribution_metrics, draft_metrics)
+    {
+        set_active_live_state_metrics(
+            state,
+            contribution_keys.saturating_add(draft_keys),
+            contribution_bytes.saturating_add(draft_bytes),
+        );
+    }
+}
+
 #[allow(clippy::too_many_lines)] // Validation, terminal dominance, and accounting remain atomic under one lock.
 fn update_active_contribution(
     state: &ServerState,
@@ -17904,6 +17968,11 @@ fn update_active_contribution(
             }
         }
         registry.terminal_sequences.insert(key, event.sequence);
+        drop(registry);
+        state
+            .metrics
+            .increment_counter("server.live_state.terminal_cleanup_total");
+        refresh_active_live_state_metrics(state);
         return Ok(true);
     }
     registry.terminal_sequences.remove(&key);
@@ -17943,6 +18012,10 @@ fn update_active_contribution(
         .session_bytes
         .insert(session_id, next_session_bytes);
     drop(registry);
+    state
+        .metrics
+        .increment_counter("server.live_state.accepted_updates_total");
+    refresh_active_live_state_metrics(state);
     Ok(true)
 }
 
@@ -17965,6 +18038,26 @@ fn active_contribution_snapshot_events(
             },
         })
         .collect())
+}
+
+fn clear_session_live_state(state: &ServerState, session_id: SessionId) {
+    if let Ok(mut registry) = state.active_contributions.lock() {
+        registry
+            .envelopes
+            .retain(|key, _| key.session() != session_id);
+        registry
+            .terminal_sequences
+            .retain(|key, _| key.session() != session_id);
+        registry.session_bytes.remove(&session_id);
+    }
+    if let Ok(mut registry) = state.active_tool_request_drafts.lock() {
+        registry.drafts.retain(|key, _| key.session() != session_id);
+        registry
+            .terminal_revisions
+            .retain(|key, _| key.session() != session_id);
+        registry.session_bytes.remove(&session_id);
+    }
+    refresh_active_live_state_metrics(state);
 }
 
 async fn clear_active_contributions(
@@ -18002,6 +18095,7 @@ async fn clear_active_contributions(
             removed
         },
     );
+    let removed_count = removed.len();
     for mut envelope in removed {
         envelope.contribution.sequence = envelope.contribution.sequence.saturating_add(1);
         envelope.contribution.operation = bcode_session_models::ToolContributionOperation::Remove;
@@ -18013,6 +18107,13 @@ async fn clear_active_contributions(
                 SessionLiveEventKind::ToolContributionPlaced { envelope },
             )
             .await;
+    }
+    if removed_count != 0 {
+        state.metrics.add_counter(
+            "server.live_state.terminal_cleanup_total",
+            u64::try_from(removed_count).unwrap_or(u64::MAX),
+        );
+        refresh_active_live_state_metrics(state);
     }
 }
 async fn append_tool_contribution_envelope(
@@ -18057,8 +18158,17 @@ async fn append_tool_contribution_envelope(
                     )
                     .await;
             }
-            Ok(false) => {}
+            Ok(false) => {
+                state
+                    .metrics
+                    .increment_counter("server.live_state.stale_updates_total");
+            }
             Err(error) => {
+                if error.contains("bytes") || error.contains("byte limit") {
+                    state
+                        .metrics
+                        .increment_counter("server.live_state.rejected_oversized_updates_total");
+                }
                 tracing::warn!(%error, "discarded invalid active placed contribution");
             }
         }
@@ -18122,8 +18232,19 @@ async fn append_tool_contribution_event(
                     )
                     .await;
             }
-            Ok(false) => {}
-            Err(error) => return Err(error),
+            Ok(false) => {
+                state
+                    .metrics
+                    .increment_counter("server.live_state.stale_updates_total");
+            }
+            Err(error) => {
+                if error.contains("bytes") || error.contains("byte limit") {
+                    state
+                        .metrics
+                        .increment_counter("server.live_state.rejected_oversized_updates_total");
+                }
+                return Err(error);
+            }
         }
         return Ok(());
     }
@@ -21245,6 +21366,8 @@ fn forward_session_events(
                             skipped,
                             "durable session event subscriber lagged; requesting renderer resync"
                         );
+                        sink.metrics
+                            .increment_counter("server.live_state.lag_resync_total");
                         if let Err(error) = sink
                             .send(Event::SessionViewResyncRequired { session_id })
                             .await
@@ -21285,6 +21408,8 @@ fn forward_session_events(
                             skipped,
                             "live session event subscriber lagged; requesting renderer resync"
                         );
+                        sink.metrics
+                            .increment_counter("server.live_state.lag_resync_total");
                         if let Err(error) = sink
                             .send(Event::SessionViewResyncRequired { session_id })
                             .await
@@ -21834,7 +21959,48 @@ mod tests {
     #[allow(clippy::wildcard_imports)]
     use crate::context_compaction::*;
     use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent};
+    use std::sync::Mutex as TestMutex;
     use switchy::database::DatabaseValue;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone, Default)]
+    struct CapturedLogWriter(Arc<TestMutex<Vec<u8>>>);
+
+    struct CapturedLogGuard(Arc<TestMutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogGuard {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> MakeWriter<'writer> for CapturedLogWriter {
+        type Writer = CapturedLogGuard;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            CapturedLogGuard(Arc::clone(&self.0))
+        }
+    }
+
+    impl CapturedLogWriter {
+        fn text(&self) -> String {
+            String::from_utf8(
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            )
+            .expect("captured logs should be UTF-8")
+        }
+    }
 
     #[derive(Default)]
     struct DelayedWorkflowBlockPlugin;
@@ -25210,6 +25376,133 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn request_draft_cancellation_emits_remove_and_clears_checkpoint() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("draft cancellation".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let mut attachment = sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("attach");
+        let state = test_server_state(sessions);
+        let mut progress = ModelStreamProgress::default();
+        progress.start_tool_call(
+            "call-write".to_owned(),
+            "filesystem.write".to_owned(),
+            Some("bcode.filesystem".to_owned()),
+        );
+        progress.record_tool_call_delta("call-write", &"x".repeat(512));
+        let draft = progress
+            .take_tool_request_draft_event("turn-1", "call-write")
+            .expect("draft");
+        publish_tool_request_draft_live(&state, session_id, draft).await;
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, session_id).len(),
+            1
+        );
+
+        finish_all_tool_request_drafts(
+            &state,
+            session_id,
+            "turn-1",
+            &mut progress,
+            bcode_session_models::ToolRequestDraftTerminalReason::Cancelled,
+        )
+        .await;
+
+        assert!(active_tool_request_draft_snapshot_events(&state, session_id).is_empty());
+        assert!(progress.tool_request_draft_checkpoints("turn-1").is_empty());
+        let first = attachment.live_events.recv().await.expect("draft event");
+        assert!(matches!(
+            first.kind,
+            SessionLiveEventKind::ToolRequestDraft { event }
+                if !matches!(
+                    event.operation,
+                    bcode_session_models::ToolRequestDraftOperation::Remove { .. }
+                )
+        ));
+        let terminal = attachment
+            .live_events
+            .recv()
+            .await
+            .expect("terminal removal");
+        assert!(matches!(
+            terminal.kind,
+            SessionLiveEventKind::ToolRequestDraft { event }
+                if matches!(
+                    event.operation,
+                    bcode_session_models::ToolRequestDraftOperation::Remove {
+                        reason: bcode_session_models::ToolRequestDraftTerminalReason::Cancelled
+                    }
+                )
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_request_draft_is_rejected_without_payload_in_history_traces_or_logs() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("persistent sessions");
+        let session = sessions
+            .create_session(Some("oversized draft".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let durable_before = sessions
+            .session_history(session.id)
+            .await
+            .expect("history before");
+        let state = test_server_state(sessions);
+        let secret = format!("draft-secret-{}", uuid::Uuid::new_v4());
+        let writer = CapturedLogWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        publish_tool_request_draft_live(
+            &state,
+            session.id,
+            request_draft_event(
+                "call-oversized",
+                1,
+                1,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: format!(
+                        "{secret}{}",
+                        "x".repeat(MAX_ACTIVE_TOOL_REQUEST_DRAFT_BYTES_PER_SESSION)
+                    ),
+                },
+            ),
+        )
+        .await;
+        drop(guard);
+
+        assert!(active_tool_request_draft_snapshot_events(&state, session.id).is_empty());
+        let history = state
+            .sessions
+            .session_history(session.id)
+            .await
+            .expect("history after");
+        assert_eq!(history, durable_before);
+        let history_json = serde_json::to_string(&history).expect("history JSON");
+        assert!(!history_json.contains(&secret));
+        assert!(!writer.text().contains(&secret));
+        let persisted =
+            std::fs::read_to_string(root.path().join(session.id.to_string()).join("session.db"))
+                .unwrap_or_default();
+        assert!(!persisted.contains(&secret));
+    }
+
+    #[tokio::test]
     async fn request_draft_registry_rejects_append_gaps_until_checkpoint() {
         let state = test_server_state(SessionManager::default());
         let session_id = SessionId::new();
@@ -25817,7 +26110,47 @@ library = "test"
     }
 
     #[test]
-    fn tool_request_draft_provider_retry_supersedes_every_active_call() {
+    fn tool_request_draft_fragmented_utf8_and_split_escape_remain_exact() {
+        let mut progress = ModelStreamProgress::default();
+        progress.start_tool_call(
+            "call-write".to_owned(),
+            "filesystem.write".to_owned(),
+            Some("bcode.filesystem".to_owned()),
+        );
+        let fragments = vec![
+            r#"{"path":"src/λ.rs","contents":"line\"#.to_owned(),
+            r"nemoji ".to_owned(),
+            "🙂".to_owned(),
+            "x".repeat(512),
+            r#""}"#.to_owned(),
+        ];
+        for fragment in &fragments {
+            progress.record_tool_call_delta("call-write", fragment);
+        }
+        let expected = fragments.concat();
+        let event = progress
+            .take_tool_request_draft_event("turn-1", "call-write")
+            .expect("fragmented draft");
+        assert_eq!(event.argument_bytes, expected.len());
+        assert!(matches!(
+            event.operation,
+            bcode_session_models::ToolRequestDraftOperation::Append { offset: 0, ref text }
+                if text == &expected
+        ));
+        let checkpoint = progress
+            .tool_request_draft_checkpoint("turn-1", "call-write")
+            .expect("fragmented checkpoint");
+        assert!(matches!(
+            checkpoint.operation,
+            bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                start_offset: 0,
+                ref text,
+            } if text == &expected
+        ));
+    }
+
+    #[test]
+    fn tool_request_draft_provider_retry_removes_every_active_call() {
         let mut progress = ModelStreamProgress::default();
         for call_id in ["call-write", "call-edit"] {
             progress.start_tool_call(
@@ -25833,7 +26166,9 @@ library = "test"
             .map(|draft| (draft.tool_call_id, draft.generation))
             .collect::<BTreeMap<_, _>>();
 
-        progress.supersede_tool_calls();
+        for call_id in ["call-write", "call-edit"] {
+            progress.finish_tool_call(call_id);
+        }
         assert!(progress.tool_request_draft_checkpoints("turn-1").is_empty());
         progress.start_tool_call(
             "call-write".to_owned(),
@@ -34325,6 +34660,77 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn active_live_state_metrics_track_acceptance_stale_cleanup_and_gauges() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("live metrics".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state(sessions);
+        let contribution = bcode_session_models::ToolContributionEvent {
+            invocation_id: "call-metrics".to_owned(),
+            contribution_id: "surface".to_owned(),
+            sequence: 1,
+            producer_id: "test.plugin".to_owned(),
+            schema: "test.surface".to_owned(),
+            schema_version: 1,
+            operation: bcode_session_models::ToolContributionOperation::Upsert,
+            persistence: bcode_session_models::ToolContributionPersistence::Transient,
+            artifact: None,
+            payload: serde_json::json!({"live": true}),
+        };
+
+        append_tool_contribution_event(
+            &state,
+            session_id,
+            "call-metrics",
+            "test.plugin",
+            contribution.clone(),
+        )
+        .await
+        .expect("accepted contribution");
+        append_tool_contribution_event(
+            &state,
+            session_id,
+            "call-metrics",
+            "test.plugin",
+            contribution,
+        )
+        .await
+        .expect("stale contribution is ignored");
+        clear_active_contributions(&state, session_id, "call-metrics").await;
+
+        let snapshot = state.metrics.snapshot();
+        assert_eq!(
+            snapshot
+                .counters
+                .get("server.live_state.accepted_updates_total"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("server.live_state.stale_updates_total"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot
+                .counters
+                .get("server.live_state.terminal_cleanup_total"),
+            Some(&1)
+        );
+        assert_eq!(
+            snapshot.gauges.get("server.live_state.active_keys"),
+            Some(&0)
+        );
+        assert_eq!(
+            snapshot.gauges.get("server.live_state.active_bytes"),
+            Some(&0)
+        );
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)] // One active-envelope test covers validation, ordering, replay, and removal.
     async fn transient_contribution_is_published_live_only_with_verified_identity() {
         let sessions = SessionManager::default();
@@ -34683,6 +35089,105 @@ event_symbol = "bcode_plugin_handle_event_v1"
                                 == bcode_session_models::ToolInvocationLifecycleStage::Failed
                 ))
         );
+    }
+
+    #[tokio::test]
+    async fn idle_session_unload_clears_all_live_state() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("live unload".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let client_id = ClientId::new();
+        sessions
+            .attach_session(session.id, client_id)
+            .await
+            .expect("attach");
+        let state = test_server_state(sessions);
+        state.attach_client_session(client_id, session.id).await;
+        publish_tool_request_draft_live(
+            &state,
+            session.id,
+            request_draft_event(
+                "call-draft",
+                1,
+                1,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: "draft".to_owned(),
+                },
+            ),
+        )
+        .await;
+        let progress = bcode_session_models::ToolContributionEnvelope::new(
+            bcode_session_models::ToolContributionPlacement::Progress,
+            bcode_session_models::ToolContributionEvent {
+                invocation_id: "call-progress".to_owned(),
+                contribution_id: "screen".to_owned(),
+                sequence: 1,
+                producer_id: "test.plugin".to_owned(),
+                schema: "test.progress".to_owned(),
+                schema_version: 1,
+                operation: bcode_session_models::ToolContributionOperation::Upsert,
+                persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                artifact: None,
+                payload: serde_json::json!({"frame": 1}),
+            },
+        );
+        append_tool_contribution_envelope(
+            &state,
+            session.id,
+            "call-progress",
+            "test.plugin",
+            progress,
+        )
+        .await;
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, session.id).len(),
+            1
+        );
+        assert_eq!(
+            active_contribution_snapshot_events(&state, session.id)
+                .expect("progress snapshot")
+                .len(),
+            1
+        );
+
+        state
+            .detach_client_session(client_id)
+            .await
+            .expect("detach and unload");
+
+        assert!(active_tool_request_draft_snapshot_events(&state, session.id).is_empty());
+        assert!(
+            active_contribution_snapshot_events(&state, session.id)
+                .expect("cleared progress snapshot")
+                .is_empty()
+        );
+        let drafts = state
+            .active_tool_request_drafts
+            .lock()
+            .expect("draft registry");
+        assert!(!drafts.session_bytes.contains_key(&session.id));
+        assert!(
+            drafts
+                .terminal_revisions
+                .keys()
+                .all(|key| key.session() != session.id)
+        );
+        drop(drafts);
+        let contributions = state
+            .active_contributions
+            .lock()
+            .expect("contribution registry");
+        assert!(!contributions.session_bytes.contains_key(&session.id));
+        assert!(
+            contributions
+                .terminal_sequences
+                .keys()
+                .all(|key| key.session() != session.id)
+        );
+        drop(contributions);
     }
 
     #[tokio::test]

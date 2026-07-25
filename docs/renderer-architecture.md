@@ -76,6 +76,33 @@ Full snapshots are the correctness baseline. `SessionViewPatch` is an optional l
 
 Web updates use HyperChad's update/action mechanisms. Missing browser transport, routing, asset, or server capabilities belong upstream in HyperChad rather than in Bcode-specific JavaScript or WebSocket/SSE plumbing.
 
+## Live request drafts and execution progress
+
+`SessionView` is the renderer boundary for both live request assembly and execution progress.
+Renderer code does not consume provider deltas or server registries directly.
+
+```text
+SessionLiveEvent request-draft append/checkpoint ─┐
+placed transient progress upsert/remove ──────────┤
+attach/resync active checkpoint ──────────────────┘
+                         -> SessionView stable item ID/revision
+                         -> TUI or HyperChad native presentation
+```
+
+Request drafts are keyed by turn, tool call, and generation. Contiguous append batches use UTF-8
+byte offsets; a gap or lag requires a bounded replacement checkpoint. Durable request projection
+retires the live draft and reconciles into the canonical tool row without duplicate transcript
+items.
+
+Execution progress uses one replaceable slot per invocation/contribution identity. Terminal removal
+dominates stale updates. TUI adapters may provide terminal-native frames and HyperChad adapters may
+provide portable cards, but both consume identical `SessionView` semantics. Unknown schemas use a
+compact bounded fallback rather than exposing raw serialized payloads.
+
+Renderer-specific frame cadence, viewport anchoring, animation, hit testing, layout, and paint
+invalidation remain renderer-owned. Semantic generation, ordering, cleanup, and persistence
+classification do not.
+
 ## Tool presentation slots
 
 Tool contributions use a versioned `ToolContributionEnvelope` whose renderer-neutral placement is

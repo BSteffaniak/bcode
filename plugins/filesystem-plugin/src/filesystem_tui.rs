@@ -544,6 +544,88 @@ mod tests {
     }
 
     #[test]
+    fn request_draft_adapter_handles_incomplete_invalid_and_truncated_json() {
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+            None,
+        );
+        for (schema, preview, truncated, expected) in [
+            (
+                "bcode.filesystem.request-draft.write",
+                r#"{"path":"src/lib.rs","contents":"hello"#,
+                false,
+                "hello",
+            ),
+            (
+                "bcode.filesystem.request-draft.edit",
+                r#"{"path":"src/lib.rs","old_text":"a\\"#,
+                false,
+                "old_text",
+            ),
+            (
+                "bcode.filesystem.request-draft.write",
+                "not-json-at-all",
+                true,
+                "not-json-at-all",
+            ),
+        ] {
+            let payload = serde_json::json!({
+                "preview": preview,
+                "argument_bytes": preview.len(),
+                "truncated": truncated,
+            });
+            let rendered = request_draft_rows(schema, &payload, 80, &context)
+                .iter()
+                .map(line_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(rendered.contains("assembling"), "{rendered}");
+            assert!(rendered.contains(expected), "{rendered}");
+            if truncated {
+                assert!(rendered.contains("yes"), "{rendered}");
+            }
+        }
+    }
+
+    #[test]
+    fn request_draft_adapter_bounds_huge_string_rendering() {
+        let preview = format!(
+            r#"{{"path":"src/lib.rs","contents":"{}"}}"#,
+            "x".repeat(256 * 1024)
+        );
+        let payload = serde_json::json!({
+            "preview": preview,
+            "argument_bytes": preview.len(),
+            "truncated": true,
+        });
+        let rows = request_draft_rows(
+            "bcode.filesystem.request-draft.write",
+            &payload,
+            80,
+            &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+                80,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
+                None,
+            ),
+        );
+        assert!(
+            rows.len() <= 25,
+            "unexpected unbounded rows: {}",
+            rows.len()
+        );
+        let rendered_bytes = rows
+            .iter()
+            .map(line_text)
+            .map(|line| line.len())
+            .sum::<usize>();
+        assert!(
+            rendered_bytes < 16 * 1024,
+            "rendered {rendered_bytes} bytes"
+        );
+    }
+
+    #[test]
     fn renders_file_type_icons_for_path_results() {
         let rust_icon = icon_for_file("src/lib.rs", &Some(Theme::Dark));
         let payload = serde_json::json!({

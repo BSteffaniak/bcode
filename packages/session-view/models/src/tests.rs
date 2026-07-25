@@ -404,6 +404,48 @@ fn snapshot_patch_keeps_slot_replacement_incremental_with_contribution_update() 
 }
 
 #[test]
+fn snapshot_patch_removes_transient_contribution_incrementally() {
+    let contribution = bcode_session_models::ToolContributionEvent {
+        invocation_id: "call-1".to_owned(),
+        contribution_id: "progress".to_owned(),
+        sequence: 1,
+        producer_id: "test.plugin".to_owned(),
+        schema: "test.progress".to_owned(),
+        schema_version: 1,
+        operation: bcode_session_models::ToolContributionOperation::Upsert,
+        persistence: bcode_session_models::ToolContributionPersistence::Transient,
+        artifact: None,
+        payload: serde_json::json!({"frame": 1}),
+    };
+    let key = "call-1:progress".to_owned();
+    let mut item = transcript_item("tool-slot:call-1:progress", 1, "progress");
+    item.sequence = None;
+    let mut base = SessionViewSnapshot::empty();
+    base.revision = 1;
+    base.transcript = transcript_document(1, [item]);
+    base.contributions.insert(key.clone(), contribution);
+
+    let mut next = base.clone();
+    next.revision = 2;
+    next.transcript = transcript_document(2, []);
+    next.contributions.remove(&key);
+
+    let patch = SessionViewPatch::between_snapshots(&base, &next);
+    assert!(patch.reset.is_none());
+    assert!(patch.contributions.is_empty());
+    assert_eq!(patch.removed_contributions, [key]);
+    assert!(matches!(
+        patch.transcript.as_slice(),
+        [TranscriptViewPatchOp::Remove { id }]
+            if id == &TranscriptViewItemId::new("tool-slot:call-1:progress")
+    ));
+
+    base.apply_patch(&patch)
+        .expect("incremental transient removal applies");
+    assert_eq!(base, next);
+}
+
+#[test]
 fn snapshot_patch_resets_when_non_transcript_state_changes() {
     let mut base = SessionViewSnapshot::empty();
     base.revision = 1;

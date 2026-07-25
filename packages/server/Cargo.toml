@@ -80,6 +80,7 @@ hyperchad = { workspace = true, features = ["router", "router-form"] }
 png = { workspace = true }
 switchy = { workspace = true, features = ["database", "database-schema"] }
 tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 sshenv_vault = { workspace = true, features = [
