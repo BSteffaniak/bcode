@@ -18,7 +18,7 @@ use bcode_plugin_sdk::prelude::*;
 use bcode_plugin_sdk::tui::{
     BoxedPluginTuiSurface, PluginTuiAction, PluginTuiHost, PluginTuiRegistry, PluginTuiSurface,
     PluginTuiSurfaceFactory, PluginTuiSurfaceFuture, PluginTuiSurfaceOpenRequest,
-    PluginWorkflowBinding, PluginWorkflowStartRequest,
+    PluginWorkflowBinding, PluginWorkflowStartRequest, PluginWorkflowStatus,
 };
 use bcode_session_models::SessionId;
 use bmux_keyboard::KeyCode;
@@ -147,6 +147,13 @@ fn control_associated_workflow_run(
 }
 
 fn format_workflow_status(run: &bcode_workflow_store::WorkflowRunSummary) -> String {
+    format!(
+        "loop workflow {} · status {:?} · definition {} v{}",
+        run.run_id, run.status, run.definition_id, run.definition_version
+    )
+}
+
+fn format_plugin_workflow_status(run: &bcode_plugin_sdk::tui::PluginWorkflowSummary) -> String {
     format!(
         "loop workflow {} · status {:?} · definition {} v{}",
         run.run_id, run.status, run.definition_id, run.definition_version
@@ -372,6 +379,8 @@ struct LoopSurface {
     limit: TextInputState,
     field: Field,
     pending_workflow_start: Option<PluginWorkflowStartRequest>,
+    pending_workflow_lookup: bool,
+    active_workflow: Option<bcode_plugin_sdk::tui::PluginWorkflowSummary>,
     status: String,
     prompt_area: Rect,
     condition_area: Rect,
@@ -387,7 +396,9 @@ impl LoopSurface {
             limit: text_state(&DEFAULT_MAX_ITERATIONS.to_string()),
             field: Field::Prompt,
             pending_workflow_start: None,
-            status: "Tab changes field · Ctrl+Enter starts · Esc cancels".to_owned(),
+            pending_workflow_lookup: false,
+            active_workflow: None,
+            status: "checking for an active loop…".to_owned(),
             prompt_area: Rect::new(0, 0, 0, 0),
             condition_area: Rect::new(0, 0, 0, 0),
             limit_area: Rect::new(0, 0, 0, 0),
@@ -425,6 +436,17 @@ impl LoopSurface {
             "an active persisted session is required".clone_into(&mut self.status);
             return PluginTuiAction::Redraw;
         };
+        if self.active_workflow.as_ref().is_some_and(|run| {
+            matches!(
+                run.status,
+                PluginWorkflowStatus::Running
+                    | PluginWorkflowStatus::Paused
+                    | PluginWorkflowStatus::RepairRequired
+            )
+        }) {
+            "this session already has an active loop".clone_into(&mut self.status);
+            return PluginTuiAction::Redraw;
+        }
         if legacy_state_exists(session_id) {
             unsupported_legacy_message().clone_into(&mut self.status);
             return PluginTuiAction::Redraw;
@@ -581,6 +603,32 @@ impl PluginTuiSurface for LoopSurface {
         host: &'a dyn PluginTuiHost,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = PluginTuiAction> + Send + 'a>> {
         Box::pin(async move {
+            if !self.pending_workflow_lookup {
+                self.pending_workflow_lookup = true;
+                let lookup = PluginWorkflowBinding {
+                    owner_plugin_id: PLUGIN_ID.to_string(),
+                    workflow_kind: WORKFLOW_KIND.to_string(),
+                    scope_key: self
+                        .session_id
+                        .map_or_else(String::new, |id| id.to_string()),
+                    display_label: Some("Loop".to_string()),
+                    single_active: true,
+                }
+                .lookup();
+                match host.associated_workflow(lookup).await {
+                    Ok(run) => {
+                        self.active_workflow = run;
+                        self.status = self.active_workflow.as_ref().map_or_else(
+                            || "Tab changes field · Ctrl+Enter starts · Esc cancels".to_owned(),
+                            format_plugin_workflow_status,
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("failed to inspect active loop: {error}");
+                    }
+                }
+                return PluginTuiAction::Redraw;
+            }
             let Some(request) = self.pending_workflow_start.take() else {
                 return PluginTuiAction::None;
             };
@@ -824,6 +872,13 @@ mod tests {
         fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
         fn request_redraw(&self) {}
 
+        fn associated_workflow(
+            &self,
+            _lookup: bcode_plugin_sdk::tui::PluginWorkflowLookup,
+        ) -> bcode_plugin_sdk::tui::PluginWorkflowLookupFuture {
+            Box::pin(async { Ok(None) })
+        }
+
         fn start_workflow(
             &self,
             request: PluginWorkflowStartRequest,
@@ -887,6 +942,10 @@ mod tests {
         surface.prompt = text_state("implement");
         surface.condition = text_state("done");
         surface.limit = text_state("2");
+        assert!(matches!(
+            surface.drain_effects(&host).await,
+            PluginTuiAction::Redraw
+        ));
         assert_eq!(surface.start(), PluginTuiAction::Redraw);
         assert!(matches!(
             surface.drain_effects(&host).await,
