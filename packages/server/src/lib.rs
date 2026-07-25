@@ -11037,16 +11037,19 @@ impl ReasoningActivityAccumulator {
                 text,
                 ..
             } => {
-                self.parts
-                    .entry(part_id.clone())
-                    .and_modify(|part| part.text.push_str(text))
-                    .or_insert_with(|| bcode_session_models::ReasoningPart {
+                let part = self.parts.entry(part_id.clone()).or_insert_with(|| {
+                    bcode_session_models::ReasoningPart {
                         part_id: part_id.clone(),
                         kind: *kind,
                         role: *role,
                         order: *part_order,
-                        text: text.clone(),
-                    });
+                        text: String::new(),
+                    }
+                });
+                part.kind = *kind;
+                part.role = *role;
+                part.order = *part_order;
+                part.text.push_str(text);
             }
             ReasoningActivityEvent::PartCompleted {
                 part_id,
@@ -11125,7 +11128,7 @@ struct ModelStreamAccumulator {
     turn_id: String,
     assistant_text: String,
     pending_text: String,
-    pending_reasoning: String,
+    pending_legacy_reasoning: String,
     last_flush: Instant,
     cancel_state: Arc<TurnCancelState>,
 }
@@ -11137,7 +11140,7 @@ impl ModelStreamAccumulator {
             turn_id: turn_id.to_owned(),
             assistant_text: String::new(),
             pending_text: String::new(),
-            pending_reasoning: String::new(),
+            pending_legacy_reasoning: String::new(),
             last_flush: Instant::now(),
             cancel_state,
         }
@@ -11151,17 +11154,17 @@ impl ModelStreamAccumulator {
         self.pending_text.push_str(text);
     }
 
-    fn push_reasoning(&mut self, text: &str) {
+    fn push_legacy_reasoning(&mut self, text: &str) {
         if self.cancel_state.is_cancelled() {
             return;
         }
-        self.pending_reasoning.push_str(text);
+        self.pending_legacy_reasoning.push_str(text);
     }
 
     fn should_flush(&self) -> bool {
         self.pending_text
             .len()
-            .saturating_add(self.pending_reasoning.len())
+            .saturating_add(self.pending_legacy_reasoning.len())
             >= MODEL_STREAM_FLUSH_BYTES
             || self.last_flush.elapsed() >= MODEL_STREAM_FLUSH_INTERVAL
     }
@@ -11176,7 +11179,7 @@ impl ModelStreamAccumulator {
         if self.cancel_state.is_cancelled() {
             self.assistant_text.clear();
             self.pending_text.clear();
-            self.pending_reasoning.clear();
+            self.pending_legacy_reasoning.clear();
             return;
         }
         let text = std::mem::take(&mut self.pending_text);
@@ -11192,7 +11195,7 @@ impl ModelStreamAccumulator {
                 )
                 .await;
         }
-        let reasoning = std::mem::take(&mut self.pending_reasoning);
+        let reasoning = std::mem::take(&mut self.pending_legacy_reasoning);
         if !reasoning.is_empty() {
             let _ = state
                 .sessions
@@ -12797,16 +12800,11 @@ async fn run_model_turn_round(
         )
         .await;
     }
-    drop(marker_commit);
 
     if !assistant_text.is_empty() && !cancel_state.is_cancelled() {
         outcome.assistant_output = Some(assistant_text.clone());
         append_assistant_message_event(state, session_id, assistant_text).await;
     }
-    persist_reasoning_activities(state, session_id, &request.turn_id, &mut outcome).await;
-
-    service_runtime_priority_commands(state, session_id, command_context).await;
-    let active_turn = finish_provider_round(command_context).await;
     if cancel_state.is_cancelled() && outcome.completion.is_none() {
         outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
         outcome.completion = Some(ModelTurnCompletion::with_message(
@@ -12814,6 +12812,11 @@ async fn run_model_turn_round(
             "model turn cancelled",
         ));
     }
+    persist_reasoning_activities(state, session_id, &request.turn_id, &mut outcome).await;
+    drop(marker_commit);
+
+    service_runtime_priority_commands(state, session_id, command_context).await;
+    let active_turn = finish_provider_round(command_context).await;
     let finish = FinishTurnRequest {
         provider_turn_id: start.provider_turn_id,
     };
@@ -13513,7 +13516,7 @@ async fn handle_provider_turn_event(
         }
         ProviderTurnEvent::ReasoningDelta { text } => {
             outcome.saw_reasoning_evidence = true;
-            stream.push_reasoning(&text);
+            stream.push_legacy_reasoning(&text);
             stream.flush_if_ready(state).await;
             if state.observability.debug_enabled() {
                 append_provider_event_trace(state, session_id, turn_id, "reasoning_delta", None)
@@ -13532,9 +13535,6 @@ async fn handle_provider_turn_event(
                     )
                 })
                 .apply(&event);
-            if let bcode_session_models::ReasoningActivityEvent::PartDelta { text, .. } = &event {
-                stream.push_reasoning(text);
-            }
             let _ = state
                 .sessions
                 .publish_live_event(
@@ -13545,7 +13545,6 @@ async fn handle_provider_turn_event(
                     },
                 )
                 .await;
-            stream.flush_if_ready(state).await;
             if state.observability.debug_enabled() {
                 append_provider_event_trace(state, session_id, turn_id, "reasoning_activity", None)
                     .await;
@@ -27059,6 +27058,89 @@ library = "test"
                 .generation,
             generations["call-write"].saturating_add(1)
         );
+    }
+
+    #[test]
+    fn structured_reasoning_does_not_enter_legacy_batch_buffer() {
+        let mut stream = ModelStreamAccumulator::new(
+            SessionId::new(),
+            "turn-1",
+            Arc::new(TurnCancelState::default()),
+        );
+        stream.push_legacy_reasoning("legacy");
+
+        assert_eq!(stream.pending_legacy_reasoning, "legacy");
+        assert!(stream.assistant_text.is_empty());
+    }
+
+    #[test]
+    fn reasoning_activity_accumulator_preserves_part_boundaries_and_replacement() {
+        let mut streamed = ReasoningActivityAccumulator::new("reasoning-stream".to_owned(), 0);
+        for text in ["Draft ", "continued"] {
+            streamed.apply(&bcode_session_models::ReasoningActivityEvent::PartDelta {
+                activity_id: "reasoning-stream".to_owned(),
+                activity_order: 0,
+                part_id: "summary-0".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: text.to_owned(),
+            });
+        }
+        assert_eq!(
+            streamed
+                .finish(bcode_session_models::ReasoningActivityStatus::Completed)
+                .parts[0]
+                .text,
+            "Draft continued"
+        );
+
+        let mut activity = ReasoningActivityAccumulator::new("reasoning-1".to_owned(), 0);
+        for event in [
+            bcode_session_models::ReasoningActivityEvent::PartDelta {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 0,
+                part_id: "summary-0".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: "Draft ".to_owned(),
+            },
+            bcode_session_models::ReasoningActivityEvent::PartDelta {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 0,
+                part_id: "summary-0".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: "continued".to_owned(),
+            },
+            bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 0,
+                part_id: "summary-0".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: "Complete summary".to_owned(),
+            },
+            bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 0,
+                part_id: "raw-0".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Raw,
+                role: bcode_session_models::ReasoningContentRole::Detail,
+                part_order: 1,
+                text: "Raw detail".to_owned(),
+            },
+        ] {
+            activity.apply(&event);
+        }
+
+        let activity = activity.finish(bcode_session_models::ReasoningActivityStatus::Completed);
+        assert_eq!(activity.parts.len(), 2);
+        assert_eq!(activity.parts[0].text, "Complete summary");
+        assert_eq!(activity.parts[1].text, "Raw detail");
     }
 
     #[test]
