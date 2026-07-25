@@ -40376,6 +40376,62 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn final_result_publication_retires_active_draft_registry_entry() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("draft retirement".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state(sessions);
+        let draft = request_draft_event(
+            "call-result",
+            1,
+            1,
+            bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                start_offset: 0,
+                text: "{}".to_owned(),
+            },
+        );
+        publish_tool_request_draft_live(&state, session_id, draft).await;
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, session_id).len(),
+            1
+        );
+
+        append_tool_finished_event_inner(
+            &state,
+            session_id,
+            ToolFinishedEventInput {
+                tool_call_id: "call-result".to_owned(),
+                result: "done".to_owned(),
+                is_error: false,
+                content: Vec::new(),
+                semantic_result: None,
+            },
+        )
+        .await
+        .expect("canonical result");
+
+        assert!(active_tool_request_draft_snapshot_events(&state, session_id).is_empty());
+        let registry = state
+            .active_tool_request_drafts
+            .lock()
+            .expect("draft registry");
+        assert!(
+            registry
+                .drafts
+                .keys()
+                .all(|key| key.session() != session_id)
+        );
+        assert!(!registry.session_bytes.contains_key(&session_id));
+        drop(registry);
+    }
+
+    #[tokio::test]
     async fn append_tool_finished_event_inner_persists_semantic_result() {
         let sessions = SessionManager::default();
         let summary = sessions
