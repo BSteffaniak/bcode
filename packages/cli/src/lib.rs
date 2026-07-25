@@ -7511,6 +7511,29 @@ fn print_session_event(event: &SessionEvent) {
     }
 }
 
+fn reasoning_activity_description(
+    sequence: u64,
+    turn_id: &str,
+    activity: &bcode_session_models::ReasoningActivity,
+) -> String {
+    let mut parts = activity.parts.iter().collect::<Vec<_>>();
+    parts.sort_by_key(|part| (part.order, part.kind, part.part_id.as_str()));
+    let mut output = format!(
+        "#{sequence} reasoning ({turn_id}) {:?}: opaque={} parts={}",
+        activity.status,
+        activity.opaque,
+        parts.len()
+    );
+    for part in parts {
+        let _ = write!(
+            output,
+            "\nreasoning {:?}/{:?} [{}]: {}",
+            part.kind, part.role, part.part_id, part.text
+        );
+    }
+    output
+}
+
 #[allow(clippy::too_many_lines)]
 fn print_non_trace_session_event(event: &SessionEvent) {
     match &event.kind {
@@ -7539,14 +7562,9 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         }
         SessionEventKind::AssistantReasoningActivity { turn_id, activity } => {
             println!(
-                "#{} reasoning ({turn_id}) {:?}: {} part(s)",
-                event.sequence,
-                activity.status,
-                activity.parts.len()
+                "{}",
+                reasoning_activity_description(event.sequence, turn_id, activity)
             );
-            for part in &activity.parts {
-                println!("thinking {:?}: {}", part.kind, part.text);
-            }
         }
         SessionEventKind::AssistantDelta { text } => {
             println!("#{} assistant delta: {text}", event.sequence);
@@ -8137,6 +8155,39 @@ fn print_model_usage_event(
 #[cfg(test)]
 mod web_command_tests {
     use super::*;
+
+    #[test]
+    fn cli_reasoning_description_preserves_structure_and_opaque_evidence() {
+        let activity = bcode_session_models::ReasoningActivity {
+            activity_id: "reasoning-1".to_owned(),
+            order: 0,
+            status: bcode_session_models::ReasoningActivityStatus::Interrupted,
+            parts: vec![
+                bcode_session_models::ReasoningPart {
+                    part_id: "raw-0".to_owned(),
+                    kind: bcode_session_models::ReasoningContentKind::Raw,
+                    role: bcode_session_models::ReasoningContentRole::Detail,
+                    order: 1,
+                    text: "raw detail".to_owned(),
+                },
+                bcode_session_models::ReasoningPart {
+                    part_id: "summary-0".to_owned(),
+                    kind: bcode_session_models::ReasoningContentKind::Summary,
+                    role: bcode_session_models::ReasoningContentRole::Milestone,
+                    order: 0,
+                    text: "summary".to_owned(),
+                },
+            ],
+            opaque: true,
+        };
+        let rendered = reasoning_activity_description(7, "turn-1", &activity);
+        assert!(rendered.contains("Interrupted: opaque=true parts=2"));
+        assert!(rendered.contains("Summary/Milestone [summary-0]: summary"));
+        assert!(rendered.contains("Raw/Detail [raw-0]: raw detail"));
+        assert!(
+            rendered.find("summary-0").expect("summary") < rendered.find("raw-0").expect("raw")
+        );
+    }
 
     #[test]
     fn compatibility_issue_format_is_actionable_and_specific() {

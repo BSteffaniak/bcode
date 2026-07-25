@@ -1695,9 +1695,13 @@ impl BmuxApp {
 
     fn refresh_thinking_label(&mut self) {
         let display = if self.reasoning_visible() {
-            "reasoning output shown"
+            match self.reasoning_display_mode {
+                bcode_config::TuiThinkingMode::All => "display: all",
+                bcode_config::TuiThinkingMode::Summary => "display: summaries",
+                bcode_config::TuiThinkingMode::Raw => "display: raw",
+            }
         } else {
-            "reasoning output hidden"
+            "display: hidden"
         };
         if !self.reasoning_support.is_supported() {
             self.thinking_label = format!("{display} · unsupported by current model");
@@ -1711,7 +1715,8 @@ impl BmuxApp {
             .reasoning_summary()
             .or(self.reasoning_default_summary.as_deref())
             .unwrap_or("not requested");
-        self.thinking_label = format!("{display} · effort: {effort} · visible summary: {summary}");
+        self.thinking_label =
+            format!("{display} · request effort: {effort} · provider summary: {summary}");
     }
 
     /// Mark the app as waiting for turn cancellation.
