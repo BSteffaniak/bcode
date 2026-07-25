@@ -8326,6 +8326,7 @@ mod context_compaction_tests {
                         producer_plugin_id: Some("bcode.filesystem".to_owned()),
                         schema: "bcode.filesystem.request-draft.write".to_owned(),
                         schema_version: 1,
+                        placement: bcode_session_models::ToolContributionPlacement::Request,
                         generation: 1,
                         revision: 2,
                         operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {

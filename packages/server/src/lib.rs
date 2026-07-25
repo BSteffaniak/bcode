@@ -21693,6 +21693,7 @@ fn is_expected_disconnect(error: &CodecError) -> bool {
 const SESSION_LIVE_FAN_OUT_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_PENDING_LIVE_KEYS_PER_CLIENT: usize = 256;
 const MAX_PENDING_LIVE_BYTES_PER_CLIENT: usize = 8 * 1024 * 1024;
+const MAX_PENDING_LIVE_APPEND_BYTES_PER_CLIENT: usize = 128 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum PendingLiveEventKey {
@@ -21747,6 +21748,35 @@ impl PendingLiveEventBuffer {
 
     const fn encoded_bytes(&self) -> usize {
         self.encoded_bytes
+    }
+
+    fn should_flush_before(&self, next: &bcode_session_models::SessionLiveEvent) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let Some(key) = pending_live_event_key(next) else {
+            return false;
+        };
+        self.events.get(&key).is_some_and(|pending| {
+            let SessionLiveEventKind::ToolRequestDraft {
+                event: pending_draft,
+            } = &pending.event.kind
+            else {
+                return false;
+            };
+            let SessionLiveEventKind::ToolRequestDraft { event: next_draft } = &next.kind else {
+                return false;
+            };
+            let next_append_bytes = request_draft_append_bytes(next_draft);
+            matches!(
+                (&pending_draft.operation, &next_draft.operation),
+                (
+                    bcode_session_models::ToolRequestDraftOperation::Append { .. },
+                    bcode_session_models::ToolRequestDraftOperation::Append { .. }
+                )
+            ) && request_draft_append_bytes(pending_draft).saturating_add(next_append_bytes)
+                > MAX_PENDING_LIVE_APPEND_BYTES_PER_CLIENT
+        })
     }
 
     fn clear(&mut self) {
@@ -21815,6 +21845,14 @@ impl PendingLiveEventBuffer {
         );
         self.encoded_bytes = next_bytes;
         BufferLiveEventResult::Buffered { superseded }
+    }
+}
+
+const fn request_draft_append_bytes(event: &bcode_session_models::ToolRequestDraftEvent) -> usize {
+    match &event.operation {
+        bcode_session_models::ToolRequestDraftOperation::Append { text, .. } => text.len(),
+        bcode_session_models::ToolRequestDraftOperation::Checkpoint { .. }
+        | bcode_session_models::ToolRequestDraftOperation::Remove { .. } => 0,
     }
 }
 
@@ -22088,6 +22126,19 @@ fn forward_session_events(
                         event.kind,
                         SessionLiveEventKind::ToolRequestDraft { .. }
                     );
+                    if pending_live.should_flush_before(&event) {
+                        if let Err(error) = flush_pending_live_events(&sink, &mut pending_live).await {
+                            if !is_expected_disconnect(&error) {
+                                tracing::warn!(
+                                    "failed to flush bounded live append batch to {}: {error}",
+                                    sink.client_id()
+                                );
+                            }
+                            break;
+                        }
+                        sink.metrics.set_gauge("server.live_state.pending_subscriber_keys", 0);
+                        sink.metrics.set_gauge("server.live_state.pending_subscriber_bytes", 0);
+                    }
                     match pending_live.push(event) {
                         BufferLiveEventResult::Buffered { superseded } => {
                             if superseded {
@@ -36188,6 +36239,180 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(attachment.live_events.try_recv().is_err());
     }
 
+    fn report_pending_live_workload(
+        name: &str,
+        events: impl IntoIterator<Item = bcode_session_models::SessionLiveEvent>,
+    ) {
+        let mut pending = PendingLiveEventBuffer::default();
+        let mut produced_events = 0_u64;
+        let mut serialized_bytes = 0_u64;
+        let mut coalesced_updates = 0_u64;
+        let mut latencies_ns = Vec::new();
+        let started = Instant::now();
+        for event in events {
+            produced_events = produced_events.saturating_add(1);
+            serialized_bytes = serialized_bytes.saturating_add(
+                u64::try_from(
+                    serde_json::to_vec(&event)
+                        .expect("serialize workload event")
+                        .len(),
+                )
+                .unwrap_or(u64::MAX),
+            );
+            let push_started = Instant::now();
+            let result = pending.push(event);
+            latencies_ns.push(u64::try_from(push_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            match result {
+                BufferLiveEventResult::Buffered { superseded } => {
+                    coalesced_updates = coalesced_updates.saturating_add(u64::from(superseded));
+                }
+                BufferLiveEventResult::PassThrough(_) => {
+                    panic!("fixed workload {name} unexpectedly bypassed coalescing");
+                }
+                BufferLiveEventResult::Rejected(error) => {
+                    panic!("fixed workload {name} was rejected: {error:?}");
+                }
+            }
+        }
+        latencies_ns.sort_unstable();
+        let percentile = |percent: usize| {
+            let index = latencies_ns.len().saturating_sub(1).saturating_mul(percent) / 100;
+            latencies_ns.get(index).copied().unwrap_or_default()
+        };
+        println!(
+            "BCODE_PERF_CASE {}",
+            serde_json::json!({
+                "domain": "pending_live_fanout",
+                "workload": name,
+                "produced_events": produced_events,
+                "serialized_bytes": serialized_bytes,
+                "retained_events": pending.len(),
+                "pending_bytes": pending.encoded_bytes(),
+                "coalesced_updates": coalesced_updates,
+                "push_latency_ns_p50": percentile(50),
+                "push_latency_ns_p95": percentile(95),
+                "push_latency_ns_p99": percentile(99),
+                "wall_us": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            })
+        );
+    }
+
+    #[test]
+    #[ignore = "manual deterministic transient-streaming performance baseline"]
+    #[allow(clippy::too_many_lines)] // Keep the fixed workload visible as one reproducible benchmark scenario.
+    fn transient_streaming_fixed_workload_baseline_report() {
+        let session_id = SessionId::new();
+        let draft = |revision, operation, argument_bytes| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-benchmark".to_owned(),
+                    tool_call_id: "call-write".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Request,
+                    generation: 1,
+                    revision,
+                    operation,
+                    argument_bytes,
+                    truncated: false,
+                },
+            },
+        };
+        report_pending_live_workload(
+            "small_contiguous_deltas",
+            (0..10_000_u64).map(|index| {
+                let text = "0123456789abcdef";
+                let offset = usize::try_from(index).unwrap_or(usize::MAX) * text.len();
+                draft(
+                    index.saturating_add(1),
+                    bcode_session_models::ToolRequestDraftOperation::Append {
+                        offset,
+                        text: text.to_owned(),
+                    },
+                    offset.saturating_add(text.len()),
+                )
+            }),
+        );
+        let large_contents = "x".repeat(128 * 1024);
+        report_pending_live_workload(
+            "large_filesystem_write_checkpoints",
+            (1..=64_u64).map(|revision| {
+                let text = format!(r#"{{"path":"large.txt","contents":"{large_contents}"}}"#);
+                let argument_bytes = text.len();
+                draft(
+                    revision,
+                    bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text,
+                    },
+                    argument_bytes,
+                )
+            }),
+        );
+        let progress = |invocation_id: String, sequence: u64, payload: serde_json::Value| {
+            bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::ToolContributionPlaced {
+                    envelope: bcode_session_models::ToolContributionEnvelope::new(
+                        bcode_session_models::ToolContributionPlacement::Progress,
+                        bcode_session_models::ToolContributionEvent {
+                            invocation_id,
+                            contribution_id: "screen".to_owned(),
+                            sequence,
+                            producer_id: "bcode.vim-edit".to_owned(),
+                            schema: "bcode.vim-edit.live".to_owned(),
+                            schema_version: 1,
+                            operation: bcode_session_models::ToolContributionOperation::Upsert,
+                            persistence:
+                                bcode_session_models::ToolContributionPersistence::Transient,
+                            artifact: None,
+                            payload,
+                        },
+                    ),
+                },
+            }
+        };
+        report_pending_live_workload(
+            "vim_frames",
+            (1..=10_000_u64).map(|sequence| {
+                progress(
+                    "call-vim".to_owned(),
+                    sequence,
+                    serde_json::json!({
+                        "phase": "running",
+                        "step_index": sequence % 20,
+                        "step_total": 20,
+                        "cursor": {"line": sequence % 200, "column": sequence % 80},
+                        "context": {"start_line": 1, "lines": ["alpha", "beta", "gamma"]}
+                    }),
+                )
+            }),
+        );
+        report_pending_live_workload(
+            "concurrent_invocations",
+            (0..MAX_PENDING_LIVE_KEYS_PER_CLIENT).map(|index| {
+                progress(
+                    format!("call-{index}"),
+                    1,
+                    serde_json::json!({"frame": index}),
+                )
+            }),
+        );
+        report_pending_live_workload(
+            "slow_client_latest_state",
+            (1..=10_000_u64).map(|sequence| {
+                progress(
+                    "call-slow".to_owned(),
+                    sequence,
+                    serde_json::json!({"frame": sequence}),
+                )
+            }),
+        );
+    }
+
     #[test]
     fn pending_live_event_buffer_coalesces_snapshots_and_contiguous_appends() {
         let session_id = SessionId::new();
@@ -36276,6 +36501,51 @@ event_symbol = "bcode_plugin_handle_event_v1"
             BufferLiveEventResult::Rejected(BufferLiveEventError::Gap)
         ));
         assert_eq!(pending.len(), 1);
+    }
+
+    #[test]
+    fn pending_live_event_buffer_requests_flush_before_append_batch_exceeds_bound() {
+        let session_id = SessionId::new();
+        let draft = |revision, offset, text: String| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-append-bound".to_owned(),
+                    tool_call_id: "call-append-bound".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Request,
+                    generation: 1,
+                    revision,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Append {
+                        offset,
+                        text: text.clone(),
+                    },
+                    argument_bytes: offset.saturating_add(text.len()),
+                    truncated: false,
+                },
+            },
+        };
+        let mut pending = PendingLiveEventBuffer::default();
+        let first_text = "a".repeat(MAX_PENDING_LIVE_APPEND_BYTES_PER_CLIENT);
+        let first = draft(1, 0, first_text);
+        assert!(!pending.should_flush_before(&first));
+        assert!(matches!(
+            pending.push(first),
+            BufferLiveEventResult::Buffered { superseded: false }
+        ));
+        let next = draft(2, MAX_PENDING_LIVE_APPEND_BYTES_PER_CLIENT, "b".to_owned());
+        assert!(pending.should_flush_before(&next));
+        let flushed = pending.take_events();
+        assert_eq!(flushed.len(), 1);
+        assert!(!pending.should_flush_before(&next));
+        assert!(matches!(
+            pending.push(next),
+            BufferLiveEventResult::Buffered { superseded: false }
+        ));
+        assert!(pending.encoded_bytes() < MAX_PENDING_LIVE_BYTES_PER_CLIENT);
     }
 
     #[test]

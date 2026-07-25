@@ -2344,7 +2344,7 @@ mod tests {
                 producer_plugin_id: Some("bcode.filesystem".to_owned()),
                 schema: "bcode.filesystem.request-draft.write".to_owned(),
                 schema_version: 1,
-                placement: bcode_session_models::ToolContributionPlacement::Request,
+                placement: ToolContributionPlacement::Request,
                 generation: 1,
                 revision: u64::try_from(index + 1).expect("revision"),
                 operation,

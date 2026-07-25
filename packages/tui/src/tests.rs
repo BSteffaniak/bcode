@@ -4778,6 +4778,7 @@ fn live_filesystem_edit_request_draft_renders_progressive_diff_and_removes() {
                 producer_plugin_id: Some("bcode.filesystem".to_owned()),
                 schema: "bcode.filesystem.request-draft.edit".to_owned(),
                 schema_version: 1,
+                placement: bcode_session_models::ToolContributionPlacement::Request,
                 generation: 1,
                 revision,
                 operation,
