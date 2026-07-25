@@ -7,9 +7,96 @@ use bcode_mermaid_render::{
     MermaidRenderedOutput,
 };
 use bmux_tui::geometry::Rect;
+use bmux_tui::image::{
+    ImageContribution, ImageKey, ImageLifecycle, ImagePayload, ImagePixelFormat, ImagePlacement,
+};
 
 /// Fixed rows reserved before and after Mermaid rendering.
 pub const RESERVED_MERMAID_ROWS: u16 = 8;
+
+/// Rasterized Mermaid image suitable for BMUX protocol-neutral transport.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedMermaidImage {
+    /// Pixel width.
+    pub width: u32,
+    /// Pixel height.
+    pub height: u32,
+    /// RGBA8 pixels.
+    pub rgba: Vec<u8>,
+}
+
+impl DecodedMermaidImage {
+    fn contribution(
+        &self,
+        key: impl Into<String>,
+        destination: Rect,
+        clip: Rect,
+    ) -> ImageContribution {
+        ImageContribution::Present(ImagePlacement {
+            key: ImageKey::new(key),
+            payload: ImagePayload::Pixels {
+                bytes: self.rgba.clone(),
+                width: self.width,
+                height: self.height,
+                format: ImagePixelFormat::Rgba8,
+            },
+            destination,
+            clip,
+            lifecycle: ImageLifecycle::Frame,
+        })
+    }
+}
+
+/// SVG rasterization failure.
+#[derive(Debug, thiserror::Error)]
+pub enum MermaidImageError {
+    /// SVG could not be parsed safely.
+    #[error("invalid Mermaid SVG: {0}")]
+    InvalidSvg(String),
+    /// SVG dimensions are invalid or exceed fixed limits.
+    #[error("Mermaid SVG dimensions are invalid")]
+    InvalidDimensions,
+    /// Pixel allocation failed.
+    #[error("Mermaid image allocation failed")]
+    AllocationFailed,
+}
+
+/// Convert successful worker SVG into bounded RGBA pixels for BMUX.
+///
+/// # Errors
+///
+/// Returns an error for malformed SVG, invalid dimensions, excessive decoded
+/// pixels, or failed pixel allocation.
+pub fn rasterize_mermaid_svg(svg: &[u8]) -> Result<DecodedMermaidImage, MermaidImageError> {
+    const MAX_DIMENSION: u32 = 4096;
+    const MAX_PIXELS: u64 = 16_000_000;
+
+    let tree = resvg::usvg::Tree::from_data(svg, &resvg::usvg::Options::default())
+        .map_err(|error| MermaidImageError::InvalidSvg(error.to_string()))?;
+    let size = tree.size().to_int_size();
+    let width = size.width();
+    let height = size.height();
+    if width == 0
+        || height == 0
+        || width > MAX_DIMENSION
+        || height > MAX_DIMENSION
+        || u64::from(width).saturating_mul(u64::from(height)) > MAX_PIXELS
+    {
+        return Err(MermaidImageError::InvalidDimensions);
+    }
+    let mut pixmap =
+        resvg::tiny_skia::Pixmap::new(width, height).ok_or(MermaidImageError::AllocationFailed)?;
+    resvg::render(
+        &tree,
+        resvg::tiny_skia::Transform::identity(),
+        &mut pixmap.as_mut(),
+    );
+    Ok(DecodedMermaidImage {
+        width,
+        height,
+        rgba: pixmap.take(),
+    })
+}
 
 /// Per-contribution Mermaid presentation state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,8 +105,8 @@ pub enum MarkdownMermaidPresentationState {
     Idle,
     /// A bounded worker is active.
     Rendering,
-    /// Successful SVG output is available for image adaptation.
-    Ready(Vec<u8>),
+    /// Successful RGBA pixels are ready for BMUX image transport.
+    Ready(DecodedMermaidImage),
     /// Rendering failed with a visible typed diagnostic.
     Failed(String),
     /// BMUX cannot present images on this terminal.
@@ -157,7 +244,9 @@ impl MarkdownMermaidPresentationStore {
         {
             if let Some(rendered) = cache.get(&entry.cache_key) {
                 let MermaidRenderedOutput::Svg(svg) = rendered.output;
-                entry.state = MarkdownMermaidPresentationState::Ready(svg);
+                if let Ok(image) = rasterize_mermaid_svg(&svg) {
+                    entry.state = MarkdownMermaidPresentationState::Ready(image);
+                }
             }
         }
     }
@@ -174,12 +263,26 @@ impl MarkdownMermaidPresentationStore {
             Ok(rendered) => {
                 cache.insert(rendered.clone());
                 let MermaidRenderedOutput::Svg(svg) = rendered.output;
-                for entry in self
-                    .entries
-                    .values_mut()
-                    .filter(|entry| entry.cache_key == key)
-                {
-                    entry.state = MarkdownMermaidPresentationState::Ready(svg.clone());
+                match rasterize_mermaid_svg(&svg) {
+                    Ok(image) => {
+                        for entry in self
+                            .entries
+                            .values_mut()
+                            .filter(|entry| entry.cache_key == key)
+                        {
+                            entry.state = MarkdownMermaidPresentationState::Ready(image.clone());
+                        }
+                    }
+                    Err(error) => {
+                        for entry in self
+                            .entries
+                            .values_mut()
+                            .filter(|entry| entry.cache_key == key)
+                        {
+                            entry.state =
+                                MarkdownMermaidPresentationState::Failed(error.to_string());
+                        }
+                    }
                 }
             }
             Err(error) => {
@@ -215,14 +318,13 @@ impl MarkdownMermaidPresentationStore {
         contribution_id: &str,
         destination: Rect,
         clip: Rect,
-    ) -> Option<(String, &[u8], Rect, Rect)> {
-        let MarkdownMermaidPresentationState::Ready(svg) = self.state(contribution_id)? else {
+    ) -> Option<ImageContribution> {
+        let MarkdownMermaidPresentationState::Ready(image) = self.state(contribution_id)? else {
             return None;
         };
         (!destination.intersection(clip).is_empty()).then(|| {
-            (
+            image.contribution(
                 format!("markdown-mermaid:{contribution_id}"),
-                svg.as_slice(),
                 destination,
                 clip,
             )
@@ -250,6 +352,7 @@ mod tests {
         MermaidRenderedOutput,
     };
     use bmux_tui::geometry::Rect;
+    use bmux_tui::image::{ImageContribution, ImagePayload, ImagePixelFormat};
 
     use super::{
         MarkdownMermaidInput, MarkdownMermaidPresentationState, MarkdownMermaidPresentationStore,
@@ -267,7 +370,9 @@ mod tests {
 
     fn rendered(key: &str) -> MermaidRendered {
         MermaidRendered {
-            output: MermaidRenderedOutput::Svg(b"<svg/>".to_vec()),
+            output: MermaidRenderedOutput::Svg(
+                br#"<svg xmlns="http://www.w3.org/2000/svg" width="2" height="2"><rect width="2" height="2" fill="red"/></svg>"#.to_vec(),
+            ),
             cache_key: key.to_owned(),
             diagnostics: Vec::new(),
         }
@@ -298,11 +403,22 @@ mod tests {
             RESERVED_MERMAID_ROWS
         );
         assert_eq!(store.source("visible"), Some("flowchart LR\nA --> B"));
-        assert!(
-            store
-                .ready_placement("visible", Rect::new(2, 3, 20, 8), Rect::new(4, 4, 10, 4),)
-                .is_some()
-        );
+        let contribution = store
+            .ready_placement("visible", Rect::new(2, 3, 20, 8), Rect::new(4, 4, 10, 4))
+            .expect("ready placement");
+        let ImageContribution::Present(placement) = contribution else {
+            panic!("expected presented Mermaid image");
+        };
+        assert_eq!(placement.key.as_str(), "markdown-mermaid:visible");
+        assert!(matches!(
+            placement.payload,
+            ImagePayload::Pixels {
+                width: 2,
+                height: 2,
+                format: ImagePixelFormat::Rgba8,
+                ..
+            }
+        ));
     }
 
     #[test]

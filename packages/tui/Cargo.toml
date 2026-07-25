@@ -48,6 +48,7 @@ image                     = { workspace = true }
 open                      = { workspace = true }
 png                       = { workspace = true }
 reqwest                   = { workspace = true, features = ["rustls-tls", "stream"] }
+resvg                     = { workspace = true }
 serde                     = { workspace = true, features = ["derive", "std"] }
 serde_json                = { workspace = true }
 thiserror                 = { workspace = true }
