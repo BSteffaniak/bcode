@@ -1944,6 +1944,7 @@ impl ServerState {
     }
 
     fn request_shutdown(&self) {
+        clear_all_live_state(self);
         let _ = self.shutdown.send(());
     }
 }
@@ -18316,6 +18317,23 @@ fn active_contribution_snapshot_events(
         .collect())
 }
 
+fn clear_all_live_state(state: &ServerState) {
+    if let Ok(mut registry) = state.active_contributions.lock() {
+        registry.envelopes.clear();
+        registry.terminal_sequences.clear();
+        registry.session_bytes.clear();
+    }
+    if let Ok(mut registry) = state.active_tool_request_drafts.lock() {
+        registry.drafts.clear();
+        registry.terminal_revisions.clear();
+        registry.session_bytes.clear();
+    }
+    if let Ok(mut artifacts) = state.active_artifacts.lock() {
+        artifacts.clear();
+    }
+    refresh_active_live_state_metrics(state);
+}
+
 fn clear_session_live_state(state: &ServerState, session_id: SessionId) {
     if let Ok(mut registry) = state.active_contributions.lock() {
         registry
@@ -18333,7 +18351,22 @@ fn clear_session_live_state(state: &ServerState, session_id: SessionId) {
             .retain(|key, _| key.session() != session_id);
         registry.session_bytes.remove(&session_id);
     }
+    if let Ok(mut artifacts) = state.active_artifacts.lock() {
+        artifacts.retain(|key, _| key.session_id != session_id);
+    }
     refresh_active_live_state_metrics(state);
+}
+
+fn clear_unfinalized_active_artifacts(
+    state: &ServerState,
+    session_id: SessionId,
+    invocation_id: &str,
+) {
+    if let Ok(mut artifacts) = state.active_artifacts.lock() {
+        artifacts.retain(|key, artifact| {
+            key.session_id != session_id || key.tool_call_id != invocation_id || artifact.finalized
+        });
+    }
 }
 
 async fn clear_active_contributions(
@@ -19714,6 +19747,7 @@ async fn append_tool_invocation_terminal_event(
     )
     .await;
     clear_active_contributions(state, session_id, invocation_id).await;
+    clear_unfinalized_active_artifacts(state, session_id, invocation_id);
 }
 
 async fn append_tool_request_event(
@@ -22632,6 +22666,31 @@ mod tests {
                     .clone(),
             )
             .expect("captured logs should be UTF-8")
+        }
+    }
+
+    fn assert_directory_tree_excludes_marker(root: &Path, marker: &str) {
+        if !root.exists() {
+            return;
+        }
+        let marker = marker.as_bytes();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(path) = pending.pop() {
+            let metadata = std::fs::symlink_metadata(&path).expect("durable sink metadata");
+            if metadata.is_dir() {
+                pending.extend(
+                    std::fs::read_dir(&path)
+                        .expect("durable sink directory")
+                        .map(|entry| entry.expect("durable sink entry").path()),
+                );
+            } else if metadata.is_file() {
+                let bytes = std::fs::read(&path).expect("durable sink file");
+                assert!(
+                    !bytes.windows(marker.len()).any(|window| window == marker),
+                    "transient marker leaked into {}",
+                    path.display()
+                );
+            }
         }
     }
 
@@ -25993,6 +26052,102 @@ library = "test"
                             == bcode_session_models::ToolInvocationLifecycleStage::Waiting
                             && event.message.as_deref() == Some("awaiting external service")
                 ))
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One privacy fixture scans every configured durable/observability sink for unique live markers.
+    async fn transient_payload_markers_never_enter_durable_or_observability_sinks() {
+        let session_root = tempfile::tempdir().expect("session root");
+        let trace_root = tempfile::tempdir().expect("trace root");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let sessions =
+            SessionManager::persistent(session_root.path()).expect("persistent sessions");
+        let session = sessions
+            .create_session(
+                Some("transient privacy".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let session_id = session.id;
+        let mut state = test_server_state(sessions);
+        state.trace_store = TraceStore::new(trace_root.path().to_path_buf());
+        state.workflow_store = StdMutex::new(
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("workflow store"),
+        );
+        let contribution_marker = format!("live-contribution-{}", uuid::Uuid::new_v4());
+        let draft_marker = format!("live-draft-{}", uuid::Uuid::new_v4());
+        let writer = CapturedLogWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        publish_tool_request_draft_live(
+            &state,
+            session_id,
+            request_draft_event(
+                "call-private-draft",
+                1,
+                1,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: format!(r#"{{"contents":"{draft_marker}"}}"#),
+                },
+            ),
+        )
+        .await;
+        append_tool_contribution_envelope(
+            &state,
+            session_id,
+            "call-private-progress",
+            "test.plugin",
+            bcode_session_models::ToolContributionEnvelope::new(
+                bcode_session_models::ToolContributionPlacement::Progress,
+                bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call-private-progress".to_owned(),
+                    contribution_id: "screen".to_owned(),
+                    sequence: 1,
+                    producer_id: "test.plugin".to_owned(),
+                    schema: "test.progress".to_owned(),
+                    schema_version: 1,
+                    operation: bcode_session_models::ToolContributionOperation::Upsert,
+                    persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                    artifact: None,
+                    payload: serde_json::json!({"frame": contribution_marker}),
+                },
+            ),
+        )
+        .await;
+        drop(guard);
+
+        let durable_history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("durable history");
+        let durable_json = serde_json::to_string(&durable_history).expect("durable history JSON");
+        for marker in [&contribution_marker, &draft_marker] {
+            assert!(!durable_json.contains(marker));
+            assert!(!writer.text().contains(marker));
+            assert_directory_tree_excludes_marker(session_root.path(), marker);
+            assert_directory_tree_excludes_marker(trace_root.path(), marker);
+            assert_directory_tree_excludes_marker(workflow_root.path(), marker);
+        }
+        assert_eq!(
+            active_contribution_snapshot_events(&state, session_id)
+                .expect("live contribution")
+                .len(),
+            1
+        );
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, session_id).len(),
+            1
         );
     }
 
@@ -36459,96 +36614,156 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
-    async fn host_terminal_failure_clears_progress_without_producer_cleanup() {
-        let sessions = SessionManager::default();
-        let session_id = sessions
-            .create_session(
-                Some("failed progress cleanup".to_owned()),
-                test_working_directory(),
-            )
-            .await
-            .expect("session should be created")
-            .id;
-        let mut attachment = sessions
-            .attach_session(session_id, ClientId::new())
-            .await
-            .expect("session should attach");
-        let state = test_server_state(sessions);
-        let envelope = bcode_session_models::ToolContributionEnvelope::new(
-            bcode_session_models::ToolContributionPlacement::Progress,
-            bcode_session_models::ToolContributionEvent {
-                invocation_id: "call-failed".to_owned(),
-                contribution_id: "screen".to_owned(),
-                sequence: 1,
-                producer_id: "test.plugin".to_owned(),
-                schema: "test.progress".to_owned(),
-                schema_version: 1,
-                operation: bcode_session_models::ToolContributionOperation::Upsert,
-                persistence: bcode_session_models::ToolContributionPersistence::Transient,
-                artifact: None,
-                payload: serde_json::json!({"frame": 1}),
-            },
-        );
-        append_tool_contribution_envelope(
-            &state,
-            session_id,
-            "call-failed",
-            "test.plugin",
-            envelope,
-        )
-        .await;
-        assert!(matches!(
-            attachment.live_events.recv().await.expect("live progress").kind,
-            SessionLiveEventKind::ToolContributionPlaced { envelope }
-                if envelope.contribution.operation
-                    == bcode_session_models::ToolContributionOperation::Upsert
-        ));
-
-        append_tool_invocation_terminal_event(
-            &state,
-            session_id,
-            "call-failed",
+    #[allow(clippy::too_many_lines)] // One matrix verifies identical cleanup for every host-owned terminal stage.
+    async fn host_terminal_lifecycle_clears_progress_for_success_error_and_cancellation() {
+        for terminal_stage in [
+            bcode_session_models::ToolInvocationLifecycleStage::Completed,
             bcode_session_models::ToolInvocationLifecycleStage::Failed,
-        )
-        .await;
-
-        assert!(
-            active_contribution_snapshot_events(&state, session_id)
-                .expect("active contribution snapshot")
-                .is_empty()
-        );
-        assert!(matches!(
-            attachment
-                .live_events
-                .recv()
+            bcode_session_models::ToolInvocationLifecycleStage::Cancelled,
+        ] {
+            let sessions = SessionManager::default();
+            let session_id = sessions
+                .create_session(
+                    Some(format!("{terminal_stage:?} progress cleanup")),
+                    test_working_directory(),
+                )
                 .await
-                .expect("host-owned terminal removal")
-                .kind,
-            SessionLiveEventKind::ToolContributionPlaced { envelope }
-                if envelope.placement
-                    == bcode_session_models::ToolContributionPlacement::Progress
-                    && envelope.contribution.operation
-                        == bcode_session_models::ToolContributionOperation::Remove
-                    && envelope.contribution.sequence == 2
-        ));
-        assert!(
+                .expect("session should be created")
+                .id;
+            let mut attachment = sessions
+                .attach_session(session_id, ClientId::new())
+                .await
+                .expect("session should attach");
+            let state = test_server_state(sessions);
+            let artifact_root = default_session_artifact_dir(session_id);
+            std::fs::create_dir_all(&artifact_root).expect("artifact root");
+            let artifact_path = artifact_root.join("terminal.bin");
+            std::fs::write(&artifact_path, b"live").expect("artifact bytes");
             state
-                .sessions
-                .session_history(session_id)
-                .await
-                .expect("durable history")
-                .iter()
-                .any(|event| matches!(
-                    &event.kind,
-                    SessionEventKind::ToolInvocationLifecycle { event }
-                        if event.invocation_id == "call-failed"
-                            && event.stage
-                                == bcode_session_models::ToolInvocationLifecycleStage::Failed
-                ))
-        );
+                .active_artifacts
+                .lock()
+                .expect("artifact registry")
+                .insert(
+                    ActiveArtifactKey {
+                        session_id,
+                        tool_call_id: "call-terminal".to_owned(),
+                        artifact_id: "artifact-terminal".to_owned(),
+                        reference_key: "recording".to_owned(),
+                    },
+                    ActiveArtifactReference {
+                        producer_plugin_id: "test.plugin".to_owned(),
+                        schema: "test.progress".to_owned(),
+                        schema_version: 1,
+                        content_type: None,
+                        path: artifact_path,
+                        committed_bytes: 4,
+                        revision: 1,
+                        finalized: false,
+                        abandoned: false,
+                        contribution_snapshot: bcode_session_models::ToolContributionEnvelope::new(
+                            bcode_session_models::ToolContributionPlacement::Progress,
+                            bcode_session_models::ToolContributionEvent {
+                                invocation_id: "call-terminal".to_owned(),
+                                contribution_id: "artifact".to_owned(),
+                                sequence: 1,
+                                producer_id: "test.plugin".to_owned(),
+                                schema: "test.progress".to_owned(),
+                                schema_version: 1,
+                                operation: bcode_session_models::ToolContributionOperation::Upsert,
+                                persistence:
+                                    bcode_session_models::ToolContributionPersistence::Transient,
+                                artifact: None,
+                                payload: serde_json::Value::Null,
+                            },
+                        ),
+                    },
+                );
+            let envelope = bcode_session_models::ToolContributionEnvelope::new(
+                bcode_session_models::ToolContributionPlacement::Progress,
+                bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call-terminal".to_owned(),
+                    contribution_id: "screen".to_owned(),
+                    sequence: 1,
+                    producer_id: "test.plugin".to_owned(),
+                    schema: "test.progress".to_owned(),
+                    schema_version: 1,
+                    operation: bcode_session_models::ToolContributionOperation::Upsert,
+                    persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                    artifact: None,
+                    payload: serde_json::json!({"frame": 1}),
+                },
+            );
+            append_tool_contribution_envelope(
+                &state,
+                session_id,
+                "call-terminal",
+                "test.plugin",
+                envelope,
+            )
+            .await;
+            assert!(matches!(
+                attachment.live_events.recv().await.expect("live progress").kind,
+                SessionLiveEventKind::ToolContributionPlaced { envelope }
+                    if envelope.contribution.operation
+                        == bcode_session_models::ToolContributionOperation::Upsert
+            ));
+
+            append_tool_invocation_terminal_event(
+                &state,
+                session_id,
+                "call-terminal",
+                terminal_stage,
+            )
+            .await;
+
+            assert!(
+                active_contribution_snapshot_events(&state, session_id)
+                    .expect("active contribution snapshot")
+                    .is_empty()
+            );
+            assert!(
+                state
+                    .active_artifacts
+                    .lock()
+                    .expect("artifact registry")
+                    .keys()
+                    .all(|key| {
+                        key.session_id != session_id || key.tool_call_id != "call-terminal"
+                    })
+            );
+            assert!(matches!(
+                attachment
+                    .live_events
+                    .recv()
+                    .await
+                    .expect("host-owned terminal removal")
+                    .kind,
+                SessionLiveEventKind::ToolContributionPlaced { envelope }
+                    if envelope.placement
+                        == bcode_session_models::ToolContributionPlacement::Progress
+                        && envelope.contribution.operation
+                            == bcode_session_models::ToolContributionOperation::Remove
+                        && envelope.contribution.sequence == 2
+            ));
+            assert!(
+                state
+                    .sessions
+                    .session_history(session_id)
+                    .await
+                    .expect("durable history")
+                    .iter()
+                    .any(|event| matches!(
+                        &event.kind,
+                        SessionEventKind::ToolInvocationLifecycle { event }
+                            if event.invocation_id == "call-terminal"
+                                && event.stage == terminal_stage
+                    ))
+            );
+        }
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One unload fixture covers draft, contribution, artifact, tombstone, and byte-accounting cleanup.
     async fn idle_session_unload_clears_all_live_state() {
         let sessions = SessionManager::default();
         let session = sessions
@@ -36645,6 +36860,146 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .all(|key| key.session() != session.id)
         );
         drop(contributions);
+        assert!(
+            state
+                .active_artifacts
+                .lock()
+                .expect("artifact registry")
+                .keys()
+                .all(|key| key.session_id != session.id)
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One shutdown fixture covers every process-local live registry across sessions.
+    async fn shutdown_clears_all_process_local_live_state() {
+        let sessions = SessionManager::default();
+        let first = sessions
+            .create_session(Some("shutdown one".to_owned()), test_working_directory())
+            .await
+            .expect("first session")
+            .id;
+        let second = sessions
+            .create_session(Some("shutdown two".to_owned()), test_working_directory())
+            .await
+            .expect("second session")
+            .id;
+        let state = test_server_state(sessions);
+
+        for (session_id, invocation_id) in [(first, "call-first"), (second, "call-second")] {
+            publish_tool_request_draft_live(
+                &state,
+                session_id,
+                request_draft_event(
+                    invocation_id,
+                    1,
+                    1,
+                    bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: "draft".to_owned(),
+                    },
+                ),
+            )
+            .await;
+            append_tool_contribution_envelope(
+                &state,
+                session_id,
+                invocation_id,
+                "test.plugin",
+                bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Progress,
+                    bcode_session_models::ToolContributionEvent {
+                        invocation_id: invocation_id.to_owned(),
+                        contribution_id: "screen".to_owned(),
+                        sequence: 1,
+                        producer_id: "test.plugin".to_owned(),
+                        schema: "test.progress".to_owned(),
+                        schema_version: 1,
+                        operation: bcode_session_models::ToolContributionOperation::Upsert,
+                        persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                        artifact: None,
+                        payload: serde_json::json!({"frame": 1}),
+                    },
+                ),
+            )
+            .await;
+        }
+        let artifact_root = default_session_artifact_dir(first);
+        std::fs::create_dir_all(&artifact_root).expect("artifact root");
+        let artifact_path = artifact_root.join("shutdown.bin");
+        std::fs::write(&artifact_path, b"live").expect("artifact bytes");
+        state
+            .active_artifacts
+            .lock()
+            .expect("artifact registry")
+            .insert(
+                ActiveArtifactKey {
+                    session_id: first,
+                    tool_call_id: "call-first".to_owned(),
+                    artifact_id: "artifact-first".to_owned(),
+                    reference_key: "recording".to_owned(),
+                },
+                ActiveArtifactReference {
+                    producer_plugin_id: "test.plugin".to_owned(),
+                    schema: "test.progress".to_owned(),
+                    schema_version: 1,
+                    content_type: None,
+                    path: artifact_path,
+                    committed_bytes: 4,
+                    revision: 1,
+                    finalized: false,
+                    abandoned: false,
+                    contribution_snapshot: bcode_session_models::ToolContributionEnvelope::new(
+                        bcode_session_models::ToolContributionPlacement::Progress,
+                        bcode_session_models::ToolContributionEvent {
+                            invocation_id: "call-first".to_owned(),
+                            contribution_id: "artifact".to_owned(),
+                            sequence: 1,
+                            producer_id: "test.plugin".to_owned(),
+                            schema: "test.progress".to_owned(),
+                            schema_version: 1,
+                            operation: bcode_session_models::ToolContributionOperation::Upsert,
+                            persistence:
+                                bcode_session_models::ToolContributionPersistence::Transient,
+                            artifact: None,
+                            payload: serde_json::Value::Null,
+                        },
+                    ),
+                },
+            );
+
+        assert!(!active_tool_request_draft_snapshot_events(&state, first).is_empty());
+        assert!(
+            !active_contribution_snapshot_events(&state, second)
+                .expect("second snapshot")
+                .is_empty()
+        );
+        assert!(!state.active_artifacts.lock().expect("artifacts").is_empty());
+
+        state.request_shutdown();
+
+        assert!(active_tool_request_draft_snapshot_events(&state, first).is_empty());
+        assert!(active_tool_request_draft_snapshot_events(&state, second).is_empty());
+        assert!(
+            active_contribution_snapshot_events(&state, first)
+                .expect("first cleared snapshot")
+                .is_empty()
+        );
+        assert!(
+            active_contribution_snapshot_events(&state, second)
+                .expect("second cleared snapshot")
+                .is_empty()
+        );
+        assert!(state.active_artifacts.lock().expect("artifacts").is_empty());
+        let metrics = state.metrics.snapshot();
+        assert_eq!(
+            metrics.gauges.get("server.live_state.active_keys"),
+            Some(&0)
+        );
+        assert_eq!(
+            metrics.gauges.get("server.live_state.active_bytes"),
+            Some(&0)
+        );
     }
 
     #[tokio::test]
