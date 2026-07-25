@@ -25771,6 +25771,137 @@ library = "test"
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One persistence fixture snapshots every durable sink around the full flood.
+    async fn ten_thousand_live_updates_do_not_grow_durable_session_state() {
+        let root = tempfile::tempdir().expect("session root");
+        let trace_root = tempfile::tempdir().expect("trace root");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let sessions = SessionManager::persistent(root.path()).expect("persistent sessions");
+        let session = sessions
+            .create_session(
+                Some("durable non-growth".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let session_id = session.id;
+        let mut state = test_server_state(sessions);
+        state.trace_store = TraceStore::new(trace_root.path().to_path_buf());
+        state.workflow_store = StdMutex::new(
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("workflow store"),
+        );
+        let db = bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, root.path())
+            .await
+            .expect("session database");
+        let history_before = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history before");
+        let tail_before = db.last_event_sequence().await.expect("tail before");
+        let checkpoints_before = futures::future::try_join_all(
+            bcode_session::db::MaterializedProjection::all()
+                .iter()
+                .copied()
+                .map(|projection| db.materialized_projection_checkpoint(projection)),
+        )
+        .await
+        .expect("checkpoints before");
+        let manifest_path =
+            bcode_session::db::session_dir_path(root.path(), session_id).join("manifest.json");
+        let manifest_before = fs::read(&manifest_path).expect("manifest before");
+        let trace_files_before = std::fs::read_dir(trace_root.path())
+            .map(std::iter::Iterator::count)
+            .unwrap_or_default();
+        let workflow_runs_before = state
+            .workflow_store
+            .lock()
+            .expect("workflow store")
+            .list_runs(1_000)
+            .expect("workflow runs before");
+
+        for sequence in 1..=10_000 {
+            let envelope = bcode_session_models::ToolContributionEnvelope::new(
+                bcode_session_models::ToolContributionPlacement::Progress,
+                bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call-flood".to_owned(),
+                    contribution_id: "screen".to_owned(),
+                    sequence,
+                    producer_id: "test.plugin".to_owned(),
+                    schema: "test.progress".to_owned(),
+                    schema_version: 1,
+                    operation: bcode_session_models::ToolContributionOperation::Upsert,
+                    persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                    artifact: None,
+                    payload: serde_json::json!({"frame": sequence}),
+                },
+            );
+            append_tool_contribution_envelope(
+                &state,
+                session_id,
+                "call-flood",
+                "test.plugin",
+                envelope,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            state
+                .sessions
+                .session_history(session_id)
+                .await
+                .expect("history after"),
+            history_before
+        );
+        assert_eq!(
+            db.last_event_sequence().await.expect("tail after"),
+            tail_before
+        );
+        let checkpoints_after = futures::future::try_join_all(
+            bcode_session::db::MaterializedProjection::all()
+                .iter()
+                .copied()
+                .map(|projection| db.materialized_projection_checkpoint(projection)),
+        )
+        .await
+        .expect("checkpoints after");
+        assert_eq!(checkpoints_after, checkpoints_before);
+        assert_eq!(
+            fs::read(&manifest_path).expect("manifest after"),
+            manifest_before
+        );
+        assert_eq!(
+            std::fs::read_dir(trace_root.path())
+                .map(std::iter::Iterator::count)
+                .unwrap_or_default(),
+            trace_files_before
+        );
+        assert_eq!(
+            state
+                .workflow_store
+                .lock()
+                .expect("workflow store")
+                .list_runs(1_000)
+                .expect("workflow runs after"),
+            workflow_runs_before
+        );
+        assert!(
+            db.finalized_artifact_reference("call-flood", "screen")
+                .await
+                .expect("artifact lookup")
+                .is_none()
+        );
+        assert_eq!(
+            active_contribution_snapshot_events(&state, session_id)
+                .expect("active checkpoint")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn request_draft_streaming_does_not_change_final_durable_history() {
         let root = tempfile::tempdir().expect("session root");
         let sessions = SessionManager::persistent(root.path()).expect("persistent sessions");
