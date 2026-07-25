@@ -1410,6 +1410,9 @@ pub struct ToolRequestDraftEvent {
     pub schema: String,
     /// Version of `schema` used by the draft payload.
     pub schema_version: u32,
+    /// Semantic transcript slot updated by this draft.
+    #[serde(default)]
+    pub placement: ToolContributionPlacement,
     /// Monotonic draft generation. A new provider start for the same call advances it.
     pub generation: u64,
     /// Monotonic update revision within `generation`.
@@ -2341,6 +2344,7 @@ mod tests {
                 producer_plugin_id: Some("bcode.filesystem".to_owned()),
                 schema: "bcode.filesystem.request-draft.write".to_owned(),
                 schema_version: 1,
+                placement: bcode_session_models::ToolContributionPlacement::Request,
                 generation: 1,
                 revision: u64::try_from(index + 1).expect("revision"),
                 operation,

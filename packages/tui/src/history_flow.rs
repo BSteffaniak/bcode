@@ -315,11 +315,6 @@ enum SupersedableEventKey {
         invocation_id: String,
         contribution_id: String,
     },
-    ToolRequestDraft {
-        turn_id: String,
-        tool_call_id: String,
-        generation: u64,
-    },
 }
 
 fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
@@ -358,18 +353,7 @@ fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
                     contribution_id: envelope.contribution.contribution_id.clone(),
                 })
             }
-            bcode_session_models::SessionLiveEventKind::ToolRequestDraft { event }
-                if !matches!(
-                    event.operation,
-                    bcode_session_models::ToolRequestDraftOperation::Remove { .. }
-                ) =>
-            {
-                Some(SupersedableEventKey::ToolRequestDraft {
-                    turn_id: event.turn_id.clone(),
-                    tool_call_id: event.tool_call_id.clone(),
-                    generation: event.generation,
-                })
-            }
+            bcode_session_models::SessionLiveEventKind::ToolRequestDraft { .. } => None,
             _ => None,
         },
         BcodeEvent::RuntimeWork(_)
@@ -587,6 +571,7 @@ mod tests {
                     producer_plugin_id: Some("bcode.filesystem".to_owned()),
                     schema: "bcode.filesystem.request-draft.write".to_owned(),
                     schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Request,
                     generation: 1,
                     revision,
                     operation,

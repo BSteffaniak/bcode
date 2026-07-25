@@ -13,6 +13,18 @@ description  = "Model-callable filesystem tools"
 interface_id = "bcode.tool/v1"
 name         = "Filesystem Tools"
 
+[[tool_presentations]]
+request_draft_placement      = "result"
+request_draft_schema         = "bcode.filesystem.request-draft.write"
+request_draft_schema_version = 1
+tool_name                    = "filesystem.write"
+
+[[tool_presentations]]
+request_draft_placement      = "result"
+request_draft_schema         = "bcode.filesystem.request-draft.edit"
+request_draft_schema_version = 1
+tool_name                    = "filesystem.edit"
+
 [[visual_adapters]]
 artifact_schema    = "bcode.filesystem.change"
 id                 = "filesystem-change-card"

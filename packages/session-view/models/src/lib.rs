@@ -924,6 +924,9 @@ pub struct ToolRequestDraftView {
     pub schema: String,
     /// Version of `schema` used by the preview.
     pub schema_version: u32,
+    /// Semantic transcript slot updated by this draft.
+    #[serde(default)]
+    pub placement: bcode_session_models::ToolContributionPlacement,
     /// Monotonic draft generation.
     pub generation: u64,
     /// Latest accepted revision.

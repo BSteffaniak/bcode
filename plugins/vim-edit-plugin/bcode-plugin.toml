@@ -8,6 +8,18 @@ description  = "Model-callable Vim/Neovim editing tools"
 interface_id = "bcode.tool/v1"
 name         = "Vim Edit Tools"
 
+[[tool_presentations]]
+request_draft_placement      = "result"
+request_draft_schema         = "bcode.vim-edit.request-draft.preview"
+request_draft_schema_version = 1
+tool_name                    = "vim_edit.preview"
+
+[[tool_presentations]]
+request_draft_placement      = "result"
+request_draft_schema         = "bcode.vim-edit.request-draft.apply"
+request_draft_schema_version = 1
+tool_name                    = "vim_edit.apply"
+
 [[visual_adapters]]
 artifact_schema    = "bcode.vim-edit.request.preview"
 id                 = "vim-edit-preview-request-card"

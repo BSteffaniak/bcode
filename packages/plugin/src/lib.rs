@@ -161,6 +161,8 @@ pub struct PluginManifest {
     #[serde(default)]
     pub visual_adapters: Vec<PluginVisualAdapterDeclaration>,
     #[serde(default)]
+    pub tool_presentations: Vec<PluginToolPresentationDeclaration>,
+    #[serde(default)]
     pub command_contributions: Vec<PluginCommandContribution>,
     #[serde(default)]
     pub event_subscriptions: Vec<PluginEventSubscription>,
@@ -205,6 +207,20 @@ pub struct PluginVisualAdapterDeclaration {
     pub producer_default: bool,
     #[serde(default)]
     pub render_mode: PluginVisualAdapterRenderMode,
+}
+
+/// Plugin-owned request-draft presentation routing for one model-callable tool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginToolPresentationDeclaration {
+    /// Exact model-callable tool name owned by this plugin.
+    pub tool_name: String,
+    /// Plugin-owned schema used to present streamed request arguments.
+    pub request_draft_schema: String,
+    /// Version of `request_draft_schema`.
+    pub request_draft_schema_version: u32,
+    /// Semantic transcript slot updated by the live draft.
+    #[serde(default)]
+    pub request_draft_placement: bcode_tool::ToolContributionPlacement,
 }
 
 impl PluginVisualAdapterDeclaration {
@@ -2104,6 +2120,21 @@ impl PluginRegistry {
         &self.manifests
     }
 
+    /// Return request-draft presentation metadata for an exact model-callable tool.
+    #[must_use]
+    pub fn tool_presentation(
+        &self,
+        tool_name: &str,
+    ) -> Option<(&str, &PluginToolPresentationDeclaration)> {
+        self.manifests.iter().find_map(|(plugin_id, manifest)| {
+            manifest
+                .tool_presentations
+                .iter()
+                .find(|presentation| presentation.tool_name == tool_name)
+                .map(|presentation| (plugin_id.as_str(), presentation))
+        })
+    }
+
     /// Return the service interface registry.
     #[must_use]
     pub const fn service_registry(&self) -> &PluginServiceRegistry {
@@ -2359,6 +2390,15 @@ impl PluginRuntimeHost {
     #[must_use]
     pub fn plugin_ids(&self) -> Vec<String> {
         self.registry.manifests.keys().cloned().collect()
+    }
+
+    /// Return request-draft presentation metadata for an exact model-callable tool.
+    #[must_use]
+    pub fn tool_presentation(
+        &self,
+        tool_name: &str,
+    ) -> Option<(&str, &PluginToolPresentationDeclaration)> {
+        self.registry.tool_presentation(tool_name)
     }
 
     /// Return loaded plugin executor handles keyed by plugin ID.
@@ -4185,6 +4225,7 @@ library = "libcommands.dylib"
             services: Vec::new(),
             tui_surfaces: Vec::new(),
             visual_adapters: Vec::new(),
+            tool_presentations: Vec::new(),
             command_contributions: Vec::new(),
             event_subscriptions: Vec::new(),
             config: Some(PluginManifestConfig {
@@ -4230,6 +4271,7 @@ library = "libcommands.dylib"
             services: Vec::new(),
             tui_surfaces: Vec::new(),
             visual_adapters: Vec::new(),
+            tool_presentations: Vec::new(),
             command_contributions: Vec::new(),
             event_subscriptions: Vec::new(),
             config: Some(PluginManifestConfig {
@@ -4466,6 +4508,28 @@ library = "libexample_plugin.dylib"
                 turn_id: Some("turn-1".to_string()),
                 work_id: Some("work-1".to_string()),
             }
+        );
+    }
+
+    #[test]
+    fn parses_tool_presentation_metadata() {
+        let manifest: PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/filesystem-plugin/bcode-plugin.toml"
+        ))
+        .expect("filesystem manifest should parse");
+        let write = manifest
+            .tool_presentations
+            .iter()
+            .find(|presentation| presentation.tool_name == "filesystem.write")
+            .expect("write presentation");
+        assert_eq!(
+            write.request_draft_schema,
+            "bcode.filesystem.request-draft.write"
+        );
+        assert_eq!(write.request_draft_schema_version, 1);
+        assert_eq!(
+            write.request_draft_placement,
+            bcode_tool::ToolContributionPlacement::Result
         );
     }
 
@@ -5186,6 +5250,7 @@ library = "libexample_plugin.dylib"
                 }],
                 tui_surfaces: Vec::new(),
                 visual_adapters: Vec::new(),
+                tool_presentations: Vec::new(),
                 command_contributions: Vec::new(),
                 event_subscriptions: Vec::new(),
                 concurrency: PluginConcurrencyConfig::Exclusive,
@@ -5849,6 +5914,7 @@ library = "libexample_plugin.dylib"
             }],
             tui_surfaces: Vec::new(),
             visual_adapters: Vec::new(),
+            tool_presentations: Vec::new(),
             command_contributions: Vec::new(),
             event_subscriptions: Vec::new(),
             concurrency: PluginConcurrencyConfig::Exclusive,

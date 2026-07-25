@@ -469,6 +469,7 @@ impl SessionView {
                 producer_plugin_id: draft.producer_plugin_id,
                 schema: draft.schema,
                 schema_version: draft.schema_version,
+                placement: draft.placement,
                 generation: draft.generation,
                 revision: draft.revision,
                 operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
@@ -710,12 +711,13 @@ impl SessionView {
                         .remove(tool_call_id)
                         .is_some()
                 {
-                    let prefix = format!("tool-draft:{tool_call_id}:");
+                    let id = TranscriptViewItemId::tool_presentation_slot(
+                        tool_call_id,
+                        bcode_session_models::ToolContributionPlacement::Request,
+                        None,
+                    );
                     let item_count = self.snapshot.transcript.items.len();
-                    self.snapshot
-                        .transcript
-                        .items
-                        .retain(|item| !item.id.get().starts_with(&prefix));
+                    self.snapshot.transcript.items.retain(|item| item.id != id);
                     if self.snapshot.transcript.items.len() != item_count {
                         self.snapshot.transcript.revision =
                             self.snapshot.transcript.revision.saturating_add(1);
@@ -1353,7 +1355,7 @@ impl SessionView {
         use bcode_session_models::ToolRequestDraftOperation;
 
         let key = event.tool_call_id.clone();
-        let id = TranscriptViewItemId::tool_request_draft(&key, event.generation);
+        let id = tool_request_draft_item_id(event);
         let current = self.tool_request_drafts.get(&key).cloned();
         let terminal_update = matches!(event.operation, ToolRequestDraftOperation::Remove { .. });
         if self
@@ -1377,23 +1379,22 @@ impl SessionView {
             .as_ref()
             .is_some_and(|current| event.generation > current.generation)
         {
-            let previous_id = TranscriptViewItemId::tool_request_draft(
-                &key,
-                current.as_ref().map_or(0, |draft| draft.generation),
-            );
-            self.snapshot
-                .transcript
-                .items
-                .retain(|item| item.id != previous_id);
-            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
             self.tool_request_drafts.remove(&key);
         }
         if let ToolRequestDraftOperation::Remove { .. } = event.operation {
             self.tool_request_drafts.remove(&key);
             self.terminal_tool_request_drafts
                 .insert(key, (event.generation, event.revision.saturating_add(1)));
-            self.snapshot.transcript.items.retain(|item| item.id != id);
-            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            let authoritative_result = self
+                .snapshot
+                .tools
+                .get(&event.tool_call_id)
+                .is_some_and(|tool| is_terminal_tool_status(tool.status));
+            if !authoritative_result {
+                self.snapshot.transcript.items.retain(|item| item.id != id);
+                self.snapshot.transcript.revision =
+                    self.snapshot.transcript.revision.saturating_add(1);
+            }
             self.bump_revision();
             return;
         }
@@ -1407,6 +1408,7 @@ impl SessionView {
                 producer_plugin_id: event.producer_plugin_id.clone(),
                 schema: event.schema.clone(),
                 schema_version: event.schema_version,
+                placement: event.placement,
                 generation: event.generation,
                 revision: 0,
                 argument_bytes: 0,
@@ -1437,10 +1439,16 @@ impl SessionView {
             .clone_from(&event.producer_plugin_id);
         draft.schema.clone_from(&event.schema);
         draft.schema_version = event.schema_version;
+        draft.placement = event.placement;
         draft.revision = event.revision;
         draft.argument_bytes = event.argument_bytes;
         draft.truncated = event.truncated;
         self.tool_request_drafts.insert(key, draft.clone());
+        if let Some(tool) = self.snapshot.tools.get(&event.tool_call_id)
+            && is_terminal_tool_status(tool.status)
+        {
+            return;
+        }
         if let Some(item) = self
             .snapshot
             .transcript
@@ -1780,21 +1788,68 @@ impl SessionView {
         self.snapshot
             .tools
             .insert(tool_call_id.to_owned(), tool.clone());
+        if is_terminal_tool_status(tool.status) {
+            let result_id = TranscriptViewItemId::tool_presentation_slot(
+                tool_call_id,
+                bcode_session_models::ToolContributionPlacement::Result,
+                None,
+            );
+            if let Some(index) = self
+                .snapshot
+                .transcript
+                .items
+                .iter()
+                .position(|item| item.id == result_id)
+            {
+                self.replace_tool_item(index, tool.clone(), tool_call_id, sequence, timestamp_ms);
+            } else {
+                self.push_item(
+                    result_id,
+                    sequence,
+                    timestamp_ms,
+                    false,
+                    TranscriptViewItemKind::ToolInvocation {
+                        tool: Box::new(tool.clone()),
+                    },
+                );
+            }
+            if let Some(request_id) = self.tool_item_ids.remove(tool_call_id)
+                && let Some(index) = self
+                    .snapshot
+                    .transcript
+                    .items
+                    .iter()
+                    .position(|item| item.id == request_id)
+                && matches!(
+                    self.snapshot.transcript.items[index].kind,
+                    TranscriptViewItemKind::ToolInvocation { .. }
+                )
+            {
+                self.snapshot.transcript.items[index].kind = TranscriptViewItemKind::ToolRequest {
+                    tool: Box::new(tool.clone()),
+                };
+                self.snapshot.transcript.items[index].streaming = false;
+                self.snapshot.transcript.items[index].revision = self.snapshot.transcript.items
+                    [index]
+                    .revision
+                    .saturating_add(1);
+                self.snapshot.transcript.revision =
+                    self.snapshot.transcript.revision.saturating_add(1);
+            }
+            self.sync_contribution_invocation_context(tool_call_id);
+            return;
+        }
         match self.tool_item_ids.entry(tool_call_id.to_owned()) {
             Entry::Occupied(entry) => {
                 let id = entry.get().clone();
                 self.update_existing_tool_item(id, tool_call_id, sequence, timestamp_ms, tool);
             }
             Entry::Vacant(_) => {
-                let id = if is_terminal_tool_status(tool.status) {
-                    TranscriptViewItemId::tool(tool_call_id)
-                } else {
-                    TranscriptViewItemId::tool_presentation_slot(
-                        tool_call_id,
-                        bcode_session_models::ToolContributionPlacement::Request,
-                        None,
-                    )
-                };
+                let id = TranscriptViewItemId::tool_presentation_slot(
+                    tool_call_id,
+                    bcode_session_models::ToolContributionPlacement::Request,
+                    None,
+                );
                 let id = self.push_item(
                     id,
                     sequence,
@@ -1948,9 +2003,6 @@ impl SessionView {
         timestamp_ms: Option<u64>,
     ) {
         let item = &mut self.snapshot.transcript.items[index];
-        if is_terminal_tool_status(tool.status) {
-            item.id = TranscriptViewItemId::tool(tool_call_id);
-        }
         item.kind = TranscriptViewItemKind::ToolInvocation {
             tool: Box::new(tool),
         };
@@ -2178,6 +2230,12 @@ fn contribution_item_id(
         (placement == bcode_session_models::ToolContributionPlacement::Supplemental)
             .then_some(contribution.contribution_id.as_str()),
     )
+}
+
+fn tool_request_draft_item_id(
+    draft: &bcode_session_models::ToolRequestDraftEvent,
+) -> TranscriptViewItemId {
+    TranscriptViewItemId::tool_presentation_slot(&draft.tool_call_id, draft.placement, None)
 }
 
 fn working_directory_changed_message(
@@ -2800,6 +2858,7 @@ mod tests {
                     producer_plugin_id: Some("bcode.filesystem".to_owned()),
                     schema: "bcode.filesystem.request-draft.write".to_owned(),
                     schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Request,
                     generation: 1,
                     revision,
                     operation,
@@ -2888,6 +2947,7 @@ mod tests {
                     producer_plugin_id: Some("bcode.filesystem".to_owned()),
                     schema: "bcode.filesystem.request-draft.write".to_owned(),
                     schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Request,
                     generation: 1,
                     revision,
                     operation: bcode_session_models::ToolRequestDraftOperation::Append {
@@ -2925,6 +2985,7 @@ mod tests {
                         producer_plugin_id: Some("bcode.filesystem".to_owned()),
                         schema: "bcode.filesystem.request-draft.write".to_owned(),
                         schema_version: 1,
+                        placement: bcode_session_models::ToolContributionPlacement::Request,
                         generation: 1,
                         revision,
                         operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
@@ -3029,6 +3090,7 @@ mod tests {
                     producer_plugin_id: Some("bcode.filesystem".to_owned()),
                     schema: "bcode.filesystem.request-draft.write".to_owned(),
                     schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Request,
                     generation: 1,
                     revision: 1,
                     operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
@@ -3924,6 +3986,7 @@ mod tests {
                     producer_plugin_id: Some("bcode.filesystem".to_owned()),
                     schema: "bcode.filesystem.request-draft.write".to_owned(),
                     schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Request,
                     generation: 1,
                     revision: 1,
                     operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
@@ -4588,10 +4651,18 @@ mod tests {
         ));
 
         let items = &view.snapshot().transcript.items;
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].id, TranscriptViewItemId::tool("call-1"));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id, compact.id);
+        assert_eq!(
+            items[1].id,
+            TranscriptViewItemId::tool_presentation_slot(
+                "call-1",
+                bcode_session_models::ToolContributionPlacement::Result,
+                None,
+            )
+        );
         assert!(matches!(
-            items[0].kind,
+            items[1].kind,
             TranscriptViewItemKind::ToolInvocation { .. }
         ));
     }

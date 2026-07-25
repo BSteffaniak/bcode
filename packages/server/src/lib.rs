@@ -5915,7 +5915,6 @@ impl ActiveLiveStateKey {
         )
     }
 
-    #[cfg(test)]
     fn is_tool_request_draft_for(&self, session_id: SessionId, tool_call_id: &str) -> bool {
         matches!(
             self,
@@ -11102,6 +11101,7 @@ struct ToolArgumentStreamProgress {
     producer_plugin_id: Option<String>,
     schema: String,
     schema_version: u32,
+    placement: bcode_session_models::ToolContributionPlacement,
     generation: u64,
     revision: u64,
     argument_bytes: usize,
@@ -11111,10 +11111,6 @@ struct ToolArgumentStreamProgress {
     pending_offset: usize,
     pending_checkpoint: bool,
     truncated: bool,
-    last_emitted_argument_bytes: usize,
-    last_emitted_at: Option<Instant>,
-    emitted_progress_events: usize,
-    force_emit_final: bool,
 }
 
 #[derive(Debug, Default)]
@@ -11222,10 +11218,6 @@ impl ModelStreamAccumulator {
 }
 
 impl ModelStreamProgress {
-    const FIRST_TOOL_PROGRESS_BYTES: usize = 512;
-    const TOOL_PROGRESS_MIN_BYTES: usize = 1024;
-    const TOOL_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(100);
-    const MAX_TOOL_PROGRESS_EVENTS: usize = 512;
     const MAX_TOOL_REQUEST_DRAFT_PREVIEW_BYTES: usize = 128 * 1024;
 
     fn start_tool_call(
@@ -11234,21 +11226,39 @@ impl ModelStreamProgress {
         name: String,
         producer_plugin_id: Option<String>,
     ) {
+        self.start_tool_call_with_presentation(
+            call_id,
+            name,
+            producer_plugin_id,
+            "bcode.tool.request-draft".to_owned(),
+            0,
+            bcode_session_models::ToolContributionPlacement::Request,
+        );
+    }
+
+    fn start_tool_call_with_presentation(
+        &mut self,
+        call_id: String,
+        name: String,
+        producer_plugin_id: Option<String>,
+        schema: String,
+        schema_version: u32,
+        placement: bcode_session_models::ToolContributionPlacement,
+    ) {
         let generation = self
             .generations
             .entry(call_id.clone())
             .and_modify(|generation| *generation = generation.saturating_add(1))
             .or_insert(1);
-        let (fallback_producer_plugin_id, schema) = tool_request_draft_route(&name);
-        let schema_version = u32::from(fallback_producer_plugin_id.is_some());
         self.active_tool_calls.insert(
             call_id.clone(),
             ToolArgumentStreamProgress {
                 call_id,
                 name,
-                producer_plugin_id: producer_plugin_id.or(fallback_producer_plugin_id),
+                producer_plugin_id,
                 schema,
                 schema_version,
+                placement,
                 generation: *generation,
                 revision: 0,
                 argument_bytes: 0,
@@ -11258,10 +11268,6 @@ impl ModelStreamProgress {
                 pending_offset: 0,
                 pending_checkpoint: false,
                 truncated: false,
-                last_emitted_argument_bytes: 0,
-                last_emitted_at: None,
-                emitted_progress_events: 0,
-                force_emit_final: false,
             },
         );
     }
@@ -11272,7 +11278,6 @@ impl ModelStreamProgress {
         }
         if let Some(active) = self.active_tool_calls.get_mut(&call.id) {
             active.argument_bytes = serialized_tool_argument_len(&call.arguments);
-            active.force_emit_final = true;
         }
     }
 
@@ -11314,10 +11319,10 @@ impl ModelStreamProgress {
         turn_id: &str,
         call_id: &str,
     ) -> Option<bcode_session_models::ToolRequestDraftEvent> {
-        if !self.should_emit_tool_progress(call_id) {
+        let active = self.active_tool_calls.get_mut(call_id)?;
+        if !active.pending_checkpoint && active.pending_text.is_empty() {
             return None;
         }
-        let active = self.active_tool_calls.get_mut(call_id)?;
         active.revision = active.revision.saturating_add(1);
         let operation = if active.pending_checkpoint {
             active.pending_checkpoint = false;
@@ -11343,6 +11348,7 @@ impl ModelStreamProgress {
             producer_plugin_id: active.producer_plugin_id.clone(),
             schema: active.schema.clone(),
             schema_version: active.schema_version,
+            placement: active.placement,
             generation: active.generation,
             revision: active.revision,
             operation,
@@ -11364,6 +11370,7 @@ impl ModelStreamProgress {
             producer_plugin_id: active.producer_plugin_id.clone(),
             schema: active.schema.clone(),
             schema_version: active.schema_version,
+            placement: active.placement,
             generation: active.generation,
             revision: active.revision,
             operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
@@ -11385,41 +11392,6 @@ impl ModelStreamProgress {
             .collect()
     }
 
-    fn should_emit_tool_progress(&mut self, call_id: &str) -> bool {
-        let Some(active) = self.active_tool_calls.get_mut(call_id) else {
-            return false;
-        };
-        if !active.force_emit_final {
-            if active.emitted_progress_events >= Self::MAX_TOOL_PROGRESS_EVENTS {
-                return false;
-            }
-            if active.emitted_progress_events == 0 {
-                if active.argument_bytes < Self::FIRST_TOOL_PROGRESS_BYTES {
-                    return false;
-                }
-            } else {
-                let byte_delta = active
-                    .argument_bytes
-                    .saturating_sub(active.last_emitted_argument_bytes);
-                if byte_delta < Self::TOOL_PROGRESS_MIN_BYTES {
-                    return false;
-                }
-                if active.last_emitted_at.is_some_and(|emitted_at| {
-                    emitted_at.elapsed() < Self::TOOL_PROGRESS_MIN_INTERVAL
-                }) {
-                    return false;
-                }
-            }
-        } else if active.argument_bytes == active.last_emitted_argument_bytes {
-            return false;
-        }
-        active.force_emit_final = false;
-        active.emitted_progress_events = active.emitted_progress_events.saturating_add(1);
-        active.last_emitted_argument_bytes = active.argument_bytes;
-        active.last_emitted_at = Some(Instant::now());
-        true
-    }
-
     fn tool_progress_snapshot(&self) -> Option<ProviderToolCallProgress> {
         let active = self.active_tool_calls.values().next()?;
         Some(ProviderToolCallProgress {
@@ -11428,24 +11400,6 @@ impl ModelStreamProgress {
             argument_bytes: active.argument_bytes,
         })
     }
-}
-fn tool_request_draft_route(tool_name: &str) -> (Option<String>, String) {
-    let producer = tool_name
-        .strip_prefix("filesystem.")
-        .map(|_| "bcode.filesystem".to_owned())
-        .or_else(|| {
-            tool_name
-                .strip_prefix("vim_edit.")
-                .map(|_| "bcode.vim-edit".to_owned())
-        });
-    let schema = match tool_name {
-        "filesystem.write" => "bcode.filesystem.request-draft.write",
-        "filesystem.edit" => "bcode.filesystem.request-draft.edit",
-        "vim_edit.preview" => "bcode.vim-edit.request-draft.preview",
-        "vim_edit.apply" => "bcode.vim-edit.request-draft.apply",
-        _ => "bcode.tool.request-draft",
-    };
-    (producer, schema.to_owned())
 }
 
 fn serialized_tool_argument_len(arguments: &serde_json::Value) -> usize {
@@ -13357,13 +13311,16 @@ async fn handle_provider_turn_event(
                 stream_progress.tool_request_draft_checkpoint(turn_id, &call_id)
             {
                 publish_tool_request_draft_live(state, session_id, checkpoint.clone()).await;
-                remove_tool_request_draft_live(
-                    state,
-                    session_id,
-                    &checkpoint,
-                    bcode_session_models::ToolRequestDraftTerminalReason::Completed,
-                )
-                .await;
+                if checkpoint.placement == bcode_session_models::ToolContributionPlacement::Request
+                {
+                    remove_tool_request_draft_live(
+                        state,
+                        session_id,
+                        &checkpoint,
+                        bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+                    )
+                    .await;
+                }
             }
             handle_provider_tool_call_finished_event(state, session_id, turn_id, &call, stream)
                 .await;
@@ -13504,15 +13461,45 @@ async fn handle_provider_turn_event(
             .await;
         }
         ProviderTurnEvent::ToolCallStarted { call_id, name } => {
-            let producer_plugin_id = collect_server_tool_catalog(state)
-                .await
-                .ok()
-                .and_then(|catalog| catalog.find_tool(&name))
-                .and_then(|tool| match tool.source {
-                    ToolSource::Plugin { plugin_id } => Some(plugin_id),
-                    ToolSource::Inline => None,
-                });
-            stream_progress.start_tool_call(call_id.clone(), name.clone(), producer_plugin_id);
+            let presentation =
+                state
+                    .plugins
+                    .tool_presentation(&name)
+                    .map(|(plugin_id, presentation)| {
+                        (
+                            Some(plugin_id.to_owned()),
+                            presentation.request_draft_schema.clone(),
+                            presentation.request_draft_schema_version,
+                            presentation.request_draft_placement,
+                        )
+                    });
+            let (producer_plugin_id, schema, schema_version, placement) =
+                if let Some(presentation) = presentation {
+                    presentation
+                } else {
+                    let producer_plugin_id = collect_server_tool_catalog(state)
+                        .await
+                        .ok()
+                        .and_then(|catalog| catalog.find_tool(&name))
+                        .and_then(|tool| match tool.source {
+                            ToolSource::Plugin { plugin_id } => Some(plugin_id),
+                            ToolSource::Inline => None,
+                        });
+                    (
+                        producer_plugin_id,
+                        "bcode.tool.request-draft".to_owned(),
+                        0,
+                        bcode_session_models::ToolContributionPlacement::Request,
+                    )
+                };
+            stream_progress.start_tool_call_with_presentation(
+                call_id.clone(),
+                name.clone(),
+                producer_plugin_id,
+                schema,
+                schema_version,
+                placement,
+            );
             publish_provider_stream_progress_live(
                 state,
                 session_id,
@@ -13996,6 +13983,7 @@ async fn remove_tool_request_draft_live(
         producer_plugin_id: current.producer_plugin_id.clone(),
         schema: current.schema.clone(),
         schema_version: current.schema_version,
+        placement: current.placement,
         generation: current.generation,
         revision: current.revision.saturating_add(1),
         operation: bcode_session_models::ToolRequestDraftOperation::Remove { reason },
@@ -14032,6 +14020,33 @@ fn active_tool_request_draft_snapshot_events(
                 .collect()
         },
     )
+}
+
+async fn retire_tool_request_draft_after_result(
+    state: &ServerState,
+    session_id: SessionId,
+    tool_call_id: &str,
+) {
+    let draft = state
+        .active_tool_request_drafts
+        .lock()
+        .ok()
+        .and_then(|registry| {
+            registry
+                .drafts
+                .iter()
+                .find(|(key, _)| key.is_tool_request_draft_for(session_id, tool_call_id))
+                .map(|(_, draft)| draft.event.clone())
+        });
+    if let Some(draft) = draft {
+        remove_tool_request_draft_live(
+            state,
+            session_id,
+            &draft,
+            bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+        )
+        .await;
+    }
 }
 
 async fn publish_provider_stream_progress_live(
@@ -19901,6 +19916,7 @@ async fn append_tool_finished_event_inner(
         .await?;
     transition_finalized_active_artifacts(state, session_id, semantic_result.as_ref());
     publish_session_event(state, &generic_event).await;
+    retire_tool_request_draft_after_result(state, session_id, &tool_call_id).await;
     if let Ok(runtime_event) = state
         .sessions
         .append_runtime_work_finished(
@@ -21610,7 +21626,7 @@ fn is_expected_disconnect(error: &CodecError) -> bool {
     )
 }
 
-const SESSION_LIVE_FAN_OUT_FLUSH_INTERVAL: Duration = Duration::from_millis(40);
+const SESSION_LIVE_FAN_OUT_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 const MAX_PENDING_LIVE_KEYS_PER_CLIENT: usize = 256;
 const MAX_PENDING_LIVE_BYTES_PER_CLIENT: usize = 8 * 1024 * 1024;
 
@@ -25819,6 +25835,7 @@ library = "test"
             producer_plugin_id: Some("bcode.filesystem".to_owned()),
             schema: "bcode.filesystem.request-draft.write".to_owned(),
             schema_version: 1,
+            placement: bcode_session_models::ToolContributionPlacement::Result,
             generation,
             revision,
             operation,
@@ -26822,18 +26839,23 @@ library = "test"
     #[test]
     fn tool_request_draft_batches_append_bytes_and_checkpoints_bounded_state() {
         let mut progress = ModelStreamProgress::default();
-        progress.start_tool_call(
+        progress.start_tool_call_with_presentation(
             "call-write".to_owned(),
             "filesystem.write".to_owned(),
             Some("bcode.filesystem".to_owned()),
+            "bcode.filesystem.request-draft.write".to_owned(),
+            1,
+            bcode_session_models::ToolContributionPlacement::Result,
         );
         progress.record_tool_call_delta("call-write", "{\"path\":\"src/lib.rs\",");
         progress.record_tool_call_delta("call-write", "\"contents\":\"hello\"}");
-        assert!(
-            progress
-                .take_tool_request_draft_event("turn-1", "call-write")
-                .is_none()
-        );
+        let first = progress
+            .take_tool_request_draft_event("turn-1", "call-write")
+            .expect("first provider delta should be visible immediately");
+        assert!(matches!(
+            first.operation,
+            bcode_session_models::ToolRequestDraftOperation::Append { offset: 0, .. }
+        ));
         progress.record_tool_call_delta("call-write", &"x".repeat(1024));
 
         let event = progress
@@ -26848,7 +26870,8 @@ library = "test"
         assert_eq!(event.schema, "bcode.filesystem.request-draft.write");
         assert!(matches!(
             event.operation,
-            bcode_session_models::ToolRequestDraftOperation::Append { offset: 0, .. }
+            bcode_session_models::ToolRequestDraftOperation::Append { offset, .. }
+                if offset == first.argument_bytes
         ));
         let checkpoint = progress
             .tool_request_draft_checkpoint("turn-1", "call-write")
@@ -35769,6 +35792,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     producer_plugin_id: Some("bcode.filesystem".to_owned()),
                     schema: "bcode.filesystem.request-draft.write".to_owned(),
                     schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Request,
                     generation: 1,
                     revision,
                     operation: bcode_session_models::ToolRequestDraftOperation::Append {
