@@ -11129,6 +11129,10 @@ impl ModelStreamProgress {
         self.active_tool_calls.remove(call_id);
     }
 
+    fn supersede_tool_calls(&mut self) {
+        self.active_tool_calls.clear();
+    }
+
     fn record_tool_call_delta(&mut self, call_id: &str, delta: &str) {
         let Some(active) = self.active_tool_calls.get_mut(call_id) else {
             return;
@@ -13180,6 +13184,16 @@ async fn handle_provider_turn_event(
             message,
             retry_at_unix,
         } => {
+            for draft in stream_progress.tool_request_draft_checkpoints(turn_id) {
+                remove_tool_request_draft_live(
+                    state,
+                    session_id,
+                    &draft,
+                    bcode_session_models::ToolRequestDraftTerminalReason::Superseded,
+                )
+                .await;
+            }
+            stream_progress.supersede_tool_calls();
             append_provider_event_trace(
                 state,
                 session_id,
@@ -25437,6 +25451,39 @@ library = "test"
         assert_eq!(progress.tool_request_draft_checkpoints("turn-1").len(), 2);
         progress.finish_tool_call("call-write");
         assert_eq!(progress.tool_request_draft_checkpoints("turn-1").len(), 1);
+    }
+
+    #[test]
+    fn tool_request_draft_provider_retry_supersedes_every_active_call() {
+        let mut progress = ModelStreamProgress::default();
+        for call_id in ["call-write", "call-edit"] {
+            progress.start_tool_call(
+                call_id.to_owned(),
+                "filesystem.write".to_owned(),
+                Some("bcode.filesystem".to_owned()),
+            );
+            progress.record_tool_call_delta(call_id, &"x".repeat(512));
+        }
+        let generations = progress
+            .tool_request_draft_checkpoints("turn-1")
+            .into_iter()
+            .map(|draft| (draft.tool_call_id, draft.generation))
+            .collect::<BTreeMap<_, _>>();
+
+        progress.supersede_tool_calls();
+        assert!(progress.tool_request_draft_checkpoints("turn-1").is_empty());
+        progress.start_tool_call(
+            "call-write".to_owned(),
+            "filesystem.write".to_owned(),
+            Some("bcode.filesystem".to_owned()),
+        );
+        assert_eq!(
+            progress
+                .tool_request_draft_checkpoint("turn-1", "call-write")
+                .expect("retry generation")
+                .generation,
+            generations["call-write"].saturating_add(1)
+        );
     }
 
     #[test]

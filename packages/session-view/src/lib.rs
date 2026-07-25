@@ -353,6 +353,27 @@ impl SessionView {
     pub fn clear_history_window(&mut self) {
         let previous = self.snapshot.clone();
         let terminal_runtime_work = self.terminal_runtime_work.clone();
+        let live_tool_request_drafts = self
+            .tool_request_drafts
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let terminal_tool_request_drafts = self.terminal_tool_request_drafts.clone();
+        let live_contributions = self
+            .snapshot
+            .contributions
+            .iter()
+            .filter(|(_, contribution)| {
+                contribution.persistence
+                    == bcode_session_models::ToolContributionPersistence::Transient
+            })
+            .filter_map(|(key, contribution)| {
+                self.contribution_placements
+                    .get(key)
+                    .copied()
+                    .map(|placement| (contribution.clone(), placement))
+            })
+            .collect::<Vec<_>>();
         let mut replacement = Self::new();
         replacement.snapshot.session_id = previous.session_id;
         replacement.snapshot.title = previous.title;
@@ -367,7 +388,29 @@ impl SessionView {
         replacement.snapshot.interactions = previous.interactions;
         replacement.snapshot.session_summary = previous.session_summary;
         replacement.terminal_runtime_work = terminal_runtime_work;
+        replacement.terminal_tool_request_drafts = terminal_tool_request_drafts;
         replacement.snapshot.revision = self.snapshot.revision.saturating_add(1);
+        for draft in live_tool_request_drafts {
+            replacement.apply_tool_request_draft(&bcode_session_models::ToolRequestDraftEvent {
+                turn_id: draft.turn_id,
+                tool_call_id: draft.tool_call_id,
+                tool_name: draft.tool_name,
+                producer_plugin_id: draft.producer_plugin_id,
+                schema: draft.schema,
+                schema_version: draft.schema_version,
+                generation: draft.generation,
+                revision: draft.revision,
+                operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: draft.preview_start_offset,
+                    text: draft.preview,
+                },
+                argument_bytes: draft.argument_bytes,
+                truncated: draft.truncated,
+            });
+        }
+        for (contribution, placement) in live_contributions {
+            replacement.apply_contribution_event(0, None, &contribution, placement);
+        }
         *self = replacement;
     }
 
@@ -3386,6 +3429,82 @@ mod tests {
 
         assert_eq!(rebuilt.snapshot().transcript, expected.transcript);
         assert_eq!(rebuilt.snapshot().contributions, expected.contributions);
+    }
+
+    #[test]
+    fn history_window_rebuild_preserves_live_state_without_reconstructing_it_from_history() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "call-draft".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    generation: 1,
+                    revision: 1,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: "draft".to_owned(),
+                    },
+                    argument_bytes: 5,
+                    truncated: false,
+                },
+            },
+        });
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Progress,
+                    bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call-progress".to_owned(),
+                        contribution_id: "preview".to_owned(),
+                        sequence: 1,
+                        producer_id: "test.plugin".to_owned(),
+                        schema: "test.progress".to_owned(),
+                        schema_version: 1,
+                        operation: bcode_session_models::ToolContributionOperation::Upsert,
+                        persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                        artifact: None,
+                        payload: serde_json::json!({"status": "running"}),
+                    },
+                ),
+            },
+        });
+
+        view.rebuild_history_window(&[event(
+            session_id,
+            10,
+            SessionEventKind::AssistantMessage {
+                text: "durable".to_owned(),
+            },
+        )]);
+
+        assert_eq!(view.tool_request_drafts.len(), 1);
+        assert_eq!(view.snapshot().contributions.len(), 1);
+        assert_eq!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .filter(|item| item.streaming)
+                .count(),
+            2
+        );
+        assert_eq!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .filter(|item| matches!(item.kind, TranscriptViewItemKind::AssistantMessage { .. }))
+                .count(),
+            1
+        );
     }
 
     #[test]

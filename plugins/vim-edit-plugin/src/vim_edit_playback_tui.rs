@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use super::{
     VIM_EDIT_LIVE_SCHEMA, VIM_EDIT_PLAYBACK_SCHEMA, VIM_EDIT_REQUEST_APPLY_SCHEMA,
+    VIM_EDIT_REQUEST_DRAFT_APPLY_SCHEMA, VIM_EDIT_REQUEST_DRAFT_PREVIEW_SCHEMA,
     VIM_EDIT_REQUEST_PREVIEW_SCHEMA,
 };
 
@@ -17,6 +18,8 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for VimEditPlaybackTuiVisualA
             kind,
             VIM_EDIT_REQUEST_PREVIEW_SCHEMA
                 | VIM_EDIT_REQUEST_APPLY_SCHEMA
+                | VIM_EDIT_REQUEST_DRAFT_PREVIEW_SCHEMA
+                | VIM_EDIT_REQUEST_DRAFT_APPLY_SCHEMA
                 | VIM_EDIT_LIVE_SCHEMA
                 | VIM_EDIT_PLAYBACK_SCHEMA
                 | "bcode.vim-edit.change"
@@ -41,6 +44,12 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for VimEditPlaybackTuiVisualA
         match kind {
             VIM_EDIT_REQUEST_PREVIEW_SCHEMA => request_rows("Vim edit preview", payload, context),
             VIM_EDIT_REQUEST_APPLY_SCHEMA => request_rows("Vim edit apply", payload, context),
+            VIM_EDIT_REQUEST_DRAFT_PREVIEW_SCHEMA => {
+                request_draft_rows("Vim edit preview", payload, context)
+            }
+            VIM_EDIT_REQUEST_DRAFT_APPLY_SCHEMA => {
+                request_draft_rows("Vim edit apply", payload, context)
+            }
             VIM_EDIT_LIVE_SCHEMA => live_rows(payload, width, context),
             VIM_EDIT_PLAYBACK_SCHEMA | "bcode.vim-edit.change" => {
                 playback_rows(payload, None, true, true, width, context)
@@ -57,6 +66,49 @@ const fn unknown_visual_context() -> bcode_plugin_sdk::tui::PluginTuiVisualRende
         bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint: 120 },
         None,
     )
+}
+
+fn request_draft_rows(
+    title: &str,
+    payload: &Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
+    let preview = text(payload, "preview").unwrap_or_default();
+    let parsed = serde_json::from_str::<Value>(preview).ok();
+    let arguments = parsed.as_ref().unwrap_or(payload);
+    let mut rows = vec![header(&format!("{title} · assembling…"))];
+    if let Some(path) = text(arguments, "path") {
+        push_kv(&mut rows, "file", context.display_path(path).to_string());
+        push_kv(&mut rows, "steps", count(arguments, "steps").to_string());
+    }
+    if let Some(files) = arguments.get("files").and_then(Value::as_array) {
+        push_kv(&mut rows, "files", files.len().to_string());
+        for file in files.iter().take(8) {
+            let path = text(file, "path").unwrap_or("<path>");
+            let steps = count(file, "steps");
+            rows.push(Line::from_spans(vec![
+                Span::styled("  ◆ ", accent()),
+                Span::styled(context.display_path(path).to_string(), value_style()),
+                Span::styled(format!("  {steps} steps"), muted()),
+            ]));
+        }
+    }
+    push_kv(
+        &mut rows,
+        "received",
+        payload
+            .get("argument_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            .to_string(),
+    );
+    if payload.get("truncated").and_then(Value::as_bool) == Some(true) {
+        push_kv(&mut rows, "truncated", "yes".to_owned());
+    }
+    if parsed.is_none() && !preview.is_empty() {
+        push_kv(&mut rows, "state", "incomplete arguments".to_owned());
+    }
+    rows
 }
 
 fn request_rows(
@@ -425,6 +477,41 @@ mod tests {
             .flat_map(|line| line.spans.iter().map(|span| span.content.as_str()))
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn incomplete_request_draft_renders_separately_from_execution_frames() {
+        let payload = json!({
+            "preview": "{\"path\":\"/tmp/demo.txt\",\"steps\":[",
+            "argument_bytes": 38,
+            "truncated": false,
+        });
+        let text = row_text(&request_draft_rows(
+            "Vim edit preview",
+            &payload,
+            &unknown_visual_context(),
+        ));
+        assert!(text.contains("assembling"), "{text}");
+        assert!(text.contains("received"), "{text}");
+        assert!(text.contains("incomplete arguments"), "{text}");
+        assert!(!text.contains("nvim live"), "{text}");
+    }
+
+    #[test]
+    fn complete_request_draft_renders_known_paths_and_steps() {
+        let payload = json!({
+            "preview": "{\"path\":\"/tmp/demo.txt\",\"steps\":[{\"keys\":\"w\"}]}",
+            "argument_bytes": 54,
+            "truncated": true,
+        });
+        let text = row_text(&request_draft_rows(
+            "Vim edit apply",
+            &payload,
+            &unknown_visual_context(),
+        ));
+        assert!(text.contains("demo.txt"), "{text}");
+        assert!(text.contains("steps"), "{text}");
+        assert!(text.contains("truncated"), "{text}");
     }
 
     #[test]
