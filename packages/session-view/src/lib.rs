@@ -33,6 +33,20 @@ struct LiveReasoningActivity {
 }
 
 impl LiveReasoningActivity {
+    fn from_complete(activity: &bcode_session_models::ReasoningActivity) -> Self {
+        Self {
+            order: activity.order,
+            parts: activity
+                .parts
+                .iter()
+                .cloned()
+                .map(|part| (part.part_id.clone(), part))
+                .collect(),
+            opaque: activity.opaque,
+            finished: true,
+        }
+    }
+
     fn apply(&mut self, event: &bcode_session_models::ReasoningActivityEvent) {
         use bcode_session_models::ReasoningActivityEvent;
         self.order = event.activity_order();
@@ -276,14 +290,16 @@ impl SessionView {
     ) {
         if self.snapshot.thinking.mode != mode {
             self.snapshot.thinking.mode = mode;
+            self.refresh_reasoning_items();
             self.bump_revision();
         }
     }
 
     /// Set whether renderers should expose reasoning transcript content.
-    pub const fn set_reasoning_visible(&mut self, visible: bool) {
+    pub fn set_reasoning_visible(&mut self, visible: bool) {
         if self.snapshot.thinking.visible != visible {
             self.snapshot.thinking.visible = visible;
+            self.refresh_reasoning_items();
             self.bump_revision();
         }
     }
@@ -587,29 +603,14 @@ impl SessionView {
                 );
             }
             SessionEventKind::AssistantReasoningActivity { turn_id, activity } => {
-                let mut parts = activity.parts.iter().collect::<Vec<_>>();
-                parts.sort_by_key(|part| (part.order, part.kind, part.part_id.as_str()));
-                let text = if self.snapshot.thinking.visible {
-                    parts
-                        .into_iter()
-                        .filter(|part| match self.snapshot.thinking.mode {
-                            bcode_session_view_models::ReasoningDisplayMode::All => true,
-                            bcode_session_view_models::ReasoningDisplayMode::Summary => matches!(
-                                part.kind,
-                                bcode_session_models::ReasoningContentKind::Summary
-                                    | bcode_session_models::ReasoningContentKind::Legacy
-                            ),
-                            bcode_session_view_models::ReasoningDisplayMode::Raw => {
-                                matches!(part.kind, bcode_session_models::ReasoningContentKind::Raw)
-                            }
-                        })
-                        .map(|part| part.text.as_str())
-                        .filter(|text| !text.is_empty())
-                        .collect::<Vec<_>>()
-                        .join("\n\n")
-                } else {
-                    String::new()
-                };
+                let key = (turn_id.clone(), activity.activity_id.clone());
+                self.live_reasoning
+                    .insert(key, LiveReasoningActivity::from_complete(activity));
+                let text = filtered_reasoning_text(
+                    activity.parts.iter(),
+                    self.snapshot.thinking.visible,
+                    self.snapshot.thinking.mode,
+                );
                 self.upsert_item(
                     TranscriptViewItemId::reasoning(turn_id, &activity.activity_id),
                     event.sequence,
@@ -1472,6 +1473,30 @@ impl SessionView {
         );
     }
 
+    fn refresh_reasoning_items(&mut self) {
+        let visible = self.snapshot.thinking.visible;
+        let mode = self.snapshot.thinking.mode;
+        let mut changed = false;
+        for ((turn_id, activity_id), activity) in &self.live_reasoning {
+            let item_id = TranscriptViewItemId::reasoning(turn_id, activity_id);
+            let text = filtered_reasoning_text(activity.parts.values(), visible, mode);
+            if let Some(item) = self
+                .snapshot
+                .transcript
+                .items
+                .iter_mut()
+                .find(|item| item.id == item_id)
+                && replace_text_in_item(item, &text)
+            {
+                item.revision = item.revision.saturating_add(1);
+                changed = true;
+            }
+        }
+        if changed {
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        }
+    }
+
     fn apply_live_reasoning_activity(
         &mut self,
         turn_id: &str,
@@ -1487,29 +1512,11 @@ impl SessionView {
             .get(&key)
             .expect("live reasoning activity was inserted");
         let item_id = TranscriptViewItemId::reasoning(turn_id, event.activity_id());
-        let mut parts = activity.parts.values().collect::<Vec<_>>();
-        parts.sort_by_key(|part| (part.order, part.kind, part.part_id.as_str()));
-        let text = if self.snapshot.thinking.visible {
-            parts
-                .into_iter()
-                .filter(|part| match self.snapshot.thinking.mode {
-                    bcode_session_view_models::ReasoningDisplayMode::All => true,
-                    bcode_session_view_models::ReasoningDisplayMode::Summary => matches!(
-                        part.kind,
-                        bcode_session_models::ReasoningContentKind::Summary
-                            | bcode_session_models::ReasoningContentKind::Legacy
-                    ),
-                    bcode_session_view_models::ReasoningDisplayMode::Raw => {
-                        matches!(part.kind, bcode_session_models::ReasoningContentKind::Raw)
-                    }
-                })
-                .map(|part| part.text.as_str())
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        } else {
-            String::new()
-        };
+        let text = filtered_reasoning_text(
+            activity.parts.values(),
+            self.snapshot.thinking.visible,
+            self.snapshot.thinking.mode,
+        );
         let streaming = !activity.finished;
         if let Some(item) = self
             .snapshot
@@ -1518,7 +1525,7 @@ impl SessionView {
             .iter_mut()
             .find(|item| item.id == item_id)
         {
-            replace_text_in_item(item, &text);
+            let _ = replace_text_in_item(item, &text);
             item.streaming = streaming;
             item.revision = item.revision.saturating_add(1);
             self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
@@ -2183,7 +2190,7 @@ impl SessionView {
         if let Some(item) = streaming_finish_target_mut(&mut self.snapshot.transcript.items, kind) {
             item.sequence = (sequence != 0).then_some(sequence).or(item.sequence);
             item.timestamp_ms = timestamp_ms.or(item.timestamp_ms);
-            replace_text_in_item(item, text);
+            let _ = replace_text_in_item(item, text);
             item.streaming = false;
             item.revision = item.revision.saturating_add(1);
             self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
@@ -2481,12 +2488,48 @@ fn append_text_to_item(item: &mut TranscriptViewItem, text: &str) {
     }
 }
 
-fn replace_text_in_item(item: &mut TranscriptViewItem, text: &str) {
+fn filtered_reasoning_text<'a>(
+    parts: impl Iterator<Item = &'a bcode_session_models::ReasoningPart>,
+    visible: bool,
+    mode: bcode_session_view_models::ReasoningDisplayMode,
+) -> String {
+    if !visible {
+        return String::new();
+    }
+    let mut parts = parts.collect::<Vec<_>>();
+    parts.sort_by_key(|part| (part.order, part.kind, part.part_id.as_str()));
+    parts
+        .into_iter()
+        .filter(|part| match mode {
+            bcode_session_view_models::ReasoningDisplayMode::All => true,
+            bcode_session_view_models::ReasoningDisplayMode::Summary => matches!(
+                part.kind,
+                bcode_session_models::ReasoningContentKind::Summary
+                    | bcode_session_models::ReasoningContentKind::Legacy
+            ),
+            bcode_session_view_models::ReasoningDisplayMode::Raw => {
+                matches!(part.kind, bcode_session_models::ReasoningContentKind::Raw)
+            }
+        })
+        .map(|part| part.text.as_str())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn replace_text_in_item(item: &mut TranscriptViewItem, text: &str) -> bool {
     match &mut item.kind {
         TranscriptViewItemKind::AssistantMessage { message }
         | TranscriptViewItemKind::ReasoningMessage { message }
         | TranscriptViewItemKind::UserMessage { message }
-        | TranscriptViewItemKind::SystemMessage { message } => text.clone_into(&mut message.text),
+        | TranscriptViewItemKind::SystemMessage { message } => {
+            if message.text == text {
+                false
+            } else {
+                text.clone_into(&mut message.text);
+                true
+            }
+        }
         TranscriptViewItemKind::ToolInvocation { .. }
         | TranscriptViewItemKind::ToolRequestDraft { .. }
         | TranscriptViewItemKind::ToolRequest { .. }
@@ -2496,7 +2539,7 @@ fn replace_text_in_item(item: &mut TranscriptViewItem, text: &str) {
         | TranscriptViewItemKind::Compaction { .. }
         | TranscriptViewItemKind::Skill { .. }
         | TranscriptViewItemKind::Interaction { .. }
-        | TranscriptViewItemKind::ToolContribution { .. } => {}
+        | TranscriptViewItemKind::ToolContribution { .. } => false,
     }
 }
 
@@ -3674,6 +3717,61 @@ mod tests {
         hidden.set_reasoning_visible(false);
         hidden.apply_event(&source);
         assert_reasoning_text(&hidden.snapshot().transcript.items[0], "", false);
+    }
+
+    #[test]
+    fn reasoning_display_mode_changes_rebuild_replayed_semantic_content() {
+        let session_id = SessionId::new();
+        let source = event(
+            session_id,
+            1,
+            SessionEventKind::AssistantReasoningActivity {
+                turn_id: "turn-1".to_owned(),
+                activity: bcode_session_models::ReasoningActivity {
+                    activity_id: "reasoning-1".to_owned(),
+                    order: 0,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    parts: vec![
+                        bcode_session_models::ReasoningPart {
+                            part_id: "summary-0".to_owned(),
+                            kind: bcode_session_models::ReasoningContentKind::Summary,
+                            role: bcode_session_models::ReasoningContentRole::Milestone,
+                            order: 0,
+                            text: "summary".to_owned(),
+                        },
+                        bcode_session_models::ReasoningPart {
+                            part_id: "raw-0".to_owned(),
+                            kind: bcode_session_models::ReasoningContentKind::Raw,
+                            role: bcode_session_models::ReasoningContentRole::Detail,
+                            order: 1,
+                            text: "raw".to_owned(),
+                        },
+                    ],
+                    opaque: false,
+                },
+            },
+        );
+        let mut view = SessionView::new();
+        view.apply_event(&source);
+        assert_reasoning_text(
+            &view.snapshot().transcript.items[0],
+            "summary\n\nraw",
+            false,
+        );
+
+        view.set_reasoning_display_mode(bcode_session_view_models::ReasoningDisplayMode::Summary);
+        assert_reasoning_text(&view.snapshot().transcript.items[0], "summary", false);
+        view.set_reasoning_display_mode(bcode_session_view_models::ReasoningDisplayMode::Raw);
+        assert_reasoning_text(&view.snapshot().transcript.items[0], "raw", false);
+        view.set_reasoning_visible(false);
+        assert_reasoning_text(&view.snapshot().transcript.items[0], "", false);
+        view.set_reasoning_visible(true);
+        view.set_reasoning_display_mode(bcode_session_view_models::ReasoningDisplayMode::All);
+        assert_reasoning_text(
+            &view.snapshot().transcript.items[0],
+            "summary\n\nraw",
+            false,
+        );
     }
 
     #[test]
