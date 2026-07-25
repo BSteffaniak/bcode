@@ -1,7 +1,8 @@
 use bcode_session_models::{
     LocalContextEstimate, ModelRequestIdentity, RequestContextObservation,
     RequestContextTokenCount, SessionEvent, SessionEventKind, SessionEventProvenance, SessionId,
-    ToolArtifact, ToolInvocationResult, ToolInvocationResultRecord, current_unix_timestamp_ms,
+    ToolArtifact, ToolArtifactRef, ToolInvocationResult, ToolInvocationResultRecord,
+    current_unix_timestamp_ms,
 };
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
@@ -151,7 +152,63 @@ struct LegacyToolCallFinished {
 enum LegacyToolInvocationResult {
     Text { text: String },
     Json { value: String },
-    Artifact { artifact: Box<ToolArtifact> },
+    Artifact { artifact: Box<Schema28ToolArtifact> },
+}
+
+#[derive(Debug, Deserialize)]
+struct Schema28ToolArtifact {
+    artifact_id: String,
+    producer_plugin_id: String,
+    schema: String,
+    schema_version: u32,
+    #[serde(default)]
+    tool_call_id: Option<String>,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    metadata: serde_json::Value,
+    #[serde(default)]
+    refs: Vec<Schema28ToolArtifactRef>,
+}
+
+impl From<Schema28ToolArtifact> for ToolArtifact {
+    fn from(value: Schema28ToolArtifact) -> Self {
+        Self {
+            artifact_id: value.artifact_id,
+            producer_plugin_id: value.producer_plugin_id,
+            schema: value.schema,
+            schema_version: value.schema_version,
+            tool_call_id: value.tool_call_id,
+            title: value.title,
+            metadata: value.metadata,
+            refs: value.refs.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct Schema28ToolArtifactRef {
+    key: String,
+    #[serde(default)]
+    content_type: Option<String>,
+    #[serde(default)]
+    storage_uri: Option<String>,
+    #[serde(default)]
+    byte_len: Option<u64>,
+    #[serde(default)]
+    metadata: Option<serde_json::Value>,
+}
+
+impl From<Schema28ToolArtifactRef> for ToolArtifactRef {
+    fn from(value: Schema28ToolArtifactRef) -> Self {
+        Self {
+            key: value.key,
+            content_type: value.content_type,
+            storage_uri: value.storage_uri,
+            byte_len: value.byte_len,
+            metadata: value.metadata,
+        }
+    }
 }
 
 impl LegacyToolInvocationResult {
@@ -159,7 +216,9 @@ impl LegacyToolInvocationResult {
         match self {
             Self::Text { text } => ToolInvocationResult::Text { text },
             Self::Json { value } => ToolInvocationResult::Json { value },
-            Self::Artifact { artifact } => ToolInvocationResult::Artifact { artifact },
+            Self::Artifact { artifact } => ToolInvocationResult::Artifact {
+                artifact: Box::new((*artifact).into()),
+            },
         }
     }
 }
@@ -507,6 +566,28 @@ mod tests {
 
     fn reject_current(_: &str) -> Result<SessionEvent, String> {
         Err("not current".to_owned())
+    }
+
+    #[test]
+    fn schema_28_artifact_result_decodes_through_frozen_dto() {
+        let payload = format!(
+            r#"{{"schema_version":28,"sequence":8,"timestamp_ms":9,"session_id":"{SESSION_ID}","kind":{{"tool_call_finished":{{"tool_call_id":"call-artifact","result":"artifact result","semantic_result":{{"type":"artifact","artifact":{{"artifact_id":"artifact-1","producer_plugin_id":"fixture.plugin","schema":"fixture.artifact","schema_version":2,"tool_call_id":"call-artifact","title":"Fixture","metadata":{{"safe":true}},"refs":[{{"key":"body","content_type":"text/plain","storage_uri":"file:///tmp/fixture","byte_len":7,"metadata":{{"encoding":"utf8"}}}}]}}}}}}}}}}"#
+        );
+        let decoded = decode_for_migration(&payload, reject_current).expect("historical decode");
+        let HistoricalDecode::Converted { event, .. } = decoded else {
+            panic!("expected converted event");
+        };
+        let SessionEventKind::ToolInvocationResultRecorded { record } = event.kind else {
+            panic!("expected current invocation result");
+        };
+        let Some(ToolInvocationResult::Artifact { artifact }) = record.result else {
+            panic!("expected artifact result");
+        };
+        assert_eq!(artifact.artifact_id, "artifact-1");
+        assert_eq!(artifact.producer_plugin_id, "fixture.plugin");
+        assert_eq!(artifact.refs.len(), 1);
+        assert_eq!(artifact.refs[0].key, "body");
+        assert_eq!(artifact.refs[0].byte_len, Some(7));
     }
 
     #[test]

@@ -489,12 +489,25 @@ if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 15' packages/ipc/src/lib.rs \
   || ! rg -q 'session_open_preparation_requests_and_response_round_trip' packages/ipc/src/lib.rs \
   || ! rg -q 'session_open_wait_returns_newer_terminal_or_timeout_snapshot' packages/server/src/lib.rs \
   || ! rg -q 'session_open_operation_not_found' packages/server/src/lib.rs \
+  || ! rg -q 'legacy_session_migrates_across_real_attach_and_send_ipc' packages/server/src/lib.rs \
+  || ! rg -q 'preparation_recovers_retained_operation_after_transport_interruption' packages/client/src/lib.rs \
+  || ! rg -q 'dropping_progress_receiver_stops_client_observation_cleanly' packages/client/src/lib.rs \
+  || ! rg -q 'runner_drains_streaming_session_progress_through_effect_results' packages/tui/src/effects.rs \
+  || ! rg -q 'migration_stage_families_and_terminal_failure_render_through_status_chrome' packages/tui/src/tests.rs \
+  || ! rg -q 'session_open_progress_ignores_stale_session_updates' packages/tui/src/chat_loop.rs \
   || ! rg -q 'prepare_session_open_until_terminal' packages/client/src/lib.rs; then
   echo "Session migration IPC violation: protocol-v15 prepare/wait routing, bounded revision waits, exact operation errors, codec coverage, and client APIs must remain present." >&2
   violations=1
 fi
 
-if ! rg -q 'MIGRATION_EVENT_PAGE_SIZE: usize = 1_000' packages/session/src/db.rs \
+if ! rg -q 'Schema28ToolArtifact' packages/session-migration/src/historical.rs \
+  || rg -n 'Artifact \{ artifact: Box<ToolArtifact> \}' packages/session-migration/src/historical.rs >/tmp/bcode-mutable-historical-artifact-dto.txt \
+  || ! rg -q 'decode_for_migration' packages/session/src/db.rs \
+  || ! rg -q 'decode_session_event_compatible' packages/session/src/persisted.rs \
+  || ! rg -q 'normal_history_reads_preserve_future_events_without_mutation' packages/session/src/db.rs \
+  || ! sed -n '/"tool_invocation_stream" =>/,/}),/p' packages/session-migration/src/historical.rs | grep -q 'RetiredKnown' \
+  || rg -n 'ToolInvocationStreamEvent|ToolInvocationStream' packages/session/src packages/session-migration/src --glob '*.rs' >/tmp/bcode-retired-tool-stream-runtime.txt \
+  || ! rg -q 'MIGRATION_EVENT_PAGE_SIZE: usize = 1_000' packages/session/src/db.rs \
   || ! rg -q 'canonical_migration_page' packages/session/src/db.rs \
   || rg -q 'canonical_migration_history' packages/session/src/db.rs \
   || ! rg -q 'every_supported_source_epoch_migrates_to_current_writable_storage' packages/session/src/db.rs \
@@ -512,7 +525,7 @@ if ! rg -q 'MIGRATION_EVENT_PAGE_SIZE: usize = 1_000' packages/session/src/db.rs
   || ! rg -q 'publish_backup_path' packages/session-migration/src/operation.rs \
   || ! rg -q 'completed.is_multiple_of\(100\)' packages/session/src/db.rs \
   || ! rg -q 'MIGRATION_PROGRESS_BYTE_INTERVAL' packages/session/src/lib.rs; then
-  echo "Session migration progress violation: ordered/throttled success, failure, backup, byte, decode, and replay progress coverage must remain intact." >&2
+  echo "Session migration boundary/progress violation: writable historical decode, degraded read-only decode, inert retired history, bounded replay, ordered progress, and transactional coverage must remain intact." >&2
   violations=1
 fi
 
