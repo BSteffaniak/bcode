@@ -61,6 +61,20 @@ for foreground in (
                 f"portable theme contrast is below 4.5:1: {foreground}/{background}={ratio:.2f}"
             )
 
+accent_values = dict(re.findall(r"pub const (\w+): &str = \"(#[0-9a-fA-F]{6})\";", theme_text.split("pub(super) mod accent", 1)[1]))
+for background in ("POSITIVE", "DESTRUCTIVE"):
+    ratio = contrast_ratio(color_values["ON_ACCENT"], accent_values[background])
+    if ratio < 4.5:
+        raise SystemExit(
+            f"portable control contrast is below 4.5:1: ON_ACCENT/{background}={ratio:.2f}"
+        )
+for background in ("ACTIVE", "DISABLED"):
+    ratio = contrast_ratio(color_values["ON_ACCENT"], color_values[background])
+    if ratio < 4.5:
+        raise SystemExit(
+            f"portable control contrast is below 4.5:1: ON_ACCENT/{background}={ratio:.2f}"
+        )
+
 runtime_suffixes = {".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".html"}
 runtime_files = sorted(
     path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in runtime_suffixes

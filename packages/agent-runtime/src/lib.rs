@@ -4494,7 +4494,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canonical_loop_preserves_unknown_provider_parallel_capability() {
+    async fn canonical_loop_defaults_unknown_provider_parallel_capability_to_sequential() {
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let mut provider = MultiRoundProvider::new(
             [vec![ProviderTurnEvent::TurnFinished {
@@ -4527,8 +4527,9 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            requests[0].tool_call_policy.parallel, None,
-            "unknown provider/model capability must remain unknown until resolution"
+            requests[0].tool_call_policy.parallel,
+            Some(false),
+            "unknown provider/model capability must default to sequential before invocation"
         );
         drop(requests);
     }

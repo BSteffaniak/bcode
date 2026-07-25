@@ -972,9 +972,10 @@ if rg -n 'ToolInvocationStreamEvent|ToolStreamVisualUpdate|VisualUpdate' \
   violations=1
 fi
 
-if ! grep -F 'emit_vim_live_contribution' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
-   ! grep -F 'ToolContributionPersistence::Transient' plugins/vim-edit-plugin/src/lib.rs >/dev/null; then
-  echo "Runtime architecture violation: generic transient Vim-edit visual contributions were removed." >&2
+if ! grep -F 'TransientProgressPublisher::new' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'VIM_EDIT_LIVE_SCHEMA' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'ToolContributionPersistence::Transient' packages/plugin-sdk/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: shared transient Vim-edit progress contributions were removed." >&2
   violations=1
 fi
 
