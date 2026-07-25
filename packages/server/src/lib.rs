@@ -5946,6 +5946,7 @@ struct ActiveToolRequestDraft {
     event: bcode_session_models::ToolRequestDraftEvent,
     preview: String,
     preview_start_offset: usize,
+    last_updated_at: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -13956,6 +13957,7 @@ async fn publish_tool_request_draft_live(
                     event: event.clone(),
                     preview,
                     preview_start_offset,
+                    last_updated_at: Instant::now(),
                 },
             );
             registry
@@ -14023,18 +14025,28 @@ fn active_tool_request_draft_snapshot_events(
                 .drafts
                 .iter()
                 .filter(|(key, _)| key.session() == session_id)
-                .map(|(_, draft)| bcode_session_models::SessionLiveEvent {
-                    session_id,
-                    kind: SessionLiveEventKind::ToolRequestDraft {
-                        event: bcode_session_models::ToolRequestDraftEvent {
-                            operation:
-                                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
-                                    start_offset: draft.preview_start_offset,
-                                    text: draft.preview.clone(),
-                                },
-                            ..draft.event.clone()
+                .map(|(_, draft)| {
+                    state.metrics.increment_counter(
+                        "server.live_state.request_draft_checkpoints_emitted_total",
+                    );
+                    state.metrics.record_histogram(
+                        "server.live_state.request_draft_checkpoint_age_us",
+                        u64::try_from(draft.last_updated_at.elapsed().as_micros())
+                            .unwrap_or(u64::MAX),
+                    );
+                    bcode_session_models::SessionLiveEvent {
+                        session_id,
+                        kind: SessionLiveEventKind::ToolRequestDraft {
+                            event: bcode_session_models::ToolRequestDraftEvent {
+                                operation:
+                                    bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                                        start_offset: draft.preview_start_offset,
+                                        text: draft.preview.clone(),
+                                    },
+                                ..draft.event.clone()
+                            },
                         },
-                    },
+                    }
                 })
                 .collect()
         },
@@ -21700,6 +21712,7 @@ enum PendingLiveEventKey {
 struct PendingLiveEvent {
     event: bcode_session_models::SessionLiveEvent,
     encoded_bytes: usize,
+    first_buffered_at: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -21741,10 +21754,15 @@ impl PendingLiveEventBuffer {
         self.encoded_bytes = 0;
     }
 
-    fn take_events(&mut self) -> Vec<bcode_session_models::SessionLiveEvent> {
+    fn take_pending_events(&mut self) -> Vec<PendingLiveEvent> {
         self.encoded_bytes = 0;
-        std::mem::take(&mut self.events)
-            .into_values()
+        std::mem::take(&mut self.events).into_values().collect()
+    }
+
+    #[cfg(test)]
+    fn take_events(&mut self) -> Vec<bcode_session_models::SessionLiveEvent> {
+        self.take_pending_events()
+            .into_iter()
             .map(|pending| pending.event)
             .collect()
     }
@@ -21783,11 +21801,16 @@ impl PendingLiveEventBuffer {
             return BufferLiveEventResult::Rejected(BufferLiveEventError::ByteLimit);
         }
         let superseded = self.events.contains_key(&key);
+        let first_buffered_at = self
+            .events
+            .get(&key)
+            .map_or_else(Instant::now, |pending| pending.first_buffered_at);
         self.events.insert(
             key,
             PendingLiveEvent {
                 event,
                 encoded_bytes,
+                first_buffered_at,
             },
         );
         self.encoded_bytes = next_bytes;
@@ -21886,8 +21909,20 @@ async fn flush_pending_live_events(
     sink: &ClientEventSink,
     pending: &mut PendingLiveEventBuffer,
 ) -> Result<(), CodecError> {
-    for event in pending.take_events() {
-        sink.send(Event::SessionLive(event)).await?;
+    for pending_event in pending.take_pending_events() {
+        if matches!(
+            pending_event.event.kind,
+            SessionLiveEventKind::ToolRequestDraft { .. }
+        ) {
+            sink.metrics
+                .increment_counter("server.live_state.request_draft_frames_emitted_total");
+            sink.metrics.record_histogram(
+                "server.live_state.request_draft_frame_latency_us",
+                u64::try_from(pending_event.first_buffered_at.elapsed().as_micros())
+                    .unwrap_or(u64::MAX),
+            );
+        }
+        sink.send(Event::SessionLive(pending_event.event)).await?;
     }
     Ok(())
 }
@@ -21895,9 +21930,12 @@ async fn flush_pending_live_events(
 async fn send_session_resync_required(
     sink: &ClientEventSink,
     session_id: SessionId,
+    cause: &'static str,
 ) -> Result<(), CodecError> {
     sink.metrics
         .increment_counter("server.live_state.lag_resync_total");
+    sink.metrics
+        .increment_counter(format!("server.live_state.resync.{cause}_total"));
     sink.send(Event::SessionViewResyncRequired { session_id })
         .await
 }
@@ -21979,7 +22017,7 @@ fn forward_session_events(
                                 skipped,
                                 "durable session event subscriber lagged; requesting renderer resync"
                             );
-                            if let Err(error) = send_session_resync_required(&sink, session_id).await
+                            if let Err(error) = send_session_resync_required(&sink, session_id, "durable_lag").await
                                 && !is_expected_disconnect(&error)
                             {
                                 tracing::warn!(
@@ -21995,7 +22033,7 @@ fn forward_session_events(
                                 %session_id,
                                 "durable session event broker closed; requesting renderer resync"
                             );
-                            if let Err(error) = send_session_resync_required(&sink, session_id).await
+                            if let Err(error) = send_session_resync_required(&sink, session_id, "durable_closed").await
                                 && !is_expected_disconnect(&error)
                             {
                                 tracing::warn!(
@@ -22018,7 +22056,7 @@ fn forward_session_events(
                                 skipped,
                                 "live session event subscriber lagged; requesting renderer resync"
                             );
-                            if let Err(error) = send_session_resync_required(&sink, session_id).await
+                            if let Err(error) = send_session_resync_required(&sink, session_id, "live_lag").await
                                 && !is_expected_disconnect(&error)
                             {
                                 tracing::warn!(
@@ -22035,7 +22073,7 @@ fn forward_session_events(
                                 %session_id,
                                 "live session event broker closed; requesting renderer resync"
                             );
-                            if let Err(error) = send_session_resync_required(&sink, session_id).await
+                            if let Err(error) = send_session_resync_required(&sink, session_id, "live_closed").await
                                 && !is_expected_disconnect(&error)
                             {
                                 tracing::warn!(
@@ -22046,12 +22084,21 @@ fn forward_session_events(
                             break;
                         }
                     };
+                    let request_draft = matches!(
+                        event.kind,
+                        SessionLiveEventKind::ToolRequestDraft { .. }
+                    );
                     match pending_live.push(event) {
                         BufferLiveEventResult::Buffered { superseded } => {
                             if superseded {
                                 sink.metrics.increment_counter(
                                     "server.live_state.coalesced_updates_total",
                                 );
+                                if request_draft {
+                                    sink.metrics.increment_counter(
+                                        "server.live_state.request_draft_deltas_merged_total",
+                                    );
+                                }
                             }
                             sink.metrics.set_gauge(
                                 "server.live_state.pending_subscriber_keys",
@@ -22105,7 +22152,7 @@ fn forward_session_events(
                                 }
                             };
                             sink.metrics.increment_counter(metric);
-                            if let Err(error) = send_session_resync_required(&sink, session_id).await
+                            if let Err(error) = send_session_resync_required(&sink, session_id, "buffer_rejected").await
                                 && !is_expected_disconnect(&error)
                             {
                                 tracing::warn!(
@@ -33062,6 +33109,16 @@ library = "test"
             )
             .await
             .expect("keeper attach");
+        assert!(
+            state
+                .metrics
+                .snapshot()
+                .counters
+                .get("server.live_state.request_draft_checkpoints_emitted_total")
+                .copied()
+                .unwrap_or_default()
+                > 0
+        );
 
         // Keep one attachment alive while replacing the observed connection. A final detach is a
         // session-unload boundary and correctly clears transient state rather than replaying it.
@@ -33179,6 +33236,28 @@ library = "test"
                 .copied()
                 .unwrap_or_default()
                 > 0
+        );
+        assert!(
+            metrics
+                .counters
+                .get("server.live_state.request_draft_deltas_merged_total")
+                .copied()
+                .unwrap_or_default()
+                > 0
+        );
+        assert!(
+            metrics
+                .counters
+                .get("server.live_state.request_draft_frames_emitted_total")
+                .copied()
+                .unwrap_or_default()
+                > 0
+        );
+        assert!(
+            metrics
+                .histograms
+                .get("server.live_state.request_draft_frame_latency_us")
+                .is_some_and(|histogram| histogram.count > 0)
         );
         assert!(
             metrics
