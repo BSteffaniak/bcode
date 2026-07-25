@@ -25049,6 +25049,60 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn request_draft_streaming_has_no_durable_history_or_restart_replay() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("persistent sessions");
+        let session = sessions
+            .create_session(Some("draft restart".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let state = test_server_state(sessions.clone());
+        let durable_before = sessions
+            .session_history(session.id)
+            .await
+            .expect("history before");
+
+        publish_tool_request_draft_live(
+            &state,
+            session.id,
+            request_draft_event(
+                "call-1",
+                1,
+                1,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: "private live draft".to_owned(),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, session.id).len(),
+            1
+        );
+        assert_eq!(
+            sessions
+                .session_history(session.id)
+                .await
+                .expect("history after live draft"),
+            durable_before
+        );
+
+        drop(state);
+        drop(sessions);
+        let restarted = SessionManager::persistent(root.path()).expect("restarted sessions");
+        assert_eq!(
+            restarted
+                .session_history(session.id)
+                .await
+                .expect("history after restart"),
+            durable_before
+        );
+        let restarted_state = test_server_state(restarted);
+        assert!(active_tool_request_draft_snapshot_events(&restarted_state, session.id).is_empty());
+    }
+
+    #[tokio::test]
     async fn request_draft_registry_rejects_stale_and_post_terminal_updates() {
         let state = test_server_state(SessionManager::default());
         let session_id = SessionId::new();
