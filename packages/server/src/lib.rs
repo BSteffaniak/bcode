@@ -13348,6 +13348,7 @@ async fn handle_provider_turn_event(
             }
             handle_provider_tool_call_finished_event(state, session_id, turn_id, &call, stream)
                 .await;
+            persist_completed_reasoning_activities(state, session_id, turn_id, outcome).await;
             outcome.pending_tool_calls.push(call);
             stream_progress.finish_tool_call(&call_id);
         }
@@ -19668,6 +19669,41 @@ const fn compaction_mode_name(mode: bcode_config::CompactionMode) -> &'static st
         bcode_config::CompactionMode::Proactive => "proactive",
         bcode_config::CompactionMode::ProactiveAndOverflow => "proactive_and_overflow",
         bcode_config::CompactionMode::Auto => "auto",
+    }
+}
+
+fn take_completed_reasoning_activities(
+    outcome: &mut ModelPollOutcome,
+) -> Vec<ReasoningActivityAccumulator> {
+    let mut retained = BTreeMap::new();
+    std::mem::swap(&mut retained, &mut outcome.reasoning_activities);
+    let mut completed = Vec::new();
+    for (activity_id, activity) in retained {
+        if activity.status.is_some() {
+            completed.push(activity);
+        } else {
+            outcome.reasoning_activities.insert(activity_id, activity);
+        }
+    }
+    completed
+}
+
+async fn persist_completed_reasoning_activities(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    outcome: &mut ModelPollOutcome,
+) {
+    for activity in take_completed_reasoning_activities(outcome) {
+        let activity = activity.finish(bcode_session_models::ReasoningActivityStatus::Completed);
+        match state
+            .sessions
+            .append_assistant_reasoning_activity(session_id, turn_id.to_owned(), activity)
+            .await
+        {
+            Ok(event) => publish_session_event(state, &event).await,
+            Err(error) => tracing::warn!("failed to append assistant reasoning activity: {error}"),
+        }
     }
 }
 
@@ -27333,6 +27369,26 @@ library = "test"
                 .generation,
             generations["call-write"].saturating_add(1)
         );
+    }
+
+    #[test]
+    fn completed_reasoning_is_taken_at_tool_boundary_without_unfinished_activity() {
+        let mut outcome = ModelPollOutcome::default();
+        let mut complete = ReasoningActivityAccumulator::new("complete".to_owned(), 0);
+        complete.status = Some(bcode_session_models::ReasoningActivityStatus::Completed);
+        let unfinished = ReasoningActivityAccumulator::new("unfinished".to_owned(), 1);
+        outcome
+            .reasoning_activities
+            .insert("complete".to_owned(), complete);
+        outcome
+            .reasoning_activities
+            .insert("unfinished".to_owned(), unfinished);
+
+        let taken = take_completed_reasoning_activities(&mut outcome);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].activity_id, "complete");
+        assert_eq!(outcome.reasoning_activities.len(), 1);
+        assert!(outcome.reasoning_activities.contains_key("unfinished"));
     }
 
     #[test]
