@@ -2,6 +2,50 @@
 
 Plugins should use live progress for replaceable presentation state that is useful while an invocation is active but is not part of durable session history. Examples include a Vim frame, terminal recording checkpoint, or another bounded execution preview.
 
+## Streamed tool request presentation
+
+Model-provider argument fragments are host-owned transport data, but a tool plugin may declare how
+those fragments are presented while the request is assembling. Add one exact-name declaration for
+each opted-in tool:
+
+```toml
+[[tool_presentations]]
+tool_name                    = "example.apply"
+request_draft_schema         = "example.request-draft.apply"
+request_draft_schema_version = 1
+request_draft_placement      = "result"
+
+[[visual_adapters]]
+artifact_schema    = "example.request-draft.apply"
+id                 = "example-apply-draft"
+min_schema_version = 1
+max_schema_version = 1
+surfaces           = ["tui"]
+```
+
+Legal placements are `request`, `progress`, and `result`. Use `result` only when the draft is a
+preview of the same primary visual later supplied by the canonical result/artifact. The host keeps
+that preview live through permission and execution, publishes the canonical result first, and then
+retires the draft from the same stable result slot. Keep durable request context in the request slot;
+a result-targeted draft does not turn request arguments into a durable result.
+
+Plugins that omit `[[tool_presentations]]` remain compatible. Their argument drafts use the generic
+`bcode.tool.request-draft` schema, version `0`, and request placement. Renderers show bounded
+metadata-only fallback text when no compatible visual adapter exists; raw argument JSON is not a
+normal transcript fallback.
+
+At plugin startup the host validates that:
+
+* the plugin provides `bcode.tool/v1`;
+* `tool_name` exactly matches a name returned by that plugin's `list_tools`;
+* the schema is non-empty and its version is greater than zero;
+* a declared visual adapter supports that schema version;
+* no tool declaration is duplicated or ambiguously owned.
+
+Third-party plugins can migrate one tool at a time. Adding a declaration opts only that exact tool
+into rich streamed presentation; it does not alter other tools or ordinary request/progress/result
+contribution placement.
+
 ## Execution progress
 
 Use `bcode_plugin_sdk::TransientProgressPublisher` rather than constructing transient contribution envelopes manually. The publisher owns:
