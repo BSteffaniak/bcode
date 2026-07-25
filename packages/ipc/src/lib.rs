@@ -283,6 +283,8 @@ pub enum Request {
     },
     /// Register one immutable, structurally validated workflow definition.
     RegisterWorkflowDefinition(WorkflowDefinitionRegistrationRequest),
+    /// Register an exact definition and start its bound durable run through one retry-safe request.
+    StartWorkflow(WorkflowStartRequest),
     /// Start one durable workflow from an existing exact definition.
     StartWorkflowRun(WorkflowRunStartRequest),
     /// List bounded, checksum-verified durable workflow definitions.
@@ -302,6 +304,15 @@ pub enum Request {
     /// Return one bounded durable workflow run summary.
     WorkflowRunStatus {
         run_id: String,
+    },
+    /// Return the newest run for one exact generic binding key.
+    AssociatedWorkflowRun {
+        key: WorkflowRunBindingLookup,
+    },
+    /// Apply one lifecycle transition to the newest run for one exact binding key.
+    ControlAssociatedWorkflowRun {
+        key: WorkflowRunBindingLookup,
+        action: WorkflowRunControlAction,
     },
     /// List bounded durable workflow run summaries.
     ListWorkflowRuns {
@@ -1146,6 +1157,38 @@ pub struct WorkflowRunInspection {
     pub child_sessions: Vec<SessionSummary>,
 }
 
+/// Lifecycle transition applied to one workflow run found through a generic binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRunControlAction {
+    Pause,
+    Resume,
+    Cancel,
+}
+
+/// Generic associated workflow run lookup key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRunBindingLookup {
+    pub owner_plugin_id: String,
+    pub workflow_kind: String,
+    pub scope_key: String,
+}
+
+/// Generic request to register and start one exact durable workflow atomically from the caller's
+/// perspective.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowStartRequest {
+    pub identity: bcode_workflow::WorkflowDefinitionIdentity,
+    pub definition: bcode_workflow::WorkflowDefinition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub parent_session_id: bcode_session_models::SessionId,
+    pub input: serde_json::Value,
+    pub binding: bcode_workflow_store::WorkflowRunBinding,
+    #[serde(default)]
+    pub limits: bcode_workflow_store::WorkflowRunLimits,
+}
+
 /// Generic request to start one durable workflow from a registered exact definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunStartRequest {
@@ -1158,6 +1201,9 @@ pub struct WorkflowRunStartRequest {
     pub workspace_snapshot: String,
     /// Session used for compact generic runtime-work presentation.
     pub parent_session_id: bcode_session_models::SessionId,
+    /// Optional bounded product ownership and discovery association.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<bcode_workflow_store::WorkflowRunBinding>,
     /// Optional typed input validated against the registered definition input schema.
     #[serde(default)]
     pub input: Option<serde_json::Value>,
@@ -1357,6 +1403,13 @@ pub enum ResponsePayload {
     },
     WorkflowRunStatus {
         run: Option<bcode_workflow_store::WorkflowRunSummary>,
+    },
+    AssociatedWorkflowRun {
+        run: Option<bcode_workflow_store::WorkflowRunSummary>,
+    },
+    AssociatedWorkflowRunControlled {
+        run: Option<bcode_workflow_store::WorkflowRunSummary>,
+        changed: bool,
     },
     WorkflowRunList {
         runs: Vec<bcode_workflow_store::WorkflowRunSummary>,
@@ -2221,12 +2274,32 @@ mod tests {
                 version: 1,
                 definition: definition.clone(),
             }),
+            Request::StartWorkflow(WorkflowStartRequest {
+                identity: bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+                    "review",
+                    &definition,
+                )
+                .expect("identity"),
+                definition: definition.clone(),
+                run_id: Some("bound-review-run".to_string()),
+                parent_session_id: SessionId::new(),
+                input: serde_json::json!(1),
+                binding: bcode_workflow_store::WorkflowRunBinding {
+                    owner_plugin_id: "bcode.review".to_string(),
+                    workflow_kind: "review".to_string(),
+                    scope_key: "session-1".to_string(),
+                    display_label: Some("Review".to_string()),
+                    single_active: true,
+                },
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            }),
             Request::StartWorkflowRun(WorkflowRunStartRequest {
                 definition_id: "review".to_string(),
                 definition_version: 1,
                 run_id: Some("review-run".to_string()),
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: SessionId::new(),
+                binding: None,
                 input: Some(serde_json::json!(1)),
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             }),
@@ -2241,6 +2314,13 @@ mod tests {
             },
             Request::WorkflowRunStatus {
                 run_id: "run-1".to_string(),
+            },
+            Request::AssociatedWorkflowRun {
+                key: WorkflowRunBindingLookup {
+                    owner_plugin_id: "bcode.review".to_string(),
+                    workflow_kind: "review".to_string(),
+                    scope_key: "session-1".to_string(),
+                },
             },
             Request::ListWorkflowRuns { limit: 25 },
             Request::CancelWorkflowRun {
@@ -2314,6 +2394,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: None,
+                binding: None,
                 status: bcode_workflow_store::RunStatus::Running,
                 cancellation_requested_at_ms: None,
                 created_at_ms: 1,

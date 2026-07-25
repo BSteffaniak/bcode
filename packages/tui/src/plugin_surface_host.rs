@@ -77,24 +77,26 @@ impl PluginTuiHost for BcodePluginTuiHost {
     fn start_workflow(&self, request: PluginWorkflowStartRequest) -> PluginWorkflowStartFuture {
         let client = self.client.clone();
         Box::pin(async move {
-            let definition = serde_json::from_value(request.definition)
-                .map_err(|error| PluginTuiHostError::InvalidRequest(error.to_string()))?;
-            client
-                .register_workflow_definition(bcode_ipc::WorkflowDefinitionRegistrationRequest {
-                    definition_id: request.definition_id.clone(),
-                    version: request.definition_version,
-                    definition,
-                })
-                .await
-                .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
+            let parent_scope = request.parent_session_id.to_string();
+            if request.binding.scope_key != parent_scope {
+                return Err(PluginTuiHostError::InvalidRequest(
+                    "workflow binding scope must match the active parent session".to_string(),
+                ));
+            }
             let started = client
-                .start_workflow_run(bcode_ipc::WorkflowRunStartRequest {
-                    definition_id: request.definition_id,
-                    definition_version: request.definition_version,
+                .start_workflow(bcode_ipc::WorkflowStartRequest {
+                    identity: request.identity,
+                    definition: request.definition,
                     run_id: request.run_id,
-                    workspace_snapshot: request.workspace_snapshot,
                     parent_session_id: request.parent_session_id,
-                    input: Some(request.input),
+                    input: request.input,
+                    binding: bcode_workflow_store::WorkflowRunBinding {
+                        owner_plugin_id: request.binding.owner_plugin_id,
+                        workflow_kind: request.binding.workflow_kind,
+                        scope_key: request.binding.scope_key,
+                        display_label: request.binding.display_label,
+                        single_active: request.binding.single_active,
+                    },
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
                 .await

@@ -15,8 +15,9 @@ use std::pin::Pin;
 use thiserror::Error;
 
 const DATABASE_FILE: &str = "workflow.db";
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const MAX_ID_BYTES: usize = 512;
+const MAX_DISPLAY_LABEL_BYTES: usize = 512;
 const MAX_INLINE_JSON_BYTES: usize = 1_048_576;
 
 /// Durable workflow run status.
@@ -77,6 +78,8 @@ pub struct WorkflowRunSummary {
     pub definition_version: u32,
     pub workspace_snapshot: String,
     pub parent_session_id: Option<String>,
+    #[serde(default)]
+    pub binding: Option<WorkflowRunBinding>,
     pub status: RunStatus,
     pub cancellation_requested_at_ms: Option<u64>,
     pub created_at_ms: u64,
@@ -194,6 +197,24 @@ impl Default for WorkflowRunLimits {
     }
 }
 
+/// Bounded product ownership and discovery association for one workflow run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRunBinding {
+    pub owner_plugin_id: String,
+    pub workflow_kind: String,
+    pub scope_key: String,
+    pub display_label: Option<String>,
+    pub single_active: bool,
+}
+
+/// Generic associated-run lookup key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRunBindingKey {
+    pub owner_plugin_id: String,
+    pub workflow_kind: String,
+    pub scope_key: String,
+}
+
 /// Durable workflow run creation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NewWorkflowRun {
@@ -206,6 +227,9 @@ pub struct NewWorkflowRun {
     pub workspace_snapshot: String,
     /// Optional parent session identity serialized without coupling this store to session logic.
     pub parent_session_id: Option<String>,
+    /// Optional bounded product ownership and discovery association.
+    #[serde(default)]
+    pub binding: Option<WorkflowRunBinding>,
     /// Optional bounded initial input validated against the definition input schema.
     pub input: Option<serde_json::Value>,
     /// Creation timestamp supplied by the host clock.
@@ -905,7 +929,8 @@ impl WorkflowStore {
             .connection
             .query_row(
                 "SELECT definition_id, definition_version, workspace_snapshot, parent_session_id, \
-                 input_json, deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap \
+                 input_json, deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap, \
+                 owner_plugin_id, workflow_kind, scope_key, display_label, single_active \
                  FROM workflow_runs WHERE run_id = ?1",
                 [&run.run_id],
                 |row| {
@@ -920,6 +945,11 @@ impl WorkflowStore {
                         row.get::<_, u32>(7)?,
                         row.get::<_, u32>(8)?,
                         row.get::<_, u32>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, Option<String>>(13)?,
+                        row.get::<_, bool>(14)?,
                     ))
                 },
             )
@@ -935,6 +965,11 @@ impl WorkflowStore {
             concurrency_cap,
             cycle_cap,
             retry_cap,
+            owner_plugin_id,
+            workflow_kind,
+            scope_key,
+            display_label,
+            single_active,
         )) = existing
         else {
             self.create_run(run)?;
@@ -950,10 +985,28 @@ impl WorkflowStore {
             cycle_cap,
             retry_cap,
         };
+        let existing_binding = match (owner_plugin_id, workflow_kind, scope_key) {
+            (Some(owner_plugin_id), Some(workflow_kind), Some(scope_key)) => {
+                Some(WorkflowRunBinding {
+                    owner_plugin_id,
+                    workflow_kind,
+                    scope_key,
+                    display_label,
+                    single_active,
+                })
+            }
+            (None, None, None) => None,
+            _ => {
+                return Err(WorkflowStoreError::InvalidData(
+                    "stored workflow run has an incomplete binding".to_string(),
+                ));
+            }
+        };
         if definition_id == run.definition_id
             && definition_version == run.definition_version
             && workspace_snapshot == run.workspace_snapshot
             && parent_session_id == run.parent_session_id
+            && existing_binding == run.binding
             && input == run.input
             && limits == run.limits
         {
@@ -971,9 +1024,35 @@ impl WorkflowStore {
     ///
     /// Returns an error for malformed identity, missing definition, identity conflict, or database
     /// failure.
+    #[allow(clippy::too_many_lines)]
     pub fn create_run(&mut self, run: &NewWorkflowRun) -> Result<(), WorkflowStoreError> {
         validate_run(run)?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(binding) = &run.binding
+            && binding.single_active
+        {
+            let active: Option<String> = transaction
+                .query_row(
+                    "SELECT run_id FROM workflow_runs WHERE owner_plugin_id = ?1 \
+                     AND workflow_kind = ?2 AND scope_key = ?3 \
+                     AND status IN ('running', 'paused', 'repair_required') \
+                     ORDER BY updated_at_ms DESC, run_id LIMIT 1",
+                    (
+                        &binding.owner_plugin_id,
+                        &binding.workflow_kind,
+                        &binding.scope_key,
+                    ),
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(active) = active {
+                return Err(WorkflowStoreError::InvalidData(format!(
+                    "workflow binding already has an active run: {active}"
+                )));
+            }
+        }
         let definition_json = transaction
             .query_row(
                 "SELECT definition_json FROM workflow_definitions \
@@ -994,18 +1073,36 @@ impl WorkflowStore {
             .as_ref()
             .map(|input| validate_run_input(&definition, input))
             .transpose()?;
+        let (owner_plugin_id, workflow_kind, scope_key, display_label, single_active) = run
+            .binding
+            .as_ref()
+            .map_or((None, None, None, None, false), |binding| {
+                (
+                    Some(binding.owner_plugin_id.as_str()),
+                    Some(binding.workflow_kind.as_str()),
+                    Some(binding.scope_key.as_str()),
+                    binding.display_label.as_deref(),
+                    binding.single_active,
+                )
+            });
         transaction.execute(
             "INSERT INTO workflow_runs \
              (run_id, definition_id, definition_version, workspace_snapshot, parent_session_id, \
+              owner_plugin_id, workflow_kind, scope_key, display_label, single_active, \
               input_json, status, deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap, \
               created_at_ms, updated_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)",
-            (
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18)",
+            rusqlite::params![
                 &run.run_id,
                 &run.definition_id,
                 run.definition_version,
                 &run.workspace_snapshot,
                 &run.parent_session_id,
+                owner_plugin_id,
+                workflow_kind,
+                scope_key,
+                display_label,
+                single_active,
                 &input_json,
                 RunStatus::Running.as_str(),
                 run.limits.deadline_at_ms,
@@ -1014,7 +1111,7 @@ impl WorkflowStore {
                 run.limits.cycle_cap,
                 run.limits.retry_cap,
                 run.created_at_ms,
-            ),
+            ],
         )?;
         append_event(
             &transaction,
@@ -2994,8 +3091,9 @@ impl WorkflowStore {
         self.connection
             .query_row(
                 "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
-                 parent_session_id, status, cancellation_requested_at_ms, created_at_ms, \
-                 updated_at_ms FROM workflow_runs WHERE run_id = ?1",
+                 parent_session_id, owner_plugin_id, workflow_kind, scope_key, display_label, \
+                 single_active, status, cancellation_requested_at_ms, created_at_ms, updated_at_ms \
+                 FROM workflow_runs WHERE run_id = ?1",
                 [run_id],
                 run_summary_from_row,
             )
@@ -3082,7 +3180,8 @@ impl WorkflowStore {
         let limit = bounded_limit(limit)?;
         let mut statement = self.connection.prepare(
             "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
-             parent_session_id, status, cancellation_requested_at_ms, created_at_ms, updated_at_ms \
+             parent_session_id, owner_plugin_id, workflow_kind, scope_key, display_label, \
+             single_active, status, cancellation_requested_at_ms, created_at_ms, updated_at_ms \
              FROM workflow_runs ORDER BY updated_at_ms DESC, run_id LIMIT ?1",
         )?;
         statement
@@ -3092,6 +3191,36 @@ impl WorkflowStore {
                     .and_then(parse_run_summary)
             })
             .collect()
+    }
+
+    /// Return the newest run associated with one exact generic binding key.
+    ///
+    /// This uses a bounded indexed lookup and never replays workflow events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the key is malformed, persisted binding data is inconsistent, or the
+    /// row query fails.
+    pub fn associated_run(
+        &self,
+        key: &WorkflowRunBindingKey,
+    ) -> Result<Option<WorkflowRunSummary>, WorkflowStoreError> {
+        validate_id("owner_plugin_id", &key.owner_plugin_id)?;
+        validate_id("workflow_kind", &key.workflow_kind)?;
+        validate_id("scope_key", &key.scope_key)?;
+        self.connection
+            .query_row(
+                "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
+                 parent_session_id, owner_plugin_id, workflow_kind, scope_key, display_label, \
+                 single_active, status, cancellation_requested_at_ms, created_at_ms, updated_at_ms \
+                 FROM workflow_runs WHERE owner_plugin_id = ?1 AND workflow_kind = ?2 \
+                 AND scope_key = ?3 ORDER BY updated_at_ms DESC, run_id LIMIT 1",
+                (&key.owner_plugin_id, &key.workflow_kind, &key.scope_key),
+                run_summary_from_row,
+            )
+            .optional()?
+            .map(parse_run_summary)
+            .transpose()
     }
 
     /// Return bounded durable input/approval waits ordered deterministically.
@@ -4281,6 +4410,11 @@ type RawRunSummary = (
     u32,
     String,
     Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    bool,
     String,
     Option<u64>,
     u64,
@@ -4298,6 +4432,11 @@ fn run_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRunSumma
         row.get(6)?,
         row.get(7)?,
         row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
     ))
 }
 
@@ -4308,17 +4447,38 @@ fn parse_run_summary(raw: RawRunSummary) -> Result<WorkflowRunSummary, WorkflowS
         definition_version,
         workspace_snapshot,
         parent_session_id,
+        owner_plugin_id,
+        workflow_kind,
+        scope_key,
+        display_label,
+        single_active,
         status,
         cancellation_requested_at_ms,
         created_at_ms,
         updated_at_ms,
     ) = raw;
+    let binding = match (owner_plugin_id, workflow_kind, scope_key) {
+        (Some(owner_plugin_id), Some(workflow_kind), Some(scope_key)) => Some(WorkflowRunBinding {
+            owner_plugin_id,
+            workflow_kind,
+            scope_key,
+            display_label,
+            single_active,
+        }),
+        (None, None, None) => None,
+        _ => {
+            return Err(WorkflowStoreError::InvalidData(
+                "stored workflow run has an incomplete binding".to_string(),
+            ));
+        }
+    };
     Ok(WorkflowRunSummary {
         run_id,
         definition_id,
         definition_version,
         workspace_snapshot,
         parent_session_id,
+        binding,
         status: parse_run_status(&status)?,
         cancellation_requested_at_ms,
         created_at_ms,
@@ -4795,6 +4955,25 @@ fn validate_run(run: &NewWorkflowRun) -> Result<(), WorkflowStoreError> {
     if let Some(parent_session_id) = &run.parent_session_id {
         validate_id("parent_session_id", parent_session_id)?;
     }
+    if let Some(binding) = &run.binding {
+        validate_binding(binding)?;
+    }
+    Ok(())
+}
+
+fn validate_binding(binding: &WorkflowRunBinding) -> Result<(), WorkflowStoreError> {
+    validate_id("owner_plugin_id", &binding.owner_plugin_id)?;
+    validate_id("workflow_kind", &binding.workflow_kind)?;
+    validate_id("scope_key", &binding.scope_key)?;
+    if binding
+        .display_label
+        .as_ref()
+        .is_some_and(|label| label.trim().is_empty() || label.len() > MAX_DISPLAY_LABEL_BYTES)
+    {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "display_label must contain 1..={MAX_DISPLAY_LABEL_BYTES} bytes when present"
+        )));
+    }
     Ok(())
 }
 
@@ -4983,6 +5162,11 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
              definition_version INTEGER NOT NULL,\
              workspace_snapshot TEXT NOT NULL,\
              parent_session_id TEXT,\
+             owner_plugin_id TEXT,\
+             workflow_kind TEXT,\
+             scope_key TEXT,\
+             display_label TEXT,\
+             single_active INTEGER NOT NULL DEFAULT 0,\
              input_json TEXT,\
              status TEXT NOT NULL,\
              cancellation_requested_at_ms INTEGER,\
@@ -5102,6 +5286,45 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
     transaction.execute(
         "UPDATE workflow_store_contract SET schema_version = 4 \
          WHERE contract_id = 1 AND schema_version = 3",
+        [],
+    )?;
+    let run_columns = transaction
+        .prepare("PRAGMA table_info(workflow_runs)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (column, sql) in [
+        (
+            "owner_plugin_id",
+            "ALTER TABLE workflow_runs ADD COLUMN owner_plugin_id TEXT",
+        ),
+        (
+            "workflow_kind",
+            "ALTER TABLE workflow_runs ADD COLUMN workflow_kind TEXT",
+        ),
+        (
+            "scope_key",
+            "ALTER TABLE workflow_runs ADD COLUMN scope_key TEXT",
+        ),
+        (
+            "display_label",
+            "ALTER TABLE workflow_runs ADD COLUMN display_label TEXT",
+        ),
+        (
+            "single_active",
+            "ALTER TABLE workflow_runs ADD COLUMN single_active INTEGER NOT NULL DEFAULT 0",
+        ),
+    ] {
+        if !run_columns.iter().any(|existing| existing == column) {
+            transaction.execute(sql, [])?;
+        }
+    }
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_workflow_runs_binding_updated \
+             ON workflow_runs(owner_plugin_id, workflow_kind, scope_key, updated_at_ms DESC, run_id);",
+    )?;
+    transaction.execute(
+        "UPDATE workflow_store_contract SET schema_version = 5 \
+         WHERE contract_id = 1 AND schema_version = 4",
         [],
     )?;
     let actual: u32 = transaction.query_row(
@@ -5231,10 +5454,72 @@ mod tests {
             definition_version: 1,
             workspace_snapshot: "snapshot-1".to_string(),
             parent_session_id: Some("session-1".to_string()),
+            binding: None,
             input: Some(serde_json::json!(1)),
             created_at_ms: 10,
             limits: WorkflowRunLimits::default(),
         }
+    }
+
+    #[test]
+    fn associated_run_lookup_is_indexed_and_single_active_is_atomic() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        let run = NewWorkflowRun {
+            binding: Some(WorkflowRunBinding {
+                owner_plugin_id: "bcode.test".to_string(),
+                workflow_kind: "test.workflow".to_string(),
+                scope_key: "session-1".to_string(),
+                display_label: Some("Test workflow".to_string()),
+                single_active: true,
+            }),
+            ..new_run()
+        };
+        store.create_run(&run).expect("run");
+        let key = WorkflowRunBindingKey {
+            owner_plugin_id: "bcode.test".to_string(),
+            workflow_kind: "test.workflow".to_string(),
+            scope_key: "session-1".to_string(),
+        };
+        let associated = store
+            .associated_run(&key)
+            .expect("lookup")
+            .expect("associated run");
+        assert_eq!(associated.run_id, run.run_id);
+        assert_eq!(associated.binding, run.binding);
+
+        let conflict = NewWorkflowRun {
+            run_id: "run-2".to_string(),
+            created_at_ms: 11,
+            ..run.clone()
+        };
+        let error = store.create_run(&conflict).expect_err("single active");
+        assert!(error.to_string().contains("already has an active run"));
+
+        assert!(store.pause_run(&run.run_id, 12).expect("pause"));
+        assert!(store.resume_run(&run.run_id, 13).expect("resume"));
+        assert!(store.request_cancellation(&run.run_id, 14).expect("cancel"));
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET status = 'cancelled', updated_at_ms = 9 WHERE run_id = ?1",
+                [&run.run_id],
+            )
+            .expect("terminalize test run");
+        store
+            .create_run(&conflict)
+            .expect("replacement after terminal");
+        assert_eq!(
+            store
+                .associated_run(&key)
+                .expect("lookup")
+                .expect("latest")
+                .run_id,
+            "run-2"
+        );
     }
 
     #[test]
@@ -5684,6 +5969,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                binding: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
                 created_at_ms: 1,
                 limits: WorkflowRunLimits::default(),
@@ -6496,6 +6782,7 @@ mod tests {
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
+                binding: None,
                 input: Some(serde_json::json!(3)),
                 created_at_ms: 1,
                 limits: WorkflowRunLimits::default(),

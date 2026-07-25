@@ -16,7 +16,7 @@ use bmux_tui::event::Event;
 use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::prelude::Line;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::sync::mpsc;
 
 /// Boxed error returned by native TUI plugin surface factories.
@@ -58,18 +58,65 @@ impl fmt::Display for PluginTuiHostError {
 
 impl Error for PluginTuiHostError {}
 
+/// Renderer-neutral durable workflow binding supplied by the owning plugin.
+///
+/// The fields are deliberately bounded and generic. Domain data belongs in the typed workflow
+/// input and compiled definition rather than in an opaque metadata payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginWorkflowBinding {
+    /// Plugin that owns product presentation and lifecycle vocabulary.
+    pub owner_plugin_id: String,
+    /// Stable product-facing workflow kind within the owner plugin.
+    pub workflow_kind: String,
+    /// Stable scope key used for bounded associated-run lookup, such as a session identity.
+    pub scope_key: String,
+    /// Optional compact user-facing label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_label: Option<String>,
+    /// Whether at most one non-terminal run may exist for this owner/kind/scope.
+    #[serde(default)]
+    pub single_active: bool,
+}
+
 /// Renderer-neutral request for a plugin surface to start one durable workflow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginWorkflowStartRequest {
-    pub definition_id: String,
-    pub definition_version: u32,
-    pub definition: serde_json::Value,
+    /// Logical and exact identities derived from the validated compiled definition.
+    pub identity: bcode_workflow::WorkflowDefinitionIdentity,
+    pub definition: bcode_workflow::WorkflowDefinition,
     /// Optional stable run identity chosen by the plugin for crash-safe start retries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
-    pub workspace_snapshot: String,
     pub parent_session_id: SessionId,
     pub input: serde_json::Value,
+    pub binding: PluginWorkflowBinding,
+}
+
+impl PluginWorkflowStartRequest {
+    /// Build a renderer-neutral start request from a typed durable specification and typed input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the input cannot be serialized or fails its generated schema.
+    pub fn typed<I>(
+        spec: &bcode_workflow::WorkflowSpec<I>,
+        input: &I,
+        parent_session_id: SessionId,
+        binding: PluginWorkflowBinding,
+        run_id: Option<String>,
+    ) -> Result<Self, bcode_workflow::WorkflowError>
+    where
+        I: Serialize + DeserializeOwned + schemars::JsonSchema + Send + 'static,
+    {
+        Ok(Self {
+            identity: spec.identity().clone(),
+            definition: spec.definition().clone(),
+            run_id,
+            parent_session_id,
+            input: spec.serialize_input(input)?,
+            binding,
+        })
+    }
 }
 
 /// Async workflow-start result returned by a native TUI host.

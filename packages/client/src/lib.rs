@@ -1908,6 +1908,23 @@ impl BcodeClient {
         }
     }
 
+    /// Register an exact typed definition and start one associated durable workflow through one
+    /// retry-safe daemon operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects identity, definition, input,
+    /// binding, or execution context.
+    pub async fn start_workflow(
+        &self,
+        request: bcode_ipc::WorkflowStartRequest,
+    ) -> Result<bcode_ipc::WorkflowRunStartResponse, ClientError> {
+        match self.send_request(Request::StartWorkflow(request)).await? {
+            ResponsePayload::WorkflowRunStarted(response) => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Start one durable workflow from a registered exact definition.
     ///
     /// # Errors
@@ -2001,6 +2018,44 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::WorkflowRunStatus { run } => Ok(run),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return the newest workflow run associated with one exact generic binding key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the bounded lookup.
+    pub async fn associated_workflow_run(
+        &self,
+        key: bcode_ipc::WorkflowRunBindingLookup,
+    ) -> Result<Option<bcode_workflow_store::WorkflowRunSummary>, ClientError> {
+        match self
+            .send_request(Request::AssociatedWorkflowRun { key })
+            .await?
+        {
+            ResponsePayload::AssociatedWorkflowRun { run } => Ok(run),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Apply one lifecycle transition to the newest run for one generic binding key.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, lookup fails, or the transition is not
+    /// valid for the associated run.
+    pub async fn control_associated_workflow_run(
+        &self,
+        key: bcode_ipc::WorkflowRunBindingLookup,
+        action: bcode_ipc::WorkflowRunControlAction,
+    ) -> Result<(Option<bcode_workflow_store::WorkflowRunSummary>, bool), ClientError> {
+        match self
+            .send_request(Request::ControlAssociatedWorkflowRun { key, action })
+            .await?
+        {
+            ResponsePayload::AssociatedWorkflowRunControlled { run, changed } => Ok((run, changed)),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

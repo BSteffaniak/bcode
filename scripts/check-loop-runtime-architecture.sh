@@ -90,8 +90,8 @@ if [[ "$clone_files" != "$expected_clone_files" ]]; then
 fi
 
 loop_default_clients="$(rg -n 'BcodeClient::default_endpoint' plugins/loop-plugin/src/lib.rs | wc -l | tr -d ' ')"
-if [[ "$loop_default_clients" != "4" ]]; then
-  echo "Loop architecture violation: expected four recorded direct loop daemon-client constructions, found $loop_default_clients." >&2
+if [[ "$loop_default_clients" -gt "6" ]]; then
+  echo "Loop architecture violation: direct loop daemon-client constructions grew beyond the recorded workflow lifecycle boundary ($loop_default_clients > 6)." >&2
   violations=1
 fi
 

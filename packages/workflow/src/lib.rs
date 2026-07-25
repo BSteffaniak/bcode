@@ -11,8 +11,10 @@
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
@@ -50,6 +52,14 @@ pub enum WorkflowError {
         /// Stable step name.
         step: String,
         /// Step-owned failure message.
+        message: String,
+    },
+    /// A typed durable run input could not be serialized or did not match its schema.
+    #[error("workflow '{workflow}' received invalid input: {message}")]
+    InvalidInput {
+        /// Stable logical workflow kind.
+        workflow: String,
+        /// Serialization or schema-validation failure.
         message: String,
     },
     /// A step returned data that did not match its declared schema or Rust output type.
@@ -95,6 +105,172 @@ impl WorkflowError {
             message: message.into(),
         }
     }
+}
+
+/// Exact identity for one immutable compiled workflow definition variant.
+///
+/// `kind` is the stable product-facing workflow identity. `definition_id` includes a digest of the
+/// normalized compiled definition, so topology or policy changes cannot accidentally reuse one
+/// durable definition slot. The schema version remains explicit for future incompatible compiled
+/// definition formats.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowDefinitionIdentity {
+    /// Stable plugin or product-owned logical workflow kind.
+    pub kind: String,
+    /// Collision-resistant exact identity for the compiled definition content using the complete
+    /// SHA-256 digest.
+    pub definition_id: String,
+    /// Compiled workflow definition schema version.
+    pub definition_version: u32,
+}
+
+impl WorkflowDefinitionIdentity {
+    /// Derive the exact durable identity for one logical kind and compiled definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the kind is empty or too large, the definition is invalid, or its
+    /// normalized representation cannot be serialized.
+    pub fn for_definition(
+        kind: impl Into<String>,
+        definition: &WorkflowDefinition,
+    ) -> Result<Self, WorkflowError> {
+        let kind = kind.into();
+        if kind.trim().is_empty() || kind.len() > 256 {
+            return Err(WorkflowError::Build {
+                path: kind,
+                message: "workflow kind must contain 1..=256 bytes".to_string(),
+            });
+        }
+        definition.validate()?;
+        let encoded = serde_json::to_vec(definition).map_err(|error| WorkflowError::Build {
+            path: kind.clone(),
+            message: format!("compiled definition cannot be serialized: {error}"),
+        })?;
+        let digest = Sha256::digest(encoded);
+        let mut suffix = String::with_capacity(64);
+        for byte in digest {
+            write!(&mut suffix, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        Ok(Self {
+            definition_id: format!("{kind}@{suffix}"),
+            kind,
+            definition_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
+        })
+    }
+}
+
+/// Reusable typed durable workflow specification.
+///
+/// This packages the validated compiled definition together with its logical and exact identities.
+/// Per-run input is intentionally separate: input changes do not create definition variants unless
+/// they also change compiled topology or policy.
+#[derive(Debug, Clone)]
+pub struct WorkflowSpec<I> {
+    identity: WorkflowDefinitionIdentity,
+    definition: WorkflowDefinition,
+    _input: PhantomData<fn(I)>,
+}
+
+impl<I> WorkflowSpec<I>
+where
+    I: Serialize + DeserializeOwned + JsonSchema + Send + 'static,
+{
+    /// Build a durable specification from a typed compiled workflow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the logical kind is empty or too large, the definition is invalid, or
+    /// its normalized representation cannot be serialized.
+    pub fn new<O>(kind: impl Into<String>, workflow: &Workflow<I, O>) -> Result<Self, WorkflowError>
+    where
+        O: Serialize + DeserializeOwned + JsonSchema + Send + 'static,
+    {
+        Self::from_definition(kind, workflow.definition().clone())
+    }
+
+    /// Build a durable specification from an already compiled definition.
+    ///
+    /// This is useful at plugin ABI boundaries where only the serializable definition is retained.
+    /// The definition input schema must exactly match `I`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the kind or definition is invalid, the input schema differs from `I`,
+    /// or the normalized definition cannot be serialized.
+    pub fn from_definition(
+        kind: impl Into<String>,
+        definition: WorkflowDefinition,
+    ) -> Result<Self, WorkflowError> {
+        let kind = kind.into();
+        definition.validate()?;
+        if definition.input != ValueSchema::of::<I>() {
+            return Err(WorkflowError::Build {
+                path: kind,
+                message: format!(
+                    "workflow input schema does not match {}",
+                    std::any::type_name::<I>()
+                ),
+            });
+        }
+        let identity = WorkflowDefinitionIdentity::for_definition(kind, &definition)?;
+        if identity.definition_id.len() > 512 {
+            return Err(WorkflowError::Build {
+                path: identity.kind,
+                message: "exact workflow definition identity exceeds 512 bytes".to_string(),
+            });
+        }
+        Ok(Self {
+            identity,
+            definition,
+            _input: PhantomData,
+        })
+    }
+
+    /// Return the logical and exact durable identity.
+    #[must_use]
+    pub const fn identity(&self) -> &WorkflowDefinitionIdentity {
+        &self.identity
+    }
+
+    /// Return the validated compiled definition.
+    #[must_use]
+    pub const fn definition(&self) -> &WorkflowDefinition {
+        &self.definition
+    }
+
+    /// Validate and serialize one typed run input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when serialization fails or the value does not satisfy its generated JSON
+    /// schema.
+    pub fn serialize_input(&self, input: &I) -> Result<serde_json::Value, WorkflowError> {
+        validate_typed_value(&self.identity.kind, input)
+    }
+}
+
+fn validate_typed_value<T>(location: &str, value: &T) -> Result<serde_json::Value, WorkflowError>
+where
+    T: Serialize + DeserializeOwned + JsonSchema,
+{
+    let value = serde_json::to_value(value).map_err(|error| WorkflowError::InvalidInput {
+        workflow: location.to_string(),
+        message: error.to_string(),
+    })?;
+    let validator = jsonschema::validator_for(&ValueSchema::of::<T>().schema).map_err(|error| {
+        WorkflowError::InvalidInput {
+            workflow: location.to_string(),
+            message: format!("invalid generated schema: {error}"),
+        }
+    })?;
+    if let Err(error) = validator.validate(&value) {
+        return Err(WorkflowError::InvalidInput {
+            workflow: location.to_string(),
+            message: error.to_string(),
+        });
+    }
+    Ok(value)
 }
 
 /// Cloneable cancellation state shared by a workflow and all of its steps.
@@ -3048,6 +3224,51 @@ mod tests {
     #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
     struct Doubled {
         value: u64,
+    }
+
+    #[test]
+    fn durable_spec_identity_is_stable_and_topology_sensitive() {
+        let compile = |max_iterations| {
+            WorkflowBuilder::new(
+                "loop",
+                Step::map("work", |input: Input| Ok(input)).repeat_while(
+                    "repeat",
+                    field::<Input>("value").eq(0_u64),
+                    max_iterations,
+                ),
+            )
+            .build()
+            .expect("workflow")
+        };
+        let first = WorkflowSpec::new("bcode.loop", &compile(2)).expect("spec");
+        let same = WorkflowSpec::new("bcode.loop", &compile(2)).expect("same spec");
+        let variant = WorkflowSpec::new("bcode.loop", &compile(3)).expect("variant");
+
+        assert_eq!(first.identity(), same.identity());
+        assert_ne!(
+            first.identity().definition_id,
+            variant.identity().definition_id
+        );
+        assert_eq!(first.identity().kind, "bcode.loop");
+        assert_eq!(
+            first.identity().definition_version,
+            WORKFLOW_DEFINITION_SCHEMA_VERSION
+        );
+        assert_eq!(
+            first.serialize_input(&Input { value: 1 }).expect("input"),
+            serde_json::json!({"value": 1})
+        );
+    }
+
+    #[test]
+    fn durable_spec_rejects_mismatched_typed_input() {
+        let workflow = WorkflowBuilder::new("typed", Step::map("work", |input: Input| Ok(input)))
+            .build()
+            .expect("workflow");
+        let error =
+            WorkflowSpec::<Doubled>::from_definition("bcode.typed", workflow.definition().clone())
+                .expect_err("input mismatch");
+        assert!(error.to_string().contains("input schema does not match"));
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]

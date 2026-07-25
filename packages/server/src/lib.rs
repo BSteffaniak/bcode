@@ -2627,11 +2627,14 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ListRuntimeWork { .. } => "list_runtime_work",
         Request::CancelRuntimeWork { .. } => "cancel_runtime_work",
         Request::RegisterWorkflowDefinition(_) => "register_workflow_definition",
+        Request::StartWorkflow(_) => "start_workflow",
         Request::StartWorkflowRun(_) => "start_workflow_run",
         Request::ListWorkflowDefinitions { .. } => "list_workflow_definitions",
         Request::DescribeWorkflowDefinition { .. } => "describe_workflow_definition",
         Request::InspectWorkflowRun { .. } => "inspect_workflow_run",
         Request::WorkflowRunStatus { .. } => "workflow_run_status",
+        Request::AssociatedWorkflowRun { .. } => "associated_workflow_run",
+        Request::ControlAssociatedWorkflowRun { .. } => "control_associated_workflow_run",
         Request::ListWorkflowRuns { .. } => "list_workflow_runs",
         Request::CancelWorkflowRun { .. } => "cancel_workflow_run",
         Request::PauseWorkflowRun { .. } => "pause_workflow_run",
@@ -3060,6 +3063,9 @@ async fn handle_request_inner(
         Request::RegisterWorkflowDefinition(request) => {
             handle_register_workflow_definition(request_id, state, writer, request).await
         }
+        Request::StartWorkflow(request) => {
+            handle_start_workflow(request_id, state, writer, request).await
+        }
         Request::StartWorkflowRun(request) => {
             handle_start_workflow_run(request_id, state, writer, request).await
         }
@@ -3078,6 +3084,12 @@ async fn handle_request_inner(
         }
         Request::WorkflowRunStatus { run_id } => {
             handle_workflow_run_status(request_id, state, writer, run_id).await
+        }
+        Request::AssociatedWorkflowRun { key } => {
+            handle_associated_workflow_run(request_id, state, writer, key).await
+        }
+        Request::ControlAssociatedWorkflowRun { key, action } => {
+            handle_control_associated_workflow_run(request_id, state, writer, key, action).await
         }
         Request::ListWorkflowRuns { limit } => {
             handle_list_workflow_runs(request_id, state, writer, limit).await
@@ -10007,6 +10019,68 @@ async fn handle_register_workflow_definition(
     .await
 }
 
+async fn handle_start_workflow(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::WorkflowStartRequest,
+) -> Result<(), ServerError> {
+    if request.identity.kind != request.binding.workflow_kind {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow logical identity does not match its binding kind".to_string(),
+        )
+        .into());
+    }
+    let expected_identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+        request.identity.kind.clone(),
+        &request.definition,
+    )
+    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    if expected_identity != request.identity {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow exact identity does not match its compiled definition".to_string(),
+        )
+        .into());
+    }
+    let stored = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .persist_definition(
+            &request.identity.definition_id,
+            request.identity.definition_version,
+            &request.definition,
+        )?;
+    if stored.definition_id != request.identity.definition_id
+        || stored.version != request.identity.definition_version
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow exact identity does not match persisted definition".to_string(),
+        )
+        .into());
+    }
+    let started = start_workflow_run(
+        state,
+        bcode_ipc::WorkflowRunStartRequest {
+            definition_id: request.identity.definition_id,
+            definition_version: request.identity.definition_version,
+            run_id: request.run_id,
+            workspace_snapshot: String::new(),
+            parent_session_id: request.parent_session_id,
+            binding: Some(request.binding),
+            input: Some(request.input),
+            limits: request.limits,
+        },
+    )
+    .await?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowRunStarted(started)),
+    )
+    .await
+}
+
 async fn handle_start_workflow_run(
     request_id: u64,
     state: &Arc<ServerState>,
@@ -10035,12 +10109,21 @@ async fn start_workflow_run(
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let created_at_ms = current_unix_millis();
+    let workspace_snapshot = if request.workspace_snapshot.is_empty() {
+        parent_session
+            .working_directory
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        request.workspace_snapshot
+    };
     let new_run = bcode_workflow_store::NewWorkflowRun {
         run_id: run_id.clone(),
         definition_id: request.definition_id.clone(),
         definition_version: request.definition_version,
-        workspace_snapshot: request.workspace_snapshot,
+        workspace_snapshot,
         parent_session_id: Some(request.parent_session_id.to_string()),
+        binding: request.binding,
         input: request.input,
         created_at_ms,
         limits: request.limits,
@@ -10222,6 +10305,90 @@ async fn handle_workflow_run_status(
         writer,
         request_id,
         Response::Ok(ResponsePayload::WorkflowRunStatus { run }),
+    )
+    .await
+}
+
+async fn handle_associated_workflow_run(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    key: bcode_ipc::WorkflowRunBindingLookup,
+) -> Result<(), ServerError> {
+    let run = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .associated_run(&bcode_workflow_store::WorkflowRunBindingKey {
+            owner_plugin_id: key.owner_plugin_id,
+            workflow_kind: key.workflow_kind,
+            scope_key: key.scope_key,
+        })?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::AssociatedWorkflowRun { run }),
+    )
+    .await
+}
+
+async fn handle_control_associated_workflow_run(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    key: bcode_ipc::WorkflowRunBindingLookup,
+    action: bcode_ipc::WorkflowRunControlAction,
+) -> Result<(), ServerError> {
+    let key = bcode_workflow_store::WorkflowRunBindingKey {
+        owner_plugin_id: key.owner_plugin_id,
+        workflow_kind: key.workflow_kind,
+        scope_key: key.scope_key,
+    };
+    let run = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .associated_run(&key)?;
+    let changed = if let Some(run) = &run {
+        match action {
+            bcode_ipc::WorkflowRunControlAction::Pause => state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pause_run(&run.run_id, current_unix_millis())?,
+            bcode_ipc::WorkflowRunControlAction::Resume => state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .resume_run(&run.run_id, current_unix_millis())?,
+            bcode_ipc::WorkflowRunControlAction::Cancel => {
+                let (recorded, attempts) = {
+                    let mut store = state
+                        .workflow_store
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let recorded =
+                        store.request_cancellation(&run.run_id, current_unix_millis())?;
+                    let attempts = store.active_attempt_cancellations(&run.run_id, 1_000)?;
+                    drop(store);
+                    (recorded, attempts)
+                };
+                propagate_persisted_workflow_cancellation(state, attempts).await?;
+                recorded
+            }
+        }
+    } else {
+        false
+    };
+    let run = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .associated_run(&key)?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::AssociatedWorkflowRunControlled { run, changed }),
     )
     .await
 }
@@ -34638,6 +34805,7 @@ library = "test"
                 definition_version: 1,
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: Some(parent.id.to_string()),
+                binding: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -34815,6 +34983,7 @@ library = "test"
                 definition_version: 1,
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: Some(parent.id.to_string()),
+                binding: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -34965,6 +35134,7 @@ library = "test"
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: Some(parent.id.to_string()),
+                    binding: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -35120,6 +35290,7 @@ library = "test"
                     definition_version: 1,
                     workspace_snapshot: "snapshot".to_string(),
                     parent_session_id: Some(parent.id.to_string()),
+                    binding: None,
                     input: Some(serde_json::json!({"condition_met": false})),
                     created_at_ms: 1,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -35374,6 +35545,7 @@ library = "test"
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: Some(parent.id.to_string()),
+                    binding: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -35558,6 +35730,7 @@ library = "test"
                     definition_version: 1,
                     workspace_snapshot: "snapshot".to_string(),
                     parent_session_id: Some(parent.id.to_string()),
+                    binding: None,
                     input: Some(serde_json::json!({"condition_met": false})),
                     created_at_ms: 1,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -35782,6 +35955,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: Some(parent.id.to_string()),
+                binding: None,
                 input: Some(serde_json::json!({"delay_ms": 5_000})),
                 created_at_ms: 1,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -35938,6 +36112,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 definition_version: 1,
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: Some(parent.id.to_string()),
+                binding: None,
                 input: Some(serde_json::json!({"delay_ms": 5_000})),
                 created_at_ms: 1,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -36146,6 +36321,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 definition_version: 1,
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: Some(parent.id.to_string()),
+                binding: None,
                 input: Some(serde_json::to_value(input).expect("input")),
                 created_at_ms: 1,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -36273,6 +36449,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 definition_version: 1,
                 workspace_snapshot: head.clone(),
                 parent_session_id: Some(parent.id.to_string()),
+                binding: None,
                 input: Some(serde_json::json!({
                     "repo_path": repository.path(),
                     "expected_head": head,
@@ -36418,6 +36595,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: Some(parent.id.to_string()),
+                    binding: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -36583,6 +36761,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: Some(parent.id.to_string()),
+                    binding: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -36687,6 +36866,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: Some(session.id.to_string()),
+                    binding: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -36756,6 +36936,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             run_id: Some("plugin-stable-run".to_string()),
             workspace_snapshot: "snapshot-1".to_string(),
             parent_session_id: session.id,
+            binding: None,
             input: Some(serde_json::json!(1)),
             limits: bcode_workflow_store::WorkflowRunLimits::default(),
         };
@@ -36833,6 +37014,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: None,
+                    binding: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -36888,6 +37070,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     definition_version: 1,
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: Some(session.id.to_string()),
+                    binding: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
@@ -36985,6 +37168,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 definition_version: 1,
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: Some(session.id.to_string()),
+                binding: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),

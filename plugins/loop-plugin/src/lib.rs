@@ -189,10 +189,52 @@ fn session_status_response(session_id: SessionId) -> bcode_plugin_sdk::SessionSt
     }
 }
 
+fn workflow_binding_key(session_id: SessionId) -> bcode_ipc::WorkflowRunBindingLookup {
+    bcode_ipc::WorkflowRunBindingLookup {
+        owner_plugin_id: PLUGIN_ID.to_string(),
+        workflow_kind: "bcode.loop".to_string(),
+        scope_key: session_id.to_string(),
+    }
+}
+
+fn associated_workflow_run(
+    session_id: SessionId,
+) -> Result<Option<bcode_workflow_store::WorkflowRunSummary>, String> {
+    run_async(async move {
+        BcodeClient::default_endpoint()
+            .associated_workflow_run(workflow_binding_key(session_id))
+            .await
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn control_associated_workflow_run(
+    session_id: SessionId,
+    action: bcode_ipc::WorkflowRunControlAction,
+) -> Result<(Option<bcode_workflow_store::WorkflowRunSummary>, bool), String> {
+    run_async(async move {
+        BcodeClient::default_endpoint()
+            .control_associated_workflow_run(workflow_binding_key(session_id), action)
+            .await
+            .map_err(|error| error.to_string())
+    })
+}
+
+fn format_workflow_status(run: &bcode_workflow_store::WorkflowRunSummary) -> String {
+    format!(
+        "loop workflow {} · status {:?} · definition {} v{}",
+        run.run_id, run.status, run.definition_id, run.definition_version
+    )
+}
+
 fn status_for_session(session_id: SessionId) -> InvokeCommandResponse {
-    match load_state_result(session_id) {
-        Ok(state) => status_response(&format_status(state.as_ref(), None)),
-        Err(error) => status_response(&format!("loop state unavailable: {error}")),
+    match associated_workflow_run(session_id) {
+        Ok(Some(run)) => status_response(&format_workflow_status(&run)),
+        Ok(None) => match load_state_result(session_id) {
+            Ok(state) => status_response(&format_status(state.as_ref(), None)),
+            Err(error) => status_response(&format!("loop state unavailable: {error}")),
+        },
+        Err(error) => status_response(&format!("workflow status unavailable: {error}")),
     }
 }
 
@@ -264,6 +306,20 @@ fn stop_confirmation() -> String {
 }
 
 fn stop_loop(session_id: SessionId) -> InvokeCommandResponse {
+    match control_associated_workflow_run(session_id, bcode_ipc::WorkflowRunControlAction::Cancel) {
+        Ok((Some(run), changed)) => {
+            let message = if changed {
+                format!("loop workflow {} cancellation requested", run.run_id)
+            } else {
+                format_workflow_status(&run)
+            };
+            return status_response(&message);
+        }
+        Ok((None, _)) => {}
+        Err(error) => {
+            return status_response(&format!("workflow cancellation unavailable: {error}"));
+        }
+    }
     let mut state = match load_state_result(session_id) {
         Ok(Some(state)) => state,
         Ok(None) => return status_response("no loop found for this session"),
@@ -352,6 +408,18 @@ fn prepare_resume_state(state: &mut LoopState) -> Result<(), String> {
 }
 
 fn resume_loop(session_id: SessionId) -> InvokeCommandResponse {
+    match control_associated_workflow_run(session_id, bcode_ipc::WorkflowRunControlAction::Resume) {
+        Ok((Some(run), changed)) => {
+            let message = if changed {
+                format!("loop workflow {} resumed", run.run_id)
+            } else {
+                format_workflow_status(&run)
+            };
+            return status_response(&message);
+        }
+        Ok((None, _)) => {}
+        Err(error) => return status_response(&format!("workflow resume unavailable: {error}")),
+    }
     let mut state = match load_state_result(session_id) {
         Ok(Some(state)) => state,
         Ok(None) => return status_response("no loop found for this session"),
@@ -370,6 +438,22 @@ fn resume_loop(session_id: SessionId) -> InvokeCommandResponse {
     }
     tokio::spawn(run_loop(state));
     status_response("loop resumed")
+}
+
+fn run_async<F, T>(future: F) -> Result<T, String>
+where
+    F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())?
+            .block_on(future)
+    })
+    .join()
+    .map_err(|_| "loop plugin async worker panicked".to_string())?
 }
 
 fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
@@ -658,18 +742,32 @@ impl PluginTuiSurface for LoopSurface {
                 .workflow_initial_value
                 .clone()
                 .expect("new loop state has workflow input");
-            let workspace_snapshot = std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .to_string_lossy()
-                .into_owned();
-            let request = bcode_plugin_sdk::tui::PluginWorkflowStartRequest {
-                definition_id: "bcode.loop".to_string(),
-                definition_version: 1,
-                definition: serde_json::to_value(definition).expect("definition serializes"),
-                run_id: Some(state.run_id.clone()),
-                workspace_snapshot,
-                parent_session_id: state.session_id,
-                input: serde_json::to_value(input).expect("input serializes"),
+            let spec = match bcode_workflow::WorkflowSpec::from_definition("bcode.loop", definition)
+            {
+                Ok(spec) => spec,
+                Err(error) => {
+                    self.status = format!("invalid durable loop workflow: {error}");
+                    return PluginTuiAction::Redraw;
+                }
+            };
+            let request = match bcode_plugin_sdk::tui::PluginWorkflowStartRequest::typed(
+                &spec,
+                &input,
+                state.session_id,
+                bcode_plugin_sdk::tui::PluginWorkflowBinding {
+                    owner_plugin_id: PLUGIN_ID.to_string(),
+                    workflow_kind: "bcode.loop".to_string(),
+                    scope_key: state.session_id.to_string(),
+                    display_label: Some("Loop".to_string()),
+                    single_active: true,
+                },
+                Some(state.run_id.clone()),
+            ) {
+                Ok(request) => request,
+                Err(error) => {
+                    self.status = format!("invalid durable loop input: {error}");
+                    return PluginTuiAction::Redraw;
+                }
             };
             match host.start_workflow(request).await {
                 Ok(started) => {
@@ -895,9 +993,9 @@ struct LoopWorkflowIteration {
     summary: String,
 }
 
-fn loop_workflow_definition(
+fn loop_workflow_spec(
     input: &LoopWorkflowInput,
-) -> Result<bcode_workflow::WorkflowDefinition, String> {
+) -> Result<bcode_workflow::WorkflowSpec<LoopWorkflowIteration>, String> {
     let implementation = bcode_workflow::Step::configured_task(
         "loop.implementation",
         bcode_workflow::NodeKind::Agent,
@@ -934,7 +1032,7 @@ fn loop_workflow_definition(
     let workflow = bcode_workflow::WorkflowBuilder::new("bcode.loop", cycle)
         .build()
         .map_err(|error| error.to_string())?;
-    Ok(workflow.definition().clone())
+    bcode_workflow::WorkflowSpec::new("bcode.loop", &workflow).map_err(|error| error.to_string())
 }
 
 fn loop_workflow_initial_value(input: &LoopWorkflowInput) -> LoopWorkflowIteration {
@@ -1107,8 +1205,10 @@ impl LoopState {
         let workflow_input =
             LoopWorkflowInput::new(iteration_prompt, stop_condition, max_iterations)
                 .expect("loop state is created only after validated start input");
-        let definition = loop_workflow_definition(&workflow_input)
-            .expect("validated loop input must compile to the standard workflow definition");
+        let definition = loop_workflow_spec(&workflow_input)
+            .expect("validated loop input must compile to the standard workflow definition")
+            .definition()
+            .clone();
         let initial_value = loop_workflow_initial_value(&workflow_input);
         Self {
             schema_version: STATE_SCHEMA_VERSION,
@@ -2023,7 +2123,8 @@ mod tests {
             .expect("request")
             .clone()
             .expect("start");
-        assert_eq!(request.definition_id, "bcode.loop");
+        assert_eq!(request.identity.kind, "bcode.loop");
+        assert_eq!(request.binding.owner_plugin_id, PLUGIN_ID);
         assert_eq!(request.parent_session_id, session_id);
         assert_eq!(request.input["implementation_prompt"], "implement");
         assert_eq!(request.input["max_iterations"], 2);
@@ -2065,17 +2166,23 @@ mod tests {
         // test keeps the plugin-facing contract renderer-neutral and serializable.
         let input =
             LoopWorkflowInput::new("implement".to_string(), "done".to_string(), 2).expect("input");
-        let definition = loop_workflow_definition(&input).expect("definition");
-        let request = bcode_plugin_sdk::tui::PluginWorkflowStartRequest {
-            definition_id: "bcode.loop".to_string(),
-            definition_version: 1,
-            definition: serde_json::to_value(&definition).expect("definition JSON"),
-            run_id: Some("loop-run".to_string()),
-            workspace_snapshot: "/repo".to_string(),
-            parent_session_id: SessionId::new(),
-            input: serde_json::to_value(loop_workflow_initial_value(&input)).expect("input JSON"),
-        };
-        assert_eq!(request.definition_id, definition.name);
+        let spec = loop_workflow_spec(&input).expect("definition");
+        let request = bcode_plugin_sdk::tui::PluginWorkflowStartRequest::typed(
+            &spec,
+            &loop_workflow_initial_value(&input),
+            SessionId::new(),
+            bcode_plugin_sdk::tui::PluginWorkflowBinding {
+                owner_plugin_id: PLUGIN_ID.to_string(),
+                workflow_kind: "bcode.loop".to_string(),
+                scope_key: "session".to_string(),
+                display_label: Some("Loop".to_string()),
+                single_active: true,
+            },
+            Some("loop-run".to_string()),
+        )
+        .expect("request");
+        assert_eq!(request.identity.kind, "bcode.loop");
+        assert_eq!(request.definition.name, "bcode.loop");
         assert_eq!(request.input["max_iterations"], 2);
     }
 
