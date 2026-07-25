@@ -207,6 +207,8 @@ fi
 if ! rg -q 'historical_codec_never_applies_schema_28_rules_to_other_schemas' packages/session-migration/src/historical.rs \
   || ! rg -q 'schema_28_store_fixture_classifies_affected_historical_events' packages/session-migration/src/historical.rs \
   || ! rg -q 'fixture_manifest_enforces_complete_sanitized_inventory' packages/session-migration/src/historical.rs \
+  || ! rg -q 'pub mod schema_28' packages/session-migration/src/codec.rs \
+  || ! rg -q 'pub enum HistoricalDecode' packages/session-migration/src/classification.rs \
   || ! test -f packages/session-migration/fixtures/manifest.json; then
   echo "Session historical-codec violation: released schema rules and exact fixture classifications must remain explicit." >&2
   violations=1
@@ -532,14 +534,14 @@ if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 15' packages/ipc/src/lib.rs \
   violations=1
 fi
 
-if ! rg -q 'mod schema_28' packages/session-migration/src/historical.rs \
+if ! rg -q 'pub mod schema_28' packages/session-migration/src/codec.rs \
   || ! rg -q '28 => schema_28::decode' packages/session-migration/src/historical.rs \
-  || ! rg -q 'Schema28ToolArtifact' packages/session-migration/src/historical.rs \
-  || rg -n 'Artifact \{ artifact: Box<ToolArtifact> \}' packages/session-migration/src/historical.rs >/tmp/bcode-mutable-historical-artifact-dto.txt \
+  || ! rg -q 'ToolArtifactDto' packages/session-migration/src/codec.rs \
+  || rg -n 'Artifact \{ artifact: Box<ToolArtifact> \}' packages/session-migration/src/codec.rs >/tmp/bcode-mutable-historical-artifact-dto.txt \
   || ! rg -q 'decode_for_migration' packages/session/src/db.rs \
   || ! rg -q 'decode_session_event_compatible' packages/session/src/persisted.rs \
   || ! rg -q 'normal_history_reads_preserve_future_events_without_mutation' packages/session/src/db.rs \
-  || ! sed -n '/"tool_invocation_stream" =>/,/}),/p' packages/session-migration/src/historical.rs | grep -q 'RetiredKnown' \
+  || ! sed -n '/"tool_invocation_stream" =>/,/}),/p' packages/session-migration/src/codec.rs | grep -q 'RetiredKnown' \
   || rg -n 'ToolInvocationStreamEvent|ToolInvocationStream' packages/session/src packages/session-migration/src --glob '*.rs' >/tmp/bcode-retired-tool-stream-runtime.txt \
   || ! rg -q 'released_epoch_four_writer_rejects_corrected_epoch_five_store' packages/session/src/db.rs \
   || ! rg -q 'MIGRATION_EVENT_PAGE_SIZE: usize = 1_000' packages/session/src/db.rs \
