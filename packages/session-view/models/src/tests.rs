@@ -25,6 +25,40 @@ fn tool_presentation_slot_ids_are_stable_and_supplementals_are_independent() {
 }
 
 #[test]
+fn structured_reasoning_activity_round_trips_through_renderer_wire_model() {
+    let item = TranscriptViewItem {
+        id: TranscriptViewItemId::reasoning("turn-1", "reasoning-1"),
+        revision: 2,
+        sequence: Some(9),
+        timestamp_ms: Some(10),
+        streaming: false,
+        kind: TranscriptViewItemKind::ReasoningActivity {
+            activity: ReasoningActivityView {
+                turn_id: "turn-1".to_owned(),
+                activity_id: "reasoning-1".to_owned(),
+                order: 3,
+                status: bcode_session_models::ReasoningActivityStatus::Interrupted,
+                parts: vec![bcode_session_models::ReasoningPart {
+                    part_id: "summary-0".to_owned(),
+                    kind: bcode_session_models::ReasoningContentKind::Summary,
+                    role: bcode_session_models::ReasoningContentRole::Milestone,
+                    order: 0,
+                    text: "milestone".to_owned(),
+                }],
+                opaque: true,
+            },
+        },
+    };
+
+    let encoded = serde_json::to_string(&item).expect("serialize reasoning item");
+    let decoded: TranscriptViewItem =
+        serde_json::from_str(&encoded).expect("deserialize reasoning item");
+    assert_eq!(decoded, item);
+    assert!(!encoded.contains("encrypted_content"));
+    assert!(!encoded.contains("provider_state"));
+}
+
+#[test]
 fn empty_snapshot_shows_reasoning_by_default() {
     let snapshot = SessionViewSnapshot::empty();
     assert!(snapshot.thinking.visible);

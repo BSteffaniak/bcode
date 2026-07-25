@@ -13546,6 +13546,9 @@ async fn handle_provider_turn_event(
         }
         ProviderTurnEvent::ReasoningActivity { event } => {
             outcome.saw_reasoning_evidence = true;
+            state
+                .metrics
+                .increment_counter("model.provider.reasoning_activity_events_total");
             outcome
                 .reasoning_activities
                 .entry(event.activity_id().to_owned())
@@ -30185,6 +30188,17 @@ library = "test"
             };
             assert!(non_tool_session_event_to_model_message(&event).is_none());
         }
+    }
+
+    #[test]
+    fn provider_state_metadata_trace_never_contains_opaque_bytes() {
+        let sentinel = "encrypted-sentinel-do-not-log";
+        let detail = provider_metadata_trace_detail("provider_state", sentinel);
+        assert_eq!(detail, "provider_state");
+        assert!(!detail.contains(sentinel));
+
+        let diagnostic = provider_metadata_trace_detail("diagnostic.safe", "visible");
+        assert_eq!(diagnostic, "diagnostic.safe=visible");
     }
 
     #[test]
