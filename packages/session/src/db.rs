@@ -1784,6 +1784,47 @@ impl SessionDb {
         validate_append_preconditions_without_writer(&**self.db, &probe).await
     }
 
+    /// Return bounded current-open readiness classification for a database already known current.
+    ///
+    /// This validates the writer contract and compatibility projection checkpoint without reading
+    /// canonical payloads or materializing compatibility issue rows. A present issue row is enough
+    /// to classify the store as degraded; exact counts belong to diagnosis. Callers must use this
+    /// only after the store has passed current writer/migration-ledger classification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writer or compatibility state is malformed, stale, or unsupported.
+    pub async fn current_open_readiness_known_current(
+        &self,
+    ) -> SessionDbResult<SessionCompatibilityStatus> {
+        validate_storage_writer_contract(&**self.db).await?;
+        let status = self.session_compatibility_status().await?;
+        match status {
+            SessionCompatibilityStatus::Compatible { .. }
+            | SessionCompatibilityStatus::Degraded { .. } => Ok(status),
+            SessionCompatibilityStatus::Missing => Err(SessionDbError::ProjectionStale {
+                projection: "session_compatibility",
+                checkpoint: None,
+                expected: self.last_event_sequence().await?.unwrap_or_default(),
+            }),
+            SessionCompatibilityStatus::Stale {
+                checkpoint,
+                expected,
+            } => Err(SessionDbError::ProjectionStale {
+                projection: "session_compatibility",
+                checkpoint: Some(checkpoint),
+                expected,
+            }),
+            SessionCompatibilityStatus::Incompatible { actual, expected } => {
+                Err(SessionDbError::ProjectionIncompatible {
+                    projection: "session_compatibility",
+                    actual,
+                    expected,
+                })
+            }
+        }
+    }
+
     /// Return bounded compatibility status without replaying canonical history.
     ///
     /// # Errors

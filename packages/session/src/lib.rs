@@ -344,59 +344,6 @@ fn terminal_session_open_snapshot(
     }
 }
 
-async fn current_storage_open_snapshot(
-    db: &db::SessionDb,
-    session_id: SessionId,
-) -> SessionOpenOperationSnapshot {
-    let compatibility_status = match db.session_compatibility_status().await {
-        Ok(status) => status,
-        Err(error) => {
-            return terminal_session_open_snapshot(
-                session_id,
-                SessionOpenTerminalOutcome::RepairRequired {
-                    reason: error.to_string(),
-                },
-                "Session compatibility projection requires repair".to_owned(),
-            );
-        }
-    };
-    let (outcome, message) = match compatibility_status {
-        db::SessionCompatibilityStatus::Compatible { .. } => {
-            return ready_session_open_snapshot(session_id);
-        }
-        db::SessionCompatibilityStatus::Degraded { issue_count, .. } => (
-            SessionOpenTerminalOutcome::DegradedReadOnly { issue_count },
-            format!("Session history contains {issue_count} unsupported event(s) and is read-only"),
-        ),
-        db::SessionCompatibilityStatus::Missing => (
-            SessionOpenTerminalOutcome::RepairRequired {
-                reason: "session compatibility projection is missing".to_owned(),
-            },
-            "Session compatibility projection is missing".to_owned(),
-        ),
-        db::SessionCompatibilityStatus::Stale {
-            checkpoint,
-            expected,
-        } => (
-            SessionOpenTerminalOutcome::RepairRequired {
-                reason: format!(
-                    "session compatibility projection is stale: checkpoint {checkpoint}, expected {expected}"
-                ),
-            },
-            "Session compatibility projection is stale".to_owned(),
-        ),
-        db::SessionCompatibilityStatus::Incompatible { actual, expected } => (
-            SessionOpenTerminalOutcome::RepairRequired {
-                reason: format!(
-                    "session compatibility projection schema {actual} is incompatible with expected schema {expected}"
-                ),
-            },
-            "Session compatibility projection is incompatible".to_owned(),
-        ),
-    };
-    terminal_session_open_snapshot(session_id, outcome, message)
-}
-
 fn ready_session_open_snapshot(session_id: SessionId) -> SessionOpenOperationSnapshot {
     terminal_session_open_snapshot(
         session_id,
@@ -1531,31 +1478,57 @@ impl SessionManager {
                 ));
             }
         };
-        if matches!(
-            compatibility,
-            db::SessionStorageCompatibility::Current { .. }
-        ) {
-            return Ok(current_storage_open_snapshot(&db, session_id).await);
+        if let db::SessionStorageCompatibility::KnownLegacy { writer_epoch } = compatibility {
+            let initial = migrating_session_open_snapshot(session_id, writer_epoch);
+            let manager = self.clone();
+            let operation = self
+                .migration_operations
+                .start_or_join(initial, move |operation| async move {
+                    let reporter = MigrationProgressReporter::new(operation);
+                    match manager
+                        .ensure_session_loaded_with_progress(session_id, Some(&reporter))
+                        .await
+                    {
+                        Ok(()) => SessionOpenTerminalOutcome::Ready,
+                        Err(error) => session_open_failure_outcome(&error),
+                    }
+                })
+                .await;
+            return Ok(operation.snapshot());
         }
-        let db::SessionStorageCompatibility::KnownLegacy { writer_epoch } = compatibility else {
-            unreachable!("current compatibility returned above")
-        };
-        let initial = migrating_session_open_snapshot(session_id, writer_epoch);
-        let manager = self.clone();
-        let operation = self
-            .migration_operations
-            .start_or_join(initial, move |operation| async move {
-                let reporter = MigrationProgressReporter::new(operation);
-                match manager
-                    .ensure_session_loaded_with_progress(session_id, Some(&reporter))
-                    .await
-                {
-                    Ok(()) => SessionOpenTerminalOutcome::Ready,
-                    Err(error) => session_open_failure_outcome(&error),
-                }
-            })
-            .await;
-        Ok(operation.snapshot())
+        match db.current_open_readiness_known_current().await {
+            Ok(db::SessionCompatibilityStatus::Compatible { .. }) => {
+                Ok(ready_session_open_snapshot(session_id))
+            }
+            Ok(db::SessionCompatibilityStatus::Degraded { issue_count, .. }) => {
+                Ok(terminal_session_open_snapshot(
+                    session_id,
+                    SessionOpenTerminalOutcome::DegradedReadOnly { issue_count },
+                    "Session history contains unsupported event(s) and is read-only".to_owned(),
+                ))
+            }
+            Ok(
+                db::SessionCompatibilityStatus::Missing
+                | db::SessionCompatibilityStatus::Stale { .. }
+                | db::SessionCompatibilityStatus::Incompatible { .. },
+            ) => unreachable!("current-open readiness rejects non-ready projection states"),
+            Err(db::SessionDbError::WriterIncompatible { actual, expected }) => {
+                Ok(terminal_session_open_snapshot(
+                    session_id,
+                    SessionOpenTerminalOutcome::WriterIncompatible { actual, expected },
+                    format!(
+                        "Session writer epoch {actual:?} is incompatible with expected epoch {expected}"
+                    ),
+                ))
+            }
+            Err(error) => Ok(terminal_session_open_snapshot(
+                session_id,
+                SessionOpenTerminalOutcome::RepairRequired {
+                    reason: error.to_string(),
+                },
+                "Session storage requires repair".to_owned(),
+            )),
+        }
     }
 
     /// Return one operation snapshot when both session and operation identities match.
