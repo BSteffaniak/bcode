@@ -33,7 +33,14 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use std::{borrow::Cow, cell::Cell, collections::BTreeMap, fmt::Write as _, ops::Range, rc::Rc};
+use std::{
+    borrow::Cow,
+    cell::{Cell, RefCell},
+    collections::BTreeMap,
+    fmt::Write as _,
+    ops::Range,
+    rc::Rc,
+};
 
 use bcode_mermaid_render::{
     MermaidCancellationToken, MermaidRenderRequest, MermaidRenderedOutput, render_mermaid,
@@ -609,8 +616,32 @@ pub struct MarkdownRenderResult {
     pub lines: Vec<Line>,
     /// Source-order semantic contributions independent of TUI event-loop types.
     pub contributions: Vec<MarkdownContribution>,
+    /// Post-layout document-relative cell rectangles for rich contributions.
+    pub geometry: Vec<MarkdownContributionGeometry>,
     /// Layout signature including every renderer-owned layout-affecting option.
     pub layout_signature: String,
+}
+
+/// Document-relative terminal-cell rectangle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkdownCellRect {
+    /// Zero-based terminal column.
+    pub x: u16,
+    /// Zero-based rendered row.
+    pub y: u16,
+    /// Width in terminal cells.
+    pub width: u16,
+    /// Height in terminal rows.
+    pub height: u16,
+}
+
+/// Stable contribution identity and its post-layout rectangles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownContributionGeometry {
+    /// Stable contribution identity matching [`MarkdownContribution::id`].
+    pub contribution_id: String,
+    /// One rectangle per contiguous visual-row segment.
+    pub rects: Vec<MarkdownCellRect>,
 }
 
 /// Stable semantic contribution emitted alongside terminal lines.
@@ -730,11 +761,42 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
         projected_markdown
     };
     let layout_signature = markdown_layout_signature(markdown, options, &contributions);
+    let (lines, geometry) = render_markdown_projection(&projected_markdown, options);
+    let geometry = assign_contribution_geometry(geometry, &contributions);
     MarkdownRenderResult {
-        lines: render_markdown_lines_internal(&projected_markdown, options),
+        lines,
         contributions,
+        geometry,
         layout_signature,
     }
+}
+
+fn assign_contribution_geometry(
+    mut geometry: Vec<MarkdownContributionGeometry>,
+    contributions: &[MarkdownContribution],
+) -> Vec<MarkdownContributionGeometry> {
+    let mut links = contributions.iter().filter_map(|contribution| {
+        matches!(contribution.kind, MarkdownContributionKind::Link { .. })
+            .then_some(contribution.id.as_str())
+    });
+    let mut images = contributions.iter().filter_map(|contribution| {
+        matches!(contribution.kind, MarkdownContributionKind::Image { .. })
+            .then_some(contribution.id.as_str())
+    });
+    geometry.retain_mut(|item| {
+        let id = match item.contribution_id.as_str() {
+            "link" => links.next(),
+            "image" => images.next(),
+            _ => None,
+        };
+        if let Some(id) = id {
+            id.clone_into(&mut item.contribution_id);
+            true
+        } else {
+            false
+        }
+    });
+    geometry
 }
 
 fn markdown_layout_signature(
@@ -1413,7 +1475,10 @@ pub fn render_markdown_lines(markdown: &str, options: MarkdownRenderOptions) -> 
     result.lines
 }
 
-fn render_markdown_lines_internal(markdown: &str, options: &MarkdownRenderOptions) -> Vec<Line> {
+fn render_markdown_projection(
+    markdown: &str,
+    options: &MarkdownRenderOptions,
+) -> (Vec<Line>, Vec<MarkdownContributionGeometry>) {
     let table_alignments = table_alignments(markdown);
     let alert_kinds = alert_kinds(markdown);
     let container = markdown_to_container_with_options(markdown, hyperchad_markdown_options());
@@ -1426,7 +1491,7 @@ fn render_markdown_lines_internal(markdown: &str, options: &MarkdownRenderOption
             preserve_whitespace: false,
         },
     );
-    renderer.finish()
+    renderer.finish_projection()
 }
 
 fn markdown_contributions(
@@ -2047,6 +2112,9 @@ struct TerminalMarkdownRenderer {
     rows: Vec<Line>,
     current_spans: Vec<Span>,
     current_width: usize,
+    geometry: Rc<RefCell<Vec<MarkdownContributionGeometry>>>,
+    origin_x: usize,
+    origin_y: usize,
     in_table_collection: bool,
     table_alignments: Vec<Vec<Alignment>>,
     next_table_index: usize,
@@ -2067,6 +2135,9 @@ impl TerminalMarkdownRenderer {
             rows: Vec::new(),
             current_spans: Vec::new(),
             current_width: 0,
+            geometry: Rc::new(RefCell::new(Vec::new())),
+            origin_x: 0,
+            origin_y: 0,
             in_table_collection: false,
             table_alignments,
             next_table_index: 0,
@@ -2076,12 +2147,15 @@ impl TerminalMarkdownRenderer {
         }
     }
 
-    fn nested(&self, width: usize) -> Self {
+    fn nested(&self, width: usize, origin_x: usize, origin_y: usize) -> Self {
         Self {
             width: width.max(1),
             rows: Vec::new(),
             current_spans: Vec::new(),
             current_width: 0,
+            geometry: Rc::clone(&self.geometry),
+            origin_x,
+            origin_y,
             in_table_collection: false,
             table_alignments: Vec::new(),
             next_table_index: 0,
@@ -2095,6 +2169,25 @@ impl TerminalMarkdownRenderer {
         self.flush_line();
         trim_blank_edges(&mut self.rows);
         self.rows
+    }
+
+    fn finish_projection(mut self) -> (Vec<Line>, Vec<MarkdownContributionGeometry>) {
+        self.flush_line();
+        let trimmed_top = self
+            .rows
+            .iter()
+            .take_while(|line| line.spans.is_empty())
+            .count();
+        trim_blank_edges(&mut self.rows);
+        let mut geometry = std::mem::take(&mut *self.geometry.borrow_mut());
+        for item in &mut geometry {
+            for rect in &mut item.rects {
+                rect.y = rect
+                    .y
+                    .saturating_sub(u16::try_from(trimmed_top).unwrap_or(u16::MAX));
+            }
+        }
+        (self.rows, geometry)
     }
 
     fn render_container_children(&mut self, container: &Container, style: TextStyle) {
@@ -2112,7 +2205,7 @@ impl TerminalMarkdownRenderer {
                     .or_else(|| alt.as_deref().filter(|value| !value.is_empty()))
                     .or_else(|| source.as_deref().filter(|value| !value.is_empty()))
                     .unwrap_or("image");
-                self.push_text(&format!("[image: {image}]"), style);
+                self.render_marked_text(&format!("[image: {image}]"), style, "image");
             } else {
                 self.render_container(child, style);
             }
@@ -2129,8 +2222,11 @@ impl TerminalMarkdownRenderer {
             Element::Text { value } | Element::Raw { value } => {
                 self.push_text(value, style);
             }
-            Element::Span | Element::Anchor { .. } | Element::THead | Element::TBody => {
+            Element::Span | Element::THead | Element::TBody => {
                 self.render_container_children(container, style);
+            }
+            Element::Anchor { .. } => {
+                self.render_marked_children(container, style, "link");
             }
             Element::TH { .. } | Element::TD { .. } => {
                 if !self.in_table_collection {
@@ -2169,11 +2265,84 @@ impl TerminalMarkdownRenderer {
                     .filter(|value| !value.is_empty())
                     .or_else(|| source.as_deref().filter(|value| !value.is_empty()))
                     .unwrap_or("image");
-                self.push_text(&format!("[image: {image}]"), style);
+                self.render_marked_text(&format!("[image: {image}]"), style, "image");
             }
             _ => {
                 self.render_special_block_container(container, style);
             }
+        }
+    }
+
+    fn render_marked_children(&mut self, container: &Container, style: TextStyle, kind: &str) {
+        let start_row = self.rows.len();
+        let start_column = self.current_width;
+        self.render_container_children(container, style);
+        self.record_geometry(kind, start_row, start_column);
+    }
+
+    fn render_marked_text(&mut self, text: &str, style: TextStyle, kind: &str) {
+        let start_row = self.rows.len();
+        let start_column = self.current_width;
+        self.push_text(text, style);
+        self.record_geometry(kind, start_row, start_column);
+    }
+
+    fn record_geometry(&self, kind: &str, start_row: usize, start_column: usize) {
+        let end_row = self.rows.len();
+        let mut rects = Vec::new();
+        if start_row == end_row {
+            let width = self.current_width.saturating_sub(start_column);
+            if width > 0 {
+                rects.push(markdown_cell_rect(start_column, start_row, width));
+            }
+        } else {
+            if let Some(first) = self.rows.get(start_row) {
+                let width = spans_width(&first.spans).saturating_sub(start_column);
+                if width > 0 {
+                    rects.push(markdown_cell_rect(start_column, start_row, width));
+                }
+            }
+            for row in start_row.saturating_add(1)..end_row {
+                if let Some(line) = self.rows.get(row) {
+                    let width = spans_width(&line.spans);
+                    if width > 0 {
+                        rects.push(markdown_cell_rect(0, row, width));
+                    }
+                }
+            }
+            if self.current_width > 0 {
+                rects.push(markdown_cell_rect(0, end_row, self.current_width));
+            }
+        }
+        if !rects.is_empty() {
+            let global_start_row = self.origin_y.saturating_add(start_row);
+            let global_start_column = self.origin_x.saturating_add(start_column);
+            let global_end_row = self.origin_y.saturating_add(end_row);
+            for rect in &mut rects {
+                rect.x = rect
+                    .x
+                    .saturating_add(u16::try_from(self.origin_x).unwrap_or(u16::MAX));
+                rect.y = rect
+                    .y
+                    .saturating_add(u16::try_from(self.origin_y).unwrap_or(u16::MAX));
+            }
+            debug_assert!(
+                rects
+                    .iter()
+                    .all(|rect| usize::from(rect.y) >= global_start_row)
+                    && rects
+                        .first()
+                        .is_none_or(|rect| usize::from(rect.x) >= global_start_column)
+                    && rects
+                        .last()
+                        .is_none_or(|rect| usize::from(rect.y) <= global_end_row)
+            );
+            self.geometry
+                .borrow_mut()
+                .push(MarkdownContributionGeometry {
+                    contribution_id: kind.to_owned(),
+                    rects,
+                });
         }
     }
 
@@ -2249,7 +2418,11 @@ impl TerminalMarkdownRenderer {
         let alert_kind = self.alert_kinds.get(blockquote_index).copied().flatten();
         self.next_blockquote_index
             .set(blockquote_index.saturating_add(1));
-        let mut nested = self.nested(self.width.saturating_sub(2));
+        let mut nested = self.nested(
+            self.width.saturating_sub(2),
+            self.origin_x.saturating_add(2),
+            self.origin_y.saturating_add(self.rows.len()),
+        );
         nested.render_container_children(container, style);
         nested.flush_line();
         let mut rows = nested.finish();
@@ -2285,7 +2458,11 @@ impl TerminalMarkdownRenderer {
             .push(Line::from_spans(vec![Span::styled(header, border_style)]));
 
         let nested_width = self.width.saturating_sub(2);
-        let mut nested = self.nested(nested_width);
+        let mut nested = self.nested(
+            nested_width,
+            self.origin_x.saturating_add(2),
+            self.origin_y.saturating_add(self.rows.len()),
+        );
         nested.render_container_children(
             container,
             TextStyle {
@@ -2352,7 +2529,11 @@ impl TerminalMarkdownRenderer {
     fn render_prefixed_list_item(&mut self, item: &Container, style: TextStyle, marker: &str) {
         let marker_width = text_display_width(marker);
         let nested_width = self.width.saturating_sub(marker_width);
-        let mut nested = self.nested(nested_width);
+        let mut nested = self.nested(
+            nested_width,
+            self.origin_x.saturating_add(marker_width),
+            self.origin_y.saturating_add(self.rows.len()),
+        );
         nested.render_container_children(item, style);
         nested.flush_line();
         let mut item_rows = nested.finish();
@@ -2523,6 +2704,15 @@ impl TerminalMarkdownRenderer {
                 .push(Span::styled(grapheme.to_owned(), style));
             self.current_width = self.current_width.saturating_add(grapheme_width);
         }
+    }
+}
+
+fn markdown_cell_rect(column: usize, row: usize, width: usize) -> MarkdownCellRect {
+    MarkdownCellRect {
+        x: u16::try_from(column).unwrap_or(u16::MAX),
+        y: u16::try_from(row).unwrap_or(u16::MAX),
+        width: u16::try_from(width).unwrap_or(u16::MAX),
+        height: 1,
     }
 }
 
@@ -2832,7 +3022,7 @@ fn text_display_width(text: &str) -> usize {
 mod tests {
     use super::{
         MarkdownRenderOptions, MarkdownTheme, TableRow, aligned_padding, markdown_to_plain_text,
-        render_markdown_lines, table_column_widths, table_content_line,
+        render_markdown, render_markdown_lines, table_column_widths, table_content_line,
     };
     use bmux_tui::prelude::{Color, Modifier, Span, Style};
     use pulldown_cmark::Alignment;
@@ -3079,6 +3269,56 @@ mod tests {
         assert!(lines.iter().flat_map(|line| &line.spans).any(|span| {
             span.content.contains("┌─ rust") && span.style == Style::new().fg(Color::Magenta)
         }));
+    }
+
+    #[test]
+    fn contribution_geometry_tracks_wrapped_unicode_link_cells() {
+        let result = render_markdown(
+            "[a界b](https://example.com)",
+            &MarkdownRenderOptions::new(3).with_document_id("item-1"),
+        );
+        assert_eq!(result.geometry.len(), 1);
+        assert_eq!(result.geometry[0].contribution_id, "item-1:link:0:28");
+        assert_eq!(
+            result.geometry[0]
+                .rects
+                .iter()
+                .map(|rect| (rect.x, rect.y, rect.width, rect.height))
+                .collect::<Vec<_>>(),
+            [(0, 0, 3, 1), (0, 1, 1, 1)]
+        );
+    }
+
+    #[test]
+    fn contribution_geometry_disambiguates_duplicate_link_labels() {
+        let result = render_markdown(
+            "[same](https://one.example) and [same](https://two.example)",
+            &MarkdownRenderOptions::new(80),
+        );
+        assert_eq!(result.geometry.len(), 2);
+        assert_eq!(result.geometry[0].rects[0].x, 0);
+        assert_eq!(result.geometry[1].rects[0].x, 9);
+        assert_ne!(
+            result.geometry[0].contribution_id,
+            result.geometry[1].contribution_id
+        );
+    }
+
+    #[test]
+    fn contribution_geometry_tracks_complete_image_fallback() {
+        let result = render_markdown(
+            "![diagram](https://example.com/image.png)",
+            &MarkdownRenderOptions::new(80),
+        );
+        assert_eq!(result.geometry.len(), 1);
+        assert_eq!(
+            result.geometry[0]
+                .rects
+                .iter()
+                .map(|rect| (rect.x, rect.y, rect.width))
+                .collect::<Vec<_>>(),
+            [(0, 0, 16)]
+        );
     }
 
     #[test]
