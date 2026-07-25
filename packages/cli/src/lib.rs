@@ -7166,6 +7166,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
+        SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
         SessionEventKind::OpaqueEvent { .. } => "opaque_event",
@@ -7531,6 +7532,17 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         SessionEventKind::AssistantReasoningDelta { text }
         | SessionEventKind::AssistantReasoningMessage { text } => {
             println!("thinking: {text}");
+        }
+        SessionEventKind::AssistantReasoningActivity { turn_id, activity } => {
+            println!(
+                "#{} reasoning ({turn_id}) {:?}: {} part(s)",
+                event.sequence,
+                activity.status,
+                activity.parts.len()
+            );
+            for part in &activity.parts {
+                println!("thinking {:?}: {}", part.kind, part.text);
+            }
         }
         SessionEventKind::AssistantDelta { text } => {
             println!("#{} assistant delta: {text}", event.sequence);

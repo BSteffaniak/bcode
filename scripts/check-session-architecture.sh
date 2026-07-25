@@ -67,7 +67,7 @@ done
 
 for fixture in \
   packages/session/fixtures/migrations/unknown-future-event-kind-v39.json \
-  packages/session/fixtures/migrations/future-schema-v40.json \
+  packages/session/fixtures/migrations/future-schema-v41.json \
   packages/session/fixtures/migrations/malformed-json-v39.json \
   packages/session/fixtures/migrations/mismatched-session-id-v39.json \
   packages/session/fixtures/migrations/sequence-gap-v39.jsonl; do
@@ -79,7 +79,7 @@ done
 
 if find packages/session/fixtures/migrations -maxdepth 1 -type f \
     \( -name '*-v[0-9]*.json' -o -name '*-v[0-9]*.jsonl' \) \
-    | grep -Ev -- '-v(39|40)\.jsonl?$' >/tmp/bcode-old-session-fixture-names.txt \
+    | grep -Ev -- '-v(39|40|41)\.jsonl?$' >/tmp/bcode-old-session-fixture-names.txt \
   || ! python3 - <<'PY'
 from pathlib import Path
 import re
@@ -91,7 +91,7 @@ for pattern in ("*.json", "*.jsonl"):
             if not line.strip():
                 continue
             match = re.search(r'"schema_version"\s*:\s*(\d+)', line)
-            if match is None or int(match.group(1)) not in {39, 40}:
+            if match is None or int(match.group(1)) not in {39, 40, 41}:
                 invalid.append(f"{path}:{line_number}")
 if invalid:
     print("\n".join(invalid))

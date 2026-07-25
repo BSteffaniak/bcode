@@ -4096,6 +4096,7 @@ const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
+        SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
         SessionEventKind::OpaqueEvent { .. } => "opaque_event",
@@ -6224,6 +6225,11 @@ mod tests {
             (
                 "future-schema-v40.json",
                 include_str!("../fixtures/migrations/future-schema-v40.json"),
+                ExpectedHistory::Sequences(&[0]),
+            ),
+            (
+                "future-schema-v41.json",
+                include_str!("../fixtures/migrations/future-schema-v41.json"),
                 ExpectedHistory::Sequences(&[0]),
             ),
             (

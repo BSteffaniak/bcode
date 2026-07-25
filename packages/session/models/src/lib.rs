@@ -165,7 +165,7 @@ fn tool_invocation_projection_mut<'a>(
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 39;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 40;
 
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
@@ -2229,6 +2229,13 @@ pub enum SessionEventKind {
     ExecutionSessionCreated {
         provenance: Box<ExecutionSessionProvenance>,
         visibility: SessionVisibility,
+    },
+    /// Complete durable semantic state for one provider-reported reasoning activity.
+    AssistantReasoningActivity {
+        /// Model turn that owns the activity.
+        turn_id: String,
+        /// Complete terminal reasoning activity.
+        activity: ReasoningActivity,
     },
 }
 

@@ -381,6 +381,20 @@ impl TranscriptProjectionBuilder {
             SessionEventKind::AssistantReasoningMessage { text } => {
                 self.finish_stream(TranscriptProjectionItemKind::Reasoning, event, text);
             }
+            SessionEventKind::AssistantReasoningActivity { activity, .. } => {
+                self.flush_streams();
+                let content_bytes = activity
+                    .parts
+                    .iter()
+                    .map(|part| part.text.len())
+                    .sum::<usize>();
+                self.push_item(
+                    TranscriptProjectionItemKind::Reasoning,
+                    event.sequence,
+                    event.sequence,
+                    content_bytes,
+                );
+            }
             SessionEventKind::ToolCallRequested {
                 tool_call_id,
                 arguments_json,

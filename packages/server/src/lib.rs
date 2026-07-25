@@ -11002,6 +11002,90 @@ struct ModelPollOutcome {
     pending_managed_compaction: Option<PendingManagedCompaction>,
     pending_provider_response_id: Option<String>,
     pending_tool_calls: Vec<bcode_model::ToolCall>,
+    reasoning_activities: BTreeMap<String, ReasoningActivityAccumulator>,
+}
+
+#[derive(Debug, Clone)]
+struct ReasoningActivityAccumulator {
+    activity_id: String,
+    order: u32,
+    status: Option<bcode_session_models::ReasoningActivityStatus>,
+    parts: BTreeMap<String, bcode_session_models::ReasoningPart>,
+    opaque: bool,
+}
+
+impl ReasoningActivityAccumulator {
+    const fn new(activity_id: String, order: u32) -> Self {
+        Self {
+            activity_id,
+            order,
+            status: None,
+            parts: BTreeMap::new(),
+            opaque: false,
+        }
+    }
+
+    fn apply(&mut self, event: &bcode_session_models::ReasoningActivityEvent) {
+        use bcode_session_models::ReasoningActivityEvent;
+        match event {
+            ReasoningActivityEvent::Started { .. } => {}
+            ReasoningActivityEvent::PartDelta {
+                part_id,
+                kind,
+                role,
+                part_order,
+                text,
+                ..
+            } => {
+                self.parts
+                    .entry(part_id.clone())
+                    .and_modify(|part| part.text.push_str(text))
+                    .or_insert_with(|| bcode_session_models::ReasoningPart {
+                        part_id: part_id.clone(),
+                        kind: *kind,
+                        role: *role,
+                        order: *part_order,
+                        text: text.clone(),
+                    });
+            }
+            ReasoningActivityEvent::PartCompleted {
+                part_id,
+                kind,
+                role,
+                part_order,
+                text,
+                ..
+            } => {
+                self.parts.insert(
+                    part_id.clone(),
+                    bcode_session_models::ReasoningPart {
+                        part_id: part_id.clone(),
+                        kind: *kind,
+                        role: *role,
+                        order: *part_order,
+                        text: text.clone(),
+                    },
+                );
+            }
+            ReasoningActivityEvent::OpaqueObserved { .. } => self.opaque = true,
+            ReasoningActivityEvent::Finished { status, .. } => self.status = Some(*status),
+        }
+    }
+
+    fn finish(
+        self,
+        fallback_status: bcode_session_models::ReasoningActivityStatus,
+    ) -> bcode_session_models::ReasoningActivity {
+        let mut parts = self.parts.into_values().collect::<Vec<_>>();
+        parts.sort_by_key(|part| (part.order, part.kind, part.part_id.clone()));
+        bcode_session_models::ReasoningActivity {
+            activity_id: self.activity_id,
+            order: self.order,
+            status: self.status.unwrap_or(fallback_status),
+            parts,
+            opaque: self.opaque,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -12764,6 +12848,7 @@ async fn run_model_turn_round(
         outcome.assistant_output = Some(assistant_text.clone());
         append_assistant_message_event(state, session_id, assistant_text).await;
     }
+    persist_reasoning_activities(state, session_id, &request.turn_id, &mut outcome).await;
 
     service_runtime_priority_commands(state, session_id, command_context).await;
     let active_turn = finish_provider_round(command_context).await;
@@ -13441,6 +13526,16 @@ async fn handle_provider_turn_event(
             }
         }
         ProviderTurnEvent::ReasoningActivity { event } => {
+            outcome
+                .reasoning_activities
+                .entry(event.activity_id().to_owned())
+                .or_insert_with(|| {
+                    ReasoningActivityAccumulator::new(
+                        event.activity_id().to_owned(),
+                        event.activity_order(),
+                    )
+                })
+                .apply(&event);
             if let bcode_session_models::ReasoningActivityEvent::PartDelta { text, .. } = &event {
                 stream.push_reasoning(text);
             }
@@ -19392,6 +19487,41 @@ const fn compaction_mode_name(mode: bcode_config::CompactionMode) -> &'static st
     }
 }
 
+async fn persist_reasoning_activities(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    outcome: &mut ModelPollOutcome,
+) {
+    let fallback_status = if outcome.stop_reason == Some(bcode_model::StopReason::Cancelled) {
+        bcode_session_models::ReasoningActivityStatus::Interrupted
+    } else if outcome.stop_reason == Some(bcode_model::StopReason::Error)
+        || outcome
+            .completion
+            .as_ref()
+            .is_some_and(|completion| completion.outcome == ModelTurnOutcome::Error)
+    {
+        bcode_session_models::ReasoningActivityStatus::Failed
+    } else {
+        bcode_session_models::ReasoningActivityStatus::Completed
+    };
+    let mut activities = std::mem::take(&mut outcome.reasoning_activities)
+        .into_values()
+        .map(|activity| activity.finish(fallback_status))
+        .collect::<Vec<_>>();
+    activities.sort_by_key(|activity| (activity.order, activity.activity_id.clone()));
+    for activity in activities {
+        match state
+            .sessions
+            .append_assistant_reasoning_activity(session_id, turn_id.to_owned(), activity)
+            .await
+        {
+            Ok(event) => publish_session_event(state, &event).await,
+            Err(error) => tracing::warn!("failed to append assistant reasoning activity: {error}"),
+        }
+    }
+}
+
 async fn append_assistant_message_event(state: &ServerState, session_id: SessionId, text: String) {
     match state
         .sessions
@@ -21304,6 +21434,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::SessionImported { .. } => "session_imported",
         SessionEventKind::SessionForked { .. } => "session_forked",
         SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
+        SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
         SessionEventKind::OpaqueEvent { .. } => "opaque_event",

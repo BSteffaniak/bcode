@@ -512,6 +512,23 @@ impl SessionView {
                     text,
                 );
             }
+            SessionEventKind::AssistantReasoningActivity { activity, .. } => {
+                let mut parts = activity.parts.iter().collect::<Vec<_>>();
+                parts.sort_by_key(|part| (part.order, part.kind, part.part_id.as_str()));
+                let text = parts
+                    .into_iter()
+                    .map(|part| part.text.as_str())
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                self.push_item(
+                    TranscriptViewItemId::event(event.sequence),
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    StreamingMessageKind::Reasoning.item_kind(text),
+                );
+            }
             SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
                 use bcode_session_models::ToolInvocationLifecycleStage;
                 if self.terminal_invocations.contains(&lifecycle.invocation_id) {
@@ -3193,6 +3210,47 @@ mod tests {
             }
             other => panic!("unexpected item: {other:?}"),
         }
+    }
+
+    #[test]
+    fn durable_reasoning_activity_preserves_part_boundaries() {
+        let session_id = SessionId::new();
+        let snapshot = build_session_view_snapshot(&[event(
+            session_id,
+            1,
+            SessionEventKind::AssistantReasoningActivity {
+                turn_id: "turn-1".to_owned(),
+                activity: bcode_session_models::ReasoningActivity {
+                    activity_id: "reasoning-1".to_owned(),
+                    order: 0,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    parts: vec![
+                        bcode_session_models::ReasoningPart {
+                            part_id: "summary-0".to_owned(),
+                            kind: bcode_session_models::ReasoningContentKind::Summary,
+                            role: bcode_session_models::ReasoningContentRole::Milestone,
+                            order: 0,
+                            text: "First milestone".to_owned(),
+                        },
+                        bcode_session_models::ReasoningPart {
+                            part_id: "summary-1".to_owned(),
+                            kind: bcode_session_models::ReasoningContentKind::Summary,
+                            role: bcode_session_models::ReasoningContentRole::Milestone,
+                            order: 1,
+                            text: "Second milestone".to_owned(),
+                        },
+                    ],
+                    opaque: false,
+                },
+            },
+        )]);
+
+        assert_eq!(snapshot.transcript.items.len(), 1);
+        assert_reasoning_text(
+            &snapshot.transcript.items[0],
+            "First milestone\n\nSecond milestone",
+            false,
+        );
     }
 
     #[test]

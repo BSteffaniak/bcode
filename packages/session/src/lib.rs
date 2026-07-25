@@ -4020,6 +4020,24 @@ impl SessionManager {
             .await
     }
 
+    /// Append one complete terminal provider-reported reasoning activity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_assistant_reasoning_activity(
+        &self,
+        session_id: SessionId,
+        turn_id: String,
+        activity: bcode_session_models::ReasoningActivity,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::AssistantReasoningActivity { turn_id, activity },
+        )
+        .await
+    }
+
     /// Append a tool-call request event to a session.
     ///
     /// # Errors
@@ -8645,6 +8663,10 @@ mod tests {
             (
                 "future-schema-v40.json",
                 include_str!("../fixtures/migrations/future-schema-v40.json"),
+            ),
+            (
+                "future-schema-v41.json",
+                include_str!("../fixtures/migrations/future-schema-v41.json"),
             ),
             (
                 "malformed-json-v39.json",

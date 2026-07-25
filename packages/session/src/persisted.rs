@@ -576,6 +576,10 @@ enum PersistedSessionEventKind {
         provenance: Box<bcode_session_models::ExecutionSessionProvenance>,
         visibility: bcode_session_models::SessionVisibility,
     },
+    AssistantReasoningActivity {
+        turn_id: String,
+        activity: bcode_session_models::ReasoningActivity,
+    },
 }
 
 impl From<&SessionEventKind> for PersistedSessionEventKind {
@@ -846,6 +850,12 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 provenance: provenance.clone(),
                 visibility: *visibility,
             },
+            SessionEventKind::AssistantReasoningActivity { turn_id, activity } => {
+                Self::AssistantReasoningActivity {
+                    turn_id: turn_id.clone(),
+                    activity: activity.clone(),
+                }
+            }
             SessionEventKind::WorkingDirectoryChanged {
                 old_working_directory,
                 new_working_directory,
@@ -1251,6 +1261,9 @@ impl PersistedSessionEventKind {
                 provenance,
                 visibility,
             },
+            Self::AssistantReasoningActivity { turn_id, activity } => {
+                SessionEventKind::AssistantReasoningActivity { turn_id, activity }
+            }
         }
     }
 }
@@ -1259,6 +1272,36 @@ impl PersistedSessionEventKind {
 mod tests {
     use super::*;
     use bcode_session_models::ToolInvocationResult;
+
+    #[test]
+    fn structured_reasoning_activity_round_trips_through_persistence() {
+        let kind = SessionEventKind::AssistantReasoningActivity {
+            turn_id: "turn-1".to_owned(),
+            activity: bcode_session_models::ReasoningActivity {
+                activity_id: "reasoning-1".to_owned(),
+                order: 0,
+                status: bcode_session_models::ReasoningActivityStatus::Completed,
+                parts: vec![bcode_session_models::ReasoningPart {
+                    part_id: "raw-0".to_owned(),
+                    kind: bcode_session_models::ReasoningContentKind::Raw,
+                    role: bcode_session_models::ReasoningContentRole::Detail,
+                    order: 0,
+                    text: "raw detail".to_owned(),
+                }],
+                opaque: true,
+            },
+        };
+
+        let persisted = PersistedSessionEventKind::from(&kind);
+        let decoded = persisted.into_domain();
+
+        assert_eq!(decoded, kind);
+        assert!(
+            !serde_json::to_string(&decoded)
+                .expect("reasoning event should encode")
+                .contains("encrypted_content")
+        );
+    }
 
     #[test]
     fn generic_invocation_result_record_round_trips_through_persistence() {
@@ -1353,7 +1396,7 @@ mod tests {
                 "future_event_kind",
             ),
             (
-                include_str!("../fixtures/migrations/future-schema-v40.json"),
+                include_str!("../fixtures/migrations/future-schema-v41.json"),
                 SessionEventCompatibilityKind::FutureSchema,
                 "assistant_message",
             ),
