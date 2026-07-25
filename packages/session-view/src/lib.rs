@@ -3677,6 +3677,34 @@ mod tests {
     }
 
     #[test]
+    fn durable_terminal_reasoning_states_and_opaque_activity_survive_replay() {
+        let session_id = SessionId::new();
+        for status in [
+            bcode_session_models::ReasoningActivityStatus::Completed,
+            bcode_session_models::ReasoningActivityStatus::Interrupted,
+            bcode_session_models::ReasoningActivityStatus::Failed,
+        ] {
+            let snapshot = build_session_view_snapshot(&[event(
+                session_id,
+                1,
+                SessionEventKind::AssistantReasoningActivity {
+                    turn_id: "turn-1".to_owned(),
+                    activity: bcode_session_models::ReasoningActivity {
+                        activity_id: format!("reasoning-{status:?}"),
+                        order: 0,
+                        status,
+                        parts: Vec::new(),
+                        opaque: true,
+                    },
+                },
+            )]);
+
+            assert_eq!(snapshot.transcript.items.len(), 1);
+            assert_reasoning_text(&snapshot.transcript.items[0], "", false);
+        }
+    }
+
+    #[test]
     fn durable_reasoning_activity_preserves_part_boundaries() {
         let session_id = SessionId::new();
         let snapshot = build_session_view_snapshot(&[event(

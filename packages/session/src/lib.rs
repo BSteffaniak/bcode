@@ -8153,6 +8153,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn structured_reasoning_survives_session_database_restart() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("structured reasoning".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should create");
+        let activity = bcode_session_models::ReasoningActivity {
+            activity_id: "reasoning-1".to_owned(),
+            order: 3,
+            status: bcode_session_models::ReasoningActivityStatus::Interrupted,
+            parts: vec![
+                bcode_session_models::ReasoningPart {
+                    part_id: "summary-0".to_owned(),
+                    kind: bcode_session_models::ReasoningContentKind::Summary,
+                    role: bcode_session_models::ReasoningContentRole::Milestone,
+                    order: 0,
+                    text: "First milestone".to_owned(),
+                },
+                bcode_session_models::ReasoningPart {
+                    part_id: "raw-0".to_owned(),
+                    kind: bcode_session_models::ReasoningContentKind::Raw,
+                    role: bcode_session_models::ReasoningContentRole::Detail,
+                    order: 1,
+                    text: "Completed detail".to_owned(),
+                },
+            ],
+            opaque: true,
+        };
+        manager
+            .append_assistant_reasoning_activity(session.id, "turn-1".to_owned(), activity.clone())
+            .await
+            .expect("reasoning activity should append");
+        drop(manager);
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let history = restored
+            .session_history(session.id)
+            .await
+            .expect("history should load");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::AssistantReasoningActivity { turn_id, activity: stored }
+                if turn_id == "turn-1" && stored == &activity
+        )));
+        let encoded = serde_json::to_string(&history).expect("history should serialize");
+        assert!(!encoded.contains("encrypted_content"));
+        assert!(!encoded.contains("provider_state"));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn attach_uses_db_input_history() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
