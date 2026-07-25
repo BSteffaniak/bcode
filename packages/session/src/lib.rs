@@ -247,26 +247,6 @@ async fn create_verified_migration_backup(
     metrics: &MetricsRegistry,
     progress: Option<&MigrationProgressReporter>,
 ) -> Result<PathBuf, SessionError> {
-    let source = root.join(session_id.to_string());
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis());
-    let destination = root
-        .parent()
-        .unwrap_or(root)
-        .join("session-migration-backups")
-        .join(format!("{timestamp}-{session_id}-epoch-{writer_epoch}"));
-    let manifest = serde_json::to_vec_pretty(&serde_json::json!({
-        "session_id": session_id,
-        "source_writer_epoch": writer_epoch,
-        "target_writer_epoch": db::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
-        "created_at_ms": u64::try_from(timestamp).unwrap_or(u64::MAX),
-    }))
-    .map_err(|error| SessionError::MigrationBackup {
-        session_id,
-        reason: error.to_string(),
-    })?;
-    let backup_destination = destination.clone();
     let backup_progress = progress.cloned().map(|progress| {
         Arc::new(move |update: SessionMigrationProgress| {
             if let (Some(completed), Some(total), Some(unit)) =
@@ -283,10 +263,13 @@ async fn create_verified_migration_backup(
             }
         }) as bcode_session_migration::BackupProgressCallback
     });
-    let result = bcode_session_migration::create_verified_migration_backup(
-        &source,
-        &backup_destination,
-        &manifest,
+    let result = bcode_session_migration::create_retained_migration_backup(
+        bcode_session_migration::MigrationBackupRequest {
+            sessions_root: root.to_path_buf(),
+            session_id,
+            source_writer_epoch: writer_epoch,
+            target_writer_epoch: u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+        },
         backup_progress,
     )
     .await
@@ -308,7 +291,7 @@ async fn create_verified_migration_backup(
     );
     metrics.add_counter("session.migration.backup.files_total", result.files);
     metrics.add_counter("session.migration.backup.bytes_total", result.bytes);
-    Ok(destination)
+    Ok(result.path)
 }
 
 fn duration_millis(duration: std::time::Duration) -> u64 {

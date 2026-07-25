@@ -16,7 +16,8 @@ mod registry;
 
 pub use audit::SessionMigrationReceipt;
 pub use backup::{
-    BackupProgressCallback, MigrationBackupError, VerifiedMigrationBackup,
+    BackupProgressCallback, MigrationBackupError, MigrationBackupManifest, MigrationBackupRequest,
+    RetainedMigrationBackup, VerifiedMigrationBackup, create_retained_migration_backup,
     create_verified_migration_backup,
 };
 pub use operation::{SessionMigrationOperation, SessionMigrationOperations};

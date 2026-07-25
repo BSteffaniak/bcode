@@ -373,8 +373,137 @@ pub fn decode_for_migration(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::Deserialize;
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
 
     const SESSION_ID: &str = "00000000-0000-0000-0000-000000000001";
+
+    #[derive(Debug, Deserialize)]
+    struct FixtureManifest {
+        format_version: u32,
+        fixtures: Vec<FixtureManifestEntry>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FixtureManifestEntry {
+        path: PathBuf,
+        source_writer_epochs: Vec<u64>,
+        event_schemas: Vec<u16>,
+        expected_event_count: usize,
+        expected_classifications: FixtureClassificationCounts,
+        covered_event_kinds: Vec<String>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FixtureClassificationCounts {
+        converted: usize,
+        retired_known: usize,
+        current_passthrough: usize,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct FixtureEnvelope {
+        schema_version: u16,
+        sequence: u64,
+        kind: BTreeMap<String, serde_json::Value>,
+    }
+
+    #[test]
+    fn fixture_manifest_enforces_complete_sanitized_inventory() {
+        let manifest: FixtureManifest =
+            serde_json::from_str(include_str!("../fixtures/manifest.json"))
+                .expect("fixture manifest");
+        assert_eq!(manifest.format_version, 1);
+        assert!(!manifest.fixtures.is_empty());
+
+        let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let listed_paths = manifest
+            .fixtures
+            .iter()
+            .map(|fixture| fixture.path.clone())
+            .collect::<BTreeSet<_>>();
+        let actual_paths = std::fs::read_dir(fixture_root.join("stores"))
+            .expect("fixture directory")
+            .map(|entry| PathBuf::from("stores").join(entry.expect("fixture entry").file_name()))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            listed_paths, actual_paths,
+            "fixture manifest must be exhaustive"
+        );
+
+        for fixture in manifest.fixtures {
+            assert!(!fixture.source_writer_epochs.is_empty());
+            let contents =
+                std::fs::read_to_string(fixture_root.join(&fixture.path)).expect("listed fixture");
+            let payloads = contents.lines().collect::<Vec<_>>();
+            assert_eq!(payloads.len(), fixture.expected_event_count);
+            let envelopes = payloads
+                .iter()
+                .map(|payload| serde_json::from_str::<FixtureEnvelope>(payload))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("fixture envelopes");
+            assert_eq!(
+                envelopes
+                    .iter()
+                    .map(|event| event.sequence)
+                    .collect::<Vec<_>>(),
+                (0..u64::try_from(envelopes.len()).expect("fixture length")).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                envelopes
+                    .iter()
+                    .map(|event| event.schema_version)
+                    .collect::<BTreeSet<_>>(),
+                fixture.event_schemas.into_iter().collect()
+            );
+            assert_eq!(
+                envelopes
+                    .iter()
+                    .flat_map(|event| event.kind.keys().cloned())
+                    .collect::<BTreeSet<_>>(),
+                fixture.covered_event_kinds.into_iter().collect()
+            );
+
+            let historical_payloads = payloads
+                .iter()
+                .zip(&envelopes)
+                .filter(|(_, event)| {
+                    event.kind.keys().any(|kind| {
+                        matches!(
+                            kind.as_str(),
+                            "tool_invocation_stream"
+                                | "tool_call_finished"
+                                | "context_usage_observed"
+                        )
+                    })
+                })
+                .map(|(payload, _)| *payload)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                payloads.len() - historical_payloads.len(),
+                fixture.expected_classifications.current_passthrough
+            );
+            let decoded = historical_payloads
+                .iter()
+                .map(|payload| decode_for_migration(payload, reject_current))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("fixture migration classifications");
+            let converted = decoded
+                .iter()
+                .filter(|event| matches!(event, HistoricalDecode::Converted { .. }))
+                .count();
+            let retired_known = decoded
+                .iter()
+                .filter(|event| matches!(event, HistoricalDecode::RetiredKnown { .. }))
+                .count();
+            assert_eq!(converted, fixture.expected_classifications.converted);
+            assert_eq!(
+                retired_known,
+                fixture.expected_classifications.retired_known
+            );
+        }
+    }
 
     fn reject_current(_: &str) -> Result<SessionEvent, String> {
         Err("not current".to_owned())

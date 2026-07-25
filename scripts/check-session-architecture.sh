@@ -203,7 +203,9 @@ if ! rg -q 'CURRENT_WRITER_EPOCH: u32 = 5' packages/session-migration/src/regist
 fi
 
 if ! rg -q 'historical_codec_never_applies_schema_28_rules_to_other_schemas' packages/session-migration/src/historical.rs \
-  || ! rg -q 'schema_28_store_fixture_classifies_affected_historical_events' packages/session-migration/src/historical.rs; then
+  || ! rg -q 'schema_28_store_fixture_classifies_affected_historical_events' packages/session-migration/src/historical.rs \
+  || ! rg -q 'fixture_manifest_enforces_complete_sanitized_inventory' packages/session-migration/src/historical.rs \
+  || ! test -f packages/session-migration/fixtures/manifest.json; then
   echo "Session historical-codec violation: released schema rules and exact fixture classifications must remain explicit." >&2
   violations=1
 fi

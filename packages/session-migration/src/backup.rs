@@ -1,19 +1,63 @@
 use bcode_session_models::{
-    SessionMigrationProgress, SessionMigrationProgressUnit, SessionMigrationStage,
+    SessionId, SessionMigrationProgress, SessionMigrationProgressUnit, SessionMigrationStage,
 };
+use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufReader, BufWriter, ErrorKind, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const BACKUP_BUFFER_BYTES: usize = 64 * 1024;
 
 /// Progress callback for retained migration-backup planning, copying, and verification.
 pub type BackupProgressCallback = Arc<dyn Fn(SessionMigrationProgress) + Send + Sync>;
+
+/// Metadata written alongside a verified retained migration backup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MigrationBackupManifest {
+    /// Session identifier whose physical store was retained.
+    pub session_id: SessionId,
+    /// Writer epoch observed before migration.
+    pub source_writer_epoch: u64,
+    /// Writer epoch the migration intends to produce.
+    pub target_writer_epoch: u64,
+    /// Backup creation time as Unix epoch milliseconds.
+    pub created_at_ms: u64,
+}
+
+/// Request to create a verified retained migration backup using the standard storage layout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationBackupRequest {
+    /// Canonical sessions storage root.
+    pub sessions_root: PathBuf,
+    /// Session identifier and canonical directory name.
+    pub session_id: SessionId,
+    /// Writer epoch observed before migration.
+    pub source_writer_epoch: u64,
+    /// Writer epoch the migration intends to produce.
+    pub target_writer_epoch: u64,
+}
+
+/// Timing, size, and retained path for one verified migration backup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedMigrationBackup {
+    /// Retained backup directory.
+    pub path: PathBuf,
+    /// Number of copied source files.
+    pub files: u64,
+    /// Total copied source bytes.
+    pub bytes: u64,
+    /// Time spent enumerating source files.
+    pub plan_duration: Duration,
+    /// Time spent streaming and hashing source files.
+    pub copy_duration: Duration,
+    /// Time spent verifying destination lengths and hashes.
+    pub verify_duration: Duration,
+}
 
 /// Timing and size measurements for one verified retained backup.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +77,12 @@ pub struct VerifiedMigrationBackup {
 /// Failure to create a verified retained migration backup.
 #[derive(Debug, Error)]
 pub enum MigrationBackupError {
+    /// The system clock is earlier than the Unix epoch.
+    #[error("system clock is earlier than the Unix epoch")]
+    Clock,
+    /// The backup manifest could not be serialized.
+    #[error("backup manifest serialization failed: {0}")]
+    Manifest(#[from] serde_json::Error),
     /// The blocking backup worker failed to join.
     #[error("backup worker failed: {0}")]
     Worker(#[from] tokio::task::JoinError),
@@ -48,6 +98,51 @@ enum BackupCopyFault {
     PermissionDenied,
     #[cfg(test)]
     ShortWriteAfter(u64),
+}
+
+/// Create a retained physical backup using the canonical session-backup layout and manifest.
+///
+/// # Errors
+///
+/// Returns an error if the clock is invalid, manifest serialization fails, the source cannot be
+/// copied, the destination conflicts, destination verification fails, or the worker cannot run.
+pub async fn create_retained_migration_backup(
+    request: MigrationBackupRequest,
+    progress: Option<BackupProgressCallback>,
+) -> Result<RetainedMigrationBackup, MigrationBackupError> {
+    let created_at_ms = u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| MigrationBackupError::Clock)?
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX);
+    let source = request.sessions_root.join(request.session_id.to_string());
+    let destination = request
+        .sessions_root
+        .parent()
+        .unwrap_or(&request.sessions_root)
+        .join("session-migration-backups")
+        .join(format!(
+            "{}-{}-epoch-{}",
+            created_at_ms, request.session_id, request.source_writer_epoch
+        ));
+    let manifest = serde_json::to_vec_pretty(&MigrationBackupManifest {
+        session_id: request.session_id,
+        source_writer_epoch: request.source_writer_epoch,
+        target_writer_epoch: request.target_writer_epoch,
+        created_at_ms,
+    })?;
+    let result =
+        create_verified_migration_backup(&source, &destination, &manifest, progress).await?;
+    Ok(RetainedMigrationBackup {
+        path: destination,
+        files: result.files,
+        bytes: result.bytes,
+        plan_duration: result.plan_duration,
+        copy_duration: result.copy_duration,
+        verify_duration: result.verify_duration,
+    })
 }
 
 /// Create and hash-verify a retained physical migration backup off the async runtime worker.
@@ -331,6 +426,45 @@ fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn retained_backup_owns_layout_and_manifest_policy() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sessions_root = temp.path().join("sessions");
+        let session_id = SessionId::new();
+        let source = sessions_root.join(session_id.to_string());
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("session.db"), b"canonical").expect("database");
+
+        let result = create_retained_migration_backup(
+            MigrationBackupRequest {
+                sessions_root,
+                session_id,
+                source_writer_epoch: 2,
+                target_writer_epoch: 5,
+            },
+            None,
+        )
+        .await
+        .expect("retained backup");
+
+        assert_eq!(
+            fs::read(result.path.join("session.db")).expect("database"),
+            b"canonical"
+        );
+        assert_eq!(
+            result.path.parent(),
+            Some(temp.path().join("session-migration-backups").as_path())
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(result.path.join("migration-backup.json")).expect("manifest"),
+        )
+        .expect("manifest json");
+        assert_eq!(manifest["session_id"], session_id.to_string());
+        assert_eq!(manifest["source_writer_epoch"], 2);
+        assert_eq!(manifest["target_writer_epoch"], 5);
+        assert!(manifest["created_at_ms"].as_u64().is_some());
+    }
 
     #[test]
     fn streaming_backup_handles_nested_empty_and_large_files() {

@@ -1,0 +1,23 @@
+{
+  "format_version": 1,
+  "fixtures": [
+    {
+      "path": "stores/schema-28-tool-context.jsonl",
+      "source_writer_epochs": [2],
+      "event_schemas": [28],
+      "expected_event_count": 5,
+      "expected_classifications": {
+        "converted": 2,
+        "retired_known": 1,
+        "current_passthrough": 2
+      },
+      "covered_event_kinds": [
+        "session_created",
+        "tool_call_requested",
+        "tool_invocation_stream",
+        "tool_call_finished",
+        "context_usage_observed"
+      ]
+    }
+  ]
+}

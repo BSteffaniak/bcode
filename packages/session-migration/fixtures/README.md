@@ -23,6 +23,13 @@ Expected migration treatment:
   streaming behavior.
 * flat `context_usage_observed` converts to `RequestContextObserved`.
 
+## Manifest
+
+`manifest.json` is the machine-enforced inventory for permanent sanitized fixtures. Every listed
+path must exist, contain exactly the declared contiguous event count and schemas, cover exactly the
+declared event kinds, and produce the declared migration classifications. Fixture files not listed
+in the manifest fail the inventory test.
+
 A complete migration must normalize all canonical payloads to the current event schema, rebuild
 current projections, produce zero compatibility issues, pass write readiness, and permit a new
 append.
