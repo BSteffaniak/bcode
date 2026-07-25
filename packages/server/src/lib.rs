@@ -32357,6 +32357,135 @@ library = "test"
         server.abort();
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One real-IPC fixture covers flood bounds, coalescing, disconnect, and checkpoint convergence.
+    async fn slow_client_progress_flood_converges_to_latest_checkpoint_after_reconnect() {
+        let workspace = tempfile::tempdir().expect("slow client workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent session manager");
+        let session = sessions
+            .create_session(
+                Some("slow live client".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("session");
+        let session_id = session.id;
+        let state = Arc::new(test_server_state(sessions));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut slow = client.connect("slow-live-client").await.expect("connect");
+        slow.attach_session_projection_window_with_input_history(
+            session_id,
+            projection_ipc_window_request(
+                bcode_session_models::ProjectionWindowAnchor::Latest,
+                bcode_session_models::ProjectionWindowDirection::Backward,
+            ),
+        )
+        .await
+        .expect("attach slow client");
+
+        for revision in 1..=10_000 {
+            publish_tool_request_draft_live(
+                &state,
+                session_id,
+                request_draft_event(
+                    "call-slow",
+                    1,
+                    revision,
+                    bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: format!("latest-{revision}"),
+                    },
+                ),
+            )
+            .await;
+        }
+        tokio::time::sleep(SESSION_LIVE_FAN_OUT_FLUSH_INTERVAL * 2).await;
+        let metrics = state.metrics.snapshot();
+        assert!(
+            metrics
+                .counters
+                .get("server.live_state.coalesced_updates_total")
+                .copied()
+                .unwrap_or_default()
+                > 0
+        );
+        assert!(
+            metrics
+                .gauges
+                .get("server.live_state.pending_subscriber_keys")
+                .copied()
+                .unwrap_or_default()
+                <= i64::try_from(MAX_PENDING_LIVE_KEYS_PER_CLIENT).unwrap_or(i64::MAX)
+        );
+        assert!(
+            metrics
+                .gauges
+                .get("server.live_state.pending_subscriber_bytes")
+                .copied()
+                .unwrap_or_default()
+                <= i64::try_from(MAX_PENDING_LIVE_BYTES_PER_CLIENT).unwrap_or(i64::MAX)
+        );
+
+        let mut keeper = client.connect("slow-live-keeper").await.expect("keeper");
+        keeper
+            .attach_session_projection_window_with_input_history(
+                session_id,
+                projection_ipc_window_request(
+                    bcode_session_models::ProjectionWindowAnchor::Latest,
+                    bcode_session_models::ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .expect("keeper attach");
+        drop(slow);
+        let mut reconnected = client
+            .connect("slow-live-reconnect")
+            .await
+            .expect("reconnect");
+        reconnected
+            .attach_session_projection_window_with_input_history(
+                session_id,
+                projection_ipc_window_request(
+                    bcode_session_models::ProjectionWindowAnchor::Latest,
+                    bcode_session_models::ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .expect("reattach");
+        let checkpoint = tokio::time::timeout(Duration::from_secs(2), reconnected.recv_event())
+            .await
+            .expect("checkpoint timeout")
+            .expect("checkpoint");
+        assert!(matches!(
+            checkpoint,
+            bcode_ipc::Event::SessionLive(bcode_session_models::SessionLiveEvent {
+                kind: SessionLiveEventKind::ToolRequestDraft { event },
+                ..
+            }) if event.revision == 10_000
+                && matches!(
+                    event.operation,
+                    bcode_session_models::ToolRequestDraftOperation::Checkpoint { ref text, .. }
+                        if text == "latest-10000"
+                )
+        ));
+        drop(keeper);
+        server.abort();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn permission_resolution_crosses_real_ipc_and_persists_resolution() {
