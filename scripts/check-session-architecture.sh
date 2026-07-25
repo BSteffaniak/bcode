@@ -190,6 +190,9 @@ fi
 if ! rg -q 'CURRENT_WRITER_EPOCH: u32 = 5' packages/session-migration/src/inventory.rs \
   || ! rg -q 'RELEASED_HISTORICAL_EVENT_SCHEMAS' packages/session-migration/src/inventory.rs \
   || ! rg -q 'plan_writer_epoch_migration' packages/session-migration/src/planning.rs \
+  || rg -n 'CURRENT_WRITER_EPOCH|RELEASED_HISTORICAL_EVENT_SCHEMAS|MIGRATION_STEPS' packages/session/src \
+    --glob '*.rs' | rg -v 'CURRENT_SESSION_STORAGE_WRITER_EPOCH' \
+    >/tmp/bcode-current-historical-inventory-violations.txt \
   || ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =' packages/session/src/lease.rs \
   || ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5' packages/ipc/src/lib.rs \
   || ! rg -q 'session_event_schema_version' packages/ipc/src/lib.rs \
@@ -201,12 +204,14 @@ if ! rg -q 'CURRENT_WRITER_EPOCH: u32 = 5' packages/session-migration/src/invent
   || ! rg -q 'broken_epoch_four_compatibility_state_is_rebuilt_to_writable_epoch_five' packages/session/src/db.rs \
   || ! rg -q 'unknown_legacy_history_preparation_fails_closed' packages/session/src/lib.rs; then
   echo "Session compatibility-projection violation: epoch-5 migration must normalize known history, reject unresolved history atomically, and retain bounded compatibility reporting." >&2
+  cat /tmp/bcode-current-historical-inventory-violations.txt >&2 2>/dev/null || true
   violations=1
 fi
 
-if ! rg -q 'historical_codec_never_applies_schema_28_rules_to_other_schemas' packages/session-migration/src/historical.rs \
-  || ! rg -q 'schema_28_store_fixture_classifies_affected_historical_events' packages/session-migration/src/historical.rs \
-  || ! rg -q 'fixture_manifest_enforces_complete_sanitized_inventory' packages/session-migration/src/historical.rs \
+if ! rg -q 'historical_codec_never_applies_schema_28_rules_to_other_schemas' packages/session-migration/src/execution.rs \
+  || ! rg -q 'pub fn normalize_canonical_event' packages/session-migration/src/execution.rs \
+  || ! rg -q 'schema_28_store_fixture_classifies_affected_historical_events' packages/session-migration/src/execution.rs \
+  || ! rg -q 'fixture_manifest_enforces_complete_sanitized_inventory' packages/session-migration/src/execution.rs \
   || ! rg -q 'pub mod schema_28' packages/session-migration/src/codec.rs \
   || ! rg -q 'pub enum HistoricalDecode' packages/session-migration/src/classification.rs \
   || ! test -f packages/session-migration/fixtures/manifest.json; then
@@ -215,6 +220,8 @@ if ! rg -q 'historical_codec_never_applies_schema_28_rules_to_other_schemas' pac
 fi
 
 if ! rg -q 'pub enum SessionDiagnosisClassification' packages/session-migration/src/diagnosis.rs \
+  || ! rg -q 'pub struct SessionMigrationDiagnosis' packages/session-migration/src/diagnosis.rs \
+  || ! rg -q 'pub struct SessionMigrationOwnerDiagnosis' packages/session-migration/src/diagnosis.rs \
   || ! rg -q 'classify_session_diagnosis' packages/session-migration/src/diagnosis.rs \
   || rg -q '^enum SessionDiagnosisClassification' packages/cli/src/lib.rs; then
   echo "Session diagnosis ownership violation: historical/current/future diagnosis policy must remain migration-owned and CLI must only adapt database facts." >&2
@@ -304,10 +311,15 @@ if rg -n 'join\("session-storage"\)|writer-epoch-' packages/session/src --glob '
   || ! rg -q 'historical_session_has_active_owner' packages/session/src/migration_adapter.rs \
   || ! rg -q 'relocate_historical_session' packages/session/src/migration_adapter.rs \
   || rg -n 'diagnose_accidental_epoch_session_root|recover_accidental_epoch_session_root' packages/session/src --glob '*.rs' \
-    >/tmp/bcode-current-historical-policy-violations.txt; then
+    | rg -v 'packages/session/src/migration_adapter\.rs' \
+    >/tmp/bcode-current-historical-policy-violations.txt \
+  || sed '/#\[cfg(test)\]/,$d' packages/session/src/migration_adapter.rs \
+    | rg -n 'diagnose_accidental_epoch_session_root|recover_accidental_epoch_session_root' \
+    >/tmp/bcode-current-historical-adapter-policy-violations.txt; then
   echo "Session historical-root violation: historical layout discovery and recovery policy must remain migration-owned." >&2
   cat /tmp/bcode-current-historical-session-root-violations.txt >&2 2>/dev/null || true
   cat /tmp/bcode-current-historical-policy-violations.txt >&2 2>/dev/null || true
+  cat /tmp/bcode-current-historical-adapter-policy-violations.txt >&2 2>/dev/null || true
   violations=1
 fi
 
@@ -547,10 +559,10 @@ if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 15' packages/ipc/src/lib.rs \
 fi
 
 if ! rg -q 'pub mod schema_28' packages/session-migration/src/codec.rs \
-  || ! rg -q '28 => schema_28::decode' packages/session-migration/src/historical.rs \
+  || ! rg -q '28 => schema_28::decode' packages/session-migration/src/execution.rs \
   || ! rg -q 'ToolArtifactDto' packages/session-migration/src/codec.rs \
   || rg -n 'Artifact \{ artifact: Box<ToolArtifact> \}' packages/session-migration/src/codec.rs >/tmp/bcode-mutable-historical-artifact-dto.txt \
-  || ! rg -q 'decode_for_migration' packages/session/src/db.rs \
+  || ! rg -q 'normalize_canonical_event' packages/session/src/db.rs \
   || ! rg -q 'decode_session_event_compatible' packages/session/src/persisted.rs \
   || ! rg -q 'normal_history_reads_preserve_future_events_without_mutation' packages/session/src/db.rs \
   || ! sed -n '/"tool_invocation_stream" =>/,/}),/p' packages/session-migration/src/codec.rs | grep -q 'RetiredKnown' \

@@ -9,7 +9,7 @@ use bcode_session_models::{
 use serde::Deserialize;
 
 use crate::classification::{HistoricalDecode, HistoricalEventMetadata};
-use crate::historical::HistoricalSessionEventError;
+use crate::execution::HistoricalSessionEventError;
 
 #[derive(Debug, Deserialize)]
 pub struct HistoricalEnvelope {

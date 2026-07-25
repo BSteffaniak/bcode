@@ -1,7 +1,10 @@
-use crate::classification::HistoricalDecode;
+//! Historical canonical normalization and conversion into current session events.
+
+use crate::classification::{HistoricalDecode, HistoricalEventMetadata};
 use crate::codec::{HistoricalEnvelope, schema_28};
 use bcode_session_models::SessionEvent;
 use sha2::{Digest as _, Sha256};
+#[cfg(test)]
 use std::collections::BTreeMap;
 use thiserror::Error;
 
@@ -39,6 +42,43 @@ pub enum HistoricalSessionEventError {
     },
 }
 
+/// Result of normalizing one canonical payload for migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedCanonicalEvent {
+    /// Current event ready for canonical replacement and projector ingestion.
+    pub event: SessionEvent,
+    /// Historical source metadata when explicit conversion or inert preservation occurred.
+    pub historical: Option<HistoricalEventMetadata>,
+    /// Whether the historical event is intentionally inert current history.
+    pub retired_known: bool,
+}
+
+/// Normalize one canonical payload into the final current representation.
+///
+/// `decode_current` must be the strict current persistence decoder. Historical adapters are used
+/// only after that decoder rejects the payload. The resulting event schema is always the supplied
+/// current schema.
+///
+/// # Errors
+///
+/// Returns an error when historical decoding fails.
+pub fn normalize_canonical_event(
+    payload: &str,
+    current_schema: u16,
+    decode_current: impl FnOnce(&str) -> Result<SessionEvent, String>,
+) -> Result<NormalizedCanonicalEvent, HistoricalSessionEventError> {
+    let decoded = decode_for_migration(payload, decode_current)?;
+    let historical = decoded.metadata().cloned();
+    let retired_known = decoded.is_retired_known();
+    let mut event = decoded.into_event();
+    event.schema_version = current_schema;
+    Ok(NormalizedCanonicalEvent {
+        event,
+        historical,
+        retired_known,
+    })
+}
+
 /// Compute the stable digest used for ordered canonical migration audit.
 #[must_use]
 pub fn ordered_payload_digest<'a>(payloads: impl IntoIterator<Item = &'a str>) -> String {
@@ -52,8 +92,9 @@ pub fn ordered_payload_digest<'a>(payloads: impl IntoIterator<Item = &'a str>) -
 }
 
 /// Accumulate converted and retired-known audit counts.
+#[cfg(test)]
 #[must_use]
-pub fn historical_conversion_counts<'a>(
+fn historical_conversion_counts<'a>(
     decoded: impl IntoIterator<Item = &'a HistoricalDecode>,
 ) -> (BTreeMap<String, u64>, BTreeMap<String, u64>) {
     let mut converted = BTreeMap::new();
@@ -84,7 +125,7 @@ pub fn historical_conversion_counts<'a>(
 /// Returns an error when the stable envelope is malformed, the source kind was
 /// never released by a supported Bcode writer, or conversion would require
 /// inventing semantics absent from the source payload.
-pub fn decode_for_migration(
+fn decode_for_migration(
     payload: &str,
     decode_current: impl FnOnce(&str) -> Result<SessionEvent, String>,
 ) -> Result<HistoricalDecode, HistoricalSessionEventError> {
@@ -441,6 +482,29 @@ mod tests {
         assert_eq!(converted.get("28:tool_call_finished"), Some(&1));
         assert_eq!(converted.get("28:context_usage_observed"), Some(&1));
         assert_eq!(retired.get("28:tool_invocation_stream"), Some(&1));
+    }
+
+    #[test]
+    fn canonical_normalization_always_materializes_the_requested_current_schema() {
+        let current_payload = format!(
+            r#"{{"schema_version":39,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"session_created":{{"summary":{{"id":"{SESSION_ID}","title":"fixture","cwd":"/tmp","created_at_ms":1,"updated_at_ms":1}}}}}}}}"#
+        );
+        let normalized = normalize_canonical_event(&current_payload, 40, |payload| {
+            serde_json::from_str(payload).map_err(|error| error.to_string())
+        })
+        .expect("normalize current-compatible event");
+        assert_eq!(normalized.event.schema_version, 40);
+        assert!(normalized.historical.is_none());
+        assert!(!normalized.retired_known);
+
+        let historical_payload = format!(
+            r#"{{"schema_version":28,"sequence":8,"timestamp_ms":9,"session_id":"{SESSION_ID}","kind":{{"context_usage_observed":{{"snapshot":{{"provider_plugin_id":"provider","model_id":"model","input_tokens":123,"context_through_sequence":4,"request_id":"request","model_turn_id":"turn","round":0,"request_fingerprint":"fingerprint","auth_profile":"profile","estimated_input_tokens":120,"context_format_version":null,"compatibility_key":null,"source":"estimated"}}}}}}}}"#
+        );
+        let normalized = normalize_canonical_event(&historical_payload, 40, reject_current)
+            .expect("normalize historical event");
+        assert_eq!(normalized.event.schema_version, 40);
+        assert_eq!(normalized.historical.expect("metadata").source_schema, 28);
+        assert!(!normalized.retired_known);
     }
 
     #[test]

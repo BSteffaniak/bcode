@@ -1,7 +1,48 @@
 //! Migration-owned diagnosis classification for current, released historical, future, and damaged stores.
 
+use bcode_session_models::{SessionId, SessionOpenOperationId};
+use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
+
+/// Identity and coordination details for a live owner blocking migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMigrationOwnerDiagnosis {
+    /// Daemon instance that currently owns the source session.
+    pub daemon_instance_id: String,
+    /// Owning process identifier, when available.
+    pub process_id: Option<u32>,
+    /// Owner start timestamp in Unix milliseconds, when available.
+    pub started_at_ms: Option<u64>,
+}
+
+/// Migration-specific diagnosis facts composed with current store health.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMigrationDiagnosis {
+    /// Session being diagnosed.
+    pub session_id: SessionId,
+    /// Stable diagnosis classification.
+    pub classification: SessionDiagnosisClassification,
+    /// Historical source writer epoch, when applicable.
+    pub source_writer_epoch: Option<u32>,
+    /// Writer epoch required by this build.
+    pub target_writer_epoch: u32,
+    /// Ordered migration steps required to reach the target writer.
+    pub migration_step_ids: Vec<String>,
+    /// Operation currently waiting or running for this session.
+    pub operation_id: Option<SessionOpenOperationId>,
+    /// Whether migration is waiting for exclusive ownership.
+    pub waiting_for_owner: bool,
+    /// Live owner preventing migration, when known.
+    pub owner: Option<SessionMigrationOwnerDiagnosis>,
+    /// Latest retained verified backup for this source, when available.
+    pub retained_backup_path: Option<PathBuf>,
+    /// Actionable recovery guidance.
+    pub recovery_guidance: Option<String>,
+}
+
 /// Final diagnosis classification presented by CLI and support tooling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionDiagnosisClassification {
     /// Store is current and writable.
     CurrentReady,
@@ -79,6 +120,33 @@ pub const fn classify_session_diagnosis(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_diagnosis_serializes_process_boundary_fields() {
+        let session_id = SessionId::new();
+        let operation_id = SessionOpenOperationId::new();
+        let diagnosis = SessionMigrationDiagnosis {
+            session_id,
+            classification: SessionDiagnosisClassification::BlockedOwner,
+            source_writer_epoch: Some(4),
+            target_writer_epoch: 5,
+            migration_step_ids: vec!["session-writer-epoch-4-to-5".to_owned()],
+            operation_id: Some(operation_id),
+            waiting_for_owner: true,
+            owner: Some(SessionMigrationOwnerDiagnosis {
+                daemon_instance_id: "daemon-1".to_owned(),
+                process_id: Some(42),
+                started_at_ms: Some(10),
+            }),
+            retained_backup_path: Some(PathBuf::from("backup/session")),
+            recovery_guidance: Some("stop the owning daemon and retry".to_owned()),
+        };
+
+        let encoded = serde_json::to_string(&diagnosis).expect("serialize diagnosis");
+        let decoded = serde_json::from_str::<SessionMigrationDiagnosis>(&encoded)
+            .expect("deserialize diagnosis");
+        assert_eq!(decoded, diagnosis);
+    }
 
     #[test]
     fn classification_distinguishes_every_required_state() {

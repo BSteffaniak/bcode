@@ -67,11 +67,97 @@ pub fn relocate_historical_session(
 }
 
 /// Map migration-owned storage recovery errors into the current adapter error.
+#[must_use]
 pub fn map_historical_storage_error(
     error: HistoricalStorageError<SessionStorageRecoveryError>,
 ) -> SessionStorageRecoveryError {
     match error {
         HistoricalStorageError::Io(error) => SessionStorageRecoveryError::Io(error),
         HistoricalStorageError::Coordination(error) => error,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recovery_relocates_once_and_is_idempotent() {
+        let state = tempfile::tempdir().expect("state");
+        let session_id = SessionId::new();
+        let historical = bcode_session_migration::accidental_epoch_session_root(state.path());
+        let source = historical.join(session_id.to_string());
+        let canonical = state.path().join("sessions");
+        let destination = canonical.join(session_id.to_string());
+        fs::create_dir_all(&source).expect("source");
+        fs::write(source.join("session.db"), b"fixture").expect("fixture");
+
+        let report = bcode_session_migration::recover_accidental_epoch_session_root(
+            state.path(),
+            relocate_historical_session,
+        )
+        .map_err(map_historical_storage_error)
+        .expect("recover");
+        assert_eq!(report.relocated, vec![session_id]);
+        assert_eq!(
+            fs::read(destination.join("session.db")).expect("moved"),
+            b"fixture"
+        );
+        assert_eq!(
+            bcode_session_migration::recover_accidental_epoch_session_root(
+                state.path(),
+                relocate_historical_session,
+            )
+            .map_err(map_historical_storage_error)
+            .expect("repeat"),
+            bcode_session_migration::HistoricalStorageRecoveryReport::default()
+        );
+    }
+
+    #[test]
+    fn recovery_reports_destination_conflict_without_merging() {
+        let state = tempfile::tempdir().expect("state");
+        let session_id = SessionId::new();
+        let historical = bcode_session_migration::accidental_epoch_session_root(state.path());
+        let source = historical.join(session_id.to_string());
+        let destination = state.path().join("sessions").join(session_id.to_string());
+        fs::create_dir_all(&source).expect("source");
+        fs::create_dir_all(&destination).expect("destination");
+        fs::write(source.join("source"), b"source").expect("source fixture");
+        fs::write(destination.join("destination"), b"destination").expect("destination fixture");
+
+        let report = bcode_session_migration::recover_accidental_epoch_session_root(
+            state.path(),
+            relocate_historical_session,
+        )
+        .map_err(map_historical_storage_error)
+        .expect("recover");
+        assert_eq!(report.destination_conflicts, vec![session_id]);
+        assert!(source.join("source").exists());
+        assert!(destination.join("destination").exists());
+    }
+
+    #[test]
+    fn recovery_reports_live_owner_without_moving_session() {
+        let state = tempfile::tempdir().expect("state");
+        let historical = bcode_session_migration::accidental_epoch_session_root(state.path());
+        let session_id = SessionId::new();
+        let source = historical.join(session_id.to_string());
+        fs::create_dir_all(&source).expect("source");
+        let _owner = crate::lease::acquire_session_lease(
+            &historical,
+            session_id,
+            &crate::lease::SessionLeaseOwnerContext::default(),
+        )
+        .expect("owner");
+
+        let report = bcode_session_migration::recover_accidental_epoch_session_root(
+            state.path(),
+            relocate_historical_session,
+        )
+        .map_err(map_historical_storage_error)
+        .expect("recover");
+        assert_eq!(report.blocked_by_owner, vec![session_id]);
+        assert!(source.exists());
     }
 }

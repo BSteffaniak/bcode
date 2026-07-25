@@ -18,7 +18,7 @@ use crate::persisted::{
     CompatibleSessionEvent, PersistedSessionEventError, decode_session_event,
     decode_session_event_compatible, encode_session_event,
 };
-use bcode_session_migration::{HistoricalDecode, decode_for_migration};
+use bcode_session_migration::normalize_canonical_event;
 use sha2::{Digest as _, Sha256};
 
 use bcode_database_observability::ObservedDatabase;
@@ -1499,22 +1499,33 @@ impl SessionDb {
                 );
                 digest.update(payload.as_bytes());
                 if classification_error.is_none() {
-                    match decode_for_migration(&payload, |payload| {
-                        decode_session_event(payload).map_err(|error| error.to_string())
-                    }) {
-                        Ok(decoded) => {
+                    match normalize_canonical_event(
+                        &payload,
+                        bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                        |payload| decode_session_event(payload).map_err(|error| error.to_string()),
+                    ) {
+                        Ok(normalized) => {
                             if let Err(error) = validate_migration_event_identity(
-                                decoded.event(),
+                                &normalized.event,
                                 sequence,
                                 self.session_id,
                             ) {
                                 classification_error = Some(error);
                             } else {
-                                record_historical_migration_count(
-                                    &decoded,
-                                    &mut converted_events,
-                                    &mut retired_known_events,
-                                );
+                                if let Some(metadata) = normalized.historical.as_ref() {
+                                    let counts = if normalized.retired_known {
+                                        &mut retired_known_events
+                                    } else {
+                                        &mut converted_events
+                                    };
+                                    let count = counts
+                                        .entry(format!(
+                                            "{}:{}",
+                                            metadata.source_schema, metadata.source_kind
+                                        ))
+                                        .or_insert(0_u64);
+                                    *count = count.saturating_add(1);
+                                }
                                 classified_event_count = classified_event_count.saturating_add(1);
                             }
                         }
@@ -2861,60 +2872,6 @@ fn validate_migration_event_identity(
     Ok(())
 }
 
-fn record_historical_migration_count(
-    decoded: &HistoricalDecode,
-    converted_events: &mut BTreeMap<String, u64>,
-    retired_known_events: &mut BTreeMap<String, u64>,
-) {
-    let classified = match decoded {
-        HistoricalDecode::Converted { metadata, .. } => Some((converted_events, metadata)),
-        HistoricalDecode::RetiredKnown { metadata, .. } => Some((retired_known_events, metadata)),
-        HistoricalDecode::Current(_) => None,
-    };
-    if let Some((counts, metadata)) = classified {
-        let count = counts
-            .entry(format!(
-                "{}:{}",
-                metadata.source_schema, metadata.source_kind
-            ))
-            .or_insert(0_u64);
-        *count = count.saturating_add(1);
-    }
-}
-
-fn record_historical_migration_classification(
-    metrics: &MetricsRegistry,
-    decoded: &HistoricalDecode,
-    converted_events: &mut BTreeMap<String, u64>,
-    retired_known_events: &mut BTreeMap<String, u64>,
-) {
-    record_historical_migration_count(decoded, converted_events, retired_known_events);
-    match decoded {
-        HistoricalDecode::Converted { metadata, .. }
-            if metadata.source_schema == 28
-                && metadata.source_kind == concat!("tool_call_", "finished") =>
-        {
-            metrics
-                .increment_counter("session.migration.converted_tool_call_finished_events_total");
-        }
-        HistoricalDecode::Converted { metadata, .. }
-            if metadata.source_schema == 28 && metadata.source_kind == "context_usage_observed" =>
-        {
-            metrics.increment_counter(
-                "session.migration.converted_context_usage_observed_events_total",
-            );
-        }
-        HistoricalDecode::RetiredKnown { metadata, .. }
-            if metadata.source_schema == 28 && metadata.source_kind == "tool_invocation_stream" =>
-        {
-            metrics.increment_counter("session.migration.retired_tool_stream_events_total");
-        }
-        HistoricalDecode::Current(_)
-        | HistoricalDecode::Converted { .. }
-        | HistoricalDecode::RetiredKnown { .. } => {}
-    }
-}
-
 #[allow(clippy::too_many_lines)]
 async fn rebuild_migration_projections(
     db: &dyn Database,
@@ -2970,22 +2927,49 @@ async fn rebuild_migration_projections(
             source_digest.update(payload.as_bytes());
             let decode_timer = metrics.timer();
             inject_migration_fault(fault, MigrationFaultPhase::CanonicalDecode)?;
-            let decoded = decode_for_migration(&payload, |payload| {
-                decode_session_event(payload).map_err(|error| error.to_string())
-            })?;
+            let normalized = normalize_canonical_event(
+                &payload,
+                bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                |payload| decode_session_event(payload).map_err(|error| error.to_string()),
+            )?;
             metrics.record_histogram(
                 "session.migration.canonical_decode_duration_ms",
                 decode_timer.elapsed_ms(),
             );
-            record_historical_migration_classification(
-                metrics,
-                &decoded,
-                &mut converted_events,
-                &mut retired_known_events,
-            );
-            validate_migration_event_identity(decoded.event(), event_seq, session_id)?;
-            let mut event = decoded.into_event();
-            event.schema_version = bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION;
+            if let Some(metadata) = normalized.historical.as_ref() {
+                let counts = if normalized.retired_known {
+                    &mut retired_known_events
+                } else {
+                    &mut converted_events
+                };
+                let count = counts
+                    .entry(format!(
+                        "{}:{}",
+                        metadata.source_schema, metadata.source_kind
+                    ))
+                    .or_insert(0_u64);
+                *count = count.saturating_add(1);
+                match (metadata.source_kind.as_str(), normalized.retired_known) {
+                    (concat!("tool_call_", "finished"), false) => {
+                        metrics.increment_counter(
+                            "session.migration.converted_tool_call_finished_events_total",
+                        );
+                    }
+                    ("context_usage_observed", false) => {
+                        metrics.increment_counter(
+                            "session.migration.converted_context_usage_observed_events_total",
+                        );
+                    }
+                    ("tool_invocation_stream", true) => {
+                        metrics.increment_counter(
+                            "session.migration.retired_tool_stream_events_total",
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            validate_migration_event_identity(&normalized.event, event_seq, session_id)?;
+            let event = normalized.event;
             let current_payload = encode_session_event(&event)?;
             db.update("events")
                 .value("event_type", event_kind_name(&event.kind))

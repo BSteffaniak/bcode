@@ -12,7 +12,7 @@ mod backup;
 mod classification;
 mod codec;
 mod diagnosis;
-mod historical;
+mod execution;
 mod inventory;
 mod operation;
 mod planning;
@@ -38,12 +38,13 @@ pub use storage::{
 };
 pub use validation::SessionMigrationReceipt;
 
-pub use classification::{HistoricalDecode, HistoricalEventMetadata};
+pub use classification::HistoricalEventMetadata;
 pub use diagnosis::{
-    SessionDiagnosisClassification, SessionDiagnosisCompatibility, classify_session_diagnosis,
+    SessionDiagnosisClassification, SessionDiagnosisCompatibility, SessionMigrationDiagnosis,
+    SessionMigrationOwnerDiagnosis, classify_session_diagnosis,
 };
-pub use historical::{
-    HistoricalSessionEventError, decode_for_migration, historical_conversion_counts,
+pub use execution::{
+    HistoricalSessionEventError, NormalizedCanonicalEvent, normalize_canonical_event,
     ordered_payload_digest,
 };
 pub use inventory::{

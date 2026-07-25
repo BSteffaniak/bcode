@@ -33,7 +33,8 @@ pub enum HistoricalDecode {
 }
 
 impl HistoricalDecode {
-    /// Return the current event materialized by this classification.
+    /// Return the current event materialized by this classification in crate tests.
+    #[cfg(test)]
     #[must_use]
     pub const fn event(&self) -> &SessionEvent {
         match self {
