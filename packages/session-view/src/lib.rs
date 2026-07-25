@@ -1442,9 +1442,6 @@ impl SessionView {
             {
                 self.contribution_placements.remove(&previous_owner);
             }
-            if item.sequence.is_some() {
-                self.tool_item_ids.remove(&contribution.invocation_id);
-            }
             item.kind = TranscriptViewItemKind::ToolContribution {
                 contribution,
                 placement,
@@ -1627,6 +1624,17 @@ impl SessionView {
         else {
             return;
         };
+        if is_terminal_tool_status(tool.status)
+            && matches!(
+                self.snapshot.transcript.items[index].kind,
+                TranscriptViewItemKind::ToolContribution { .. }
+            )
+        {
+            self.contribution_slot_items.remove(&id);
+            self.contribution_slot_owners.remove(&id);
+            self.replace_tool_item(index, tool, tool_call_id, sequence, timestamp_ms);
+            return;
+        }
         let existing_tool = match &self.snapshot.transcript.items[index].kind {
             TranscriptViewItemKind::ToolInvocation { tool } => Some((**tool).clone()),
             TranscriptViewItemKind::ToolRequest { .. }
@@ -1694,6 +1702,9 @@ impl SessionView {
         timestamp_ms: Option<u64>,
     ) {
         let item = &mut self.snapshot.transcript.items[index];
+        if is_terminal_tool_status(tool.status) {
+            item.id = TranscriptViewItemId::tool(tool_call_id);
+        }
         item.kind = TranscriptViewItemKind::ToolInvocation {
             tool: Box::new(tool),
         };
@@ -4113,6 +4124,38 @@ mod tests {
         assert!(matches!(
             items[0].kind,
             TranscriptViewItemKind::ToolContribution { .. }
+        ));
+
+        view.apply_event(&event(
+            session_id,
+            3,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-1".to_owned(),
+                    model_output: "applied 1 replacement".to_owned(),
+                    is_error: false,
+                    result: Some(ToolInvocationResult::Artifact {
+                        artifact: Box::new(bcode_session_models::ToolArtifact {
+                            artifact_id: "call-1-filesystem-change".to_owned(),
+                            producer_plugin_id: "test.plugin".to_owned(),
+                            schema: "test.change".to_owned(),
+                            schema_version: 1,
+                            tool_call_id: Some("call-1".to_owned()),
+                            title: Some("File change".to_owned()),
+                            metadata: serde_json::json!({"old_start_line": 2218}),
+                            refs: Vec::new(),
+                        }),
+                    }),
+                },
+            },
+        ));
+
+        let items = &view.snapshot().transcript.items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, TranscriptViewItemId::tool("call-1"));
+        assert!(matches!(
+            items[0].kind,
+            TranscriptViewItemKind::ToolInvocation { .. }
         ));
     }
 

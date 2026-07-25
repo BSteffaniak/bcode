@@ -21,76 +21,83 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FileChangeTuiVisualAdapte
         payload: &serde_json::Value,
         context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
     ) -> Vec<Line> {
-        let width = context.width();
-        let path = payload
-            .get("path")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("<path>");
-        let old_text = payload
-            .get("old_text")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let new_text = payload
-            .get("new_text")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or_default();
-        let old_start_line = payload
-            .get("old_start_line")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|line| u32::try_from(line).ok())
-            .unwrap_or(1);
-        let new_start_line = payload
-            .get("new_start_line")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|line| u32::try_from(line).ok())
-            .unwrap_or(old_start_line);
-        let title = payload
-            .get("title")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| payload.get("summary").and_then(serde_json::Value::as_str))
-            .unwrap_or_else(|| {
-                if payload.get("tool_name").is_some() {
-                    "File change"
-                } else {
-                    "Streaming preview"
-                }
-            });
-        let subtitle = payload.get("subtitle").and_then(serde_json::Value::as_str);
-        let argument_bytes = payload
-            .get("argument_bytes")
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|bytes| usize::try_from(bytes).ok());
-        let truncated = payload
-            .get("truncated")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-
-        diff_viewer_rows(
-            DiffViewerInput {
-                label: &context.display_path(path).to_string(),
-                old_text,
-                new_text,
-                old_start_line,
-                new_start_line,
-                title,
-                subtitle,
-                argument_bytes,
-                truncated,
-                layout: match context.diff_layout() {
-                    bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint } => {
-                        DiffViewerLayout::Auto { breakpoint }
-                    }
-                    bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified => {
-                        DiffViewerLayout::Unified
-                    }
-                    bcode_plugin_sdk::tui::PluginTuiDiffLayout::SideBySide => {
-                        DiffViewerLayout::SideBySide
-                    }
-                },
-            },
-            width,
-        )
+        file_change_rows(payload, context)
     }
+}
+
+pub fn file_change_rows(
+    payload: &serde_json::Value,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
+    let width = context.width();
+    let path = payload
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("<path>");
+    let old_text = payload
+        .get("old_text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let new_text = payload
+        .get("new_text")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default();
+    let old_start_line = payload
+        .get("old_start_line")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|line| u32::try_from(line).ok());
+    let new_start_line = payload
+        .get("new_start_line")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|line| u32::try_from(line).ok());
+    let line_numbers_known = old_start_line.is_some() && new_start_line.is_some();
+    let old_start_line = old_start_line.unwrap_or(1);
+    let new_start_line = new_start_line.unwrap_or(old_start_line);
+    let title = payload
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| payload.get("summary").and_then(serde_json::Value::as_str))
+        .unwrap_or_else(|| {
+            if payload.get("tool_name").is_some() {
+                "File change"
+            } else {
+                "Streaming preview"
+            }
+        });
+    let subtitle = payload.get("subtitle").and_then(serde_json::Value::as_str);
+    let argument_bytes = payload
+        .get("argument_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|bytes| usize::try_from(bytes).ok());
+    let truncated = payload
+        .get("truncated")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+
+    diff_viewer_rows(
+        DiffViewerInput {
+            label: &context.display_path(path).to_string(),
+            old_text,
+            new_text,
+            old_start_line,
+            new_start_line,
+            line_numbers_known,
+            title,
+            subtitle,
+            argument_bytes,
+            truncated,
+            layout: match context.diff_layout() {
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Auto { breakpoint } => {
+                    DiffViewerLayout::Auto { breakpoint }
+                }
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified => DiffViewerLayout::Unified,
+                bcode_plugin_sdk::tui::PluginTuiDiffLayout::SideBySide => {
+                    DiffViewerLayout::SideBySide
+                }
+            },
+        },
+        width,
+    )
 }
 
 #[cfg(test)]

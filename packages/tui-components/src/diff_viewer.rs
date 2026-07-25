@@ -565,6 +565,7 @@ mod diff_tests {
 }
 
 const MAX_INLINE_DIFF_ROWS: usize = 24;
+const MAX_INLINE_DIFF_RENDER_ROWS: usize = 15;
 const INLINE_DIFF_CARD_MIN_WIDTH: usize = 24;
 const INLINE_DIFF_CARD_CHROME_WIDTH: usize = 14;
 const INLINE_DIFF_BODY_CHROME_WIDTH: usize = 14;
@@ -637,6 +638,8 @@ pub struct DiffViewerInput<'a> {
     pub old_start_line: u32,
     /// First file line represented by `new_text`.
     pub new_start_line: u32,
+    /// Whether displayed line numbers are authoritative.
+    pub line_numbers_known: bool,
     /// Title rendered above the diff.
     pub title: &'a str,
     /// Optional subtitle rendered above the diff.
@@ -652,13 +655,19 @@ pub struct DiffViewerInput<'a> {
 /// Render diff viewer rows.
 #[must_use]
 pub fn diff_viewer_rows(input: DiffViewerInput<'_>, width: u16) -> Vec<Line> {
-    let diff = diff_from_text_at_lines(
+    let mut diff = diff_from_text_at_lines(
         input.label,
         input.old_text,
         input.new_text,
         input.old_start_line,
         input.new_start_line,
     );
+    if !input.line_numbers_known {
+        for line in &mut diff.lines {
+            line.old_line = None;
+            line.new_line = None;
+        }
+    }
     let mut rows = Vec::new();
     rows.push(Line::from_spans(vec![
         Span::styled("  ", muted_style()),
@@ -743,17 +752,38 @@ pub fn diff_viewer_rows(input: DiffViewerInput<'_>, width: u16) -> Vec<Line> {
         card_width(&preview, width.saturating_sub(2))
     };
     rows.push(card_border('┌', '─', '┐', card_width));
-    if resolved_layout == DiffViewerLayout::SideBySide {
-        rows.extend(render_side_by_side_preview(&preview, card_width));
-    } else {
-        for row in preview {
-            match row {
-                PreviewRow::Line(line) => rows.extend(render_diff_line(line, card_width)),
-                PreviewRow::Hidden { count, .. } => rows.push(hidden_row(count, card_width)),
-            }
+    rows.extend(render_preview_rows(&preview, resolved_layout, card_width));
+    rows.push(card_border('└', '─', '┘', card_width));
+    rows
+}
+
+fn render_preview_rows(
+    preview: &[PreviewRow<'_>],
+    layout: DiffViewerLayout,
+    card_width: u16,
+) -> Vec<Line> {
+    if layout == DiffViewerLayout::SideBySide {
+        return render_side_by_side_preview(preview, card_width);
+    }
+    let mut rows = Vec::new();
+    let mut rendered_rows = 0_usize;
+    for row in preview {
+        let rendered = match row {
+            PreviewRow::Line(line) => render_diff_line(line, card_width),
+            PreviewRow::Hidden { count, .. } => vec![hidden_row(*count, card_width)],
+        };
+        let remaining = MAX_INLINE_DIFF_RENDER_ROWS.saturating_sub(rendered_rows);
+        if remaining == 0 {
+            break;
+        }
+        let take = rendered.len().min(remaining);
+        rows.extend(rendered.into_iter().take(take));
+        rendered_rows = rendered_rows.saturating_add(take);
+        if take == remaining {
+            rows.push(hidden_row(1, card_width));
+            break;
         }
     }
-    rows.push(card_border('└', '─', '┘', card_width));
     rows
 }
 
@@ -1384,6 +1414,7 @@ mod tests {
                 new_text,
                 old_start_line: 1,
                 new_start_line: 1,
+                line_numbers_known: true,
                 title,
                 subtitle: None,
                 argument_bytes: None,

@@ -1,5 +1,6 @@
 //! Native TUI rendering for filesystem request and result visuals.
 
+use crate::file_change_tui::file_change_rows;
 use bcode_tui_components::source_preview::{SourcePreviewOptions, source_preview_lines};
 use bcode_tui_components::source_viewer::{SourceViewerInput, source_viewer_rows};
 use bmux_tui::prelude::{Color, Line, Span, Style};
@@ -70,7 +71,7 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
 fn request_draft_rows(
     kind: &str,
     payload: &Value,
-    width: u16,
+    _width: u16,
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
 ) -> Vec<Line> {
     let operation = if kind == "bcode.filesystem.request-draft.edit" {
@@ -80,29 +81,123 @@ fn request_draft_rows(
     };
     let preview = text(payload, "preview").unwrap_or_default();
     let parsed = serde_json::from_str::<Value>(preview).ok();
-    let arguments = parsed.as_ref().unwrap_or(payload);
+    let path = parsed
+        .as_ref()
+        .and_then(|arguments| text(arguments, "path"))
+        .map(ToOwned::to_owned)
+        .or_else(|| partial_json_string(preview, "path"));
+    let old_text = if operation == "edit" {
+        parsed
+            .as_ref()
+            .and_then(|arguments| text(arguments, "old_text"))
+            .map(ToOwned::to_owned)
+            .or_else(|| partial_json_string(preview, "old_text"))
+    } else {
+        Some(String::new())
+    };
+    let new_text = parsed
+        .as_ref()
+        .and_then(|arguments| {
+            text(
+                arguments,
+                if operation == "edit" {
+                    "new_text"
+                } else {
+                    "contents"
+                },
+            )
+        })
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            partial_json_string(
+                preview,
+                if operation == "edit" {
+                    "new_text"
+                } else {
+                    "contents"
+                },
+            )
+        });
+
+    if let (Some(path), Some(old_text), Some(new_text)) =
+        (path.as_deref(), old_text.as_deref(), new_text.as_deref())
+    {
+        return file_change_rows(
+            &serde_json::json!({
+                "path": path,
+                "old_text": old_text,
+                "new_text": new_text,
+                "title": format!("Filesystem {operation} · assembling…"),
+                "subtitle": if operation == "edit" {
+                    "line numbers pending execution"
+                } else {
+                    "new file preview"
+                },
+                "old_start_line": (operation == "write").then_some(1_u32),
+                "new_start_line": (operation == "write").then_some(1_u32),
+                "argument_bytes": payload.get("argument_bytes"),
+                "truncated": payload.get("truncated"),
+            }),
+            context,
+        );
+    }
+
     let mut rows = card_header(&format!("Filesystem {operation} · assembling…"));
-    push_path_kv(&mut rows, "path", text(arguments, "path"), context);
+    push_path_kv(&mut rows, "path", path.as_deref(), context);
     push_kv(&mut rows, "received", number(payload, "argument_bytes"));
     push_kv(&mut rows, "truncated", bool_text(payload, "truncated"));
-    rows.push(Line::raw(""));
-    let source = if operation == "edit" {
-        text(arguments, "new_text")
-            .or_else(|| text(arguments, "old_text"))
-            .unwrap_or(preview)
-    } else {
-        text(arguments, "contents").unwrap_or(preview)
-    };
-    let source_lines = source_preview_lines(
-        source,
-        &SourcePreviewOptions::new(
-            text(arguments, "path").unwrap_or_default(),
-            width.saturating_sub(2).max(1),
-        )
-        .max_lines(18),
-    );
-    rows.extend(source_lines);
+    push_kv(&mut rows, "state", Some("waiting for file content"));
     rows
+}
+
+fn partial_json_string(input: &str, key: &str) -> Option<String> {
+    let key = serde_json::to_string(key).ok()?;
+    let tail = input.get(input.find(&key)?.saturating_add(key.len())..)?;
+    let tail = tail.trim_start();
+    let tail = tail.strip_prefix(':')?.trim_start();
+    let encoded = tail.strip_prefix('"')?;
+    decode_partial_json_string(encoded)
+}
+
+fn decode_partial_json_string(encoded: &str) -> Option<String> {
+    let mut escaped = false;
+    let mut unicode_digits = 0_u8;
+    let mut end = encoded.len();
+    for (index, character) in encoded.char_indices() {
+        if unicode_digits > 0 {
+            if !character.is_ascii_hexdigit() {
+                end = index;
+                break;
+            }
+            unicode_digits = unicode_digits.saturating_sub(1);
+            continue;
+        }
+        if escaped {
+            if character == 'u' {
+                unicode_digits = 4;
+            }
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '"' => {
+                end = index;
+                break;
+            }
+            _ => {}
+        }
+    }
+    let mut fragment = encoded[..end].to_owned();
+    if unicode_digits > 0 {
+        let keep = fragment
+            .len()
+            .saturating_sub(usize::from(4 - unicode_digits));
+        fragment.truncate(keep.saturating_sub(2));
+    } else if escaped {
+        fragment.pop();
+    }
+    serde_json::from_str::<String>(&format!("\"{fragment}\"")).ok()
 }
 
 fn request_rows(
@@ -553,21 +648,21 @@ mod tests {
         for (schema, preview, truncated, expected) in [
             (
                 "bcode.filesystem.request-draft.write",
-                r#"{"path":"src/lib.rs","contents":"hello"#,
+                r#"{"path":"src/lib.rs","contents":"hello\nworld"#,
                 false,
-                "hello",
+                "world",
             ),
             (
                 "bcode.filesystem.request-draft.edit",
-                r#"{"path":"src/lib.rs","old_text":"a\\"#,
+                r#"{"path":"src/lib.rs","old_text":"before\n","new_text":"after"#,
                 false,
-                "old_text",
+                "after",
             ),
             (
                 "bcode.filesystem.request-draft.write",
                 "not-json-at-all",
                 true,
-                "not-json-at-all",
+                "waiting for file content",
             ),
         ] {
             let payload = serde_json::json!({
@@ -582,6 +677,10 @@ mod tests {
                 .join("\n");
             assert!(rendered.contains("assembling"), "{rendered}");
             assert!(rendered.contains(expected), "{rendered}");
+            if preview.contains("contents") || preview.contains("new_text") {
+                assert!(rendered.contains("live preview"), "{rendered}");
+                assert!(!rendered.contains(r#"{\"path\""#), "{rendered}");
+            }
             if truncated {
                 assert!(rendered.contains("yes"), "{rendered}");
             }

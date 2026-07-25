@@ -763,29 +763,12 @@ fn filesystem_request_contribution(
             serde_json::Value::Object(payload)
         },
     );
-    let (schema, payload) = if operation == "filesystem.write" {
-        let mut payload = payload;
-        if let Some(object) = payload.as_object_mut() {
-            object.insert(
-                "old_text".to_owned(),
-                serde_json::Value::String(String::new()),
-            );
-            if let Some(contents) = object.get("contents").cloned() {
-                object.insert("new_text".to_owned(), contents);
-            }
-        }
-        ("bcode.filesystem.change", payload)
-    } else if operation == "filesystem.edit" {
-        ("bcode.filesystem.change", payload)
-    } else {
-        (FILESYSTEM_REQUEST_SCHEMA, payload)
-    };
     ToolContributionEvent {
         invocation_id: invocation_id.to_owned(),
         contribution_id: "filesystem-request".to_owned(),
         sequence: 1,
         producer_id: FILESYSTEM_PLUGIN_ID.to_owned(),
-        schema: schema.to_owned(),
+        schema: FILESYSTEM_REQUEST_SCHEMA.to_owned(),
         schema_version: 1,
         operation: ToolContributionOperation::Upsert,
         persistence: ToolContributionPersistence::Durable,
@@ -2581,9 +2564,9 @@ mod tests {
         assert_eq!(contribution.payload["path"], "src/lib.rs");
         let write_arguments = serde_json::json!({"path": "new.rs", "contents": "fn main() {}"});
         let write = filesystem_request_contribution("call-2", "filesystem.write", &write_arguments);
-        assert_eq!(write.schema, "bcode.filesystem.change");
-        assert_eq!(write.payload["old_text"], "");
-        assert_eq!(write.payload["new_text"], "fn main() {}");
+        assert_eq!(write.schema, FILESYSTEM_REQUEST_SCHEMA);
+        assert_eq!(write.payload["operation"], "filesystem.write");
+        assert_eq!(write.payload["contents"], "fn main() {}");
     }
 
     #[test]
