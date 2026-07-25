@@ -754,21 +754,106 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
         &details,
         options,
     );
-    let projected_markdown = project_semantic_fallbacks(markdown, &document, &details);
+    let projection = project_semantic_fallbacks(markdown, &document, &details);
     let projected_markdown = if options.streaming {
-        project_incomplete_details_fallback(&projected_markdown)
+        project_incomplete_details_fallback(&projection.markdown)
     } else {
-        projected_markdown
+        Cow::Borrowed(projection.markdown.as_ref())
     };
-    let layout_signature = markdown_layout_signature(markdown, options, &contributions);
-    let (lines, geometry) = render_markdown_projection(&projected_markdown, options);
+    let (lines, mut geometry) = render_markdown_projection(&projected_markdown, options);
+    geometry.extend(projected_contribution_geometry(
+        &projected_markdown,
+        &projection.contributions,
+        options,
+    ));
     let geometry = assign_contribution_geometry(geometry, &contributions);
+    let layout_signature = markdown_layout_signature(markdown, options, &contributions, &geometry);
     MarkdownRenderResult {
         lines,
         contributions,
         geometry,
         layout_signature,
     }
+}
+
+fn projected_contribution_geometry(
+    markdown: &str,
+    projected: &[ProjectedContributionRange],
+    options: &MarkdownRenderOptions,
+) -> Vec<MarkdownContributionGeometry> {
+    projected
+        .iter()
+        .filter_map(|item| {
+            let prefix = markdown.get(..item.range.start)?;
+            let _target = markdown.get(item.range.clone())?;
+            let prefix_lines = render_markdown_projection(prefix, options).0;
+            let through_lines = render_markdown_projection(&markdown[..item.range.end], options).0;
+            let start = rendered_cursor(&prefix_lines);
+            let end = rendered_cursor(&through_lines);
+            let rects = rects_between(start, end, options.width.max(1));
+            (!rects.is_empty()).then(|| MarkdownContributionGeometry {
+                contribution_id: match item.kind {
+                    ProjectedContributionKind::Details => "details",
+                    ProjectedContributionKind::FootnoteReference => "footnote-reference",
+                    ProjectedContributionKind::FootnoteDefinition => "footnote-definition",
+                }
+                .to_owned(),
+                rects,
+            })
+        })
+        .collect()
+}
+
+fn rendered_cursor(lines: &[Line]) -> (u16, u16) {
+    let Some(last) = lines.last() else {
+        return (0, 0);
+    };
+    (
+        u16::try_from(lines.len().saturating_sub(1)).unwrap_or(u16::MAX),
+        u16::try_from(spans_width(&last.spans)).unwrap_or(u16::MAX),
+    )
+}
+
+fn rects_between(start: (u16, u16), end: (u16, u16), width: u16) -> Vec<MarkdownCellRect> {
+    let (start_row, start_column) = start;
+    let (end_row, end_column) = end;
+    if start_row == end_row {
+        return (end_column > start_column)
+            .then(|| MarkdownCellRect {
+                x: start_column,
+                y: start_row,
+                width: end_column.saturating_sub(start_column),
+                height: 1,
+            })
+            .into_iter()
+            .collect();
+    }
+    let mut rects = Vec::new();
+    if width > start_column {
+        rects.push(MarkdownCellRect {
+            x: start_column,
+            y: start_row,
+            width: width.saturating_sub(start_column),
+            height: 1,
+        });
+    }
+    for row in start_row.saturating_add(1)..end_row {
+        rects.push(MarkdownCellRect {
+            x: 0,
+            y: row,
+            width,
+            height: 1,
+        });
+    }
+    if end_column > 0 {
+        rects.push(MarkdownCellRect {
+            x: 0,
+            y: end_row,
+            width: end_column,
+            height: 1,
+        });
+    }
+    rects
 }
 
 fn assign_contribution_geometry(
@@ -829,9 +914,10 @@ fn markdown_layout_signature(
     markdown: &str,
     options: &MarkdownRenderOptions,
     contributions: &[MarkdownContribution],
+    geometry: &[MarkdownContributionGeometry],
 ) -> String {
     format!(
-        "markdown-layout-v1:{}:{}:{}:{}:{}:{}:{}:{}",
+        "markdown-layout-v2:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         options.width,
         stable_text_hash(markdown),
         stable_text_hash(&format!("{:?}", options.theme)),
@@ -839,7 +925,8 @@ fn markdown_layout_signature(
         options.mermaid_enabled,
         options.mermaid_width,
         options.streaming,
-        stable_text_hash(&format!("{}:{:?}", options.mermaid_height, contributions))
+        stable_text_hash(&format!("{}:{:?}", options.mermaid_height, contributions)),
+        stable_text_hash(&format!("{geometry:?}"))
     )
 }
 
@@ -851,11 +938,82 @@ fn stable_text_hash(source: &str) -> u64 {
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProjectedContributionKind {
+    Details,
+    FootnoteReference,
+    FootnoteDefinition,
+}
+
+#[derive(Debug, Clone)]
+struct ProjectedContributionRange {
+    kind: ProjectedContributionKind,
+    range: Range<usize>,
+}
+
+struct ProjectedMarkdown<'a> {
+    markdown: Cow<'a, str>,
+    contributions: Vec<ProjectedContributionRange>,
+}
+
+type ProjectionReplacement = (
+    Range<usize>,
+    String,
+    Option<(ProjectedContributionKind, Range<usize>)>,
+);
+
+fn semantic_replacements(
+    details: &[DetailsProjection],
+    math: Vec<MathProjection>,
+    footnotes: &FootnoteProjection,
+) -> Vec<ProjectionReplacement> {
+    let mut replacements = Vec::new();
+    for details in details.iter().filter(|candidate| {
+        !details.iter().any(|parent| {
+            parent.source_range.start < candidate.source_range.start
+                && parent.source_range.end >= candidate.source_range.end
+        })
+    }) {
+        let summary = details.summary_markdown.trim();
+        let replacement = format!(
+            "**{summary}**\n\n{}",
+            project_details_markup(&details.body_markdown).trim()
+        );
+        replacements.push((
+            details.source_range.clone(),
+            replacement,
+            Some((ProjectedContributionKind::Details, 2..2 + summary.len())),
+        ));
+    }
+    replacements.extend(math.into_iter().map(|projection| {
+        let replacement = match projection.kind {
+            MathKind::Inline => format!("`{}`", projection.rendered),
+            MathKind::Display => format!("\n```text\n{}\n```\n", projection.rendered),
+        };
+        (projection.source_range, replacement, None)
+    }));
+    for reference in &footnotes.references {
+        let replacement = format!("[{}]", reference.number);
+        replacements.push((
+            reference.source_range.clone(),
+            replacement.clone(),
+            Some((
+                ProjectedContributionKind::FootnoteReference,
+                0..replacement.len(),
+            )),
+        ));
+    }
+    for definition in footnotes.definitions.values() {
+        replacements.push((definition.source_range.clone(), String::new(), None));
+    }
+    replacements
+}
+
 fn project_semantic_fallbacks<'a>(
     markdown: &'a str,
     document: &MarkdownDocument,
     details: &[DetailsProjection],
-) -> Cow<'a, str> {
+) -> ProjectedMarkdown<'a> {
     let footnotes = collect_footnotes(markdown, document);
     let math = collect_math_projections(markdown, document);
     if footnotes.references.is_empty()
@@ -863,58 +1021,51 @@ fn project_semantic_fallbacks<'a>(
         && math.is_empty()
         && details.is_empty()
     {
-        return Cow::Borrowed(markdown);
+        return ProjectedMarkdown {
+            markdown: Cow::Borrowed(markdown),
+            contributions: Vec::new(),
+        };
     }
 
-    let mut replacements = details
-        .iter()
-        .filter(|candidate| {
-            !details.iter().any(|parent| {
-                parent.source_range.start < candidate.source_range.start
-                    && parent.source_range.end >= candidate.source_range.end
-            })
-        })
-        .cloned()
-        .map(|details| {
-            (
-                details.source_range,
-                format!(
-                    "**{}<!--bcode-details-start--><!--bcode-details-end-->**\n\n{}",
-                    details.summary_markdown.trim(),
-                    project_details_markup(&details.body_markdown).trim()
-                ),
-            )
-        })
-        .collect::<Vec<_>>();
-    replacements.extend(math.into_iter().map(|projection| {
-        let replacement = match projection.kind {
-            MathKind::Inline => format!("`{}`", projection.rendered),
-            MathKind::Display => format!("\n```text\n{}\n```\n", projection.rendered),
-        };
-        (projection.source_range, replacement)
-    }));
-    for reference in &footnotes.references {
-        replacements.push((
-            reference.source_range.clone(),
-            format!(
-                "[{}]<!--bcode-footnote-reference-start--><!--bcode-footnote-reference-end-->",
-                reference.number
-            ),
-        ));
+    let mut replacements = semantic_replacements(details, math, &footnotes);
+    replacements.sort_by_key(|(range, _, _)| (range.start, range.end));
+    let mut projected = markdown.to_owned();
+    let mut projected_contributions: Vec<ProjectedContributionRange> = Vec::new();
+    for (range, replacement, contribution) in replacements.into_iter().rev() {
+        projected.replace_range(range.clone(), &replacement);
+        let removed = range.end.saturating_sub(range.start);
+        let delta = replacement
+            .len()
+            .cast_signed()
+            .saturating_sub(removed.cast_signed());
+        for existing in &mut projected_contributions {
+            existing.range.start = existing.range.start.saturating_add_signed(delta);
+            existing.range.end = existing.range.end.saturating_add_signed(delta);
+        }
+        if let Some((kind, local)) = contribution {
+            projected_contributions.push(ProjectedContributionRange {
+                kind,
+                range: range.start.saturating_add(local.start)
+                    ..range.start.saturating_add(local.end),
+            });
+        }
     }
-    for definition in footnotes.definitions.values() {
-        replacements.push((definition.source_range.clone(), String::new()));
-    }
-    let mut projected = replace_source_ranges(markdown, replacements);
+    projected_contributions.sort_by_key(|item| item.range.start);
     if !footnotes.definitions.is_empty() {
         projected.push_str("\n\n---\n\nFootnotes\n\n");
         for definition in footnotes.definitions.values() {
+            let start = projected.len();
             let _ = write!(
                 projected,
-                "{}.  {}<!--bcode-footnote-definition-start--><!--bcode-footnote-definition-end-->",
+                "{}.  {}",
                 definition.number,
                 definition.body.trim()
             );
+            let number_end = start.saturating_add(definition.number.to_string().len());
+            projected_contributions.push(ProjectedContributionRange {
+                kind: ProjectedContributionKind::FootnoteDefinition,
+                range: start..number_end,
+            });
             if !definition.reference_numbers.is_empty() {
                 projected.push_str(" ↩");
                 if definition.reference_numbers.len() > 1 {
@@ -924,7 +1075,10 @@ fn project_semantic_fallbacks<'a>(
             projected.push_str("\n\n");
         }
     }
-    Cow::Owned(projected)
+    ProjectedMarkdown {
+        markdown: Cow::Owned(projected),
+        contributions: projected_contributions,
+    }
 }
 
 fn project_incomplete_details_fallback(markdown: &str) -> Cow<'_, str> {
@@ -2154,7 +2308,6 @@ struct TerminalMarkdownRenderer {
     next_table_index: usize,
     alert_kinds: Rc<Vec<Option<BlockQuoteKind>>>,
     next_blockquote_index: Rc<Cell<usize>>,
-    active_markers: BTreeMap<&'static str, (usize, usize, Option<Style>)>,
     theme: MarkdownTheme,
 }
 
@@ -2178,7 +2331,6 @@ impl TerminalMarkdownRenderer {
             next_table_index: 0,
             alert_kinds: Rc::new(alert_kinds),
             next_blockquote_index: Rc::new(Cell::new(0)),
-            active_markers: BTreeMap::new(),
             theme,
         }
     }
@@ -2197,7 +2349,6 @@ impl TerminalMarkdownRenderer {
             next_table_index: 0,
             alert_kinds: Rc::clone(&self.alert_kinds),
             next_blockquote_index: Rc::clone(&self.next_blockquote_index),
-            active_markers: BTreeMap::new(),
             theme: self.theme,
         }
     }
@@ -2257,7 +2408,7 @@ impl TerminalMarkdownRenderer {
         let style = style.merge_container(container, self.theme);
         match &container.element {
             Element::Text { value } | Element::Raw { value } => {
-                self.push_marker_aware_text(value, style);
+                self.push_text(value, style);
             }
             Element::Span | Element::THead | Element::TBody => {
                 self.render_container_children(container, style);
@@ -2269,10 +2420,7 @@ impl TerminalMarkdownRenderer {
                     Some("bcode-contribution:footnote-definition") => "footnote-definition",
                     _ => "link",
                 };
-                let semantic_only = href
-                    .as_deref()
-                    .is_some_and(|href| href.starts_with("bcode-contribution:"));
-                self.render_anchor_children(container, style, kind, semantic_only);
+                self.render_marked_children(container, style, kind);
             }
             Element::TH { .. } | Element::TD { .. } => {
                 if !self.in_table_collection {
@@ -2319,48 +2467,11 @@ impl TerminalMarkdownRenderer {
         }
     }
 
-    fn render_anchor_children(
-        &mut self,
-        container: &Container,
-        style: TextStyle,
-        kind: &str,
-        semantic_only: bool,
-    ) {
+    fn render_marked_children(&mut self, container: &Container, style: TextStyle, kind: &str) {
         let start_row = self.rows.len();
         let start_column = self.current_width;
         self.render_container_children(container, style);
-        if semantic_only {
-            self.restyle_range(start_row, start_column, self.theme.link, style.style);
-        }
         self.record_geometry(kind, start_row, start_column);
-    }
-
-    fn restyle_range(
-        &mut self,
-        start_row: usize,
-        start_column: usize,
-        remove: Style,
-        replacement: Style,
-    ) {
-        let end_row = self.rows.len();
-        for row in start_row..=end_row {
-            let spans = if row == end_row {
-                &mut self.current_spans
-            } else if let Some(line) = self.rows.get_mut(row) {
-                &mut line.spans
-            } else {
-                continue;
-            };
-            let mut column = 0_usize;
-            for span in spans {
-                let width = text_display_width(&span.content);
-                let span_end = column.saturating_add(width);
-                if span_end > start_column || row > start_row {
-                    span.style = strip_style(span.style, remove).patch(replacement);
-                }
-                column = span_end;
-            }
-        }
     }
 
     fn render_marked_text(&mut self, text: &str, style: TextStyle, kind: &str) {
@@ -2759,67 +2870,6 @@ impl TerminalMarkdownRenderer {
         self.current_width = 0;
     }
 
-    fn push_marker_aware_text(&mut self, text: &str, style: TextStyle) {
-        let markers = [
-            ("<!--bcode-details-start-->", "details", true),
-            ("<!--bcode-details-end-->", "details", false),
-            (
-                "<!--bcode-footnote-reference-start-->",
-                "footnote-reference",
-                true,
-            ),
-            (
-                "<!--bcode-footnote-reference-end-->",
-                "footnote-reference",
-                false,
-            ),
-            (
-                "<!--bcode-footnote-definition-start-->",
-                "footnote-definition",
-                true,
-            ),
-            (
-                "<!--bcode-footnote-definition-end-->",
-                "footnote-definition",
-                false,
-            ),
-        ];
-        let mut remaining = text;
-        while let Some((index, marker, kind, start)) = markers
-            .iter()
-            .filter_map(|(marker, kind, start)| {
-                remaining
-                    .find(marker)
-                    .map(|index| (index, *marker, *kind, *start))
-            })
-            .min_by_key(|(index, _, _, _)| *index)
-        {
-            self.push_text(&remaining[..index], style);
-            if start {
-                let (row, column) = self.previous_token_start();
-                self.active_markers.insert(kind, (row, column, None));
-            } else if let Some((start_row, start_column, _)) = self.active_markers.remove(kind) {
-                self.record_geometry(kind, start_row, start_column);
-            }
-            remaining = &remaining[index + marker.len()..];
-        }
-        self.push_text(remaining, style);
-    }
-
-    fn previous_token_start(&self) -> (usize, usize) {
-        let text = self
-            .current_spans
-            .iter()
-            .map(|span| span.content.as_str())
-            .collect::<String>();
-        let trailing = text.trim_end();
-        let token = trailing.split_whitespace().next_back().unwrap_or(trailing);
-        (
-            self.rows.len(),
-            self.current_width.saturating_sub(text_display_width(token)),
-        )
-    }
-
     fn push_text(&mut self, text: &str, style: TextStyle) {
         for segment in text.split_inclusive('\n') {
             let without_newline = segment.strip_suffix('\n').unwrap_or(segment);
@@ -2846,22 +2896,6 @@ impl TerminalMarkdownRenderer {
                 .push(Span::styled(grapheme.to_owned(), style));
             self.current_width = self.current_width.saturating_add(grapheme_width);
         }
-    }
-}
-
-fn strip_style(style: Style, remove: Style) -> Style {
-    Style {
-        fg: if style.fg == remove.fg {
-            None
-        } else {
-            style.fg
-        },
-        bg: if style.bg == remove.bg {
-            None
-        } else {
-            style.bg
-        },
-        modifiers: style.modifiers.difference(remove.modifiers),
     }
 }
 
@@ -3473,23 +3507,19 @@ mod tests {
             .iter()
             .map(|geometry| geometry.contribution_id.as_str())
             .collect::<Vec<_>>();
-        assert!(ids.iter().any(|id| id.starts_with("item:details:")));
-        assert!(
-            ids.iter()
-                .any(|id| id.starts_with("item:footnote-reference:"))
-        );
-        assert!(
-            ids.iter()
-                .any(|id| id.starts_with("item:footnote-definition:"))
-        );
-        assert!(ids.iter().any(|id| id.starts_with("item:mermaid:")));
-        assert!(result.geometry.iter().all(|geometry| {
-            !geometry.rects.is_empty()
-                && geometry
-                    .rects
-                    .iter()
-                    .all(|rect| rect.width > 0 && rect.height == 1)
-        }));
+        for kind in [
+            "details",
+            "footnote-reference",
+            "footnote-definition",
+            "mermaid",
+        ] {
+            assert!(
+                ids.iter()
+                    .any(|id| id.starts_with(&format!("item:{kind}:"))),
+                "missing {kind}: {ids:?}"
+            );
+        }
+        assert!(result.geometry.iter().all(|item| !item.rects.is_empty()));
     }
 
     #[test]
