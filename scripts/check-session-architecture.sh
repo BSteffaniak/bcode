@@ -187,7 +187,9 @@ if ! rg -q 'create_verified_migration_backup' packages/session/src/lib.rs \
   violations=1
 fi
 
-if ! rg -q 'CURRENT_WRITER_EPOCH: u32 = 5' packages/session-migration/src/registry.rs \
+if ! rg -q 'CURRENT_WRITER_EPOCH: u32 = 5' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'RELEASED_HISTORICAL_EVENT_SCHEMAS' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'plan_writer_epoch_migration' packages/session-migration/src/planning.rs \
   || ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =' packages/session/src/lease.rs \
   || ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5' packages/ipc/src/lib.rs \
   || ! rg -q 'session_event_schema_version' packages/ipc/src/lib.rs \

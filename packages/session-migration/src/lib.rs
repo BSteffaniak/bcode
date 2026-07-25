@@ -11,8 +11,9 @@
 mod audit;
 mod backup;
 mod historical;
+mod inventory;
 mod operation;
-mod registry;
+mod planning;
 mod service;
 mod storage;
 
@@ -38,8 +39,12 @@ pub use historical::{
     HistoricalDecode, HistoricalEventMetadata, HistoricalSessionEventError, decode_for_migration,
     historical_conversion_counts, ordered_payload_digest,
 };
-pub use registry::{
-    CURRENT_WRITER_EPOCH, MigrationPlan, MigrationPlanError, MigrationPlanService,
-    MigrationStepDescriptor, plan_writer_epoch_migration,
+pub use inventory::{
+    CURRENT_EVENT_SCHEMA, CURRENT_WRITER_EPOCH, MIGRATION_STEPS, MigrationStepDescriptor,
+    RELEASED_HISTORICAL_EVENT_SCHEMAS, RELEASED_HISTORICAL_WRITER_EPOCHS,
+    is_released_historical_event_schema,
+};
+pub use planning::{
+    MigrationPlan, MigrationPlanError, MigrationPlanService, plan_writer_epoch_migration,
     plan_writer_epoch_migration_with_registry,
 };

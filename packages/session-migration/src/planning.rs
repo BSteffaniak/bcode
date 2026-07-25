@@ -1,41 +1,7 @@
+//! Complete migration planning from released writer epochs to the current writer.
+
+use crate::inventory::{CURRENT_WRITER_EPOCH, MIGRATION_STEPS, MigrationStepDescriptor};
 use thiserror::Error;
-
-/// Writer epoch produced by the corrected migration contract.
-pub const CURRENT_WRITER_EPOCH: u32 = 5;
-
-/// One monotonic writer-contract transition supported by this build.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MigrationStepDescriptor {
-    /// Stable audit identity for the transition.
-    pub id: &'static str,
-    /// Writer epoch accepted by the step.
-    pub source_writer_epoch: u32,
-    /// Writer epoch produced by the step.
-    pub target_writer_epoch: u32,
-}
-
-const MIGRATION_STEPS: [MigrationStepDescriptor; 4] = [
-    MigrationStepDescriptor {
-        id: "session-writer-epoch-1-to-2",
-        source_writer_epoch: 1,
-        target_writer_epoch: 2,
-    },
-    MigrationStepDescriptor {
-        id: "session-writer-epoch-2-to-3",
-        source_writer_epoch: 2,
-        target_writer_epoch: 3,
-    },
-    MigrationStepDescriptor {
-        id: "session-writer-epoch-3-to-4",
-        source_writer_epoch: 3,
-        target_writer_epoch: 4,
-    },
-    MigrationStepDescriptor {
-        id: "session-writer-epoch-4-to-5",
-        source_writer_epoch: 4,
-        target_writer_epoch: 5,
-    },
-];
 
 /// Complete ordered writer migration selected for one session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,22 +17,22 @@ pub struct MigrationPlan {
 /// Failure to resolve a safe writer migration path.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MigrationPlanError {
-    /// The store was written by a newer Bcode build and cannot be downgraded.
+    /// The store was written by a future writer and cannot be downgraded.
     #[error(
-        "session writer epoch {source_writer_epoch} is newer than supported epoch {current_writer_epoch}"
+        "session writer epoch {source_writer_epoch} is newer than current epoch {current_writer_epoch}"
     )]
     FutureWriter {
-        /// Writer epoch recorded by the store.
+        /// Writer epoch found in storage.
         source_writer_epoch: u32,
-        /// Writer epoch supported by this build.
+        /// Current writer epoch supported by this build.
         current_writer_epoch: u32,
     },
-    /// No registered transition begins at the required epoch.
+    /// The migration graph has no edge from a required writer epoch.
     #[error(
-        "no session migration step continues from writer epoch {writer_epoch} toward epoch {target_writer_epoch}"
+        "no session migration step from writer epoch {writer_epoch} to target epoch {target_writer_epoch}"
     )]
     MissingStep {
-        /// Epoch where planning stopped.
+        /// Writer epoch with no registered transition.
         writer_epoch: u32,
         /// Requested final epoch.
         target_writer_epoch: u32,
@@ -100,9 +66,7 @@ impl MigrationPlanService {
     }
 }
 
-/// Resolve a complete monotonic migration path against an explicit registry and target.
-///
-/// This is primarily useful for validating a registry before any migration uses it.
+/// Resolve a complete monotonic migration path against an explicit inventory and target.
 ///
 /// # Errors
 ///
@@ -119,8 +83,8 @@ pub fn plan_writer_epoch_migration_with_registry(
         });
     }
 
-    let mut steps = Vec::new();
     let mut writer_epoch = source_writer_epoch;
+    let mut steps = Vec::new();
     while writer_epoch < target_writer_epoch {
         let step = steps_registry
             .iter()
@@ -152,8 +116,8 @@ pub fn plan_writer_epoch_migration_with_registry(
 ///
 /// # Errors
 ///
-/// Returns an error when the source is newer than this build, a required edge
-/// is not registered, or a registered edge is non-monotonic.
+/// Returns an error when the source is newer than this build, a required edge is not registered,
+/// or a registered edge is non-monotonic.
 pub fn plan_writer_epoch_migration(
     source_writer_epoch: u32,
 ) -> Result<MigrationPlan, MigrationPlanError> {
@@ -170,7 +134,11 @@ mod tests {
 
     #[test]
     fn every_released_writer_epoch_has_a_complete_monotonic_plan() {
-        for source_writer_epoch in 1..=CURRENT_WRITER_EPOCH {
+        for source_writer_epoch in crate::inventory::RELEASED_HISTORICAL_WRITER_EPOCHS
+            .iter()
+            .copied()
+            .chain(std::iter::once(CURRENT_WRITER_EPOCH))
+        {
             let plan = plan_writer_epoch_migration(source_writer_epoch)
                 .expect("released writer epoch should have a migration plan");
             assert_eq!(plan.source_writer_epoch, source_writer_epoch);
