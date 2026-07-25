@@ -7465,6 +7465,10 @@ fn session_live_event_description(event: &SessionLiveEvent) -> String {
             event.argument_bytes,
             event.truncated
         ),
+        SessionLiveEventKind::ToolInvocationProgress { event } => format!(
+            "live tool progress call={} sequence={} stage={:?}",
+            event.invocation_id, event.sequence, event.stage
+        ),
         SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } => {
             format!("live context occupancy: {occupancy:?}")
         }

@@ -16869,6 +16869,16 @@ async fn persist_scoped_turn_event(
         ScopedTurnEvent::Runtime(_) => Ok(()),
         ScopedTurnEvent::InvocationLifecycle(event) => {
             let invocation_id = event.invocation_id.clone();
+            if event.stage == bcode_session_models::ToolInvocationLifecycleStage::Progress {
+                let _ = state
+                    .sessions
+                    .publish_live_event(
+                        session_id,
+                        SessionLiveEventKind::ToolInvocationProgress { event },
+                    )
+                    .await;
+                return Ok(());
+            }
             let terminal = matches!(
                 event.stage,
                 bcode_session_models::ToolInvocationLifecycleStage::Completed
@@ -18009,14 +18019,26 @@ async fn append_plugin_tool_lifecycle_event(
     invocation_id: &str,
     event: bcode_session_models::ToolInvocationLifecycleEvent,
 ) {
-    if event.invocation_id == invocation_id
-        && matches!(
-            event.stage,
-            bcode_session_models::ToolInvocationLifecycleStage::Progress
-                | bcode_session_models::ToolInvocationLifecycleStage::Waiting
-        )
-    {
-        append_tool_invocation_lifecycle_event(state, session_id, event).await;
+    if event.invocation_id != invocation_id {
+        return;
+    }
+    match event.stage {
+        bcode_session_models::ToolInvocationLifecycleStage::Progress => {
+            let _ = state
+                .sessions
+                .publish_live_event(
+                    session_id,
+                    SessionLiveEventKind::ToolInvocationProgress { event },
+                )
+                .await;
+        }
+        bcode_session_models::ToolInvocationLifecycleStage::Waiting => {
+            append_tool_invocation_lifecycle_event(state, session_id, event).await;
+        }
+        bcode_session_models::ToolInvocationLifecycleStage::Started
+        | bcode_session_models::ToolInvocationLifecycleStage::Completed
+        | bcode_session_models::ToolInvocationLifecycleStage::Cancelled
+        | bcode_session_models::ToolInvocationLifecycleStage::Failed => {}
     }
 }
 
@@ -21540,6 +21562,7 @@ const MAX_PENDING_LIVE_BYTES_PER_CLIENT: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum PendingLiveEventKey {
+    ToolInvocation(String),
     Contribution {
         invocation_id: String,
         contribution_id: String,
@@ -21654,6 +21677,13 @@ fn pending_live_event_key(
     event: &bcode_session_models::SessionLiveEvent,
 ) -> Option<PendingLiveEventKey> {
     match &event.kind {
+        SessionLiveEventKind::ToolInvocationProgress { event }
+            if event.stage == bcode_session_models::ToolInvocationLifecycleStage::Progress =>
+        {
+            Some(PendingLiveEventKey::ToolInvocation(
+                event.invocation_id.clone(),
+            ))
+        }
         SessionLiveEventKind::ToolContributionPlaced { envelope }
             if envelope.contribution.persistence
                 == bcode_session_models::ToolContributionPersistence::Transient
@@ -25795,6 +25825,86 @@ library = "test"
         );
         let restarted_state = test_server_state(restarted);
         assert!(active_tool_request_draft_snapshot_events(&restarted_state, session.id).is_empty());
+    }
+
+    #[tokio::test]
+    async fn plugin_progress_is_live_only_while_waiting_remains_durable() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("persistent sessions");
+        let session_id = sessions
+            .create_session(
+                Some("lifecycle routing".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let mut attachment = sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("attach");
+        let state = test_server_state(sessions);
+        append_plugin_tool_lifecycle_event(
+            &state,
+            session_id,
+            "call-1",
+            bcode_session_models::ToolInvocationLifecycleEvent {
+                invocation_id: "call-1".to_owned(),
+                sequence: 1,
+                stage: bcode_session_models::ToolInvocationLifecycleStage::Progress,
+                message: Some("scanning".to_owned()),
+                metadata: serde_json::Value::Null,
+            },
+        )
+        .await;
+        assert!(matches!(
+            attachment.live_events.recv().await.expect("live progress").kind,
+            SessionLiveEventKind::ToolInvocationProgress { event }
+                if event.message.as_deref() == Some("scanning")
+        ));
+        assert!(
+            !state
+                .sessions
+                .session_history(session_id)
+                .await
+                .expect("history after progress")
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::ToolInvocationLifecycle { event }
+                        if event.stage
+                            == bcode_session_models::ToolInvocationLifecycleStage::Progress
+                ))
+        );
+
+        append_plugin_tool_lifecycle_event(
+            &state,
+            session_id,
+            "call-1",
+            bcode_session_models::ToolInvocationLifecycleEvent {
+                invocation_id: "call-1".to_owned(),
+                sequence: 2,
+                stage: bcode_session_models::ToolInvocationLifecycleStage::Waiting,
+                message: Some("awaiting external service".to_owned()),
+                metadata: serde_json::Value::Null,
+            },
+        )
+        .await;
+        assert!(
+            state
+                .sessions
+                .session_history(session_id)
+                .await
+                .expect("history after waiting")
+                .iter()
+                .any(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::ToolInvocationLifecycle { event }
+                        if event.stage
+                            == bcode_session_models::ToolInvocationLifecycleStage::Waiting
+                            && event.message.as_deref() == Some("awaiting external service")
+                ))
+        );
     }
 
     #[tokio::test]

@@ -342,6 +342,9 @@ fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
             _ => None,
         },
         BcodeEvent::SessionLive(event) => match &event.kind {
+            bcode_session_models::SessionLiveEventKind::ToolInvocationProgress { event } => Some(
+                SupersedableEventKey::Invocation(event.invocation_id.clone()),
+            ),
             bcode_session_models::SessionLiveEventKind::ToolContributionPlaced { envelope }
                 if envelope.contribution.persistence
                     == bcode_session_models::ToolContributionPersistence::Transient

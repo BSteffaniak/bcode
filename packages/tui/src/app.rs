@@ -2220,6 +2220,9 @@ impl BmuxApp {
                 }
             }
             SessionLiveEventKind::RequestContextOccupancyChanged { .. } => {}
+            SessionLiveEventKind::ToolInvocationProgress { .. } => {
+                self.apply_shared_runtime_work_activity();
+            }
             SessionLiveEventKind::ProviderStreamProgress { event, .. } => {
                 self.apply_shared_provider_stream_progress(event);
             }

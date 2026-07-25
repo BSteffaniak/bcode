@@ -1375,6 +1375,11 @@ pub enum SessionLiveEventKind {
         /// Current occupancy, or `None` when a model/compaction boundary cleared it.
         occupancy: Box<Option<RequestContextOccupancy>>,
     },
+    /// Live-only non-terminal progress for one active tool invocation.
+    ///
+    /// Only [`ToolInvocationLifecycleStage::Progress`] is valid here. Started, waiting, and
+    /// terminal lifecycle facts remain canonical durable events.
+    ToolInvocationProgress { event: ToolInvocationLifecycleEvent },
     /// Live-only provider stream progress for active model turns.
     ProviderStreamProgress {
         /// Model turn associated with this progress update.

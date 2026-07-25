@@ -1208,6 +1208,16 @@ impl SessionView {
             SessionLiveEventKind::ToolRequestDraft { event } => {
                 self.apply_tool_request_draft(event);
             }
+            SessionLiveEventKind::ToolInvocationProgress { event } => {
+                if event.stage == bcode_session_models::ToolInvocationLifecycleStage::Progress
+                    && !self.terminal_invocations.contains(&event.invocation_id)
+                {
+                    self.snapshot
+                        .active_invocations
+                        .insert(event.invocation_id.clone(), event.clone());
+                    self.bump_revision();
+                }
+            }
             SessionLiveEventKind::ProviderStreamProgress { turn_id, event } => {
                 self.snapshot.runtime.provider_progress = Some(ProviderProgressView {
                     turn_id: turn_id.clone(),
