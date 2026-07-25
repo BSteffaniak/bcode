@@ -926,6 +926,8 @@ impl SessionDb {
         let source_writer_epoch = db.storage_writer_epoch().await?;
         #[cfg(test)]
         abort_at_migration_crash_boundary("before_transaction");
+        #[cfg(test)]
+        abort_at_migration_crash_boundary("transaction_start");
         let tx = db.db.begin_transaction().await?;
         report_migration_stage(
             progress.as_ref(),
@@ -974,6 +976,8 @@ impl SessionDb {
         tx.commit().await?;
         #[cfg(test)]
         abort_at_migration_crash_boundary("after_commit");
+        #[cfg(test)]
+        abort_at_migration_crash_boundary("post_commit_checkpoint");
         metrics.record_histogram(
             "session.migration.commit_duration_ms",
             commit_timer.elapsed_ms(),
@@ -2808,6 +2812,7 @@ fn validate_projection_checkpoint_snapshot(
     Ok(())
 }
 
+#[cfg(test)]
 async fn validate_all_projection_checkpoints_at_tail(
     db: &dyn Database,
     expected: Option<u64>,
@@ -2841,6 +2846,8 @@ async fn migrate_session_storage(
         rebuild_migration_projections(db, event_total, session_id, metrics, progress, fault)
             .await?;
     inject_migration_fault(fault, MigrationFaultPhase::FinalValidation)?;
+    #[cfg(test)]
+    abort_at_migration_crash_boundary("final_validation");
     validate_migrated_storage(db, replay.tail.as_ref(), metrics, progress).await?;
     Ok(replay)
 }
@@ -2925,6 +2932,8 @@ async fn rebuild_migration_projections(
             source_digest.update(payload.as_bytes());
             let decode_timer = metrics.timer();
             inject_migration_fault(fault, MigrationFaultPhase::CanonicalDecode)?;
+            #[cfg(test)]
+            abort_at_migration_crash_boundary("normalization");
             let normalized = normalize_canonical_event(
                 &payload,
                 bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -2952,6 +2961,8 @@ async fn rebuild_migration_projections(
                 .execute(db)
                 .await?;
             inject_migration_fault(fault, MigrationFaultPhase::Projection)?;
+            #[cfg(test)]
+            abort_at_migration_crash_boundary("projection_rebuild");
             project_migration_event(db, &event, metrics, &mut state).await?;
             completed = completed.saturating_add(1);
             if completed == event_total || completed.is_multiple_of(100) {
@@ -2990,6 +3001,90 @@ async fn rebuild_migration_projections(
     })
 }
 
+async fn migration_target_validation_facts(
+    db: &dyn Database,
+    canonical_tail: Option<u64>,
+) -> SessionDbResult<bcode_session_migration::MigrationTargetValidation> {
+    if canonical_tail.is_none() {
+        return Ok(bcode_session_migration::MigrationTargetValidation {
+            canonical_tail,
+            projections: Vec::new(),
+            model_context_schema_version: None,
+            expected_model_context_schema_version: u64::from(
+                MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION,
+            ),
+            model_context_checkpoint: None,
+            compatibility_schema_version: None,
+            expected_compatibility_schema_version: u64::from(
+                SESSION_COMPATIBILITY_PROJECTION_SCHEMA_VERSION,
+            ),
+            compatibility_checkpoint: None,
+            compatibility_resolved: true,
+        });
+    }
+
+    let snapshot = projection_checkpoint_snapshot(db).await?;
+    let projections = MaterializedProjection::all()
+        .iter()
+        .map(|projection| {
+            let state = snapshot.get(projection.as_str());
+            bcode_session_migration::MigrationProjectionValidation {
+                projection: projection.as_str().to_owned(),
+                actual_schema_version: state.map(|state| state.version),
+                expected_schema_version: u64::from(projection.schema_version()),
+                checkpoint: state.map(|state| state.checkpoint),
+            }
+        })
+        .collect();
+    let model_state = db
+        .select("model_context_projection_state")
+        .columns(&["schema_version", "last_event_seq"])
+        .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
+        .execute_first(db)
+        .await?;
+    let model_context_schema_version = model_state
+        .as_ref()
+        .map(|row| required_non_negative_u64(row, "schema_version"))
+        .transpose()?;
+    let model_context_checkpoint = model_state
+        .as_ref()
+        .map(|row| required_non_negative_u64(row, "last_event_seq"))
+        .transpose()?;
+    let compatibility_state = db
+        .select("session_compatibility_state")
+        .columns(&["schema_version", "last_event_seq"])
+        .where_eq("projection_id", DatabaseValue::Int32(1))
+        .execute_first(db)
+        .await?;
+    let compatibility_schema_version = compatibility_state
+        .as_ref()
+        .map(|row| required_non_negative_u64(row, "schema_version"))
+        .transpose()?;
+    let compatibility_checkpoint = compatibility_state
+        .as_ref()
+        .map(|row| required_non_negative_u64(row, "last_event_seq"))
+        .transpose()?;
+    let compatibility_issue_count = db
+        .select("session_compatibility_issues")
+        .columns(&["event_seq"])
+        .execute(db)
+        .await?
+        .len();
+    Ok(bcode_session_migration::MigrationTargetValidation {
+        canonical_tail,
+        projections,
+        model_context_schema_version,
+        expected_model_context_schema_version: u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION),
+        model_context_checkpoint,
+        compatibility_schema_version,
+        expected_compatibility_schema_version: u64::from(
+            SESSION_COMPATIBILITY_PROJECTION_SCHEMA_VERSION,
+        ),
+        compatibility_checkpoint,
+        compatibility_resolved: compatibility_issue_count == 0,
+    })
+}
+
 async fn validate_migrated_storage(
     db: &dyn Database,
     tail: Option<&SessionEvent>,
@@ -3009,35 +3104,12 @@ async fn validate_migrated_storage(
         project_session_compatibility_state(db, tail).await?;
     }
     let canonical_tail = tail.map(|event| event.sequence);
-    validate_all_projection_checkpoints_at_tail(db, canonical_tail).await?;
-    if let Some(expected) = canonical_tail {
-        let model_state = db
-            .select("model_context_projection_state")
-            .columns(&["schema_version", "last_event_seq"])
-            .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
-            .execute_first(db)
-            .await?
-            .ok_or(SessionDbError::ProjectionStale {
-                projection: "model_context",
-                checkpoint: None,
-                expected,
-            })?;
-        let schema_version = required_non_negative_u64(&model_state, "schema_version")?;
-        if schema_version != u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION) {
-            return Err(SessionDbError::ModelContextProjectionVersion {
-                actual: schema_version,
-                expected: u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION),
-            });
+    let target = migration_target_validation_facts(db, canonical_tail).await?;
+    bcode_session_migration::validate_migration_target(&target).map_err(|error| {
+        SessionDbError::MigrationHistoryIncompatible {
+            reason: error.to_string(),
         }
-        let checkpoint = required_non_negative_u64(&model_state, "last_event_seq")?;
-        if checkpoint != expected {
-            return Err(SessionDbError::ModelContextProjectionStale {
-                checkpoint,
-                expected,
-            });
-        }
-    }
-    validate_session_compatibility_precondition(db, canonical_tail).await?;
+    })?;
     metrics.record_histogram(
         "session.migration.validation_duration_ms",
         validation_timer.elapsed_ms(),
@@ -8751,10 +8823,15 @@ mod tests {
     async fn migration_crash_boundaries_reclassify_durably() {
         for phase in [
             "before_transaction",
+            "transaction_start",
+            "normalization",
+            "projection_rebuild",
+            "final_validation",
             "before_epoch_update",
             "after_epoch_update_before_commit",
             "during_transaction",
             "after_commit",
+            "post_commit_checkpoint",
         ] {
             let temp_dir = tempfile::tempdir().expect("temp dir");
             let session_id = create_legacy_crash_fixture(temp_dir.path()).await;
@@ -8765,6 +8842,10 @@ mod tests {
                 .expect("reopen after migration crash");
             match phase {
                 "before_transaction"
+                | "transaction_start"
+                | "normalization"
+                | "projection_rebuild"
+                | "final_validation"
                 | "before_epoch_update"
                 | "after_epoch_update_before_commit"
                 | "during_transaction" => {
@@ -8780,7 +8861,7 @@ mod tests {
                         u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)
                     );
                 }
-                "after_commit" => {
+                "after_commit" | "post_commit_checkpoint" => {
                     assert!(matches!(
                         reopened
                             .storage_compatibility()

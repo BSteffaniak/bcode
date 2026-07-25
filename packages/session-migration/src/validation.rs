@@ -3,6 +3,157 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 
+/// One current projection checkpoint observed after migration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationProjectionValidation {
+    /// Stable projection identity.
+    pub projection: String,
+    /// Projection schema observed in current storage.
+    pub actual_schema_version: Option<u64>,
+    /// Current projection schema required by the target API.
+    pub expected_schema_version: u64,
+    /// Last canonical sequence projected, when initialized.
+    pub checkpoint: Option<u64>,
+}
+
+/// Current-format target facts collected by the migration-target API after rebuilding state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationTargetValidation {
+    /// Canonical target tail, if the session contains events.
+    pub canonical_tail: Option<u64>,
+    /// Checkpointed current materialized projections.
+    pub projections: Vec<MigrationProjectionValidation>,
+    /// Model-context projection schema, when initialized.
+    pub model_context_schema_version: Option<u64>,
+    /// Current model-context schema required by the target API.
+    pub expected_model_context_schema_version: u64,
+    /// Model-context checkpoint, when initialized.
+    pub model_context_checkpoint: Option<u64>,
+    /// Compatibility projection schema, when initialized.
+    pub compatibility_schema_version: Option<u64>,
+    /// Current compatibility projection schema required by the target API.
+    pub expected_compatibility_schema_version: u64,
+    /// Compatibility projection checkpoint, when initialized.
+    pub compatibility_checkpoint: Option<u64>,
+    /// Whether current compatibility validation found no unresolved history.
+    pub compatibility_resolved: bool,
+}
+
+/// Failure to validate a rebuilt current-format migration target.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum MigrationTargetValidationError {
+    /// A required materialized projection is absent or behind canonical history.
+    #[error(
+        "migration projection {projection} is stale: checkpoint={checkpoint:?} expected={expected:?}"
+    )]
+    ProjectionStale {
+        /// Stable projection identity.
+        projection: String,
+        /// Observed checkpoint.
+        checkpoint: Option<u64>,
+        /// Canonical tail required by validation.
+        expected: Option<u64>,
+    },
+    /// A required materialized projection uses a non-current schema.
+    #[error(
+        "migration projection {projection} schema is incompatible: actual={actual:?} expected={expected}"
+    )]
+    ProjectionIncompatible {
+        /// Stable projection identity.
+        projection: String,
+        /// Observed schema version.
+        actual: Option<u64>,
+        /// Required current schema version.
+        expected: u64,
+    },
+    /// The model-context projection is absent or behind canonical history.
+    #[error(
+        "migration model-context projection is stale: checkpoint={checkpoint:?} expected={expected:?}"
+    )]
+    ModelContextStale {
+        /// Observed checkpoint.
+        checkpoint: Option<u64>,
+        /// Canonical tail required by validation.
+        expected: Option<u64>,
+    },
+    /// The model-context projection uses a non-current schema.
+    #[error(
+        "migration model-context schema is incompatible: actual={actual:?} expected={expected}"
+    )]
+    ModelContextIncompatible {
+        /// Observed schema version.
+        actual: Option<u64>,
+        /// Required current schema version.
+        expected: u64,
+    },
+    /// Current compatibility validation found unresolved canonical history.
+    #[error("migration target retains unresolved compatibility state")]
+    CompatibilityUnresolved,
+}
+
+/// Validate projection and compatibility facts produced by the current migration-target API.
+///
+/// # Errors
+///
+/// Returns an error when any required current projection is absent, stale, incompatible, or when
+/// compatibility state remains unresolved.
+pub fn validate_migration_target(
+    target: &MigrationTargetValidation,
+) -> Result<(), MigrationTargetValidationError> {
+    if target.canonical_tail.is_some() {
+        for projection in &target.projections {
+            if projection.actual_schema_version != Some(projection.expected_schema_version) {
+                return Err(MigrationTargetValidationError::ProjectionIncompatible {
+                    projection: projection.projection.clone(),
+                    actual: projection.actual_schema_version,
+                    expected: projection.expected_schema_version,
+                });
+            }
+            if projection.checkpoint != target.canonical_tail {
+                return Err(MigrationTargetValidationError::ProjectionStale {
+                    projection: projection.projection.clone(),
+                    checkpoint: projection.checkpoint,
+                    expected: target.canonical_tail,
+                });
+            }
+        }
+        if target.model_context_schema_version != Some(target.expected_model_context_schema_version)
+        {
+            return Err(MigrationTargetValidationError::ModelContextIncompatible {
+                actual: target.model_context_schema_version,
+                expected: target.expected_model_context_schema_version,
+            });
+        }
+        if target.model_context_checkpoint != target.canonical_tail {
+            return Err(MigrationTargetValidationError::ModelContextStale {
+                checkpoint: target.model_context_checkpoint,
+                expected: target.canonical_tail,
+            });
+        }
+    }
+    if target.canonical_tail.is_some() {
+        if target.compatibility_schema_version != Some(target.expected_compatibility_schema_version)
+        {
+            return Err(MigrationTargetValidationError::ProjectionIncompatible {
+                projection: "session_compatibility".to_owned(),
+                actual: target.compatibility_schema_version,
+                expected: target.expected_compatibility_schema_version,
+            });
+        }
+        if target.compatibility_checkpoint != target.canonical_tail {
+            return Err(MigrationTargetValidationError::ProjectionStale {
+                projection: "session_compatibility".to_owned(),
+                checkpoint: target.compatibility_checkpoint,
+                expected: target.canonical_tail,
+            });
+        }
+    }
+    if !target.compatibility_resolved {
+        return Err(MigrationTargetValidationError::CompatibilityUnresolved);
+    }
+    Ok(())
+}
+
 /// Migration-owned classification of an observed durable writer epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriterEpochCompatibility {
@@ -158,6 +309,62 @@ pub fn build_session_migration_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_target_validation_rejects_stale_incompatible_and_unresolved_state() {
+        let valid = MigrationTargetValidation {
+            canonical_tail: Some(9),
+            projections: vec![MigrationProjectionValidation {
+                projection: "session_state".to_owned(),
+                actual_schema_version: Some(1),
+                expected_schema_version: 1,
+                checkpoint: Some(9),
+            }],
+            model_context_schema_version: Some(2),
+            expected_model_context_schema_version: 2,
+            model_context_checkpoint: Some(9),
+            compatibility_schema_version: Some(1),
+            expected_compatibility_schema_version: 1,
+            compatibility_checkpoint: Some(9),
+            compatibility_resolved: true,
+        };
+        assert!(validate_migration_target(&valid).is_ok());
+
+        let mut stale = valid.clone();
+        stale.projections[0].checkpoint = Some(8);
+        assert!(matches!(
+            validate_migration_target(&stale),
+            Err(MigrationTargetValidationError::ProjectionStale { .. })
+        ));
+        let mut incompatible = valid.clone();
+        incompatible.model_context_schema_version = Some(1);
+        assert!(matches!(
+            validate_migration_target(&incompatible),
+            Err(MigrationTargetValidationError::ModelContextIncompatible { .. })
+        ));
+        let mut unresolved = valid;
+        unresolved.compatibility_resolved = false;
+        assert_eq!(
+            validate_migration_target(&unresolved),
+            Err(MigrationTargetValidationError::CompatibilityUnresolved)
+        );
+    }
+
+    #[test]
+    fn empty_target_requires_resolved_compatibility_without_projection_rows() {
+        let target = MigrationTargetValidation {
+            canonical_tail: None,
+            projections: Vec::new(),
+            model_context_schema_version: None,
+            expected_model_context_schema_version: 2,
+            model_context_checkpoint: None,
+            compatibility_schema_version: None,
+            expected_compatibility_schema_version: 1,
+            compatibility_checkpoint: None,
+            compatibility_resolved: true,
+        };
+        assert!(validate_migration_target(&target).is_ok());
+    }
 
     #[test]
     fn writer_epoch_classification_and_finalization_are_migration_owned() {

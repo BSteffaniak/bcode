@@ -38,9 +38,11 @@ pub use storage::{
     recover_accidental_epoch_session_root,
 };
 pub use validation::{
+    MigrationProjectionValidation, MigrationTargetValidation, MigrationTargetValidationError,
     SessionMigrationCanonicalReceiptEvidence, SessionMigrationReceipt,
     SessionMigrationReceiptRequest, WriterEpochCompatibility, WriterFinalizationError,
-    build_session_migration_receipt, classify_writer_epoch, validate_writer_finalization,
+    build_session_migration_receipt, classify_writer_epoch, validate_migration_target,
+    validate_writer_finalization,
 };
 
 pub use classification::HistoricalEventMetadata;

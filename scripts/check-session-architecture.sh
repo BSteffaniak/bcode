@@ -226,9 +226,12 @@ if ! rg -q 'pub struct SessionMigrationReceipt' packages/session-migration/src/v
   || ! rg -q 'pub fn build_session_migration_receipt' packages/session-migration/src/validation.rs \
   || ! rg -q 'plan_writer_epoch_migration' packages/session-migration/src/validation.rs \
   || ! rg -q 'pub fn classify_writer_epoch' packages/session-migration/src/validation.rs \
+  || ! rg -q 'pub fn validate_migration_target' packages/session-migration/src/validation.rs \
   || ! rg -q 'pub const fn validate_writer_finalization' packages/session-migration/src/validation.rs \
+  || ! rg -q 'migration_target_validation_facts' packages/session/src/db.rs \
+  || ! rg -q 'validate_migration_target' packages/session/src/db.rs \
   || ! rg -q 'build_session_migration_receipt' packages/session/src/db.rs \
-  || ! rg -q 'validate_writer_finalization' packages/session/src/db.rs; then
+  || sed -n '/async fn validate_migrated_storage(/,/^}/p' packages/session/src/db.rs | grep -q 'ProjectionStale\|ProjectionIncompatible\|CompatibilityDegraded'; then
   echo "Session migration validation ownership violation: receipt construction and migration-plan selection must remain migration-owned." >&2
   violations=1
 fi
@@ -588,8 +591,13 @@ if ! rg -q 'pub mod schema_28' packages/session-migration/src/codec.rs \
   || ! rg -q 'every_supported_source_epoch_migrates_to_current_writable_storage' packages/session/src/db.rs \
   || ! rg -q 'read migrated authoritative draft' packages/session/src/db.rs \
   || ! rg -q 'migration_pages_more_than_one_thousand_events_without_gaps_or_duplicates' packages/session/src/lib.rs \
+  || ! rg -q 'abort_at_migration_crash_boundary\("transaction_start"\)' packages/session/src/db.rs \
+  || ! rg -q 'abort_at_migration_crash_boundary\("normalization"\)' packages/session/src/db.rs \
+  || ! rg -q 'abort_at_migration_crash_boundary\("projection_rebuild"\)' packages/session/src/db.rs \
+  || ! rg -q 'abort_at_migration_crash_boundary\("final_validation"\)' packages/session/src/db.rs \
   || ! rg -q 'abort_at_migration_crash_boundary\("before_epoch_update"\)' packages/session/src/db.rs \
   || ! rg -q 'abort_at_migration_crash_boundary\("after_epoch_update_before_commit"\)' packages/session/src/db.rs \
+  || ! rg -q 'abort_at_migration_crash_boundary\("post_commit_checkpoint"\)' packages/session/src/db.rs \
   || ! rg -q 'write_session_migration_receipt' packages/session/src/db.rs \
   || ! sed -n '/let migration_outcome =/,/validate_storage_writer_contract/p' packages/session/src/db.rs | awk '/write_session_migration_receipt/{receipt=NR} /set_storage_writer_contract/{epoch=NR} END {exit !(receipt && epoch && receipt < epoch)}' \
   || ! rg -q 'set_storage_writer_contract\(&\*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH\)' packages/session/src/db.rs \
