@@ -72,6 +72,29 @@ Correctness-sensitive controls such as `ToolChoice::None`, `ToolChoice::Required
 choice, structured output, and cancellation cannot be silently ignored. A provider that cannot
 honor one returns a normalized `UnsupportedFeature` or `InvalidRequest` error.
 
+## Provider-neutral reasoning events
+
+Provider-native reasoning parsing and classification belong in the provider plugin. Shared host and
+runtime layers receive only `ProviderTurnEvent::ReasoningActivity` operations using the neutral
+session-model vocabulary:
+
+* `Started` records activity evidence and stable turn-local identity;
+* `PartDelta` and `PartCompleted` classify readable content as summary, raw, or deliberate legacy
+  compatibility content while preserving stable part identity and provider order;
+* `OpaqueObserved` records only that non-readable continuation state exists; provider bytes,
+  lengths, hashes, and prefixes must not enter this event;
+* `Finished` records completed, interrupted, or failed lifecycle state.
+
+Plugins derive deterministic activity and part IDs from provider IDs/indexes when available and
+from stable turn-local ordering otherwise. Provider event names, model-name checks, encrypted
+continuation state, and dialect-specific reconciliation remain inside the plugin. Streamed and
+completed forms must reconcile by identity: completion may authoritatively replace a partial part,
+but must not duplicate equal text or flatten distinct parts. Opaque continuation payloads may be
+retained only in private provider metadata needed for replay.
+
+`ReasoningDelta` remains a lossy compatibility event for providers or consumers that have not yet
+migrated. New provider implementations should emit structured reasoning activities.
+
 ## Turn lifecycle and polling
 
 A successful `start_turn` allocates a unique, non-empty provider turn ID and an isolated active
