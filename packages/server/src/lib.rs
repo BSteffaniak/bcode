@@ -30090,6 +30090,47 @@ library = "test"
     }
 
     #[test]
+    fn reasoning_transcript_events_are_excluded_from_model_context() {
+        let session_id = SessionId::new();
+        let kinds = [
+            SessionEventKind::AssistantReasoningDelta {
+                text: "legacy delta".to_owned(),
+            },
+            SessionEventKind::AssistantReasoningMessage {
+                text: "legacy complete".to_owned(),
+            },
+            SessionEventKind::AssistantReasoningActivity {
+                turn_id: "turn-1".to_owned(),
+                activity: bcode_session_models::ReasoningActivity {
+                    activity_id: "reasoning-1".to_owned(),
+                    order: 0,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    parts: vec![bcode_session_models::ReasoningPart {
+                        part_id: "summary-0".to_owned(),
+                        kind: bcode_session_models::ReasoningContentKind::Summary,
+                        role: bcode_session_models::ReasoningContentRole::Milestone,
+                        order: 0,
+                        text: "summary".to_owned(),
+                    }],
+                    opaque: true,
+                },
+            },
+        ];
+
+        for (sequence, kind) in kinds.into_iter().enumerate() {
+            let event = bcode_session_models::SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: u64::try_from(sequence).unwrap_or(u64::MAX),
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind,
+            };
+            assert!(non_tool_session_event_to_model_message(&event).is_none());
+        }
+    }
+
+    #[test]
     fn plugin_status_notes_are_excluded_from_model_context() {
         let event = bcode_session_models::SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,

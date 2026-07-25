@@ -8153,6 +8153,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_reasoning_events_survive_session_database_restart() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("legacy reasoning".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should create");
+        for kind in [
+            SessionEventKind::AssistantReasoningDelta {
+                text: "legacy delta".to_owned(),
+            },
+            SessionEventKind::AssistantReasoningMessage {
+                text: "legacy complete".to_owned(),
+            },
+        ] {
+            manager
+                .append_event(session.id, kind)
+                .await
+                .expect("legacy reasoning should append");
+        }
+        drop(manager);
+
+        let restored = SessionManager::persistent(&root).expect("manager should restore");
+        let history = restored
+            .session_history(session.id)
+            .await
+            .expect("history should load");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::AssistantReasoningDelta { text } if text == "legacy delta"
+        )));
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::AssistantReasoningMessage { text } if text == "legacy complete"
+        )));
+
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn structured_reasoning_survives_session_database_restart() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
