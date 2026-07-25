@@ -1467,8 +1467,21 @@ impl SessionView {
         draft.argument_bytes = event.argument_bytes;
         draft.truncated = event.truncated;
         self.tool_request_drafts.insert(key, draft.clone());
-        if let Some(tool) = self.snapshot.tools.get(&event.tool_call_id)
-            && is_terminal_tool_status(tool.status)
+        let slot_has_contribution = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.id == id)
+            .is_some_and(|item| {
+                matches!(item.kind, TranscriptViewItemKind::ToolContribution { .. })
+            });
+        if slot_has_contribution
+            || self
+                .snapshot
+                .tools
+                .get(&event.tool_call_id)
+                .is_some_and(|tool| is_terminal_tool_status(tool.status))
         {
             return;
         }
@@ -1638,6 +1651,14 @@ impl SessionView {
                 }
                 if placement == bcode_session_models::ToolContributionPlacement::Hidden {
                     self.remove_contribution_slot_item(&item_id);
+                } else if placement == bcode_session_models::ToolContributionPlacement::Result
+                    && self
+                        .snapshot
+                        .tools
+                        .get(&contribution.invocation_id)
+                        .is_some_and(|tool| is_terminal_tool_status(tool.status))
+                {
+                    self.remove_owned_contribution_slot_item(&item_id, &key);
                 } else {
                     self.upsert_contribution_slot_item(
                         item_id,
@@ -3468,6 +3489,76 @@ mod tests {
     }
 
     #[test]
+    fn durable_result_contribution_cannot_override_canonical_result_record() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("test.plugin".to_owned()),
+                tool_name: "test.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-1".to_owned(),
+                    model_output: "canonical".to_owned(),
+                    is_error: false,
+                    result: Some(ToolInvocationResult::Text {
+                        text: "canonical".to_owned(),
+                    }),
+                },
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            3,
+            SessionEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Result,
+                    bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call-1".to_owned(),
+                        contribution_id: "late-result".to_owned(),
+                        sequence: 1,
+                        producer_id: "test.plugin".to_owned(),
+                        schema: "test.result".to_owned(),
+                        schema_version: 1,
+                        operation: bcode_session_models::ToolContributionOperation::Upsert,
+                        persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                        artifact: None,
+                        payload: serde_json::json!({"late": true}),
+                    },
+                ),
+            },
+        ));
+
+        let result_id = TranscriptViewItemId::tool_presentation_slot(
+            "call-1",
+            bcode_session_models::ToolContributionPlacement::Result,
+            None,
+        );
+        let result_items = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .filter(|item| item.id == result_id)
+            .collect::<Vec<_>>();
+        assert_eq!(result_items.len(), 1);
+        assert!(matches!(
+            result_items[0].kind,
+            TranscriptViewItemKind::ToolInvocation { .. }
+        ));
+    }
+
+    #[test]
     fn session_view_projects_generic_final_result_without_legacy_finish_event() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
@@ -5089,6 +5180,88 @@ mod tests {
                     } if contribution.sequence == REPLACEMENTS
                 )
         }));
+    }
+
+    #[test]
+    fn durable_rich_request_dominates_late_request_draft() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("test.plugin".to_owned()),
+                tool_name: "test.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        let contribution = bcode_session_models::ToolContributionEvent {
+            invocation_id: "call-1".to_owned(),
+            contribution_id: "request".to_owned(),
+            sequence: 1,
+            producer_id: "test.plugin".to_owned(),
+            schema: "test.request".to_owned(),
+            schema_version: 1,
+            operation: bcode_session_models::ToolContributionOperation::Upsert,
+            persistence: bcode_session_models::ToolContributionPersistence::Durable,
+            artifact: None,
+            payload: serde_json::json!({"rich": true}),
+        };
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Request,
+                    contribution.clone(),
+                ),
+            },
+        ));
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "test.tool".to_owned(),
+                    producer_plugin_id: Some("test.plugin".to_owned()),
+                    schema: "test.draft".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Request,
+                    generation: 1,
+                    revision: 1,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: "must not replace rich request".to_owned(),
+                    },
+                    argument_bytes: 29,
+                    truncated: false,
+                },
+            },
+        });
+
+        let request_id = TranscriptViewItemId::tool_presentation_slot(
+            "call-1",
+            bcode_session_models::ToolContributionPlacement::Request,
+            None,
+        );
+        let request_items = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .filter(|item| item.id == request_id)
+            .collect::<Vec<_>>();
+        assert_eq!(request_items.len(), 1);
+        assert!(matches!(
+            &request_items[0].kind,
+            TranscriptViewItemKind::ToolContribution {
+                contribution: current,
+                ..
+            } if current == &contribution
+        ));
     }
 
     #[test]
