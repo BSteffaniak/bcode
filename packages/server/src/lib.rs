@@ -34665,22 +34665,41 @@ library = "test"
                 .is_err()
         );
         restore_workflow_runtime_work(&state).await;
-        let mut join = None;
+        let mut joined_input = None;
         for _ in 0..60 {
-            let pending = state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .pending_activations(10)
-                .expect("pending");
-            if let Some(found) = pending.into_iter().find(|item| item.node_id == "join") {
-                join = Some(found);
+            joined_input = {
+                let store = state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let pending = store.pending_activations(10).expect("pending");
+                if let Some(found) = pending.into_iter().find(|item| item.node_id == "join") {
+                    found.input
+                } else {
+                    // The completion task may settle the join between polls, so its durable
+                    // terminal output is the same positive result as observing it pending.
+                    store
+                        .event_history("parallel-restart-run", None, 100)
+                        .expect("event history")
+                        .iter()
+                        .find_map(|event| {
+                            (event.event_type == "output_validated"
+                                && event
+                                    .payload
+                                    .get("node_id")
+                                    .and_then(serde_json::Value::as_str)
+                                    == Some("join"))
+                            .then(|| event.payload.get("value").cloned())
+                            .flatten()
+                        })
+                }
+            };
+            if joined_input.is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        let join = join.expect("parallel join becomes ready");
-        assert_eq!(join.input, Some(serde_json::json!([0, 0])));
+        assert_eq!(joined_input, Some(serde_json::json!([0, 0])));
         restore_workflow_runtime_work(&state).await;
         let children = state
             .sessions
