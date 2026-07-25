@@ -28,7 +28,7 @@ use bcode_session_models::{
 use bcode_session_view::{SessionView, execute_session_view_action};
 use bcode_session_view_models::{
     ComposerDraftViewScope, InteractionViewSummary, MessageAcceptanceDispositionView,
-    PromptPlacementView, SessionViewAction, SessionViewSnapshot,
+    PromptPlacementView, SessionViewAction, SessionViewPatch, SessionViewSnapshot,
 };
 use hyperchad::router::{RoutePath, RouteRequest, Router};
 use serde::Deserialize;
@@ -127,6 +127,7 @@ impl std::fmt::Debug for RenderSubscriptionScope {
 struct ScopedSnapshotUpdate {
     scope: RenderSubscriptionScope,
     snapshot: SessionViewSnapshot,
+    patch: Option<SessionViewPatch>,
     sessions: Vec<SessionSummary>,
 }
 
@@ -135,6 +136,7 @@ struct SessionWatchContext {
     render_scope: RenderSubscriptionScope,
     session_id: SessionId,
     renderer_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>>>>,
+    last_sent_snapshot: Arc<Mutex<Option<SessionViewSnapshot>>>,
     history_windows: Arc<Mutex<BTreeMap<SessionId, ProjectionWindowRequest>>>,
     interaction_controllers: Arc<Mutex<LocalInteractionControllers>>,
 }
@@ -329,6 +331,7 @@ impl HyperChadAppState {
                 render_scope,
                 session_id,
                 renderer_tx: Arc::clone(&renderer_tx),
+                last_sent_snapshot: Arc::new(Mutex::new(None)),
                 history_windows,
                 interaction_controllers,
             }))
@@ -1755,6 +1758,37 @@ async fn attach_watch_with_retry(
     }
 }
 
+fn scoped_snapshot_patch(
+    previous: &mut Option<SessionViewSnapshot>,
+    snapshot: &SessionViewSnapshot,
+) -> Option<SessionViewPatch> {
+    let patch = previous
+        .as_ref()
+        .map(|base| SessionViewPatch::between_snapshots(base, snapshot));
+    *previous = Some(snapshot.clone());
+    patch
+}
+
+fn scoped_snapshot_update(
+    context: &SessionWatchContext,
+    snapshot: SessionViewSnapshot,
+    sessions: Vec<SessionSummary>,
+) -> ScopedSnapshotUpdate {
+    let patch = {
+        let mut previous = context
+            .last_sent_snapshot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        scoped_snapshot_patch(&mut previous, &snapshot)
+    };
+    ScopedSnapshotUpdate {
+        scope: context.render_scope.clone(),
+        snapshot,
+        patch,
+        sessions,
+    }
+}
+
 async fn send_connection_update(
     context: &SessionWatchContext,
     attached: &AttachedSessionHistory,
@@ -1787,11 +1821,7 @@ async fn send_connection_update(
     snapshot.connection_status = status;
     snapshot.catalog_status = catalog_status;
     Ok(sender
-        .send(ScopedSnapshotUpdate {
-            scope: context.render_scope.clone(),
-            snapshot,
-            sessions,
-        })
+        .send(scoped_snapshot_update(context, snapshot, sessions))
         .await
         .is_ok())
 }
@@ -1823,11 +1853,11 @@ async fn send_watched_snapshot(
         return Ok(false);
     };
     Ok(sender
-        .send(ScopedSnapshotUpdate {
-            scope: context.render_scope.clone(),
+        .send(scoped_snapshot_update(
+            context,
             snapshot,
-            sessions: session_list.sessions,
-        })
+            session_list.sessions,
+        ))
         .await
         .is_ok())
 }
@@ -1918,6 +1948,7 @@ async fn watch_session_updates(context: SessionWatchContext) -> Result<(), Clien
 }
 
 #[cfg(any(test, feature = "renderer-html-actix"))]
+#[cfg(feature = "renderer-html-actix")]
 fn live_update_fragment(
     snapshot: &SessionViewSnapshot,
     sessions: &[SessionSummary],
@@ -1927,7 +1958,7 @@ fn live_update_fragment(
     (containers.len() == 1).then(|| containers.remove(0))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "renderer-html-actix"))]
 fn live_update_view(
     snapshot: &SessionViewSnapshot,
     sessions: &[SessionSummary],
@@ -1955,6 +1986,15 @@ where
     let access_token = Arc::clone(&state.access_token);
     tokio::spawn(async move {
         while let Some(update) = rx.recv().await {
+            if let Some(patch) = &update.patch {
+                tracing::trace!(
+                    base_revision = patch.base_revision,
+                    revision = patch.revision,
+                    transcript_operations = patch.transcript.len(),
+                    reset = patch.reset.is_some(),
+                    "rendering scoped HyperChad session-view patch"
+                );
+            }
             let context = html_actix::HtmlActixPresentationContext::new(Arc::clone(&access_token));
             let Some(fragment) = live_update_fragment(&update.snapshot, &update.sessions, &context)
             else {
@@ -1974,6 +2014,66 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scoped_snapshot_patch_replaces_stable_result_slot() {
+        let item_id = bcode_session_view_models::TranscriptViewItemId::tool_presentation_slot(
+            "call-1",
+            bcode_session_models::ToolContributionPlacement::Result,
+            None,
+        );
+        let draft = bcode_session_view_models::TranscriptViewItem {
+            id: item_id.clone(),
+            revision: 1,
+            sequence: None,
+            timestamp_ms: None,
+            streaming: true,
+            kind: bcode_session_view_models::TranscriptViewItemKind::ToolRequestDraft {
+                draft: bcode_session_view_models::ToolRequestDraftView {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Result,
+                    generation: 1,
+                    revision: 1,
+                    argument_bytes: 1,
+                    preview_start_offset: 0,
+                    preview: "{".to_owned(),
+                    truncated: false,
+                },
+            },
+        };
+        let final_item = bcode_session_view_models::TranscriptViewItem {
+            id: item_id,
+            revision: 2,
+            sequence: Some(2),
+            timestamp_ms: Some(1),
+            streaming: false,
+            kind: bcode_session_view_models::TranscriptViewItemKind::SystemMessage {
+                message: bcode_session_view_models::ChatMessageView::plain("final"),
+            },
+        };
+        let mut base = SessionViewSnapshot::empty();
+        base.revision = 1;
+        base.transcript.revision = 1;
+        base.transcript.items.push(draft);
+        let mut next = base.clone();
+        next.revision = 2;
+        next.transcript.revision = 2;
+        next.transcript.items[0] = final_item.clone();
+        let mut previous = Some(base);
+
+        let patch = scoped_snapshot_patch(&mut previous, &next).expect("incremental patch");
+        assert!(patch.reset.is_none());
+        assert_eq!(
+            patch.transcript,
+            vec![bcode_session_view_models::TranscriptViewPatchOp::Replace { item: final_item }]
+        );
+        assert_eq!(previous, Some(next));
+    }
 
     #[cfg(feature = "static-bundled-question-plugin")]
     #[test]

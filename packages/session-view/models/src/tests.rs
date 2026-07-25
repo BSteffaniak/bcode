@@ -143,6 +143,71 @@ fn permission_view_deserializes_legacy_shape() {
 }
 
 #[test]
+fn transcript_patch_replaces_tool_slot_across_draft_and_final_schemas() {
+    let id = TranscriptViewItemId::tool_presentation_slot(
+        "call-1",
+        bcode_session_models::ToolContributionPlacement::Result,
+        None,
+    );
+    let draft = TranscriptViewItem {
+        id: id.clone(),
+        revision: 1,
+        sequence: None,
+        timestamp_ms: None,
+        streaming: true,
+        kind: TranscriptViewItemKind::ToolRequestDraft {
+            draft: ToolRequestDraftView {
+                turn_id: "turn-1".to_owned(),
+                tool_call_id: "call-1".to_owned(),
+                tool_name: "filesystem.write".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                schema: "bcode.filesystem.request-draft.write".to_owned(),
+                schema_version: 1,
+                placement: bcode_session_models::ToolContributionPlacement::Result,
+                generation: 1,
+                revision: 1,
+                argument_bytes: 1,
+                preview_start_offset: 0,
+                preview: "{".to_owned(),
+                truncated: false,
+            },
+        },
+    };
+    let final_item = TranscriptViewItem {
+        id,
+        revision: 2,
+        sequence: None,
+        timestamp_ms: Some(1),
+        streaming: false,
+        kind: TranscriptViewItemKind::SystemMessage {
+            message: ChatMessageView::plain("authoritative final artifact"),
+        },
+    };
+    let base = TranscriptViewDocument {
+        revision: 1,
+        items: vec![draft],
+        source_start_sequence: None,
+        source_end_sequence: None,
+        has_older_history: false,
+        has_newer_history: false,
+    };
+    let next = TranscriptViewDocument {
+        revision: 2,
+        items: vec![final_item.clone()],
+        source_start_sequence: None,
+        source_end_sequence: None,
+        has_older_history: false,
+        has_newer_history: false,
+    };
+
+    let patch = SessionViewPatch::transcript_between(1, 2, None, &base, &next);
+    assert_eq!(
+        patch.transcript,
+        vec![TranscriptViewPatchOp::Replace { item: final_item }]
+    );
+}
+
+#[test]
 fn transcript_patch_appends_and_replaces_prefix_compatible_items() {
     let mut base = transcript_document(3, [transcript_item("one", 1, "old")]);
     let next = transcript_document(
