@@ -192,6 +192,9 @@ fi
 
 if ! rg -q 'CURRENT_WRITER_EPOCH: u32 = 5' packages/session-migration/src/inventory.rs \
   || ! rg -q 'RELEASED_HISTORICAL_EVENT_SCHEMAS' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'RELEASED_MIGRATION_IDS' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'RELEASED_PERSISTED_TABLES' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'released_migration_and_table_inventories_are_sorted_unique_and_domain_complete' packages/session-migration/src/inventory.rs \
   || ! rg -q 'plan_writer_epoch_migration' packages/session-migration/src/planning.rs \
   || rg -n 'CURRENT_WRITER_EPOCH|RELEASED_HISTORICAL_EVENT_SCHEMAS|MIGRATION_STEPS' packages/session/src \
     --glob '*.rs' | rg -v 'CURRENT_SESSION_STORAGE_WRITER_EPOCH' \
@@ -214,6 +217,9 @@ fi
 if ! rg -q 'historical_codec_never_applies_schema_28_rules_to_other_schemas' packages/session-migration/src/execution.rs \
   || ! rg -q 'pub fn normalize_canonical_event' packages/session-migration/src/execution.rs \
   || ! rg -q 'schema_28_store_fixture_classifies_affected_historical_events' packages/session-migration/src/execution.rs \
+  || ! rg -q 'pub struct ReleasedFixtureManifest' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'load_released_fixture_manifest' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'permanent_fixture_manifest_is_exhaustive_and_inventory_valid' packages/session-migration/src/inventory.rs \
   || ! rg -q 'fixture_manifest_enforces_complete_sanitized_inventory' packages/session-migration/src/execution.rs \
   || ! rg -q 'pub mod schema_28' packages/session-migration/src/codec.rs \
   || ! rg -q 'pub enum HistoricalDecode' packages/session-migration/src/classification.rs \

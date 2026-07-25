@@ -214,33 +214,10 @@ mod tests {
     use super::*;
     use bcode_session_models::{RequestContextTokenCount, SessionEventKind, ToolInvocationResult};
     use serde::Deserialize;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
     const SESSION_ID: &str = "00000000-0000-0000-0000-000000000001";
-
-    #[derive(Debug, Deserialize)]
-    struct FixtureManifest {
-        format_version: u32,
-        fixtures: Vec<FixtureManifestEntry>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct FixtureManifestEntry {
-        path: PathBuf,
-        source_writer_epochs: Vec<u64>,
-        event_schemas: Vec<u16>,
-        expected_event_count: usize,
-        expected_classifications: FixtureClassificationCounts,
-        covered_event_kinds: Vec<String>,
-    }
-
-    #[derive(Debug, Deserialize)]
-    struct FixtureClassificationCounts {
-        converted: usize,
-        retired_known: usize,
-        current_passthrough: usize,
-    }
 
     #[derive(Debug, Deserialize)]
     struct FixtureEnvelope {
@@ -251,26 +228,10 @@ mod tests {
 
     #[test]
     fn fixture_manifest_enforces_complete_sanitized_inventory() {
-        let manifest: FixtureManifest =
-            serde_json::from_str(include_str!("../fixtures/manifest.json"))
-                .expect("fixture manifest");
-        assert_eq!(manifest.format_version, 1);
-        assert!(!manifest.fixtures.is_empty());
-
         let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
-        let listed_paths = manifest
-            .fixtures
-            .iter()
-            .map(|fixture| fixture.path.clone())
-            .collect::<BTreeSet<_>>();
-        let actual_paths = std::fs::read_dir(fixture_root.join("stores"))
-            .expect("fixture directory")
-            .map(|entry| PathBuf::from("stores").join(entry.expect("fixture entry").file_name()))
-            .collect::<BTreeSet<_>>();
-        assert_eq!(
-            listed_paths, actual_paths,
-            "fixture manifest must be exhaustive"
-        );
+        let manifest = crate::load_released_fixture_manifest(&fixture_root)
+            .expect("fixture manifest and disk inventory");
+        assert_eq!(manifest.format_version, 1);
 
         for fixture in manifest.fixtures {
             assert!(!fixture.source_writer_epochs.is_empty());

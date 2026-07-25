@@ -56,8 +56,11 @@ pub use execution::{
 };
 pub use inventory::{
     CURRENT_EVENT_SCHEMA, CURRENT_WRITER_EPOCH, MIGRATION_STEPS, MigrationStepDescriptor,
-    RELEASED_HISTORICAL_EVENT_SCHEMAS, RELEASED_HISTORICAL_WRITER_EPOCHS,
-    is_released_historical_event_schema,
+    RELEASED_HISTORICAL_EVENT_SCHEMAS, RELEASED_HISTORICAL_WRITER_EPOCHS, RELEASED_MIGRATION_IDS,
+    RELEASED_PERSISTED_TABLES, ReleasedFixtureClassificationCounts, ReleasedFixtureDescriptor,
+    ReleasedFixtureInventoryError, ReleasedFixtureManifest, ReleasedMigrationDescriptor,
+    ReleasedMigrationDomain, is_released_historical_event_schema, load_released_fixture_manifest,
+    released_fixture_schema_coverage, released_fixture_writer_coverage,
 };
 pub use planning::{
     MigrationPlan, MigrationPlanError, MigrationPlanService, plan_writer_epoch_migration,
