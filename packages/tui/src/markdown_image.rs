@@ -2,7 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Read, Seek};
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use bcode_markdown_render::MarkdownDestination;
@@ -141,12 +144,32 @@ pub enum MarkdownImageLoadError {
     /// Request exceeded the fixed wall-clock deadline.
     #[error("image load timed out")]
     TimedOut,
+    /// Loading was cancelled because its owner changed or left the resident window.
+    #[error("image load cancelled")]
+    Cancelled,
     /// The local image could not be opened or read.
     #[error("image I/O failed: {0}")]
     Io(String),
     /// The remote image request failed.
     #[error("image request failed: {0}")]
     Network(String),
+}
+
+/// Cancellation flag for one Markdown image load.
+#[derive(Debug, Clone, Default)]
+pub struct MarkdownImageCancellationToken(Arc<AtomicBool>);
+
+impl MarkdownImageCancellationToken {
+    /// Request cancellation of associated loading work.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Return whether cancellation was requested.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// Concurrency-limited Markdown image loader.
@@ -189,50 +212,80 @@ impl MarkdownImageLoader {
         &self,
         destination: &MarkdownDestination,
     ) -> Result<DecodedMarkdownImage, MarkdownImageLoadFailure> {
+        self.load_cancellable(destination, &MarkdownImageCancellationToken::default())
+            .await
+    }
+
+    /// Load and decode one destination with cooperative cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Self::load`], plus cancellation when the
+    /// supplied token is cancelled before a transport or decode stage.
+    pub async fn load_cancellable(
+        &self,
+        destination: &MarkdownDestination,
+        cancellation: &MarkdownImageCancellationToken,
+    ) -> Result<DecodedMarkdownImage, MarkdownImageLoadFailure> {
+        ensure_not_cancelled(cancellation)?;
         let started = Instant::now();
-        let _permit = tokio::time::timeout(remaining_load_time(started)?, self.permits.acquire())
-            .await
-            .map_err(|_| MarkdownImageLoadError::TimedOut)?
-            .map_err(|_| MarkdownImageLoadError::Network("image loader closed".to_owned()))?;
+        let permit = self.permits.acquire();
+        tokio::pin!(permit);
+        let _permit = loop {
+            tokio::select! {
+                result = &mut permit => {
+                    break result.map_err(|_| MarkdownImageLoadError::Network("image loader closed".to_owned()))?;
+                }
+                () = tokio::time::sleep(Duration::from_millis(10)) => {
+                    ensure_not_cancelled(cancellation)?;
+                    let _ = remaining_load_time(started)?;
+                }
+            }
+        };
+        ensure_not_cancelled(cancellation)?;
         let encoded = match markdown_image_load_decision(destination) {
-            MarkdownImageLoadDecision::Remote(url) => self.load_remote(url, started).await?,
-            MarkdownImageLoadDecision::Local(path) => tokio::time::timeout(
-                remaining_load_time(started)?,
-                tokio::task::spawn_blocking(move || read_local_image(&path)),
-            )
-            .await
-            .map_err(|_| MarkdownImageLoadError::TimedOut)?
-            .map_err(|error| MarkdownImageLoadError::Io(error.to_string()))??,
+            MarkdownImageLoadDecision::Remote(url) => {
+                self.load_remote(url, started, cancellation).await?
+            }
+            MarkdownImageLoadDecision::Local(path) => {
+                let task = tokio::task::spawn_blocking(move || read_local_image(&path));
+                wait_for_task(task, started, cancellation).await??
+            }
             MarkdownImageLoadDecision::Reject => {
                 return Err(MarkdownImageLoadError::RejectedDestination.into());
             }
         };
-        tokio::time::timeout(
-            remaining_load_time(started)?,
-            tokio::task::spawn_blocking(move || {
-                decode_markdown_image(std::io::Cursor::new(encoded))
-            }),
-        )
-        .await
-        .map_err(|_| MarkdownImageLoadError::TimedOut)?
-        .map_err(|error| MarkdownImageLoadError::Io(error.to_string()))?
-        .map_err(Into::into)
+        ensure_not_cancelled(cancellation)?;
+        let task = tokio::task::spawn_blocking(move || {
+            decode_markdown_image(std::io::Cursor::new(encoded))
+        });
+        wait_for_task(task, started, cancellation)
+            .await?
+            .map_err(Into::into)
     }
 
     async fn load_remote(
         &self,
         mut url: url::Url,
         started: Instant,
+        cancellation: &MarkdownImageCancellationToken,
     ) -> Result<Vec<u8>, MarkdownImageLoadFailure> {
         let mut redirects = 0_usize;
         loop {
-            let response = tokio::time::timeout(
-                remaining_load_time(started)?,
-                self.http.get(url.clone()).send(),
-            )
-            .await
-            .map_err(|_| MarkdownImageLoadError::TimedOut)?
-            .map_err(|error| MarkdownImageLoadError::Network(error.to_string()))?;
+            ensure_not_cancelled(cancellation)?;
+            let request = self.http.get(url.clone()).send();
+            tokio::pin!(request);
+            let response = loop {
+                tokio::select! {
+                    result = &mut request => {
+                        break result.map_err(|error| MarkdownImageLoadError::Network(error.to_string()))?;
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {
+                        ensure_not_cancelled(cancellation)?;
+                        let _ = remaining_load_time(started)?;
+                    }
+                }
+            };
             if response.status().is_redirection() {
                 if redirects >= MAX_REDIRECTS {
                     return Err(MarkdownImageLoadError::TooManyRedirects.into());
@@ -261,7 +314,7 @@ impl MarkdownImageLoader {
                     MarkdownImageLoadError::Network(format!("HTTP {}", response.status())).into(),
                 );
             }
-            return read_remote_image(response, started).await;
+            return read_remote_image(response, started, cancellation).await;
         }
     }
 }
@@ -275,6 +328,40 @@ pub enum MarkdownImageLoadFailure {
     /// Encoded payload or decoded image rejection.
     #[error(transparent)]
     Image(#[from] MarkdownImageError),
+}
+
+fn ensure_not_cancelled(
+    cancellation: &MarkdownImageCancellationToken,
+) -> Result<(), MarkdownImageLoadError> {
+    if cancellation.is_cancelled() {
+        Err(MarkdownImageLoadError::Cancelled)
+    } else {
+        Ok(())
+    }
+}
+
+async fn wait_for_task<T>(
+    mut task: tokio::task::JoinHandle<T>,
+    started: Instant,
+    cancellation: &MarkdownImageCancellationToken,
+) -> Result<T, MarkdownImageLoadError> {
+    loop {
+        tokio::select! {
+            result = &mut task => {
+                return result.map_err(|error| MarkdownImageLoadError::Io(error.to_string()));
+            }
+            () = tokio::time::sleep(Duration::from_millis(10)) => {
+                if let Err(error) = ensure_not_cancelled(cancellation) {
+                    task.abort();
+                    return Err(error);
+                }
+                if let Err(error) = remaining_load_time(started) {
+                    task.abort();
+                    return Err(error);
+                }
+            }
+        }
+    }
 }
 
 fn remaining_load_time(started: Instant) -> Result<Duration, MarkdownImageLoadError> {
@@ -293,6 +380,7 @@ fn read_local_image(path: &std::path::Path) -> Result<Vec<u8>, MarkdownImageLoad
 async fn read_remote_image(
     mut response: reqwest::Response,
     started: Instant,
+    cancellation: &MarkdownImageCancellationToken,
 ) -> Result<Vec<u8>, MarkdownImageLoadFailure> {
     if response
         .content_length()
@@ -302,6 +390,7 @@ async fn read_remote_image(
     }
     let mut bytes = Vec::new();
     loop {
+        ensure_not_cancelled(cancellation)?;
         let chunk = tokio::time::timeout(remaining_load_time(started)?, response.chunk())
             .await
             .map_err(|_| MarkdownImageLoadError::TimedOut)?
@@ -454,35 +543,71 @@ impl MarkdownImageCache {
 /// In-flight image keys used to deduplicate concurrent loading work.
 #[derive(Debug, Default)]
 pub struct MarkdownImageInflight {
-    keys: BTreeSet<MarkdownImageCacheKey>,
+    loads: BTreeMap<MarkdownImageCacheKey, MarkdownImageCancellationToken>,
 }
 
 impl MarkdownImageInflight {
     /// Start work for `key`; returns false when identical work is already active.
     pub fn start(&mut self, key: MarkdownImageCacheKey) -> bool {
-        self.keys.insert(key)
+        if self.loads.contains_key(&key) {
+            return false;
+        }
+        self.loads
+            .insert(key, MarkdownImageCancellationToken::default());
+        true
     }
 
-    /// Finish or cancel work for `key`.
+    /// Return the cancellation token for active work owned by `key`.
+    #[must_use]
+    pub fn cancellation_token(
+        &self,
+        key: &MarkdownImageCacheKey,
+    ) -> Option<MarkdownImageCancellationToken> {
+        self.loads.get(key).cloned()
+    }
+
+    /// Finish completed work for `key` without cancelling it.
     pub fn finish(&mut self, key: &MarkdownImageCacheKey) {
-        self.keys.remove(key);
+        self.loads.remove(key);
     }
 
-    /// Remove work that is no longer owned by a resident/current item.
+    /// Cancel and remove work that is no longer owned by a resident/current item.
     pub fn retain(&mut self, active: &BTreeSet<MarkdownImageCacheKey>) {
-        self.keys.retain(|key| active.contains(key));
+        self.loads.retain(|key, cancellation| {
+            if active.contains(key) {
+                true
+            } else {
+                cancellation.cancel();
+                false
+            }
+        });
+    }
+
+    /// Cancel and remove work whose source or owning item changed.
+    pub fn cancel(&mut self, key: &MarkdownImageCacheKey) {
+        if let Some(cancellation) = self.loads.remove(key) {
+            cancellation.cancel();
+        }
+    }
+
+    /// Cancel and remove every active load.
+    pub fn cancel_all(&mut self) {
+        for cancellation in self.loads.values() {
+            cancellation.cancel();
+        }
+        self.loads.clear();
     }
 
     /// Return active in-flight work count.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.keys.len()
+        self.loads.len()
     }
 
     /// Return whether no work is active.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.keys.is_empty()
+        self.loads.is_empty()
     }
 }
 
@@ -577,10 +702,10 @@ mod tests {
     use super::{
         DecodedMarkdownImage, MAX_CACHE_BYTES, MAX_CACHE_ENTRIES, MAX_DECODED_PIXELS,
         MAX_DIMENSION, MAX_ENCODED_BYTES, MAX_REDIRECTS, MarkdownImageCache, MarkdownImageCacheKey,
-        MarkdownImageError, MarkdownImageInflight, MarkdownImageLoadDecision,
-        MarkdownImageLoadError, MarkdownImageLoadFailure, MarkdownImageLoadGuard,
-        MarkdownImageLoader, decode_markdown_image, markdown_image_load_decision,
-        validate_dimensions,
+        MarkdownImageCancellationToken, MarkdownImageError, MarkdownImageInflight,
+        MarkdownImageLoadDecision, MarkdownImageLoadError, MarkdownImageLoadFailure,
+        MarkdownImageLoadGuard, MarkdownImageLoader, decode_markdown_image,
+        markdown_image_load_decision, validate_dimensions,
     };
     use bcode_markdown_render::{
         MarkdownDestination, MarkdownDestinationRejection, resolve_markdown_destination,
@@ -708,10 +833,35 @@ mod tests {
         assert!(inflight.start(key(1)));
         assert!(!inflight.start(key(1)));
         assert!(inflight.start(key(2)));
+        let removed = inflight.cancellation_token(&key(1)).unwrap();
+        let retained = inflight.cancellation_token(&key(2)).unwrap();
+
         inflight.retain(&BTreeSet::from([key(2)]));
+
+        assert!(removed.is_cancelled());
+        assert!(!retained.is_cancelled());
+        assert!(inflight.cancellation_token(&key(1)).is_none());
         assert!(inflight.start(key(1)));
         inflight.finish(&key(1));
         inflight.finish(&key(2));
+        assert!(inflight.is_empty());
+    }
+
+    #[test]
+    fn changed_and_all_inflight_work_are_actively_cancelled() {
+        let mut inflight = MarkdownImageInflight::default();
+        assert!(inflight.start(key(1)));
+        assert!(inflight.start(key(2)));
+        let changed = inflight.cancellation_token(&key(1)).unwrap();
+        let remaining = inflight.cancellation_token(&key(2)).unwrap();
+
+        inflight.cancel(&key(1));
+        assert!(changed.is_cancelled());
+        assert!(!remaining.is_cancelled());
+        assert_eq!(inflight.len(), 1);
+
+        inflight.cancel_all();
+        assert!(remaining.is_cancelled());
         assert!(inflight.is_empty());
     }
 
@@ -767,6 +917,21 @@ mod tests {
         assert!(matches!(
             guard.final_destination(&safe),
             Ok(MarkdownImageLoadDecision::Remote(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancelled_load_stops_before_network_or_decode_work() {
+        let loader = MarkdownImageLoader::new().unwrap();
+        let cancellation = MarkdownImageCancellationToken::default();
+        cancellation.cancel();
+        let destination = resolve_markdown_destination("https://example.com/image.png", None);
+
+        assert!(matches!(
+            loader.load_cancellable(&destination, &cancellation).await,
+            Err(MarkdownImageLoadFailure::Load(
+                MarkdownImageLoadError::Cancelled
+            ))
         ));
     }
 
@@ -866,6 +1031,43 @@ mod tests {
             Err(MarkdownImageLoadFailure::Image(
                 MarkdownImageError::EncodedTooLarge
             ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn loader_rejects_malformed_remote_payload() {
+        let origin = serve(1, |_, stream| {
+            response(
+                stream,
+                "200 OK",
+                &[("Content-Type", "image/png")],
+                b"not an image",
+            );
+        });
+        let loader = MarkdownImageLoader::new().unwrap();
+        let destination = resolve_markdown_destination(&origin, None);
+
+        assert!(matches!(
+            loader.load(&destination).await,
+            Err(MarkdownImageLoadFailure::Image(
+                MarkdownImageError::Invalid(_)
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn loader_rejects_non_successful_remote_status() {
+        let origin = serve(1, |_, stream| {
+            response(stream, "404 Not Found", &[], b"missing");
+        });
+        let loader = MarkdownImageLoader::new().unwrap();
+        let destination = resolve_markdown_destination(&origin, None);
+
+        assert!(matches!(
+            loader.load(&destination).await,
+            Err(MarkdownImageLoadFailure::Load(
+                MarkdownImageLoadError::Network(message)
+            )) if message == "HTTP 404 Not Found"
         ));
     }
 

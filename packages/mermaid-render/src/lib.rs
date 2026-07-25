@@ -9,8 +9,9 @@
 
 use std::{
     collections::BTreeMap,
+    io::{Read, Write},
     sync::{
-        Arc,
+        Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -20,6 +21,54 @@ use std::{
 pub const MAX_CACHE_ENTRIES: usize = 64;
 /// Maximum encoded Mermaid output bytes retained in memory.
 pub const MAX_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+static RENDER_PERMITS: OnceLock<(Mutex<usize>, Condvar)> = OnceLock::new();
+
+struct RenderPermit;
+
+impl RenderPermit {
+    fn acquire(
+        limit: usize,
+        timeout: Duration,
+        cancellation: &MermaidCancellationToken,
+    ) -> Result<Self, MermaidRenderError> {
+        let (permits, available) = RENDER_PERMITS.get_or_init(|| (Mutex::new(0), Condvar::new()));
+        let mut active = permits
+            .lock()
+            .map_err(|_| MermaidRenderError::BackendPanicked)?;
+        let started = std::time::Instant::now();
+        while *active >= limit {
+            if cancellation.is_cancelled() {
+                return Err(MermaidRenderError::Cancelled);
+            }
+            let remaining = timeout
+                .checked_sub(started.elapsed())
+                .ok_or(MermaidRenderError::TimedOut)?;
+            let wait = remaining.min(Duration::from_millis(10));
+            let result = available
+                .wait_timeout(active, wait)
+                .map_err(|_| MermaidRenderError::BackendPanicked)?;
+            active = result.0;
+            if result.1.timed_out() && started.elapsed() >= timeout {
+                return Err(MermaidRenderError::TimedOut);
+            }
+        }
+        *active = active.saturating_add(1);
+        drop(active);
+        Ok(Self)
+    }
+}
+
+impl Drop for RenderPermit {
+    fn drop(&mut self) {
+        if let Some((permits, available)) = RENDER_PERMITS.get()
+            && let Ok(mut active) = permits.lock()
+        {
+            *active = active.saturating_sub(1);
+            available.notify_one();
+        }
+    }
+}
 
 /// Version of the stable Bcode Mermaid render contract and cache-key semantics.
 pub const RENDER_CONTRACT_VERSION: u16 = 1;
@@ -60,10 +109,9 @@ pub struct MermaidRenderLimits {
     pub max_width: u32,
     /// Maximum requested pixel height.
     pub max_height: u32,
-    /// Maximum simultaneous renders allowed by an orchestrator.
+    /// Maximum simultaneous renders enforced by this crate.
     pub max_concurrent_renders: usize,
-    /// Caller deadline contract. Synchronous backends validate cancellation
-    /// before and after rendering; asynchronous orchestration owns preemption.
+    /// End-to-end deadline covering permit wait and backend rendering.
     pub timeout: Duration,
 }
 
@@ -288,6 +336,10 @@ pub enum MermaidRenderError {
     Cancelled,
     /// Backend rejected or could not render the diagram.
     InvalidDiagram { message: String },
+    /// Private worker could not be started or communicated with.
+    WorkerUnavailable { message: String },
+    /// Private worker returned an invalid response envelope.
+    InvalidWorkerResponse { message: String },
     /// Encoded output exceeds the configured byte limit.
     OutputTooLarge { actual: usize, maximum: usize },
 }
@@ -316,6 +368,12 @@ impl std::fmt::Display for MermaidRenderError {
             Self::InvalidDiagram { message } => {
                 write!(formatter, "invalid Mermaid diagram: {message}")
             }
+            Self::WorkerUnavailable { message } => {
+                write!(formatter, "Mermaid worker unavailable: {message}")
+            }
+            Self::InvalidWorkerResponse { message } => {
+                write!(formatter, "invalid Mermaid worker response: {message}")
+            }
             Self::OutputTooLarge { actual, maximum } => {
                 write!(
                     formatter,
@@ -327,6 +385,153 @@ impl std::fmt::Display for MermaidRenderError {
 }
 
 impl std::error::Error for MermaidRenderError {}
+
+const WORKER_REQUEST_MAGIC: &[u8; 4] = b"BCMW";
+const WORKER_RESPONSE_MAGIC: &[u8; 4] = b"BCMR";
+const WORKER_PROTOCOL_VERSION: u16 = 1;
+const WORKER_RESPONSE_HEADER_BYTES: usize = 11;
+
+/// Render a Mermaid request through the private worker executable.
+///
+/// The caller supplies the worker path explicitly so application packaging owns
+/// executable discovery. Timeout and cancellation forcefully terminate the
+/// child before this function returns.
+///
+/// # Errors
+///
+/// Returns a typed render error when request validation fails, the worker cannot
+/// start, cancellation or timeout occurs, or the response is malformed.
+pub fn render_mermaid_with_worker(
+    worker_path: &std::path::Path,
+    request: &MermaidRenderRequest,
+    cancellation: &MermaidCancellationToken,
+) -> Result<MermaidRendered, MermaidRenderError> {
+    validate_request(request, cancellation)?;
+    let request_bytes = encode_worker_request(request)?;
+    let mut child = std::process::Command::new(worker_path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| MermaidRenderError::WorkerUnavailable {
+            message: error.to_string(),
+        })?;
+    let write_result = child
+        .stdin
+        .take()
+        .ok_or_else(|| MermaidRenderError::WorkerUnavailable {
+            message: "worker stdin unavailable".to_owned(),
+        })?
+        .write_all(&request_bytes);
+    if let Err(error) = write_result {
+        terminate_worker(&mut child);
+        return Err(MermaidRenderError::WorkerUnavailable {
+            message: error.to_string(),
+        });
+    }
+    let started = std::time::Instant::now();
+    loop {
+        if cancellation.is_cancelled() {
+            terminate_worker(&mut child);
+            return Err(MermaidRenderError::Cancelled);
+        }
+        if started.elapsed() >= request.limits.timeout {
+            terminate_worker(&mut child);
+            return Err(MermaidRenderError::TimedOut);
+        }
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => std::thread::sleep(Duration::from_millis(5)),
+            Err(error) => {
+                terminate_worker(&mut child);
+                return Err(MermaidRenderError::WorkerUnavailable {
+                    message: error.to_string(),
+                });
+            }
+        }
+    }
+    let mut response = Vec::new();
+    child
+        .stdout
+        .take()
+        .ok_or_else(|| MermaidRenderError::InvalidWorkerResponse {
+            message: "worker stdout unavailable".to_owned(),
+        })?
+        .take(u64::try_from(request.limits.max_output_bytes).unwrap_or(u64::MAX) + 4096)
+        .read_to_end(&mut response)
+        .map_err(|error| MermaidRenderError::InvalidWorkerResponse {
+            message: error.to_string(),
+        })?;
+    decode_worker_response(request, &response)
+}
+
+fn encode_worker_request(request: &MermaidRenderRequest) -> Result<Vec<u8>, MermaidRenderError> {
+    let source = request.source.as_str().as_bytes();
+    let source_len =
+        u32::try_from(source.len()).map_err(|_| MermaidRenderError::SourceTooLarge {
+            actual: source.len(),
+            maximum: u32::MAX as usize,
+        })?;
+    let max_output = u32::try_from(request.limits.max_output_bytes)
+        .map_err(|_| MermaidRenderError::InvalidExecutionLimits)?;
+    let mut encoded = Vec::with_capacity(22 + source.len());
+    encoded.extend_from_slice(WORKER_REQUEST_MAGIC);
+    encoded.extend_from_slice(&WORKER_PROTOCOL_VERSION.to_be_bytes());
+    encoded.extend_from_slice(&request.width.to_be_bytes());
+    encoded.extend_from_slice(&request.height.to_be_bytes());
+    encoded.extend_from_slice(&max_output.to_be_bytes());
+    encoded.extend_from_slice(&source_len.to_be_bytes());
+    encoded.extend_from_slice(source);
+    Ok(encoded)
+}
+
+fn decode_worker_response(
+    request: &MermaidRenderRequest,
+    response: &[u8],
+) -> Result<MermaidRendered, MermaidRenderError> {
+    if response.len() < WORKER_RESPONSE_HEADER_BYTES || &response[..4] != WORKER_RESPONSE_MAGIC {
+        return Err(MermaidRenderError::InvalidWorkerResponse {
+            message: "missing response envelope".to_owned(),
+        });
+    }
+    let version = u16::from_be_bytes([response[4], response[5]]);
+    if version != WORKER_PROTOCOL_VERSION {
+        return Err(MermaidRenderError::InvalidWorkerResponse {
+            message: format!("unsupported protocol version {version}"),
+        });
+    }
+    let length = usize::try_from(u32::from_be_bytes(
+        response[7..11]
+            .try_into()
+            .expect("fixed worker length field"),
+    ))
+    .unwrap_or(usize::MAX);
+    let payload = response
+        .get(WORKER_RESPONSE_HEADER_BYTES..)
+        .ok_or_else(|| MermaidRenderError::InvalidWorkerResponse {
+            message: "missing response payload".to_owned(),
+        })?;
+    if payload.len() != length || payload.len() > request.limits.max_output_bytes {
+        return Err(MermaidRenderError::InvalidWorkerResponse {
+            message: "response length is invalid".to_owned(),
+        });
+    }
+    if response[6] == 0 {
+        return Err(MermaidRenderError::InvalidDiagram {
+            message: String::from_utf8_lossy(payload).into_owned(),
+        });
+    }
+    Ok(MermaidRendered {
+        output: MermaidRenderedOutput::Svg(payload.to_vec()),
+        cache_key: request.cache_key(),
+        diagnostics: Vec::new(),
+    })
+}
+
+fn terminate_worker(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
 
 /// Render a Mermaid request through the private native backend.
 ///
@@ -343,7 +548,19 @@ pub fn render_mermaid(
     request: &MermaidRenderRequest,
     cancellation: &MermaidCancellationToken,
 ) -> Result<MermaidRendered, MermaidRenderError> {
+    let started = std::time::Instant::now();
     validate_request(request, cancellation)?;
+    let _permit = RenderPermit::acquire(
+        request.limits.max_concurrent_renders,
+        request.limits.timeout,
+        cancellation,
+    )?;
+    let elapsed = started.elapsed();
+    let backend_timeout = request
+        .limits
+        .timeout
+        .checked_sub(elapsed)
+        .ok_or(MermaidRenderError::TimedOut)?;
     let source = request.source.as_str().to_owned();
     let (sender, receiver) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
@@ -351,7 +568,7 @@ pub fn render_mermaid(
             .unwrap_or(Err(MermaidRenderError::BackendPanicked));
         let _ = sender.send(rendered);
     });
-    let deadline = std::time::Instant::now() + request.limits.timeout;
+    let deadline = std::time::Instant::now() + backend_timeout;
     let svg = loop {
         if cancellation.is_cancelled() {
             return Err(MermaidRenderError::Cancelled);

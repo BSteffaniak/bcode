@@ -13,6 +13,10 @@ version     = { workspace = true }
 [dependencies]
 mermaid-rs-renderer = { workspace = true }
 
+[[bin]]
+name = "bcode-mermaid-worker"
+path = "src/bin/worker.rs"
+
 [features]
 default          = []
 fail-on-warnings = []
