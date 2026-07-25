@@ -33,6 +33,7 @@ fn context(source: &str) -> NativeServiceContext {
         events: ServiceEventEmitter::default(),
         cancellation: ServiceCancellation::default(),
         bridge: ServiceBridge::default(),
+        transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
     }
 }
 

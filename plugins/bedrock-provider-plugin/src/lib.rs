@@ -2950,6 +2950,7 @@ mod tests {
                 events: ServiceEventEmitter::default(),
                 cancellation: ServiceCancellation::default(),
                 bridge: ServiceBridge::default(),
+                transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
             });
             if let Some(error) = response.error {
                 return Err(format!("{}: {}", error.code, error.message));

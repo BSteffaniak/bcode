@@ -279,6 +279,10 @@ impl ServiceEventEmitter {
     }
 
     /// Emit an incremental service event payload.
+    ///
+    /// This is the low-level escape hatch for advanced service event schemas. Tool execution
+    /// progress should normally use [`TransientProgressPublisher`], which fixes transient
+    /// persistence and progress placement while enforcing host limits.
     pub fn emit(self, payload: &[u8]) {
         if let Some(callback) = self.callback {
             callback(
@@ -293,11 +297,89 @@ impl ServiceEventEmitter {
 unsafe impl Send for ServiceEventEmitter {}
 unsafe impl Sync for ServiceEventEmitter {}
 
+/// Default maximum encoded transient progress envelope accepted by the host.
+pub const DEFAULT_TRANSIENT_PROGRESS_MAX_ENCODED_BYTES: usize = 256 * 1024;
+/// Default producer cadence for replaceable transient progress snapshots.
+pub const DEFAULT_TRANSIENT_PROGRESS_MIN_INTERVAL_MS: u64 = 50;
+
+/// Host-advertised bounds for transient plugin progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransientProgressLimits {
+    /// Maximum encoded contribution envelope size.
+    pub max_encoded_bytes: usize,
+    /// Minimum interval between non-terminal producer updates.
+    pub min_interval_ms: u64,
+}
+
+impl Default for TransientProgressLimits {
+    fn default() -> Self {
+        Self {
+            max_encoded_bytes: DEFAULT_TRANSIENT_PROGRESS_MAX_ENCODED_BYTES,
+            min_interval_ms: DEFAULT_TRANSIENT_PROGRESS_MIN_INTERVAL_MS,
+        }
+    }
+}
+
+/// Failure returned while publishing transient plugin progress.
+#[derive(Debug)]
+pub enum TransientProgressError {
+    /// The host did not provide an incremental event callback.
+    Unavailable,
+    /// The invocation was cancelled before publication.
+    Cancelled,
+    /// The progress scope has already emitted terminal cleanup.
+    Finished,
+    /// No later monotonic sequence can be represented.
+    SequenceExhausted,
+    /// Typed payload or envelope serialization failed.
+    Encode(serde_json::Error),
+    /// The encoded envelope exceeded the host-advertised bound.
+    TooLarge { actual: usize, maximum: usize },
+}
+
+impl std::fmt::Display for TransientProgressError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("transient progress events are unavailable"),
+            Self::Cancelled => formatter.write_str("transient progress invocation was cancelled"),
+            Self::Finished => formatter.write_str("transient progress scope is already finished"),
+            Self::SequenceExhausted => {
+                formatter.write_str("transient progress sequence is exhausted")
+            }
+            Self::Encode(error) => write!(formatter, "transient progress encoding failed: {error}"),
+            Self::TooLarge { actual, maximum } => write!(
+                formatter,
+                "transient progress envelope contains {actual} bytes but maximum is {maximum}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TransientProgressError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Encode(error) => Some(error),
+            Self::Unavailable
+            | Self::Cancelled
+            | Self::Finished
+            | Self::SequenceExhausted
+            | Self::TooLarge { .. } => None,
+        }
+    }
+}
+
+impl From<serde_json::Error> for TransientProgressError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Encode(error)
+    }
+}
+
 /// Scoped producer for one replaceable live tool progress contribution.
 ///
 /// The publisher fixes progress placement and transient persistence so plugin authors cannot
 /// accidentally make intermediate state durable. Each successful mutation receives the next
-/// monotonic sequence number. Call [`Self::finish`] at every terminal boundary; the host also
+/// monotonic sequence number. Host-advertised byte and cadence limits are enforced before the
+/// payload crosses the plugin ABI. Call [`Self::finish`] at every terminal boundary; the host also
 /// clears remaining transient state when the invocation terminates unexpectedly.
 #[derive(Debug, Clone)]
 pub struct TransientProgressPublisher {
@@ -309,6 +391,9 @@ pub struct TransientProgressPublisher {
     schema_version: u32,
     sequence: u64,
     finished: bool,
+    limits: TransientProgressLimits,
+    cancellation: ServiceCancellation,
+    last_emitted_at: Option<Instant>,
 }
 
 impl TransientProgressPublisher {
@@ -331,17 +416,136 @@ impl TransientProgressPublisher {
             schema_version,
             sequence: 0,
             finished: false,
+            limits: TransientProgressLimits::default(),
+            cancellation: ServiceCancellation::default(),
+            last_emitted_at: None,
         }
+    }
+
+    /// Create a scoped publisher using host-advertised progress limits.
+    #[must_use]
+    pub fn with_limits(
+        events: ServiceEventEmitter,
+        invocation_id: impl Into<String>,
+        contribution_id: impl Into<String>,
+        producer_id: impl Into<String>,
+        schema: impl Into<String>,
+        schema_version: u32,
+        limits: TransientProgressLimits,
+    ) -> Self {
+        Self::with_limits_and_cancellation(
+            events,
+            invocation_id,
+            contribution_id,
+            producer_id,
+            schema,
+            schema_version,
+            limits,
+            ServiceCancellation::default(),
+        )
+    }
+
+    /// Create a scoped publisher using host limits and invocation cancellation.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)] // Identity and host policy remain explicit at construction.
+    pub fn with_limits_and_cancellation(
+        events: ServiceEventEmitter,
+        invocation_id: impl Into<String>,
+        contribution_id: impl Into<String>,
+        producer_id: impl Into<String>,
+        schema: impl Into<String>,
+        schema_version: u32,
+        limits: TransientProgressLimits,
+        cancellation: ServiceCancellation,
+    ) -> Self {
+        Self {
+            events,
+            invocation_id: invocation_id.into(),
+            contribution_id: contribution_id.into(),
+            producer_id: producer_id.into(),
+            schema: schema.into(),
+            schema_version,
+            sequence: 0,
+            finished: false,
+            limits,
+            cancellation,
+            last_emitted_at: None,
+        }
+    }
+
+    /// Return the host-advertised bounds applied by this publisher.
+    #[must_use]
+    pub const fn limits(&self) -> TransientProgressLimits {
+        self.limits
+    }
+
+    /// Return whether a non-terminal snapshot can be emitted at the configured cadence.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        !self.finished
+            && !self.cancellation.is_cancelled()
+            && self.events.is_available()
+            && self.last_emitted_at.is_none_or(|emitted_at| {
+                emitted_at.elapsed() >= Duration::from_millis(self.limits.min_interval_ms)
+            })
     }
 
     /// Publish a replacement snapshot and return its sequence.
     ///
     /// # Errors
     ///
-    /// Returns an error when `payload` or the resulting contribution envelope cannot be encoded.
-    pub fn upsert<T: Serialize + ?Sized>(&mut self, payload: &T) -> Result<u64, serde_json::Error> {
+    /// Returns an error when progress is unavailable, finished, oversized, exhausted, or cannot
+    /// be encoded.
+    pub fn upsert<T: Serialize + ?Sized>(
+        &mut self,
+        payload: &T,
+    ) -> Result<u64, TransientProgressError> {
         let payload = serde_json::to_value(payload)?;
         self.emit(bcode_tool::ToolContributionOperation::Upsert, payload)
+    }
+
+    /// Append one producer-defined bounded payload batch and return its sequence.
+    ///
+    /// High-rate append schemas must remain latest-state materializable by the host; this API does
+    /// not make append history durable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when progress is unavailable, finished, oversized, exhausted, or cannot
+    /// be encoded.
+    pub fn append<T: Serialize + ?Sized>(
+        &mut self,
+        payload: &T,
+    ) -> Result<u64, TransientProgressError> {
+        let payload = serde_json::to_value(payload)?;
+        self.emit(bcode_tool::ToolContributionOperation::Append, payload)
+    }
+
+    /// Publish a replacement snapshot only when the configured producer cadence permits it.
+    ///
+    /// Returns `Ok(None)` when an update is intentionally skipped before serialization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when progress is unavailable, finished, oversized, exhausted, or cannot
+    /// be encoded.
+    pub fn upsert_if_ready<T: Serialize + ?Sized>(
+        &mut self,
+        payload: &T,
+    ) -> Result<Option<u64>, TransientProgressError> {
+        if !self.is_ready() {
+            if self.finished {
+                return Err(TransientProgressError::Finished);
+            }
+            if self.cancellation.is_cancelled() {
+                return Err(TransientProgressError::Cancelled);
+            }
+            if !self.events.is_available() {
+                return Err(TransientProgressError::Unavailable);
+            }
+            return Ok(None);
+        }
+        self.upsert(payload).map(Some)
     }
 
     /// Remove the active progress contribution and return its terminal sequence.
@@ -350,8 +554,9 @@ impl TransientProgressPublisher {
     ///
     /// # Errors
     ///
-    /// Returns an error when the removal envelope cannot be encoded.
-    pub fn finish(&mut self) -> Result<u64, serde_json::Error> {
+    /// Returns an error when progress is unavailable, oversized, exhausted, or the removal
+    /// envelope cannot be encoded.
+    pub fn finish(&mut self) -> Result<u64, TransientProgressError> {
         if self.finished {
             return Ok(self.sequence);
         }
@@ -373,8 +578,22 @@ impl TransientProgressPublisher {
         &mut self,
         operation: bcode_tool::ToolContributionOperation,
         payload: serde_json::Value,
-    ) -> Result<u64, serde_json::Error> {
-        let sequence = self.sequence.saturating_add(1);
+    ) -> Result<u64, TransientProgressError> {
+        if self.finished {
+            return Err(TransientProgressError::Finished);
+        }
+        if self.cancellation.is_cancelled()
+            && operation != bcode_tool::ToolContributionOperation::Remove
+        {
+            return Err(TransientProgressError::Cancelled);
+        }
+        if !self.events.is_available() {
+            return Err(TransientProgressError::Unavailable);
+        }
+        let sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(TransientProgressError::SequenceExhausted)?;
         let event = bcode_tool::ToolContributionEvent {
             invocation_id: self.invocation_id.clone(),
             contribution_id: self.contribution_id.clone(),
@@ -392,8 +611,15 @@ impl TransientProgressPublisher {
             event,
         );
         let encoded = serde_json::to_vec(&envelope)?;
+        if encoded.len() > self.limits.max_encoded_bytes {
+            return Err(TransientProgressError::TooLarge {
+                actual: encoded.len(),
+                maximum: self.limits.max_encoded_bytes,
+            });
+        }
         self.events.emit(&encoded);
         self.sequence = sequence;
+        self.last_emitted_at = Some(Instant::now());
         Ok(sequence)
     }
 }
@@ -737,6 +963,9 @@ pub struct NativeServiceContext {
     pub cancellation: ServiceCancellation,
     #[serde(skip)]
     pub bridge: ServiceBridge,
+    /// Host-advertised limits for transient progress produced by this invocation.
+    #[serde(default)]
+    pub transient_progress_limits: TransientProgressLimits,
 }
 
 /// Resolved plugin configuration delivered by the host.
@@ -799,6 +1028,27 @@ impl NativeServiceContext {
         T: Default + DeserializeOwned,
     {
         self.config.typed_or_default()
+    }
+
+    /// Create a scoped transient progress publisher using host-advertised limits.
+    #[must_use]
+    pub fn transient_progress(
+        &self,
+        invocation_id: impl Into<String>,
+        contribution_id: impl Into<String>,
+        schema: impl Into<String>,
+        schema_version: u32,
+    ) -> TransientProgressPublisher {
+        TransientProgressPublisher::with_limits_and_cancellation(
+            self.events,
+            invocation_id,
+            contribution_id,
+            self.plugin_id.clone(),
+            schema,
+            schema_version,
+            self.transient_progress_limits,
+            self.cancellation.clone(),
+        )
     }
 }
 
@@ -1766,7 +2016,8 @@ pub mod prelude {
     };
     pub use crate::{
         CURRENT_PLUGIN_ABI_VERSION, CommandRegistrar, ConcurrentRustPlugin,
-        DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL, EVENT_STATUS_DECODE_FAILED,
+        DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL, DEFAULT_TRANSIENT_PROGRESS_MAX_ENCODED_BYTES,
+        DEFAULT_TRANSIENT_PROGRESS_MIN_INTERVAL_MS, EVENT_STATUS_DECODE_FAILED,
         EVENT_STATUS_INVALID_ARGUMENT, EVENT_STATUS_OK, EVENT_STATUS_PLUGIN_UNAVAILABLE,
         EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, NativeEventContext, NativeServiceContext,
         PluginError, PluginEvent, RustPlugin, SERVICE_STATUS_BUFFER_TOO_SMALL,
@@ -1775,9 +2026,9 @@ pub mod prelude {
         ServiceBridge, ServiceBridgeCallback, ServiceBridgeError, ServiceBridgeRequest,
         ServiceBridgeResponse, ServiceError, ServiceEventCallback, ServiceEventEmitter,
         ServiceRequest, ServiceResponse, StaticPluginVtable, StreamingServiceFn,
-        TransientProgressPublisher, export_concurrent_plugin, export_plugin,
-        prepare_tool_from_definitions, prepare_tool_service_response,
-        static_concurrent_plugin_vtable, static_plugin_vtable,
+        TransientProgressError, TransientProgressLimits, TransientProgressPublisher,
+        export_concurrent_plugin, export_plugin, prepare_tool_from_definitions,
+        prepare_tool_service_response, static_concurrent_plugin_vtable, static_plugin_vtable,
     };
 }
 
@@ -1786,7 +2037,7 @@ mod tests {
     use super::{
         SERVICE_BRIDGE_STATUS_OK, ServiceBridge, ServiceBridgeRequest, ServiceBridgeResponse,
         ServiceCancellation, ServiceEventEmitter, ServiceRequest, ServiceResponse,
-        TransientProgressPublisher,
+        TransientProgressError, TransientProgressLimits, TransientProgressPublisher,
     };
     use serde::{Deserialize, Serialize};
     use std::ffi::c_void;
@@ -1838,8 +2089,14 @@ mod tests {
                 .expect("second progress"),
             2
         );
-        assert_eq!(progress.finish().expect("finish progress"), 3);
-        assert_eq!(progress.finish().expect("repeat finish"), 3);
+        assert_eq!(
+            progress
+                .append(&serde_json::json!({"lines": ["next"]}))
+                .expect("append progress"),
+            3
+        );
+        assert_eq!(progress.finish().expect("finish progress"), 4);
+        assert_eq!(progress.finish().expect("repeat finish"), 4);
 
         let decoded = events
             .lock()
@@ -1850,7 +2107,7 @@ mod tests {
                     .expect("progress envelope")
             })
             .collect::<Vec<_>>();
-        assert_eq!(decoded.len(), 3);
+        assert_eq!(decoded.len(), 4);
         assert!(decoded.iter().all(|envelope| {
             envelope.placement == bcode_tool::ToolContributionPlacement::Progress
                 && envelope.contribution.persistence
@@ -1861,9 +2118,197 @@ mod tests {
         assert_eq!(decoded[2].contribution.sequence, 3);
         assert_eq!(
             decoded[2].contribution.operation,
+            bcode_tool::ToolContributionOperation::Append
+        );
+        assert_eq!(decoded[3].contribution.sequence, 4);
+        assert_eq!(
+            decoded[3].contribution.operation,
             bcode_tool::ToolContributionOperation::Remove
         );
-        assert_eq!(decoded[2].contribution.payload, serde_json::Value::Null);
+        assert_eq!(decoded[3].contribution.payload, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn native_service_context_progress_helper_uses_host_identity_and_limits() {
+        let events: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+        let context = super::NativeServiceContext {
+            plugin_id: "example.plugin".to_owned(),
+            request: ServiceRequest {
+                interface_id: "example/v1".to_owned(),
+                operation: "run".to_owned(),
+                payload: Vec::new(),
+            },
+            config: super::PluginConfigContext::default(),
+            events: ServiceEventEmitter::new(
+                Some(collect_progress_event),
+                std::ptr::from_ref(&events).cast_mut().cast(),
+            ),
+            cancellation: ServiceCancellation::default(),
+            bridge: ServiceBridge::default(),
+            transient_progress_limits: TransientProgressLimits {
+                max_encoded_bytes: 1024,
+                min_interval_ms: 7,
+            },
+        };
+        let mut progress = context.transient_progress("call-1", "preview", "example.progress", 1);
+        assert_eq!(progress.limits(), context.transient_progress_limits);
+        progress
+            .upsert(&serde_json::json!({"step": 1}))
+            .expect("context progress");
+        let envelope: bcode_tool::ToolContributionEnvelope = {
+            let encoded = events.lock().expect("event collector");
+            serde_json::from_slice(&encoded[0]).expect("progress envelope")
+        };
+        assert_eq!(envelope.contribution.producer_id, context.plugin_id);
+    }
+
+    #[test]
+    fn transient_progress_publisher_enforces_availability_bounds_and_cadence() {
+        let mut unavailable = TransientProgressPublisher::new(
+            ServiceEventEmitter::default(),
+            "call-1",
+            "preview",
+            "example.plugin",
+            "example.progress",
+            1,
+        );
+        assert!(matches!(
+            unavailable.upsert(&serde_json::json!({"step": 1})),
+            Err(TransientProgressError::Unavailable)
+        ));
+        assert_eq!(unavailable.sequence(), 0);
+
+        let events: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+        let emitter = ServiceEventEmitter::new(
+            Some(collect_progress_event),
+            std::ptr::from_ref(&events).cast_mut().cast(),
+        );
+        let mut bounded = TransientProgressPublisher::with_limits(
+            emitter,
+            "call-1",
+            "preview",
+            "example.plugin",
+            "example.progress",
+            1,
+            TransientProgressLimits {
+                max_encoded_bytes: 1,
+                min_interval_ms: 0,
+            },
+        );
+        assert!(matches!(
+            bounded.upsert(&serde_json::json!({"step": 1})),
+            Err(TransientProgressError::TooLarge { maximum: 1, .. })
+        ));
+        assert_eq!(bounded.sequence(), 0);
+        assert!(events.lock().expect("event collector").is_empty());
+
+        let mut cadence = TransientProgressPublisher::with_limits(
+            emitter,
+            "call-1",
+            "preview",
+            "example.plugin",
+            "example.progress",
+            1,
+            TransientProgressLimits {
+                max_encoded_bytes: 1024,
+                min_interval_ms: 60_000,
+            },
+        );
+        assert_eq!(
+            cadence
+                .upsert_if_ready(&serde_json::json!({"step": 1}))
+                .expect("first snapshot"),
+            Some(1)
+        );
+        assert_eq!(
+            cadence
+                .upsert_if_ready(&serde_json::json!({"step": 2}))
+                .expect("coalesced snapshot"),
+            None
+        );
+        assert_eq!(cadence.finish().expect("terminal cleanup"), 2);
+        assert!(matches!(
+            cadence.upsert(&serde_json::json!({"step": 3})),
+            Err(TransientProgressError::Finished)
+        ));
+        assert_eq!(cadence.finish().expect("idempotent cleanup"), 2);
+
+        let cancelled = ServiceCancellation::default();
+        let mut cancelled_progress = TransientProgressPublisher::with_limits_and_cancellation(
+            emitter,
+            "call-cancelled",
+            "preview",
+            "example.plugin",
+            "example.progress",
+            1,
+            TransientProgressLimits {
+                max_encoded_bytes: 1024,
+                min_interval_ms: 0,
+            },
+            cancelled.clone(),
+        );
+        cancelled.cancel();
+        assert!(matches!(
+            cancelled_progress.upsert(&serde_json::json!({"step": 1})),
+            Err(TransientProgressError::Cancelled)
+        ));
+        assert_eq!(cancelled_progress.finish().expect("cancelled cleanup"), 1);
+    }
+
+    #[test]
+    fn transient_progress_publisher_reports_serialization_failure() {
+        struct BrokenPayload;
+        impl Serialize for BrokenPayload {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("broken payload"))
+            }
+        }
+
+        let events: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+        let emitter = ServiceEventEmitter::new(
+            Some(collect_progress_event),
+            std::ptr::from_ref(&events).cast_mut().cast(),
+        );
+        let mut progress = TransientProgressPublisher::new(
+            emitter,
+            "call-1",
+            "preview",
+            "example.plugin",
+            "example.progress",
+            1,
+        );
+        assert!(matches!(
+            progress.upsert(&BrokenPayload),
+            Err(TransientProgressError::Encode(_))
+        ));
+        assert_eq!(progress.sequence(), 0);
+        assert!(events.lock().expect("event collector").is_empty());
+    }
+
+    #[test]
+    fn transient_progress_publisher_rejects_exhausted_sequence() {
+        let events: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+        let emitter = ServiceEventEmitter::new(
+            Some(collect_progress_event),
+            std::ptr::from_ref(&events).cast_mut().cast(),
+        );
+        let mut progress = TransientProgressPublisher::new(
+            emitter,
+            "call-1",
+            "preview",
+            "example.plugin",
+            "example.progress",
+            1,
+        );
+        progress.sequence = u64::MAX;
+        assert!(matches!(
+            progress.upsert(&serde_json::json!({"step": 1})),
+            Err(TransientProgressError::SequenceExhausted)
+        ));
+        assert!(events.lock().expect("event collector").is_empty());
     }
 
     #[test]

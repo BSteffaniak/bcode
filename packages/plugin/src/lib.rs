@@ -815,6 +815,7 @@ impl LoadedPlugin {
             events: bcode_plugin_sdk::ServiceEventEmitter::default(),
             cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
             bridge: bcode_plugin_sdk::ServiceBridge::default(),
+            transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
         };
         let input = serde_json::to_vec(&context).map_err(PluginLoadError::ServiceEncode)?;
         let output_capacity = 1024 * 1024;

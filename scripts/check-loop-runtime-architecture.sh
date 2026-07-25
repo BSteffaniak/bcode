@@ -972,7 +972,7 @@ if rg -n 'ToolInvocationStreamEvent|ToolStreamVisualUpdate|VisualUpdate' \
   violations=1
 fi
 
-if ! grep -F 'TransientProgressPublisher::new' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
+if ! rg -n 'TransientProgressPublisher::(new|with_limits|with_limits_and_cancellation)' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
    ! grep -F 'VIM_EDIT_LIVE_SCHEMA' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
    ! grep -F 'ToolContributionPersistence::Transient' packages/plugin-sdk/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: shared transient Vim-edit progress contributions were removed." >&2
