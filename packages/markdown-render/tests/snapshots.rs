@@ -179,6 +179,23 @@ fn contribution_snapshot(markdown: &str) -> String {
 }
 
 #[test]
+fn rejected_destination_diagnostics_do_not_retain_sensitive_values() {
+    let secret = "custom-secret://user:password@example.invalid/private?token=abc";
+    let destination = resolve_markdown_destination(secret, None);
+    let debug = format!("{destination:?}");
+
+    assert_eq!(
+        destination,
+        MarkdownDestination::Inert {
+            reason: MarkdownDestinationRejection::UnsupportedScheme,
+        }
+    );
+    assert!(!debug.contains("password"));
+    assert!(!debug.contains("token"));
+    assert!(!debug.contains("private"));
+}
+
+#[test]
 fn image_sources_use_the_same_safe_context_classification_as_links() {
     let options = MarkdownRenderOptions::new(80).with_document_context(MarkdownDocumentContext {
         base_url: None,
@@ -446,7 +463,6 @@ fn link_destinations_require_explicit_safe_context() {
     assert_eq!(
         resolve_markdown_destination("javascript:alert(1)", Some(&context)),
         MarkdownDestination::Inert {
-            original: "javascript:alert(1)".to_owned(),
             reason: MarkdownDestinationRejection::UnsupportedScheme,
         }
     );

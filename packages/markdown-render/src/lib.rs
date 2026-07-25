@@ -169,10 +169,8 @@ pub enum MarkdownDestination {
     LocalPath(std::path::PathBuf),
     /// In-document fragment.
     Fragment(String),
-    /// Unsupported or dangerous scheme; remains visible but inert.
+    /// Original destination is intentionally omitted to avoid leaking secrets.
     Inert {
-        /// Original destination.
-        original: String,
         /// Stable reason suitable for UI diagnostics.
         reason: MarkdownDestinationRejection,
     },
@@ -203,13 +201,11 @@ pub fn resolve_markdown_destination(
             "http" | "https" => MarkdownDestination::Web(url),
             "file" => url.to_file_path().map_or_else(
                 |()| MarkdownDestination::Inert {
-                    original: destination.to_owned(),
                     reason: MarkdownDestinationRejection::InvalidFileUrl,
                 },
                 MarkdownDestination::LocalPath,
             ),
             _ => MarkdownDestination::Inert {
-                original: destination.to_owned(),
                 reason: MarkdownDestinationRejection::UnsupportedScheme,
             },
         };
@@ -1394,7 +1390,6 @@ fn github_issue_contributions(
             );
             let destination = Url::parse(&url).map_or_else(
                 |_| MarkdownDestination::Inert {
-                    original: url,
                     reason: MarkdownDestinationRejection::UnsupportedScheme,
                 },
                 MarkdownDestination::Web,
