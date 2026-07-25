@@ -196,7 +196,7 @@ type ActivePresentationUpdates =
 #[derive(Debug)]
 pub struct ServerState {
     pub sessions: SessionManager,
-    session_migrations: bcode_session_migration::MigrationPlanService,
+    session_migrations: bcode_session_migration::SessionMigrationService,
     pub session_catalog: Arc<session_catalog::SessionCatalog>,
     pub plugins: bcode_plugin::PluginRuntimeHost,
     model_catalog: bcode_model_catalog::ModelCatalogResolver,
@@ -1322,9 +1322,11 @@ impl ServerState {
         init: ServerStateInit,
     ) -> Self {
         let (shutdown, _) = broadcast::channel(1);
+        let session_migrations = bcode_session_migration::SessionMigrationService::default();
+        let sessions = sessions.with_migration_operations(session_migrations.operations());
         Self {
             sessions,
-            session_migrations: bcode_session_migration::MigrationPlanService,
+            session_migrations,
             session_catalog: Arc::new(session_catalog::SessionCatalog::default()),
             plugins,
             model_catalog: init
@@ -1559,7 +1561,7 @@ impl ServerState {
         {
             return Ok(false);
         }
-        if self.sessions.active_session_migration_count().await > 0 {
+        if self.session_migrations.active_count().await > 0 {
             return Ok(false);
         }
         clear_session_live_state(self, session_id);
@@ -1770,7 +1772,7 @@ impl ServerState {
     }
 
     async fn active_migration_shutdown_blocker(&self) -> Option<String> {
-        active_migration_shutdown_blocker(self.sessions.active_session_migration_count().await)
+        active_migration_shutdown_blocker(self.session_migrations.active_count().await)
     }
 
     async fn idle_shutdown_blocker(&self) -> Option<String> {
@@ -6872,8 +6874,8 @@ async fn handle_wait_session_open_progress(
     timeout_ms: u64,
 ) -> Result<(), ServerError> {
     let Some(mut receiver) = state
-        .sessions
-        .subscribe_session_open_operation(session_id, operation_id)
+        .session_migrations
+        .subscribe(session_id, operation_id)
         .await
     else {
         return send_response(

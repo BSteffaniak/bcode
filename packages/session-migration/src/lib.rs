@@ -13,6 +13,7 @@ mod backup;
 mod historical;
 mod operation;
 mod registry;
+mod service;
 mod storage;
 
 pub use audit::SessionMigrationReceipt;
@@ -22,6 +23,7 @@ pub use backup::{
     create_verified_migration_backup,
 };
 pub use operation::{SessionMigrationOperation, SessionMigrationOperations};
+pub use service::SessionMigrationService;
 pub use storage::{
     HistoricalStorageDiagnosis, HistoricalStorageDiagnosisStatus, HistoricalStorageError,
     HistoricalStorageInspectionReport, HistoricalStorageRecoveryReport,

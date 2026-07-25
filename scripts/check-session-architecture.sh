@@ -516,7 +516,10 @@ if ! rg -q 'MIGRATION_EVENT_PAGE_SIZE: usize = 1_000' packages/session/src/db.rs
   violations=1
 fi
 
-if ! rg -q 'pub async fn prepare_session_open' packages/session/src/lib.rs \
+if ! rg -q 'session_migrations: bcode_session_migration::SessionMigrationService' packages/server/src/lib.rs \
+  || ! rg -q 'with_migration_operations\(session_migrations.operations\(\)\)' packages/server/src/lib.rs \
+  || ! rg -q 'session_migrations\.active_count\(\)' packages/server/src/lib.rs \
+  || ! rg -q 'pub async fn prepare_session_open' packages/session/src/lib.rs \
   || ! rg -q 'migration_operations: bcode_session_migration::SessionMigrationOperations' packages/session/src/lib.rs \
   || ! rg -q 'concurrent_preparation_joins_one_detached_legacy_migration' packages/session/src/lib.rs \
   || ! rg -q 'current_session_preparation_is_immediately_ready_without_operation' packages/session/src/lib.rs \

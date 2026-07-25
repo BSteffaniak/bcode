@@ -1319,7 +1319,33 @@ impl SessionManager {
     ) -> Result<Self, SessionStoreError> {
         let store = SessionStore::with_metrics(root, metrics);
         let sessions = store.load_catalog()?;
-        Ok(Self::from_store(store, sessions, true))
+        Ok(Self::from_store(
+            store,
+            sessions,
+            true,
+            bcode_session_migration::SessionMigrationOperations::default(),
+        ))
+    }
+
+    /// Create a session manager backed by a session store root with metrics and shared migration
+    /// operation coordination.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisted session history cannot be loaded.
+    pub fn persistent_with_metrics_and_migration_operations(
+        root: impl Into<PathBuf>,
+        metrics: MetricsRegistry,
+        migration_operations: bcode_session_migration::SessionMigrationOperations,
+    ) -> Result<Self, SessionStoreError> {
+        let store = SessionStore::with_metrics(root, metrics);
+        let sessions = store.load_catalog()?;
+        Ok(Self::from_store(
+            store,
+            sessions,
+            true,
+            migration_operations,
+        ))
     }
 
     /// Create a session manager backed by a session store root with lease owner metadata.
@@ -1334,7 +1360,12 @@ impl SessionManager {
     ) -> Result<Self, SessionStoreError> {
         let store = SessionStore::with_metrics(root, metrics).with_lease_owner(lease_owner);
         let sessions = store.load_catalog()?;
-        Ok(Self::from_store(store, sessions, true))
+        Ok(Self::from_store(
+            store,
+            sessions,
+            true,
+            bcode_session_migration::SessionMigrationOperations::default(),
+        ))
     }
 
     /// Create a session manager whose catalog is loaded on demand.
@@ -1350,7 +1381,12 @@ impl SessionManager {
         metrics: MetricsRegistry,
     ) -> Self {
         let store = SessionStore::with_metrics(root, metrics);
-        Self::from_store(store, BTreeMap::new(), false)
+        Self::from_store(
+            store,
+            BTreeMap::new(),
+            false,
+            bcode_session_migration::SessionMigrationOperations::default(),
+        )
     }
 
     /// Create a lazy persistent session manager with lease owner metadata.
@@ -1361,13 +1397,32 @@ impl SessionManager {
         lease_owner: SessionLeaseOwnerContext,
     ) -> Self {
         let store = SessionStore::with_metrics(root, metrics).with_lease_owner(lease_owner);
-        Self::from_store(store, BTreeMap::new(), false)
+        Self::from_store(
+            store,
+            BTreeMap::new(),
+            false,
+            bcode_session_migration::SessionMigrationOperations::default(),
+        )
+    }
+
+    /// Create a lazy persistent session manager with lease owner metadata and shared migration
+    /// operation coordination.
+    #[must_use]
+    pub fn persistent_lazy_with_metrics_lease_owner_and_migration_operations(
+        root: impl Into<PathBuf>,
+        metrics: MetricsRegistry,
+        lease_owner: SessionLeaseOwnerContext,
+        migration_operations: bcode_session_migration::SessionMigrationOperations,
+    ) -> Self {
+        let store = SessionStore::with_metrics(root, metrics).with_lease_owner(lease_owner);
+        Self::from_store(store, BTreeMap::new(), false, migration_operations)
     }
 
     fn from_store(
         store: SessionStore,
         sessions: BTreeMap<SessionId, SessionState>,
         catalog_loaded: bool,
+        migration_operations: bcode_session_migration::SessionMigrationOperations,
     ) -> Self {
         let executor = SessionStoreExecutor::new(store);
         let metrics = executor.metrics();
@@ -1397,10 +1452,20 @@ impl SessionManager {
             catalog_status_tx,
             catalog_status_rx,
             mutation_tx,
-            migration_operations: bcode_session_migration::SessionMigrationOperations::default(),
+            migration_operations,
             shared_execution_locks: Arc::new(Mutex::new(BTreeMap::new())),
             metrics,
         }
+    }
+
+    /// Replace migration operation coordination before composing the manager into its server.
+    #[must_use]
+    pub fn with_migration_operations(
+        mut self,
+        migration_operations: bcode_session_migration::SessionMigrationOperations,
+    ) -> Self {
+        self.migration_operations = migration_operations;
+        self
     }
 
     /// Start or join server-owned preparation for opening one persistent session.
