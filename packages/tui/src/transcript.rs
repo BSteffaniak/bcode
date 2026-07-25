@@ -99,6 +99,11 @@ pub enum TranscriptItemKind {
     Skill,
     /// Skill failure note.
     SkillError,
+    /// Live provider tool request draft rendered through a plugin-owned schema.
+    ToolRequestDraft {
+        /// Current bounded draft state.
+        draft: Box<bcode_session_view_models::ToolRequestDraftView>,
+    },
     /// Generic schema-versioned tool contribution.
     ToolContribution {
         /// Opaque contribution envelope.
@@ -276,6 +281,7 @@ impl TranscriptItem {
             TranscriptItemKind::ToolContribution { contribution, .. } => {
                 Some(&contribution.invocation_id)
             }
+            TranscriptItemKind::ToolRequestDraft { draft } => Some(&draft.tool_call_id),
             TranscriptItemKind::UserMessage
             | TranscriptItemKind::AssistantMessage
             | TranscriptItemKind::ReasoningMessage
@@ -705,6 +711,14 @@ pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
         ),
         TranscriptViewItemKind::Skill { skill } => terminal_skill_item_from_shared(skill),
         TranscriptViewItemKind::ToolInvocation { tool } => terminal_tool_item_from_shared(tool),
+        TranscriptViewItemKind::ToolRequestDraft { draft } => TranscriptItem::with_kind(
+            "Tool request draft",
+            format!("assembling {} arguments", draft.tool_name),
+            true,
+            TranscriptItemKind::ToolRequestDraft {
+                draft: Box::new(draft.clone()),
+            },
+        ),
         TranscriptViewItemKind::ToolRequest { tool } => {
             terminal_tool_request_item_from_shared(tool)
         }

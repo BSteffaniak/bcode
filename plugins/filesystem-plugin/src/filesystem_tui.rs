@@ -24,6 +24,8 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
                 | "bcode.filesystem.artifact.metadata"
                 | "bcode.filesystem.artifact.read"
                 | "bcode.filesystem.artifact.grep"
+                | "bcode.filesystem.request-draft.write"
+                | "bcode.filesystem.request-draft.edit"
         )
     }
 
@@ -44,6 +46,9 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
         let width = context.width();
         match kind {
             "bcode.filesystem.request" => request_rows(payload, context),
+            "bcode.filesystem.request-draft.write" | "bcode.filesystem.request-draft.edit" => {
+                request_draft_rows(kind, payload, width, context)
+            }
             "bcode.filesystem.read" | "bcode.filesystem.artifact.read" => {
                 read_rows(kind, payload, width, context)
             }
@@ -60,6 +65,44 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for FilesystemTuiVisualAdapte
             _ => Vec::new(),
         }
     }
+}
+
+fn request_draft_rows(
+    kind: &str,
+    payload: &Value,
+    width: u16,
+    context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
+) -> Vec<Line> {
+    let operation = if kind == "bcode.filesystem.request-draft.edit" {
+        "edit"
+    } else {
+        "write"
+    };
+    let preview = text(payload, "preview").unwrap_or_default();
+    let parsed = serde_json::from_str::<Value>(preview).ok();
+    let arguments = parsed.as_ref().unwrap_or(payload);
+    let mut rows = card_header(&format!("Filesystem {operation} · assembling…"));
+    push_path_kv(&mut rows, "path", text(arguments, "path"), context);
+    push_kv(&mut rows, "received", number(payload, "argument_bytes"));
+    push_kv(&mut rows, "truncated", bool_text(payload, "truncated"));
+    rows.push(Line::raw(""));
+    let source = if operation == "edit" {
+        text(arguments, "new_text")
+            .or_else(|| text(arguments, "old_text"))
+            .unwrap_or(preview)
+    } else {
+        text(arguments, "contents").unwrap_or(preview)
+    };
+    let source_lines = source_preview_lines(
+        source,
+        &SourcePreviewOptions::new(
+            text(arguments, "path").unwrap_or_default(),
+            width.saturating_sub(2).max(1),
+        )
+        .max_lines(18),
+    );
+    rows.extend(source_lines);
+    rows
 }
 
 fn request_rows(

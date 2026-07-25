@@ -47,6 +47,12 @@ impl TranscriptViewItemId {
         Self(format!("tool:{tool_call_id}"))
     }
 
+    /// Create an identifier for a live tool request draft generation.
+    #[must_use]
+    pub fn tool_request_draft(tool_call_id: &str, generation: u64) -> Self {
+        Self(format!("tool-draft:{tool_call_id}:{generation}"))
+    }
+
     /// Create an identifier for historical tool request context retained after completion.
     #[must_use]
     pub fn tool_request(tool_call_id: &str) -> Self {
@@ -749,6 +755,8 @@ pub enum TranscriptViewItemKind {
     ReasoningMessage { message: ChatMessageView },
     /// Tool request/result/stream block.
     ToolInvocation { tool: Box<ToolInvocationView> },
+    /// Live-only provider argument assembly state.
+    ToolRequestDraft { draft: ToolRequestDraftView },
     /// Historical request context retained after a tool result supersedes the active invocation row.
     ToolRequest { tool: Box<ToolInvocationView> },
     /// Permission request block.
@@ -873,6 +881,35 @@ pub enum TextFormat {
     Markdown,
     /// JSON text.
     Json,
+}
+
+/// Renderer-neutral live tool request draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolRequestDraftView {
+    /// Model turn that owns this generation.
+    pub turn_id: String,
+    /// Provider tool-call identifier.
+    pub tool_call_id: String,
+    /// Model-visible tool name.
+    pub tool_name: String,
+    /// Plugin that owns request-draft presentation, when resolved.
+    pub producer_plugin_id: Option<String>,
+    /// Plugin-owned request-draft schema.
+    pub schema: String,
+    /// Version of `schema` used by the preview.
+    pub schema_version: u32,
+    /// Monotonic draft generation.
+    pub generation: u64,
+    /// Latest accepted revision.
+    pub revision: u64,
+    /// Total provider argument bytes observed.
+    pub argument_bytes: usize,
+    /// Original stream offset represented by `preview` byte zero.
+    pub preview_start_offset: usize,
+    /// Bounded retained UTF-8 argument preview.
+    pub preview: String,
+    /// Whether bytes were omitted from the retained preview.
+    pub truncated: bool,
 }
 
 /// Renderer-neutral tool invocation view.

@@ -7454,6 +7454,15 @@ fn session_live_event_description(event: &SessionLiveEvent) -> String {
         SessionLiveEventKind::ProviderStreamProgress { turn_id, event } => {
             format!("live provider progress ({turn_id}): {event:?}")
         }
+        SessionLiveEventKind::ToolRequestDraft { event } => format!(
+            "live tool request draft ({}) call={} generation={} revision={} bytes={} truncated={}",
+            event.turn_id,
+            event.tool_call_id,
+            event.generation,
+            event.revision,
+            event.argument_bytes,
+            event.truncated
+        ),
         SessionLiveEventKind::RequestContextOccupancyChanged { occupancy } => {
             format!("live context occupancy: {occupancy:?}")
         }

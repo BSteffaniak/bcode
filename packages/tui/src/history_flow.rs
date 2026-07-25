@@ -315,6 +315,11 @@ enum SupersedableEventKey {
         invocation_id: String,
         contribution_id: String,
     },
+    ToolRequestDraft {
+        turn_id: String,
+        tool_call_id: String,
+        generation: u64,
+    },
 }
 
 fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
@@ -348,6 +353,18 @@ fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
                 Some(SupersedableEventKey::ToolContribution {
                     invocation_id: envelope.contribution.invocation_id.clone(),
                     contribution_id: envelope.contribution.contribution_id.clone(),
+                })
+            }
+            bcode_session_models::SessionLiveEventKind::ToolRequestDraft { event }
+                if !matches!(
+                    event.operation,
+                    bcode_session_models::ToolRequestDraftOperation::Remove { .. }
+                ) =>
+            {
+                Some(SupersedableEventKey::ToolRequestDraft {
+                    turn_id: event.turn_id.clone(),
+                    tool_call_id: event.tool_call_id.clone(),
+                    generation: event.generation,
                 })
             }
             _ => None,
@@ -552,6 +569,31 @@ mod tests {
         })
     }
 
+    fn request_draft_event(
+        session_id: SessionId,
+        revision: u64,
+        operation: bcode_session_models::ToolRequestDraftOperation,
+    ) -> BcodeEvent {
+        BcodeEvent::SessionLive(bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    generation: 1,
+                    revision,
+                    operation,
+                    argument_bytes: usize::try_from(revision).unwrap_or(usize::MAX),
+                    truncated: false,
+                },
+            },
+        })
+    }
+
     #[test]
     fn progress_events_are_supersedable_but_boundaries_are_not() {
         let session_id = SessionId::new();
@@ -584,6 +626,27 @@ mod tests {
                 session_id,
                 2,
                 bcode_session_models::ToolContributionOperation::Remove,
+            ))
+            .is_none()
+        );
+        assert!(
+            supersedable_event_key(&request_draft_event(
+                session_id,
+                1,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: "draft".to_owned(),
+                },
+            ))
+            .is_some()
+        );
+        assert!(
+            supersedable_event_key(&request_draft_event(
+                session_id,
+                2,
+                bcode_session_models::ToolRequestDraftOperation::Remove {
+                    reason: bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+                },
             ))
             .is_none()
         );

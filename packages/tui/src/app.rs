@@ -2165,6 +2165,34 @@ impl BmuxApp {
             SessionLiveEventKind::ToolContributionPlaced { envelope } => {
                 self.apply_live_contribution(&envelope.contribution, envelope.placement);
             }
+            SessionLiveEventKind::ToolRequestDraft { event: draft } => {
+                let shared_item = self
+                    .session_view
+                    .snapshot()
+                    .transcript
+                    .items
+                    .iter()
+                    .find(|item| {
+                        matches!(
+                            &item.kind,
+                            bcode_session_view_models::TranscriptViewItemKind::ToolRequestDraft {
+                                draft: item_draft,
+                            } if item_draft.tool_call_id == draft.tool_call_id
+                                && item_draft.generation == draft.generation
+                        )
+                    })
+                    .map(terminal_item_from_shared);
+                let source_id = bcode_session_view_models::TranscriptViewItemId::tool_request_draft(
+                    &draft.tool_call_id,
+                    draft.generation,
+                );
+                if let Some(item) = shared_item {
+                    self.transcript.upsert_shared_item(item);
+                } else {
+                    self.transcript
+                        .retain(|item| item.source_view_item_id() != Some(&source_id));
+                }
+            }
             SessionLiveEventKind::RequestContextOccupancyChanged { .. } => {}
             SessionLiveEventKind::ProviderStreamProgress { event, .. } => {
                 self.apply_shared_provider_stream_progress(event);
@@ -4191,6 +4219,9 @@ fn referenced_tool_call_ids(items: &[TranscriptItem]) -> BTreeSet<String> {
             | TranscriptItemKind::ToolResult { tool_call_id, .. }
             | TranscriptItemKind::PermissionRequest { tool_call_id, .. } => {
                 ids.insert(tool_call_id.clone());
+            }
+            TranscriptItemKind::ToolRequestDraft { draft } => {
+                ids.insert(draft.tool_call_id.clone());
             }
             TranscriptItemKind::UserMessage
             | TranscriptItemKind::AssistantMessage

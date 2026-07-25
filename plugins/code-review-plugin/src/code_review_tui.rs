@@ -4203,6 +4203,11 @@ impl ReviewAgentSessionStreamState {
                 self.status = "running tool…".to_string();
                 self.activity = Some("tool output streaming…".to_string());
             }
+            SessionLiveEventKind::ToolRequestDraft { event } => {
+                self.phase = ReviewAgentThreadPhase::Running;
+                self.status = "assembling tool request…".to_string();
+                self.activity = Some(format!("assembling {} arguments…", event.tool_name));
+            }
             SessionLiveEventKind::RequestContextOccupancyChanged { .. } => {}
             SessionLiveEventKind::ProviderStreamProgress { turn_id, .. } => {
                 self.active_turn_id = Some(turn_id);

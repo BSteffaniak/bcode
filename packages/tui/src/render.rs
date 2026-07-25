@@ -949,6 +949,35 @@ fn push_transcript_item_rows(
         TranscriptItemKind::SkillError => {
             push_detail_block(rows, "Skill error", item.text(), Color::Red, width);
         }
+        TranscriptItemKind::ToolRequestDraft { draft } => {
+            let artifact = bcode_session_models::ToolArtifact {
+                artifact_id: format!("{}-request-draft-{}", draft.tool_call_id, draft.generation),
+                producer_plugin_id: draft
+                    .producer_plugin_id
+                    .clone()
+                    .unwrap_or_else(|| "bcode.unknown".to_owned()),
+                schema: draft.schema.clone(),
+                schema_version: draft.schema_version,
+                tool_call_id: Some(draft.tool_call_id.clone()),
+                title: Some("Tool request draft".to_owned()),
+                metadata: serde_json::json!({
+                    "tool_name": draft.tool_name,
+                    "argument_bytes": draft.argument_bytes,
+                    "preview_start_offset": draft.preview_start_offset,
+                    "preview": draft.preview,
+                    "truncated": draft.truncated,
+                    "streaming": true,
+                }),
+                refs: Vec::new(),
+            };
+            let visual = CanonicalToolVisual::from_artifact(&artifact);
+            if canonical_plugin_visual_available(&visual, plugin_host) {
+                push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host);
+                rows.push(Line::default());
+            } else {
+                push_meta_block(rows, item.text(), width);
+            }
+        }
         TranscriptItemKind::ToolContribution {
             contribution,
             placement,

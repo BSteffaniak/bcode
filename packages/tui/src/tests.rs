@@ -4404,6 +4404,69 @@ fn filesystem_plugin_host() -> bcode_plugin::PluginHost {
 }
 
 #[test]
+fn live_filesystem_request_draft_renders_updates_and_removes() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+    let draft = |revision, operation, argument_bytes| bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+            event: bcode_session_models::ToolRequestDraftEvent {
+                turn_id: "turn-1".to_owned(),
+                tool_call_id: "call-write".to_owned(),
+                tool_name: "filesystem.write".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                schema: "bcode.filesystem.request-draft.write".to_owned(),
+                schema_version: 1,
+                generation: 1,
+                revision,
+                operation,
+                argument_bytes,
+                truncated: false,
+            },
+        },
+    };
+
+    app.absorb_session_live_event(&draft(
+        1,
+        bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+            start_offset: 0,
+            text: r#"{"path":"src/lib.rs","contents":"hello"}"#.to_owned(),
+        },
+        40,
+    ));
+    let first = render_app_text(&mut app);
+    assert!(first.contains("Filesystem write · assembling"), "{first}");
+    assert!(first.contains("src/lib.rs"), "{first}");
+    assert!(first.contains("hello"), "{first}");
+
+    app.absorb_session_live_event(&draft(
+        2,
+        bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+            start_offset: 0,
+            text: r#"{"path":"src/lib.rs","contents":"hello world"}"#.to_owned(),
+        },
+        46,
+    ));
+    let second = render_app_text(&mut app);
+    assert!(second.contains("hello world"), "{second}");
+    assert!(!second.contains("\n  hello\n"), "{second}");
+
+    app.absorb_session_live_event(&draft(
+        3,
+        bcode_session_models::ToolRequestDraftOperation::Remove {
+            reason: bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+        },
+        46,
+    ));
+    let removed = render_app_text(&mut app);
+    assert!(
+        !removed.contains("Filesystem write · assembling"),
+        "{removed}"
+    );
+}
+
+#[test]
 fn live_progress_contribution_renders_replaces_in_place_and_removes() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);

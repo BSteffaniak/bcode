@@ -24,6 +24,26 @@ render_mode        = "transcript_block"
 surfaces           = ["tui"]
 
 [[visual_adapters]]
+artifact_schema    = "bcode.filesystem.request-draft.write"
+id                 = "filesystem-write-request-draft"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 110
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
+artifact_schema    = "bcode.filesystem.request-draft.edit"
+id                 = "filesystem-edit-request-draft"
+max_schema_version = 1
+min_schema_version = 1
+priority           = 110
+producer_default   = true
+render_mode        = "transcript_block"
+surfaces           = ["tui"]
+
+[[visual_adapters]]
 artifact_schema    = "bcode.filesystem.request"
 id                 = "filesystem-request-card"
 max_schema_version = 1

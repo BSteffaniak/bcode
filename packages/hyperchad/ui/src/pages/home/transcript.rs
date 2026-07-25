@@ -258,6 +258,13 @@ fn transcript_item_body_with_context(
         | TranscriptViewItemKind::ToolInvocation { tool } => {
             render_tool_lifecycle_with_context(tool, session_id, context)
         }
+        TranscriptViewItemKind::ToolRequestDraft { draft } => container! {
+            aside color=(color::MUTED) {
+                div color=(color::STRONG) { (format!("{} · assembling…", draft.tool_name)) }
+                div font-size=((typeface::LABEL)) { (format!("{} argument bytes", draft.argument_bytes)) }
+                div white-space="preserve-wrap" { (draft.preview) }
+            }
+        },
         TranscriptViewItemKind::Permission { permission } => permission_history(permission),
         TranscriptViewItemKind::Usage { usage } => usage_transcript_item(usage),
         TranscriptViewItemKind::RuntimeWork { work } => container! {
@@ -281,6 +288,7 @@ pub(super) const fn item_label(kind: &TranscriptViewItemKind) -> &'static str {
         TranscriptViewItemKind::ReasoningMessage { .. } => "reasoning",
         TranscriptViewItemKind::ToolInvocation { .. } => "tool",
         TranscriptViewItemKind::ToolRequest { .. } => "tool request",
+        TranscriptViewItemKind::ToolRequestDraft { .. } => "tool request draft",
         TranscriptViewItemKind::Permission { .. } => "permission",
         TranscriptViewItemKind::RuntimeWork { .. } => "runtime work",
         TranscriptViewItemKind::Usage { .. } => "usage",

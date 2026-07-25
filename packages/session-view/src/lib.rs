@@ -19,7 +19,7 @@ use bcode_session_view_models::{
     ChatMessageView, CompactionView, CompactionViewStatus, ComposerViewState,
     InteractionViewSummary, PluginStatusView, ProviderProgressView, SessionViewSnapshot, SkillView,
     SkillViewStatus, TextFormat, ThinkingViewState, ToolInvocationView, ToolInvocationViewStatus,
-    ToolResultView, ToolTimingView, TranscriptViewItem, TranscriptViewItemId,
+    ToolRequestDraftView, ToolResultView, ToolTimingView, TranscriptViewItem, TranscriptViewItemId,
     TranscriptViewItemKind,
 };
 use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
@@ -38,6 +38,7 @@ pub struct SessionView {
     terminal_invocations: BTreeSet<String>,
     terminal_invocation_statuses: BTreeMap<String, ToolInvocationViewStatus>,
     terminal_runtime_work: BTreeSet<bcode_session_models::WorkId>,
+    tool_request_drafts: BTreeMap<String, ToolRequestDraftView>,
 }
 
 impl Default for SessionView {
@@ -62,6 +63,7 @@ impl SessionView {
             terminal_invocations: BTreeSet::new(),
             terminal_invocation_statuses: BTreeMap::new(),
             terminal_runtime_work: BTreeSet::new(),
+            tool_request_drafts: BTreeMap::new(),
         }
     }
 
@@ -1121,6 +1123,9 @@ impl SessionView {
             SessionLiveEventKind::ToolContributionPlaced { envelope } => {
                 self.apply_contribution_event(0, None, &envelope.contribution, envelope.placement);
             }
+            SessionLiveEventKind::ToolRequestDraft { event } => {
+                self.apply_tool_request_draft(event);
+            }
             SessionLiveEventKind::ProviderStreamProgress { turn_id, event } => {
                 self.snapshot.runtime.provider_progress = Some(ProviderProgressView {
                     turn_id: turn_id.clone(),
@@ -1139,6 +1144,124 @@ impl SessionView {
                 self.set_context_occupancy((**occupancy).clone());
             }
         }
+    }
+
+    #[allow(clippy::too_many_lines)] // One state-machine handler keeps generation/revision/offset transitions atomic.
+    fn apply_tool_request_draft(&mut self, event: &bcode_session_models::ToolRequestDraftEvent) {
+        use bcode_session_models::ToolRequestDraftOperation;
+
+        let key = event.tool_call_id.clone();
+        let id = TranscriptViewItemId::tool_request_draft(&key, event.generation);
+        let current = self.tool_request_drafts.get(&key).cloned();
+        if current.as_ref().is_some_and(|current| {
+            event.generation < current.generation
+                || (event.generation == current.generation && event.revision <= current.revision)
+        }) {
+            return;
+        }
+        if current
+            .as_ref()
+            .is_some_and(|current| event.generation > current.generation)
+        {
+            let previous_id = TranscriptViewItemId::tool_request_draft(
+                &key,
+                current.as_ref().map_or(0, |draft| draft.generation),
+            );
+            self.snapshot
+                .transcript
+                .items
+                .retain(|item| item.id != previous_id);
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.tool_request_drafts.remove(&key);
+        }
+        if let ToolRequestDraftOperation::Remove { .. } = event.operation {
+            let mut terminal = current.unwrap_or_else(|| ToolRequestDraftView {
+                turn_id: event.turn_id.clone(),
+                tool_call_id: event.tool_call_id.clone(),
+                tool_name: event.tool_name.clone(),
+                producer_plugin_id: event.producer_plugin_id.clone(),
+                schema: event.schema.clone(),
+                schema_version: event.schema_version,
+                generation: event.generation,
+                revision: event.revision,
+                argument_bytes: event.argument_bytes,
+                preview_start_offset: 0,
+                preview: String::new(),
+                truncated: event.truncated,
+            });
+            terminal.revision = event.revision;
+            terminal.argument_bytes = event.argument_bytes;
+            terminal.truncated = event.truncated;
+            self.tool_request_drafts.insert(key, terminal);
+            self.snapshot.transcript.items.retain(|item| item.id != id);
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+            return;
+        }
+        let mut draft = current
+            .filter(|current| current.generation == event.generation)
+            .unwrap_or_else(|| ToolRequestDraftView {
+                turn_id: event.turn_id.clone(),
+                tool_call_id: event.tool_call_id.clone(),
+                tool_name: event.tool_name.clone(),
+                producer_plugin_id: event.producer_plugin_id.clone(),
+                schema: event.schema.clone(),
+                schema_version: event.schema_version,
+                generation: event.generation,
+                revision: 0,
+                argument_bytes: 0,
+                preview_start_offset: 0,
+                preview: String::new(),
+                truncated: false,
+            });
+        match &event.operation {
+            ToolRequestDraftOperation::Append { offset, text } => {
+                let expected = draft
+                    .preview_start_offset
+                    .saturating_add(draft.preview.len());
+                if *offset != expected {
+                    return;
+                }
+                draft.preview.push_str(text);
+            }
+            ToolRequestDraftOperation::Checkpoint { start_offset, text } => {
+                draft.preview_start_offset = *start_offset;
+                draft.preview.clone_from(text);
+            }
+            ToolRequestDraftOperation::Remove { .. } => unreachable!(),
+        }
+        draft.turn_id.clone_from(&event.turn_id);
+        draft.tool_name.clone_from(&event.tool_name);
+        draft
+            .producer_plugin_id
+            .clone_from(&event.producer_plugin_id);
+        draft.schema.clone_from(&event.schema);
+        draft.schema_version = event.schema_version;
+        draft.revision = event.revision;
+        draft.argument_bytes = event.argument_bytes;
+        draft.truncated = event.truncated;
+        self.tool_request_drafts.insert(key, draft.clone());
+        if let Some(item) = self
+            .snapshot
+            .transcript
+            .items
+            .iter_mut()
+            .find(|item| item.id == id)
+        {
+            item.kind = TranscriptViewItemKind::ToolRequestDraft { draft };
+            item.streaming = true;
+            item.revision = item.revision.saturating_add(1);
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+            return;
+        }
+        self.push_item(
+            id,
+            0,
+            None,
+            true,
+            TranscriptViewItemKind::ToolRequestDraft { draft },
+        );
     }
 
     fn apply_contribution_event(
@@ -1447,6 +1570,7 @@ impl SessionView {
         let existing_tool = match &self.snapshot.transcript.items[index].kind {
             TranscriptViewItemKind::ToolInvocation { tool } => Some((**tool).clone()),
             TranscriptViewItemKind::ToolRequest { .. }
+            | TranscriptViewItemKind::ToolRequestDraft { .. }
             | TranscriptViewItemKind::AssistantMessage { .. }
             | TranscriptViewItemKind::ReasoningMessage { .. }
             | TranscriptViewItemKind::UserMessage { .. }
@@ -1961,6 +2085,7 @@ fn append_text_to_item(item: &mut TranscriptViewItem, text: &str) {
         | TranscriptViewItemKind::UserMessage { message }
         | TranscriptViewItemKind::SystemMessage { message } => message.text.push_str(text),
         TranscriptViewItemKind::ToolInvocation { .. }
+        | TranscriptViewItemKind::ToolRequestDraft { .. }
         | TranscriptViewItemKind::ToolRequest { .. }
         | TranscriptViewItemKind::Permission { .. }
         | TranscriptViewItemKind::RuntimeWork { .. }
@@ -1979,6 +2104,7 @@ fn replace_text_in_item(item: &mut TranscriptViewItem, text: &str) {
         | TranscriptViewItemKind::UserMessage { message }
         | TranscriptViewItemKind::SystemMessage { message } => text.clone_into(&mut message.text),
         TranscriptViewItemKind::ToolInvocation { .. }
+        | TranscriptViewItemKind::ToolRequestDraft { .. }
         | TranscriptViewItemKind::ToolRequest { .. }
         | TranscriptViewItemKind::Permission { .. }
         | TranscriptViewItemKind::RuntimeWork { .. }
@@ -2341,6 +2467,82 @@ mod tests {
             serde_json::json!({"revive": true}),
         ));
         assert!(view.snapshot().contributions.is_empty());
+    }
+
+    #[test]
+    fn request_draft_live_updates_apply_append_checkpoint_and_terminal_dominance() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let draft = |revision, operation| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "call-write".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    generation: 1,
+                    revision,
+                    operation,
+                    argument_bytes: 10,
+                    truncated: false,
+                },
+            },
+        };
+
+        view.apply_live_event(&draft(
+            1,
+            bcode_session_models::ToolRequestDraftOperation::Append {
+                offset: 0,
+                text: "hello".to_owned(),
+            },
+        ));
+        view.apply_live_event(&draft(
+            2,
+            bcode_session_models::ToolRequestDraftOperation::Append {
+                offset: 5,
+                text: " world".to_owned(),
+            },
+        ));
+        let item = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| matches!(item.kind, TranscriptViewItemKind::ToolRequestDraft { .. }))
+            .expect("request draft item");
+        let TranscriptViewItemKind::ToolRequestDraft {
+            draft: projected_draft,
+        } = &item.kind
+        else {
+            unreachable!();
+        };
+        assert_eq!(projected_draft.preview, "hello world");
+        assert!(item.streaming);
+
+        view.apply_live_event(&draft(
+            3,
+            bcode_session_models::ToolRequestDraftOperation::Remove {
+                reason: bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+            },
+        ));
+        view.apply_live_event(&draft(
+            2,
+            bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                start_offset: 0,
+                text: "stale".to_owned(),
+            },
+        ));
+        assert!(
+            !view
+                .snapshot()
+                .transcript
+                .items
+                .iter()
+                .any(|item| matches!(item.kind, TranscriptViewItemKind::ToolRequestDraft { .. }))
+        );
     }
 
     #[test]

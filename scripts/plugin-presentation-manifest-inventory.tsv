@@ -4,7 +4,7 @@
 bcode.code_review	-	code-review-home,code-review
 bcode.document	bcode.document.request,bcode.document.extract_result,bcode.document.status	-
 bcode.eval	-	eval-run-picker,eval-run-viewer
-bcode.filesystem	bcode.filesystem.change,bcode.filesystem.request,bcode.filesystem.read,bcode.filesystem.image,bcode.filesystem.exists,bcode.filesystem.list,bcode.filesystem.find,bcode.filesystem.grep,bcode.filesystem.stat,bcode.filesystem.artifact.metadata,bcode.filesystem.artifact.read,bcode.filesystem.artifact.grep	-
+bcode.filesystem	bcode.filesystem.change,bcode.filesystem.request-draft.write,bcode.filesystem.request-draft.edit,bcode.filesystem.request,bcode.filesystem.read,bcode.filesystem.image,bcode.filesystem.exists,bcode.filesystem.list,bcode.filesystem.find,bcode.filesystem.grep,bcode.filesystem.stat,bcode.filesystem.artifact.metadata,bcode.filesystem.artifact.read,bcode.filesystem.artifact.grep	-
 bcode.git	bcode.git.clone_request,bcode.git.clone_result	-
 bcode.loop	-	loop.start
 bcode.metrics	-	metrics-dashboard

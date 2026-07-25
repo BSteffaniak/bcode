@@ -1211,6 +1211,78 @@ pub enum SessionLiveEventKind {
         /// Coalesced provider stream progress event.
         event: ProviderStreamEvent,
     },
+    /// Live-only assembly state for one provider-emitted tool request.
+    ///
+    /// Draft fragments are observational presentation data. They are never valid for authorization
+    /// or execution and are never persisted or replayed from durable history.
+    ToolRequestDraft { event: ToolRequestDraftEvent },
+}
+
+/// One live-only provider tool-request draft update.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolRequestDraftEvent {
+    /// Model turn that owns the draft generation.
+    pub turn_id: String,
+    /// Provider tool-call identifier.
+    pub tool_call_id: String,
+    /// Model-visible tool name.
+    pub tool_name: String,
+    /// Plugin that owns request-draft presentation, when resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_plugin_id: Option<String>,
+    /// Plugin-owned request-draft schema.
+    pub schema: String,
+    /// Version of `schema` used by the draft payload.
+    pub schema_version: u32,
+    /// Monotonic draft generation. A new provider start for the same call advances it.
+    pub generation: u64,
+    /// Monotonic update revision within `generation`.
+    pub revision: u64,
+    /// Update operation applied to the bounded retained preview.
+    pub operation: ToolRequestDraftOperation,
+    /// Total argument bytes observed from the provider for this generation.
+    pub argument_bytes: usize,
+    /// Whether bytes were omitted from the bounded retained preview.
+    pub truncated: bool,
+}
+
+/// Live-only request-draft mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ToolRequestDraftOperation {
+    /// Append one contiguous byte batch at `offset`.
+    Append {
+        /// Expected retained-stream offset before applying `text`.
+        offset: usize,
+        /// Newly observed UTF-8 provider argument bytes.
+        text: String,
+    },
+    /// Replace local draft state with a bounded checkpoint.
+    Checkpoint {
+        /// Original stream offset represented by the first retained byte.
+        start_offset: usize,
+        /// Bounded retained UTF-8 preview.
+        text: String,
+    },
+    /// Remove the draft at a terminal boundary.
+    Remove {
+        /// Why the live-only draft ended.
+        reason: ToolRequestDraftTerminalReason,
+    },
+}
+
+/// Terminal reason for removing a live request draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolRequestDraftTerminalReason {
+    /// Complete arguments were accepted by the provider stream.
+    Completed,
+    /// The owning model turn was cancelled.
+    Cancelled,
+    /// Provider argument assembly failed or was invalid.
+    Invalid,
+    /// A newer generation superseded this draft.
+    Superseded,
 }
 
 /// Session projection kind.
@@ -1992,6 +2064,42 @@ pub enum SessionEventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_request_draft_models_round_trip_all_operations() {
+        let operations = [
+            ToolRequestDraftOperation::Append {
+                offset: 4,
+                text: "hello".to_owned(),
+            },
+            ToolRequestDraftOperation::Checkpoint {
+                start_offset: 2,
+                text: "bounded".to_owned(),
+            },
+            ToolRequestDraftOperation::Remove {
+                reason: ToolRequestDraftTerminalReason::Cancelled,
+            },
+        ];
+        for (index, operation) in operations.into_iter().enumerate() {
+            let event = ToolRequestDraftEvent {
+                turn_id: "turn-1".to_owned(),
+                tool_call_id: "call-1".to_owned(),
+                tool_name: "filesystem.write".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                schema: "bcode.filesystem.request-draft.write".to_owned(),
+                schema_version: 1,
+                generation: 1,
+                revision: u64::try_from(index + 1).expect("revision"),
+                operation,
+                argument_bytes: 9,
+                truncated: index == 1,
+            };
+            let encoded = serde_json::to_vec(&event).expect("encode request draft");
+            let decoded: ToolRequestDraftEvent =
+                serde_json::from_slice(&encoded).expect("decode request draft");
+            assert_eq!(decoded, event);
+        }
+    }
 
     #[test]
     fn session_open_operation_models_round_trip_and_preserve_semantics() {
