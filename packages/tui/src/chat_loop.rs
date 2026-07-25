@@ -2651,6 +2651,9 @@ async fn handle_chat_key<W: Write>(
     if stroke.key == KeyCode::Tab && (stroke.modifiers.ctrl || stroke.modifiers.alt) {
         return Ok(chat.app.move_markdown_focus(stroke.modifiers.shift));
     }
+    if stroke.key == KeyCode::Enter && stroke.modifiers.alt {
+        return Ok(chat.app.activate_focused_markdown_contribution());
+    }
     let outcome = input::handle_key(&mut chat.app, context.services.keymap, stroke);
     if chat.app.should_exit() {
         return Ok(true);

@@ -272,7 +272,7 @@ pub struct BmuxApp {
     cursor: CursorBlink,
     pending_key_activation: Option<PendingKeyActivation>,
     plugin_presentation: Option<Arc<crate::plugin_tui::PluginTuiPresentation>>,
-    markdown_focus: crate::markdown_interaction::MarkdownFocusState,
+    markdown_interaction: crate::markdown_interaction::MarkdownInteractionState,
 }
 
 /// Daemon connection state used to describe startup readiness in the status chrome.
@@ -469,7 +469,7 @@ impl BmuxApp {
             cursor: CursorBlink::new(),
             pending_key_activation: None,
             plugin_presentation: None,
-            markdown_focus: crate::markdown_interaction::MarkdownFocusState::default(),
+            markdown_interaction: crate::markdown_interaction::MarkdownInteractionState::default(),
         };
         app.absorb_history(history);
         app
@@ -517,23 +517,90 @@ impl BmuxApp {
     }
 
     /// Reconcile keyboard focus with visible actionable Markdown contributions.
-    pub fn reconcile_markdown_focus(&mut self, visible: Vec<String>) {
-        self.markdown_focus.reconcile(visible);
+    pub fn reconcile_markdown_interactions(
+        &mut self,
+        visible: Vec<crate::markdown_interaction::VisibleMarkdownContribution>,
+    ) {
+        self.markdown_interaction.reconcile(visible);
     }
 
     /// Move Markdown focus in visible document order.
     pub fn move_markdown_focus(&mut self, reverse: bool) -> bool {
-        if reverse {
-            self.markdown_focus.focus_previous()
+        let changed = if reverse {
+            self.markdown_interaction.focus_previous()
         } else {
-            self.markdown_focus.focus_next()
+            self.markdown_interaction.focus_next()
+        };
+        if changed && self.markdown_interaction.focused().is_some() {
+            self.set_status(
+                "Markdown contribution focused; Alt+Enter activates, Ctrl/Alt+Tab moves".to_owned(),
+            );
         }
+        changed
+    }
+
+    /// Focus one currently visible Markdown contribution.
+    pub fn focus_markdown_contribution(&mut self, contribution_id: &str) -> bool {
+        self.markdown_interaction.focus(contribution_id)
     }
 
     /// Return the focused Markdown contribution ID.
     #[must_use]
     pub fn focused_markdown_contribution(&self) -> Option<&str> {
-        self.markdown_focus.focused()
+        self.markdown_interaction.focused()
+    }
+
+    /// Return the typed payload for a visible Markdown contribution.
+    #[must_use]
+    pub fn visible_markdown_contribution(
+        &self,
+        contribution_id: &str,
+    ) -> Option<&bcode_markdown_render::MarkdownContributionKind> {
+        self.markdown_interaction.contribution(contribution_id)
+    }
+
+    /// Activate a currently visible Markdown contribution through its typed payload.
+    pub fn activate_markdown_contribution(&mut self, contribution_id: &str) -> bool {
+        use bcode_markdown_render::MarkdownContributionKind;
+
+        let destination = match self.visible_markdown_contribution(contribution_id).cloned() {
+            Some(
+                MarkdownContributionKind::Link { destination, .. }
+                | MarkdownContributionKind::GitHubIssue { destination, .. },
+            ) => destination,
+            Some(
+                MarkdownContributionKind::Details { .. }
+                | MarkdownContributionKind::FootnoteReference { .. }
+                | MarkdownContributionKind::FootnoteDefinition { .. }
+                | MarkdownContributionKind::Image { .. }
+                | MarkdownContributionKind::InlineMath { .. }
+                | MarkdownContributionKind::DisplayMath { .. }
+                | MarkdownContributionKind::Mermaid { .. },
+            )
+            | None => return false,
+        };
+
+        match crate::markdown_activation::activate_markdown_destination(&destination) {
+            Ok(crate::markdown_activation::MarkdownActivation::External) => {
+                self.set_status("Opened Markdown destination".to_owned());
+            }
+            Ok(crate::markdown_activation::MarkdownActivation::Fragment) => {
+                self.set_status("Markdown fragment navigation is not available yet".to_owned());
+            }
+            Ok(crate::markdown_activation::MarkdownActivation::Inert) => return false,
+            Err(error) => {
+                self.set_status(format!("Could not open Markdown destination: {error}"));
+            }
+        }
+        true
+    }
+
+    /// Activate the currently focused Markdown contribution.
+    pub fn activate_focused_markdown_contribution(&mut self) -> bool {
+        let Some(contribution_id) = self.focused_markdown_contribution().map(str::to_owned) else {
+            return false;
+        };
+        self.activate_markdown_contribution(&contribution_id)
     }
 
     /// Return timeline entries for committed user messages.

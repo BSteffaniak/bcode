@@ -38,6 +38,20 @@ pub async fn handle_mouse(
         MouseEventKind::Down(MouseButton::Left) if permission_dialog.is_some() => {
             permission_flow::handle_permission_mouse(client, chat, permission_dialog, mouse).await
         }
+        MouseEventKind::Down(MouseButton::Left)
+            if hit_id
+                .as_deref()
+                .and_then(crate::markdown_interaction::contribution_id_from_hit)
+                .is_some() =>
+        {
+            let contribution_id = hit_id
+                .as_deref()
+                .and_then(crate::markdown_interaction::contribution_id_from_hit)
+                .expect("guarded Markdown contribution hit");
+            let focus_changed = chat.app.focus_markdown_contribution(contribution_id);
+            let activated = chat.app.activate_markdown_contribution(contribution_id);
+            Ok(focus_changed || activated)
+        }
         MouseEventKind::Down(MouseButton::Left) if hit_id.as_deref() == Some("composer") => {
             Ok(composer_mouse_changed(chat, mouse))
         }

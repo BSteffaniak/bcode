@@ -35,7 +35,8 @@ fn plugin_visual_context(
 use std::time::{Duration, Instant};
 
 use bcode_markdown_render::{
-    MarkdownContributionKind, MarkdownRenderOptions, render_markdown, render_markdown_lines,
+    MarkdownContributionKind, MarkdownDocumentContext, MarkdownRenderOptions, render_markdown,
+    render_markdown_lines,
 };
 use bcode_plugin_sdk::tui::PluginTuiVisualRenderMode;
 use bcode_session_view_models::TextFormat;
@@ -156,14 +157,17 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
     render_header(app, layout.header, frame, theme);
     render_composer(app, layout.composer, frame, theme);
     let focused_regions = transcript_markdown_regions(app, layout.body);
-    let mut focused_ids = Vec::new();
+    let mut visible = Vec::new();
     let mut seen_ids = std::collections::BTreeSet::new();
     for region in focused_regions {
         if seen_ids.insert(region.contribution_id.clone()) {
-            focused_ids.push(region.contribution_id);
+            visible.push(crate::markdown_interaction::VisibleMarkdownContribution {
+                id: region.contribution_id,
+                kind: region.contribution_kind,
+            });
         }
     }
-    app.reconcile_markdown_focus(focused_ids);
+    app.reconcile_markdown_interactions(visible);
     render_body(app, layout.body, frame);
     if let Some(latest_bar) = layout.latest_bar {
         render_latest_bar(app, latest_bar, frame, Instant::now());
@@ -744,6 +748,23 @@ pub const fn transcript_area_for_body(_app: &BmuxApp, area: Rect) -> Rect {
     area
 }
 
+fn markdown_render_options(
+    app: &BmuxApp,
+    item: &TranscriptItem,
+    width: u16,
+) -> MarkdownRenderOptions {
+    let mut options = MarkdownRenderOptions::new(width)
+        .with_document_id(format!("transcript:{}", item.id().get()))
+        .with_streaming(item.streaming());
+    if let Some(base_directory) = app.working_directory() {
+        options = options.with_document_context(MarkdownDocumentContext {
+            base_directory: Some(base_directory.to_path_buf()),
+            ..MarkdownDocumentContext::default()
+        });
+    }
+    options
+}
+
 fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     if area.is_empty() {
         return;
@@ -772,6 +793,7 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
 #[derive(Debug)]
 struct MarkdownTranscriptRegion {
     contribution_id: String,
+    contribution_kind: MarkdownContributionKind,
     rect_index: usize,
     rect: Rect,
 }
@@ -822,9 +844,7 @@ fn transcript_markdown_regions(app: &BmuxApp, area: Rect) -> Vec<MarkdownTranscr
         let content_offset = transcript_markdown_content_row_offset(item, area.width);
         let rendered = render_markdown(
             item.text(),
-            &MarkdownRenderOptions::new(area.width.saturating_sub(2).max(1))
-                .with_document_id(format!("transcript:{}", item.id().get()))
-                .with_streaming(item.streaming()),
+            &markdown_render_options(app, item, area.width.saturating_sub(2).max(1)),
         );
         for geometry in &rendered.geometry {
             let Some(contribution) = rendered
@@ -857,6 +877,7 @@ fn transcript_markdown_regions(app: &BmuxApp, area: Rect) -> Vec<MarkdownTranscr
                 }
                 regions.push(MarkdownTranscriptRegion {
                     contribution_id: geometry.contribution_id.clone(),
+                    contribution_kind: contribution.kind.clone(),
                     rect_index,
                     rect: clipped,
                 });
