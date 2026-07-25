@@ -29555,6 +29555,55 @@ library = "test"
         ));
     }
 
+    #[tokio::test]
+    async fn model_no_progress_timeout_marks_outcome_with_active_tool_context() {
+        let mut state = test_server_state(SessionManager::default());
+        state.model_streaming.no_progress_warning_secs = 0;
+        state.model_streaming.no_progress_timeout_secs = 0;
+        let session_id = SessionId::new();
+        let cancel_state = TurnCancelState::default();
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(0);
+        let current_turn = Arc::new(Mutex::new(None));
+        let mut command_context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued_followups,
+            current_turn,
+        );
+        let mut outcome = ModelPollOutcome::default();
+        let mut warned = false;
+        let result = wait_for_model_progress_or_timeout(
+            &state,
+            session_id,
+            Duration::ZERO,
+            &mut warned,
+            &cancel_state,
+            Some(ProviderToolCallProgress {
+                tool_call_id: "call-timeout".to_owned(),
+                tool_name: "filesystem.write".to_owned(),
+                argument_bytes: 4096,
+            }),
+            &mut outcome,
+            &mut command_context,
+        )
+        .await;
+        assert!(result.is_none());
+        assert!(warned);
+        assert!(matches!(
+            outcome.completion,
+            Some(ModelTurnCompletion {
+                outcome: ModelTurnOutcome::IdleTimeout,
+                message: Some(ref message),
+                ..
+            }) if message.contains("filesystem.write") && message.contains("4.0 KiB")
+        ));
+        assert!(outcome.provider_error.is_some());
+    }
+
     #[test]
     fn model_no_progress_timeout_is_a_structured_retryable_error() {
         let message = "model provider made no progress for 300 seconds before timeout while assembling shell.run arguments · 2.0 KiB received".to_string();

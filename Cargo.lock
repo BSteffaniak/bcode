@@ -1820,7 +1820,6 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_plugin_sdk",
  "bcode_session_models",
- "bcode_session_view",
  "bcode_session_view_models",
  "hyperchad",
  "hyperchad_color",

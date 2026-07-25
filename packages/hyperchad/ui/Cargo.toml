@@ -35,9 +35,6 @@ hyperchad_transformer_models = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
-[dev-dependencies]
-bcode_session_view = { workspace = true }
-
 [features]
 default = []
 fail-on-warnings = [
