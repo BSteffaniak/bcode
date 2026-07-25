@@ -215,6 +215,14 @@ if ! rg -q '033_session_migration_receipts_table' packages/session/src/db.rs \
   violations=1
 fi
 
+if ! rg -q 'pub async fn canonical_event_inventory' packages/session/src/db.rs \
+  || ! rg -q 'strict_history_error' packages/cli/src/lib.rs \
+  || ! rg -q 'event_schema_counts' packages/cli/src/lib.rs \
+  || ! rg -q 'event_kind_counts' packages/cli/src/lib.rs; then
+  echo "Session diagnosis violation: bounded non-decoding canonical inventory must remain available when strict historical decoding fails." >&2
+  violations=1
+fi
+
 if rg -n 'decode_session_event_degraded' packages/session/src/db.rs \
   >/tmp/bcode-lossy-session-read-violations.txt; then
   echo "Session history violation: DB-backed canonical/indexed reads must not silently discard undecodable rows." >&2

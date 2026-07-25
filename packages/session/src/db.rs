@@ -1340,6 +1340,55 @@ impl SessionDb {
         &**self.db
     }
 
+    /// Return a bounded, non-decoding inventory of canonical event envelopes.
+    ///
+    /// This diagnosis path reads only indexed scalar columns and never deserializes payloads,
+    /// rebuilds projections, or mutates storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the bounded database queries fail or rows are malformed.
+    pub async fn canonical_event_inventory(
+        &self,
+    ) -> SessionDbResult<(u64, Option<u64>, BTreeMap<u16, u64>, BTreeMap<String, u64>)> {
+        let rows = self
+            .db
+            .select("events")
+            .columns(&["event_seq", "event_type", "schema_version"])
+            .sort("event_seq", SortDirection::Asc)
+            .execute(&**self.db)
+            .await?;
+        let mut schemas = BTreeMap::new();
+        let mut kinds = BTreeMap::new();
+        let mut tail = None;
+        for (index, row) in rows.iter().enumerate() {
+            let sequence = required_non_negative_u64(row, "event_seq")?;
+            let expected = u64::try_from(index).unwrap_or(u64::MAX);
+            if sequence != expected {
+                return Err(SessionDbError::InvalidCanonicalSequence {
+                    expected,
+                    actual: sequence,
+                });
+            }
+            tail = Some(sequence);
+            let schema = required_non_negative_u64(row, "schema_version")?;
+            let schema = u16::try_from(schema).map_err(|_| SessionDbError::InvalidRow {
+                column: "events.schema_version".to_owned(),
+            })?;
+            let count = schemas.entry(schema).or_insert(0_u64);
+            *count = count.saturating_add(1);
+            let kind = required_string(row, "event_type")?;
+            let count = kinds.entry(kind).or_insert(0_u64);
+            *count = count.saturating_add(1);
+        }
+        Ok((
+            u64::try_from(rows.len()).unwrap_or(u64::MAX),
+            tail,
+            schemas,
+            kinds,
+        ))
+    }
+
     /// Inspect this database's durable storage compatibility without mutating it.
     ///
     /// # Errors

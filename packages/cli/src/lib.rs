@@ -6744,6 +6744,10 @@ struct SessionDiagnosis {
     writer_epoch: Option<u64>,
     expected_writer_epoch: u64,
     canonical_tail: Option<u64>,
+    canonical_event_count: u64,
+    event_schema_counts: BTreeMap<u16, u64>,
+    event_kind_counts: BTreeMap<String, u64>,
+    strict_history_error: Option<String>,
     write_readiness: String,
     model_context_status: String,
     projections: Vec<SessionProjectionDiagnosis>,
@@ -6785,7 +6789,9 @@ async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliEr
     let database_path = bcode_session::db::session_db_path(&root, session_id);
     let db = bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
     let writer_epoch = db.storage_writer_epoch().await.ok();
-    let canonical_tail = db.last_event_sequence().await?;
+    let (canonical_event_count, inventory_tail, event_schema_counts, event_kind_counts) =
+        db.canonical_event_inventory().await?;
+    let canonical_tail = inventory_tail;
     let write_readiness = db
         .validate_write_readiness()
         .await
@@ -6807,7 +6813,9 @@ async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliEr
             "Run `bcode session doctor {session_id}` first; if canonical history is healthy and projections require rebuilding, run `bcode session reindex {session_id}`."
         )
     });
-    let history = db.all_events_strict().await?;
+    let strict_history = db.all_events_strict().await;
+    let strict_history_error = strict_history.as_ref().err().map(ToString::to_string);
+    let history = strict_history.unwrap_or_default();
     let diagnosis = SessionDiagnosis::from_history(
         session_id,
         &history,
@@ -6815,6 +6823,10 @@ async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliEr
             database_path,
             writer_epoch,
             canonical_tail,
+            canonical_event_count,
+            event_schema_counts,
+            event_kind_counts,
+            strict_history_error,
             write_readiness,
             model_context_status,
             projections,
@@ -7053,6 +7065,10 @@ struct SessionStorageDiagnosis {
     database_path: PathBuf,
     writer_epoch: Option<u64>,
     canonical_tail: Option<u64>,
+    canonical_event_count: u64,
+    event_schema_counts: BTreeMap<u16, u64>,
+    event_kind_counts: BTreeMap<String, u64>,
+    strict_history_error: Option<String>,
     write_readiness: String,
     model_context_status: String,
     projections: Vec<SessionProjectionDiagnosis>,
@@ -7102,6 +7118,10 @@ impl SessionDiagnosis {
                 bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
             ),
             canonical_tail: storage.canonical_tail,
+            canonical_event_count: storage.canonical_event_count,
+            event_schema_counts: storage.event_schema_counts,
+            event_kind_counts: storage.event_kind_counts,
+            strict_history_error: storage.strict_history_error,
             write_readiness: storage.write_readiness,
             model_context_status: storage.model_context_status,
             projections: storage.projections,
@@ -7128,6 +7148,12 @@ fn print_session_diagnosis(diagnosis: &SessionDiagnosis) {
         diagnosis.writer_epoch, diagnosis.expected_writer_epoch
     );
     println!("canonical tail: {:?}", diagnosis.canonical_tail);
+    println!("canonical events: {}", diagnosis.canonical_event_count);
+    println!("event schemas: {:?}", diagnosis.event_schema_counts);
+    println!("event kinds: {:?}", diagnosis.event_kind_counts);
+    if let Some(error) = &diagnosis.strict_history_error {
+        println!("strict history: unavailable ({error})");
+    }
     println!("write readiness: {}", diagnosis.write_readiness);
     println!("model context: {}", diagnosis.model_context_status);
     println!("projections:");
