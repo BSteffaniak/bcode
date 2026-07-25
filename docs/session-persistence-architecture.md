@@ -51,8 +51,12 @@ complete request / permission / terminal result
 ```
 
 Reconnect may restore only the current bounded active checkpoint. It does not replay missed live
-deltas. Terminal completion, failure, timeout, cancellation, or host-owned invocation teardown
-removes active state before stale revisions can revive it.
+deltas. Completing provider argument assembly does not retire a result-targeted request preview: the
+bounded preview remains active through permission and execution so reconnect can restore it. The
+server first persists and publishes the complete `ToolInvocationResultRecorded` semantic fact, then
+retires the live preview. Cancellation, failure, timeout, retry/supersession, or host-owned teardown
+that cannot produce a canonical result removes active state directly. Daemon restart intentionally
+drops every preview while durable request/result history remains authoritative.
 
 ## On-disk layout
 

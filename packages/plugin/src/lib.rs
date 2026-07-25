@@ -219,8 +219,93 @@ pub struct PluginToolPresentationDeclaration {
     /// Version of `request_draft_schema`.
     pub request_draft_schema_version: u32,
     /// Semantic transcript slot updated by the live draft.
-    #[serde(default)]
-    pub request_draft_placement: bcode_tool::ToolContributionPlacement,
+    pub request_draft_placement: PluginToolPresentationPlacement,
+}
+
+/// Legal semantic placement for a streamed tool request draft.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginToolPresentationPlacement {
+    /// Primary request presentation for the invocation.
+    Request,
+    /// Current progress presentation for the invocation.
+    Progress,
+    /// Primary result preview for the invocation.
+    Result,
+}
+
+impl From<PluginToolPresentationPlacement> for bcode_tool::ToolContributionPlacement {
+    fn from(value: PluginToolPresentationPlacement) -> Self {
+        match value {
+            PluginToolPresentationPlacement::Request => Self::Request,
+            PluginToolPresentationPlacement::Progress => Self::Progress,
+            PluginToolPresentationPlacement::Result => Self::Result,
+        }
+    }
+}
+
+fn validate_tool_presentation_declarations<'a>(
+    manifests: impl IntoIterator<Item = &'a PluginManifest>,
+) -> Result<(), PluginLoadError> {
+    let mut owners = BTreeMap::<&str, Vec<&str>>::new();
+    for manifest in manifests {
+        let has_tool_service = manifest
+            .services
+            .iter()
+            .any(|service| service.interface_id == bcode_tool::TOOL_SERVICE_INTERFACE_ID);
+        let mut plugin_tools = BTreeSet::new();
+        for presentation in &manifest.tool_presentations {
+            let tool_name = presentation.tool_name.trim();
+            let invalid = |reason: &str| PluginLoadError::InvalidToolPresentation {
+                plugin_id: manifest.id.clone(),
+                tool_name: presentation.tool_name.clone(),
+                reason: reason.to_owned(),
+            };
+            if !has_tool_service {
+                return Err(invalid(
+                    "the declaring plugin does not provide bcode.tool/v1",
+                ));
+            }
+            if tool_name.is_empty() {
+                return Err(invalid("tool_name must not be empty"));
+            }
+            if !plugin_tools.insert(tool_name) {
+                return Err(invalid(
+                    "the tool is declared more than once by this plugin",
+                ));
+            }
+            if presentation.request_draft_schema.trim().is_empty() {
+                return Err(invalid("request_draft_schema must not be empty"));
+            }
+            if presentation.request_draft_schema_version == 0 {
+                return Err(invalid(
+                    "request_draft_schema_version must be greater than zero",
+                ));
+            }
+            let adapter_matches = manifest.visual_adapters.iter().any(|adapter| {
+                adapter.schema == presentation.request_draft_schema
+                    && adapter
+                        .min_schema_version
+                        .is_none_or(|minimum| presentation.request_draft_schema_version >= minimum)
+                    && adapter
+                        .max_schema_version
+                        .is_none_or(|maximum| presentation.request_draft_schema_version <= maximum)
+            });
+            if !adapter_matches {
+                return Err(invalid(
+                    "no visual adapter supports the declared draft schema version",
+                ));
+            }
+            owners.entry(tool_name).or_default().push(&manifest.id);
+        }
+    }
+    if let Some((tool_name, plugin_ids)) = owners.into_iter().find(|(_, owners)| owners.len() > 1) {
+        return Err(PluginLoadError::AmbiguousToolPresentation {
+            tool_name: tool_name.to_owned(),
+            plugin_ids: plugin_ids.into_iter().map(str::to_owned).collect(),
+        });
+    }
+    Ok(())
 }
 
 impl PluginVisualAdapterDeclaration {
@@ -1034,6 +1119,17 @@ pub enum PluginLoadError {
     },
     #[error("manifest ID mismatch: file declared '{file_id}', library exported '{library_id}'")]
     ManifestIdMismatch { file_id: String, library_id: String },
+    #[error("plugin '{plugin_id}' has invalid tool presentation for '{tool_name}': {reason}")]
+    InvalidToolPresentation {
+        plugin_id: String,
+        tool_name: String,
+        reason: String,
+    },
+    #[error("tool presentation for '{tool_name}' is declared by multiple plugins: {plugin_ids:?}")]
+    AmbiguousToolPresentation {
+        tool_name: String,
+        plugin_ids: Vec<String>,
+    },
     #[error("plugin is not loaded: {0}")]
     PluginNotLoaded(String),
     #[error("no loaded plugin declares service interface '{0}'")]
@@ -2073,6 +2169,8 @@ pub struct PluginRegistry {
 impl PluginRegistry {
     #[must_use]
     fn from_manifests(manifests: BTreeMap<String, PluginManifest>) -> Self {
+        validate_tool_presentation_declarations(manifests.values())
+            .expect("loaded plugin tool presentation contracts must be valid");
         for manifest in manifests.values() {
             for service in &manifest.services {
                 for block in &service.workflow_blocks {
@@ -3382,6 +3480,7 @@ impl PluginHost {
         };
         host.load_static_plugins_into(&static_plugins)?;
         host.load_registered_plugins_into(&plugins)?;
+        validate_tool_presentation_declarations(host.loaded.iter().map(LoadedPlugin::manifest))?;
         Ok(host)
     }
 
@@ -3391,6 +3490,7 @@ impl PluginHost {
     ///
     /// Returns an error when loading or activation fails.
     pub fn load_registered_plugins(plugins: &[RegisteredPlugin]) -> Result<Self, PluginLoadError> {
+        validate_tool_presentation_declarations(plugins.iter().map(|plugin| &plugin.manifest))?;
         let mut host = Self::default();
         host.load_registered_plugins_into(plugins)?;
         Ok(host)
@@ -3404,6 +3504,7 @@ impl PluginHost {
     pub fn load_static_plugins(
         plugins: &[(PluginManifest, StaticPluginVtable)],
     ) -> Result<Self, PluginLoadError> {
+        validate_tool_presentation_declarations(plugins.iter().map(|(manifest, _)| manifest))?;
         let mut host = Self::default();
         host.load_static_plugins_into(plugins)?;
         Ok(host)
@@ -3623,6 +3724,7 @@ impl Drop for PluginHost {
 ///
 /// Returns an error if the plugin cannot be loaded or exports invalid metadata.
 pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin, PluginLoadError> {
+    validate_tool_presentation_declarations(std::iter::once(&plugin.manifest))?;
     let PluginRuntime::Native(runtime) = &plugin.manifest.runtime;
     tracing::debug!(
         target: "bcode_plugin::startup",
@@ -3695,6 +3797,7 @@ pub fn load_static_plugin(
     manifest: PluginManifest,
     vtable: StaticPluginVtable,
 ) -> Result<LoadedPlugin, PluginLoadError> {
+    validate_tool_presentation_declarations(std::iter::once(&manifest))?;
     let PluginRuntime::Native(runtime) = &manifest.runtime;
     if !runtime.is_current_abi() {
         return Err(PluginLoadError::UnsupportedAbi {
@@ -4529,8 +4632,81 @@ library = "libexample_plugin.dylib"
         assert_eq!(write.request_draft_schema_version, 1);
         assert_eq!(
             write.request_draft_placement,
-            bcode_tool::ToolContributionPlacement::Result
+            PluginToolPresentationPlacement::Result
         );
+    }
+
+    #[test]
+    fn rejects_invalid_tool_presentation_metadata() {
+        let mut manifest = test_manifest("bcode.invalid-presentation");
+        manifest.services[0].interface_id = bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned();
+        manifest.tool_presentations = vec![PluginToolPresentationDeclaration {
+            tool_name: "filesystem.write".to_owned(),
+            request_draft_schema: String::new(),
+            request_draft_schema_version: 1,
+            request_draft_placement: PluginToolPresentationPlacement::Result,
+        }];
+
+        let error = validate_tool_presentation_declarations([&manifest])
+            .expect_err("empty schemas must be rejected");
+        assert!(matches!(
+            error,
+            PluginLoadError::InvalidToolPresentation { reason, .. }
+                if reason == "request_draft_schema must not be empty"
+        ));
+    }
+
+    #[test]
+    fn rejects_tool_presentation_without_matching_adapter() {
+        let mut manifest = test_manifest("bcode.invalid-presentation");
+        manifest.services[0].interface_id = bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned();
+        manifest.tool_presentations = vec![PluginToolPresentationDeclaration {
+            tool_name: "filesystem.write".to_owned(),
+            request_draft_schema: "bcode.filesystem.request-draft.write".to_owned(),
+            request_draft_schema_version: 1,
+            request_draft_placement: PluginToolPresentationPlacement::Result,
+        }];
+
+        let error = validate_tool_presentation_declarations([&manifest])
+            .expect_err("unsupported schemas must be rejected");
+        assert!(matches!(
+            error,
+            PluginLoadError::InvalidToolPresentation { reason, .. }
+                if reason == "no visual adapter supports the declared draft schema version"
+        ));
+    }
+
+    #[test]
+    fn rejects_ambiguous_tool_presentation_ownership() {
+        let mut first = test_manifest("bcode.first");
+        first.services[0].interface_id = bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned();
+        first.visual_adapters.push(PluginVisualAdapterDeclaration {
+            id: "draft".to_owned(),
+            schema: "test.draft".to_owned(),
+            min_schema_version: Some(1),
+            max_schema_version: Some(1),
+            service_interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned(),
+            surfaces: vec!["tui".to_owned()],
+            priority: 0,
+            producer_default: true,
+            render_mode: PluginVisualAdapterRenderMode::TranscriptBlock,
+        });
+        first.tool_presentations = vec![PluginToolPresentationDeclaration {
+            tool_name: "duplicate.tool".to_owned(),
+            request_draft_schema: "test.draft".to_owned(),
+            request_draft_schema_version: 1,
+            request_draft_placement: PluginToolPresentationPlacement::Result,
+        }];
+        let mut second = first.clone();
+        second.id = "bcode.second".to_owned();
+
+        let error = validate_tool_presentation_declarations([&first, &second])
+            .expect_err("ambiguous tool ownership must be rejected");
+        assert!(matches!(
+            error,
+            PluginLoadError::AmbiguousToolPresentation { tool_name, .. }
+                if tool_name == "duplicate.tool"
+        ));
     }
 
     #[test]

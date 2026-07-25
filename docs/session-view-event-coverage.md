@@ -66,6 +66,8 @@ Status meanings:
 |---|---|---|---|
 | `AssistantTextDelta` | Cumulatively updates the active assistant item with stable semantic identity. | Upserts terminal presentation by shared `TranscriptViewItemId` while retaining renderer-local identity and anchoring. | **Complete** for semantic content and canonical projection consumption. |
 | `AssistantReasoningDelta` | Cumulatively updates reasoning item and thinking state without overriding renderer-selected visibility. | Upserts terminal reasoning presentation by shared `TranscriptViewItemId` while preserving split-stream boundaries and anchoring. | **Complete** for semantic content, visibility, and canonical projection consumption. |
+| `ToolRequestDraft` | Applies generation/revision-dominant append, checkpoint, and remove operations to the plugin-declared semantic tool slot. A canonical final result remains authoritative over stale or terminal draft updates. | Consumes the shared draft item and routes its producer/schema/version through native visual adapters; request drafts bypass the TUI's lossy generic superseding key. | **Complete** for live draft projection and final-result replacement semantics; terminal layout remains renderer-owned. |
+
 The former `ToolArgumentPreview` and `ToolOutputDelta` channels were removed. Plugin-owned transient contributions and durable request visuals now carry tool visual updates without host-projected partial-argument or output events.
 
 | `RequestContextOccupancyChanged` | Replaces authoritative current occupancy while rejecting stale epoch/sequence updates. | Footer context accounting consumes shared occupancy. | **Complete**. |

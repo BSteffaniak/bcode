@@ -89,10 +89,24 @@ attach/resync active checkpoint ────────────────
                          -> TUI or HyperChad native presentation
 ```
 
-Request drafts are keyed by turn, tool call, and generation. Contiguous append batches use UTF-8
-byte offsets; a gap or lag requires a bounded replacement checkpoint. Durable request projection
-retires the live draft and reconciles into the canonical tool row without duplicate transcript
-items.
+Request drafts are keyed by turn, tool call, and generation for transport ordering, while their
+visible identity is the plugin-declared semantic placement slot. Contiguous append batches use UTF-8
+byte offsets; a gap or lag requires a bounded replacement checkpoint. A request-targeted draft is
+retired when the complete durable request takes authority. A result-targeted draft instead remains
+the result-slot preview through permission and execution. Publishing the authoritative
+`ToolInvocationResultRecorded` replaces that same result slot before the server retires the live
+draft, so renderers never observe an intentional blank handoff frame.
+
+Slot source precedence is renderer-neutral:
+
+* Request: durable rich request contribution, request-targeted live draft, compact canonical
+  `ToolCallRequested`, then absent.
+* Result: canonical typed/textual result or artifact, terminal failure/cancellation fallback,
+  durable result contribution, result-targeted live draft, then absent.
+
+Once a canonical final result owns the result slot, stale drafts, lower-authority contributions, and
+lifecycle progress cannot overwrite or remove it. Durable request/result replay reconstructs the same
+final slot identities; live drafts are intentionally absent after daemon restart.
 
 Execution progress uses one replaceable slot per invocation/contribution identity. Terminal removal
 dominates stale updates. TUI adapters may provide terminal-native frames and HyperChad adapters may

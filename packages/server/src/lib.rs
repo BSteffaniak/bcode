@@ -13470,7 +13470,7 @@ async fn handle_provider_turn_event(
                             Some(plugin_id.to_owned()),
                             presentation.request_draft_schema.clone(),
                             presentation.request_draft_schema_version,
-                            presentation.request_draft_placement,
+                            presentation.request_draft_placement.into(),
                         )
                     });
             let (producer_plugin_id, schema, schema_version, placement) =
