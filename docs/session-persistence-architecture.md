@@ -289,9 +289,12 @@ Maintenance commands are explicit:
 * `bcode session export <session-id>` is the pre-cutover escape hatch. It performs a read-only
   strict canonical-event JSONL export through the non-migrating existing-database open and does not
   load the runtime session, acquire write ownership, migrate, repair, or reindex storage.
-* `bcode session diagnose <session-id>` reports writer, projection, canonical-tail, and ownership
-  state without mutation.
-* `bcode session doctor` diagnoses database and WAL state without mutation.
+* `bcode session diagnose <session-id>` reports writer, migration source/target/steps, projection,
+  canonical-tail, owner/waiting, retained-backup, and recovery-guidance state without mutation.
+  Repeated diagnosis is byte-preserving for current, legacy, damaged, and future stores.
+* `bcode session doctor [<session-id>] [--catalog|--scan]` diagnoses database and WAL state without
+  mutation. It never migrates, repairs, or reindexes; follow its result with an explicit maintenance
+  command only when needed.
 * `bcode session repair` acquires exclusive maintenance ownership, creates backups, and performs
   only supported database-sidecar/tail repair.
 * `bcode session reindex` acquires maintenance and write capabilities before rebuilding projections.
@@ -376,6 +379,9 @@ retained backup before running maintenance.
   the reported filesystem error, free space, destination permissions, and destination conflicts,
   then retry normal open. Keep any retained backup path reported by Bcode. Do not replace the
   session database with a partial backup.
+* **Unsupported future writer:** The store was last written by a newer Bcode build. Do not run
+  repair, reindex, or migration with this older build; use a build that supports the reported
+  writer epoch.
 * **Structural corruption or repair-required:** Malformed canonical JSON, sequence gaps, session-id
   mismatches, dirty migration history, and stale/incompatible projections fail closed. Capture
   `bcode session diagnose <session-id> --json`, then use `bcode session doctor <session-id>` and a

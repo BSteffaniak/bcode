@@ -64,6 +64,7 @@ sshenv_vault = { workspace = true, features = ["windows-dpapi"] }
 sshenv_vault = { workspace = true }
 
 [dev-dependencies]
+switchy  = { workspace = true, features = ["database"] }
 tempfile = { workspace = true }
 
 [features]

@@ -886,11 +886,13 @@ enum SessionCommand {
     Timeline {
         session_id: SessionId,
     },
+    /// Report writer, migration, projection, ownership, and recovery state without mutation.
     Diagnose {
         session_id: SessionId,
         #[arg(long)]
         json: bool,
     },
+    /// Inspect database/WAL health without mutation; use repair or reindex explicitly afterward.
     Doctor {
         session_id: Option<SessionId>,
         #[arg(long)]
@@ -6793,10 +6795,12 @@ struct SessionDiagnosisTrace {
 }
 
 #[allow(clippy::too_many_lines)]
-async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliError> {
-    let root = bcode_config::default_session_store_dir();
-    let database_path = bcode_session::db::session_db_path(&root, session_id);
-    let db = bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
+async fn collect_session_diagnosis(
+    session_id: SessionId,
+    root: &Path,
+) -> Result<SessionDiagnosis, CliError> {
+    let database_path = bcode_session::db::session_db_path(root, session_id);
+    let db = bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, root).await?;
     let writer_epoch = db.storage_writer_epoch().await.ok();
     let compatibility = db.storage_compatibility().await;
     let migration_plan = compatibility.as_ref().ok().and_then(|compatibility| {
@@ -6831,10 +6835,10 @@ async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliEr
     let strict_history = db.all_events_strict().await;
     let strict_history_error = strict_history.as_ref().err().map(ToString::to_string);
     let history = strict_history.unwrap_or_default();
-    let active_owners = bcode_session::lease::active_session_owners(&root, session_id)?;
+    let active_owners = bcode_session::lease::active_session_owners(root, session_id)?;
     let waiting_for_owner = migration_plan.is_some() && !active_owners.is_empty();
     let retained_backup =
-        bcode_session_migration::latest_retained_migration_backup(&root, session_id)?;
+        bcode_session_migration::latest_retained_migration_backup(root, session_id)?;
     let classification = session_diagnosis_classification(
         compatibility.as_ref(),
         &write_readiness,
@@ -6862,7 +6866,7 @@ async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliEr
                 ),
             }
         });
-    let diagnosis = SessionDiagnosis::from_history(
+    Ok(SessionDiagnosis::from_history(
         session_id,
         &history,
         SessionStorageDiagnosis {
@@ -6891,7 +6895,12 @@ async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliEr
             active_owners,
             recovery_guidance,
         },
-    );
+    ))
+}
+
+async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliError> {
+    let root = bcode_config::default_session_store_dir();
+    let diagnosis = collect_session_diagnosis(session_id, &root).await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&diagnosis)?);
     } else {
@@ -8390,6 +8399,134 @@ fn print_model_usage_event(
 #[cfg(test)]
 mod session_diagnosis_tests {
     use super::*;
+    use switchy::database::{DatabaseValue, query::FilterableQuery as _};
+
+    fn collect_files(root: &Path, path: &Path, files: &mut Vec<(String, Vec<u8>)>) {
+        for entry in fs::read_dir(path).expect("diagnosis fixture directory") {
+            let entry = entry.expect("diagnosis fixture entry");
+            let path = entry.path();
+            if path.is_dir() {
+                collect_files(root, &path, files);
+            } else {
+                files.push((
+                    path.strip_prefix(root)
+                        .expect("fixture-relative path")
+                        .to_string_lossy()
+                        .into_owned(),
+                    fs::read(path).expect("fixture file bytes"),
+                ));
+            }
+        }
+    }
+
+    fn session_store_files(root: &Path) -> Vec<(String, Vec<u8>)> {
+        let mut files = Vec::new();
+        collect_files(root, root, &mut files);
+        files.sort_by(|left, right| left.0.cmp(&right.0));
+        files
+    }
+
+    async fn current_diagnosis_fixture(root: &Path) -> SessionId {
+        let session_id = SessionId::new();
+        let db = bcode_session::db::SessionDb::initialize_turso_in_root(session_id, root)
+            .await
+            .expect("current diagnosis fixture");
+        drop(db);
+        session_id
+    }
+
+    async fn assert_repeated_diagnosis_preserves_bytes(
+        root: &Path,
+        session_id: SessionId,
+        expected_classification: &str,
+    ) {
+        let before = session_store_files(root);
+        let first = collect_session_diagnosis(session_id, root)
+            .await
+            .expect("first diagnosis");
+        let after_first = session_store_files(root);
+        let second = collect_session_diagnosis(session_id, root)
+            .await
+            .expect("second diagnosis");
+        let after_second = session_store_files(root);
+
+        assert_eq!(first.classification, expected_classification);
+        assert_eq!(second.classification, expected_classification);
+        assert_eq!(after_first, before, "first diagnosis changed storage bytes");
+        assert_eq!(
+            after_second, before,
+            "repeated diagnosis changed storage bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_diagnosis_is_byte_preserving_for_current_legacy_damaged_and_future_stores() {
+        let current_root = tempfile::tempdir().expect("current root");
+        let current = current_diagnosis_fixture(current_root.path()).await;
+        assert_repeated_diagnosis_preserves_bytes(current_root.path(), current, "current_ready")
+            .await;
+
+        let legacy_root = tempfile::tempdir().expect("legacy root");
+        let legacy = current_diagnosis_fixture(legacy_root.path()).await;
+        let legacy_db =
+            bcode_session::db::SessionDb::open_existing_turso_in_root(legacy, legacy_root.path())
+                .await
+                .expect("legacy DB");
+        legacy_db
+            .database()
+            .update("session_storage_contract")
+            .value("writer_epoch", DatabaseValue::Int64(2))
+            .where_eq("contract_id", 1)
+            .execute(legacy_db.database())
+            .await
+            .expect("legacy writer epoch");
+        drop(legacy_db);
+        assert_repeated_diagnosis_preserves_bytes(legacy_root.path(), legacy, "migratable").await;
+
+        let damaged_root = tempfile::tempdir().expect("damaged root");
+        let damaged = current_diagnosis_fixture(damaged_root.path()).await;
+        let damaged_db =
+            bcode_session::db::SessionDb::open_existing_turso_in_root(damaged, damaged_root.path())
+                .await
+                .expect("damaged DB");
+        damaged_db
+            .database()
+            .delete("session_storage_contract")
+            .where_eq("contract_id", 1)
+            .execute(damaged_db.database())
+            .await
+            .expect("remove writer contract");
+        drop(damaged_db);
+        assert_repeated_diagnosis_preserves_bytes(
+            damaged_root.path(),
+            damaged,
+            "structurally_corrupt",
+        )
+        .await;
+
+        let future_root = tempfile::tempdir().expect("future root");
+        let future = current_diagnosis_fixture(future_root.path()).await;
+        let future_db =
+            bcode_session::db::SessionDb::open_existing_turso_in_root(future, future_root.path())
+                .await
+                .expect("future DB");
+        future_db
+            .database()
+            .update("session_storage_contract")
+            .value(
+                "writer_epoch",
+                DatabaseValue::Int64(i64::from(
+                    bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH + 1,
+                )),
+            )
+            .where_eq("contract_id", 1)
+            .execute(future_db.database())
+            .await
+            .expect("future writer epoch");
+        drop(future_db);
+        assert_repeated_diagnosis_preserves_bytes(future_root.path(), future, "unsupported_future")
+            .await;
+    }
 
     #[test]
     fn diagnosis_classification_distinguishes_all_required_storage_states() {

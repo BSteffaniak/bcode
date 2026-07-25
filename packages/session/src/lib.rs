@@ -1504,7 +1504,8 @@ impl SessionManager {
             return Err(SessionError::NotFound(session_id));
         }
         if self.inner.lock().await.leases.contains_key(&session_id) {
-            return Ok(ready_session_open_snapshot(session_id));
+            let db = db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
+            return classify_known_current_session_open(session_id, &db).await;
         }
         let db = db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
         let compatibility = match db.storage_compatibility().await {
@@ -1741,6 +1742,17 @@ impl SessionManager {
                 self.inner.lock().await.leases.remove(&session_id);
             }
             result?;
+        } else if inserted_lease {
+            let readiness = async {
+                let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path())
+                    .await?;
+                db.validate_write_readiness().await
+            }
+            .await;
+            if readiness.is_err() {
+                self.inner.lock().await.leases.remove(&session_id);
+            }
+            readiness?;
         }
         record_ensure_loaded_duration(
             &self.metrics,
@@ -2046,6 +2058,7 @@ impl SessionManager {
     ) -> Result<(), SessionError> {
         let db_open_timer = self.metrics.timer();
         let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+        db.validate_write_readiness().await?;
         if let db::SessionCompatibilityStatus::Degraded { issue_count, .. } =
             db.session_compatibility_status().await?
         {
@@ -2088,6 +2101,7 @@ impl SessionManager {
         );
         let db_open_timer = self.metrics.timer();
         let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+        db.validate_write_readiness().await?;
         if let db::SessionCompatibilityStatus::Degraded { issue_count, .. } =
             db.session_compatibility_status().await?
         {
