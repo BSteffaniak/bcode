@@ -122,7 +122,8 @@ fn transcript_item_with_context(
     let (background, accent, margin_left, margin_right) = match &item.kind {
         TranscriptViewItemKind::UserMessage { .. } => (surface::USER_MESSAGE, color::INFO, 48, 0),
         TranscriptViewItemKind::AssistantMessage { .. } => (surface::APP, color::SUCCESS, 0, 48),
-        TranscriptViewItemKind::ReasoningMessage { .. } => {
+        TranscriptViewItemKind::ReasoningMessage { .. }
+        | TranscriptViewItemKind::ReasoningActivity { .. } => {
             (surface::PANEL, color::REASONING, 24, 24)
         }
         TranscriptViewItemKind::SystemMessage { .. }
@@ -250,6 +251,17 @@ fn transcript_item_body_with_context(
                 }
             }
         },
+        TranscriptViewItemKind::ReasoningActivity { activity } => container! {
+            details {
+                summary color=(color::REASONING) {
+                    (reasoning_activity_label(activity.status))
+                }
+                @let text = activity.text();
+                @if !text.is_empty() {
+                    div margin-top=((space::SM)) { (message_content(&ChatMessageView::markdown(text))) }
+                }
+            }
+        },
         TranscriptViewItemKind::SystemMessage { message } => container! {
             aside color=(color::MUTED) { (message_content(message)) }
         },
@@ -283,11 +295,22 @@ fn transcript_item_body_with_context(
     }
 }
 
+const fn reasoning_activity_label(
+    status: bcode_session_models::ReasoningActivityStatus,
+) -> &'static str {
+    match status {
+        bcode_session_models::ReasoningActivityStatus::Completed => "Reasoning",
+        bcode_session_models::ReasoningActivityStatus::Interrupted => "Reasoning interrupted",
+        bcode_session_models::ReasoningActivityStatus::Failed => "Reasoning failed",
+    }
+}
+
 pub(super) const fn item_label(kind: &TranscriptViewItemKind) -> &'static str {
     match kind {
         TranscriptViewItemKind::UserMessage { .. } => "user",
         TranscriptViewItemKind::AssistantMessage { .. } => "assistant",
-        TranscriptViewItemKind::ReasoningMessage { .. } => "reasoning",
+        TranscriptViewItemKind::ReasoningMessage { .. }
+        | TranscriptViewItemKind::ReasoningActivity { .. } => "reasoning",
         TranscriptViewItemKind::ToolInvocation { .. } => "tool",
         TranscriptViewItemKind::ToolRequest { .. } => "tool request",
         TranscriptViewItemKind::ToolRequestDraft { .. } => "tool request draft",

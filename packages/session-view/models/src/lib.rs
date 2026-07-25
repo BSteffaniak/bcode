@@ -774,8 +774,10 @@ pub enum TranscriptViewItemKind {
     UserMessage { message: ChatMessageView },
     /// Assistant-authored chat message.
     AssistantMessage { message: ChatMessageView },
-    /// Assistant reasoning/thinking content.
+    /// Assistant reasoning/thinking content retained for legacy compatibility.
     ReasoningMessage { message: ChatMessageView },
+    /// Provider-neutral structured reasoning activity.
+    ReasoningActivity { activity: ReasoningActivityView },
     /// Tool request/result/stream block.
     ToolInvocation { tool: Box<ToolInvocationView> },
     /// Live-only provider argument assembly state.
@@ -804,6 +806,36 @@ pub enum TranscriptViewItemKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         invocation: Option<Box<ToolInvocationView>>,
     },
+}
+
+/// Provider-neutral reasoning activity prepared for renderers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningActivityView {
+    /// Correlated model turn.
+    pub turn_id: String,
+    /// Stable activity identifier within the turn.
+    pub activity_id: String,
+    /// Provider order within the turn.
+    pub order: u32,
+    /// Current activity lifecycle.
+    pub status: bcode_session_models::ReasoningActivityStatus,
+    /// Readable parts selected by local presentation policy.
+    pub parts: Vec<bcode_session_models::ReasoningPart>,
+    /// Whether opaque activity evidence exists.
+    pub opaque: bool,
+}
+
+impl ReasoningActivityView {
+    /// Return selected readable text with explicit part boundaries.
+    #[must_use]
+    pub fn text(&self) -> String {
+        self.parts
+            .iter()
+            .map(|part| part.text.as_str())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
 }
 
 /// Renderer-neutral model usage transcript item.

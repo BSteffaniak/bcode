@@ -812,6 +812,38 @@ fn system_skill_and_compaction_items_render_as_notices() {
 }
 
 #[test]
+fn structured_reasoning_activity_renders_terminal_status_chrome() {
+    for (status, expected) in [
+        (
+            bcode_session_models::ReasoningActivityStatus::Completed,
+            "Reasoning",
+        ),
+        (
+            bcode_session_models::ReasoningActivityStatus::Interrupted,
+            "Reasoning interrupted",
+        ),
+        (
+            bcode_session_models::ReasoningActivityStatus::Failed,
+            "Reasoning failed",
+        ),
+    ] {
+        let kind = TranscriptViewItemKind::ReasoningActivity {
+            activity: bcode_session_view_models::ReasoningActivityView {
+                turn_id: "turn-1".to_owned(),
+                activity_id: "reasoning-1".to_owned(),
+                order: 0,
+                status,
+                parts: Vec::new(),
+                opaque: true,
+            },
+        };
+        let rendered = format!("{:?}", transcript_item_body(&kind));
+        assert!(rendered.contains(expected));
+        assert!(!rendered.contains("Empty message"));
+    }
+}
+
+#[test]
 fn reasoning_activity_chrome_remains_visible_without_readable_text() {
     let item = TranscriptViewItem {
         id: TranscriptViewItemId::new("reasoning:test"),

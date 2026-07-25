@@ -606,17 +606,19 @@ impl SessionView {
                 let key = (turn_id.clone(), activity.activity_id.clone());
                 self.live_reasoning
                     .insert(key, LiveReasoningActivity::from_complete(activity));
-                let text = filtered_reasoning_text(
-                    activity.parts.iter(),
-                    self.snapshot.thinking.visible,
-                    self.snapshot.thinking.mode,
-                );
                 self.upsert_item(
                     TranscriptViewItemId::reasoning(turn_id, &activity.activity_id),
                     event.sequence,
                     Some(event.timestamp_ms),
                     false,
-                    StreamingMessageKind::Reasoning.item_kind(text),
+                    TranscriptViewItemKind::ReasoningActivity {
+                        activity: reasoning_activity_view(
+                            turn_id,
+                            activity,
+                            self.snapshot.thinking.visible,
+                            self.snapshot.thinking.mode,
+                        ),
+                    },
                 );
             }
             SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
@@ -1479,17 +1481,34 @@ impl SessionView {
         let mut changed = false;
         for ((turn_id, activity_id), activity) in &self.live_reasoning {
             let item_id = TranscriptViewItemId::reasoning(turn_id, activity_id);
-            let text = filtered_reasoning_text(activity.parts.values(), visible, mode);
             if let Some(item) = self
                 .snapshot
                 .transcript
                 .items
                 .iter_mut()
                 .find(|item| item.id == item_id)
-                && replace_text_in_item(item, &text)
             {
-                item.revision = item.revision.saturating_add(1);
-                changed = true;
+                let next =
+                    live_reasoning_activity_view(turn_id, activity_id, activity, visible, mode);
+                let item_changed = match &mut item.kind {
+                    TranscriptViewItemKind::ReasoningActivity { activity } => {
+                        if activity == &next {
+                            false
+                        } else {
+                            *activity = next;
+                            true
+                        }
+                    }
+                    TranscriptViewItemKind::ReasoningMessage { .. } => {
+                        let text = filtered_reasoning_text(activity.parts.values(), visible, mode);
+                        replace_text_in_item(item, &text)
+                    }
+                    _ => false,
+                };
+                if item_changed {
+                    item.revision = item.revision.saturating_add(1);
+                    changed = true;
+                }
             }
         }
         if changed {
@@ -1512,8 +1531,10 @@ impl SessionView {
             .get(&key)
             .expect("live reasoning activity was inserted");
         let item_id = TranscriptViewItemId::reasoning(turn_id, event.activity_id());
-        let text = filtered_reasoning_text(
-            activity.parts.values(),
+        let view = live_reasoning_activity_view(
+            turn_id,
+            event.activity_id(),
+            activity,
             self.snapshot.thinking.visible,
             self.snapshot.thinking.mode,
         );
@@ -1525,7 +1546,7 @@ impl SessionView {
             .iter_mut()
             .find(|item| item.id == item_id)
         {
-            let _ = replace_text_in_item(item, &text);
+            item.kind = TranscriptViewItemKind::ReasoningActivity { activity: view };
             item.streaming = streaming;
             item.revision = item.revision.saturating_add(1);
             self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
@@ -1536,7 +1557,7 @@ impl SessionView {
                 0,
                 None,
                 streaming,
-                StreamingMessageKind::Reasoning.item_kind(text),
+                TranscriptViewItemKind::ReasoningActivity { activity: view },
             );
         }
     }
@@ -1958,6 +1979,7 @@ impl SessionView {
             | TranscriptViewItemKind::ToolRequestDraft { .. }
             | TranscriptViewItemKind::AssistantMessage { .. }
             | TranscriptViewItemKind::ReasoningMessage { .. }
+            | TranscriptViewItemKind::ReasoningActivity { .. }
             | TranscriptViewItemKind::UserMessage { .. }
             | TranscriptViewItemKind::SystemMessage { .. }
             | TranscriptViewItemKind::Permission { .. }
@@ -2475,7 +2497,8 @@ fn append_text_to_item(item: &mut TranscriptViewItem, text: &str) {
         | TranscriptViewItemKind::ReasoningMessage { message }
         | TranscriptViewItemKind::UserMessage { message }
         | TranscriptViewItemKind::SystemMessage { message } => message.text.push_str(text),
-        TranscriptViewItemKind::ToolInvocation { .. }
+        TranscriptViewItemKind::ReasoningActivity { .. }
+        | TranscriptViewItemKind::ToolInvocation { .. }
         | TranscriptViewItemKind::ToolRequestDraft { .. }
         | TranscriptViewItemKind::ToolRequest { .. }
         | TranscriptViewItemKind::Permission { .. }
@@ -2485,6 +2508,74 @@ fn append_text_to_item(item: &mut TranscriptViewItem, text: &str) {
         | TranscriptViewItemKind::Skill { .. }
         | TranscriptViewItemKind::Interaction { .. }
         | TranscriptViewItemKind::ToolContribution { .. } => {}
+    }
+}
+
+fn live_reasoning_activity_view(
+    turn_id: &str,
+    activity_id: &str,
+    activity: &LiveReasoningActivity,
+    visible: bool,
+    mode: bcode_session_view_models::ReasoningDisplayMode,
+) -> bcode_session_view_models::ReasoningActivityView {
+    let mut parts = activity.parts.values().cloned().collect::<Vec<_>>();
+    parts.sort_by_key(|part| (part.order, part.kind, part.part_id.clone()));
+    if visible {
+        parts.retain(|part| reasoning_part_selected(part.kind, mode));
+    } else {
+        parts.clear();
+    }
+    bcode_session_view_models::ReasoningActivityView {
+        turn_id: turn_id.to_owned(),
+        activity_id: activity_id.to_owned(),
+        order: activity.order,
+        status: if activity.finished {
+            bcode_session_models::ReasoningActivityStatus::Completed
+        } else {
+            bcode_session_models::ReasoningActivityStatus::Interrupted
+        },
+        parts,
+        opaque: activity.opaque,
+    }
+}
+
+const fn reasoning_part_selected(
+    kind: bcode_session_models::ReasoningContentKind,
+    mode: bcode_session_view_models::ReasoningDisplayMode,
+) -> bool {
+    match mode {
+        bcode_session_view_models::ReasoningDisplayMode::All => true,
+        bcode_session_view_models::ReasoningDisplayMode::Summary => matches!(
+            kind,
+            bcode_session_models::ReasoningContentKind::Summary
+                | bcode_session_models::ReasoningContentKind::Legacy
+        ),
+        bcode_session_view_models::ReasoningDisplayMode::Raw => {
+            matches!(kind, bcode_session_models::ReasoningContentKind::Raw)
+        }
+    }
+}
+
+fn reasoning_activity_view(
+    turn_id: &str,
+    activity: &bcode_session_models::ReasoningActivity,
+    visible: bool,
+    mode: bcode_session_view_models::ReasoningDisplayMode,
+) -> bcode_session_view_models::ReasoningActivityView {
+    let mut parts = activity.parts.clone();
+    parts.sort_by_key(|part| (part.order, part.kind, part.part_id.clone()));
+    if visible {
+        parts.retain(|part| reasoning_part_selected(part.kind, mode));
+    } else {
+        parts.clear();
+    }
+    bcode_session_view_models::ReasoningActivityView {
+        turn_id: turn_id.to_owned(),
+        activity_id: activity.activity_id.clone(),
+        order: activity.order,
+        status: activity.status,
+        parts,
+        opaque: activity.opaque,
     }
 }
 
@@ -2530,7 +2621,8 @@ fn replace_text_in_item(item: &mut TranscriptViewItem, text: &str) -> bool {
                 true
             }
         }
-        TranscriptViewItemKind::ToolInvocation { .. }
+        TranscriptViewItemKind::ReasoningActivity { .. }
+        | TranscriptViewItemKind::ToolInvocation { .. }
         | TranscriptViewItemKind::ToolRequestDraft { .. }
         | TranscriptViewItemKind::ToolRequest { .. }
         | TranscriptViewItemKind::Permission { .. }
@@ -2624,10 +2716,11 @@ mod tests {
 
     fn assert_reasoning_text(item: &TranscriptViewItem, text: &str, streaming: bool) {
         assert_eq!(item.streaming, streaming);
-        assert!(matches!(
-            &item.kind,
-            TranscriptViewItemKind::ReasoningMessage { message } if message.text == text
-        ));
+        assert!(match &item.kind {
+            TranscriptViewItemKind::ReasoningMessage { message } => message.text == text,
+            TranscriptViewItemKind::ReasoningActivity { activity } => activity.text() == text,
+            _ => false,
+        });
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3572,6 +3665,54 @@ mod tests {
             }
             other => panic!("unexpected item: {other:?}"),
         }
+    }
+
+    #[test]
+    fn every_display_mode_preserves_opaque_only_activity_chrome() {
+        let session_id = SessionId::new();
+        for mode in [
+            bcode_session_view_models::ReasoningDisplayMode::All,
+            bcode_session_view_models::ReasoningDisplayMode::Summary,
+            bcode_session_view_models::ReasoningDisplayMode::Raw,
+        ] {
+            let mut view = SessionView::new();
+            view.set_reasoning_display_mode(mode);
+            view.apply_event(&event(
+                session_id,
+                1,
+                SessionEventKind::AssistantReasoningActivity {
+                    turn_id: "turn-1".to_owned(),
+                    activity: bcode_session_models::ReasoningActivity {
+                        activity_id: "reasoning-1".to_owned(),
+                        order: 0,
+                        status: bcode_session_models::ReasoningActivityStatus::Completed,
+                        parts: Vec::new(),
+                        opaque: true,
+                    },
+                },
+            ));
+            assert_eq!(view.snapshot().transcript.items.len(), 1);
+            assert_reasoning_text(&view.snapshot().transcript.items[0], "", false);
+        }
+
+        let mut hidden = SessionView::new();
+        hidden.set_reasoning_visible(false);
+        hidden.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::AssistantReasoningActivity {
+                turn_id: "turn-1".to_owned(),
+                activity: bcode_session_models::ReasoningActivity {
+                    activity_id: "reasoning-1".to_owned(),
+                    order: 0,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    parts: Vec::new(),
+                    opaque: true,
+                },
+            },
+        ));
+        assert_eq!(hidden.snapshot().transcript.items.len(), 1);
+        assert_reasoning_text(&hidden.snapshot().transcript.items[0], "", false);
     }
 
     #[test]

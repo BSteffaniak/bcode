@@ -701,6 +701,13 @@ pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
             item.streaming,
             TranscriptItemKind::ReasoningMessage,
         ),
+        TranscriptViewItemKind::ReasoningActivity { activity } => TranscriptItem::with_identity(
+            reasoning_activity_title(activity.status),
+            activity.text(),
+            item.streaming,
+            bcode_session_view_models::TextFormat::Markdown,
+            TranscriptItemKind::ReasoningMessage,
+        ),
         TranscriptViewItemKind::SystemMessage { message } => {
             let role = message
                 .display_label
@@ -765,6 +772,16 @@ pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
         terminal = terminal.with_event_metadata(sequence, timestamp_ms);
     }
     terminal.with_source_view_item(item.id.clone(), item.revision)
+}
+
+const fn reasoning_activity_title(
+    status: bcode_session_models::ReasoningActivityStatus,
+) -> &'static str {
+    match status {
+        bcode_session_models::ReasoningActivityStatus::Completed => "Reasoning",
+        bcode_session_models::ReasoningActivityStatus::Interrupted => "Reasoning interrupted",
+        bcode_session_models::ReasoningActivityStatus::Failed => "Reasoning failed",
+    }
 }
 
 fn message_text_item(
@@ -1270,6 +1287,48 @@ mod tests {
         assert!(item.text().contains("resolved"));
         assert!(item.text().contains("answered"));
         assert!(item.text().contains("yes"));
+    }
+
+    #[test]
+    fn structured_reasoning_activity_adapts_terminal_lifecycle_chrome() {
+        for (status, expected) in [
+            (
+                bcode_session_models::ReasoningActivityStatus::Completed,
+                "Reasoning",
+            ),
+            (
+                bcode_session_models::ReasoningActivityStatus::Interrupted,
+                "Reasoning interrupted",
+            ),
+            (
+                bcode_session_models::ReasoningActivityStatus::Failed,
+                "Reasoning failed",
+            ),
+        ] {
+            let item = TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new(format!(
+                    "reasoning:{status:?}"
+                )),
+                revision: 0,
+                sequence: Some(1),
+                timestamp_ms: None,
+                streaming: false,
+                kind: TranscriptViewItemKind::ReasoningActivity {
+                    activity: bcode_session_view_models::ReasoningActivityView {
+                        turn_id: "turn-1".to_owned(),
+                        activity_id: "reasoning-1".to_owned(),
+                        order: 0,
+                        status,
+                        parts: Vec::new(),
+                        opaque: true,
+                    },
+                },
+            };
+
+            let terminal = terminal_item_from_shared(&item);
+            assert_eq!(terminal.role(), expected);
+            assert!(terminal.text().is_empty());
+        }
     }
 
     #[test]
