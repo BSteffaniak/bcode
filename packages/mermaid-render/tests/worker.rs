@@ -3,6 +3,8 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
+use bcode_mermaid_render::WORKER_MEMORY_BYTES;
 use bcode_mermaid_render::{
     MermaidCancellationToken, MermaidRenderError, MermaidRenderRequest, MermaidRenderedOutput,
     render_mermaid_with_worker,
@@ -71,6 +73,25 @@ fn scripted_worker(script: &str) -> tempfile::NamedTempFile {
     permissions.set_mode(0o700);
     worker.as_file().set_permissions(permissions).unwrap();
     worker
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn public_worker_adapter_enforces_address_space_limit() {
+    let worker = scripted_worker(&format!(
+        "#!/bin/sh\npython3 - <<'PY'\nvalue = bytearray({})\nprint(len(value))\nPY\n",
+        WORKER_MEMORY_BYTES.saturating_add(64 * 1024 * 1024)
+    ));
+    let request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 800, 600);
+
+    assert!(matches!(
+        render_mermaid_with_worker(
+            worker.path(),
+            &request,
+            &MermaidCancellationToken::default()
+        ),
+        Err(MermaidRenderError::InvalidWorkerResponse { .. })
+    ));
 }
 
 #[test]

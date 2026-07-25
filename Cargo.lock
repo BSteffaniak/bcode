@@ -1898,6 +1898,7 @@ dependencies = [
 name = "bcode_mermaid_render"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "libc",
  "mermaid-rs-renderer",
  "tempfile",
 ]
@@ -2524,6 +2525,7 @@ dependencies = [
  "bcode_git_plugin",
  "bcode_ipc",
  "bcode_markdown_render",
+ "bcode_mermaid_render",
  "bcode_metrics",
  "bcode_model",
  "bcode_plugin",

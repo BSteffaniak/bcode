@@ -17,6 +17,9 @@ use std::{
     time::Duration,
 };
 
+/// Maximum worker address-space bytes on Unix platforms.
+pub const WORKER_MEMORY_BYTES: u64 = 512 * 1024 * 1024;
+
 /// Maximum successful Mermaid renders retained in memory.
 pub const MAX_CACHE_ENTRIES: usize = 64;
 /// Maximum encoded Mermaid output bytes retained in memory.
@@ -408,7 +411,9 @@ pub fn render_mermaid_with_worker(
 ) -> Result<MermaidRendered, MermaidRenderError> {
     validate_request(request, cancellation)?;
     let request_bytes = encode_worker_request(request)?;
-    let mut child = std::process::Command::new(worker_path)
+    let mut command = std::process::Command::new(worker_path);
+    configure_worker_memory_limit(&mut command);
+    let mut child = command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
@@ -563,6 +568,31 @@ fn decode_worker_response(
         diagnostics: Vec::new(),
     })
 }
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn configure_worker_memory_limit(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    // SAFETY: `pre_exec` runs in the child after fork. The closure performs
+    // only the async-signal-safe `setrlimit` syscall and constructs an I/O
+    // error from the OS error code when it fails.
+    unsafe {
+        command.pre_exec(|| {
+            let limit = libc::rlimit {
+                rlim_cur: WORKER_MEMORY_BYTES as libc::rlim_t,
+                rlim_max: WORKER_MEMORY_BYTES as libc::rlim_t,
+            };
+            if libc::setrlimit(libc::RLIMIT_AS, &limit) == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        });
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const fn configure_worker_memory_limit(_command: &mut std::process::Command) {}
 
 fn terminate_worker(child: &mut std::process::Child) {
     let _ = child.kill();
