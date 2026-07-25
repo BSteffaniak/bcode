@@ -11003,6 +11003,7 @@ struct ModelPollOutcome {
     pending_provider_response_id: Option<String>,
     pending_tool_calls: Vec<bcode_model::ToolCall>,
     reasoning_activities: BTreeMap<String, ReasoningActivityAccumulator>,
+    saw_reasoning_evidence: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -13412,9 +13413,15 @@ async fn handle_provider_turn_event(
             .await;
         }
         ProviderTurnEvent::Usage { usage } => {
-            append_provider_event_trace(state, session_id, turn_id, "usage", None).await;
-            update_provider_usage_state(state, session_id, &usage).await;
-            append_model_usage_event(state, session_id, turn_id.to_string(), usage).await;
+            handle_provider_usage_event(
+                state,
+                session_id,
+                provider_turn_id,
+                turn_id,
+                usage,
+                outcome,
+            )
+            .await;
         }
         ProviderTurnEvent::ExactRequestInputTokens { tokens } => {
             let active_turn = command_context
@@ -13518,6 +13525,7 @@ async fn handle_provider_turn_event(
             .await;
         }
         ProviderTurnEvent::ReasoningDelta { text } => {
+            outcome.saw_reasoning_evidence = true;
             stream.push_reasoning(&text);
             stream.flush_if_ready(state).await;
             if state.observability.debug_enabled() {
@@ -13526,6 +13534,7 @@ async fn handle_provider_turn_event(
             }
         }
         ProviderTurnEvent::ReasoningActivity { event } => {
+            outcome.saw_reasoning_evidence = true;
             outcome
                 .reasoning_activities
                 .entry(event.activity_id().to_owned())
@@ -13562,6 +13571,51 @@ async fn handle_provider_turn_event(
             }
         }
     }
+}
+
+async fn handle_provider_usage_event(
+    state: &ServerState,
+    session_id: SessionId,
+    provider_turn_id: &str,
+    turn_id: &str,
+    usage: bcode_model::TokenUsage,
+    outcome: &mut ModelPollOutcome,
+) {
+    if usage.reasoning_tokens.is_some_and(|tokens| tokens > 0) && !outcome.saw_reasoning_evidence {
+        let activity_id = format!("reasoning-tokens:{provider_turn_id}");
+        let mut activity = ReasoningActivityAccumulator::new(activity_id.clone(), u32::MAX);
+        activity.opaque = true;
+        activity.status = Some(bcode_session_models::ReasoningActivityStatus::Completed);
+        outcome
+            .reasoning_activities
+            .insert(activity_id.clone(), activity);
+        outcome.saw_reasoning_evidence = true;
+        for event in [
+            bcode_session_models::ReasoningActivityEvent::OpaqueObserved {
+                activity_id: activity_id.clone(),
+                activity_order: u32::MAX,
+            },
+            bcode_session_models::ReasoningActivityEvent::Finished {
+                activity_id,
+                activity_order: u32::MAX,
+                status: bcode_session_models::ReasoningActivityStatus::Completed,
+            },
+        ] {
+            let _ = state
+                .sessions
+                .publish_live_event(
+                    session_id,
+                    SessionLiveEventKind::AssistantReasoningActivity {
+                        turn_id: turn_id.to_owned(),
+                        event,
+                    },
+                )
+                .await;
+        }
+    }
+    append_provider_event_trace(state, session_id, turn_id, "usage", None).await;
+    update_provider_usage_state(state, session_id, &usage).await;
+    append_model_usage_event(state, session_id, turn_id.to_owned(), usage).await;
 }
 
 async fn handle_provider_request_projection_event(
@@ -26981,6 +27035,24 @@ library = "test"
                 .expect("retry generation")
                 .generation,
             generations["call-write"].saturating_add(1)
+        );
+    }
+
+    #[test]
+    fn reasoning_activity_accumulator_preserves_opaque_token_evidence() {
+        let mut activity = ReasoningActivityAccumulator::new(
+            "reasoning-tokens:provider-turn".to_owned(),
+            u32::MAX,
+        );
+        activity.opaque = true;
+        activity.status = Some(bcode_session_models::ReasoningActivityStatus::Completed);
+
+        let activity = activity.finish(bcode_session_models::ReasoningActivityStatus::Completed);
+        assert!(activity.opaque);
+        assert!(activity.parts.is_empty());
+        assert_eq!(
+            activity.status,
+            bcode_session_models::ReasoningActivityStatus::Completed
         );
     }
 

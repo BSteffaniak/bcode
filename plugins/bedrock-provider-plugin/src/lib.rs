@@ -17,9 +17,10 @@ use aws_sdk_bedrockruntime::types::{
     AnyToolChoice, AutoToolChoice, CachePointBlock, CachePointType,
     ContentBlock as BedrockContentBlock, ContentBlockDelta, ContentBlockStart, ConversationRole,
     ConverseStreamOutput, ImageBlock, ImageFormat, ImageSource, InferenceConfiguration,
-    Message as BedrockMessage, SpecificToolChoice, StopReason as BedrockStopReason,
-    SystemContentBlock, Tool, ToolChoice as BedrockToolChoice, ToolConfiguration, ToolInputSchema,
-    ToolResultBlock, ToolResultContentBlock, ToolResultStatus, ToolSpecification, ToolUseBlock,
+    Message as BedrockMessage, ReasoningContentBlockDelta, SpecificToolChoice,
+    StopReason as BedrockStopReason, SystemContentBlock, Tool, ToolChoice as BedrockToolChoice,
+    ToolConfiguration, ToolInputSchema, ToolResultBlock, ToolResultContentBlock, ToolResultStatus,
+    ToolSpecification, ToolUseBlock,
 };
 use aws_smithy_types::Blob;
 use aws_smithy_types::error::metadata::ProvideErrorMetadata;
@@ -614,6 +615,7 @@ struct StreamAccumulator {
     tool_calls: BTreeMap<i32, ToolCallAccumulator>,
     saw_tool_call: bool,
     stop_reason: Option<StopReason>,
+    reasoning_blocks: BTreeMap<i32, String>,
     name_map: BTreeMap<String, String>,
 }
 
@@ -623,6 +625,7 @@ impl StreamAccumulator {
             tool_calls: BTreeMap::new(),
             saw_tool_call: false,
             stop_reason: None,
+            reasoning_blocks: BTreeMap::new(),
             name_map,
         }
     }
@@ -656,9 +659,7 @@ impl StreamAccumulator {
                     self.process_tool_use_delta(event.content_block_index(), delta.input(), turn);
                 }
                 Some(ContentBlockDelta::ReasoningContent(delta)) => {
-                    turn.push(ProviderTurnEvent::ReasoningDelta {
-                        text: format!("{delta:?}"),
-                    });
+                    self.process_reasoning_delta(event.content_block_index(), delta, turn);
                 }
                 _ => {}
             },
@@ -687,6 +688,7 @@ impl StreamAccumulator {
             }
             ConverseStreamOutput::MessageStop(event) => {
                 self.stop_reason = Some(map_stop_reason(event.stop_reason()));
+                self.finish_reasoning(turn);
                 if self.saw_tool_call {
                     self.finish_tool_calls(turn)?;
                     return Ok(Some(StreamOutcome::ToolCall));
@@ -696,6 +698,83 @@ impl StreamAccumulator {
             _ => {}
         }
         Ok(None)
+    }
+
+    fn process_reasoning_delta(
+        &mut self,
+        content_block_index: i32,
+        delta: &ReasoningContentBlockDelta,
+        turn: &TurnState,
+    ) {
+        let part_order = u32::try_from(content_block_index).unwrap_or_default();
+        let activity_id = format!("bedrock-reasoning-{content_block_index}");
+        let part_id = format!("raw-{part_order}");
+        let started = self.reasoning_blocks.contains_key(&content_block_index);
+        if !started {
+            self.reasoning_blocks
+                .insert(content_block_index, String::new());
+            turn.push(ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::Started {
+                    activity_id: activity_id.clone(),
+                    order: part_order,
+                },
+            });
+        }
+        match delta {
+            ReasoningContentBlockDelta::Text(text) if !text.is_empty() => {
+                self.reasoning_blocks
+                    .entry(content_block_index)
+                    .or_default()
+                    .push_str(text);
+                turn.push(ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::PartDelta {
+                        activity_id,
+                        activity_order: part_order,
+                        part_id,
+                        kind: bcode_session_models::ReasoningContentKind::Raw,
+                        role: bcode_session_models::ReasoningContentRole::Detail,
+                        part_order,
+                        text: text.clone(),
+                    },
+                });
+            }
+            ReasoningContentBlockDelta::RedactedContent(_) => {
+                turn.push(ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::OpaqueObserved {
+                        activity_id,
+                        activity_order: part_order,
+                    },
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn finish_reasoning(&mut self, turn: &TurnState) {
+        for (content_block_index, text) in std::mem::take(&mut self.reasoning_blocks) {
+            let part_order = u32::try_from(content_block_index).unwrap_or_default();
+            let activity_id = format!("bedrock-reasoning-{content_block_index}");
+            if !text.is_empty() {
+                turn.push(ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                        activity_id: activity_id.clone(),
+                        activity_order: part_order,
+                        part_id: format!("raw-{part_order}"),
+                        kind: bcode_session_models::ReasoningContentKind::Raw,
+                        role: bcode_session_models::ReasoningContentRole::Detail,
+                        part_order,
+                        text,
+                    },
+                });
+            }
+            turn.push(ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::Finished {
+                    activity_id,
+                    activity_order: part_order,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                },
+            });
+        }
     }
 
     fn process_tool_use_delta(&mut self, content_block_index: i32, input: &str, turn: &TurnState) {
@@ -3057,6 +3136,56 @@ mod tests {
         });
         assert!(response.error.is_none());
         assert!(turn.is_cancelled());
+    }
+
+    #[test]
+    fn bedrock_reasoning_text_and_redaction_use_neutral_activity_events() {
+        let turn = TurnState::default();
+        let mut accumulator = StreamAccumulator::new(BTreeMap::new());
+
+        accumulator.process_reasoning_delta(
+            2,
+            &ReasoningContentBlockDelta::Text("raw detail".to_owned()),
+            &turn,
+        );
+        accumulator.process_reasoning_delta(
+            2,
+            &ReasoningContentBlockDelta::RedactedContent(Blob::new("secret")),
+            &turn,
+        );
+        accumulator.finish_reasoning(&turn);
+
+        let events = turn.drain();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::PartDelta {
+                    kind: bcode_session_models::ReasoningContentKind::Raw,
+                    text,
+                    ..
+                }
+            } if text == "raw detail"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::OpaqueObserved { .. }
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::Finished {
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    ..
+                }
+            }
+        )));
+        assert!(
+            events
+                .iter()
+                .all(|event| !format!("{event:?}").contains("secret"))
+        );
     }
 
     #[test]

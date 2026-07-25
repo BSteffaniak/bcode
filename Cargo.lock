@@ -1391,6 +1391,7 @@ dependencies = [
  "bcode_model",
  "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
+ "bcode_session_models",
  "clap",
  "serde",
  "serde_json",

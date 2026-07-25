@@ -3461,6 +3461,34 @@ fn process_responses_stream_line(
             }
             ensure_reasoning_activity_started(processor.turn, output_index, item);
         }
+        "response.reasoning_summary_part.done" => {
+            let output_index = reasoning_output_index(&event, reasoning_items);
+            let part_index = event
+                .get("summary_index")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|index| u32::try_from(index).ok())
+                .unwrap_or(0);
+            let item = reasoning_items.entry(output_index).or_default();
+            if item.id.is_none()
+                && let Some(item_id) = event.get("item_id").and_then(serde_json::Value::as_str)
+            {
+                item.id = Some(item_id.to_owned());
+            }
+            ensure_reasoning_activity_started(processor.turn, output_index, item);
+            if let Some(text) = item.summary.get(&part_index).cloned() {
+                processor.turn.push(ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                        activity_id: item.activity_id(output_index),
+                        activity_order: output_index,
+                        part_id: format!("summary-{part_index}"),
+                        kind: bcode_session_models::ReasoningContentKind::Summary,
+                        role: bcode_session_models::ReasoningContentRole::Milestone,
+                        part_order: part_index,
+                        text,
+                    },
+                });
+            }
+        }
         "response.output_item.added" => {
             process_responses_output_item(
                 &event,
@@ -9890,6 +9918,7 @@ mod tests {
             r#"data: {"type":"response.reasoning_summary_part.added","output_index":0,"item_id":"rs_1","summary_index":0}"#,
             r#"data: {"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"rs_1","summary_index":0,"delta":"First"}"#,
             r#"data: {"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"rs_1","summary_index":0,"delta":" milestone"}"#,
+            r#"data: {"type":"response.reasoning_summary_part.done","output_index":0,"item_id":"rs_1","summary_index":0}"#,
             r#"data: {"type":"response.reasoning_summary_part.added","output_index":0,"item_id":"rs_1","summary_index":1}"#,
             r#"data: {"type":"response.reasoning_summary_text.delta","output_index":0,"item_id":"rs_1","summary_index":1,"delta":"Second"}"#,
             r#"data: {"type":"response.reasoning_text.delta","output_index":0,"item_id":"rs_1","content_index":0,"delta":"raw detail"}"#,
@@ -9907,6 +9936,16 @@ mod tests {
         }
 
         let events = turn.drain();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                    part_id,
+                    text,
+                    ..
+                }
+            } if part_id == "summary-0" && text == "First milestone"
+        )));
         assert!(events.iter().any(|event| matches!(
             event,
             ProviderTurnEvent::ReasoningActivity {
