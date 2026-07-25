@@ -320,7 +320,11 @@ BCODE_MIGRATION_BENCHMARK_PROFILE=large cargo test -p bcode_session benchmark_ge
 ```
 
 The same host measured current-session preparation over 100 runs at 5,768 µs median, 6,433 µs
-p95, and 6,911 µs maximum. The enforced release gate is p95 at or below 25 ms:
+p95, and 6,911 µs maximum. The enforced release gate is p95 at or below 25 ms. Migration release
+gates are 1,000 / 30,000 / 240,000 ms total duration and 1 / 8 / 32 MiB database growth for the
+100 / 5,000 / 50,000-event profiles, with final WAL required to be zero after checkpoint. These
+ceilings deliberately provide headroom over the measured debug-build results while still catching
+order-of-magnitude regressions:
 
 ```text
 cargo test -p bcode_session benchmark_current_session_preparation_latency -- --ignored --nocapture

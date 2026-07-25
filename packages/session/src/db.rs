@@ -1792,6 +1792,29 @@ impl SessionDb {
     pub async fn session_compatibility_status(
         &self,
     ) -> SessionDbResult<SessionCompatibilityStatus> {
+        self.session_compatibility_status_with_issue_count(false)
+            .await
+    }
+
+    /// Return the complete compatibility status, including exact degraded issue count.
+    ///
+    /// This is intended for diagnosis and status display. Normal current-open readiness should use
+    /// [`Self::session_compatibility_status`] so healthy sessions never scan issue rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if compatibility state or issue rows are malformed.
+    pub async fn session_compatibility_status_for_diagnosis(
+        &self,
+    ) -> SessionDbResult<SessionCompatibilityStatus> {
+        self.session_compatibility_status_with_issue_count(true)
+            .await
+    }
+
+    async fn session_compatibility_status_with_issue_count(
+        &self,
+        exact_issue_count: bool,
+    ) -> SessionDbResult<SessionCompatibilityStatus> {
         let row = self
             .db
             .select("session_compatibility_state")
@@ -1818,13 +1841,21 @@ impl SessionDb {
                 expected,
             });
         }
-        let issue_count = self
+        let issue_query = self
             .db
             .select("session_compatibility_issues")
-            .columns(&["event_seq"])
-            .execute(&**self.db)
-            .await?
-            .len();
+            .columns(&["event_seq"]);
+        let issue_count = if exact_issue_count {
+            issue_query.execute(&**self.db).await?.len()
+        } else {
+            usize::from(
+                issue_query
+                    .limit(1)
+                    .execute_first(&**self.db)
+                    .await?
+                    .is_some(),
+            )
+        };
         if issue_count == 0 {
             Ok(SessionCompatibilityStatus::Compatible { checkpoint })
         } else {

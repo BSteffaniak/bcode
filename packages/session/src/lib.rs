@@ -6555,6 +6555,22 @@ mod tests {
             }
         }
 
+        const fn total_duration_gate_ms(self) -> u128 {
+            match self {
+                Self::Small => 1_000,
+                Self::Medium => 30_000,
+                Self::Large => 240_000,
+            }
+        }
+
+        const fn database_growth_gate_bytes(self) -> u64 {
+            match self {
+                Self::Small => 1_048_576,
+                Self::Medium => 8_388_608,
+                Self::Large => 33_554_432,
+            }
+        }
+
         const fn name(self) -> &'static str {
             match self {
                 Self::Small => "small",
@@ -6569,6 +6585,23 @@ mod tests {
         profile: MigrationBenchmarkProfile,
     ) -> SessionId {
         generate_migration_benchmark_store(root, profile, 3).await
+    }
+
+    async fn generate_current_migration_benchmark_store(
+        root: &std::path::Path,
+        profile: MigrationBenchmarkProfile,
+    ) -> SessionId {
+        let session_id = generate_migration_benchmark_store(root, profile, 3).await;
+        let maintenance = lease::acquire_session_maintenance_guard(root, session_id)
+            .expect("benchmark maintenance guard");
+        let write = lease::acquire_maintenance_session_write_lock(&maintenance, root, session_id)
+            .expect("benchmark write guard");
+        db::SessionDb::migrate_turso_in_root(session_id, root, &maintenance, &write)
+            .await
+            .expect("benchmark current migration");
+        drop(write);
+        drop(maintenance);
+        session_id
     }
 
     async fn generate_migration_benchmark_store(
@@ -7559,6 +7592,42 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "manual release acceptance for current-session preparation event-count independence"]
+    async fn benchmark_current_session_preparation_is_event_count_independent() {
+        const RUNS: usize = 30;
+
+        for profile in [
+            MigrationBenchmarkProfile::Small,
+            MigrationBenchmarkProfile::Medium,
+            MigrationBenchmarkProfile::Large,
+        ] {
+            let root = unique_temp_dir();
+            let session_id = generate_current_migration_benchmark_store(&root, profile).await;
+            let manager = SessionManager::persistent(&root).expect("manager");
+            let mut durations = Vec::with_capacity(RUNS);
+            for _ in 0..RUNS {
+                let started = std::time::Instant::now();
+                let snapshot = manager
+                    .prepare_session_open(session_id)
+                    .await
+                    .expect("prepare current session");
+                durations.push(started.elapsed().as_micros());
+                assert_eq!(snapshot.outcome, Some(SessionOpenTerminalOutcome::Ready));
+                assert_eq!(manager.active_session_migration_count().await, 0);
+            }
+            durations.sort_unstable();
+            let p95_us = durations[RUNS * 95 / 100];
+            eprintln!(
+                "current_session_prepare_by_events profile={} events={} p95_us={p95_us}",
+                profile.name(),
+                profile.event_count()
+            );
+            drop(manager);
+            std::fs::remove_dir_all(root).expect("benchmark cleanup");
+        }
+    }
+
+    #[tokio::test]
     #[ignore = "manual generated legacy-session migration benchmark"]
     async fn benchmark_generated_legacy_session_migrations() {
         let profiles = match std::env::var("BCODE_MIGRATION_BENCHMARK_PROFILE").as_deref() {
@@ -7595,6 +7664,7 @@ mod tests {
             let database_bytes_before = storage_before.get("session.db").copied().unwrap_or(0);
             let wal_bytes_before = storage_before.get("session.db-wal").copied().unwrap_or(0);
             let database_bytes_after = storage_after.get("session.db").copied().unwrap_or(0);
+            let database_growth_bytes = database_bytes_after.saturating_sub(database_bytes_before);
             let wal_bytes_after = storage_after.get("session.db-wal").copied().unwrap_or(0);
             let report = metrics.report();
             let histogram_sum = |name: &str| {
@@ -7611,7 +7681,7 @@ mod tests {
                 storage_bytes,
                 database_bytes_before,
                 database_bytes_after,
-                database_bytes_after.saturating_sub(database_bytes_before),
+                database_growth_bytes,
                 wal_bytes_before,
                 wal_bytes_after,
                 wal_bytes_after.saturating_sub(wal_bytes_before),
@@ -7632,6 +7702,21 @@ mod tests {
                 histogram_sum("session.migration.wal_checkpoint_duration_ms"),
                 histogram_sum("session.migration.write_readiness_duration_ms"),
             );
+            assert!(
+                elapsed.as_millis() <= profile.total_duration_gate_ms(),
+                "{} migration took {} ms; release gate is {} ms",
+                profile.name(),
+                elapsed.as_millis(),
+                profile.total_duration_gate_ms()
+            );
+            assert!(
+                database_growth_bytes <= profile.database_growth_gate_bytes(),
+                "{} database growth was {} bytes; release gate is {} bytes",
+                profile.name(),
+                database_growth_bytes,
+                profile.database_growth_gate_bytes()
+            );
+            assert_eq!(wal_bytes_after, 0, "final WAL must be truncated");
             drop(manager);
             std::fs::remove_dir_all(state_root).expect("benchmark cleanup");
         }
