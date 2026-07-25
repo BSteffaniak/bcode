@@ -72,6 +72,15 @@ pub enum MarkdownImagePresentationState {
     TerminalUnsupported,
 }
 
+/// Fixed terminal rows reserved for one image before loading begins.
+pub const RESERVED_IMAGE_ROWS: u16 = 4;
+
+/// Return stable terminal row reservation for every image presentation state.
+#[must_use]
+pub const fn markdown_image_reserved_rows(_state: &MarkdownImagePresentationState) -> u16 {
+    RESERVED_IMAGE_ROWS
+}
+
 /// One current image contribution used to reconcile presentation ownership.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownImagePresentationInput {
@@ -213,6 +222,51 @@ impl MarkdownImagePresentationStore {
             });
         }
         requests
+    }
+
+    /// Complete a load and update every resident owner sharing its cache key.
+    pub fn complete_load(
+        &mut self,
+        key: &MarkdownImageCacheKey,
+        result: Result<DecodedMarkdownImage, MarkdownImageLoadFailure>,
+        cache: &mut MarkdownImageCache,
+        inflight: &mut MarkdownImageInflight,
+    ) {
+        inflight.finish(key);
+        match result {
+            Ok(image) => {
+                cache.insert(key.clone(), image.clone());
+                for entry in self
+                    .entries
+                    .values_mut()
+                    .filter(|entry| &entry.cache_key == key)
+                {
+                    entry.state.ready(image.clone());
+                }
+            }
+            Err(failure) => {
+                for entry in self
+                    .entries
+                    .values_mut()
+                    .filter(|entry| &entry.cache_key == key)
+                {
+                    entry.state.failed(&failure);
+                }
+            }
+        }
+    }
+
+    /// Hydrate idle resident states from the bounded decoded cache.
+    pub fn hydrate_from_cache(&mut self, cache: &mut MarkdownImageCache) {
+        for entry in self
+            .entries
+            .values_mut()
+            .filter(|entry| matches!(entry.state, MarkdownImagePresentationState::Idle))
+        {
+            if let Some(image) = cache.get(&entry.cache_key) {
+                entry.state.ready(image);
+            }
+        }
     }
 
     /// Emit ready pixels into the current BMUX frame with stable identity and clipped placement.
@@ -1059,8 +1113,9 @@ mod tests {
         MarkdownImageLoadDecision, MarkdownImageLoadError, MarkdownImageLoadFailure,
         MarkdownImageLoadGuard, MarkdownImageLoader, MarkdownImagePresentationInput,
         MarkdownImagePresentationPolicy, MarkdownImagePresentationState,
-        MarkdownImagePresentationStore, MarkdownImageResidency, decode_markdown_image,
-        markdown_image_load_decision, validate_dimensions,
+        MarkdownImagePresentationStore, MarkdownImageResidency, RESERVED_IMAGE_ROWS,
+        decode_markdown_image, markdown_image_load_decision, markdown_image_reserved_rows,
+        validate_dimensions,
     };
     use bcode_markdown_render::{
         MarkdownDestination, MarkdownDestinationRejection, resolve_markdown_destination,
@@ -1229,6 +1284,116 @@ mod tests {
         assert_ne!(
             MarkdownImageCacheKey::new("https://example.com/image.png", "document"),
             MarkdownImageCacheKey::new("https://example.com/other.png", "document")
+        );
+    }
+
+    #[test]
+    fn every_presentation_state_reserves_identical_rows_before_and_after_loading() {
+        let image = image(1, 4);
+        let states = [
+            MarkdownImagePresentationState::Idle,
+            MarkdownImagePresentationState::Loading,
+            MarkdownImagePresentationState::Ready(image),
+            MarkdownImagePresentationState::Failed("failure".to_owned()),
+            MarkdownImagePresentationState::NetworkDisabled,
+            MarkdownImagePresentationState::TerminalUnsupported,
+        ];
+        assert!(
+            states
+                .iter()
+                .all(|state| { markdown_image_reserved_rows(state) == RESERVED_IMAGE_ROWS })
+        );
+    }
+
+    #[test]
+    fn load_completion_updates_shared_owners_cache_and_failure_state() {
+        let remote = resolve_markdown_destination("https://example.com/image.png", None);
+        let policy = MarkdownImagePresentationPolicy {
+            interactive_resident_frame: true,
+            network_enabled: true,
+            terminal_supported: true,
+        };
+        let key = MarkdownImageCacheKey::new("image.png", "document");
+        let inputs = ["first", "second"].map(|id| MarkdownImagePresentationInput {
+            contribution_id: id.to_owned(),
+            cache_key: key.clone(),
+            destination: remote.clone(),
+            residency: MarkdownImageResidency::Visible,
+        });
+        let mut store = MarkdownImagePresentationStore::default();
+        let mut inflight = MarkdownImageInflight::default();
+        let mut cache = MarkdownImageCache::default();
+        store.reconcile_with_inflight(&inputs, policy, &mut inflight);
+        let requests = store.schedule_loads(&inputs, policy, &mut inflight);
+        assert_eq!(requests.len(), 1);
+        store.complete_load(&key, Ok(image(7, 4)), &mut cache, &mut inflight);
+        assert!(matches!(
+            store.state("first"),
+            Some(MarkdownImagePresentationState::Ready(_))
+        ));
+        assert!(matches!(
+            store.state("second"),
+            Some(MarkdownImagePresentationState::Ready(_))
+        ));
+        assert!(cache.get(&key).is_some());
+        assert!(inflight.cancellation_token(&key).is_none());
+
+        let failed_key = MarkdownImageCacheKey::new("failed.png", "document");
+        let failed = [MarkdownImagePresentationInput {
+            contribution_id: "failed".to_owned(),
+            cache_key: failed_key.clone(),
+            destination: remote,
+            residency: MarkdownImageResidency::Visible,
+        }];
+        store.reconcile_with_inflight(&failed, policy, &mut inflight);
+        assert_eq!(
+            store.schedule_loads(&failed, policy, &mut inflight).len(),
+            1
+        );
+        store.complete_load(
+            &failed_key,
+            Err(MarkdownImageLoadFailure::Load(
+                MarkdownImageLoadError::TimedOut,
+            )),
+            &mut cache,
+            &mut inflight,
+        );
+        assert!(matches!(
+            store.state("failed"),
+            Some(MarkdownImagePresentationState::Failed(message)) if message.contains("timed out")
+        ));
+    }
+
+    #[test]
+    fn reconstruction_reuses_decoded_cache_without_scheduling_new_work() {
+        let remote = resolve_markdown_destination("https://example.com/image.png", None);
+        let policy = MarkdownImagePresentationPolicy {
+            interactive_resident_frame: true,
+            network_enabled: true,
+            terminal_supported: true,
+        };
+        let key = MarkdownImageCacheKey::new("image.png", "document");
+        let input = [MarkdownImagePresentationInput {
+            contribution_id: "reconstructed".to_owned(),
+            cache_key: key.clone(),
+            destination: remote,
+            residency: MarkdownImageResidency::Visible,
+        }];
+        let mut cache = MarkdownImageCache::default();
+        cache.insert(key, image(9, 4));
+        let mut store = MarkdownImagePresentationStore::default();
+        let mut inflight = MarkdownImageInflight::default();
+        store.reconcile_with_inflight(&input, policy, &mut inflight);
+        store.hydrate_from_cache(&mut cache);
+
+        assert!(matches!(
+            store.state("reconstructed"),
+            Some(MarkdownImagePresentationState::Ready(_))
+        ));
+        assert!(
+            store
+                .schedule_loads(&input, policy, &mut inflight)
+                .is_empty()
         );
     }
 
