@@ -225,6 +225,7 @@ fn transcript_item_signature(
     input: &TranscriptLayoutInput<'_>,
 ) -> TranscriptLayoutSignature {
     let base = render::transcript_item_signature(item, input.width, ());
+    let contribution_ids = render::transcript_markdown_contribution_ids(item, input.width);
     let presentation_generation = input.plugin_host.map_or_else(
         || "none".to_owned(),
         |host| format!("{}:{}", std::ptr::from_ref(host).addr(), host.revision()),
@@ -235,7 +236,7 @@ fn transcript_item_signature(
             .map_or(0, |host| host.visual_revision(invocation_id))
     });
     TranscriptLayoutSignature::new(format!(
-        "{};presentation-generation:{presentation_generation};visual-rev:{visual_revision}",
+        "{};markdown-contributions:{contribution_ids:?};presentation-generation:{presentation_generation};visual-rev:{visual_revision}",
         base.as_str()
     ))
 }

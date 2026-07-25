@@ -2,6 +2,8 @@
 
 Bcode is a Rust-native, TUI-first, plugin-driven coding agent with a local client/server architecture.
 
+Terminal GitHub Markdown support, browser differences, security boundaries, and rich-content policies are documented in [GitHub Markdown in the transcript TUI](docs/github-markdown-tui.md).
+
 ## Use Bcode as a Rust SDK
 
 The `bcode` crate can be used directly from Rust applications without launching the TUI. The default feature set is intentionally lean and TUI-independent; opt into heavier product or integration paths only when needed.

@@ -238,6 +238,8 @@ pub struct MarkdownRenderOptions {
     pub mermaid_height: u32,
     /// Stable identity of the owning document or transcript item.
     pub document_id: Option<String>,
+    /// Whether the source is an incomplete streaming document.
+    pub streaming: bool,
 }
 
 impl Default for MarkdownRenderOptions {
@@ -251,6 +253,7 @@ impl Default for MarkdownRenderOptions {
             mermaid_width: 1600,
             mermaid_height: 1200,
             document_id: None,
+            streaming: false,
         }
     }
 }
@@ -283,6 +286,13 @@ impl MarkdownRenderOptions {
     #[must_use]
     pub fn with_document_id(mut self, document_id: impl Into<String>) -> Self {
         self.document_id = Some(document_id.into());
+        self
+    }
+
+    /// Return options for an incomplete streaming document.
+    #[must_use]
+    pub const fn with_streaming(mut self, streaming: bool) -> Self {
+        self.streaming = streaming;
         self
     }
 
@@ -714,6 +724,11 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
         options,
     );
     let projected_markdown = project_semantic_fallbacks(markdown, &document, &details);
+    let projected_markdown = if options.streaming {
+        project_incomplete_details_fallback(&projected_markdown)
+    } else {
+        projected_markdown
+    };
     let layout_signature = markdown_layout_signature(markdown, options, &contributions);
     MarkdownRenderResult {
         lines: render_markdown_lines_internal(&projected_markdown, options),
@@ -728,13 +743,14 @@ fn markdown_layout_signature(
     contributions: &[MarkdownContribution],
 ) -> String {
     format!(
-        "markdown-layout-v1:{}:{}:{}:{}:{}:{}:{}",
+        "markdown-layout-v1:{}:{}:{}:{}:{}:{}:{}:{}",
         options.width,
         stable_text_hash(markdown),
         stable_text_hash(&format!("{:?}", options.theme)),
         stable_text_hash(&format!("{:?}", options.document_context)),
         options.mermaid_enabled,
         options.mermaid_width,
+        options.streaming,
         stable_text_hash(&format!("{}:{:?}", options.mermaid_height, contributions))
     )
 }
@@ -764,6 +780,12 @@ fn project_semantic_fallbacks<'a>(
 
     let mut replacements = details
         .iter()
+        .filter(|candidate| {
+            !details.iter().any(|parent| {
+                parent.source_range.start < candidate.source_range.start
+                    && parent.source_range.end >= candidate.source_range.end
+            })
+        })
         .cloned()
         .map(|details| {
             (
@@ -771,7 +793,7 @@ fn project_semantic_fallbacks<'a>(
                 format!(
                     "**{}**\n\n{}",
                     details.summary_markdown.trim(),
-                    details.body_markdown.trim()
+                    project_details_markup(&details.body_markdown).trim()
                 ),
             )
         })
@@ -814,6 +836,77 @@ fn project_semantic_fallbacks<'a>(
     Cow::Owned(projected)
 }
 
+fn project_incomplete_details_fallback(markdown: &str) -> Cow<'_, str> {
+    let lower = markdown.to_ascii_lowercase();
+    let Some(start) = lower.rfind("<details") else {
+        return Cow::Borrowed(markdown);
+    };
+    if matching_details_close(
+        &lower,
+        lower[start..]
+            .find('>')
+            .map_or(start, |end| start + end + 1),
+    )
+    .is_some()
+    {
+        return Cow::Borrowed(markdown);
+    }
+    let suffix = &markdown[start..];
+    let suffix_lower = &lower[start..];
+    let Some(open_end) = suffix.find('>') else {
+        return Cow::Borrowed(markdown);
+    };
+    let content_start = open_end + 1;
+    let Some(summary_start_relative) = suffix_lower[content_start..].find("<summary") else {
+        return Cow::Borrowed(markdown);
+    };
+    let summary_start = content_start + summary_start_relative;
+    let Some(summary_open_end_relative) = suffix[summary_start..].find('>') else {
+        return Cow::Borrowed(markdown);
+    };
+    let summary_open_end = summary_start + summary_open_end_relative + 1;
+    let Some(summary_close_relative) = suffix_lower[summary_open_end..].find("</summary>") else {
+        return Cow::Borrowed(markdown);
+    };
+    let summary_close = summary_open_end + summary_close_relative;
+    let body_start = summary_close + "</summary>".len();
+    let mut output = markdown[..start].to_owned();
+    let _ = write!(
+        output,
+        "**{}**\n\n{}",
+        safe_summary_markdown(&suffix[summary_open_end..summary_close]).trim(),
+        suffix[body_start..].trim()
+    );
+    Cow::Owned(output)
+}
+
+fn project_details_markup(markdown: &str) -> Cow<'_, str> {
+    let details = collect_details_projections(markdown);
+    if details.is_empty() {
+        return Cow::Borrowed(markdown);
+    }
+    let replacements = details
+        .iter()
+        .filter(|candidate| {
+            !details.iter().any(|parent| {
+                parent.source_range.start < candidate.source_range.start
+                    && parent.source_range.end >= candidate.source_range.end
+            })
+        })
+        .map(|details| {
+            (
+                details.source_range.clone(),
+                format!(
+                    "**{}**\n\n{}",
+                    details.summary_markdown.trim(),
+                    project_details_markup(&details.body_markdown).trim()
+                ),
+            )
+        })
+        .collect();
+    Cow::Owned(replace_source_ranges(markdown, replacements))
+}
+
 fn collect_details_projections(markdown: &str) -> Vec<DetailsProjection> {
     let lower = markdown.to_ascii_lowercase();
     let mut output = Vec::new();
@@ -824,10 +917,9 @@ fn collect_details_projections(markdown: &str) -> Vec<DetailsProjection> {
             break;
         };
         let open_end = start + open_end_relative + 1;
-        let Some(close_relative) = lower[open_end..].find("</details>") else {
+        let Some(close_start) = matching_details_close(&lower, open_end) else {
             break;
         };
-        let close_start = open_end + close_relative;
         let end = close_start + "</details>".len();
         let inner_lower = &lower[open_end..close_start];
         let Some(summary_relative) = inner_lower.find("<summary") else {
@@ -853,9 +945,48 @@ fn collect_details_projections(markdown: &str) -> Vec<DetailsProjection> {
             body_markdown: markdown[summary_close + "</summary>".len()..close_start].to_owned(),
             default_open: details_has_open_attribute(open_tag),
         });
+        let body_start = summary_close + "</summary>".len();
+        output.extend(
+            collect_details_projections(&markdown[body_start..close_start])
+                .into_iter()
+                .map(|mut nested| {
+                    nested.source_range = nested.source_range.start.saturating_add(body_start)
+                        ..nested.source_range.end.saturating_add(body_start);
+                    nested
+                }),
+        );
         offset = end;
     }
     output
+}
+
+fn matching_details_close(lower: &str, content_start: usize) -> Option<usize> {
+    let mut depth = 1_usize;
+    let mut offset = content_start;
+    while offset < lower.len() {
+        let next_open = lower[offset..]
+            .find("<details")
+            .map(|relative| offset + relative);
+        let next_close = lower[offset..]
+            .find("</details>")
+            .map(|relative| offset + relative);
+        match (next_open, next_close) {
+            (Some(open), Some(close)) if open < close => {
+                let tag_end = lower[open..].find('>')? + open + 1;
+                depth = depth.saturating_add(1);
+                offset = tag_end;
+            }
+            (_, Some(close)) => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return Some(close);
+                }
+                offset = close.saturating_add("</details>".len());
+            }
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn details_has_open_attribute(open_tag: &str) -> bool {
@@ -2274,13 +2405,17 @@ impl TerminalMarkdownRenderer {
         self.rows
             .push(table_border_line('┌', '┬', '┐', &widths, border_style));
         for (row_index, row) in rows.iter().enumerate() {
-            self.rows.push(table_content_line(
-                &row.cells,
-                &widths,
-                &alignments,
-                border_style,
-                row.header.then_some(self.theme.strong),
-            ));
+            let visual_height = row.cells.iter().map(Vec::len).max().unwrap_or(1);
+            for visual_row in 0..visual_height {
+                self.rows.push(table_content_line(
+                    &row.cells,
+                    visual_row,
+                    &widths,
+                    &alignments,
+                    border_style,
+                    row.header.then_some(self.theme.strong),
+                ));
+            }
             if row_index + 1 < rows.len() {
                 self.rows
                     .push(table_border_line('├', '┼', '┤', &widths, border_style));
@@ -2304,17 +2439,26 @@ impl TerminalMarkdownRenderer {
             for (column_index, cell) in row.cells.iter().enumerate() {
                 let label = headers
                     .and_then(|cells| cells.get(column_index))
-                    .map(|spans| {
-                        spans
-                            .iter()
+                    .map(|lines| {
+                        lines
+                            .first()
+                            .into_iter()
+                            .flatten()
                             .map(|span| span.content.as_str())
                             .collect::<String>()
                     })
                     .filter(|label| !label.is_empty())
                     .unwrap_or_else(|| column_index.saturating_add(1).to_string());
-                let mut spans = vec![Span::styled(format!("{label}: "), muted)];
-                spans.extend(cell.clone());
-                self.rows.push(Line::from_spans(spans));
+                for (visual_row, line) in cell.iter().enumerate() {
+                    let prefix = if visual_row == 0 {
+                        format!("{label}: ")
+                    } else {
+                        " ".repeat(text_display_width(&label).saturating_add(2))
+                    };
+                    let mut spans = vec![Span::styled(prefix, muted)];
+                    spans.extend(line.clone());
+                    self.rows.push(Line::from_spans(spans));
+                }
             }
         }
         self.ensure_blank_line();
@@ -2388,7 +2532,7 @@ fn decimal_digits(value: usize) -> usize {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TableRow {
-    cells: Vec<Vec<Span>>,
+    cells: Vec<Vec<Vec<Span>>>,
     header: bool,
 }
 
@@ -2411,7 +2555,7 @@ fn collect_table_rows(
         .children
         .iter()
         .filter(|child| matches!(child.element, Element::TH { .. } | Element::TD { .. }))
-        .map(|cell| inline_spans_for_container(cell, style, theme))
+        .map(|cell| lines_for_table_cell(cell, style, theme))
         .collect::<Vec<_>>();
     if matches!(container.element, Element::TR) || in_header && !cells.is_empty() {
         rows.push(TableRow {
@@ -2425,27 +2569,34 @@ fn collect_table_rows(
     }
 }
 
-fn inline_spans_for_container(
+fn lines_for_table_cell(
     container: &Container,
     style: TextStyle,
     theme: MarkdownTheme,
-) -> Vec<Span> {
+) -> Vec<Vec<Span>> {
     let mut renderer = TerminalMarkdownRenderer::new(u16::MAX, theme, Vec::new(), Vec::new());
     renderer.in_table_collection = true;
     renderer.render_container_children(container, style.merge_container(container, theme));
     renderer.flush_line();
-    renderer
+    let lines = renderer
         .finish()
         .into_iter()
-        .flat_map(|line| line.spans)
-        .collect()
+        .map(|line| line.spans)
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        vec![Vec::new()]
+    } else {
+        lines
+    }
 }
 
 fn table_column_widths(rows: &[TableRow], column_count: usize) -> Vec<usize> {
     let mut widths = vec![1; column_count];
     for row in rows {
         for (index, cell) in row.cells.iter().enumerate() {
-            widths[index] = widths[index].max(spans_width(cell));
+            for line in cell {
+                widths[index] = widths[index].max(spans_width(line));
+            }
         }
     }
     widths
@@ -2471,7 +2622,8 @@ fn table_border_line(
 }
 
 fn table_content_line(
-    row: &[Vec<Span>],
+    row: &[Vec<Vec<Span>>],
+    visual_row: usize,
     widths: &[usize],
     alignments: &[Alignment],
     border_style: Style,
@@ -2480,7 +2632,7 @@ fn table_content_line(
     let mut spans = vec![Span::styled("│", border_style)];
     for (index, width) in widths.iter().enumerate() {
         spans.push(Span::raw(" "));
-        if let Some(cell) = row.get(index) {
+        if let Some(cell) = row.get(index).and_then(|lines| lines.get(visual_row)) {
             let padding = width.saturating_sub(spans_width(cell));
             let (left_padding, right_padding) = aligned_padding(
                 padding,
@@ -2679,9 +2831,11 @@ fn text_display_width(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        MarkdownRenderOptions, MarkdownTheme, markdown_to_plain_text, render_markdown_lines,
+        MarkdownRenderOptions, MarkdownTheme, TableRow, aligned_padding, markdown_to_plain_text,
+        render_markdown_lines, table_column_widths, table_content_line,
     };
-    use bmux_tui::prelude::{Color, Modifier, Style};
+    use bmux_tui::prelude::{Color, Modifier, Span, Style};
+    use pulldown_cmark::Alignment;
 
     fn rendered_text(markdown: &str) -> String {
         render_markdown_lines(markdown, MarkdownRenderOptions::new(80))
@@ -2694,6 +2848,38 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn multiline_table_cells_align_each_visual_row_independently() {
+        let rows = [TableRow {
+            cells: vec![
+                vec![vec![Span::raw("a")], vec![Span::raw("long")]],
+                vec![vec![Span::raw("x")], vec![Span::raw("yy")]],
+                vec![vec![Span::raw("7")], vec![Span::raw("42")]],
+            ],
+            header: false,
+        }];
+        let widths = table_column_widths(&rows, 3);
+        assert_eq!(widths, [4, 2, 2]);
+        let alignments = [Alignment::Left, Alignment::Center, Alignment::Right];
+        let line = |visual_row| {
+            table_content_line(
+                &rows[0].cells,
+                visual_row,
+                &widths,
+                &alignments,
+                Style::new(),
+                None,
+            )
+            .spans
+            .into_iter()
+            .map(|span| span.content)
+            .collect::<String>()
+        };
+        assert_eq!(line(0), "│ a    │ x  │  7 │");
+        assert_eq!(line(1), "│ long │ yy │ 42 │");
+        assert_eq!(aligned_padding(3, alignments[1]), (1, 2));
     }
 
     #[test]

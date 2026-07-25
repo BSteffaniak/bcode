@@ -34,7 +34,7 @@ fn plugin_visual_context(
 
 use std::time::{Duration, Instant};
 
-use bcode_markdown_render::{MarkdownRenderOptions, render_markdown_lines};
+use bcode_markdown_render::{MarkdownRenderOptions, render_markdown, render_markdown_lines};
 use bcode_plugin_sdk::tui::PluginTuiVisualRenderMode;
 use bcode_session_view_models::TextFormat;
 use bmux_tui::chrome::{Border, Panel};
@@ -756,6 +756,22 @@ fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
     }
 }
 
+pub fn transcript_markdown_contribution_ids(item: &TranscriptItem, width: u16) -> Vec<String> {
+    if item.text_format() != TextFormat::Markdown {
+        return Vec::new();
+    }
+    render_markdown(
+        item.text(),
+        &MarkdownRenderOptions::new(width.max(1))
+            .with_document_id(format!("transcript:{}", item.id().get()))
+            .with_streaming(item.streaming()),
+    )
+    .contributions
+    .into_iter()
+    .map(|contribution| contribution.id)
+    .collect()
+}
+
 pub fn transcript_item_rows(
     transcript: &[TranscriptItem],
     index: usize,
@@ -1075,15 +1091,27 @@ fn push_assistant_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) 
     } else {
         Color::Green
     };
-    push_formatted_block(
-        rows,
-        title,
-        item.text(),
-        item.text_format(),
-        color,
-        true,
-        width,
-    );
+    if item.text_format() == TextFormat::Markdown {
+        push_markdown_block_with_streaming(
+            rows,
+            title,
+            item.text(),
+            color,
+            width,
+            true,
+            item.streaming(),
+        );
+    } else {
+        push_formatted_block(
+            rows,
+            title,
+            item.text(),
+            item.text_format(),
+            color,
+            true,
+            width,
+        );
+    }
 }
 
 fn push_formatted_block(
@@ -1118,6 +1146,18 @@ fn push_markdown_block(
     width: u16,
     prominent: bool,
 ) {
+    push_markdown_block_with_streaming(rows, title, body, color, width, prominent, false);
+}
+
+fn push_markdown_block_with_streaming(
+    rows: &mut Vec<Line>,
+    title: &str,
+    body: &str,
+    color: Color,
+    width: u16,
+    prominent: bool,
+    streaming: bool,
+) {
     let heading_style = if prominent {
         Style::new().fg(color).add_modifier(Modifier::BOLD)
     } else {
@@ -1140,7 +1180,7 @@ fn push_markdown_block(
     } else {
         for line in render_markdown_lines(
             body,
-            MarkdownRenderOptions::new(width.saturating_sub(2).max(1)),
+            MarkdownRenderOptions::new(width.saturating_sub(2).max(1)).with_streaming(streaming),
         ) {
             let mut spans = vec![Span::styled("  ", muted_style())];
             spans.extend(line.spans);
@@ -1413,6 +1453,28 @@ fn generic_tool_headers_render_elapsed_and_duration() {
 
 #[cfg(test)]
 #[test]
+fn transcript_markdown_contributions_are_item_qualified_and_width_stable() {
+    let first = TranscriptItem::with_format(
+        "You",
+        "[Guide](guide.md) ![Diagram](diagram.png)".to_owned(),
+        TextFormat::Markdown,
+    );
+    let second = TranscriptItem::with_format("You", first.text().to_owned(), TextFormat::Markdown);
+
+    let wide = transcript_markdown_contribution_ids(&first, 80);
+    let narrow = transcript_markdown_contribution_ids(&first, 20);
+    let other = transcript_markdown_contribution_ids(&second, 80);
+
+    assert_eq!(wide, narrow);
+    assert!(
+        wide.iter()
+            .all(|id| id.starts_with(&format!("transcript:{}:", first.id().get())))
+    );
+    assert_ne!(wide, other);
+}
+
+#[cfg(test)]
+#[test]
 fn pending_signature_captures_width_state_and_text() {
     let mut pending = PendingSubmission::new("# heading".to_owned());
     let sending = pending_submission_signature(&pending, 30);
@@ -1539,15 +1601,27 @@ fn push_reasoning_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) 
     } else {
         "Reasoning"
     };
-    push_formatted_block(
-        rows,
-        title,
-        item.text(),
-        item.text_format(),
-        Color::BrightBlack,
-        false,
-        width,
-    );
+    if item.text_format() == TextFormat::Markdown {
+        push_markdown_block_with_streaming(
+            rows,
+            title,
+            item.text(),
+            Color::BrightBlack,
+            width,
+            false,
+            item.streaming(),
+        );
+    } else {
+        push_formatted_block(
+            rows,
+            title,
+            item.text(),
+            item.text_format(),
+            Color::BrightBlack,
+            false,
+            width,
+        );
+    }
 }
 
 #[derive(Clone, Copy)]

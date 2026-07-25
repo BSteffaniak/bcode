@@ -271,6 +271,19 @@ fn rendered_text(buffer: &Buffer) -> String {
         .join("\n")
 }
 
+fn rendered_lines_text(lines: &[bmux_tui::text::Line]) -> String {
+    lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn rendered_tool_body(rendered: &str) -> Vec<String> {
     rendered
         .lines()
@@ -2328,6 +2341,47 @@ async fn session_open_preserved_plugin_host_renders_live_request_contribution() 
 }
 
 #[test]
+fn pending_rich_markdown_finalizes_without_layout_drift_or_duplicate_content() {
+    let session_id = SessionId::new();
+    let markdown =
+        "# Deploy\n\n- run **tests**\n- publish\n\n| Check | State |\n|---|---|\n| CI | passing |";
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.replace_composer_with(markdown);
+    app.stage_submission();
+
+    let pending_rows = render::pending_submission_rows(&app.pending_submissions()[0], 48);
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::UserMessage {
+            client_id: ClientId::new(),
+            text: markdown.to_owned(),
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
+        },
+    ));
+
+    assert!(app.pending_submissions().is_empty());
+    let user_items = app
+        .transcript()
+        .iter()
+        .filter(|item| item.role() == "You")
+        .collect::<Vec<_>>();
+    assert_eq!(user_items.len(), 1);
+    assert_eq!(
+        user_items[0].text_format(),
+        bcode_session_view_models::TextFormat::Markdown
+    );
+    let finalized_rows = render::transcript_item_rows(
+        app.transcript(),
+        app.transcript().len() - 1,
+        48,
+        None,
+        bcode_config::TuiDiffViewerConfig::default(),
+    );
+    assert_eq!(&pending_rows[1..], &finalized_rows[1..]);
+}
+
+#[test]
 fn slash_pending_submission_clears_after_take() {
     let mut app = BmuxApp::new_with_history(None, &[], &[], false);
     app.replace_composer_with("/plan");
@@ -2428,6 +2482,70 @@ fn assistant_final_replaces_stream_when_usage_is_interleaved() {
 }
 
 #[test]
+fn reconstructed_rich_history_matches_equivalent_live_projection() {
+    let session_id = SessionId::new();
+    let user = "# Request\n\n- keep **formatting**\n\n| A | B |\n|---|---|\n| 1 | 2 |";
+    let assistant = "## Result\n\n> [!NOTE]\n> Reconstructed *correctly*.";
+    let history = [
+        event(
+            session_id,
+            1,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: user.to_owned(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::AssistantMessage {
+                text: assistant.to_owned(),
+            },
+        ),
+    ];
+    let reconstructed = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let mut live = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    for event in &history {
+        live.absorb_session_event(event);
+    }
+
+    assert_eq!(reconstructed.transcript().len(), live.transcript().len());
+    for (reconstructed_item, live_item) in reconstructed.transcript().iter().zip(live.transcript())
+    {
+        assert_eq!(
+            reconstructed_item.source_view_item_id(),
+            live_item.source_view_item_id()
+        );
+        assert_eq!(reconstructed_item.role(), live_item.role());
+        assert_eq!(reconstructed_item.text(), live_item.text());
+        assert_eq!(reconstructed_item.text_format(), live_item.text_format());
+        assert_eq!(reconstructed_item.kind(), live_item.kind());
+    }
+    for (index, item) in reconstructed.transcript().iter().enumerate() {
+        assert_eq!(
+            item.text_format(),
+            bcode_session_view_models::TextFormat::Markdown
+        );
+        let reconstructed_rows = render::transcript_item_rows(
+            reconstructed.transcript(),
+            index,
+            52,
+            None,
+            bcode_config::TuiDiffViewerConfig::default(),
+        );
+        let live_rows = render::transcript_item_rows(
+            live.transcript(),
+            index,
+            52,
+            None,
+            bcode_config::TuiDiffViewerConfig::default(),
+        );
+        assert_eq!(reconstructed_rows, live_rows);
+    }
+}
+
+#[test]
 fn history_rebuild_does_not_duplicate_initial_history() {
     let session_id = SessionId::new();
     let history = [
@@ -2467,6 +2585,126 @@ fn history_rebuild_does_not_duplicate_initial_history() {
     assert_eq!(user_items[0].text(), "first");
     assert_eq!(assistant_items.len(), 1);
     assert_eq!(assistant_items[0].text(), "second");
+}
+
+#[test]
+fn live_assistant_rich_markdown_updates_preserve_stream_and_final_layout() {
+    let session_id = SessionId::new();
+    let first = "# Result\n\n- **one**";
+    let second = "\n- two\n\n| A | B |\n|---|---|\n| 1 | 2 |";
+    let final_text = format!("{first}{second}");
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+
+    app.absorb_session_event(&event(
+        session_id,
+        1,
+        SessionEventKind::AssistantDelta {
+            text: first.to_owned(),
+        },
+    ));
+    let first_item = app
+        .transcript()
+        .iter()
+        .find(|item| item.role() == "Assistant")
+        .unwrap();
+    assert!(first_item.streaming());
+    assert_eq!(
+        first_item.text_format(),
+        bcode_session_view_models::TextFormat::Markdown
+    );
+    let first_rows = render::transcript_item_rows(
+        app.transcript(),
+        app.transcript()
+            .iter()
+            .position(|item| item.role() == "Assistant")
+            .unwrap(),
+        48,
+        None,
+        bcode_config::TuiDiffViewerConfig::default(),
+    );
+    assert!(rendered_lines_text(&first_rows).contains("Result"));
+    assert!(rendered_lines_text(&first_rows).contains("•  one"));
+
+    app.absorb_session_event(&event(
+        session_id,
+        2,
+        SessionEventKind::AssistantDelta {
+            text: second.to_owned(),
+        },
+    ));
+    let streaming_index = app
+        .transcript()
+        .iter()
+        .position(|item| item.role() == "Assistant")
+        .unwrap();
+    let streaming_rows = render::transcript_item_rows(
+        app.transcript(),
+        streaming_index,
+        48,
+        None,
+        bcode_config::TuiDiffViewerConfig::default(),
+    );
+    let streaming_body = streaming_rows[1..].to_vec();
+    assert!(rendered_lines_text(&streaming_rows).contains("│ 1 │ 2 │"));
+
+    app.absorb_session_event(&event(
+        session_id,
+        3,
+        SessionEventKind::AssistantMessage {
+            text: final_text.clone(),
+        },
+    ));
+    let assistant_items = app
+        .transcript()
+        .iter()
+        .filter(|item| item.role() == "Assistant")
+        .collect::<Vec<_>>();
+    assert_eq!(assistant_items.len(), 1);
+    assert!(!assistant_items[0].streaming());
+    assert_eq!(assistant_items[0].text(), final_text);
+    let finalized_rows = render::transcript_item_rows(
+        app.transcript(),
+        app.transcript()
+            .iter()
+            .position(|item| item.role() == "Assistant")
+            .unwrap(),
+        48,
+        None,
+        bcode_config::TuiDiffViewerConfig::default(),
+    );
+    assert_eq!(streaming_body, finalized_rows[1..]);
+}
+
+#[test]
+fn rich_markdown_resize_reflows_cached_rows_and_restores_wide_layout() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        1,
+        SessionEventKind::AssistantMessage {
+            text: "## Result\n\nA long paragraph with **emphasis** that wraps at narrow widths but fits comfortably when wide.\n\n| Check | State |\n|---|---|\n| integration suite | passing |".to_owned(),
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+
+    let mut wide_buffer = Buffer::empty(Rect::new(0, 0, 80, 24));
+    render::render(&mut app, &mut Frame::new(&mut wide_buffer));
+    let wide_rows = app.transcript_layout().total_rows();
+    let wide_text = rendered_text(&wide_buffer);
+    assert!(wide_text.contains("┌"));
+
+    let mut narrow_buffer = Buffer::empty(Rect::new(0, 0, 28, 24));
+    render::render(&mut app, &mut Frame::new(&mut narrow_buffer));
+    let narrow_rows = app.transcript_layout().total_rows();
+    let narrow_text = rendered_text(&narrow_buffer);
+    assert_ne!(narrow_rows, wide_rows);
+    assert!(narrow_text.contains("Check: integration suite"));
+    assert!(!narrow_text.contains("┌────────────────"));
+
+    let mut restored_buffer = Buffer::empty(Rect::new(0, 0, 80, 24));
+    render::render(&mut app, &mut Frame::new(&mut restored_buffer));
+    assert_eq!(app.transcript_layout().total_rows(), wide_rows);
+    assert_eq!(rendered_text(&restored_buffer), wide_text);
 }
 
 #[test]
@@ -4202,6 +4440,50 @@ fn shared_streaming_updates_remain_one_resident_terminal_item() {
 }
 
 #[test]
+fn large_rich_history_remains_bounded_in_resident_events_rows_and_payload() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    let markdown =
+        "## Result\n\n- **bounded** item\n\n| Check | State |\n|---|---|\n| suite | passing |";
+
+    for turn in 0..600_u64 {
+        let sequence = turn.saturating_mul(2).saturating_add(1);
+        app.absorb_session_event(&event(
+            session_id,
+            sequence,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: format!("# Request {turn}\n\n- retain the recent tail"),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        ));
+        app.absorb_session_event(&event(
+            session_id,
+            sequence.saturating_add(1),
+            SessionEventKind::AssistantMessage {
+                text: markdown.to_owned(),
+            },
+        ));
+    }
+
+    let _ = render_app_text(&mut app);
+    assert!(app.resident_transcript_event_count() <= 700);
+    assert!(app.transcript().len() <= 700);
+    assert!(app.transcript_layout().total_rows() <= 7_000);
+    let resident_text_bytes = app
+        .transcript()
+        .iter()
+        .map(|item| item.text().len())
+        .sum::<usize>();
+    assert!(resident_text_bytes <= 128 * 1024);
+    let sync = app.transcript_layout_mut().drain_sync_stats();
+    assert_eq!(sync.len(), 1);
+    assert!(sync[0].entries_scanned <= app.transcript().len().saturating_add(1));
+    assert!(sync[0].rows_regenerated <= app.transcript_layout().total_rows());
+    assert!(app.has_older_history());
+}
+
+#[test]
 fn transcript_resident_window_trims_live_bottom_following_turns() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
@@ -4958,6 +5240,58 @@ fn canonical_generic_result_record_renders_filesystem_source_viewer() {
     assert!(rendered.contains("pub fn alpha() {}"), "{rendered}");
     assert!(rendered.contains("pub fn beta() {}"), "{rendered}");
     assert!(!rendered.contains("model-visible fallback"), "{rendered}");
+}
+
+#[test]
+fn rich_stream_update_reuses_unaffected_markdown_layout_entry() {
+    let session_id = SessionId::new();
+    let history = [
+        event(
+            session_id,
+            1,
+            SessionEventKind::UserMessage {
+                client_id: ClientId::new(),
+                text: "# Stable\n\n- **unchanged**\n\n| A | B |\n|---|---|\n| 1 | 2 |".to_owned(),
+                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+            },
+        ),
+        event(
+            session_id,
+            2,
+            SessionEventKind::AssistantDelta {
+                text: "## Working\n\n- first".to_owned(),
+            },
+        ),
+    ];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    let _ = render_app_text(&mut app);
+    let stable_id = app.transcript()[0].id();
+    let stable_row = app
+        .transcript_layout()
+        .transcript_entry_row_ptr(0)
+        .expect("stable Markdown row");
+    let _ = app.transcript_layout_mut().drain_sync_stats();
+
+    app.absorb_session_event(&event(
+        session_id,
+        3,
+        SessionEventKind::AssistantDelta {
+            text: "\n- second".to_owned(),
+        },
+    ));
+    let _ = render_app_text(&mut app);
+
+    assert_eq!(app.transcript()[0].id(), stable_id);
+    assert_eq!(
+        app.transcript_layout()
+            .transcript_entry_row_ptr(0)
+            .expect("retained stable Markdown row"),
+        stable_row
+    );
+    let sync = app.transcript_layout_mut().drain_sync_stats();
+    assert_eq!(sync.len(), 1);
+    assert_eq!(sync[0].signatures_changed, 1);
+    assert_eq!(sync[0].entries_rebuilt, 1);
 }
 
 #[test]

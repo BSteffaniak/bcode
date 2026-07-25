@@ -273,6 +273,32 @@ mod tests {
     }
 
     #[test]
+    fn anchored_history_top_row_survives_async_row_height_growth() {
+        let mut viewport = TranscriptViewport::default();
+        let mut older = older_history();
+        viewport.sync_max(30, 0, 40, 10, false, &mut older);
+        viewport.scroll_up(12, &mut older);
+        let top_row = viewport.top_row(40, 10);
+
+        viewport.sync_max(37, 0, 47, 10, false, &mut older);
+
+        assert_eq!(viewport.top_row(47, 10), top_row);
+        assert_eq!(viewport.offset(), 47 - top_row - 10);
+    }
+
+    #[test]
+    fn following_bottom_tracks_async_row_height_growth() {
+        let mut viewport = TranscriptViewport::default();
+        let mut older = older_history();
+        viewport.sync_max(30, 0, 40, 10, false, &mut older);
+
+        viewport.sync_max(37, 0, 47, 10, false, &mut older);
+
+        assert_eq!(viewport.top_row(47, 10), 37);
+        assert!(viewport.at_bottom_threshold());
+    }
+
+    #[test]
     fn following_bottom_tracks_appended_rows() {
         let mut viewport = TranscriptViewport::default();
         let mut older = older_history();

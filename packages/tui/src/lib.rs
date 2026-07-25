@@ -28,6 +28,8 @@ pub(crate) mod input_history;
 pub(crate) mod interactive_surface;
 pub(crate) mod invalidation;
 pub(crate) mod keymap;
+pub(crate) mod markdown_activation;
+pub mod markdown_image;
 pub mod metrics_launcher;
 pub(crate) mod model_flow;
 pub(crate) mod model_picker;
@@ -120,6 +122,18 @@ use crossterm::event::{
 
 const CURSOR_BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const OLDER_HISTORY_EVENT_LIMIT: usize = 256;
+
+fn markdown_activation_adapter_linkage() {
+    let activate: fn(
+        &bcode_markdown_render::MarkdownDestination,
+    ) -> Result<
+        markdown_activation::MarkdownActivation,
+        markdown_activation::MarkdownActivationError,
+    > = markdown_activation::activate_markdown_destination;
+    let copy: fn(&bcode_markdown_render::MarkdownDestination) -> Result<bool, arboard::Error> =
+        markdown_activation::copy_markdown_destination;
+    let _ = (activate, copy);
+}
 
 /// Errors returned by the TUI.
 #[derive(Debug, thiserror::Error)]
@@ -432,6 +446,7 @@ pub async fn run_ralph_home() -> Result<(), TuiError> {
 /// client operations.
 #[allow(clippy::future_not_send)]
 pub async fn run(session_id: Option<SessionId>) -> Result<(), TuiError> {
+    markdown_activation_adapter_linkage();
     Box::pin(run_with_static_bundled(
         session_id,
         &static_bundled_plugins(),

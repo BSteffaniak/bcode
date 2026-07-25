@@ -5461,6 +5461,83 @@ mod tests {
     }
 
     #[test]
+    fn live_reasoning_rich_updates_preserve_markdown_projection_and_finalize_once() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        app.set_reasoning_visible(true);
+        let event = |sequence, kind| shared_projection_adapter_event(session_id, sequence, kind);
+
+        app.absorb_session_event(&event(
+            1,
+            SessionEventKind::AssistantReasoningDelta {
+                text: "## Why\n\n- **safe**".to_owned(),
+            },
+        ));
+        app.absorb_session_event(&event(
+            2,
+            SessionEventKind::AssistantReasoningDelta {
+                text: "\n- fast".to_owned(),
+            },
+        ));
+
+        let reasoning = app
+            .transcript()
+            .iter()
+            .filter(|item| item.role().starts_with("Reasoning"))
+            .collect::<Vec<_>>();
+        assert_eq!(reasoning.len(), 1);
+        assert!(reasoning[0].streaming());
+        assert_eq!(
+            reasoning[0].text_format(),
+            bcode_session_view_models::TextFormat::Markdown
+        );
+        let streaming_rows = crate::render::transcript_item_rows(
+            app.transcript(),
+            app.transcript()
+                .iter()
+                .position(|item| item.role().starts_with("Reasoning"))
+                .unwrap(),
+            48,
+            None,
+            bcode_config::TuiDiffViewerConfig::default(),
+        );
+        let streaming_body = streaming_rows[1..].to_vec();
+        let text = streaming_rows
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert!(text.contains("Why"));
+        assert!(text.contains("safe"));
+        assert!(text.contains("fast"));
+
+        app.absorb_session_event(&event(
+            3,
+            SessionEventKind::AssistantReasoningMessage {
+                text: "## Why\n\n- **safe**\n- fast".to_owned(),
+            },
+        ));
+        let reasoning = app
+            .transcript()
+            .iter()
+            .filter(|item| item.role().starts_with("Reasoning"))
+            .collect::<Vec<_>>();
+        assert_eq!(reasoning.len(), 1);
+        assert!(!reasoning[0].streaming());
+        let finalized_rows = crate::render::transcript_item_rows(
+            app.transcript(),
+            app.transcript()
+                .iter()
+                .position(|item| item.role().starts_with("Reasoning"))
+                .unwrap(),
+            48,
+            None,
+            bcode_config::TuiDiffViewerConfig::default(),
+        );
+        assert_eq!(streaming_body, finalized_rows[1..]);
+    }
+
+    #[test]
     fn reasoning_final_message_consumes_shared_projection_text() {
         let session_id = SessionId::new();
         let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);

@@ -2532,6 +2532,7 @@ dependencies = [
  "crossterm",
  "image",
  "insta",
+ "open",
  "png",
  "serde",
  "serde_json",
@@ -2878,7 +2879,6 @@ dependencies = [
 [[package]]
 name = "bmux_keyboard"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#0f589f978399d96cd8dca04824af2e8a8342f40b"
 dependencies = [
  "crossterm",
 ]
@@ -2965,7 +2965,6 @@ dependencies = [
 [[package]]
 name = "bmux_text_edit"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#0f589f978399d96cd8dca04824af2e8a8342f40b"
 dependencies = [
  "bmux_keyboard",
  "unicode-segmentation",
@@ -2975,7 +2974,6 @@ dependencies = [
 [[package]]
 name = "bmux_tui"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#0f589f978399d96cd8dca04824af2e8a8342f40b"
 dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",
@@ -2987,7 +2985,6 @@ dependencies = [
 [[package]]
 name = "bmux_tui_components"
 version = "0.0.1-alpha.1"
-source = "git+https://github.com/BSteffaniak/bmux.git?branch=master#0f589f978399d96cd8dca04824af2e8a8342f40b"
 dependencies = [
  "bmux_keyboard",
  "bmux_text_edit",

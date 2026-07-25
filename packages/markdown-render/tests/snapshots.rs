@@ -14,6 +14,7 @@ const BLOCKS: &str = include_str!("fixtures/blocks.md");
 const CODE_BLOCKS: &str = include_str!("fixtures/code_blocks.md");
 const COMPOSITION: &str = include_str!("fixtures/composition.md");
 const DETAILS: &str = include_str!("fixtures/details.md");
+const DETAILS_NESTED: &str = include_str!("fixtures/details_nested.md");
 const FOOTNOTES_BLOCKS: &str = include_str!("fixtures/footnotes_blocks.md");
 const FOOTNOTES: &str = include_str!("fixtures/footnotes.md");
 const GITHUB_MARKDOWN_EXAMPLE: &str = include_str!("../../../github-markdown-example.md");
@@ -50,16 +51,22 @@ fn visible_snapshot(markdown: &str, width: u16) -> String {
 }
 
 fn visible_lines_snapshot(lines: &[Line]) -> String {
+    rendered_lines_text(lines)
+        .lines()
+        .enumerate()
+        .map(|(index, line)| format!("{index:02} │ {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn rendered_lines_text(lines: &[Line]) -> String {
     lines
         .iter()
-        .enumerate()
-        .map(|(index, line)| {
-            let text = line
-                .spans
+        .map(|line| {
+            line.spans
                 .iter()
                 .map(|span| span.content.as_str())
-                .collect::<String>();
-            format!("{index:02} │ {text}")
+                .collect::<String>()
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -176,6 +183,149 @@ fn contribution_snapshot(markdown: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MarkdownCapabilities {
+    color: bool,
+    unicode: bool,
+    interaction: bool,
+    image_protocol: bool,
+    network: bool,
+    mermaid: bool,
+}
+
+fn capability_projection(markdown: &str, capabilities: MarkdownCapabilities) -> (String, usize) {
+    let mut options = MarkdownRenderOptions::new(50);
+    if !capabilities.color {
+        options.theme = bcode_markdown_render::MarkdownTheme {
+            text: Style::new(),
+            heading: Style::new(),
+            link: Style::new(),
+            strong: Style::new(),
+            emphasis: Style::new(),
+            strikethrough: Style::new(),
+            inline_code: Style::new(),
+            code_block_text: Style::new(),
+            code_block_border: Style::new(),
+            blockquote_bar: Style::new(),
+            alert_note: Style::new(),
+            alert_tip: Style::new(),
+            alert_important: Style::new(),
+            alert_warning: Style::new(),
+            alert_caution: Style::new(),
+            list_marker: Style::new(),
+            task_checked: Style::new(),
+            task_unchecked: Style::new(),
+            table_border: Style::new(),
+            horizontal_rule: Style::new(),
+        };
+    }
+    if capabilities.mermaid {
+        options = options.with_mermaid(320, 200);
+    }
+    if capabilities.network {
+        options = options.with_document_context(MarkdownDocumentContext {
+            base_url: Some(url::Url::parse("https://example.com/base/").unwrap()),
+            ..MarkdownDocumentContext::default()
+        });
+    }
+    let result = render_markdown(markdown, &options);
+    let actionable = if capabilities.interaction {
+        result
+            .contributions
+            .iter()
+            .filter(|item| match &item.kind {
+                MarkdownContributionKind::Link { destination, .. }
+                | MarkdownContributionKind::GitHubIssue { destination, .. } => matches!(
+                    destination,
+                    MarkdownDestination::Web(_) | MarkdownDestination::LocalPath(_)
+                ),
+                MarkdownContributionKind::Image { source, .. } => {
+                    capabilities.image_protocol
+                        && matches!(
+                            source,
+                            MarkdownDestination::Web(_) | MarkdownDestination::LocalPath(_)
+                        )
+                }
+                MarkdownContributionKind::Details { .. }
+                | MarkdownContributionKind::FootnoteReference { .. }
+                | MarkdownContributionKind::FootnoteDefinition { .. } => true,
+                MarkdownContributionKind::InlineMath { .. }
+                | MarkdownContributionKind::DisplayMath { .. }
+                | MarkdownContributionKind::Mermaid { .. } => false,
+            })
+            .count()
+    } else {
+        0
+    };
+    let mut visible = rendered_lines_text(&result.lines);
+    if !capabilities.unicode {
+        visible = visible
+            .replace('ⓘ', "NOTE")
+            .replace('◆', "TIP")
+            .replace('❗', "IMPORTANT")
+            .replace('⚠', "WARNING")
+            .replace('⛔', "CAUTION");
+    }
+    (visible, actionable)
+}
+
+#[test]
+fn capability_matrix_preserves_content_and_gates_interaction() {
+    let markdown = concat!(
+        "> [!NOTE]\n> Unicode 東京 and **important** content.\n\n",
+        "[Guide](guide.md) ![Diagram](diagram.png)\n\n",
+        "<details><summary>More</summary>Details body.</details>\n\n",
+        "```mermaid\nflowchart LR\n  A --> B\n```\n",
+    );
+    let matrix = [
+        MarkdownCapabilities {
+            color: true,
+            unicode: true,
+            interaction: true,
+            image_protocol: true,
+            network: true,
+            mermaid: true,
+        },
+        MarkdownCapabilities {
+            color: false,
+            unicode: false,
+            interaction: true,
+            image_protocol: false,
+            network: false,
+            mermaid: false,
+        },
+        MarkdownCapabilities {
+            color: false,
+            unicode: true,
+            interaction: false,
+            image_protocol: true,
+            network: true,
+            mermaid: false,
+        },
+    ];
+    for capabilities in matrix {
+        let (visible, actionable) = capability_projection(markdown, capabilities);
+        for expected in [
+            "NOTE",
+            "Unicode",
+            "important content",
+            "Guide",
+            "Diagram",
+            "More",
+            "Details body",
+            "flowchart LR",
+            "A --> B",
+        ] {
+            assert!(visible.contains(expected), "{capabilities:?}: {visible}");
+        }
+        if capabilities.interaction && capabilities.network {
+            assert!(actionable >= 3);
+        } else if !capabilities.interaction {
+            assert_eq!(actionable, 0);
+        }
+    }
 }
 
 #[test]
@@ -306,6 +456,79 @@ fn details_contributions_preserve_safe_summary_body_and_default_state() {
 }
 
 #[test]
+fn nested_details_preserve_contributions_and_readable_recursive_fallback() {
+    let result = render_markdown(DETAILS_NESTED, &MarkdownRenderOptions::new(60));
+    let details = result
+        .contributions
+        .iter()
+        .filter_map(|item| match &item.kind {
+            MarkdownContributionKind::Details {
+                summary,
+                body,
+                default_open,
+            } => Some((summary.as_str(), body.as_str(), *default_open)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(details.len(), 2);
+    assert_eq!(details[0].0, "Outer **summary**");
+    assert!(details[0].1.contains("Inner `summary`"));
+    assert!(!details[0].2);
+    assert_eq!(details[1].0, "Inner `summary`");
+    assert!(details[1].1.contains("Inner body with *Markdown*"));
+    assert!(details[1].2);
+
+    let visible = visible_snapshot(DETAILS_NESTED, 60);
+    for content in [
+        "Before.",
+        "Outer summary",
+        "Outer body.",
+        "Inner summary",
+        "Inner body with Markdown.",
+        "After inner.",
+        "After.",
+    ] {
+        assert!(visible.contains(content), "missing {content:?}: {visible}");
+    }
+    assert!(!visible.contains("<details"));
+    assert!(!visible.contains("</details>"));
+}
+
+#[test]
+fn streamed_incomplete_details_remain_visible_until_complete() {
+    let partial = "Before.\n\n<details><summary>Retry</summary>Body with **important** content";
+    let rendered = render_markdown(
+        partial,
+        &MarkdownRenderOptions::new(50).with_streaming(true),
+    );
+    let partial_visible = rendered_lines_text(&rendered.lines);
+    assert!(!partial_visible.contains("<details>"));
+    assert!(partial_visible.contains("Retry"));
+    assert!(partial_visible.contains("Body with important content"));
+    assert!(
+        !rendered
+            .contributions
+            .iter()
+            .any(|item| matches!(item.kind, MarkdownContributionKind::Details { .. }))
+    );
+
+    let complete = format!("{partial}</details>");
+    let rendered = render_markdown(&complete, &MarkdownRenderOptions::new(50));
+    let complete_visible = rendered_lines_text(&rendered.lines);
+    assert!(complete_visible.contains("Retry"));
+    assert!(complete_visible.contains("Body with important content"));
+    assert!(!complete_visible.contains("<details>"));
+    assert_eq!(
+        rendered
+            .contributions
+            .iter()
+            .filter(|item| matches!(item.kind, MarkdownContributionKind::Details { .. }))
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn streamed_semantic_ids_shift_only_at_or_after_changed_source() {
     let before = render_markdown(
         "[first](a.md) and [second](b.md)",
@@ -356,6 +579,9 @@ fn markdown_layout_signature_tracks_every_renderer_owned_layout_input() {
     let variants = [
         MarkdownRenderOptions::new(40).with_document_id("item:1"),
         MarkdownRenderOptions::new(80).with_document_id("item:2"),
+        MarkdownRenderOptions::new(80)
+            .with_document_id("item:1")
+            .with_streaming(true),
         MarkdownRenderOptions::new(80)
             .with_document_id("item:1")
             .with_mermaid(800, 600),
@@ -757,6 +983,43 @@ fn github_alert_labels_are_semantic_and_unknown_markers_remain_quotes() {
     assert!(output.contains("[!UNKNOWN]"));
     assert!(output.contains("[!NOTE] trailing text"));
     assert!(output.contains("[!NOTE Incomplete marker"));
+}
+
+#[test]
+fn every_semantic_fallback_preserves_important_content() {
+    let source = concat!(
+        "[Guide](relative.md) and ![Architecture diagram](diagram.png).\n\n",
+        "Reference.[^note]\n\n[^note]: Footnote **body**.\n\n",
+        "Inline $x^2$ and display:\n\n$$y = 2$$\n\n",
+        "<details><summary>Retry policy</summary>Retry **body**.</details>\n\n",
+        "```mermaid\nflowchart LR\n  Client --> Server\n```\n\n",
+        "| Check | State |\n|---|---|\n| integration | passing |\n",
+    );
+    for width in [80_u16, 20] {
+        let rendered = render_markdown(source, &MarkdownRenderOptions::new(width));
+        let visible = rendered_lines_text(&rendered.lines);
+        let compact = visible.replace('\n', "");
+        for expected in [
+            "Guide",
+            "Architecture diagram",
+            "[1]",
+            "Footnotes",
+            "Footnote body",
+            "x²",
+            "y = 2",
+            "Retry policy",
+            "Retry body",
+            "flowchart LR",
+            "Client --> Serve",
+            "integration",
+            "passing",
+        ] {
+            assert!(
+                compact.contains(expected),
+                "width {width} lost fallback content {expected:?}: {visible}"
+            );
+        }
+    }
 }
 
 #[test]
