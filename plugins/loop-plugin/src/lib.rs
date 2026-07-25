@@ -30,6 +30,7 @@ use bmux_tui::style::Color;
 use bmux_tui_components::modal_frame::{ModalFrame, ModalPlacement, ModalSizing, ModalTheme};
 use bmux_tui_components::text_input::{TextInputPolicy, TextInputState};
 use bmux_tui_components::text_input_box::{TextInputBox, TextInputBoxOutcome, TextInputBoxPolicy};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 const PLUGIN_ID: &str = "bcode.loop";
@@ -306,6 +307,21 @@ fn stop_loop(session_id: SessionId) -> InvokeCommandResponse {
 }
 
 fn prepare_resume(state: &mut LoopState) -> Result<(), String> {
+    if is_legacy_loop_state(state) {
+        return prepare_legacy_resume(state);
+    }
+    prepare_workflow_resume(state)
+}
+
+fn prepare_legacy_resume(state: &mut LoopState) -> Result<(), String> {
+    prepare_resume_state(state)
+}
+
+fn prepare_workflow_resume(state: &mut LoopState) -> Result<(), String> {
+    prepare_resume_state(state)
+}
+
+fn prepare_resume_state(state: &mut LoopState) -> Result<(), String> {
     if matches!(
         state.state,
         RunState::Completed | RunState::LimitReached | RunState::Canceled
@@ -767,6 +783,103 @@ fn transition_or_fail(state: &mut LoopState, next: RunState) -> bool {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+struct LoopWorkflowInput {
+    implementation_prompt: String,
+    stop_condition: String,
+    max_iterations: u32,
+}
+
+impl LoopWorkflowInput {
+    fn new(
+        implementation_prompt: String,
+        stop_condition: String,
+        max_iterations: u64,
+    ) -> Result<Self, String> {
+        if implementation_prompt.trim().is_empty() {
+            return Err("implementation prompt is required".to_string());
+        }
+        if stop_condition.trim().is_empty() {
+            return Err("stop condition is required".to_string());
+        }
+        let max_iterations = u32::try_from(max_iterations)
+            .map_err(|_| "maximum iterations exceed the workflow limit".to_string())?;
+        if !(1..=u32::try_from(HARD_MAX_ITERATIONS).unwrap_or(u32::MAX)).contains(&max_iterations) {
+            return Err(format!(
+                "maximum iterations must be 1..={HARD_MAX_ITERATIONS}"
+            ));
+        }
+        Ok(Self {
+            implementation_prompt,
+            stop_condition,
+            max_iterations,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+struct LoopWorkflowIteration {
+    implementation_prompt: String,
+    stop_condition: String,
+    max_iterations: u32,
+    iteration: u32,
+    condition_met: bool,
+    evidence: Vec<String>,
+    summary: String,
+}
+
+fn loop_workflow_definition(
+    input: &LoopWorkflowInput,
+) -> Result<bcode_workflow::WorkflowDefinition, String> {
+    let implementation = bcode_workflow::Step::configured_task(
+        "loop.implementation",
+        bcode_workflow::NodeKind::Agent,
+        serde_json::json!({
+            "agent_id": null,
+            "agent_profile_configured": false,
+            "prompt_mode": "json_input",
+            "read_only": false,
+            "tools": null,
+            "loop_role": "implementation",
+        }),
+        |state: LoopWorkflowIteration, _context| async move { Ok(state) },
+    );
+    let evaluation = bcode_workflow::Step::configured_task(
+        "loop.evaluation",
+        bcode_workflow::NodeKind::Agent,
+        serde_json::json!({
+            "agent_id": null,
+            "agent_profile_configured": false,
+            "prompt_mode": "json_input",
+            "read_only": true,
+            "tools": null,
+            "loop_role": "evaluation",
+        }),
+        |state: LoopWorkflowIteration, _context| async move { Ok(state) },
+    );
+    let cycle = implementation.then(evaluation).repeat_while(
+        "loop.repeat",
+        bcode_workflow::field::<LoopWorkflowIteration>("condition_met").eq(false),
+        input.max_iterations,
+    );
+    let workflow = bcode_workflow::WorkflowBuilder::new("bcode.loop", cycle)
+        .build()
+        .map_err(|error| error.to_string())?;
+    Ok(workflow.definition().clone())
+}
+
+fn loop_workflow_initial_value(input: &LoopWorkflowInput) -> LoopWorkflowIteration {
+    LoopWorkflowIteration {
+        implementation_prompt: input.implementation_prompt.clone(),
+        stop_condition: input.stop_condition.clone(),
+        max_iterations: input.max_iterations,
+        iteration: 1,
+        condition_met: false,
+        evidence: Vec::new(),
+        summary: String::new(),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Evaluation {
@@ -833,6 +946,10 @@ struct LoopState {
     iteration_prompt: String,
     stop_condition: String,
     max_iterations: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow_definition: Option<bcode_workflow::WorkflowDefinition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow_initial_value: Option<LoopWorkflowIteration>,
     current_iteration: u64,
     state: RunState,
     #[serde(default)]
@@ -854,13 +971,21 @@ impl LoopState {
         stop_condition: String,
         max_iterations: u64,
     ) -> Self {
+        let workflow_input =
+            LoopWorkflowInput::new(iteration_prompt, stop_condition, max_iterations)
+                .expect("loop state is created only after validated start input");
+        let definition = loop_workflow_definition(&workflow_input)
+            .expect("validated loop input must compile to the standard workflow definition");
+        let initial_value = loop_workflow_initial_value(&workflow_input);
         Self {
             schema_version: STATE_SCHEMA_VERSION,
             run_id: uuid::Uuid::new_v4().to_string(),
             session_id,
-            iteration_prompt,
-            stop_condition,
-            max_iterations,
+            iteration_prompt: workflow_input.implementation_prompt,
+            stop_condition: workflow_input.stop_condition,
+            max_iterations: u64::from(workflow_input.max_iterations),
+            workflow_definition: Some(definition),
+            workflow_initial_value: Some(initial_value),
             current_iteration: 0,
             state: RunState::Ready,
             latest_evaluation: None,
@@ -1501,6 +1626,14 @@ fn state_root() -> PathBuf {
     )
 }
 
+const fn loop_state_uses_workflow_runtime(state: &LoopState) -> bool {
+    state.workflow_definition.is_some() && state.workflow_initial_value.is_some()
+}
+
+const fn is_legacy_loop_state(state: &LoopState) -> bool {
+    !loop_state_uses_workflow_runtime(state)
+}
+
 fn validate_state(state: &LoopState) -> Result<(), String> {
     if state.schema_version != STATE_SCHEMA_VERSION {
         return Err(format!(
@@ -1518,6 +1651,29 @@ fn validate_state(state: &LoopState) -> Result<(), String> {
     }
     if state.current_iteration > state.max_iterations {
         return Err("persisted loop iteration count exceeds its maximum".to_owned());
+    }
+    match (&state.workflow_definition, &state.workflow_initial_value) {
+        (Some(definition), Some(initial_value)) => {
+            definition
+                .validate()
+                .map_err(|error| format!("invalid persisted loop workflow definition: {error}"))?;
+            if definition.name != "bcode.loop" {
+                return Err("persisted loop workflow definition has the wrong identity".to_string());
+            }
+            if initial_value.max_iterations != u32::try_from(state.max_iterations).unwrap_or(0)
+                || initial_value.implementation_prompt != state.iteration_prompt
+                || initial_value.stop_condition != state.stop_condition
+            {
+                return Err("persisted loop workflow input disagrees with loop state".to_string());
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "persisted loop workflow definition/input must be both present or both absent"
+                    .to_string(),
+            );
+        }
     }
     Ok(())
 }
@@ -1596,6 +1752,66 @@ mod tests {
                 ..bmux_keyboard::Modifiers::NONE
             },
         })
+    }
+
+    #[test]
+    fn new_loop_state_embeds_valid_standard_workflow_definition() {
+        let state = LoopState::new(
+            SessionId::new(),
+            "implement".to_string(),
+            "all checks pass".to_string(),
+            3,
+        );
+        assert!(loop_state_uses_workflow_runtime(&state));
+        assert!(!is_legacy_loop_state(&state));
+        let definition = state.workflow_definition.as_ref().expect("definition");
+        let initial = state.workflow_initial_value.as_ref().expect("input");
+        assert_eq!(initial.implementation_prompt, "implement");
+        assert_eq!(initial.stop_condition, "all checks pass");
+        assert_eq!(initial.max_iterations, 3);
+        assert_eq!(definition.name, "bcode.loop");
+        assert_eq!(
+            definition.nodes["loop.implementation"].kind,
+            bcode_workflow::NodeKind::Agent
+        );
+        assert_eq!(
+            definition.nodes["loop.evaluation"].kind,
+            bcode_workflow::NodeKind::Agent
+        );
+        assert_eq!(
+            definition.nodes["loop.repeat"].kind,
+            bcode_workflow::NodeKind::Repeat
+        );
+        assert_eq!(
+            definition.nodes["loop.evaluation"]
+                .configuration
+                .get("read_only"),
+            Some(&serde_json::json!(true))
+        );
+        assert!(definition.edges.iter().any(|edge| matches!(
+            edge.kind,
+            bcode_workflow::EdgeKind::Back {
+                max_iterations: 3,
+                ..
+            }
+        )));
+        validate_state(&state).expect("valid state");
+    }
+
+    #[test]
+    fn legacy_loop_state_remains_detectable_and_uses_legacy_resume() {
+        let mut state = LoopState::new(
+            SessionId::new(),
+            "implement".to_string(),
+            "done".to_string(),
+            2,
+        );
+        state.workflow_definition = None;
+        state.workflow_initial_value = None;
+        state.state = RunState::Paused;
+        assert!(is_legacy_loop_state(&state));
+        prepare_resume(&mut state).expect("legacy resume");
+        assert_eq!(state.state, RunState::Ready);
     }
 
     #[test]
