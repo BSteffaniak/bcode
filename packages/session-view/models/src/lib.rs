@@ -794,6 +794,9 @@ pub enum TranscriptViewItemKind {
     ToolContribution {
         contribution: bcode_session_models::ToolContributionEvent,
         placement: bcode_session_models::ToolContributionPlacement,
+        /// Current semantic state of the owning invocation, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invocation: Option<Box<ToolInvocationView>>,
     },
 }
 

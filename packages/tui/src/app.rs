@@ -2434,6 +2434,7 @@ impl BmuxApp {
                 );
             }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
+                self.sync_shared_tool_contributions(&record.invocation_id);
                 if application.live_activity() {
                     self.set_activity(ActivityState::PreparingFollowUpRequest);
                 }
@@ -2575,6 +2576,7 @@ impl BmuxApp {
                     envelope.placement,
                 ),
             SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
+                self.sync_shared_tool_contributions(&lifecycle.invocation_id);
                 if lifecycle.stage == bcode_session_models::ToolInvocationLifecycleStage::Started
                     && let Some(context) = self
                         .tool_call_contexts
@@ -3059,6 +3061,29 @@ impl BmuxApp {
             .rev()
             .map(terminal_item_from_shared)
             .find(|item| item.role == role && item.streaming)
+    }
+
+    fn sync_shared_tool_contributions(&mut self, invocation_id: &str) {
+        let items = self
+            .session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    &item.kind,
+                    bcode_session_view_models::TranscriptViewItemKind::ToolContribution {
+                        contribution,
+                        ..
+                    } if contribution.invocation_id == invocation_id
+                )
+            })
+            .map(terminal_item_from_shared)
+            .collect::<Vec<_>>();
+        for item in items {
+            self.transcript.upsert_shared_item(item);
+        }
     }
 
     fn shared_tool_request_item(

@@ -5787,6 +5787,7 @@ fn replayed_shell_request_uses_shell_request_contribution_renderer() {
         rendered.contains("/Users/braden/GitHub/bcode ❯"),
         "{rendered}"
     );
+    assert!(rendered.contains("Shell run · timeout 2m"), "{rendered}");
     assert!(!rendered.contains("Tool · shell.run"), "{rendered}");
     assert!(!rendered.contains("arguments"), "{rendered}");
 }

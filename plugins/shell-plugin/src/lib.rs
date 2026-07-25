@@ -32,10 +32,10 @@ use bcode_tool::{
     ToolInvocationResponse, ToolInvocationResult, ToolList,
 };
 use contracts::{
-    SHELL_INVOCATION_INPUT_SCHEMA, SHELL_RECORDING_CONTENT_TYPE, SHELL_RECORDING_REF_KEY,
-    SHELL_RUN_SCHEMA, SHELL_RUN_SUMMARY_SCHEMA, SHELL_RUN_TOOL_NAME, SHELL_SCHEMA_VERSION,
-    ShellInvocationAction, ShellLiveRecordingPayload, ShellRunArguments, ShellRunResult,
-    TERMINAL_PTY_STREAM_CONTENT_TYPE, TERMINAL_PTY_STREAM_REF_KEY,
+    DEFAULT_SHELL_TIMEOUT_MS, SHELL_INVOCATION_INPUT_SCHEMA, SHELL_RECORDING_CONTENT_TYPE,
+    SHELL_RECORDING_REF_KEY, SHELL_RUN_SCHEMA, SHELL_RUN_SUMMARY_SCHEMA, SHELL_RUN_TOOL_NAME,
+    SHELL_SCHEMA_VERSION, ShellInvocationAction, ShellLiveRecordingPayload, ShellRunArguments,
+    ShellRunResult, TERMINAL_PTY_STREAM_CONTENT_TYPE, TERMINAL_PTY_STREAM_REF_KEY,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -46,7 +46,6 @@ use std::process::Command;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
-const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_TERMINAL_COLUMNS: u16 = 120;
 const DEFAULT_TERMINAL_ROWS: u16 = 30;
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
@@ -874,7 +873,7 @@ fn run_terminal_shell_command_inner(
     paths: TerminalRunPaths<'_>,
     environment: &impl bcode_config::ConfigEnvironment,
 ) -> Result<ToolInvocationResponse, String> {
-    let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
+    let timeout = Duration::from_millis(arguments.timeout_ms.unwrap_or(DEFAULT_SHELL_TIMEOUT_MS));
     let cwd = resolve_effective_cwd(arguments, paths.session_cwd);
     let shell_config = shell_config_with_environment(cwd.as_deref(), environment)?;
     let format_commands =

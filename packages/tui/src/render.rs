@@ -981,6 +981,7 @@ fn push_transcript_item_rows(
         TranscriptItemKind::ToolContribution {
             contribution,
             placement,
+            invocation,
         } => {
             let artifact = bcode_session_models::ToolArtifact {
                 artifact_id: format!(
@@ -996,9 +997,52 @@ fn push_transcript_item_rows(
                 refs: Vec::new(),
             };
             let visual = CanonicalToolVisual::from_artifact(&artifact);
+            let CanonicalToolVisual::Plugin(plugin_visual) = &visual;
             if canonical_plugin_visual_available(&visual, plugin_host) {
-                push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host);
-                rows.push(Line::default());
+                match canonical_plugin_visual_render_mode(plugin_visual, plugin_host) {
+                    Some(PluginTuiVisualRenderMode::FullBlock) => {
+                        push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host);
+                        rows.push(Line::default());
+                    }
+                    Some(PluginTuiVisualRenderMode::TranscriptBlock) => {
+                        let header = canonical_plugin_visual_header(plugin_visual, plugin_host)
+                            .unwrap_or_default();
+                        let mut timing = item.tool_timing();
+                        if let Some(timeout_ms) = header.timeout_ms {
+                            timing.get_or_insert_default().timeout_ms = Some(timeout_ms);
+                        }
+                        push_plugin_transcript_block_rows(
+                            rows,
+                            PluginTranscriptBlockContext {
+                                title: header.title.as_deref().unwrap_or("Tool contribution"),
+                                visual: plugin_visual,
+                                working_directory: invocation
+                                    .as_deref()
+                                    .and_then(|invocation| invocation.working_directory.as_deref()),
+                                plugin_host,
+                                streaming: item.streaming(),
+                                is_error: invocation
+                                    .as_deref()
+                                    .and_then(|invocation| invocation.is_error)
+                                    .unwrap_or(false),
+                                timing,
+                            },
+                            width,
+                        );
+                    }
+                    Some(PluginTuiVisualRenderMode::Inline) | None => {
+                        push_tool_block_header(
+                            rows,
+                            "Tool contribution",
+                            item.tool_timing(),
+                            item.streaming(),
+                            false,
+                            width,
+                        );
+                        push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host);
+                        rows.push(Line::default());
+                    }
+                }
             } else if matches!(
                 placement,
                 bcode_session_models::ToolContributionPlacement::Request
@@ -1569,6 +1613,22 @@ fn canonical_plugin_visual_render_mode(
     })
 }
 
+fn canonical_plugin_visual_header(
+    visual: &CanonicalPluginVisual,
+    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
+) -> Option<bcode_plugin_sdk::tui::PluginTuiTranscriptHeader> {
+    let presentation = plugin_host?;
+    let route = presentation.host().visual_adapter(
+        &visual.schema,
+        visual.schema_version,
+        "tui",
+        visual.producer_plugin_id.as_deref(),
+    )?;
+    presentation
+        .registry(&route.plugin_id)?
+        .visual_transcript_header(&route.schema, &visual.payload)
+}
+
 fn canonical_plugin_visual_available(
     visual: &CanonicalToolVisual,
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
@@ -1725,25 +1785,28 @@ fn tool_block_title_with_timing(
     if timing.timed_out == Some(true) {
         parts.push("timed out".to_owned());
     }
-    if streaming {
-        if let Some(started_at_ms) = timing.started_at_ms {
+    if streaming && let Some(started_at_ms) = timing.started_at_ms {
+        parts.push(format!(
+            "elapsed {}",
+            format_millis(now_ms.saturating_sub(started_at_ms))
+        ));
+    }
+    if let Some(timeout_ms) = timing.timeout_ms
+        && (streaming || timing.duration_ms.is_none() && timing.finished_at_ms.is_none())
+    {
+        parts.push(format!("timeout {}", format_millis(timeout_ms)));
+    }
+    if !streaming {
+        if let Some(duration_ms) = timing.duration_ms {
+            parts.push(format!("duration {}", format_millis(duration_ms)));
+        } else if let (Some(started_at_ms), Some(finished_at_ms)) =
+            (timing.started_at_ms, timing.finished_at_ms)
+        {
             parts.push(format!(
-                "elapsed {}",
-                format_millis(now_ms.saturating_sub(started_at_ms))
+                "duration {}",
+                format_millis(finished_at_ms.saturating_sub(started_at_ms))
             ));
         }
-        if let Some(timeout_ms) = timing.timeout_ms {
-            parts.push(format!("timeout {}", format_millis(timeout_ms)));
-        }
-    } else if let Some(duration_ms) = timing.duration_ms {
-        parts.push(format!("duration {}", format_millis(duration_ms)));
-    } else if let (Some(started_at_ms), Some(finished_at_ms)) =
-        (timing.started_at_ms, timing.finished_at_ms)
-    {
-        parts.push(format!(
-            "duration {}",
-            format_millis(finished_at_ms.saturating_sub(started_at_ms))
-        ));
     }
     if parts.is_empty() {
         title.to_owned()

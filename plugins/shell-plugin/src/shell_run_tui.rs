@@ -130,6 +130,23 @@ impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for ShellRunTuiVisualAdapter 
         }
     }
 
+    fn transcript_header(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> bcode_plugin_sdk::tui::PluginTuiTranscriptHeader {
+        let timeout_ms = (kind == "bcode.tool.request.shell.run").then(|| {
+            serde_json::from_value::<crate::contracts::ShellRunArguments>(payload.clone())
+                .ok()
+                .and_then(|arguments| arguments.timeout_ms)
+                .unwrap_or(crate::contracts::DEFAULT_SHELL_TIMEOUT_MS)
+        });
+        bcode_plugin_sdk::tui::PluginTuiTranscriptHeader {
+            title: Some("Shell run".to_owned()),
+            timeout_ms,
+        }
+    }
+
     fn invocation_event_input(
         &self,
         invocation_id: &str,
@@ -1432,6 +1449,28 @@ mod tests {
             frames,
             columns,
         )
+    }
+
+    #[test]
+    fn transcript_header_reports_explicit_and_default_timeout() {
+        let adapter = ShellRunTuiVisualAdapter::default();
+        let explicit = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::transcript_header(
+            &adapter,
+            "bcode.tool.request.shell.run",
+            &serde_json::json!({"command": "sleep 1", "timeout_ms": 5_000}),
+        );
+        let defaulted = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::transcript_header(
+            &adapter,
+            "bcode.tool.request.shell.run",
+            &serde_json::json!({"command": "sleep 1"}),
+        );
+
+        assert_eq!(explicit.title.as_deref(), Some("Shell run"));
+        assert_eq!(explicit.timeout_ms, Some(5_000));
+        assert_eq!(
+            defaulted.timeout_ms,
+            Some(crate::contracts::DEFAULT_SHELL_TIMEOUT_MS)
+        );
     }
 
     #[test]

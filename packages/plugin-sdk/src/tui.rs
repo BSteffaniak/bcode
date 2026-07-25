@@ -223,6 +223,15 @@ impl PluginTuiAction {
     }
 }
 
+/// Host-owned transcript header hints supplied by a plugin visual adapter.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PluginTuiTranscriptHeader {
+    /// Plugin-selected title for host transcript chrome.
+    pub title: Option<String>,
+    /// Configured invocation timeout in milliseconds, when known.
+    pub timeout_ms: Option<u64>,
+}
+
 /// How a visual adapter's rows should be composed into the host transcript block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PluginTuiVisualRenderMode {
@@ -324,6 +333,15 @@ pub trait PluginTuiVisualAdapter: Send + Sync {
     /// Return how this visual should be composed by the host.
     fn render_mode(&self, _kind: &str, _payload: &serde_json::Value) -> PluginTuiVisualRenderMode {
         PluginTuiVisualRenderMode::Inline
+    }
+
+    /// Return plugin-owned hints for the host transcript header.
+    fn transcript_header(
+        &self,
+        _kind: &str,
+        _payload: &serde_json::Value,
+    ) -> PluginTuiTranscriptHeader {
+        PluginTuiTranscriptHeader::default()
     }
 
     /// Convert a renderer event into neutral input for an active invocation.
@@ -646,6 +664,19 @@ impl PluginTuiRegistry {
             .iter()
             .find(|adapter| adapter.supports(kind))
             .map(|adapter| adapter.render_mode(kind, payload))
+    }
+
+    /// Return host transcript header hints from a matching visual adapter.
+    #[must_use]
+    pub fn visual_transcript_header(
+        &self,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Option<PluginTuiTranscriptHeader> {
+        self.visual_adapters
+            .iter()
+            .find(|adapter| adapter.supports(kind))
+            .map(|adapter| adapter.transcript_header(kind, payload))
     }
 
     /// Convert a renderer event through a matching visual adapter.

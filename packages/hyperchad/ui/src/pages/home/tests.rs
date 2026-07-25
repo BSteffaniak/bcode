@@ -1719,6 +1719,7 @@ fn bundled_visual_registry_covers_actual_high_value_request_schemas() {
 #[test]
 fn unknown_contribution_has_no_raw_hyperchad_fallback() {
     let kind = TranscriptViewItemKind::ToolContribution {
+        invocation: None,
         placement: bcode_session_models::ToolContributionPlacement::Request,
         contribution: bcode_session_models::ToolContributionEvent {
             invocation_id: "call".to_owned(),
@@ -1742,6 +1743,7 @@ fn unknown_contribution_has_no_raw_hyperchad_fallback() {
 #[test]
 fn git_contribution_renders_through_schema_adapter_without_fallback() {
     let kind = TranscriptViewItemKind::ToolContribution {
+        invocation: None,
         placement: bcode_session_models::ToolContributionPlacement::Request,
         contribution: bcode_session_models::ToolContributionEvent {
             invocation_id: "git-call".to_owned(),
@@ -1769,6 +1771,7 @@ fn git_contribution_renders_through_schema_adapter_without_fallback() {
 #[test]
 fn unsupported_shell_contribution_has_no_raw_hyperchad_fallback() {
     let kind = TranscriptViewItemKind::ToolContribution {
+        invocation: None,
         placement: bcode_session_models::ToolContributionPlacement::Request,
         contribution: bcode_session_models::ToolContributionEvent {
             invocation_id: "shell-call".to_owned(),

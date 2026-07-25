@@ -16,6 +16,8 @@ pub const SHELL_RUN_SUMMARY_SCHEMA: &str = "bcode.shell.run.summary";
 pub const SHELL_INVOCATION_INPUT_SCHEMA: &str = "bcode.shell.invocation-input";
 /// Current version of all JSON shell invocation schemas above.
 pub const SHELL_SCHEMA_VERSION: u32 = 1;
+/// Default shell execution timeout in milliseconds.
+pub const DEFAULT_SHELL_TIMEOUT_MS: u64 = 30_000;
 
 /// Raw PTY byte-stream artifact reference key.
 pub const TERMINAL_PTY_STREAM_REF_KEY: &str = "terminal_pty_stream";

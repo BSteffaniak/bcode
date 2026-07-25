@@ -277,6 +277,7 @@ fn transcript_item_body_with_context(
         TranscriptViewItemKind::ToolContribution {
             contribution,
             placement,
+            invocation: _,
         } => render_tool_contribution(contribution, *placement),
     }
 }

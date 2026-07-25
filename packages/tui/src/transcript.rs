@@ -110,6 +110,8 @@ pub enum TranscriptItemKind {
         contribution: Box<bcode_session_models::ToolContributionEvent>,
         /// Renderer-neutral semantic placement.
         placement: bcode_session_models::ToolContributionPlacement,
+        /// Current semantic state of the owning invocation, when known.
+        invocation: Option<Box<ToolInvocationView>>,
     },
     /// Generic fallback item.
     Generic,
@@ -339,6 +341,10 @@ impl TranscriptItem {
         match &self.kind {
             TranscriptItemKind::ToolRequest { timing, .. }
             | TranscriptItemKind::ToolResult { timing, .. } => Some(*timing),
+            TranscriptItemKind::ToolContribution {
+                invocation: Some(invocation),
+                ..
+            } => Some(tool_timing_from_view(invocation)),
             _ => None,
         }
     }
@@ -734,6 +740,7 @@ pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
         TranscriptViewItemKind::ToolContribution {
             contribution,
             placement,
+            invocation,
         } => {
             let fallback = match placement {
                 bcode_session_models::ToolContributionPlacement::Request => "tool request",
@@ -749,6 +756,7 @@ pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
                 TranscriptItemKind::ToolContribution {
                     contribution: Box::new(contribution.clone()),
                     placement: *placement,
+                    invocation: invocation.clone(),
                 },
             )
         }
@@ -848,6 +856,16 @@ fn tool_result_text_from_shared(tool: &ToolInvocationView) -> Option<String> {
         Some(ToolResultView::Artifact { .. }) | None => {
             tool.result_text.as_deref().map(display_tool_result_text)
         }
+    }
+}
+
+const fn tool_timing_from_view(tool: &ToolInvocationView) -> ToolTiming {
+    ToolTiming {
+        started_at_ms: tool.timing.started_at_ms,
+        finished_at_ms: tool.timing.finished_at_ms,
+        timeout_ms: tool.timing.timeout_ms,
+        timed_out: tool.timing.timed_out,
+        duration_ms: tool.timing.duration_ms,
     }
 }
 
