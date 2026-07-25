@@ -16,17 +16,58 @@ const BACKUP_BUFFER_BYTES: usize = 64 * 1024;
 /// Progress callback for retained migration-backup planning, copying, and verification.
 pub type BackupProgressCallback = Arc<dyn Fn(SessionMigrationProgress) + Send + Sync>;
 
+/// Length and digest evidence for one physical database file retained in a migration backup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MigrationBackupFileEvidence {
+    /// Source file length in bytes.
+    pub bytes: u64,
+    /// Lowercase SHA-256 digest of the source bytes.
+    pub sha256: String,
+}
+
+/// Canonical source-history evidence captured before migration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct MigrationBackupCanonicalEvidence {
+    /// Decode/classification coverage captured before backup. This equals `event_count` for a
+    /// migratable source; a smaller value records where damaged or unsupported history failed.
+    pub classified_event_count: u64,
+    /// Canonical source event count.
+    pub event_count: u64,
+    /// Canonical source tail, if the session contains events.
+    pub event_tail: Option<u64>,
+    /// Digest over ordered canonical source payloads.
+    pub payload_digest_sha256: String,
+}
+
 /// Metadata written alongside a verified retained migration backup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct MigrationBackupManifest {
     /// Session identifier whose physical store was retained.
     pub session_id: SessionId,
+    /// Stable migration operation identity.
+    pub operation_id: String,
     /// Writer epoch observed before migration.
     pub source_writer_epoch: u64,
     /// Writer epoch the migration intends to produce.
     pub target_writer_epoch: u64,
+    /// Ordered monotonic migration steps selected for this source.
+    pub migration_step_ids: Vec<String>,
+    /// Canonical source-history evidence captured before backup.
+    pub canonical_source: MigrationBackupCanonicalEvidence,
+    /// Converted event counts keyed by `schema:kind`.
+    pub converted_events: BTreeMap<String, u64>,
+    /// Retired-known event counts keyed by `schema:kind`.
+    pub retired_known_events: BTreeMap<String, u64>,
+    /// Main database file evidence.
+    pub database: MigrationBackupFileEvidence,
+    /// WAL sidecar evidence when the source has a WAL.
+    pub wal: Option<MigrationBackupFileEvidence>,
+    /// shared-memory sidecar evidence when the source has one.
+    pub shm: Option<MigrationBackupFileEvidence>,
     /// Backup creation time as Unix epoch milliseconds.
     pub created_at_ms: u64,
+    /// Time at which all retained files passed length and digest verification.
+    pub verified_at_ms: u64,
 }
 
 /// Request to create a verified retained migration backup using the standard storage layout.
@@ -36,10 +77,20 @@ pub struct MigrationBackupRequest {
     pub sessions_root: PathBuf,
     /// Session identifier and canonical directory name.
     pub session_id: SessionId,
+    /// Stable migration operation identity.
+    pub operation_id: String,
     /// Writer epoch observed before migration.
     pub source_writer_epoch: u64,
     /// Writer epoch the migration intends to produce.
     pub target_writer_epoch: u64,
+    /// Ordered monotonic migration steps selected for this source.
+    pub migration_step_ids: Vec<String>,
+    /// Canonical source-history evidence captured before backup.
+    pub canonical_source: MigrationBackupCanonicalEvidence,
+    /// Converted event counts keyed by `schema:kind`.
+    pub converted_events: BTreeMap<String, u64>,
+    /// Retired-known event counts keyed by `schema:kind`.
+    pub retired_known_events: BTreeMap<String, u64>,
 }
 
 /// Timing, size, and retained path for one verified migration backup.
@@ -100,6 +151,51 @@ enum BackupCopyFault {
     ShortWriteAfter(u64),
 }
 
+#[derive(Debug)]
+struct VerifiedBackupEvidence {
+    result: VerifiedMigrationBackup,
+    files: BTreeMap<PathBuf, MigrationBackupFileEvidence>,
+    verified_at_ms: u64,
+}
+
+async fn write_backup_manifest(
+    destination: &Path,
+    manifest: Vec<u8>,
+) -> Result<(), MigrationBackupError> {
+    let destination = destination.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let result = fs::write(destination.join("migration-backup.json"), manifest);
+        if result.is_err() && destination.exists() {
+            let _ = fs::remove_dir_all(&destination);
+        }
+        result
+    })
+    .await??;
+    Ok(())
+}
+
+fn current_unix_timestamp_ms() -> Result<u64, MigrationBackupError> {
+    Ok(u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| MigrationBackupError::Clock)?
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX))
+}
+
+fn required_file_evidence(
+    files: &BTreeMap<PathBuf, MigrationBackupFileEvidence>,
+    relative_path: &str,
+) -> Result<MigrationBackupFileEvidence, MigrationBackupError> {
+    files.get(Path::new(relative_path)).cloned().ok_or_else(|| {
+        MigrationBackupError::Io(std::io::Error::new(
+            ErrorKind::NotFound,
+            format!("migration source is missing required {relative_path}"),
+        ))
+    })
+}
+
 /// Create a retained physical backup using the canonical session-backup layout and manifest.
 ///
 /// # Errors
@@ -110,13 +206,7 @@ pub async fn create_retained_migration_backup(
     request: MigrationBackupRequest,
     progress: Option<BackupProgressCallback>,
 ) -> Result<RetainedMigrationBackup, MigrationBackupError> {
-    let created_at_ms = u64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| MigrationBackupError::Clock)?
-            .as_millis(),
-    )
-    .unwrap_or(u64::MAX);
+    let created_at_ms = current_unix_timestamp_ms()?;
     let source = request.sessions_root.join(request.session_id.to_string());
     let destination = request
         .sessions_root
@@ -127,21 +217,31 @@ pub async fn create_retained_migration_backup(
             "{}-{}-epoch-{}",
             created_at_ms, request.session_id, request.source_writer_epoch
         ));
-    let manifest = serde_json::to_vec_pretty(&MigrationBackupManifest {
+    let evidence =
+        create_verified_migration_backup_evidence(&source, &destination, progress).await?;
+    let manifest = MigrationBackupManifest {
         session_id: request.session_id,
+        operation_id: request.operation_id,
         source_writer_epoch: request.source_writer_epoch,
         target_writer_epoch: request.target_writer_epoch,
+        migration_step_ids: request.migration_step_ids,
+        canonical_source: request.canonical_source,
+        converted_events: request.converted_events,
+        retired_known_events: request.retired_known_events,
+        database: required_file_evidence(&evidence.files, "session.db")?,
+        wal: evidence.files.get(Path::new("session.db-wal")).cloned(),
+        shm: evidence.files.get(Path::new("session.db-shm")).cloned(),
         created_at_ms,
-    })?;
-    let result =
-        create_verified_migration_backup(&source, &destination, &manifest, progress).await?;
+        verified_at_ms: evidence.verified_at_ms,
+    };
+    write_backup_manifest(&destination, serde_json::to_vec_pretty(&manifest)?).await?;
     Ok(RetainedMigrationBackup {
         path: destination,
-        files: result.files,
-        bytes: result.bytes,
-        plan_duration: result.plan_duration,
-        copy_duration: result.copy_duration,
-        verify_duration: result.verify_duration,
+        files: evidence.result.files,
+        bytes: evidence.result.bytes,
+        plan_duration: evidence.result.plan_duration,
+        copy_duration: evidence.result.copy_duration,
+        verify_duration: evidence.result.verify_duration,
     })
 }
 
@@ -158,14 +258,22 @@ pub async fn create_verified_migration_backup(
     manifest: &[u8],
     progress: Option<BackupProgressCallback>,
 ) -> Result<VerifiedMigrationBackup, MigrationBackupError> {
+    let evidence = create_verified_migration_backup_evidence(source, destination, progress).await?;
+    write_backup_manifest(destination, manifest.to_vec()).await?;
+    Ok(evidence.result)
+}
+
+async fn create_verified_migration_backup_evidence(
+    source: &Path,
+    destination: &Path,
+    progress: Option<BackupProgressCallback>,
+) -> Result<VerifiedBackupEvidence, MigrationBackupError> {
     let source = source.to_path_buf();
     let destination = destination.to_path_buf();
-    let manifest = manifest.to_vec();
     Ok(tokio::task::spawn_blocking(move || {
         create_verified_migration_backup_blocking(
             &source,
             &destination,
-            &manifest,
             BackupCopyFault::None,
             progress.as_ref(),
         )
@@ -195,10 +303,9 @@ fn publish_progress(
 fn create_verified_migration_backup_blocking(
     source: &Path,
     destination: &Path,
-    manifest: &[u8],
     fault: BackupCopyFault,
     progress: Option<&BackupProgressCallback>,
-) -> std::io::Result<VerifiedMigrationBackup> {
+) -> std::io::Result<VerifiedBackupEvidence> {
     if destination.exists() {
         return Err(std::io::Error::new(
             ErrorKind::AlreadyExists,
@@ -248,13 +355,39 @@ fn create_verified_migration_backup_blocking(
         let started = Instant::now();
         verify_backup_files(destination, &files, &source_hashes, progress, bytes)?;
         let verify_duration = started.elapsed();
-        fs::write(destination.join("migration-backup.json"), manifest)?;
-        Ok(VerifiedMigrationBackup {
-            files: file_count,
-            bytes,
-            plan_duration,
-            copy_duration,
-            verify_duration,
+        let verified_at_ms = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_err(|_| std::io::Error::other("system clock is earlier than Unix epoch"))?
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        let files = files
+            .into_iter()
+            .map(|file| {
+                let sha256 = source_hashes
+                    .get(&file.relative_path)
+                    .copied()
+                    .ok_or_else(|| std::io::Error::other("missing source backup digest"))?;
+                Ok((
+                    file.relative_path,
+                    MigrationBackupFileEvidence {
+                        bytes: file.bytes,
+                        sha256: hex_digest(sha256),
+                    },
+                ))
+            })
+            .collect::<std::io::Result<BTreeMap<_, _>>>()?;
+        Ok(VerifiedBackupEvidence {
+            result: VerifiedMigrationBackup {
+                files: file_count,
+                bytes,
+                plan_duration,
+                copy_duration,
+                verify_duration,
+            },
+            files,
+            verified_at_ms,
         })
     })();
     if result.is_err() && destination.exists() {
@@ -283,7 +416,7 @@ fn migration_backup_files(root: &Path, directory: &Path) -> std::io::Result<Vec<
                 .strip_prefix(root)
                 .map_err(|error| std::io::Error::other(error.to_string()))?
                 .to_path_buf();
-            if relative_path == Path::new("migration-backup.json") {
+            if relative_path.starts_with(Path::new("migration-backup.json")) {
                 return Err(std::io::Error::new(
                     ErrorKind::AlreadyExists,
                     "source contains reserved migration-backup.json path",
@@ -409,6 +542,17 @@ fn verify_backup_files(
     Ok(())
 }
 
+fn hex_digest(digest: [u8; 32]) -> String {
+    use std::fmt::Write as _;
+
+    digest
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            write!(output, "{byte:02x}").expect("writing to a String cannot fail");
+            output
+        })
+}
+
 fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
     let mut reader = BufReader::with_capacity(BACKUP_BUFFER_BYTES, File::open(path)?);
     let mut hasher = Sha256::new();
@@ -435,13 +579,25 @@ mod tests {
         let source = sessions_root.join(session_id.to_string());
         fs::create_dir_all(&source).expect("source");
         fs::write(source.join("session.db"), b"canonical").expect("database");
+        fs::write(source.join("session.db-wal"), b"wal").expect("WAL");
+        fs::write(source.join("session.db-shm"), b"shm").expect("SHM");
 
         let result = create_retained_migration_backup(
             MigrationBackupRequest {
                 sessions_root,
                 session_id,
+                operation_id: "operation-1".to_owned(),
                 source_writer_epoch: 2,
                 target_writer_epoch: 5,
+                migration_step_ids: vec!["session-writer-epoch-2-to-3".to_owned()],
+                canonical_source: MigrationBackupCanonicalEvidence {
+                    classified_event_count: 1,
+                    event_count: 1,
+                    event_tail: Some(0),
+                    payload_digest_sha256: "canonical-digest".to_owned(),
+                },
+                converted_events: BTreeMap::from([("28:tool_call_finished".to_owned(), 1)]),
+                retired_known_events: BTreeMap::new(),
             },
             None,
         )
@@ -461,9 +617,27 @@ mod tests {
         )
         .expect("manifest json");
         assert_eq!(manifest["session_id"], session_id.to_string());
+        assert_eq!(manifest["operation_id"], "operation-1");
         assert_eq!(manifest["source_writer_epoch"], 2);
         assert_eq!(manifest["target_writer_epoch"], 5);
+        assert_eq!(manifest["canonical_source"]["classified_event_count"], 1);
+        assert_eq!(manifest["canonical_source"]["event_count"], 1);
+        assert_eq!(manifest["canonical_source"]["event_tail"], 0);
+        assert_eq!(
+            manifest["canonical_source"]["payload_digest_sha256"],
+            "canonical-digest"
+        );
+        assert_eq!(manifest["database"]["bytes"], 9);
+        assert_eq!(
+            manifest["database"]["sha256"].as_str().map(str::len),
+            Some(64)
+        );
+        assert_eq!(manifest["wal"]["bytes"], 3);
+        assert_eq!(manifest["wal"]["sha256"].as_str().map(str::len), Some(64));
+        assert_eq!(manifest["shm"]["bytes"], 3);
+        assert_eq!(manifest["shm"]["sha256"].as_str().map(str::len), Some(64));
         assert!(manifest["created_at_ms"].as_u64().is_some());
+        assert!(manifest["verified_at_ms"].as_u64().is_some());
     }
 
     #[test]
@@ -479,13 +653,15 @@ mod tests {
         let result = create_verified_migration_backup_blocking(
             &source,
             &destination,
-            br#"{"manifest":true}"#,
             BackupCopyFault::None,
             None,
         )
         .expect("backup");
-        assert_eq!(result.files, 3);
-        assert_eq!(result.bytes, u64::try_from(large.len() + 5).expect("bytes"));
+        assert_eq!(result.result.files, 3);
+        assert_eq!(
+            result.result.bytes,
+            u64::try_from(large.len() + 5).expect("bytes")
+        );
         assert_eq!(fs::read(destination.join("large")).expect("large"), large);
         assert!(
             fs::read(destination.join("empty"))
@@ -506,7 +682,6 @@ mod tests {
             create_verified_migration_backup_blocking(
                 &source,
                 &destination,
-                b"manifest",
                 BackupCopyFault::None,
                 None,
             )
@@ -521,7 +696,6 @@ mod tests {
             create_verified_migration_backup_blocking(
                 &source,
                 &destination,
-                b"manifest",
                 BackupCopyFault::None,
                 None,
             )
@@ -549,14 +723,9 @@ mod tests {
             ),
         ] {
             let destination = temp.path().join(format!("backup-{index}"));
-            let error = create_verified_migration_backup_blocking(
-                &source,
-                &destination,
-                b"manifest",
-                fault,
-                None,
-            )
-            .expect_err("fault");
+            let error =
+                create_verified_migration_backup_blocking(&source, &destination, fault, None)
+                    .expect_err("fault");
             assert_eq!(error.kind(), expected);
             assert!(!destination.exists());
         }

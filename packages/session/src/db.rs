@@ -744,6 +744,13 @@ impl GlobalSessionDb {
 pub type SessionMigrationProgressCallback =
     Arc<dyn Fn(bcode_session_models::SessionMigrationProgress) + Send + Sync>;
 
+pub(crate) struct MigrationSourceEvidence {
+    pub canonical: bcode_session_migration::MigrationBackupCanonicalEvidence,
+    pub converted_events: BTreeMap<String, u64>,
+    pub retired_known_events: BTreeMap<String, u64>,
+    pub classification_error: Option<SessionDbError>,
+}
+
 /// Backend-agnostic handle for one isolated session database.
 #[derive(Debug, Clone)]
 pub struct SessionDb {
@@ -1435,6 +1442,105 @@ impl SessionDb {
             schemas,
             kinds,
         ))
+    }
+
+    /// Classify and digest canonical source history before a migration backup is created.
+    ///
+    /// The scan is bounded to fixed-size pages and retains at most one decoded event at a time.
+    /// It never mutates canonical storage or projections.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when canonical sequence/identity is invalid or a payload has no supported
+    /// deterministic writable-migration classification.
+    pub(crate) async fn migration_source_evidence(
+        &self,
+    ) -> SessionDbResult<MigrationSourceEvidence> {
+        let mut digest = Sha256::new();
+        let mut converted_events = BTreeMap::new();
+        let mut retired_known_events = BTreeMap::new();
+        let mut classification_error = None;
+        let mut cursor = 0_u64;
+        let mut event_count = 0_u64;
+        let mut classified_event_count = 0_u64;
+        let mut event_tail = None;
+        loop {
+            let page = self
+                .db
+                .select("events")
+                .columns(&["event_seq", "payload"])
+                .where_gte("event_seq", seq_to_value(cursor))
+                .sort("event_seq", SortDirection::Asc)
+                .limit(MIGRATION_EVENT_PAGE_SIZE)
+                .execute(&**self.db)
+                .await?;
+            if page.is_empty() {
+                break;
+            }
+            for row in page {
+                let sequence = required_non_negative_u64(&row, "event_seq")?;
+                if classification_error.is_none() && sequence != event_count {
+                    classification_error = Some(SessionDbError::InvalidCanonicalSequence {
+                        expected: event_count,
+                        actual: sequence,
+                    });
+                }
+                let payload = required_string(&row, "payload")?;
+                digest.update(
+                    u64::try_from(payload.len())
+                        .unwrap_or(u64::MAX)
+                        .to_le_bytes(),
+                );
+                digest.update(payload.as_bytes());
+                if classification_error.is_none() {
+                    match decode_for_migration(&payload, |payload| {
+                        decode_session_event(payload).map_err(|error| error.to_string())
+                    }) {
+                        Ok(decoded) => {
+                            if let Err(error) = validate_migration_event_identity(
+                                decoded.event(),
+                                sequence,
+                                self.session_id,
+                            ) {
+                                classification_error = Some(error);
+                            } else {
+                                record_historical_migration_count(
+                                    &decoded,
+                                    &mut converted_events,
+                                    &mut retired_known_events,
+                                );
+                                classified_event_count = classified_event_count.saturating_add(1);
+                            }
+                        }
+                        Err(error) => classification_error = Some(error.into()),
+                    }
+                }
+                event_count = event_count.saturating_add(1);
+                event_tail = Some(sequence);
+                let Some(next_cursor) = sequence.checked_add(1) else {
+                    classification_error.get_or_insert(SessionDbError::InvalidCanonicalSequence {
+                        expected: event_count,
+                        actual: sequence,
+                    });
+                    break;
+                };
+                cursor = next_cursor;
+            }
+            if event_tail == Some(u64::MAX) {
+                break;
+            }
+        }
+        Ok(MigrationSourceEvidence {
+            canonical: bcode_session_migration::MigrationBackupCanonicalEvidence {
+                classified_event_count,
+                event_count,
+                event_tail,
+                payload_digest_sha256: format!("{:x}", digest.finalize()),
+            },
+            converted_events,
+            retired_known_events,
+            classification_error,
+        })
     }
 
     /// Inspect this database's durable storage compatibility without mutating it.
@@ -2677,8 +2783,7 @@ fn validate_migration_event_identity(
     Ok(())
 }
 
-fn record_historical_migration_classification(
-    metrics: &MetricsRegistry,
+fn record_historical_migration_count(
     decoded: &HistoricalDecode,
     converted_events: &mut BTreeMap<String, u64>,
     retired_known_events: &mut BTreeMap<String, u64>,
@@ -2697,6 +2802,15 @@ fn record_historical_migration_classification(
             .or_insert(0_u64);
         *count = count.saturating_add(1);
     }
+}
+
+fn record_historical_migration_classification(
+    metrics: &MetricsRegistry,
+    decoded: &HistoricalDecode,
+    converted_events: &mut BTreeMap<String, u64>,
+    retired_known_events: &mut BTreeMap<String, u64>,
+) {
+    record_historical_migration_count(decoded, converted_events, retired_known_events);
     match decoded {
         HistoricalDecode::Converted { metadata, .. }
             if metadata.source_schema == 28

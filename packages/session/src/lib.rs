@@ -245,6 +245,8 @@ async fn create_verified_migration_backup(
     root: &Path,
     session_id: SessionId,
     writer_epoch: u64,
+    operation_id: SessionOpenOperationId,
+    source_evidence: db::MigrationSourceEvidence,
     metrics: &MetricsRegistry,
     progress: Option<&MigrationProgressReporter>,
 ) -> Result<PathBuf, SessionError> {
@@ -264,12 +266,28 @@ async fn create_verified_migration_backup(
             }
         }) as bcode_session_migration::BackupProgressCallback
     });
+    let source_writer_epoch =
+        u32::try_from(writer_epoch).map_err(|_| SessionError::MigrationBackup {
+            session_id,
+            reason: format!("source writer epoch {writer_epoch} cannot be represented"),
+        })?;
+    let plan = bcode_session_migration::plan_writer_epoch_migration(source_writer_epoch).map_err(
+        |error| SessionError::MigrationBackup {
+            session_id,
+            reason: error.to_string(),
+        },
+    )?;
     let result = bcode_session_migration::create_retained_migration_backup(
         bcode_session_migration::MigrationBackupRequest {
             sessions_root: root.to_path_buf(),
             session_id,
+            operation_id: operation_id.to_string(),
             source_writer_epoch: writer_epoch,
             target_writer_epoch: u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+            migration_step_ids: plan.steps.iter().map(|step| step.id.to_owned()).collect(),
+            canonical_source: source_evidence.canonical,
+            converted_events: source_evidence.converted_events,
+            retired_known_events: source_evidence.retired_known_events,
         },
         backup_progress,
     )
@@ -1900,6 +1918,7 @@ impl SessionManager {
         Ok(SessionLeaseLoadOutcome::Acquired(Box::new(lease)))
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn migrate_owned_legacy_storage(
         &self,
         migration: OwnedLegacyMigration<'_>,
@@ -1913,10 +1932,19 @@ impl SessionManager {
             started,
             progress,
         } = migration;
+        let operation_id = progress.map_or_else(SessionOpenOperationId::new, |progress| {
+            progress.operation.snapshot().operation_id
+        });
+        let source = db::SessionDb::open_existing_turso_in_root(session_id, root).await?;
+        let mut source_evidence = source.migration_source_evidence().await?;
+        drop(source);
+        let classification_error = source_evidence.classification_error.take();
         let backup_path = create_verified_migration_backup(
             root,
             session_id,
             writer_epoch,
+            operation_id,
+            source_evidence,
             &self.metrics,
             progress,
         )
@@ -1927,6 +1955,15 @@ impl SessionManager {
                 SessionMigrationStage::PreparingSchema,
                 "Preparing session storage schema",
             );
+        }
+        if let Some(error) = classification_error {
+            if let Some(progress) = progress {
+                progress.stage(
+                    SessionMigrationStage::ReadingCanonicalHistory,
+                    "Canonical source history requires repair",
+                );
+            }
+            return Err(error.into());
         }
         tracing::info!(
             target: "bcode_session::migration",
@@ -1946,7 +1983,7 @@ impl SessionManager {
             write,
             self.metrics.clone(),
             db_progress,
-            progress.map(|progress| progress.operation.snapshot().operation_id),
+            Some(operation_id),
         )
         .await
         .inspect_err(|error| {

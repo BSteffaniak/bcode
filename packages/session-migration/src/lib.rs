@@ -18,7 +18,8 @@ mod storage;
 
 pub use audit::SessionMigrationReceipt;
 pub use backup::{
-    BackupProgressCallback, MigrationBackupError, MigrationBackupManifest, MigrationBackupRequest,
+    BackupProgressCallback, MigrationBackupCanonicalEvidence, MigrationBackupError,
+    MigrationBackupFileEvidence, MigrationBackupManifest, MigrationBackupRequest,
     RetainedMigrationBackup, VerifiedMigrationBackup, create_retained_migration_backup,
     create_verified_migration_backup,
 };
