@@ -971,6 +971,12 @@ impl SessionDb {
             "session.migration.commit_duration_ms",
             commit_timer.elapsed_ms(),
         );
+        let checkpoint_timer = metrics.timer();
+        db.db.query_raw("PRAGMA wal_checkpoint(TRUNCATE)").await?;
+        metrics.record_histogram(
+            "session.migration.wal_checkpoint_duration_ms",
+            checkpoint_timer.elapsed_ms(),
+        );
         Ok(db)
     }
 
@@ -5803,6 +5809,67 @@ mod tests {
                 .await
                 .expect("append after source-epoch migration");
         }
+    }
+
+    #[tokio::test]
+    async fn migrated_store_checkpoints_and_truncates_wal_before_runtime_adoption() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("fixture DB");
+        db.database()
+            .update("session_storage_contract")
+            .value("writer_epoch", DatabaseValue::Int64(3))
+            .where_eq(
+                "contract_id",
+                DatabaseValue::Int32(SESSION_STORAGE_CONTRACT_ID),
+            )
+            .execute(db.database())
+            .await
+            .expect("legacy writer epoch");
+        drop(db);
+        let maintenance =
+            crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
+                .expect("maintenance guard");
+        let write = crate::lease::acquire_maintenance_session_write_lock(
+            &maintenance,
+            temp_dir.path(),
+            session_id,
+        )
+        .expect("write guard");
+        let metrics = MetricsRegistry::in_memory();
+        let migrated = SessionDb::migrate_turso_in_root_observed(
+            session_id,
+            temp_dir.path(),
+            &maintenance,
+            &write,
+            metrics.clone(),
+            None,
+        )
+        .await
+        .expect("migration");
+
+        migrated
+            .validate_write_readiness()
+            .await
+            .expect("writable migration");
+        assert_eq!(
+            std::fs::metadata(
+                session_db_path(temp_dir.path(), session_id).with_extension("db-wal")
+            )
+            .map_or(0, |metadata| metadata.len()),
+            0
+        );
+        assert_eq!(
+            metrics
+                .report()
+                .snapshot
+                .histograms
+                .get("session.migration.wal_checkpoint_duration_ms")
+                .map_or(0, |histogram| histogram.count),
+            1
+        );
     }
 
     #[tokio::test]

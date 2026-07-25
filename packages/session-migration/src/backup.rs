@@ -1,7 +1,7 @@
 use bcode_session_models::{
     SessionId, SessionMigrationProgress, SessionMigrationProgressUnit, SessionMigrationStage,
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
@@ -12,12 +12,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 
 const BACKUP_BUFFER_BYTES: usize = 64 * 1024;
+const MIGRATION_BACKUP_MANIFEST_FILE: &str = "migration-backup.json";
+const MIGRATION_BACKUPS_DIRECTORY: &str = "session-migration-backups";
 
 /// Progress callback for retained migration-backup planning, copying, and verification.
 pub type BackupProgressCallback = Arc<dyn Fn(SessionMigrationProgress) + Send + Sync>;
 
 /// Length and digest evidence for one physical database file retained in a migration backup.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationBackupFileEvidence {
     /// Source file length in bytes.
     pub bytes: u64,
@@ -26,7 +28,7 @@ pub struct MigrationBackupFileEvidence {
 }
 
 /// Canonical source-history evidence captured before migration.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationBackupCanonicalEvidence {
     /// Decode/classification coverage captured before backup. This equals `event_count` for a
     /// migratable source; a smaller value records where damaged or unsupported history failed.
@@ -40,33 +42,42 @@ pub struct MigrationBackupCanonicalEvidence {
 }
 
 /// Metadata written alongside a verified retained migration backup.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MigrationBackupManifest {
     /// Session identifier whose physical store was retained.
     pub session_id: SessionId,
     /// Stable migration operation identity.
+    #[serde(default)]
     pub operation_id: String,
     /// Writer epoch observed before migration.
     pub source_writer_epoch: u64,
     /// Writer epoch the migration intends to produce.
     pub target_writer_epoch: u64,
     /// Ordered monotonic migration steps selected for this source.
+    #[serde(default)]
     pub migration_step_ids: Vec<String>,
     /// Canonical source-history evidence captured before backup.
+    #[serde(default)]
     pub canonical_source: MigrationBackupCanonicalEvidence,
     /// Converted event counts keyed by `schema:kind`.
+    #[serde(default)]
     pub converted_events: BTreeMap<String, u64>,
     /// Retired-known event counts keyed by `schema:kind`.
+    #[serde(default)]
     pub retired_known_events: BTreeMap<String, u64>,
     /// Main database file evidence.
+    #[serde(default)]
     pub database: MigrationBackupFileEvidence,
     /// WAL sidecar evidence when the source has a WAL.
+    #[serde(default)]
     pub wal: Option<MigrationBackupFileEvidence>,
     /// shared-memory sidecar evidence when the source has one.
+    #[serde(default)]
     pub shm: Option<MigrationBackupFileEvidence>,
     /// Backup creation time as Unix epoch milliseconds.
     pub created_at_ms: u64,
     /// Time at which all retained files passed length and digest verification.
+    #[serde(default)]
     pub verified_at_ms: u64,
 }
 
@@ -91,6 +102,68 @@ pub struct MigrationBackupRequest {
     pub converted_events: BTreeMap<String, u64>,
     /// Retired-known event counts keyed by `schema:kind`.
     pub retired_known_events: BTreeMap<String, u64>,
+}
+
+/// A retained migration backup discovered for diagnosis.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RetainedMigrationBackupDiagnosis {
+    /// Retained backup directory.
+    pub path: PathBuf,
+    /// Parsed retained-backup manifest.
+    pub manifest: MigrationBackupManifest,
+}
+
+/// Discover the newest retained migration backup for one session without mutation.
+///
+/// Malformed manifests and directories for other sessions are ignored. Discovery reads only
+/// bounded manifest sidecars and never opens or hashes retained databases.
+///
+/// # Errors
+///
+/// Returns an error when the backup root or a candidate manifest cannot be read for reasons other
+/// than absence or malformed JSON.
+pub fn latest_retained_migration_backup(
+    sessions_root: &Path,
+    session_id: SessionId,
+) -> Result<Option<RetainedMigrationBackupDiagnosis>, MigrationBackupError> {
+    let root = sessions_root
+        .parent()
+        .unwrap_or(sessions_root)
+        .join(MIGRATION_BACKUPS_DIRECTORY);
+    let entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mut newest = None;
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let path = entry.path();
+        let manifest = match fs::read(path.join(MIGRATION_BACKUP_MANIFEST_FILE)) {
+            Ok(manifest) => manifest,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let Ok(manifest) = serde_json::from_slice::<MigrationBackupManifest>(&manifest) else {
+            continue;
+        };
+        if manifest.session_id != session_id {
+            continue;
+        }
+        let candidate = RetainedMigrationBackupDiagnosis { path, manifest };
+        if newest
+            .as_ref()
+            .is_none_or(|current: &RetainedMigrationBackupDiagnosis| {
+                candidate.manifest.created_at_ms > current.manifest.created_at_ms
+            })
+        {
+            newest = Some(candidate);
+        }
+    }
+    Ok(newest)
 }
 
 /// Timing, size, and retained path for one verified migration backup.
@@ -164,7 +237,7 @@ async fn write_backup_manifest(
 ) -> Result<(), MigrationBackupError> {
     let destination = destination.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let result = fs::write(destination.join("migration-backup.json"), manifest);
+        let result = fs::write(destination.join(MIGRATION_BACKUP_MANIFEST_FILE), manifest);
         if result.is_err() && destination.exists() {
             let _ = fs::remove_dir_all(&destination);
         }
@@ -212,7 +285,7 @@ pub async fn create_retained_migration_backup(
         .sessions_root
         .parent()
         .unwrap_or(&request.sessions_root)
-        .join("session-migration-backups")
+        .join(MIGRATION_BACKUPS_DIRECTORY)
         .join(format!(
             "{}-{}-epoch-{}",
             created_at_ms, request.session_id, request.source_writer_epoch
@@ -416,7 +489,7 @@ fn migration_backup_files(root: &Path, directory: &Path) -> std::io::Result<Vec<
                 .strip_prefix(root)
                 .map_err(|error| std::io::Error::other(error.to_string()))?
                 .to_path_buf();
-            if relative_path.starts_with(Path::new("migration-backup.json")) {
+            if relative_path.starts_with(Path::new(MIGRATION_BACKUP_MANIFEST_FILE)) {
                 return Err(std::io::Error::new(
                     ErrorKind::AlreadyExists,
                     "source contains reserved migration-backup.json path",
@@ -584,7 +657,7 @@ mod tests {
 
         let result = create_retained_migration_backup(
             MigrationBackupRequest {
-                sessions_root,
+                sessions_root: sessions_root.clone(),
                 session_id,
                 operation_id: "operation-1".to_owned(),
                 source_writer_epoch: 2,
@@ -610,7 +683,7 @@ mod tests {
         );
         assert_eq!(
             result.path.parent(),
-            Some(temp.path().join("session-migration-backups").as_path())
+            Some(temp.path().join(MIGRATION_BACKUPS_DIRECTORY).as_path())
         );
         let manifest: serde_json::Value = serde_json::from_slice(
             &fs::read(result.path.join("migration-backup.json")).expect("manifest"),
@@ -638,6 +711,159 @@ mod tests {
         assert_eq!(manifest["shm"]["sha256"].as_str().map(str::len), Some(64));
         assert!(manifest["created_at_ms"].as_u64().is_some());
         assert!(manifest["verified_at_ms"].as_u64().is_some());
+
+        let diagnosis = latest_retained_migration_backup(&sessions_root, session_id)
+            .expect("backup diagnosis")
+            .expect("retained backup");
+        assert_eq!(diagnosis.path, result.path);
+        assert_eq!(diagnosis.manifest.operation_id, "operation-1");
+    }
+
+    #[test]
+    fn retained_backup_diagnosis_accepts_legacy_manifest_for_incident_visibility() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sessions_root = temp.path().join("sessions");
+        let backups = temp.path().join(MIGRATION_BACKUPS_DIRECTORY);
+        let session_id = SessionId::new();
+        let backup = backups.join("legacy");
+        fs::create_dir_all(&backup).expect("backup");
+        fs::write(
+            backup.join(MIGRATION_BACKUP_MANIFEST_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "session_id": session_id,
+                "source_writer_epoch": 2,
+                "target_writer_epoch": 4,
+                "created_at_ms": 7
+            }))
+            .expect("manifest"),
+        )
+        .expect("manifest");
+
+        let diagnosis = latest_retained_migration_backup(&sessions_root, session_id)
+            .expect("diagnosis")
+            .expect("legacy backup");
+        assert_eq!(diagnosis.path, backup);
+        assert_eq!(diagnosis.manifest.source_writer_epoch, 2);
+        assert_eq!(diagnosis.manifest.target_writer_epoch, 4);
+        assert_eq!(diagnosis.manifest.created_at_ms, 7);
+        assert!(diagnosis.manifest.operation_id.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn retained_backup_diagnosis_selects_newest_matching_valid_manifest_without_mutation() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let sessions_root = temp.path().join("sessions");
+        let backups = temp.path().join(MIGRATION_BACKUPS_DIRECTORY);
+        let session_id = SessionId::new();
+        let other_session_id = SessionId::new();
+        fs::create_dir_all(&sessions_root).expect("sessions");
+        for (directory, manifest) in [
+            (
+                "older",
+                MigrationBackupManifest {
+                    session_id,
+                    operation_id: "older".to_owned(),
+                    source_writer_epoch: 2,
+                    target_writer_epoch: 5,
+                    migration_step_ids: Vec::new(),
+                    canonical_source: MigrationBackupCanonicalEvidence {
+                        classified_event_count: 0,
+                        event_count: 0,
+                        event_tail: None,
+                        payload_digest_sha256: String::new(),
+                    },
+                    converted_events: BTreeMap::new(),
+                    retired_known_events: BTreeMap::new(),
+                    database: MigrationBackupFileEvidence {
+                        bytes: 0,
+                        sha256: String::new(),
+                    },
+                    wal: None,
+                    shm: None,
+                    created_at_ms: 1,
+                    verified_at_ms: 2,
+                },
+            ),
+            (
+                "newer",
+                MigrationBackupManifest {
+                    session_id,
+                    operation_id: "newer".to_owned(),
+                    source_writer_epoch: 4,
+                    target_writer_epoch: 5,
+                    migration_step_ids: Vec::new(),
+                    canonical_source: MigrationBackupCanonicalEvidence {
+                        classified_event_count: 0,
+                        event_count: 0,
+                        event_tail: None,
+                        payload_digest_sha256: String::new(),
+                    },
+                    converted_events: BTreeMap::new(),
+                    retired_known_events: BTreeMap::new(),
+                    database: MigrationBackupFileEvidence {
+                        bytes: 0,
+                        sha256: String::new(),
+                    },
+                    wal: None,
+                    shm: None,
+                    created_at_ms: 3,
+                    verified_at_ms: 4,
+                },
+            ),
+        ] {
+            let path = backups.join(directory);
+            fs::create_dir_all(&path).expect("backup");
+            fs::write(
+                path.join(MIGRATION_BACKUP_MANIFEST_FILE),
+                serde_json::to_vec(&manifest).expect("manifest"),
+            )
+            .expect("manifest");
+        }
+        let other = backups.join("other");
+        fs::create_dir_all(&other).expect("other backup");
+        let mut other_manifest = serde_json::to_value(MigrationBackupManifest {
+            session_id: other_session_id,
+            operation_id: "other".to_owned(),
+            source_writer_epoch: 4,
+            target_writer_epoch: 5,
+            migration_step_ids: Vec::new(),
+            canonical_source: MigrationBackupCanonicalEvidence {
+                classified_event_count: 0,
+                event_count: 0,
+                event_tail: None,
+                payload_digest_sha256: String::new(),
+            },
+            converted_events: BTreeMap::new(),
+            retired_known_events: BTreeMap::new(),
+            database: MigrationBackupFileEvidence {
+                bytes: 0,
+                sha256: String::new(),
+            },
+            wal: None,
+            shm: None,
+            created_at_ms: 99,
+            verified_at_ms: 99,
+        })
+        .expect("other manifest");
+        other_manifest["ignored"] = serde_json::Value::Bool(true);
+        fs::write(
+            other.join(MIGRATION_BACKUP_MANIFEST_FILE),
+            serde_json::to_vec(&other_manifest).expect("other manifest"),
+        )
+        .expect("other manifest");
+        let damaged = backups.join("damaged");
+        fs::create_dir_all(&damaged).expect("damaged backup");
+        fs::write(damaged.join(MIGRATION_BACKUP_MANIFEST_FILE), b"not json")
+            .expect("damaged manifest");
+
+        let before = fs::read_dir(&backups).expect("before").count();
+        let diagnosis = latest_retained_migration_backup(&sessions_root, session_id)
+            .expect("diagnosis")
+            .expect("matching backup");
+        assert_eq!(diagnosis.path, backups.join("newer"));
+        assert_eq!(diagnosis.manifest.operation_id, "newer");
+        assert_eq!(fs::read_dir(&backups).expect("after").count(), before);
     }
 
     #[test]

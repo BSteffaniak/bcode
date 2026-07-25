@@ -301,20 +301,51 @@ path. Catalog listing, picker display, normal attach, and paged history must nev
 
 ### Expected migration duration
 
-On the deterministic generated stores used for release acceptance, migration completed in these
-ranges on the benchmark host:
+Release-acceptance measurements on 2026-05-10 used a debug test build on the current development
+host. The generated stores and command are deterministic; these measurements are diagnostic
+reference points rather than universal deadlines:
 
-* about 0.2 seconds for 100 events;
-* about 7 seconds for 5,000 events;
-* about 66 seconds for 50,000 events.
+| Events | Final storage | DB growth | Final WAL | Peak RSS | Total | Backup copy | Backup verify | Reprojection | Commit | WAL checkpoint | Readiness |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 100 | 237,568 B | 233,472 B | 0 B | 220,659,712 B | 196 ms | 2 ms | 1 ms | 143 ms | 0 ms | 1 ms | 1 ms |
+| 5,000 | 4,030,464 B | 4,026,368 B | 0 B | 221,396,992 B | 11,153 ms | 6 ms | 5 ms | 10,676 ms | 19 ms | 0 ms | 26 ms |
+| 50,000 | 40,046,592 B | 22,851,584 B | 0 B | 221,003,776 B | 171,365 ms | 132 ms | 106 ms | 154,391 ms | 505 ms | 8 ms | 564 ms |
 
-These are diagnostic reference points, not universal deadlines. Storage speed, canonical payload
-size, projection mix, retained sidecars, and host load all affect elapsed time. During healthy work,
-the TUI reports the active stage and stage-local natural units. A large session can spend most of
-its time rebuilding indexes. Investigate when progress stops changing rather than treating these
-host-specific figures as a timeout. Capture `bcode session diagnose <session-id>` and
-`bcode server status --verbose` for support; metrics operators should compare
-`session.migration.*_duration_ms` stage histograms to total migration duration.
+Commands:
+
+```text
+BCODE_MIGRATION_BENCHMARK_PROFILE=small cargo test -p bcode_session benchmark_generated_legacy_session_migrations -- --ignored --nocapture
+BCODE_MIGRATION_BENCHMARK_PROFILE=medium cargo test -p bcode_session benchmark_generated_legacy_session_migrations -- --ignored --nocapture
+BCODE_MIGRATION_BENCHMARK_PROFILE=large cargo test -p bcode_session benchmark_generated_legacy_session_migrations -- --ignored --nocapture
+```
+
+The same host measured current-session preparation over 100 runs at 5,768 µs median, 6,433 µs
+p95, and 6,911 µs maximum. The enforced release gate is p95 at or below 25 ms:
+
+```text
+cargo test -p bcode_session benchmark_current_session_preparation_latency -- --ignored --nocapture
+```
+
+The table's peak RSS is `/usr/bin/time -l` maximum resident set size for the complete isolated test
+process, so it is a conservative process high-water mark rather than migration-only allocation.
+Across these profiles it remained effectively flat (220.7–221.4 MB). DB growth and peak RSS are
+now measured, and explicit post-commit checkpointing leaves the final WAL at zero bytes for every
+profile. No release limits are set until the bounded-current-open regression below is corrected.
+Switchy's Turso `Database::exec_raw` rejects row-producing pragmas with `unexpected row during
+execution`; `Database::query_raw("PRAGMA wal_checkpoint(TRUNCATE)")` is therefore the supported
+abstraction and is timed separately. A direct current-store event-count probe measured preparation
+p95 at 6,370 µs for 100 events, 35,540 µs for 5,000 events, and
+469,714 µs for 50,000 events. This fails the bounded-current-open acceptance requirement and is not
+a release gate; current preparation must stop doing event-count-proportional work before that item
+can be closed.
+
+Storage speed, canonical payload size, projection mix, retained sidecars, and host load all affect
+elapsed time. During healthy work, the TUI reports the active stage and stage-local natural units. A
+large session can spend most of its time rebuilding indexes. Investigate when progress stops
+changing rather than treating these host-specific figures as a timeout. Capture
+`bcode session diagnose <session-id>` and `bcode server status --verbose` for support; metrics
+operators should compare `session.migration.*_duration_ms` stage histograms to total migration
+duration.
 
 ### Migration troubleshooting
 

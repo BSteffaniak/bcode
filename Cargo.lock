@@ -1485,6 +1485,7 @@ dependencies = [
  "bcode_server",
  "bcode_session",
  "bcode_session_import",
+ "bcode_session_migration",
  "bcode_session_models",
  "bcode_settings",
  "bcode_tui",

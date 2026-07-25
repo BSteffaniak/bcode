@@ -4912,6 +4912,33 @@ mod tests {
         files
     }
 
+    fn session_database_file_lengths(
+        root: &std::path::Path,
+        session_id: SessionId,
+    ) -> BTreeMap<String, u64> {
+        let path = db::session_db_path(root, session_id);
+        let file_name = path
+            .file_name()
+            .expect("database filename")
+            .to_string_lossy();
+        std::fs::read_dir(path.parent().expect("database parent"))
+            .expect("database directory")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(file_name.as_ref())
+            })
+            .map(|entry| {
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    entry.metadata().expect("database metadata").len(),
+                )
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn session_health_is_byte_for_byte_non_mutating() {
         let root = unique_temp_dir();
@@ -6541,6 +6568,14 @@ mod tests {
         root: &std::path::Path,
         profile: MigrationBenchmarkProfile,
     ) -> SessionId {
+        generate_migration_benchmark_store(root, profile, 3).await
+    }
+
+    async fn generate_migration_benchmark_store(
+        root: &std::path::Path,
+        profile: MigrationBenchmarkProfile,
+        writer_epoch: u32,
+    ) -> SessionId {
         let session_id = SessionId::new();
         let db = db::SessionDb::open_turso_in_root(session_id, root)
             .await
@@ -6609,7 +6644,10 @@ mod tests {
                 .expect("benchmark canonical insert");
         }
         tx.update("session_storage_contract")
-            .value("writer_epoch", switchy::database::DatabaseValue::Int64(3))
+            .value(
+                "writer_epoch",
+                switchy::database::DatabaseValue::Int64(i64::from(writer_epoch)),
+            )
             .where_eq("contract_id", switchy::database::DatabaseValue::Int32(1))
             .execute(&*tx)
             .await
@@ -7539,6 +7577,7 @@ mod tests {
             let state_root = unique_temp_dir();
             let root = state_root.join("sessions");
             let session_id = generate_legacy_migration_benchmark_store(&root, profile).await;
+            let storage_before = session_database_file_lengths(&root, session_id);
             let metrics = MetricsRegistry::in_memory();
             let started = std::time::Instant::now();
             let manager = SessionManager::persistent_with_metrics(&root, metrics.clone())
@@ -7552,6 +7591,11 @@ mod tests {
                     total.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX))
                 },
             );
+            let storage_after = session_database_file_lengths(&root, session_id);
+            let database_bytes_before = storage_before.get("session.db").copied().unwrap_or(0);
+            let wal_bytes_before = storage_before.get("session.db-wal").copied().unwrap_or(0);
+            let database_bytes_after = storage_after.get("session.db").copied().unwrap_or(0);
+            let wal_bytes_after = storage_after.get("session.db-wal").copied().unwrap_or(0);
             let report = metrics.report();
             let histogram_sum = |name: &str| {
                 report
@@ -7561,10 +7605,16 @@ mod tests {
                     .map_or(0, |histogram| histogram.sum)
             };
             eprintln!(
-                "migration_benchmark profile={} events={} storage_bytes={} total_ms={} backup_plan_ms={} backup_copy_ms={} backup_verify_ms={} schema_ms={} decode_ms={} reproject_ms={} projector_materialized_ms={} projector_model_context_ms={} projector_occupancy_ms={} projector_receipt_ms={} projector_compatibility_ms={} validate_ms={} commit_ms={} readiness_ms={}",
+                "migration_benchmark profile={} events={} storage_bytes={} database_bytes_before={} database_bytes_after={} database_growth_bytes={} wal_bytes_before={} wal_bytes_after={} wal_growth_bytes={} total_ms={} backup_plan_ms={} backup_copy_ms={} backup_verify_ms={} schema_ms={} decode_ms={} reproject_ms={} projector_materialized_ms={} projector_model_context_ms={} projector_occupancy_ms={} projector_receipt_ms={} projector_compatibility_ms={} validate_ms={} commit_ms={} wal_checkpoint_ms={} readiness_ms={}",
                 profile.name(),
                 profile.event_count(),
                 storage_bytes,
+                database_bytes_before,
+                database_bytes_after,
+                database_bytes_after.saturating_sub(database_bytes_before),
+                wal_bytes_before,
+                wal_bytes_after,
+                wal_bytes_after.saturating_sub(wal_bytes_before),
                 elapsed.as_millis(),
                 histogram_sum("session.migration.backup.plan_duration_ms"),
                 histogram_sum("session.migration.backup.copy_duration_ms"),
@@ -7579,6 +7629,7 @@ mod tests {
                 histogram_sum("session.migration.projector.compatibility_duration_ms"),
                 histogram_sum("session.migration.validation_duration_ms"),
                 histogram_sum("session.migration.commit_duration_ms"),
+                histogram_sum("session.migration.wal_checkpoint_duration_ms"),
                 histogram_sum("session.migration.write_readiness_duration_ms"),
             );
             drop(manager);

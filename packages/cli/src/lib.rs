@@ -66,6 +66,8 @@ pub enum CliError {
     SessionStore(#[from] bcode_session::SessionStoreError),
     #[error("session error: {0}")]
     Session(#[from] bcode_session::SessionError),
+    #[error("session migration backup error: {0}")]
+    SessionMigrationBackup(#[from] bcode_session_migration::MigrationBackupError),
     #[error("session repair error: {0}")]
     SessionRepair(#[from] bcode_session::repair::SessionRepairError),
     #[error("JSON error: {0}")]
@@ -6748,6 +6750,12 @@ struct SessionDiagnosis {
     event_schema_counts: BTreeMap<u16, u64>,
     event_kind_counts: BTreeMap<String, u64>,
     strict_history_error: Option<String>,
+    classification: String,
+    migration_source_writer_epoch: Option<u64>,
+    migration_target_writer_epoch: Option<u64>,
+    migration_step_ids: Vec<String>,
+    waiting_for_owner: bool,
+    retained_backup: Option<bcode_session_migration::RetainedMigrationBackupDiagnosis>,
     write_readiness: String,
     model_context_status: String,
     projections: Vec<SessionProjectionDiagnosis>,
@@ -6784,11 +6792,23 @@ struct SessionDiagnosisTrace {
     payload: bcode_session_models::SessionTracePayload,
 }
 
+#[allow(clippy::too_many_lines)]
 async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliError> {
     let root = bcode_config::default_session_store_dir();
     let database_path = bcode_session::db::session_db_path(&root, session_id);
     let db = bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
     let writer_epoch = db.storage_writer_epoch().await.ok();
+    let compatibility = db.storage_compatibility().await;
+    let migration_plan = compatibility.as_ref().ok().and_then(|compatibility| {
+        let bcode_session::db::SessionStorageCompatibility::KnownLegacy { writer_epoch } =
+            compatibility
+        else {
+            return None;
+        };
+        u32::try_from(*writer_epoch)
+            .ok()
+            .and_then(|epoch| bcode_session_migration::plan_writer_epoch_migration(epoch).ok())
+    });
     let (canonical_event_count, inventory_tail, event_schema_counts, event_kind_counts) =
         db.canonical_event_inventory().await?;
     let canonical_tail = inventory_tail;
@@ -6808,14 +6828,40 @@ async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliEr
             checkpoint: db.materialized_projection_checkpoint(*projection).await?,
         });
     }
-    let recovery_guidance = (write_readiness != "ready").then(|| {
-        format!(
-            "Run `bcode session doctor {session_id}` first; if canonical history is healthy and projections require rebuilding, run `bcode session reindex {session_id}`."
-        )
-    });
     let strict_history = db.all_events_strict().await;
     let strict_history_error = strict_history.as_ref().err().map(ToString::to_string);
     let history = strict_history.unwrap_or_default();
+    let active_owners = bcode_session::lease::active_session_owners(&root, session_id)?;
+    let waiting_for_owner = migration_plan.is_some() && !active_owners.is_empty();
+    let retained_backup =
+        bcode_session_migration::latest_retained_migration_backup(&root, session_id)?;
+    let classification = session_diagnosis_classification(
+        compatibility.as_ref(),
+        &write_readiness,
+        strict_history_error.as_deref(),
+        waiting_for_owner,
+    );
+    let recovery_guidance =
+        (classification != SessionDiagnosisClassification::CurrentReady).then(|| {
+            match classification {
+                SessionDiagnosisClassification::Migratable => format!(
+                    "Open or attach this session with a current daemon to migrate it to writer epoch {}.",
+                    bcode_session_migration::CURRENT_WRITER_EPOCH
+                ),
+                SessionDiagnosisClassification::BlockedOwner => {
+                    "Wait for the owning daemon to release the session; migration will not run underneath a live owner."
+                        .to_owned()
+                }
+                SessionDiagnosisClassification::UnsupportedFuture => {
+                    "Use a Bcode build that supports this newer writer epoch.".to_owned()
+                }
+                SessionDiagnosisClassification::CurrentReady
+                | SessionDiagnosisClassification::StructurallyCorrupt
+                | SessionDiagnosisClassification::RepairRequired => format!(
+                    "Run `bcode session doctor {session_id}` first; if canonical history is healthy and projections require rebuilding, run `bcode session reindex {session_id}`."
+                ),
+            }
+        });
     let diagnosis = SessionDiagnosis::from_history(
         session_id,
         &history,
@@ -6827,10 +6873,22 @@ async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliEr
             event_schema_counts,
             event_kind_counts,
             strict_history_error,
+            classification: classification.as_str().to_owned(),
+            migration_source_writer_epoch: migration_plan
+                .as_ref()
+                .map(|plan| u64::from(plan.source_writer_epoch)),
+            migration_target_writer_epoch: migration_plan
+                .as_ref()
+                .map(|plan| u64::from(plan.target_writer_epoch)),
+            migration_step_ids: migration_plan.as_ref().map_or_else(Vec::new, |plan| {
+                plan.steps.iter().map(|step| step.id.to_owned()).collect()
+            }),
+            waiting_for_owner,
+            retained_backup,
             write_readiness,
             model_context_status,
             projections,
-            active_owners: bcode_session::lease::active_session_owners(&root, session_id)?,
+            active_owners,
             recovery_guidance,
         },
     );
@@ -6840,6 +6898,68 @@ async fn session_diagnose(session_id: SessionId, json: bool) -> Result<(), CliEr
         print_session_diagnosis(&diagnosis);
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionDiagnosisClassification {
+    CurrentReady,
+    Migratable,
+    BlockedOwner,
+    UnsupportedFuture,
+    StructurallyCorrupt,
+    RepairRequired,
+}
+
+impl SessionDiagnosisClassification {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::CurrentReady => "current_ready",
+            Self::Migratable => "migratable",
+            Self::BlockedOwner => "blocked_owner",
+            Self::UnsupportedFuture => "unsupported_future",
+            Self::StructurallyCorrupt => "structurally_corrupt",
+            Self::RepairRequired => "repair_required",
+        }
+    }
+}
+
+fn session_diagnosis_classification(
+    compatibility: Result<
+        &bcode_session::db::SessionStorageCompatibility,
+        &bcode_session::db::SessionDbError,
+    >,
+    write_readiness: &str,
+    strict_history_error: Option<&str>,
+    waiting_for_owner: bool,
+) -> SessionDiagnosisClassification {
+    match compatibility {
+        Ok(bcode_session::db::SessionStorageCompatibility::KnownLegacy { .. })
+            if waiting_for_owner =>
+        {
+            SessionDiagnosisClassification::BlockedOwner
+        }
+        Ok(bcode_session::db::SessionStorageCompatibility::KnownLegacy { .. }) => {
+            SessionDiagnosisClassification::Migratable
+        }
+        Err(bcode_session::db::SessionDbError::WriterIncompatible {
+            actual: Some(actual),
+            expected,
+        }) if actual > expected => SessionDiagnosisClassification::UnsupportedFuture,
+        Err(_) => SessionDiagnosisClassification::StructurallyCorrupt,
+        Ok(bcode_session::db::SessionStorageCompatibility::Current { .. })
+            if strict_history_error.is_some() =>
+        {
+            SessionDiagnosisClassification::StructurallyCorrupt
+        }
+        Ok(bcode_session::db::SessionStorageCompatibility::Current { .. })
+            if write_readiness == "ready" =>
+        {
+            SessionDiagnosisClassification::CurrentReady
+        }
+        Ok(bcode_session::db::SessionStorageCompatibility::Current { .. }) => {
+            SessionDiagnosisClassification::RepairRequired
+        }
+    }
 }
 
 struct SessionRepairCliOptions {
@@ -7069,6 +7189,12 @@ struct SessionStorageDiagnosis {
     event_schema_counts: BTreeMap<u16, u64>,
     event_kind_counts: BTreeMap<String, u64>,
     strict_history_error: Option<String>,
+    classification: String,
+    migration_source_writer_epoch: Option<u64>,
+    migration_target_writer_epoch: Option<u64>,
+    migration_step_ids: Vec<String>,
+    waiting_for_owner: bool,
+    retained_backup: Option<bcode_session_migration::RetainedMigrationBackupDiagnosis>,
     write_readiness: String,
     model_context_status: String,
     projections: Vec<SessionProjectionDiagnosis>,
@@ -7122,6 +7248,12 @@ impl SessionDiagnosis {
             event_schema_counts: storage.event_schema_counts,
             event_kind_counts: storage.event_kind_counts,
             strict_history_error: storage.strict_history_error,
+            classification: storage.classification,
+            migration_source_writer_epoch: storage.migration_source_writer_epoch,
+            migration_target_writer_epoch: storage.migration_target_writer_epoch,
+            migration_step_ids: storage.migration_step_ids,
+            waiting_for_owner: storage.waiting_for_owner,
+            retained_backup: storage.retained_backup,
             write_readiness: storage.write_readiness,
             model_context_status: storage.model_context_status,
             projections: storage.projections,
@@ -7147,6 +7279,24 @@ fn print_session_diagnosis(diagnosis: &SessionDiagnosis) {
         "writer epoch: {:?} (expected {})",
         diagnosis.writer_epoch, diagnosis.expected_writer_epoch
     );
+    println!("classification: {}", diagnosis.classification);
+    if let (Some(source), Some(target)) = (
+        diagnosis.migration_source_writer_epoch,
+        diagnosis.migration_target_writer_epoch,
+    ) {
+        println!("migration: writer epoch {source} -> {target}");
+        println!("migration steps: {:?}", diagnosis.migration_step_ids);
+    }
+    println!("waiting for owner: {}", diagnosis.waiting_for_owner);
+    if let Some(backup) = &diagnosis.retained_backup {
+        println!(
+            "retained backup: {} (operation={} source_epoch={} target_epoch={})",
+            display_from_current_dir(&backup.path),
+            backup.manifest.operation_id,
+            backup.manifest.source_writer_epoch,
+            backup.manifest.target_writer_epoch
+        );
+    }
     println!("canonical tail: {:?}", diagnosis.canonical_tail);
     println!("canonical events: {}", diagnosis.canonical_event_count);
     println!("event schemas: {:?}", diagnosis.event_schema_counts);
@@ -8235,6 +8385,60 @@ fn print_model_usage_event(
         usage.cache_write_input_tokens,
         usage.reasoning_tokens,
     );
+}
+
+#[cfg(test)]
+mod session_diagnosis_tests {
+    use super::*;
+
+    #[test]
+    fn diagnosis_classification_distinguishes_all_required_storage_states() {
+        use bcode_session::db::{SessionDbError, SessionStorageCompatibility};
+
+        let current = SessionStorageCompatibility::Current { writer_epoch: 5 };
+        let legacy = SessionStorageCompatibility::KnownLegacy { writer_epoch: 2 };
+        assert_eq!(
+            session_diagnosis_classification(Ok(&current), "ready", None, false),
+            SessionDiagnosisClassification::CurrentReady
+        );
+        assert_eq!(
+            session_diagnosis_classification(Ok(&legacy), "not ready", None, false),
+            SessionDiagnosisClassification::Migratable
+        );
+        assert_eq!(
+            session_diagnosis_classification(Ok(&legacy), "not ready", None, true),
+            SessionDiagnosisClassification::BlockedOwner
+        );
+        let future = SessionDbError::WriterIncompatible {
+            actual: Some(6),
+            expected: 5,
+        };
+        assert_eq!(
+            session_diagnosis_classification(Err(&future), "not ready", None, false),
+            SessionDiagnosisClassification::UnsupportedFuture
+        );
+        let corrupt = SessionDbError::InvalidCanonicalSequence {
+            expected: 1,
+            actual: 2,
+        };
+        assert_eq!(
+            session_diagnosis_classification(Err(&corrupt), "not ready", None, false),
+            SessionDiagnosisClassification::StructurallyCorrupt
+        );
+        assert_eq!(
+            session_diagnosis_classification(
+                Ok(&current),
+                "not ready",
+                Some("strict decode failed"),
+                false,
+            ),
+            SessionDiagnosisClassification::StructurallyCorrupt
+        );
+        assert_eq!(
+            session_diagnosis_classification(Ok(&current), "projection stale", None, false),
+            SessionDiagnosisClassification::RepairRequired
+        );
+    }
 }
 
 #[cfg(test)]
