@@ -361,12 +361,28 @@ pub fn decode_for_migration(
     }
 
     let envelope = serde_json::from_str::<HistoricalEnvelope>(payload)?;
-    if envelope.schema_version != 28 {
-        return Err(HistoricalSessionEventError::UnsupportedSchema {
-            schema_version: envelope.schema_version,
-        });
+    match envelope.schema_version {
+        28 => schema_28::decode(&envelope),
+        schema_version => Err(HistoricalSessionEventError::UnsupportedSchema { schema_version }),
     }
-    let (event_kind, event_payload) = source_kind(&envelope)?;
+}
+
+mod schema_28 {
+    use super::{
+        HistoricalDecode, HistoricalEnvelope, HistoricalSessionEventError, decode_released_event,
+    };
+
+    pub(super) fn decode(
+        envelope: &HistoricalEnvelope,
+    ) -> Result<HistoricalDecode, HistoricalSessionEventError> {
+        decode_released_event(envelope)
+    }
+}
+
+fn decode_released_event(
+    envelope: &HistoricalEnvelope,
+) -> Result<HistoricalDecode, HistoricalSessionEventError> {
+    let (event_kind, event_payload) = source_kind(envelope)?;
     let metadata = HistoricalEventMetadata {
         source_schema: envelope.schema_version,
         source_kind: event_kind.to_owned(),

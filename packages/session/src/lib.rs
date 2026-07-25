@@ -1889,14 +1889,15 @@ impl SessionManager {
             .await?;
         }
         drop(write);
-        Ok(SessionLeaseLoadOutcome::Acquired(Box::new(
-            lease::transition_session_maintenance_to_lease(
-                maintenance,
-                root,
-                session_id,
-                store.lease_owner(),
-            )?,
-        )))
+        let lease = lease::transition_session_maintenance_to_lease(
+            maintenance,
+            root,
+            session_id,
+            store.lease_owner(),
+        )?;
+        let current = db::SessionDb::open_existing_turso_in_root(session_id, root).await?;
+        current.validate_write_readiness().await?;
+        Ok(SessionLeaseLoadOutcome::Acquired(Box::new(lease)))
     }
 
     async fn migrate_owned_legacy_storage(
@@ -6682,9 +6683,22 @@ mod tests {
             .expect("corrupt canonical payload");
         drop(db);
         let manager = SessionManager::persistent(&root).expect("manager");
+        let storage_before = session_database_files(&root, session_id);
 
-        assert_legacy_preparation_repair_required(&manager, session_id, "expected ident at line 1")
-            .await;
+        let terminal = assert_legacy_preparation_repair_required(
+            &manager,
+            session_id,
+            "expected ident at line 1",
+        )
+        .await;
+        let backup_path = terminal.backup_path.expect("verified backup path");
+        assert!(backup_path.join("session.db").exists());
+        assert!(backup_path.join("migration-backup.json").exists());
+        assert_eq!(
+            session_database_files(&root, session_id),
+            storage_before,
+            "failed canonical decode after verified backup must preserve source bytes"
+        );
         std::fs::remove_dir_all(state_root).expect("state root cleanup");
     }
 

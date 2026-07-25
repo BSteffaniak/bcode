@@ -1,9 +1,9 @@
-//! Cross-process session compatibility and catalog lock primitives.
+//! Cross-process session ownership and catalog lock primitives.
 //!
-//! Session access guards intentionally do not provide exclusive session ownership. Bcode's UX
-//! allows multiple clients and same-version daemons to attach to the same session, while the
-//! database provides write serialization. These guards only prevent incompatible Bcode builds from
-//! accessing the same session concurrently.
+//! One daemon instance owns a session at a time and serves any number of clients through that
+//! owner. Reentrant registrations from the same daemon instance remain compatible; another daemon
+//! is refused even when it supports the same writer epoch. Maintenance takes the coordinator
+//! exclusively and cannot run underneath a live owner.
 
 use bcode_session_models::SessionId;
 use serde::{Deserialize, Serialize};
@@ -100,7 +100,7 @@ impl Default for SessionLeaseOwnerContext {
             protocol_version: None,
             endpoint: None,
             executable_path: None,
-            daemon_instance_id: None,
+            daemon_instance_id: Some(format!("process-{}", std::process::id())),
         }
     }
 }
@@ -234,11 +234,12 @@ pub fn active_session_owners(
     Ok(owners)
 }
 
-/// Register compatible access for a session.
+/// Register ownership for a session.
 ///
-/// This is not an exclusive session lock. It briefly takes a coordinator lock, removes dead
-/// process registrations, rejects live incompatible builds, writes this process registration, and
-/// then lets the database handle read/write concurrency.
+/// This briefly takes the coordinator lock, removes dead process registrations, rejects a live
+/// owner from another daemon instance or writer epoch, and writes this process registration.
+/// Multiple registrations are allowed only for the same explicit daemon instance so many clients
+/// can continue routing through one owning daemon.
 ///
 /// # Errors
 ///
@@ -549,14 +550,12 @@ fn find_incompatible_owner(
     Ok(None)
 }
 
-const fn owner_is_compatible(
-    owner: &SessionLeaseOwner,
-    context: &SessionLeaseOwnerContext,
-) -> bool {
+fn owner_is_compatible(owner: &SessionLeaseOwner, context: &SessionLeaseOwnerContext) -> bool {
     matches!(
         (owner.storage_writer_epoch, context.storage_writer_epoch),
         (Some(owner_epoch), Some(context_epoch)) if owner_epoch == context_epoch
-    )
+    ) && owner.daemon_instance_id.is_some()
+        && owner.daemon_instance_id == context.daemon_instance_id
 }
 
 fn remove_file_best_effort(path: &Path) -> Result<(), SessionLeaseError> {
@@ -572,6 +571,9 @@ fn remove_file_best_effort(path: &Path) -> Result<(), SessionLeaseError> {
 
 fn format_owner(owner: &SessionLeaseOwner) -> String {
     let mut parts = vec![format!("pid {}", owner.pid)];
+    if let Some(instance) = &owner.daemon_instance_id {
+        parts.push(format!("daemon instance {instance}"));
+    }
     if let Some(epoch) = owner.storage_writer_epoch {
         parts.push(format!("storage writer epoch {epoch}"));
     }
@@ -698,18 +700,34 @@ mod tests {
             storage_writer_epoch: Some(storage_writer_epoch),
             build_fingerprint: Some(build.to_string()),
             protocol_version: Some(2),
+            daemon_instance_id: Some(build.to_owned()),
             ..SessionLeaseOwnerContext::default()
         }
     }
 
+    fn same_daemon_context(build: &str, instance: &str, epoch: u32) -> SessionLeaseOwnerContext {
+        SessionLeaseOwnerContext {
+            daemon_instance_id: Some(instance.to_owned()),
+            ..context(build, epoch)
+        }
+    }
+
     #[test]
-    fn allows_multiple_builds_with_same_storage_writer_epoch() {
+    fn allows_reentrant_registrations_from_one_daemon_instance() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
-        let first = acquire_session_lease(temp_dir.path(), session_id, &context("first", 7))
-            .expect("first guard");
-        let second = acquire_session_lease(temp_dir.path(), session_id, &context("second", 7))
-            .expect("compatible writer guard");
+        let first = acquire_session_lease(
+            temp_dir.path(),
+            session_id,
+            &same_daemon_context("first", "daemon-1", 7),
+        )
+        .expect("first guard");
+        let second = acquire_session_lease(
+            temp_dir.path(),
+            session_id,
+            &same_daemon_context("second", "daemon-1", 7),
+        )
+        .expect("same daemon reentrant guard");
 
         assert_eq!(first.owner().storage_writer_epoch, Some(7));
         assert_eq!(second.owner().storage_writer_epoch, Some(7));
@@ -717,6 +735,24 @@ mod tests {
             first.owner().build_fingerprint,
             second.owner().build_fingerprint
         );
+    }
+
+    #[test]
+    fn rejects_second_daemon_at_same_writer_epoch() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let _owner = acquire_session_lease(temp_dir.path(), session_id, &context("daemon-one", 7))
+            .expect("first daemon owner");
+        let error = acquire_session_lease(temp_dir.path(), session_id, &context("daemon-two", 7))
+            .expect_err("second daemon must route through existing owner");
+        assert!(matches!(
+            error,
+            SessionLeaseError::OwnedByOtherDaemon {
+                owner: Some(ref owner),
+                ..
+            } if owner.daemon_instance_id.as_deref() == Some("daemon-one")
+                && owner.storage_writer_epoch == Some(7)
+        ));
     }
 
     #[test]
@@ -784,6 +820,35 @@ mod tests {
             .expect("dead incompatible owner must be pruned");
         assert!(!owner_path.exists(), "dead owner record must be removed");
         assert_eq!(live.owner().storage_writer_epoch, Some(2));
+    }
+
+    #[test]
+    fn owner_error_exposes_actionable_identity_without_database_access() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let mut owner_context = context("owner-build", 7);
+        owner_context.daemon_namespace = Some("owner-namespace".to_owned());
+        owner_context.endpoint = Some("unix:///tmp/owner.sock".to_owned());
+        let _owner = acquire_session_lease(temp_dir.path(), session_id, &owner_context)
+            .expect("owner lease");
+
+        let error = acquire_session_maintenance_guard(temp_dir.path(), session_id)
+            .expect_err("maintenance must report owner");
+        let SessionLeaseError::OwnedByOtherDaemon {
+            owner: Some(owner),
+            owner_summary,
+            ..
+        } = error
+        else {
+            panic!("expected owner metadata");
+        };
+        assert_eq!(owner.daemon_instance_id.as_deref(), Some("owner-build"));
+        assert_eq!(owner.storage_writer_epoch, Some(7));
+        assert_eq!(owner.endpoint.as_deref(), Some("unix:///tmp/owner.sock"));
+        assert!(owner_summary.contains("daemon instance owner-build"));
+        assert!(owner_summary.contains("storage writer epoch 7"));
+        assert!(owner_summary.contains("namespace owner-namespace"));
+        assert!(owner_summary.contains("endpoint unix:///tmp/owner.sock"));
     }
 
     #[test]

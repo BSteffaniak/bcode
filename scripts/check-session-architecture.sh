@@ -440,7 +440,8 @@ fi
 
 if ! rg -q 'let tx = db\.db\.begin_transaction\(\)\.await' packages/session/src/db.rs \
   || ! rg -q 'run_session_migrations\(&\*tx\)' packages/session/src/db.rs \
-  || ! rg -q 'migrate_session_storage\(&\*tx, session_id, &metrics, progress\.as_ref\(\)\)' packages/session/src/db.rs \
+  || ! rg -q 'migrate_session_storage\(' packages/session/src/db.rs \
+  || ! sed -n '/async fn migrate_turso_in_root_observed_with_fault/,/Ok(db)/p' packages/session/src/db.rs | grep -q 'migrate_session_storage(' \
   || ! rg -q 'set_storage_writer_contract\(&\*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH\)' packages/session/src/db.rs; then
   echo "Session migration violation: schema migration, projection replay, and writer-epoch update must share explicit migration transaction." >&2
   violations=1
@@ -500,13 +501,16 @@ if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 15' packages/ipc/src/lib.rs \
   violations=1
 fi
 
-if ! rg -q 'Schema28ToolArtifact' packages/session-migration/src/historical.rs \
+if ! rg -q 'mod schema_28' packages/session-migration/src/historical.rs \
+  || ! rg -q '28 => schema_28::decode' packages/session-migration/src/historical.rs \
+  || ! rg -q 'Schema28ToolArtifact' packages/session-migration/src/historical.rs \
   || rg -n 'Artifact \{ artifact: Box<ToolArtifact> \}' packages/session-migration/src/historical.rs >/tmp/bcode-mutable-historical-artifact-dto.txt \
   || ! rg -q 'decode_for_migration' packages/session/src/db.rs \
   || ! rg -q 'decode_session_event_compatible' packages/session/src/persisted.rs \
   || ! rg -q 'normal_history_reads_preserve_future_events_without_mutation' packages/session/src/db.rs \
   || ! sed -n '/"tool_invocation_stream" =>/,/}),/p' packages/session-migration/src/historical.rs | grep -q 'RetiredKnown' \
   || rg -n 'ToolInvocationStreamEvent|ToolInvocationStream' packages/session/src packages/session-migration/src --glob '*.rs' >/tmp/bcode-retired-tool-stream-runtime.txt \
+  || ! rg -q 'released_epoch_four_writer_rejects_corrected_epoch_five_store' packages/session/src/db.rs \
   || ! rg -q 'MIGRATION_EVENT_PAGE_SIZE: usize = 1_000' packages/session/src/db.rs \
   || ! rg -q 'canonical_migration_page' packages/session/src/db.rs \
   || rg -q 'canonical_migration_history' packages/session/src/db.rs \
@@ -515,12 +519,26 @@ if ! rg -q 'Schema28ToolArtifact' packages/session-migration/src/historical.rs \
   || ! rg -q 'migration_pages_more_than_one_thousand_events_without_gaps_or_duplicates' packages/session/src/lib.rs \
   || ! rg -q 'abort_at_migration_crash_boundary\("before_epoch_update"\)' packages/session/src/db.rs \
   || ! rg -q 'abort_at_migration_crash_boundary\("after_epoch_update_before_commit"\)' packages/session/src/db.rs \
+  || ! rg -q 'write_session_migration_receipt' packages/session/src/db.rs \
+  || ! sed -n '/let migration_outcome =/,/validate_storage_writer_contract/p' packages/session/src/db.rs | awk '/write_session_migration_receipt/{receipt=NR} /set_storage_writer_contract/{epoch=NR} END {exit !(receipt && epoch && receipt < epoch)}' \
   || ! rg -q 'set_storage_writer_contract\(&\*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH\)' packages/session/src/db.rs \
   || ! rg -q 'session.migration.converted_tool_call_finished_events_total' packages/session/src/db.rs \
   || ! rg -q 'session.migration.converted_context_usage_observed_events_total' packages/session/src/db.rs \
   || ! rg -q 'report.descriptors\[counter\].label_keys.is_empty' packages/session/src/db.rs \
   || ! rg -q 'expected_backup_bytes' packages/session/src/lib.rs \
   || ! rg -q 'assert_successful_migration_progress' packages/session/src/lib.rs \
+  || ! rg -q 'benchmark_generated_legacy_session_migrations' packages/session/src/lib.rs \
+  || ! rg -q 'MIGRATION_REPLAY_MAX_RETAINED_DECODED_EVENTS: usize = 1' packages/session/src/lib.rs \
+  || rg -n 'update_multi\("events"\)|upsert_multi\("events"\)' packages/session/src/db.rs >/tmp/bcode-unprofiled-canonical-batch.txt \
+  || ! rg -q 'deterministic_migration_faults_roll_back_every_transaction_phase' packages/session/src/db.rs \
+  || ! sed -n '/async fn deterministic_migration_faults_roll_back_every_transaction_phase/,/^    }/p' packages/session/src/db.rs | grep -q 'MigrationFaultPhase::CanonicalDecode' \
+  || ! sed -n '/async fn deterministic_migration_faults_roll_back_every_transaction_phase/,/^    }/p' packages/session/src/db.rs | grep -q 'MigrationFaultPhase::Projection' \
+  || ! sed -n '/async fn deterministic_migration_faults_roll_back_every_transaction_phase/,/^    }/p' packages/session/src/db.rs | grep -q 'MigrationFaultPhase::FinalValidation' \
+  || ! sed -n '/async fn deterministic_migration_faults_roll_back_every_transaction_phase/,/^    }/p' packages/session/src/db.rs | grep -q 'MigrationFaultPhase::Receipt' \
+  || ! sed -n '/async fn deterministic_migration_faults_roll_back_every_transaction_phase/,/^    }/p' packages/session/src/db.rs | grep -q 'MigrationFaultPhase::WriterEpochFinalization' \
+  || ! rg -q 'malformed_legacy_json_preparation_requires_repair_at_canonical_read' packages/session/src/lib.rs \
+  || ! sed -n '/async fn malformed_legacy_json_preparation_requires_repair_at_canonical_read/,/^    }/p' packages/session/src/lib.rs | grep -q 'failed canonical decode after verified backup must preserve source bytes' \
+  || ! sed -n '/async fn malformed_legacy_json_preparation_requires_repair_at_canonical_read/,/^    }/p' packages/session/src/lib.rs | grep -q 'migration-backup.json' \
   || ! rg -q 'detached_preparation_reports_structured_backup_failure_without_mutation' packages/session/src/lib.rs \
   || ! rg -q 'publish_backup_path' packages/session-migration/src/operation.rs \
   || ! rg -q 'completed.is_multiple_of\(100\)' packages/session/src/db.rs \
@@ -529,7 +547,18 @@ if ! rg -q 'Schema28ToolArtifact' packages/session-migration/src/historical.rs \
   violations=1
 fi
 
-if ! rg -q 'session_migrations: bcode_session_migration::SessionMigrationService' packages/server/src/lib.rs \
+if ! rg -q 'daemon_instance_id: Some\(format!\("process-' packages/session/src/lease.rs \
+  || ! rg -q 'owner\.daemon_instance_id == context\.daemon_instance_id' packages/session/src/lease.rs \
+  || ! rg -q 'owner_error_exposes_actionable_identity_without_database_access' packages/session/src/lease.rs \
+  || ! sed -n '/fn owner_error_exposes_actionable_identity_without_database_access/,/^    }/p' packages/session/src/lease.rs | grep -q 'daemon instance owner-build' \
+  || ! rg -q 'rejects_second_daemon_at_same_writer_epoch' packages/session/src/lease.rs \
+  || ! rg -q 'allows_reentrant_registrations_from_one_daemon_instance' packages/session/src/lease.rs \
+  || ! rg -q 'maintenance_refuses_any_live_session_owner' packages/session/src/lease.rs \
+  || ! rg -q 'maintenance_to_lease_transition_prevents_incompatible_handoff_race' packages/session/src/lease.rs \
+  || ! sed -n '/async fn migrate_legacy_session_for_load/,/async fn migrate_owned_legacy_storage/p' packages/session/src/lib.rs | grep -q 'acquire_maintenance_session_write_lock' \
+  || ! sed -n '/async fn migrate_legacy_session_for_load/,/async fn migrate_owned_legacy_storage/p' packages/session/src/lib.rs | grep -q 'transition_session_maintenance_to_lease' \
+  || ! sed -n '/async fn migrate_legacy_session_for_load/,/async fn migrate_owned_legacy_storage/p' packages/session/src/lib.rs | grep -q 'validate_write_readiness' \
+  || ! rg -q 'session_migrations: bcode_session_migration::SessionMigrationService' packages/server/src/lib.rs \
   || ! rg -q 'with_migration_operations\(session_migrations.operations\(\)\)' packages/server/src/lib.rs \
   || ! rg -q 'session_migrations\.active_count\(\)' packages/server/src/lib.rs \
   || ! rg -q 'pub async fn prepare_session_open' packages/session/src/lib.rs \

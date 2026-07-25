@@ -55,6 +55,28 @@ fn abort_at_migration_crash_boundary(boundary: &str) {
         std::process::abort();
     }
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MigrationFaultPhase {
+    Disabled,
+    CanonicalDecode,
+    Projection,
+    FinalValidation,
+    Receipt,
+    WriterEpochFinalization,
+}
+
+fn inject_migration_fault(
+    configured: MigrationFaultPhase,
+    phase: MigrationFaultPhase,
+) -> SessionDbResult<()> {
+    if configured == phase && configured != MigrationFaultPhase::Disabled {
+        return Err(SessionDbError::MigrationHistoryIncompatible {
+            reason: format!("injected migration fault at {phase:?}"),
+        });
+    }
+    Ok(())
+}
+
 const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
 const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MIGRATION_EVENT_PAGE_SIZE: usize = 1_000;
@@ -862,11 +884,35 @@ impl SessionDb {
     pub(crate) async fn migrate_turso_in_root_observed_with_operation(
         session_id: SessionId,
         root: &Path,
+        maintenance: &crate::lease::SessionMaintenanceGuard,
+        write: &crate::lease::SessionWriteGuard,
+        metrics: MetricsRegistry,
+        progress: Option<SessionMigrationProgressCallback>,
+        operation_id: Option<bcode_session_models::SessionOpenOperationId>,
+    ) -> SessionDbResult<Self> {
+        Self::migrate_turso_in_root_observed_with_fault(
+            session_id,
+            root,
+            maintenance,
+            write,
+            metrics,
+            progress,
+            operation_id,
+            MigrationFaultPhase::Disabled,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn migrate_turso_in_root_observed_with_fault(
+        session_id: SessionId,
+        root: &Path,
         _maintenance: &crate::lease::SessionMaintenanceGuard,
         _write: &crate::lease::SessionWriteGuard,
         metrics: MetricsRegistry,
         progress: Option<SessionMigrationProgressCallback>,
         operation_id: Option<bcode_session_models::SessionOpenOperationId>,
+        fault: MigrationFaultPhase,
     ) -> SessionDbResult<Self> {
         let path = session_db_path(root, session_id);
         let db = Self::open_existing_turso_observed(session_id, &path, metrics.clone()).await?;
@@ -886,13 +932,8 @@ impl SessionDb {
             schema_timer.elapsed_ms(),
         );
         let migration_outcome =
-            migrate_session_storage(&*tx, session_id, &metrics, progress.as_ref()).await?;
-        #[cfg(test)]
-        abort_at_migration_crash_boundary("before_epoch_update");
-        set_storage_writer_contract(&*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await?;
-        #[cfg(test)]
-        abort_at_migration_crash_boundary("after_epoch_update_before_commit");
-        validate_storage_writer_contract(&*tx).await?;
+            migrate_session_storage(&*tx, session_id, &metrics, progress.as_ref(), fault).await?;
+        inject_migration_fault(fault, MigrationFaultPhase::Receipt)?;
         write_session_migration_receipt(
             &*tx,
             session_id,
@@ -901,6 +942,13 @@ impl SessionDb {
             &migration_outcome,
         )
         .await?;
+        #[cfg(test)]
+        abort_at_migration_crash_boundary("before_epoch_update");
+        inject_migration_fault(fault, MigrationFaultPhase::WriterEpochFinalization)?;
+        set_storage_writer_contract(&*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await?;
+        #[cfg(test)]
+        abort_at_migration_crash_boundary("after_epoch_update_before_commit");
+        validate_storage_writer_contract(&*tx).await?;
         #[cfg(test)]
         abort_at_migration_crash_boundary("during_transaction");
         report_migration_stage(
@@ -2582,6 +2630,7 @@ async fn migrate_session_storage(
     session_id: SessionId,
     metrics: &MetricsRegistry,
     progress: Option<&SessionMigrationProgressCallback>,
+    fault: MigrationFaultPhase,
 ) -> SessionDbResult<MigrationReplayOutcome> {
     let event_total = last_event_sequence_from_database(db)
         .await?
@@ -2595,7 +2644,9 @@ async fn migrate_session_storage(
     );
     metrics.add_counter("session.migration.canonical_events_total", event_total);
     let replay =
-        rebuild_migration_projections(db, event_total, session_id, metrics, progress).await?;
+        rebuild_migration_projections(db, event_total, session_id, metrics, progress, fault)
+            .await?;
+    inject_migration_fault(fault, MigrationFaultPhase::FinalValidation)?;
     validate_migrated_storage(db, replay.tail.as_ref(), metrics, progress).await?;
     Ok(replay)
 }
@@ -2679,6 +2730,7 @@ async fn rebuild_migration_projections(
     session_id: SessionId,
     metrics: &MetricsRegistry,
     progress: Option<&SessionMigrationProgressCallback>,
+    fault: MigrationFaultPhase,
 ) -> SessionDbResult<MigrationReplayOutcome> {
     for table in [
         "session_compatibility_issues",
@@ -2725,6 +2777,7 @@ async fn rebuild_migration_projections(
             source_digest.update(payload_length.to_le_bytes());
             source_digest.update(payload.as_bytes());
             let decode_timer = metrics.timer();
+            inject_migration_fault(fault, MigrationFaultPhase::CanonicalDecode)?;
             let decoded = decode_for_migration(&payload, |payload| {
                 decode_session_event(payload).map_err(|error| error.to_string())
             })?;
@@ -2752,6 +2805,7 @@ async fn rebuild_migration_projections(
                 .where_eq("event_seq", seq_to_value(event_seq))
                 .execute(db)
                 .await?;
+            inject_migration_fault(fault, MigrationFaultPhase::Projection)?;
             project_migration_event(db, &event, metrics, &mut state).await?;
             completed = completed.saturating_add(1);
             if completed == event_total || completed.is_multiple_of(100) {
@@ -4893,6 +4947,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn released_epoch_four_writer_rejects_corrected_epoch_five_store() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open epoch-five session db");
+
+        assert!(matches!(
+            validate_storage_writer_contract_for_epoch(db.database(), 4).await,
+            Err(SessionDbError::WriterIncompatible {
+                actual: Some(actual),
+                expected: 4,
+            }) if actual == u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        ));
+        assert!(matches!(
+            bcode_session_migration::plan_writer_epoch_migration_with_registry(
+                CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+                4,
+                &[],
+            ),
+            Err(bcode_session_migration::MigrationPlanError::FutureWriter {
+                source_writer_epoch: CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+                current_writer_epoch: 4,
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn storage_compatibility_rejects_future_writer_epoch() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
@@ -5726,6 +5808,38 @@ mod tests {
             assert_eq!(report.snapshot.counters.get(counter), Some(&1));
             assert!(report.descriptors[counter].label_keys.is_empty());
         }
+        let receipt_row = migrated
+            .database()
+            .select("session_migration_receipts")
+            .columns(&["receipt"])
+            .execute_first(migrated.database())
+            .await
+            .expect("migration receipt query")
+            .expect("migration receipt");
+        let receipt = serde_json::from_str::<bcode_session_migration::SessionMigrationReceipt>(
+            &required_string(&receipt_row, "receipt").expect("receipt payload"),
+        )
+        .expect("receipt JSON");
+        assert_eq!(receipt.source_event_count, 5);
+        assert_eq!(receipt.source_event_tail, Some(4));
+        assert_eq!(receipt.target_event_count, 5);
+        assert_eq!(receipt.target_event_tail, Some(4));
+        assert_eq!(
+            receipt.converted_events.get("28:tool_call_finished"),
+            Some(&1)
+        );
+        assert_eq!(
+            receipt.converted_events.get("28:context_usage_observed"),
+            Some(&1)
+        );
+        assert_eq!(
+            receipt
+                .retired_known_events
+                .get("28:tool_invocation_stream"),
+            Some(&1)
+        );
+        assert_eq!(receipt.source_event_digest_sha256.len(), 64);
+        assert_eq!(receipt.target_event_digest_sha256.len(), 64);
         migrated
             .append_event(&event(
                 session_id,
@@ -8704,6 +8818,97 @@ mod tests {
             .all_events_strict()
             .await
             .expect_err("malformed canonical payload must remain visible");
+    }
+
+    #[tokio::test]
+    async fn deterministic_migration_faults_roll_back_every_transaction_phase() {
+        for fault in [
+            MigrationFaultPhase::CanonicalDecode,
+            MigrationFaultPhase::Projection,
+            MigrationFaultPhase::FinalValidation,
+            MigrationFaultPhase::Receipt,
+            MigrationFaultPhase::WriterEpochFinalization,
+        ] {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let session_id = SessionId::new();
+            let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+                .await
+                .expect("open session db");
+            db.append_event(&event(
+                session_id,
+                0,
+                SessionEventKind::AssistantMessage {
+                    text: "fault fixture".to_owned(),
+                },
+            ))
+            .await
+            .expect("append fixture event");
+            db.database()
+                .update("session_storage_contract")
+                .value(
+                    "writer_epoch",
+                    DatabaseValue::Int64(i64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)),
+                )
+                .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
+                .execute(db.database())
+                .await
+                .expect("set legacy writer epoch");
+            drop(db);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let storage_before = session_storage_files(temp_dir.path(), session_id);
+            let maintenance =
+                crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
+                    .expect("maintenance guard");
+            let write = crate::lease::acquire_maintenance_session_write_lock(
+                &maintenance,
+                temp_dir.path(),
+                session_id,
+            )
+            .expect("write guard");
+
+            assert!(matches!(
+                SessionDb::migrate_turso_in_root_observed_with_fault(
+                    session_id,
+                    temp_dir.path(),
+                    &maintenance,
+                    &write,
+                    MetricsRegistry::disabled(),
+                    None,
+                    None,
+                    fault,
+                )
+                .await,
+                Err(SessionDbError::MigrationHistoryIncompatible { ref reason })
+                    if reason.contains("injected migration fault")
+            ));
+            drop(write);
+            drop(maintenance);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert_eq!(
+                session_storage_files(temp_dir.path(), session_id),
+                storage_before,
+                "fault {fault:?} must roll back every storage byte"
+            );
+            let reopened = SessionDb::open_existing_turso_in_root(session_id, temp_dir.path())
+                .await
+                .expect("reopen rolled-back store");
+            assert_eq!(
+                reopened.storage_writer_epoch().await.expect("writer epoch"),
+                u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH),
+                "fault {fault:?} must not finalize writer epoch"
+            );
+            assert!(
+                reopened
+                    .database()
+                    .select("session_migration_receipts")
+                    .columns(&["operation_id"])
+                    .execute_first(reopened.database())
+                    .await
+                    .expect("receipt query")
+                    .is_none(),
+                "fault {fault:?} must not commit a receipt"
+            );
+        }
     }
 
     #[tokio::test]
