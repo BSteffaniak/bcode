@@ -1286,6 +1286,38 @@ mod tests {
     }
 
     #[test]
+    fn historical_progress_contribution_decodes_for_compatibility() {
+        let historical = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 8,
+            timestamp_ms: 10,
+            session_id: SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Progress,
+                    bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call-1".to_owned(),
+                        contribution_id: "screen".to_owned(),
+                        sequence: 1,
+                        producer_id: "legacy.plugin".to_owned(),
+                        schema: "legacy.progress".to_owned(),
+                        schema_version: 1,
+                        operation: bcode_session_models::ToolContributionOperation::Upsert,
+                        persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                        artifact: None,
+                        payload: serde_json::json!({"frame": "historical"}),
+                    },
+                ),
+            },
+        };
+        let persisted = PersistedSessionEvent::from(&historical);
+        let fixture = serde_json::to_string(&persisted).expect("historical fixture");
+        let decoded = decode_session_event(&fixture).expect("historical progress decode");
+        assert_eq!(decoded, historical);
+    }
+
+    #[test]
     fn user_message_turn_origin_round_trips_through_persistence() {
         let event = SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,

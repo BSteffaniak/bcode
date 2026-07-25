@@ -25117,6 +25117,99 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn request_draft_streaming_does_not_change_final_durable_history() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("persistent sessions");
+        let working_directory = test_working_directory();
+        let streamed = sessions
+            .create_session(
+                Some("streaming equivalence".to_owned()),
+                working_directory.clone(),
+            )
+            .await
+            .expect("streamed session");
+        let non_streamed = sessions
+            .create_session(
+                Some("streaming equivalence".to_owned()),
+                working_directory.clone(),
+            )
+            .await
+            .expect("non-streamed session");
+        let state = test_server_state(sessions);
+        let draft = request_draft_event(
+            "call-1",
+            1,
+            1,
+            bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                start_offset: 0,
+                text: r#"{"path":"src/lib.rs","contents":"hello"}"#.to_owned(),
+            },
+        );
+        publish_tool_request_draft_live(&state, streamed.id, draft.clone()).await;
+        remove_tool_request_draft_live(
+            &state,
+            streamed.id,
+            &draft,
+            bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+        )
+        .await;
+
+        for session_id in [streamed.id, non_streamed.id] {
+            state
+                .sessions
+                .append_tool_call_requested(
+                    session_id,
+                    bcode_session::AppendToolCallRequestedInput {
+                        tool_call_id: "call-1".to_owned(),
+                        tool_name: "filesystem.write".to_owned(),
+                        arguments_json: r#"{"path":"src/lib.rs","contents":"hello"}"#.to_owned(),
+                        producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                        working_directory: Some(working_directory.clone()),
+                    },
+                )
+                .await
+                .expect("canonical request");
+            state
+                .sessions
+                .append_tool_invocation_result(
+                    session_id,
+                    bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "wrote src/lib.rs".to_owned(),
+                        is_error: false,
+                        result: None,
+                    },
+                )
+                .await
+                .expect("canonical result");
+        }
+
+        let durable_kinds = |history: Vec<bcode_session_models::SessionEvent>| {
+            history
+                .into_iter()
+                .map(|event| event.kind)
+                .collect::<Vec<_>>()
+        };
+        let streamed_history = durable_kinds(
+            state
+                .sessions
+                .session_history(streamed.id)
+                .await
+                .expect("streamed history"),
+        );
+        let non_streamed_history = durable_kinds(
+            state
+                .sessions
+                .session_history(non_streamed.id)
+                .await
+                .expect("non-streamed history"),
+        );
+        assert_eq!(streamed_history, non_streamed_history);
+        assert_eq!(streamed_history.len(), 3);
+        assert!(active_tool_request_draft_snapshot_events(&state, streamed.id).is_empty());
+    }
+
+    #[tokio::test]
     async fn request_draft_registry_rejects_append_gaps_until_checkpoint() {
         let state = test_server_state(SessionManager::default());
         let session_id = SessionId::new();
