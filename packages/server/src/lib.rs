@@ -33977,6 +33977,7 @@ library = "test"
             ),
         )
         .await;
+
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(2), connection.recv_event())
                 .await

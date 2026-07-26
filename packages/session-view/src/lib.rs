@@ -3850,6 +3850,178 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One scenario proves every preview-to-final ordering boundary without weakening assertions.
+    fn result_preview_survives_request_permission_and_execution_until_final_retirement() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let result_id = TranscriptViewItemId::tool_presentation_slot(
+            "call-1",
+            bcode_session_models::ToolContributionPlacement::Result,
+            None,
+        );
+        let assert_preview = |view: &SessionView| {
+            let slots = view
+                .snapshot()
+                .transcript
+                .items
+                .iter()
+                .filter(|item| item.id == result_id)
+                .collect::<Vec<_>>();
+            assert_eq!(slots.len(), 1);
+            assert!(matches!(
+                slots[0].kind,
+                TranscriptViewItemKind::ToolRequestDraft { .. }
+            ));
+        };
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Result,
+                    generation: 1,
+                    revision: 1,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Append {
+                        offset: 0,
+                        text: "partial".to_owned(),
+                    },
+                    argument_bytes: 7,
+                    truncated: false,
+                },
+            },
+        });
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Result,
+                    generation: 1,
+                    revision: 2,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: "complete preview".to_owned(),
+                    },
+                    argument_bytes: 16,
+                    truncated: false,
+                },
+            },
+        });
+        assert_preview(&view);
+
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                tool_name: "filesystem.write".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        assert_preview(&view);
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::PermissionRequested {
+                permission_id: "permission-1".to_owned(),
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                tool_name: "filesystem.write".to_owned(),
+                arguments_json: "{}".to_owned(),
+                batch: None,
+                policy_source: None,
+                policy_reason: Some("approval required".to_owned()),
+            },
+        ));
+        assert_preview(&view);
+        for (sequence, stage) in [
+            (
+                3,
+                bcode_session_models::ToolInvocationLifecycleStage::Waiting,
+            ),
+            (
+                4,
+                bcode_session_models::ToolInvocationLifecycleStage::Started,
+            ),
+        ] {
+            view.apply_event(&event(
+                session_id,
+                sequence,
+                SessionEventKind::ToolInvocationLifecycle {
+                    event: bcode_session_models::ToolInvocationLifecycleEvent {
+                        invocation_id: "call-1".to_owned(),
+                        sequence,
+                        stage,
+                        message: None,
+                        metadata: serde_json::Value::Null,
+                    },
+                },
+            ));
+            assert_preview(&view);
+        }
+
+        view.apply_event(&event(
+            session_id,
+            5,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-1".to_owned(),
+                    model_output: "written".to_owned(),
+                    is_error: false,
+                    result: Some(ToolInvocationResult::Text {
+                        text: "written".to_owned(),
+                    }),
+                },
+            },
+        ));
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Result,
+                    generation: 1,
+                    revision: u64::MAX,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Remove {
+                        reason: bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+                    },
+                    argument_bytes: 16,
+                    truncated: false,
+                },
+            },
+        });
+        let final_slots = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .filter(|item| item.id == result_id)
+            .collect::<Vec<_>>();
+        assert_eq!(final_slots.len(), 1);
+        assert!(matches!(
+            final_slots[0].kind,
+            TranscriptViewItemKind::ToolInvocation { .. }
+        ));
+    }
+
+    #[test]
     fn final_result_without_lifecycle_completion_retires_result_draft() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
