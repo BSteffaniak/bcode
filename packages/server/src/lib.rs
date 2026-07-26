@@ -13,6 +13,7 @@ pub(crate) mod context_accounting;
 pub(crate) mod context_compaction;
 mod model_ignores;
 mod runtime_work;
+mod session_migration_adapter;
 
 use context_accounting::{
     LOCAL_CONTEXT_ESTIMATOR_VERSION, estimated_model_messages_tokens, local_request_estimate,
@@ -171,7 +172,7 @@ pub enum ServerError {
     #[error("session event store error: {0}")]
     SessionStore(#[from] bcode_session::SessionStoreError),
     #[error("historical session recovery error: {0}")]
-    Migration(#[from] bcode_session::migration_adapter::SessionStorageRecoveryError),
+    Migration(#[from] bcode_session::ownership::SessionStorageRecoveryError),
     #[error("session database error: {0}")]
     SessionDb(#[from] bcode_session::db::SessionDbError),
     /// Registry I/O error: {0}
@@ -2262,11 +2263,9 @@ async fn run_with_static_bundled_inner(
         plugin_configs,
     )?;
     tracing::debug!(target: "bcode_server::startup", "plugins loaded");
-    let legacy_recovery = bcode_session_migration::recover_accidental_epoch_session_root(
+    let legacy_recovery = session_migration_adapter::recover_historical_session_storage(
         &bcode_config::default_state_dir(),
-        bcode_session::migration_adapter::relocate_historical_session,
-    )
-    .map_err(bcode_session::migration_adapter::map_historical_storage_error)?;
+    )?;
     if !legacy_recovery.relocated.is_empty() {
         tracing::info!(
             target: "bcode_server::startup",
@@ -5426,7 +5425,7 @@ async fn run_ralph_runner_skeleton(
             let completion = ralph_cancelled_iteration_completion(&state.ralph_store, &run);
             break (completion.runtime_status, Some(completion.message));
         }
-        let completion = complete_ralph_skeleton_after_iteration(
+        let completion = Box::pin(complete_ralph_skeleton_after_iteration(
             &state,
             runtime_session_id,
             &runtime_work_id,
@@ -5434,7 +5433,7 @@ async fn run_ralph_runner_skeleton(
             &run,
             iteration.as_ref(),
             runtime_context.clone(),
-        )
+        ))
         .await;
         if completion.continue_loop {
             append_ralph_runner_progress(

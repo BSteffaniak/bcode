@@ -414,7 +414,7 @@ if rg -n 'incompatible_storage_writer_records|ensure_daemon_storage_compatibilit
 fi
 
 if rg -n 'CURRENT_SESSION_EVENT_SCHEMA_VERSION\s*[-+]|schema_version\s*==\s*(2[0-9]|3[0-8])|writer-epoch-|join\("session-storage"\)' packages/session/src --glob '*.rs' \
-  | rg -v 'packages/session/src/(db|migration_adapter)\.rs' >/tmp/bcode-current-path-historical-format.txt \
+  | rg -v 'packages/session/src/(db|ownership)\.rs' >/tmp/bcode-current-path-historical-format.txt \
   || rg -n 'decode_for_migration|HistoricalDecode|HistoricalSessionEventError' packages/session/src --glob '*.rs' \
     | rg -v 'packages/session/src/db\.rs' >/tmp/bcode-current-path-historical-codec.txt; then
   echo "Session current-boundary violation: historical schema/epoch knowledge escaped explicit migration adapters." >&2
@@ -465,13 +465,11 @@ if rg -n 'join\("session-storage"\)|writer-epoch-' packages/session/src --glob '
     >/tmp/bcode-hardcoded-historical-root-violations.txt \
   || ! rg -q 'diagnose_accidental_epoch_session_root' packages/session-migration/src/storage.rs \
   || ! rg -q 'recover_accidental_epoch_session_root' packages/session-migration/src/storage.rs \
-  || ! rg -q 'historical_session_has_active_owner' packages/session/src/migration_adapter.rs \
-  || ! rg -q 'relocate_historical_session' packages/session/src/migration_adapter.rs \
-  || rg -n 'diagnose_accidental_epoch_session_root|recover_accidental_epoch_session_root' packages/session/src --glob '*.rs' \
-    | rg -v 'packages/session/src/migration_adapter\.rs' \
+  || ! rg -q 'relocate_session' packages/session/src/ownership.rs \
+  || ! rg -q 'session_has_active_owner' packages/session/src/ownership.rs \
+  || rg -n 'diagnose_accidental_epoch_session_root|recover_accidental_epoch_session_root|RELEASED_HISTORICAL_ROOTS|writer-epoch-' packages/session/src --glob '*.rs' \
     >/tmp/bcode-current-historical-policy-violations.txt \
-  || sed '/#\[cfg(test)\]/,$d' packages/session/src/migration_adapter.rs \
-    | rg -n 'diagnose_accidental_epoch_session_root|recover_accidental_epoch_session_root' \
+  || rg -n 'HistoricalStorage(Relocation|Error)|bcode_session_migration' packages/session/src/ownership.rs \
     >/tmp/bcode-current-historical-adapter-policy-violations.txt; then
   echo "Session historical-root violation: historical layout discovery and recovery policy must remain migration-owned." >&2
   cat /tmp/bcode-current-historical-session-root-violations.txt >&2 2>/dev/null || true
@@ -520,7 +518,7 @@ if rg -n "handle\.state" packages/session/src/lib.rs >/tmp/bcode-session-actor-v
 fi
 
 if rg -n "std::fs|OpenOptions|fs::File|File::open|File::create" packages/session/src --glob '*.rs' \
-  | rg -v 'packages/session/src/(lib|index|reader|migration|event_migration|migration_adapter|derived|db|lease|repair)\.rs' \
+  | rg -v 'packages/session/src/(lib|index|reader|migration|event_migration|ownership|derived|db|lease|repair)\.rs' \
   >/tmp/bcode-session-fs-violations.txt; then
   echo "Session persistence architecture violation: direct filesystem access outside approved store modules." >&2
   cat /tmp/bcode-session-fs-violations.txt >&2

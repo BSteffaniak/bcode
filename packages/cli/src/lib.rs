@@ -5,6 +5,7 @@
 //! Command-line interface for Bcode.
 
 mod plugin_cli;
+mod session_migration_adapter;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -72,7 +73,7 @@ pub enum CliError {
     #[error("session migration backup error: {0}")]
     SessionMigrationBackup(#[from] bcode_session_migration::MigrationBackupError),
     #[error("session migration storage error: {0}")]
-    SessionMigrationStorage(#[from] bcode_session::migration_adapter::SessionStorageRecoveryError),
+    SessionMigrationStorage(#[from] bcode_session::ownership::SessionStorageRecoveryError),
     #[error("session repair error: {0}")]
     SessionRepair(#[from] bcode_session::repair::SessionRepairError),
     #[error("JSON error: {0}")]
@@ -7073,11 +7074,7 @@ async fn run_session_repair_command(options: SessionRepairCliOptions) -> Result<
 fn doctor_historical_storage(
     state_dir: &Path,
 ) -> Result<bcode_session::repair::RepairReport, CliError> {
-    let diagnosis = bcode_session_migration::diagnose_accidental_epoch_session_root(
-        state_dir,
-        bcode_session::migration_adapter::historical_session_has_active_owner,
-    )
-    .map_err(bcode_session::migration_adapter::map_historical_storage_error)?;
+    let diagnosis = session_migration_adapter::diagnose_historical_session_storage(state_dir)?;
     Ok(bcode_session::repair::RepairReport::historical_storage(
         diagnosis.root,
         match diagnosis.status {
