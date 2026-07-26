@@ -58,6 +58,7 @@ fn max_bottom_overscroll(area: Rect) -> usize {
 }
 
 fn sync_layout(app: &mut BmuxApp, width: u16) {
+    render::set_markdown_details_open(app.markdown_details_open());
     let started = Instant::now();
     let elapsed_dirty_visuals =
         app.drain_elapsed_dirty_visuals_bounded(MAX_DIRTY_VISUALS_PER_LAYOUT_SYNC);
@@ -144,6 +145,7 @@ struct TranscriptLayoutInput<'a> {
     pending: &'a [PendingSubmission],
     elapsed_layout_revision: u64,
     transcript_projection_revision: u64,
+    markdown_presentation_revision: u64,
     pending_submissions_projection_revision: u64,
     has_older_history: bool,
     loading_older_history: bool,
@@ -159,6 +161,7 @@ impl<'a> TranscriptLayoutInput<'a> {
             pending: app.pending_submissions(),
             elapsed_layout_revision: app.elapsed_layout_revision(),
             transcript_projection_revision: app.transcript_projection_revision(),
+            markdown_presentation_revision: app.markdown_presentation_revision(),
             pending_submissions_projection_revision: app.pending_submissions_projection_revision(),
             has_older_history: app.has_older_history(),
             loading_older_history: app.loading_older_history(),
@@ -190,12 +193,13 @@ impl<'a> TranscriptLayoutInput<'a> {
             |host| format!("{}:{}", std::ptr::from_ref(host).addr(), host.revision()),
         );
         TranscriptLayoutFingerprint::new(format!(
-            "width:{};diff:{:?};history:{}:{};presentation:{presentation};transcript-rev:{};transcript-len:{};pending-rev:{};pending-len:{}",
+            "width:{};diff:{:?};history:{}:{};presentation:{presentation};transcript-rev:{};markdown-presentation-rev:{};transcript-len:{};pending-rev:{};pending-len:{}",
             self.width,
             self.diff_viewer_config,
             self.has_older_history,
             self.loading_older_history,
             self.transcript_projection_revision,
+            self.markdown_presentation_revision,
             self.transcript.len(),
             self.pending_submissions_projection_revision,
             self.pending.len()
@@ -220,6 +224,7 @@ pub fn test_layout_signature(
         pending: &pending,
         elapsed_layout_revision: 0,
         transcript_projection_revision: 0,
+        markdown_presentation_revision: 0,
         pending_submissions_projection_revision: 0,
         has_older_history: false,
         loading_older_history: false,

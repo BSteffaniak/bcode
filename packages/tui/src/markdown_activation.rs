@@ -144,6 +144,31 @@ mod tests {
     }
 
     #[test]
+    fn safe_destination_text_supports_copy_policy_without_clipboard_side_effects() {
+        assert_eq!(
+            markdown_destination_text(&MarkdownDestination::Web(
+                "https://example.com/docs".parse().expect("valid URL")
+            ))
+            .as_deref(),
+            Some("https://example.com/docs")
+        );
+        assert_eq!(
+            markdown_destination_text(&MarkdownDestination::LocalPath("/trusted/docs.md".into()))
+                .as_deref(),
+            Some("/trusted/docs.md")
+        );
+        for destination in [
+            MarkdownDestination::Fragment("section".to_owned()),
+            MarkdownDestination::UnresolvedRelative("docs.md".to_owned()),
+            MarkdownDestination::Inert {
+                reason: MarkdownDestinationRejection::UnsupportedScheme,
+            },
+        ] {
+            assert_eq!(markdown_destination_text(&destination), None);
+        }
+    }
+
+    #[test]
     fn fragments_are_reserved_for_internal_navigation() {
         assert_eq!(
             activate_markdown_destination(&MarkdownDestination::Fragment("section".to_owned()))

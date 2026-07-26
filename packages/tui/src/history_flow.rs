@@ -315,10 +315,6 @@ enum SupersedableEventKey {
         invocation_id: String,
         contribution_id: String,
     },
-    ToolRequestDraft {
-        tool_call_id: String,
-        placement: &'static str,
-    },
 }
 
 fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
@@ -355,25 +351,6 @@ fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
                 Some(SupersedableEventKey::ToolContribution {
                     invocation_id: envelope.contribution.invocation_id.clone(),
                     contribution_id: envelope.contribution.contribution_id.clone(),
-                })
-            }
-            bcode_session_models::SessionLiveEventKind::ToolRequestDraft { event }
-                if !matches!(
-                    event.operation,
-                    bcode_session_models::ToolRequestDraftOperation::Remove { .. }
-                ) =>
-            {
-                Some(SupersedableEventKey::ToolRequestDraft {
-                    tool_call_id: event.tool_call_id.clone(),
-                    placement: match event.placement {
-                        bcode_session_models::ToolContributionPlacement::Request => "request",
-                        bcode_session_models::ToolContributionPlacement::Progress => "progress",
-                        bcode_session_models::ToolContributionPlacement::Result => "result",
-                        bcode_session_models::ToolContributionPlacement::Supplemental => {
-                            "supplemental"
-                        }
-                        bcode_session_models::ToolContributionPlacement::Hidden => "hidden",
-                    },
                 })
             }
             _ => None,

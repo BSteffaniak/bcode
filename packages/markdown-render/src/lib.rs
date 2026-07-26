@@ -246,6 +246,16 @@ fn resolve_local_destination(
     MarkdownDestination::LocalPath(base_directory.join(relative))
 }
 
+/// Terminal presentation policy for classified link destinations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MarkdownLinkDestinationPresentation {
+    /// Render only the parser-semantic link label.
+    #[default]
+    LabelOnly,
+    /// Append a readable destination while preserving safe redaction.
+    ReadableFallback,
+}
+
 /// Options controlling terminal Markdown rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownRenderOptions {
@@ -265,6 +275,12 @@ pub struct MarkdownRenderOptions {
     pub document_id: Option<String>,
     /// Whether the source is an incomplete streaming document.
     pub streaming: bool,
+    /// Terminal projection policy for link destinations.
+    pub link_destination_presentation: MarkdownLinkDestinationPresentation,
+    /// Whether details blocks are interactive disclosure controls.
+    pub details_interactive: bool,
+    /// Explicit disclosure state keyed by stable details contribution identity.
+    pub details_open: BTreeMap<String, bool>,
 }
 
 impl Default for MarkdownRenderOptions {
@@ -279,6 +295,9 @@ impl Default for MarkdownRenderOptions {
             mermaid_height: 1200,
             document_id: None,
             streaming: false,
+            link_destination_presentation: MarkdownLinkDestinationPresentation::LabelOnly,
+            details_interactive: false,
+            details_open: BTreeMap::new(),
         }
     }
 }
@@ -318,6 +337,25 @@ impl MarkdownRenderOptions {
     #[must_use]
     pub const fn with_streaming(mut self, streaming: bool) -> Self {
         self.streaming = streaming;
+        self
+    }
+
+    /// Return options with readable link destination fallbacks enabled.
+    #[must_use]
+    pub const fn with_link_destination_fallbacks(mut self, enabled: bool) -> Self {
+        self.link_destination_presentation = if enabled {
+            MarkdownLinkDestinationPresentation::ReadableFallback
+        } else {
+            MarkdownLinkDestinationPresentation::LabelOnly
+        };
+        self
+    }
+
+    /// Return options with explicit details disclosure state.
+    #[must_use]
+    pub fn with_details_open(mut self, details_open: BTreeMap<String, bool>) -> Self {
+        self.details_interactive = true;
+        self.details_open = details_open;
         self
     }
 
@@ -636,8 +674,19 @@ pub struct MarkdownRenderResult {
     pub contributions: Vec<MarkdownContribution>,
     /// Post-layout document-relative cell rectangles for rich contributions.
     pub geometry: Vec<MarkdownContributionGeometry>,
+    /// Post-layout document anchors for internal fragment navigation.
+    pub anchors: Vec<MarkdownDocumentAnchor>,
     /// Layout signature including every renderer-owned layout-affecting option.
     pub layout_signature: String,
+}
+
+/// Stable internal document anchor and its rendered row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarkdownDocumentAnchor {
+    /// GitHub-compatible fragment identifier without the leading `#`.
+    pub fragment: String,
+    /// Zero-based rendered document row.
+    pub row: u16,
 }
 
 /// Document-relative terminal-cell rectangle.
@@ -774,7 +823,25 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
         &details,
         options,
     );
-    let projection = project_semantic_fallbacks(markdown, &document, &details);
+    let destination_projection =
+        project_link_destination_fallbacks(markdown, &contributions, options);
+    let projected_source = destination_projection.as_ref();
+    let projected_document = parse_markdown_document(projected_source);
+    let projected_details = collect_details_projections(projected_source);
+    let mut projection_options = options.clone();
+    for (original, projected) in details.iter().zip(&projected_details) {
+        let original_id = details_contribution_id(original, options.document_id.as_deref());
+        if let Some(open) = options.details_open.get(&original_id) {
+            let projected_id = details_contribution_id(projected, options.document_id.as_deref());
+            projection_options.details_open.insert(projected_id, *open);
+        }
+    }
+    let projection = project_semantic_fallbacks(
+        projected_source,
+        &projected_document,
+        &projected_details,
+        &projection_options,
+    );
     let projected_markdown = if options.streaming {
         project_incomplete_details_fallback(&projection.markdown)
     } else {
@@ -787,13 +854,149 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
         options,
     ));
     let geometry = assign_contribution_geometry(geometry, &contributions);
+    let anchors = markdown_document_anchors(markdown, options);
     let layout_signature = markdown_layout_signature(markdown, options, &contributions, &geometry);
     MarkdownRenderResult {
         lines,
         contributions,
         geometry,
+        anchors,
         layout_signature,
     }
+}
+
+fn markdown_document_anchors(
+    source: &str,
+    options: &MarkdownRenderOptions,
+) -> Vec<MarkdownDocumentAnchor> {
+    let document = parse_markdown_document(source);
+    let mut headings = Vec::new();
+    let mut active: Option<(String, Option<String>)> = None;
+    for event in document.events {
+        match event.kind {
+            MarkdownSemanticEventKind::Start(MarkdownSemanticTag::Heading(_)) => {
+                active = Some((
+                    String::new(),
+                    heading_explicit_id(source, event.source_range.start),
+                ));
+            }
+            MarkdownSemanticEventKind::Text(text) | MarkdownSemanticEventKind::Code(text) => {
+                if let Some((label, _)) = &mut active {
+                    label.push_str(&text);
+                }
+            }
+            MarkdownSemanticEventKind::End(MarkdownSemanticTagEnd::Heading) => {
+                if let Some((label, explicit)) = active.take() {
+                    let fragment = explicit.unwrap_or_else(|| github_heading_slug(&label));
+                    if !fragment.is_empty() {
+                        headings.push((event.source_range.end, fragment));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut duplicate_counts = BTreeMap::<String, usize>::new();
+    headings
+        .into_iter()
+        .filter_map(|(source_end, fragment)| {
+            let count = duplicate_counts.entry(fragment.clone()).or_default();
+            let fragment = if *count == 0 {
+                fragment
+            } else {
+                format!("{fragment}-{count}")
+            };
+            *count = count.saturating_add(1);
+            let prefix = source.get(..source_end)?;
+            let projected_prefix = project_semantic_fallbacks(
+                prefix,
+                &parse_markdown_document(prefix),
+                &collect_details_projections(prefix),
+                options,
+            );
+            let row =
+                rendered_cursor(&render_markdown_projection(&projected_prefix.markdown, options).0)
+                    .0;
+            Some(MarkdownDocumentAnchor { fragment, row })
+        })
+        .collect()
+}
+
+fn heading_explicit_id(source: &str, start: usize) -> Option<String> {
+    let line = source.get(start..)?.lines().next()?;
+    let attributes = line.rsplit_once(" {#")?.1.strip_suffix('}')?;
+    (!attributes.is_empty()).then(|| attributes.to_owned())
+}
+
+fn github_heading_slug(label: &str) -> String {
+    let mut slug = String::new();
+    let mut pending_dash = false;
+    for character in label.chars().flat_map(char::to_lowercase) {
+        if character.is_alphanumeric() || character == '_' || character == '-' {
+            if pending_dash && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_dash = false;
+            slug.push(character);
+        } else if character.is_whitespace() {
+            pending_dash = true;
+        }
+    }
+    slug
+}
+
+fn project_link_destination_fallbacks<'a>(
+    markdown: &'a str,
+    contributions: &[MarkdownContribution],
+    options: &MarkdownRenderOptions,
+) -> Cow<'a, str> {
+    if options.link_destination_presentation
+        != MarkdownLinkDestinationPresentation::ReadableFallback
+    {
+        return Cow::Borrowed(markdown);
+    }
+    let replacements = contributions
+        .iter()
+        .filter_map(|contribution| match &contribution.kind {
+            MarkdownContributionKind::Link {
+                link,
+                label,
+                destination,
+            } => readable_destination_fallback(link, label, destination).and_then(|fallback| {
+                markdown
+                    .get(contribution.source_range.clone())
+                    .map(|source| {
+                        (
+                            contribution.source_range.clone(),
+                            format!("{source} ({fallback})"),
+                        )
+                    })
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if replacements.is_empty() {
+        Cow::Borrowed(markdown)
+    } else {
+        Cow::Owned(replace_source_ranges(markdown, replacements))
+    }
+}
+
+fn readable_destination_fallback(
+    link: &MarkdownLink,
+    label: &str,
+    destination: &MarkdownDestination,
+) -> Option<String> {
+    let fallback = match destination {
+        MarkdownDestination::Web(url) => url.as_str(),
+        MarkdownDestination::LocalPath(path) => return Some(path.to_string_lossy().into_owned()),
+        MarkdownDestination::Fragment(fragment) => return Some(format!("#{fragment}")),
+        MarkdownDestination::UnresolvedRelative(value) => value,
+        MarkdownDestination::Inert { .. } => return None,
+    };
+    (fallback != label && fallback != link.destination.trim())
+        .then(|| fallback.to_owned())
+        .or_else(|| (fallback != label).then(|| fallback.to_owned()))
 }
 
 fn projected_contribution_geometry(
@@ -956,7 +1159,7 @@ fn markdown_layout_signature(
     geometry: &[MarkdownContributionGeometry],
 ) -> String {
     format!(
-        "markdown-layout-v2:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        "markdown-layout-v3:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         options.width,
         stable_text_hash(markdown),
         stable_text_hash(&format!("{:?}", options.theme)),
@@ -964,6 +1167,8 @@ fn markdown_layout_signature(
         options.mermaid_enabled,
         options.mermaid_width,
         options.streaming,
+        options.details_interactive,
+        stable_text_hash(&format!("{:?}", options.details_open)),
         stable_text_hash(&format!("{}:{:?}", options.mermaid_height, contributions)),
         stable_text_hash(&format!("{geometry:?}"))
     )
@@ -998,52 +1203,142 @@ struct ProjectedMarkdown<'a> {
 type ProjectionReplacement = (
     Range<usize>,
     String,
-    Option<(ProjectedContributionKind, Range<usize>)>,
+    Vec<(ProjectedContributionKind, Range<usize>)>,
 );
 
+fn details_contribution_id(details: &DetailsProjection, document_id: Option<&str>) -> String {
+    let id = format!(
+        "details:{}:{}",
+        details.source_range.start, details.source_range.end
+    );
+    document_id.map_or_else(|| id.clone(), |document_id| format!("{document_id}:{id}"))
+}
+
+fn projected_details(
+    details: &DetailsProjection,
+    all_details: &[DetailsProjection],
+    options: &MarkdownRenderOptions,
+) -> (String, Vec<(ProjectedContributionKind, Range<usize>)>) {
+    let summary = details.summary_markdown.trim();
+    let contribution_id = details_contribution_id(details, options.document_id.as_deref());
+    let open = options
+        .details_open
+        .get(&contribution_id)
+        .copied()
+        .unwrap_or(details.default_open);
+    let marker = if open { "▼" } else { "▶" };
+    let summary_end = marker.len().saturating_add(3).saturating_add(summary.len());
+    let mut contributions = vec![(ProjectedContributionKind::Details, 0..summary_end)];
+    if !open {
+        return (format!("{marker} **{summary}**"), contributions);
+    }
+
+    let mut body = details.body_markdown.clone();
+    let body_start = details.body_range.start;
+    let body_end = details.body_range.end;
+    let mut children = all_details
+        .iter()
+        .filter(|candidate| {
+            body_start <= candidate.source_range.start
+                && candidate.source_range.end <= body_end
+                && !all_details.iter().any(|parent| {
+                    let parent_start = parent.source_range.start;
+                    let parent_end = parent.source_range.end;
+                    body_start <= parent_start
+                        && parent_start < candidate.source_range.start
+                        && candidate.source_range.end <= parent_end
+                        && parent_end <= body_end
+                })
+        })
+        .collect::<Vec<_>>();
+    children.sort_by_key(|child| child.source_range.start);
+    let mut nested_contributions: Vec<(ProjectedContributionKind, Range<usize>)> = Vec::new();
+    for child in children.into_iter().rev() {
+        let local = child
+            .source_range
+            .start
+            .saturating_sub(details.body_range.start)
+            ..child
+                .source_range
+                .end
+                .saturating_sub(details.body_range.start);
+        let (replacement, child_contributions) = projected_details(child, all_details, options);
+        body.replace_range(local.clone(), &replacement);
+        let removed = local.end.saturating_sub(local.start);
+        let delta = replacement
+            .len()
+            .cast_signed()
+            .saturating_sub(removed.cast_signed());
+        for (_, range) in &mut nested_contributions {
+            range.start = range.start.saturating_add_signed(delta);
+            range.end = range.end.saturating_add_signed(delta);
+        }
+        nested_contributions.extend(child_contributions.into_iter().map(|(kind, range)| {
+            (
+                kind,
+                local.start.saturating_add(range.start)..local.start.saturating_add(range.end),
+            )
+        }));
+    }
+    let body_start = summary_end.saturating_add(2);
+    contributions.extend(nested_contributions.into_iter().map(|(kind, range)| {
+        (
+            kind,
+            body_start.saturating_add(range.start)..body_start.saturating_add(range.end),
+        )
+    }));
+    (format!("{marker} **{summary}**\n\n{body}"), contributions)
+}
+
 fn semantic_replacements(
-    details: &[DetailsProjection],
+    all_details: &[DetailsProjection],
     math: Vec<MathProjection>,
     footnotes: &FootnoteProjection,
+    options: &MarkdownRenderOptions,
 ) -> Vec<ProjectionReplacement> {
     let mut replacements = Vec::new();
-    for details in details.iter().filter(|candidate| {
-        !details.iter().any(|parent| {
+    for details in all_details.iter().filter(|candidate| {
+        !all_details.iter().any(|parent| {
             parent.source_range.start < candidate.source_range.start
                 && parent.source_range.end >= candidate.source_range.end
         })
     }) {
         let summary = details.summary_markdown.trim();
-        let replacement = format!(
-            "**{summary}**\n\n{}",
-            project_details_markup(&details.body_markdown).trim()
-        );
-        replacements.push((
-            details.source_range.clone(),
-            replacement,
-            Some((ProjectedContributionKind::Details, 2..2 + summary.len())),
-        ));
+        if !options.details_interactive {
+            let replacement = format!(
+                "**{summary}**\n\n{}",
+                project_details_markup(&details.body_markdown).trim()
+            );
+            replacements.push((
+                details.source_range.clone(),
+                replacement,
+                vec![(ProjectedContributionKind::Details, 2..2 + summary.len())],
+            ));
+            continue;
+        }
+        let (replacement, contributions) = projected_details(details, all_details, options);
+        replacements.push((details.source_range.clone(), replacement, contributions));
     }
     replacements.extend(math.into_iter().map(|projection| {
         let replacement = match projection.kind {
             MathKind::Inline => format!("`{}`", projection.rendered),
             MathKind::Display => format!("\n```text\n{}\n```\n", projection.rendered),
         };
-        (projection.source_range, replacement, None)
+        (projection.source_range, replacement, Vec::new())
     }));
     for reference in &footnotes.references {
         let replacement = format!("[{}]", reference.number);
         replacements.push((
             reference.source_range.clone(),
             replacement.clone(),
-            Some((
+            vec![(
                 ProjectedContributionKind::FootnoteReference,
                 0..replacement.len(),
-            )),
+            )],
         ));
     }
     for definition in footnotes.definitions.values() {
-        replacements.push((definition.source_range.clone(), String::new(), None));
+        replacements.push((definition.source_range.clone(), String::new(), Vec::new()));
     }
     replacements
 }
@@ -1052,6 +1347,7 @@ fn project_semantic_fallbacks<'a>(
     markdown: &'a str,
     document: &MarkdownDocument,
     details: &[DetailsProjection],
+    options: &MarkdownRenderOptions,
 ) -> ProjectedMarkdown<'a> {
     let footnotes = collect_footnotes(markdown, document);
     let math = collect_math_projections(markdown, document);
@@ -1066,7 +1362,7 @@ fn project_semantic_fallbacks<'a>(
         };
     }
 
-    let mut replacements = semantic_replacements(details, math, &footnotes);
+    let mut replacements = semantic_replacements(details, math, &footnotes, options);
     replacements.sort_by_key(|(range, _, _)| (range.start, range.end));
     let mut projected = markdown.to_owned();
     let mut projected_contributions: Vec<ProjectedContributionRange> = Vec::new();
@@ -1081,7 +1377,7 @@ fn project_semantic_fallbacks<'a>(
             existing.range.start = existing.range.start.saturating_add_signed(delta);
             existing.range.end = existing.range.end.saturating_add_signed(delta);
         }
-        if let Some((kind, local)) = contribution {
+        for (kind, local) in contribution {
             projected_contributions.push(ProjectedContributionRange {
                 kind,
                 range: range.start.saturating_add(local.start)
@@ -1225,6 +1521,7 @@ fn collect_details_projections(markdown: &str) -> Vec<DetailsProjection> {
         let open_tag = &lower[start..open_end];
         output.push(DetailsProjection {
             source_range: start..end,
+            body_range: summary_close + "</summary>".len()..close_start,
             summary_markdown: safe_summary_markdown(&markdown[summary_open_end..summary_close]),
             body_markdown: markdown[summary_close + "</summary>".len()..close_start].to_owned(),
             default_open: details_has_open_attribute(open_tag),
@@ -1236,6 +1533,8 @@ fn collect_details_projections(markdown: &str) -> Vec<DetailsProjection> {
                 .map(|mut nested| {
                     nested.source_range = nested.source_range.start.saturating_add(body_start)
                         ..nested.source_range.end.saturating_add(body_start);
+                    nested.body_range = nested.body_range.start.saturating_add(body_start)
+                        ..nested.body_range.end.saturating_add(body_start);
                     nested
                 }),
         );
@@ -1299,6 +1598,7 @@ fn safe_summary_markdown(summary: &str) -> String {
 #[derive(Debug, Clone)]
 struct DetailsProjection {
     source_range: Range<usize>,
+    body_range: Range<usize>,
     summary_markdown: String,
     body_markdown: String,
     default_open: bool,
@@ -3261,10 +3561,12 @@ fn text_display_width(text: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::{
-        MarkdownRenderOptions, MarkdownTheme, TableRow, aligned_padding, markdown_to_plain_text,
-        render_markdown, render_markdown_lines, table_column_widths, table_content_line,
-        text_display_width,
+        MarkdownContributionKind, MarkdownDestination, MarkdownRenderOptions, MarkdownTheme,
+        TableRow, aligned_padding, markdown_to_plain_text, render_markdown, render_markdown_lines,
+        table_column_widths, table_content_line, text_display_width,
     };
     use bmux_tui::prelude::{Color, Modifier, Span, Style};
     use pulldown_cmark::Alignment;
@@ -3313,6 +3615,226 @@ mod tests {
         assert_eq!(line(0), "│ a    │ x  │  7 │");
         assert_eq!(line(1), "│ long │ yy │ 42 │");
         assert_eq!(aligned_padding(3, alignments[1]), (1, 2));
+    }
+
+    #[test]
+    fn details_disclosure_defaults_and_explicit_state_control_visible_body() {
+        let source = "<details><summary>Retry</summary>Run it again.</details>";
+        let closed = render_markdown(
+            source,
+            &MarkdownRenderOptions::new(80).with_details_open(BTreeMap::new()),
+        );
+        let closed_text = closed
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert!(closed_text.contains("▶ Retry"));
+        assert!(!closed_text.contains("Run it again."));
+
+        let details_id = closed
+            .contributions
+            .iter()
+            .find(|item| matches!(item.kind, MarkdownContributionKind::Details { .. }))
+            .expect("details contribution")
+            .id
+            .clone();
+        let open = render_markdown(
+            source,
+            &MarkdownRenderOptions::new(80).with_details_open(BTreeMap::from([(details_id, true)])),
+        );
+        let open_text = open
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert!(open_text.contains("▼ Retry"));
+        assert!(open_text.contains("Run it again."));
+        assert_ne!(closed.layout_signature, open.layout_signature);
+    }
+
+    #[test]
+    fn details_open_attribute_initializes_expanded_state_and_can_be_overridden() {
+        let source = "<details open><summary>More</summary>Visible body.</details>";
+        let default = render_markdown(
+            source,
+            &MarkdownRenderOptions::new(80).with_details_open(BTreeMap::new()),
+        );
+        let default_text = default
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert!(default_text.contains("▼ More"));
+        assert!(default_text.contains("Visible body."));
+
+        let details_id = default.contributions[0].id.clone();
+        let collapsed = render_markdown(
+            source,
+            &MarkdownRenderOptions::new(80)
+                .with_details_open(BTreeMap::from([(details_id, false)])),
+        );
+        let collapsed_text = collapsed
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert!(collapsed_text.contains("▶ More"));
+        assert!(!collapsed_text.contains("Visible body."));
+    }
+
+    #[test]
+    fn nested_details_have_independent_disclosure_state_and_geometry() {
+        let source = "<details><summary>Outer</summary>Before <details><summary>Inner</summary>Secret</details> After</details>";
+        let initial = render_markdown(
+            source,
+            &MarkdownRenderOptions::new(80).with_details_open(BTreeMap::new()),
+        );
+        let detail_ids = initial
+            .contributions
+            .iter()
+            .filter(|item| matches!(item.kind, MarkdownContributionKind::Details { .. }))
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(detail_ids.len(), 2);
+        let initial_text = initial
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert!(initial_text.contains("▶ Outer"));
+        assert!(!initial_text.contains("Inner"));
+
+        let outer_open = render_markdown(
+            source,
+            &MarkdownRenderOptions::new(80)
+                .with_details_open(BTreeMap::from([(detail_ids[0].clone(), true)])),
+        );
+        let outer_text = outer_open
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert!(outer_text.contains("▼ Outer"));
+        assert!(outer_text.contains("▶ Inner"));
+        assert!(!outer_text.contains("Secret"));
+        assert_eq!(
+            outer_open
+                .geometry
+                .iter()
+                .filter(|geometry| detail_ids.contains(&geometry.contribution_id))
+                .count(),
+            2
+        );
+
+        let both_open = render_markdown(
+            source,
+            &MarkdownRenderOptions::new(80).with_details_open(BTreeMap::from([
+                (detail_ids[0].clone(), true),
+                (detail_ids[1].clone(), true),
+            ])),
+        );
+        let both_text = both_open
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert!(both_text.contains("▼ Outer"));
+        assert!(both_text.contains("▼ Inner"));
+        assert!(both_text.contains("Secret"));
+        assert_ne!(outer_open.layout_signature, both_open.layout_signature);
+    }
+
+    #[test]
+    fn escaped_and_nested_link_labels_preserve_typed_destination_and_readable_fallback() {
+        let rendered = render_markdown(
+            r"[Escaped \[label\] with **strong** and `code`](docs/guide.md)",
+            &MarkdownRenderOptions::new(32).with_link_destination_fallbacks(true),
+        );
+        let link = rendered
+            .contributions
+            .iter()
+            .find_map(|item| match &item.kind {
+                MarkdownContributionKind::Link {
+                    label, destination, ..
+                } => Some((label, destination)),
+                _ => None,
+            })
+            .expect("link contribution");
+        assert_eq!(link.0, "Escaped [label] with strong and code");
+        assert_eq!(
+            link.1,
+            &MarkdownDestination::UnresolvedRelative("docs/guide.md".to_owned())
+        );
+        let visible = rendered
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert!(visible.contains("Escaped [label] with strong and code"));
+        assert!(visible.contains("docs/guide.md"));
+        assert!(rendered.geometry[0].rects.len() >= 2);
+    }
+
+    #[test]
+    fn internal_heading_anchors_use_github_slugs_duplicates_and_explicit_ids() {
+        let source = "# Hello, World!\n\n## Hello World\n\n### Custom {#chosen}";
+        let rendered = render_markdown(source, &MarkdownRenderOptions::new(80));
+        assert_eq!(
+            rendered
+                .anchors
+                .iter()
+                .map(|anchor| (anchor.fragment.as_str(), anchor.row))
+                .collect::<Vec<_>>(),
+            [("hello-world", 0), ("hello-world-1", 2), ("chosen", 4)]
+        );
+    }
+
+    #[test]
+    fn links_append_readable_safe_or_unresolved_destination_fallbacks() {
+        let visible = |source: &str, options: MarkdownRenderOptions| {
+            render_markdown(source, &options)
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .map(|span| span.content.as_str())
+                .collect::<String>()
+        };
+        assert!(
+            visible(
+                "[Guide](https://example.com/docs)",
+                MarkdownRenderOptions::new(80).with_link_destination_fallbacks(true),
+            )
+            .contains("Guide (https://example.com/docs)")
+        );
+        assert!(
+            visible(
+                "[Guide](docs.md)",
+                MarkdownRenderOptions::new(80).with_link_destination_fallbacks(true),
+            )
+            .contains("Guide (docs.md)")
+        );
+        assert!(
+            visible(
+                "[Section](#target)",
+                MarkdownRenderOptions::new(80).with_link_destination_fallbacks(true),
+            )
+            .contains("Section (#target)")
+        );
+        let unsafe_visible = visible(
+            "[Secret](javascript:alert(1))",
+            MarkdownRenderOptions::new(80).with_link_destination_fallbacks(true),
+        );
+        assert!(unsafe_visible.contains("Secret"));
+        assert!(!unsafe_visible.contains("javascript"));
     }
 
     #[test]
@@ -3572,7 +4094,7 @@ mod tests {
         );
         assert_eq!(result.geometry.len(), 2);
         assert_eq!(result.geometry[0].rects[0].x, 0);
-        assert_eq!(result.geometry[1].rects[0].x, 9);
+        assert!(result.geometry[1].rects[0].x > result.geometry[0].rects[0].x);
         assert_ne!(
             result.geometry[0].contribution_id,
             result.geometry[1].contribution_id

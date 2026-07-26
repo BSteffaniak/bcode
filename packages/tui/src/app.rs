@@ -274,6 +274,12 @@ pub struct BmuxApp {
     plugin_presentation: Option<Arc<crate::plugin_tui::PluginTuiPresentation>>,
     markdown_interaction: crate::markdown_interaction::MarkdownInteractionState,
     markdown_source_view: Option<(String, String)>,
+    markdown_details_open: BTreeMap<String, bool>,
+    markdown_presentation_revision: u64,
+    footnote_return_targets: BTreeMap<String, String>,
+    markdown_footnote_rows: BTreeMap<String, usize>,
+    pending_markdown_focus: Option<String>,
+    markdown_fragment_rows: BTreeMap<String, usize>,
 }
 
 /// Daemon connection state used to describe startup readiness in the status chrome.
@@ -472,6 +478,12 @@ impl BmuxApp {
             plugin_presentation: None,
             markdown_interaction: crate::markdown_interaction::MarkdownInteractionState::default(),
             markdown_source_view: None,
+            markdown_details_open: BTreeMap::new(),
+            markdown_presentation_revision: 0,
+            footnote_return_targets: BTreeMap::new(),
+            markdown_footnote_rows: BTreeMap::new(),
+            pending_markdown_focus: None,
+            markdown_fragment_rows: BTreeMap::new(),
         };
         app.absorb_history(history);
         app
@@ -524,6 +536,11 @@ impl BmuxApp {
         visible: Vec<crate::markdown_interaction::VisibleMarkdownContribution>,
     ) {
         self.markdown_interaction.reconcile(visible);
+        if let Some(target) = self.pending_markdown_focus.take()
+            && !self.markdown_interaction.focus_target(&target)
+        {
+            self.pending_markdown_focus = Some(target);
+        }
         if self
             .markdown_source_view
             .as_ref()
@@ -531,6 +548,70 @@ impl BmuxApp {
         {
             self.markdown_source_view = None;
         }
+        self.footnote_return_targets
+            .retain(|definition, reference| {
+                self.markdown_interaction.contribution(definition).is_some()
+                    && self.markdown_interaction.contribution(reference).is_some()
+            });
+    }
+
+    /// Reconcile retained details state with all resident typed contributions.
+    pub fn reconcile_markdown_details(&mut self, resident_ids: &BTreeSet<String>) {
+        let before = self.markdown_details_open.len();
+        self.markdown_details_open
+            .retain(|id, _| resident_ids.contains(id));
+        if self.markdown_details_open.len() != before {
+            self.markdown_presentation_revision =
+                self.markdown_presentation_revision.saturating_add(1);
+        }
+    }
+
+    /// Replace resident footnote contribution targets with transcript-global rows.
+    pub fn reconcile_markdown_footnote_rows(&mut self, rows: BTreeMap<String, usize>) {
+        self.markdown_footnote_rows = rows;
+        self.footnote_return_targets
+            .retain(|definition, reference| {
+                self.markdown_footnote_rows.contains_key(definition)
+                    && self.markdown_footnote_rows.contains_key(reference)
+            });
+        if self
+            .pending_markdown_focus
+            .as_ref()
+            .is_some_and(|target| !self.markdown_footnote_rows.contains_key(target))
+        {
+            self.pending_markdown_focus = None;
+        }
+    }
+
+    fn navigate_markdown_contribution(&mut self, contribution_id: &str) -> bool {
+        let Some(row) = self.markdown_footnote_rows.get(contribution_id).copied() else {
+            return false;
+        };
+        self.transcript_scroll_animation = None;
+        self.pending_visual_overflow_bottom = None;
+        self.scroll_mode = TranscriptScrollMode::ManualDetached;
+        self.viewport.follow_anchor(row);
+        self.pending_markdown_focus = Some(contribution_id.to_owned());
+        true
+    }
+
+    /// Replace resident internal Markdown fragment targets with transcript-global rows.
+    pub fn reconcile_markdown_fragments(&mut self, fragments: BTreeMap<String, usize>) {
+        self.markdown_fragment_rows = fragments;
+    }
+
+    fn navigate_markdown_fragment(&mut self, fragment: &str) -> bool {
+        let normalized = fragment.strip_prefix('#').unwrap_or(fragment);
+        let Some(row) = self.markdown_fragment_rows.get(normalized).copied() else {
+            self.set_status("Markdown fragment target was not found".to_owned());
+            return true;
+        };
+        self.transcript_scroll_animation = None;
+        self.pending_visual_overflow_bottom = None;
+        self.scroll_mode = TranscriptScrollMode::ManualDetached;
+        self.viewport.follow_anchor(row);
+        self.set_status("Navigated to Markdown section".to_owned());
+        true
     }
 
     /// Move Markdown focus in visible document order.
@@ -580,11 +661,78 @@ impl BmuxApp {
         self.markdown_interaction.contribution(contribution_id)
     }
 
+    /// Return explicit details disclosure state for Markdown rendering.
+    #[must_use]
+    pub const fn markdown_details_open(&self) -> &BTreeMap<String, bool> {
+        &self.markdown_details_open
+    }
+
+    /// Return the revision of layout-affecting Markdown presentation state.
+    #[must_use]
+    pub const fn markdown_presentation_revision(&self) -> u64 {
+        self.markdown_presentation_revision
+    }
+
+    #[cfg(test)]
+    fn set_transcript_viewport_for_details_test(
+        &mut self,
+        total_rows: usize,
+        viewport_height: u16,
+        scroll_up: usize,
+    ) {
+        self.viewport.sync_max(
+            total_rows.saturating_sub(usize::from(viewport_height)),
+            0,
+            total_rows,
+            viewport_height,
+            false,
+            &mut self.older_history,
+        );
+        self.viewport.scroll_up(scroll_up, &mut self.older_history);
+    }
+
+    #[cfg(test)]
+    fn transcript_viewport_top_row_for_test(
+        &self,
+        total_rows: usize,
+        viewport_height: u16,
+    ) -> usize {
+        self.viewport.top_row(total_rows, viewport_height)
+    }
+
+    fn preserve_transcript_anchor_for_disclosure(&mut self) {
+        self.transcript_scroll_animation = None;
+        self.pending_visual_overflow_bottom = None;
+        self.scroll_mode = TranscriptScrollMode::ManualDetached;
+        let top_row = self
+            .viewport
+            .top_row(self.transcript_layout.total_rows(), self.viewport.height());
+        self.viewport.materialize_top_row(top_row);
+    }
+
     /// Activate a currently visible Markdown contribution through its typed payload.
     pub fn activate_markdown_contribution(&mut self, contribution_id: &str) -> bool {
         use bcode_markdown_render::MarkdownContributionKind;
 
         let contribution = self.visible_markdown_contribution(contribution_id).cloned();
+        if let Some(MarkdownContributionKind::Details { default_open, .. }) = contribution {
+            self.preserve_transcript_anchor_for_disclosure();
+            let open = self
+                .markdown_details_open
+                .get(contribution_id)
+                .copied()
+                .unwrap_or(default_open);
+            self.markdown_details_open
+                .insert(contribution_id.to_owned(), !open);
+            self.markdown_presentation_revision =
+                self.markdown_presentation_revision.saturating_add(1);
+            self.set_status(if open {
+                "Details collapsed".to_owned()
+            } else {
+                "Details expanded".to_owned()
+            });
+            return true;
+        }
         if let Some(MarkdownContributionKind::Mermaid { source, .. }) = contribution {
             if self
                 .markdown_source_view()
@@ -595,6 +743,36 @@ impl BmuxApp {
             } else {
                 self.markdown_source_view = Some((contribution_id.to_owned(), source));
                 self.set_status("Mermaid source view opened; activate again to close".to_owned());
+            }
+            return true;
+        }
+        if let Some(MarkdownContributionKind::FootnoteReference { target_id, .. }) = &contribution {
+            if target_id.is_empty()
+                || !(self.markdown_interaction.focus_target(target_id)
+                    || self.navigate_markdown_contribution(target_id))
+            {
+                self.set_status("Footnote definition is not available".to_owned());
+                return true;
+            }
+            self.footnote_return_targets
+                .insert(target_id.clone(), contribution_id.to_owned());
+            self.set_status("Footnote definition focused; activate to return".to_owned());
+            return true;
+        }
+        if let Some(MarkdownContributionKind::FootnoteDefinition { reference_ids, .. }) =
+            &contribution
+        {
+            let target = self
+                .footnote_return_targets
+                .remove(contribution_id)
+                .or_else(|| reference_ids.first().cloned());
+            if let Some(target) = target
+                && (self.markdown_interaction.focus_target(&target)
+                    || self.navigate_markdown_contribution(&target))
+            {
+                self.set_status("Returned to footnote reference".to_owned());
+            } else {
+                self.set_status("Footnote reference is not available".to_owned());
             }
             return true;
         }
@@ -620,7 +798,11 @@ impl BmuxApp {
                 self.set_status("Opened Markdown destination".to_owned());
             }
             Ok(crate::markdown_activation::MarkdownActivation::Fragment) => {
-                self.set_status("Markdown fragment navigation is not available yet".to_owned());
+                let bcode_markdown_render::MarkdownDestination::Fragment(fragment) = destination
+                else {
+                    unreachable!("fragment activation must preserve typed destination")
+                };
+                return self.navigate_markdown_fragment(&fragment);
             }
             Ok(crate::markdown_activation::MarkdownActivation::Inert) => return false,
             Err(error) => {
@@ -4505,6 +4687,258 @@ mod tests {
                 algorithm_version: 1,
             },
         }
+    }
+
+    fn markdown_details(
+        id: &str,
+        default_open: bool,
+    ) -> crate::markdown_interaction::VisibleMarkdownContribution {
+        crate::markdown_interaction::VisibleMarkdownContribution {
+            id: id.to_owned(),
+            kind: bcode_markdown_render::MarkdownContributionKind::Details {
+                summary: "More".to_owned(),
+                body: "Body".to_owned(),
+                default_open,
+            },
+        }
+    }
+
+    #[test]
+    fn fragment_activation_navigates_to_typed_resident_anchor() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_transcript_viewport_for_details_test(80, 10, 0);
+        app.reconcile_markdown_fragments(BTreeMap::from([("target".to_owned(), 24)]));
+        app.reconcile_markdown_interactions(vec![
+            crate::markdown_interaction::VisibleMarkdownContribution {
+                id: "fragment-link".to_owned(),
+                kind: bcode_markdown_render::MarkdownContributionKind::Link {
+                    link: bcode_markdown_render::MarkdownLink {
+                        destination: "#target".to_owned(),
+                        title: None,
+                        reference_id: None,
+                        kind: bcode_markdown_render::MarkdownLinkKind::Inline,
+                    },
+                    label: "Target".to_owned(),
+                    destination: bcode_markdown_render::MarkdownDestination::Fragment(
+                        "target".to_owned(),
+                    ),
+                },
+            },
+        ]);
+
+        assert!(app.activate_markdown_contribution("fragment-link"));
+        assert_eq!(app.transcript_viewport_top_row_for_test(80, 10), 24);
+        assert_eq!(app.status(), "Navigated to Markdown section");
+    }
+
+    #[test]
+    fn fragment_navigation_remains_stable_after_resize_and_scroll() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_transcript_viewport_for_details_test(100, 12, 20);
+        app.reconcile_markdown_fragments(BTreeMap::from([("target".to_owned(), 38)]));
+        app.reconcile_markdown_interactions(vec![
+            crate::markdown_interaction::VisibleMarkdownContribution {
+                id: "fragment-link".to_owned(),
+                kind: bcode_markdown_render::MarkdownContributionKind::Link {
+                    link: bcode_markdown_render::MarkdownLink {
+                        destination: "#target".to_owned(),
+                        title: None,
+                        reference_id: None,
+                        kind: bcode_markdown_render::MarkdownLinkKind::Inline,
+                    },
+                    label: "Target".to_owned(),
+                    destination: bcode_markdown_render::MarkdownDestination::Fragment(
+                        "target".to_owned(),
+                    ),
+                },
+            },
+        ]);
+        assert!(app.activate_markdown_contribution("fragment-link"));
+        assert_eq!(app.transcript_viewport_top_row_for_test(100, 12), 38);
+
+        app.sync_transcript_scroll_max(94, 0, 100, 6);
+        assert_eq!(app.transcript_viewport_top_row_for_test(100, 6), 38);
+        assert!(app.scroll_transcript_down(3));
+        assert_eq!(app.transcript_viewport_top_row_for_test(100, 6), 41);
+        assert!(app.activate_markdown_contribution("fragment-link"));
+        assert_eq!(app.transcript_viewport_top_row_for_test(100, 6), 38);
+    }
+
+    #[test]
+    fn missing_fragment_remains_safe_and_reports_failure() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.reconcile_markdown_fragments(BTreeMap::new());
+        app.reconcile_markdown_interactions(vec![
+            crate::markdown_interaction::VisibleMarkdownContribution {
+                id: "fragment-link".to_owned(),
+                kind: bcode_markdown_render::MarkdownContributionKind::Link {
+                    link: bcode_markdown_render::MarkdownLink {
+                        destination: "#missing".to_owned(),
+                        title: None,
+                        reference_id: None,
+                        kind: bcode_markdown_render::MarkdownLinkKind::Inline,
+                    },
+                    label: "Missing".to_owned(),
+                    destination: bcode_markdown_render::MarkdownDestination::Fragment(
+                        "missing".to_owned(),
+                    ),
+                },
+            },
+        ]);
+
+        assert!(app.activate_markdown_contribution("fragment-link"));
+        assert_eq!(app.status(), "Markdown fragment target was not found");
+    }
+
+    #[test]
+    fn details_activation_preserves_detached_transcript_top_row_across_height_change() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_transcript_viewport_for_details_test(40, 10, 12);
+        let top_row = app.transcript_top_row(10);
+        app.reconcile_markdown_interactions(vec![markdown_details("details", false)]);
+
+        assert!(app.activate_markdown_contribution("details"));
+        app.sync_transcript_scroll_max(37, 0, 47, 10);
+
+        assert_eq!(app.transcript_top_row(10), top_row);
+        assert_eq!(app.scroll_offset(), 47 - top_row - 10);
+    }
+
+    #[test]
+    fn details_activation_toggles_from_source_default_and_updates_layout_revision() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.reconcile_markdown_interactions(vec![markdown_details("details", true)]);
+
+        assert_eq!(app.markdown_details_open().get("details"), None);
+        assert_eq!(app.markdown_presentation_revision(), 0);
+        assert!(app.activate_markdown_contribution("details"));
+        assert_eq!(app.markdown_details_open().get("details"), Some(&false));
+        assert_eq!(app.markdown_presentation_revision(), 1);
+        assert!(app.focus_markdown_contribution("details"));
+        assert!(app.activate_focused_markdown_contribution());
+        assert_eq!(app.markdown_details_open().get("details"), Some(&true));
+        assert_eq!(app.markdown_presentation_revision(), 2);
+    }
+
+    #[test]
+    fn details_state_survives_visibility_changes_and_is_removed_with_resident_owner() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.reconcile_markdown_interactions(vec![markdown_details("details", false)]);
+        assert!(app.activate_markdown_contribution("details"));
+
+        app.reconcile_markdown_interactions(Vec::new());
+        assert_eq!(app.markdown_details_open().get("details"), Some(&true));
+        app.reconcile_markdown_details(&BTreeSet::from(["details".to_owned()]));
+        assert_eq!(app.markdown_details_open().get("details"), Some(&true));
+
+        app.reconcile_markdown_details(&BTreeSet::new());
+        assert!(app.markdown_details_open().is_empty());
+        assert_eq!(app.markdown_presentation_revision(), 2);
+    }
+
+    fn markdown_footnote_reference(
+        id: &str,
+        target_id: &str,
+    ) -> crate::markdown_interaction::VisibleMarkdownContribution {
+        crate::markdown_interaction::VisibleMarkdownContribution {
+            id: id.to_owned(),
+            kind: bcode_markdown_render::MarkdownContributionKind::FootnoteReference {
+                label: "note".to_owned(),
+                target_id: target_id.to_owned(),
+            },
+        }
+    }
+
+    fn markdown_footnote_definition(
+        id: &str,
+        reference_ids: &[&str],
+    ) -> crate::markdown_interaction::VisibleMarkdownContribution {
+        crate::markdown_interaction::VisibleMarkdownContribution {
+            id: id.to_owned(),
+            kind: bcode_markdown_render::MarkdownContributionKind::FootnoteDefinition {
+                label: "note".to_owned(),
+                reference_ids: reference_ids
+                    .iter()
+                    .map(|reference| (*reference).to_owned())
+                    .collect(),
+            },
+        }
+    }
+
+    #[test]
+    fn offscreen_footnote_navigation_scrolls_and_focuses_after_reconciliation() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_transcript_viewport_for_details_test(80, 10, 0);
+        app.reconcile_markdown_footnote_rows(BTreeMap::from([
+            ("reference".to_owned(), 4),
+            ("definition".to_owned(), 30),
+        ]));
+        app.reconcile_markdown_interactions(vec![markdown_footnote_reference(
+            "reference",
+            "definition",
+        )]);
+
+        assert!(app.activate_markdown_contribution("reference"));
+        assert_eq!(app.transcript_viewport_top_row_for_test(80, 10), 30);
+        assert_eq!(app.focused_markdown_contribution(), None);
+        app.reconcile_markdown_interactions(vec![markdown_footnote_definition(
+            "definition",
+            &["reference"],
+        )]);
+        assert_eq!(app.focused_markdown_contribution(), Some("definition"));
+
+        assert!(app.activate_focused_markdown_contribution());
+        assert_eq!(app.transcript_viewport_top_row_for_test(80, 10), 4);
+        app.reconcile_markdown_interactions(vec![markdown_footnote_reference(
+            "reference",
+            "definition",
+        )]);
+        assert_eq!(app.focused_markdown_contribution(), Some("reference"));
+    }
+
+    #[test]
+    fn footnote_activation_returns_to_the_reference_that_navigated_to_definition() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.reconcile_markdown_interactions(vec![
+            markdown_footnote_reference("reference-1", "definition"),
+            markdown_footnote_reference("reference-2", "definition"),
+            markdown_footnote_definition("definition", &["reference-1", "reference-2"]),
+        ]);
+
+        assert!(app.activate_markdown_contribution("reference-2"));
+        assert_eq!(app.focused_markdown_contribution(), Some("definition"));
+        assert!(app.activate_focused_markdown_contribution());
+        assert_eq!(app.focused_markdown_contribution(), Some("reference-2"));
+        assert!(app.footnote_return_targets.is_empty());
+    }
+
+    #[test]
+    fn footnote_definition_uses_first_reference_without_a_navigation_origin() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.reconcile_markdown_interactions(vec![
+            markdown_footnote_reference("reference-1", "definition"),
+            markdown_footnote_reference("reference-2", "definition"),
+            markdown_footnote_definition("definition", &["reference-1", "reference-2"]),
+        ]);
+
+        assert!(app.activate_markdown_contribution("definition"));
+        assert_eq!(app.focused_markdown_contribution(), Some("reference-1"));
+    }
+
+    #[test]
+    fn footnote_return_origin_is_removed_with_invisible_contributions() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        app.reconcile_markdown_interactions(vec![
+            markdown_footnote_reference("reference", "definition"),
+            markdown_footnote_definition("definition", &["reference"]),
+        ]);
+        assert!(app.activate_markdown_contribution("reference"));
+        assert_eq!(app.footnote_return_targets.len(), 1);
+
+        app.reconcile_markdown_interactions(Vec::new());
+
+        assert!(app.footnote_return_targets.is_empty());
+        assert_eq!(app.focused_markdown_contribution(), None);
     }
 
     #[test]

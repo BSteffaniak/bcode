@@ -1908,6 +1908,7 @@ dependencies = [
  "libc",
  "mermaid-rs-renderer",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

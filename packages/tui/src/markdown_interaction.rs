@@ -80,6 +80,11 @@ impl MarkdownInteractionState {
         changed
     }
 
+    /// Focus a typed target contribution by its stable identity.
+    pub fn focus_target(&mut self, contribution_id: &str) -> bool {
+        self.focus(contribution_id)
+    }
+
     /// Return the focused contribution ID.
     #[must_use]
     pub fn focused(&self) -> Option<&str> {

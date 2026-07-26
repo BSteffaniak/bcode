@@ -513,12 +513,16 @@ fn streamed_incomplete_details_remain_visible_until_complete() {
     let partial = "Before.\n\n<details><summary>Retry</summary>Body with **important** content";
     let rendered = render_markdown(
         partial,
-        &MarkdownRenderOptions::new(50).with_streaming(true),
+        &MarkdownRenderOptions::new(50)
+            .with_streaming(true)
+            .with_details_open(std::collections::BTreeMap::new()),
     );
     let partial_visible = rendered_lines_text(&rendered.lines);
     assert!(!partial_visible.contains("<details>"));
     assert!(partial_visible.contains("Retry"));
     assert!(partial_visible.contains("Body with important content"));
+    assert!(!partial_visible.contains('▶'));
+    assert!(!partial_visible.contains('▼'));
     assert!(
         !rendered
             .contributions

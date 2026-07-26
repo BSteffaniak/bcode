@@ -2,13 +2,24 @@
 
 use bcode_config::{TuiDiffViewerConfig, TuiDiffViewerLayout};
 use bcode_plugin_sdk::tui::{PluginTuiDiffLayout, PluginTuiVisualRenderContext};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 
 thread_local! {
     static DIFF_VIEWER_CONFIG: Cell<TuiDiffViewerConfig> = const { Cell::new(TuiDiffViewerConfig {
         layout: TuiDiffViewerLayout::Auto,
         side_by_side_breakpoint: 120,
     }) };
+    static MARKDOWN_DETAILS_OPEN: RefCell<BTreeMap<String, bool>> = const { RefCell::new(BTreeMap::new()) };
+}
+
+/// Synchronize layout-affecting Markdown presentation state for row generation.
+pub fn set_markdown_details_open(details_open: &BTreeMap<String, bool>) {
+    MARKDOWN_DETAILS_OPEN.with(|state| details_open.clone_into(&mut state.borrow_mut()));
+}
+
+fn markdown_details_open() -> BTreeMap<String, bool> {
+    MARKDOWN_DETAILS_OPEN.with(|state| state.borrow().clone())
 }
 
 fn plugin_visual_context(
@@ -157,6 +168,12 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
     render_header(app, layout.header, frame, theme);
     render_composer(app, layout.composer, frame, theme);
     let focused_regions = transcript_markdown_regions(app, layout.body);
+    let footnote_rows = transcript_markdown_footnote_rows(app, layout.body.width);
+    app.reconcile_markdown_footnote_rows(footnote_rows);
+    let fragment_rows = transcript_markdown_fragment_rows(app, layout.body.width);
+    app.reconcile_markdown_fragments(fragment_rows);
+    let resident_details = transcript_markdown_details_ids(app, layout.body.width);
+    app.reconcile_markdown_details(&resident_details);
     let mut visible = Vec::new();
     let mut seen_ids = std::collections::BTreeSet::new();
     for region in focused_regions {
@@ -260,6 +277,113 @@ fn frame_layout(app: &BmuxApp, area: Rect) -> Option<FrameLayout> {
         composer,
         composer_content: composer_panel(TuiTheme::for_app(app).accent).inner_area(composer),
     })
+}
+
+#[cfg(test)]
+#[test]
+fn details_state_survives_reconstruction_resize_and_cache_reuse_then_drops_on_replacement() {
+    let source = "<details><summary>More</summary>Body that wraps across several cells.</details>";
+    let item = TranscriptItem::with_format("System", source.to_owned(), TextFormat::Markdown);
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    let initial = render_markdown(source, &markdown_render_options(&app, &item, 24));
+    let details = initial
+        .contributions
+        .iter()
+        .find(|item| matches!(item.kind, MarkdownContributionKind::Details { .. }))
+        .expect("details contribution");
+    let details_id = details.id.clone();
+    app.reconcile_markdown_interactions(vec![
+        crate::markdown_interaction::VisibleMarkdownContribution {
+            id: details_id.clone(),
+            kind: details.kind.clone(),
+        },
+    ]);
+    assert!(app.activate_markdown_contribution(&details_id));
+
+    let narrow = render_markdown(source, &markdown_render_options(&app, &item, 24));
+    let wide = render_markdown(source, &markdown_render_options(&app, &item, 60));
+    for rendered in [&narrow, &wide] {
+        let text = rendered
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert!(text.contains("▼ More"));
+        assert!(text.contains("Body that wraps"));
+    }
+    let cached = render_markdown(source, &markdown_render_options(&app, &item, 24));
+    assert_eq!(narrow.lines, cached.lines);
+    assert_eq!(narrow.geometry, cached.geometry);
+    assert_eq!(narrow.layout_signature, cached.layout_signature);
+
+    let replacement = TranscriptItem::with_format(
+        "System",
+        "<details><summary>Changed</summary>Replacement</details>".to_owned(),
+        TextFormat::Markdown,
+    );
+    let replacement_ids =
+        transcript_markdown_details_ids_for_items(&app, std::slice::from_ref(&replacement), 24);
+    app.reconcile_markdown_details(&replacement_ids);
+    assert!(!app.markdown_details_open().contains_key(&details_id));
+}
+
+#[cfg(test)]
+#[test]
+fn github_fixture_retry_details_expand_and_collapse() {
+    let source = include_str!("../../../github-markdown-example.md");
+    let item = TranscriptItem::with_format("System", source.to_owned(), TextFormat::Markdown);
+    let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+    let initial = render_markdown(source, &markdown_render_options(&app, &item, 80));
+    let details = initial
+        .contributions
+        .iter()
+        .find(|contribution| {
+            matches!(
+                &contribution.kind,
+                MarkdownContributionKind::Details { summary, .. }
+                    if summary.contains("retry algorithm")
+            )
+        })
+        .expect("retry details contribution");
+    let details_id = details.id.clone();
+    let initial_text = initial
+        .lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .map(|span| span.content.as_str())
+        .collect::<String>();
+    assert!(initial_text.contains("▶ View the retry algorithm"));
+    assert!(!initial_text.contains("delay(n)"));
+
+    app.reconcile_markdown_interactions(vec![
+        crate::markdown_interaction::VisibleMarkdownContribution {
+            id: details_id.clone(),
+            kind: details.kind.clone(),
+        },
+    ]);
+    assert!(app.activate_markdown_contribution(&details_id));
+    let expanded = render_markdown(source, &markdown_render_options(&app, &item, 80));
+    let expanded_text = expanded
+        .lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .map(|span| span.content.as_str())
+        .collect::<String>();
+    assert!(expanded_text.contains("▼ View the retry algorithm"));
+    assert!(expanded_text.contains("delay(n)"));
+    assert!(expanded_text.contains("Example with Jitter"));
+
+    assert!(app.activate_markdown_contribution(&details_id));
+    let collapsed = render_markdown(source, &markdown_render_options(&app, &item, 80));
+    let collapsed_text = collapsed
+        .lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .map(|span| span.content.as_str())
+        .collect::<String>();
+    assert!(collapsed_text.contains("▶ View the retry algorithm"));
+    assert!(!collapsed_text.contains("delay(n)"));
 }
 
 #[cfg(test)]
@@ -797,14 +921,15 @@ fn markdown_render_options(
 ) -> MarkdownRenderOptions {
     let mut options = MarkdownRenderOptions::new(width)
         .with_document_id(format!("transcript:{}", item.id().get()))
-        .with_streaming(item.streaming());
+        .with_streaming(item.streaming())
+        .with_link_destination_fallbacks(true);
     if let Some(base_directory) = app.working_directory() {
         options = options.with_document_context(MarkdownDocumentContext {
             base_directory: Some(base_directory.to_path_buf()),
             ..MarkdownDocumentContext::default()
         });
     }
-    options
+    options.with_details_open(app.markdown_details_open().clone())
 }
 
 fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
@@ -868,6 +993,109 @@ fn render_transcript_markdown_hits(
             .layer(1),
         );
     }
+}
+
+fn transcript_markdown_footnote_rows(
+    app: &BmuxApp,
+    width: u16,
+) -> std::collections::BTreeMap<String, usize> {
+    let mut rows = std::collections::BTreeMap::new();
+    for (index, item) in app.transcript().iter().enumerate() {
+        if item.text_format() != TextFormat::Markdown {
+            continue;
+        }
+        let Some(entry_start) = app.transcript_layout().entry_start_row(
+            super::transcript_layout::VisibleTranscriptSource::Transcript,
+            index,
+        ) else {
+            continue;
+        };
+        let content_offset = transcript_markdown_content_row_offset(item, width);
+        let rendered = render_markdown(
+            item.text(),
+            &markdown_render_options(app, item, width.saturating_sub(2).max(1)),
+        );
+        for geometry in rendered.geometry {
+            let is_footnote = rendered.contributions.iter().any(|contribution| {
+                contribution.id == geometry.contribution_id
+                    && matches!(
+                        contribution.kind,
+                        MarkdownContributionKind::FootnoteReference { .. }
+                            | MarkdownContributionKind::FootnoteDefinition { .. }
+                    )
+            });
+            if is_footnote && let Some(rect) = geometry.rects.first() {
+                rows.insert(
+                    geometry.contribution_id,
+                    entry_start
+                        .saturating_add(content_offset)
+                        .saturating_add(usize::from(rect.y)),
+                );
+            }
+        }
+    }
+    rows
+}
+
+fn transcript_markdown_fragment_rows(
+    app: &BmuxApp,
+    width: u16,
+) -> std::collections::BTreeMap<String, usize> {
+    let mut fragments = std::collections::BTreeMap::new();
+    for (index, item) in app.transcript().iter().enumerate() {
+        if item.text_format() != TextFormat::Markdown {
+            continue;
+        }
+        let Some(entry_start) = app.transcript_layout().entry_start_row(
+            super::transcript_layout::VisibleTranscriptSource::Transcript,
+            index,
+        ) else {
+            continue;
+        };
+        let content_offset = transcript_markdown_content_row_offset(item, width);
+        let rendered = render_markdown(
+            item.text(),
+            &markdown_render_options(app, item, width.saturating_sub(2).max(1)),
+        );
+        for anchor in rendered.anchors {
+            fragments.entry(anchor.fragment).or_insert_with(|| {
+                entry_start
+                    .saturating_add(content_offset)
+                    .saturating_add(usize::from(anchor.row))
+            });
+        }
+    }
+    fragments
+}
+
+fn transcript_markdown_details_ids(
+    app: &BmuxApp,
+    width: u16,
+) -> std::collections::BTreeSet<String> {
+    transcript_markdown_details_ids_for_items(app, app.transcript(), width)
+}
+
+fn transcript_markdown_details_ids_for_items(
+    app: &BmuxApp,
+    items: &[TranscriptItem],
+    width: u16,
+) -> std::collections::BTreeSet<String> {
+    items
+        .iter()
+        .filter(|item| item.text_format() == TextFormat::Markdown)
+        .flat_map(|item| {
+            render_markdown(
+                item.text(),
+                &markdown_render_options(app, item, width.saturating_sub(2).max(1)),
+            )
+            .contributions
+            .into_iter()
+            .filter_map(|contribution| {
+                matches!(contribution.kind, MarkdownContributionKind::Details { .. })
+                    .then_some(contribution.id)
+            })
+        })
+        .collect()
 }
 
 fn transcript_markdown_regions(app: &BmuxApp, area: Rect) -> Vec<MarkdownTranscriptRegion> {
@@ -1554,7 +1782,9 @@ fn push_markdown_block_with_streaming(
     } else {
         for line in render_markdown_lines(
             body,
-            MarkdownRenderOptions::new(width.saturating_sub(2).max(1)).with_streaming(streaming),
+            MarkdownRenderOptions::new(width.saturating_sub(2).max(1))
+                .with_streaming(streaming)
+                .with_details_open(markdown_details_open()),
         ) {
             let mut spans = vec![Span::styled("  ", muted_style())];
             spans.extend(line.spans);

@@ -394,6 +394,28 @@ const WORKER_RESPONSE_MAGIC: &[u8; 4] = b"BCMR";
 const WORKER_PROTOCOL_VERSION: u16 = 1;
 const WORKER_RESPONSE_HEADER_BYTES: usize = 11;
 
+fn spawn_worker(
+    worker_path: &std::path::Path,
+) -> Result<(std::process::Child, WorkerMemoryGuard), MermaidRenderError> {
+    let mut command = std::process::Command::new(worker_path);
+    configure_worker_memory_limit(&mut command);
+    let mut child = command
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|error| MermaidRenderError::WorkerUnavailable {
+            message: error.to_string(),
+        })?;
+    let guard = attach_worker_memory_limit(&mut child).map_err(|error| {
+        terminate_worker(&mut child);
+        MermaidRenderError::WorkerUnavailable {
+            message: format!("could not enforce worker memory limit: {error}"),
+        }
+    })?;
+    Ok((child, guard))
+}
+
 /// Render a Mermaid request through the private worker executable.
 ///
 /// The caller supplies the worker path explicitly so application packaging owns
@@ -411,16 +433,7 @@ pub fn render_mermaid_with_worker(
 ) -> Result<MermaidRendered, MermaidRenderError> {
     validate_request(request, cancellation)?;
     let request_bytes = encode_worker_request(request)?;
-    let mut command = std::process::Command::new(worker_path);
-    configure_worker_memory_limit(&mut command);
-    let mut child = command
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|error| MermaidRenderError::WorkerUnavailable {
-            message: error.to_string(),
-        })?;
+    let (mut child, _memory_guard) = spawn_worker(worker_path)?;
     let write_result = child
         .stdin
         .take()
@@ -573,15 +586,24 @@ fn decode_worker_response(
 fn configure_worker_memory_limit(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
 
+    let mut existing = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `existing` points to writable storage for the duration of the call.
+    if unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut existing) } != 0 {
+        return;
+    }
+    let limit = libc::rlimit {
+        rlim_cur: existing.rlim_cur.min(WORKER_MEMORY_BYTES as libc::rlim_t),
+        rlim_max: existing.rlim_max,
+    };
+
     // SAFETY: `pre_exec` runs in the child after fork. The closure performs
     // only the async-signal-safe `setrlimit` syscall and constructs an I/O
     // error from the OS error code when it fails.
     unsafe {
-        command.pre_exec(|| {
-            let limit = libc::rlimit {
-                rlim_cur: WORKER_MEMORY_BYTES as libc::rlim_t,
-                rlim_max: WORKER_MEMORY_BYTES as libc::rlim_t,
-            };
+        command.pre_exec(move || {
             if libc::setrlimit(libc::RLIMIT_AS, &limit) == 0 {
                 Ok(())
             } else {
@@ -593,6 +615,71 @@ fn configure_worker_memory_limit(command: &mut std::process::Command) {
 
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
 const fn configure_worker_memory_limit(_command: &mut std::process::Command) {}
+
+#[cfg(windows)]
+struct WorkerMemoryGuard(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for WorkerMemoryGuard {
+    fn drop(&mut self) {
+        // SAFETY: the handle was returned by `CreateJobObjectW`, remains owned
+        // by this guard, and is closed exactly once here.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn attach_worker_memory_limit(
+    child: &mut std::process::Child,
+) -> Result<WorkerMemoryGuard, std::io::Error> {
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JobObjectExtendedLimitInformation, SetInformationJobObject,
+    };
+
+    // SAFETY: all pointers refer to initialized local storage for the duration
+    // of each call. The process handle is borrowed from the live child.
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let guard = WorkerMemoryGuard(job);
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags =
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        limits.ProcessMemoryLimit = usize::try_from(WORKER_MEMORY_BYTES).unwrap_or(usize::MAX);
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_ref(&limits).cast(),
+            u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                .expect("job limit structure size fits u32"),
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if AssignProcessToJobObject(job, child.as_raw_handle().cast()) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(guard)
+    }
+}
+
+#[cfg(not(windows))]
+struct WorkerMemoryGuard;
+
+#[cfg(not(windows))]
+fn attach_worker_memory_limit(
+    child: &mut std::process::Child,
+) -> Result<WorkerMemoryGuard, std::io::Error> {
+    child.try_wait().map(|_| WorkerMemoryGuard)
+}
 
 fn terminate_worker(child: &mut std::process::Child) {
     let _ = child.kill();
