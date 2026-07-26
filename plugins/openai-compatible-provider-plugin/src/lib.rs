@@ -3179,7 +3179,7 @@ fn build_chat_completion_request(
         } else {
             request.tool_call_policy.parallel
         },
-        response_format: chat_response_format(request),
+        response_format: chat_response_format(request)?,
         temperature: request.parameters.temperature,
         max_tokens: request.parameters.max_output_tokens,
         top_p: request.parameters.top_p,
@@ -4346,7 +4346,7 @@ fn build_responses_request(
         } else {
             None
         },
-        text: responses_text_options(settings, request),
+        text: responses_text_options(settings, request)?,
         reasoning: responses_reasoning_options(settings, request),
         include: responses_include(settings.dialect.reasoning_request_shape(), request),
         prompt_cache_key: settings
@@ -4432,38 +4432,100 @@ fn openai_tool_choice(
     })
 }
 
-fn chat_response_format(request: &ModelTurnRequest) -> Option<ChatResponseFormat> {
+fn strict_openai_schema(schema: &serde_json::Value) -> Result<serde_json::Value, ProviderError> {
+    fn normalize(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(object) => {
+                let is_object = object.get("type").and_then(serde_json::Value::as_str)
+                    == Some("object")
+                    || object.contains_key("properties");
+                if is_object {
+                    object.insert("additionalProperties".to_string(), serde_json::json!(false));
+                    if let Some(properties) = object
+                        .get("properties")
+                        .and_then(serde_json::Value::as_object)
+                    {
+                        let required = properties.keys().cloned().collect::<Vec<_>>();
+                        object.insert("required".to_string(), serde_json::json!(required));
+                    }
+                }
+                for child in object.values_mut() {
+                    normalize(child);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    normalize(value);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !schema.is_object() {
+        return Err(provider_error(
+            "invalid_structured_output_schema",
+            ProviderErrorCategory::InvalidRequest,
+            "strict structured-output schema must be a JSON object",
+        ));
+    }
+    let mut schema = schema.clone();
+    normalize(&mut schema);
+    Ok(schema)
+}
+
+fn provider_structured_output_schema(
+    structured: &bcode_model::StructuredOutputRequest,
+) -> Result<serde_json::Value, ProviderError> {
+    if structured.strict {
+        strict_openai_schema(&structured.schema)
+    } else {
+        Ok(structured.schema.clone())
+    }
+}
+
+fn chat_response_format(
+    request: &ModelTurnRequest,
+) -> Result<Option<ChatResponseFormat>, ProviderError> {
     request
         .structured_output
         .as_ref()
-        .map(|structured| ChatResponseFormat {
-            r#type: "json_schema",
-            json_schema: Some(ChatResponseJsonSchema {
-                name: structured.name.clone(),
-                schema: structured.schema.clone(),
-                strict: structured.strict,
-            }),
+        .map(|structured| {
+            Ok(ChatResponseFormat {
+                r#type: "json_schema",
+                json_schema: Some(ChatResponseJsonSchema {
+                    name: structured.name.clone(),
+                    schema: provider_structured_output_schema(structured)?,
+                    strict: structured.strict,
+                }),
+            })
         })
+        .transpose()
 }
 
 fn responses_text_options(
     settings: &Settings,
     request: &ModelTurnRequest,
-) -> Option<ResponsesTextOptions> {
+) -> Result<Option<ResponsesTextOptions>, ProviderError> {
     let format = request
         .structured_output
         .as_ref()
-        .map(|structured| ResponsesTextFormat {
-            r#type: "json_schema",
-            name: structured.name.clone(),
-            schema: structured.schema.clone(),
-            strict: structured.strict,
-        });
+        .map(|structured| {
+            Ok(ResponsesTextFormat {
+                r#type: "json_schema",
+                name: structured.name.clone(),
+                schema: provider_structured_output_schema(structured)?,
+                strict: structured.strict,
+            })
+        })
+        .transpose()?;
     let verbosity = settings.dialect.uses_codex_request_shape().then_some("low");
-    (format.is_some() || verbosity.is_some()).then_some(ResponsesTextOptions {
-        format,
-        verbosity: verbosity.unwrap_or("low"),
-    })
+    Ok(
+        (format.is_some() || verbosity.is_some()).then_some(ResponsesTextOptions {
+            format,
+            verbosity: verbosity.unwrap_or("low"),
+        }),
+    )
 }
 
 fn responses_reasoning_options(
@@ -7897,6 +7959,56 @@ mod tests {
                 case.name == required_case && case.outcome == ProviderConformanceOutcome::Passed
             }));
         }
+    }
+
+    #[test]
+    fn strict_structured_output_schema_is_normalized_for_openai() {
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        let mut request = test_request(Vec::new());
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "ConformanceResult".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "ok": {"const": true},
+                    "nested": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "required": []
+                    }
+                },
+                "required": ["ok"]
+            }),
+            strict: true,
+        });
+
+        let body = build_responses_request(&settings, &request, "model").expect("request");
+        let schema = &body["text"]["format"]["schema"];
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["required"], serde_json::json!(["nested", "ok"]));
+        assert_eq!(
+            schema["properties"]["nested"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            schema["properties"]["nested"]["required"],
+            serde_json::json!(["value"])
+        );
+    }
+
+    #[test]
+    fn non_object_strict_structured_output_schema_is_rejected() {
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        let mut request = test_request(Vec::new());
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "ConformanceResult".to_string(),
+            schema: serde_json::json!(["not", "an", "object"]),
+            strict: true,
+        });
+
+        let error = build_responses_request(&settings, &request, "model")
+            .expect_err("invalid schema must fail before transport");
+        assert_eq!(error.code, "invalid_structured_output_schema");
     }
 
     #[test]
