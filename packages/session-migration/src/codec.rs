@@ -28,6 +28,24 @@ impl HistoricalEnvelope {
         self.schema_version
     }
 
+    pub fn source_kind_name(&self) -> Result<&str, HistoricalSessionEventError> {
+        source_kind(self).map(|(kind, _)| kind)
+    }
+
+    pub fn decode_retired_known(&self) -> Result<HistoricalDecode, HistoricalSessionEventError> {
+        let (event_kind, payload) = source_kind(self)?;
+        Ok(HistoricalDecode::RetiredKnown {
+            event: self.materialize(SessionEventKind::OpaqueEvent {
+                event_type: event_kind.to_owned(),
+                payload: payload.clone(),
+            }),
+            metadata: HistoricalEventMetadata {
+                source_schema: self.schema_version,
+                source_kind: event_kind.to_owned(),
+            },
+        })
+    }
+
     fn materialize(&self, kind: SessionEventKind) -> SessionEvent {
         SessionEvent {
             schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -61,8 +79,8 @@ fn source_kind(
     Ok((event_kind, payload))
 }
 
-/// Frozen codec for schema 28, the released format affected by the invocation/context incident.
-pub mod schema_28 {
+/// Frozen codecs for released tool-result and context-usage event families.
+pub mod historical_event_families {
     use super::{
         HistoricalDecode, HistoricalEnvelope, HistoricalEventMetadata, HistoricalSessionEventError,
         LocalContextEstimate, ModelRequestIdentity, RequestContextObservation,
@@ -87,6 +105,73 @@ pub mod schema_28 {
         Text { text: String },
         Json { value: String },
         Artifact { artifact: Box<ToolArtifactDto> },
+        ShellRun { result: ShellRunResultDto },
+        FileChange { result: FileChangeResultDto },
+    }
+
+    #[derive(Debug, serde::Serialize, Deserialize)]
+    #[serde(tag = "mode", rename_all = "snake_case")]
+    enum ShellRunResultDto {
+        Terminal {
+            #[serde(default)]
+            exit_code: Option<i32>,
+            #[serde(default)]
+            timed_out: bool,
+            #[serde(default)]
+            cancelled: bool,
+            #[serde(default)]
+            duration_ms: Option<u64>,
+            #[serde(default)]
+            output_tail: String,
+            #[serde(default)]
+            output_truncated: bool,
+            #[serde(default)]
+            output_bytes: Option<u64>,
+            #[serde(default)]
+            retained_output_bytes: Option<u64>,
+            #[serde(default = "default_terminal_columns")]
+            columns: u16,
+            #[serde(default = "default_terminal_rows")]
+            rows: u16,
+        },
+        Captured {
+            #[serde(default)]
+            exit_code: Option<i32>,
+            #[serde(default)]
+            timed_out: bool,
+            #[serde(default)]
+            cancelled: bool,
+            #[serde(default)]
+            duration_ms: Option<u64>,
+            #[serde(default)]
+            stdout: String,
+            #[serde(default)]
+            stderr: String,
+            #[serde(default)]
+            stdout_truncated: bool,
+            #[serde(default)]
+            stderr_truncated: bool,
+            #[serde(default)]
+            stdout_bytes: Option<u64>,
+            #[serde(default)]
+            stderr_bytes: Option<u64>,
+        },
+    }
+
+    const fn default_terminal_columns() -> u16 {
+        80
+    }
+
+    const fn default_terminal_rows() -> u16 {
+        24
+    }
+
+    #[derive(Debug, serde::Serialize, Deserialize)]
+    struct FileChangeResultDto {
+        tool_name: String,
+        summary: String,
+        #[serde(default)]
+        path: Option<String>,
     }
 
     #[derive(Debug, Deserialize)]
@@ -153,20 +238,81 @@ pub mod schema_28 {
                 Self::Artifact { artifact } => ToolInvocationResult::Artifact {
                     artifact: Box::new((*artifact).into()),
                 },
+                Self::ShellRun { result } => ToolInvocationResult::Json {
+                    value: serde_json::json!({
+                        "type": "shell_run",
+                        "result": result,
+                    })
+                    .to_string(),
+                },
+                Self::FileChange { result } => ToolInvocationResult::Json {
+                    value: serde_json::json!({
+                        "type": "file_change",
+                        "result": result,
+                    })
+                    .to_string(),
+                },
             }
         }
     }
 
     #[derive(Debug, Deserialize)]
-    struct FlatContextUsageSnapshot {
+    struct HistoricalModelInvocationIdentity {
         provider_plugin_id: String,
-        model_id: String,
-        input_tokens: u64,
-        context_through_sequence: u64,
+        #[serde(default)]
+        requested_model_id: Option<String>,
+        effective_model_id: String,
         request_id: String,
         model_turn_id: String,
         round: u32,
         request_fingerprint: String,
+        #[serde(default)]
+        effective_auth_profile: Option<String>,
+        #[serde(default)]
+        context_format_version: Option<u16>,
+        #[serde(default)]
+        compatibility_key: Option<String>,
+        #[serde(default)]
+        context_epoch: u64,
+    }
+
+    impl From<HistoricalModelInvocationIdentity> for ModelRequestIdentity {
+        fn from(value: HistoricalModelInvocationIdentity) -> Self {
+            Self {
+                provider_plugin_id: value.provider_plugin_id,
+                requested_model_id: value.requested_model_id,
+                effective_model_id: value.effective_model_id,
+                request_id: value.request_id,
+                model_turn_id: value.model_turn_id,
+                round: value.round,
+                request_fingerprint: value.request_fingerprint,
+                effective_auth_profile: value.effective_auth_profile,
+                context_format_version: value.context_format_version,
+                compatibility_key: value.compatibility_key,
+                context_epoch: value.context_epoch,
+            }
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct HistoricalContextUsageSnapshot {
+        #[serde(default)]
+        invocation: Option<HistoricalModelInvocationIdentity>,
+        #[serde(default)]
+        provider_plugin_id: Option<String>,
+        #[serde(default)]
+        model_id: Option<String>,
+        #[serde(default)]
+        input_tokens: Option<u64>,
+        context_through_sequence: u64,
+        #[serde(default)]
+        request_id: Option<String>,
+        #[serde(default)]
+        model_turn_id: Option<String>,
+        #[serde(default)]
+        round: Option<u32>,
+        #[serde(default)]
+        request_fingerprint: Option<String>,
         #[serde(default)]
         auth_profile: Option<String>,
         #[serde(default)]
@@ -175,7 +321,12 @@ pub mod schema_28 {
         compatibility_key: Option<String>,
         #[serde(default)]
         context_epoch: u64,
-        estimated_input_tokens: u64,
+        #[serde(default)]
+        estimated_input_tokens: Option<u64>,
+        #[serde(default)]
+        context_input_tokens: Option<u64>,
+        #[serde(default)]
+        local_request_estimate_tokens: Option<u64>,
         source: ContextUsageSource,
     }
 
@@ -186,41 +337,160 @@ pub mod schema_28 {
         Estimated,
     }
 
-    impl FlatContextUsageSnapshot {
-        fn into_current(self) -> RequestContextObservation {
-            let context_tokens = match self.source {
-                ContextUsageSource::Provider => {
-                    RequestContextTokenCount::ProviderExact(self.input_tokens)
-                }
-                ContextUsageSource::Estimated => {
-                    RequestContextTokenCount::Estimated(self.input_tokens)
-                }
+    enum ContextUsageConversion {
+        Active(Box<RequestContextObservation>),
+        Inert,
+    }
+
+    impl HistoricalContextUsageSnapshot {
+        fn into_current(self) -> ContextUsageConversion {
+            let Some(context_input_tokens) = self.context_input_tokens.or(self.input_tokens) else {
+                return ContextUsageConversion::Inert;
             };
-            RequestContextObservation {
-                request: ModelRequestIdentity {
-                    provider_plugin_id: self.provider_plugin_id,
-                    requested_model_id: Some(self.model_id.clone()),
-                    effective_model_id: self.model_id,
-                    request_id: self.request_id,
-                    model_turn_id: self.model_turn_id,
-                    round: self.round,
-                    request_fingerprint: self.request_fingerprint,
+            let local_estimate_tokens = self
+                .local_request_estimate_tokens
+                .or(self.estimated_input_tokens)
+                .unwrap_or(context_input_tokens);
+            let request = if let Some(invocation) = self.invocation {
+                invocation.into()
+            } else {
+                let (
+                    Some(provider_plugin_id),
+                    Some(effective_model_id),
+                    Some(request_id),
+                    Some(model_turn_id),
+                    Some(round),
+                    Some(request_fingerprint),
+                ) = (
+                    self.provider_plugin_id,
+                    self.model_id,
+                    self.request_id,
+                    self.model_turn_id,
+                    self.round,
+                    self.request_fingerprint,
+                )
+                else {
+                    return ContextUsageConversion::Inert;
+                };
+                ModelRequestIdentity {
+                    provider_plugin_id,
+                    requested_model_id: Some(effective_model_id.clone()),
+                    effective_model_id,
+                    request_id,
+                    model_turn_id,
+                    round,
+                    request_fingerprint,
                     effective_auth_profile: self.auth_profile,
                     context_format_version: self.context_format_version,
                     compatibility_key: self.compatibility_key,
                     context_epoch: self.context_epoch,
-                },
+                }
+            };
+            let context_tokens = match self.source {
+                ContextUsageSource::Provider => {
+                    RequestContextTokenCount::ProviderExact(context_input_tokens)
+                }
+                ContextUsageSource::Estimated => {
+                    RequestContextTokenCount::Estimated(context_input_tokens)
+                }
+            };
+            ContextUsageConversion::Active(Box::new(RequestContextObservation {
+                request,
                 context_through_sequence: self.context_through_sequence,
                 context_tokens,
                 local_estimate: LocalContextEstimate {
-                    tokens: self.estimated_input_tokens,
+                    tokens: local_estimate_tokens,
                     algorithm_version: 1,
                 },
-            }
+            }))
         }
     }
 
-    pub fn decode(
+    pub fn decode_tool_call_finished(
+        envelope: &HistoricalEnvelope,
+    ) -> Result<HistoricalDecode, HistoricalSessionEventError> {
+        let (event_kind, event_payload) = source_kind(envelope)?;
+        if event_kind != "tool_call_finished" {
+            return Err(HistoricalSessionEventError::UnsupportedEventKind {
+                schema_version: envelope.schema_version,
+                event_kind: event_kind.to_owned(),
+            });
+        }
+        let metadata = HistoricalEventMetadata {
+            source_schema: envelope.schema_version,
+            source_kind: event_kind.to_owned(),
+        };
+        let source =
+            serde_json::from_value::<ToolCallFinished>(event_payload.clone()).map_err(|error| {
+                HistoricalSessionEventError::InvalidEvent {
+                    schema_version: envelope.schema_version,
+                    event_kind: event_kind.to_owned(),
+                    reason: error.to_string(),
+                }
+            })?;
+        Ok(HistoricalDecode::Converted {
+            event: envelope.materialize(SessionEventKind::ToolInvocationResultRecorded {
+                record: ToolInvocationResultRecord {
+                    invocation_id: source.tool_call_id,
+                    model_output: source.result.clone(),
+                    is_error: source.is_error,
+                    presentation: None,
+                    result: source
+                        .semantic_result
+                        .map(ToolInvocationResultDto::into_current),
+                },
+            }),
+            metadata,
+        })
+    }
+
+    pub fn decode_context_usage_observed(
+        envelope: &HistoricalEnvelope,
+    ) -> Result<HistoricalDecode, HistoricalSessionEventError> {
+        let (event_kind, event_payload) = source_kind(envelope)?;
+        if event_kind != "context_usage_observed" {
+            return Err(HistoricalSessionEventError::UnsupportedEventKind {
+                schema_version: envelope.schema_version,
+                event_kind: event_kind.to_owned(),
+            });
+        }
+        let metadata = HistoricalEventMetadata {
+            source_schema: envelope.schema_version,
+            source_kind: event_kind.to_owned(),
+        };
+        let snapshot = event_payload.get("snapshot").cloned().ok_or_else(|| {
+            HistoricalSessionEventError::InvalidEvent {
+                schema_version: envelope.schema_version,
+                event_kind: event_kind.to_owned(),
+                reason: "missing snapshot".to_owned(),
+            }
+        })?;
+        let snapshot = serde_json::from_value::<HistoricalContextUsageSnapshot>(snapshot).map_err(
+            |error| HistoricalSessionEventError::InvalidEvent {
+                schema_version: envelope.schema_version,
+                event_kind: event_kind.to_owned(),
+                reason: error.to_string(),
+            },
+        )?;
+        let observation = match snapshot.into_current() {
+            ContextUsageConversion::Active(observation) => *observation,
+            ContextUsageConversion::Inert => {
+                return Ok(HistoricalDecode::RetiredKnown {
+                    event: envelope.materialize(SessionEventKind::OpaqueEvent {
+                        event_type: event_kind.to_owned(),
+                        payload: event_payload.clone(),
+                    }),
+                    metadata,
+                });
+            }
+        };
+        Ok(HistoricalDecode::Converted {
+            event: envelope.materialize(SessionEventKind::RequestContextObserved { observation }),
+            metadata,
+        })
+    }
+
+    pub fn decode_schema_28(
         envelope: &HistoricalEnvelope,
     ) -> Result<HistoricalDecode, HistoricalSessionEventError> {
         let (event_kind, event_payload) = source_kind(envelope)?;
@@ -229,49 +499,8 @@ pub mod schema_28 {
             source_kind: event_kind.to_owned(),
         };
         match event_kind {
-            "tool_call_finished" => {
-                let source = serde_json::from_value::<ToolCallFinished>(event_payload.clone())
-                    .map_err(|error| HistoricalSessionEventError::InvalidEvent {
-                        schema_version: envelope.schema_version,
-                        event_kind: event_kind.to_owned(),
-                        reason: error.to_string(),
-                    })?;
-                Ok(HistoricalDecode::Converted {
-                    event: envelope.materialize(SessionEventKind::ToolInvocationResultRecorded {
-                        record: ToolInvocationResultRecord {
-                            invocation_id: source.tool_call_id,
-                            model_output: source.result.clone(),
-                            is_error: source.is_error,
-                            presentation: None,
-                            result: source
-                                .semantic_result
-                                .map(ToolInvocationResultDto::into_current),
-                        },
-                    }),
-                    metadata,
-                })
-            }
-            "context_usage_observed" => {
-                let snapshot = event_payload.get("snapshot").cloned().ok_or_else(|| {
-                    HistoricalSessionEventError::InvalidEvent {
-                        schema_version: envelope.schema_version,
-                        event_kind: event_kind.to_owned(),
-                        reason: "missing snapshot".to_owned(),
-                    }
-                })?;
-                let snapshot = serde_json::from_value::<FlatContextUsageSnapshot>(snapshot)
-                    .map_err(|error| HistoricalSessionEventError::InvalidEvent {
-                        schema_version: envelope.schema_version,
-                        event_kind: event_kind.to_owned(),
-                        reason: error.to_string(),
-                    })?;
-                Ok(HistoricalDecode::Converted {
-                    event: envelope.materialize(SessionEventKind::RequestContextObserved {
-                        observation: snapshot.into_current(),
-                    }),
-                    metadata,
-                })
-            }
+            "tool_call_finished" => decode_tool_call_finished(envelope),
+            "context_usage_observed" => decode_context_usage_observed(envelope),
             "tool_invocation_stream" => Ok(HistoricalDecode::RetiredKnown {
                 event: envelope.materialize(SessionEventKind::OpaqueEvent {
                     event_type: event_kind.to_owned(),

@@ -154,7 +154,36 @@ pub fn validate_migration_target(
     Ok(())
 }
 
-/// Migration-ledger facts collected without historical interpretation.
+/// One durable migration-ledger row collected from a source store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationLedgerRow {
+    /// Stable migration identifier.
+    pub id: String,
+    /// Durable migration status.
+    pub status: String,
+}
+
+/// Convert raw ledger rows into completed migration identifiers.
+///
+/// # Errors
+///
+/// Returns an error when any source migration is not completed.
+pub fn completed_migration_ids(
+    rows: impl IntoIterator<Item = MigrationLedgerRow>,
+) -> Result<BTreeSet<String>, MigrationLedgerValidationError> {
+    rows.into_iter()
+        .map(|row| {
+            if row.status != "completed" {
+                return Err(MigrationLedgerValidationError::IncompleteMigration {
+                    id: row.id,
+                    status: row.status,
+                });
+            }
+            Ok(row.id)
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationLedgerFacts {
     /// Ordered migration identifiers known to the current target schema.
@@ -175,6 +204,9 @@ pub struct ValidatedMigrationLedger {
 /// Failure to interpret a source migration ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MigrationLedgerValidationError {
+    /// A source migration is not durably complete.
+    #[error("migration {id} has status {status}")]
+    IncompleteMigration { id: String, status: String },
     /// A completed migration is not known by this build.
     #[error("unknown migration {0}")]
     UnknownMigration(String),
@@ -563,6 +595,22 @@ mod tests {
 
     #[test]
     fn migration_ledger_validation_rejects_unknown_and_non_contiguous_history() {
+        assert_eq!(
+            completed_migration_ids([
+                MigrationLedgerRow {
+                    id: "001".to_owned(),
+                    status: "completed".to_owned(),
+                },
+                MigrationLedgerRow {
+                    id: "002".to_owned(),
+                    status: "dirty".to_owned(),
+                },
+            ]),
+            Err(MigrationLedgerValidationError::IncompleteMigration {
+                id: "002".to_owned(),
+                status: "dirty".to_owned(),
+            })
+        );
         let known = vec!["001".to_owned(), "002".to_owned(), "003".to_owned()];
         assert_eq!(
             validate_migration_ledger(&MigrationLedgerFacts {

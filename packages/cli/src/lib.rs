@@ -7007,13 +7007,8 @@ async fn reindex_session_model_context(session_id: SessionId) -> Result<(), CliE
         &root,
         session_id,
     )?;
-    let db = bcode_session::db::SessionDb::migrate_turso_in_root(
-        session_id,
-        &root,
-        &maintenance,
-        &write,
-    )
-    .await?;
+    let db = bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
+    db.validate_write_readiness().await?;
     let event_count = db.reindex_model_context(&maintenance, &write).await?;
     let canonical_tail = db.last_event_sequence().await?;
     let model_context = db.model_context_projection_status().await?;

@@ -114,7 +114,9 @@ for removed_symbol in HostModelNativeWebSearchRequest cancellation_path invocati
 done
 
 if rg -n '\blegacy_request_presentation\b|\brequest_visual\b|request_presentation|tool_invocation_presentation|\bpersisted_legacy\b' \
-  packages plugins examples --glob '*.rs' >/tmp/bcode-removed-legacy-presentation.txt; then
+  packages plugins examples --glob '*.rs' \
+  | rg -v 'packages/session-migration/src/(inventory|execution)\.rs' \
+  >/tmp/bcode-removed-legacy-presentation.txt; then
   echo "Runtime architecture violation: removed legacy presentation persistence was reintroduced." >&2
   cat /tmp/bcode-removed-legacy-presentation.txt >&2
   violations=1

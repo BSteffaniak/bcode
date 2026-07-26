@@ -23,12 +23,22 @@ Expected migration treatment:
   streaming behavior.
 * flat `context_usage_observed` converts to `RequestContextObserved`.
 
+## Confirmed retired event families
+
+`stores/retired-events.jsonl` contains synthetic classification coverage for every released event
+family removed from the active runtime. Each row uses a schema that actually released that family;
+it is not a complete store fixture and therefore claims no writer, ledger, root, table, or
+writable-lifecycle coverage. Migration classification must preserve each payload as inert current
+`OpaqueEvent` history without reviving obsolete interactive-tool, plugin-automation,
+presentation, turn, or stream behavior.
+
 ## Manifest
 
 `manifest.json` is the machine-enforced inventory for permanent sanitized fixtures. Every listed
 path must exist, contain exactly the declared contiguous event count and schemas, cover exactly the
-declared event kinds, and produce the declared migration classifications. Fixture files not listed
-in the manifest fail the inventory test.
+declared writer/schema and schema/kind pairs, and produce the declared migration classifications.
+Classification-only fixtures cannot claim store-level writer, ledger, root, table, authoritative,
+or writable-lifecycle coverage. Fixture files not listed in the manifest fail the inventory test.
 
 A complete migration must normalize all canonical payloads to the current event schema, rebuild
 current projections, produce zero compatibility issues, pass write readiness, and permit a new

@@ -190,22 +190,52 @@ if ! rg -q 'create_verified_migration_backup' packages/session/src/migration_exe
   violations=1
 fi
 
-if ! rg -q 'CURRENT_WRITER_EPOCH: u32 = 5' packages/session-migration/src/inventory.rs \
+if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5' packages/session/models/src/lib.rs \
+  || ! rg -q 'CURRENT_WRITER_EPOCH: u32 = bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH' packages/session-migration/src/inventory.rs \
   || ! rg -q 'RELEASED_HISTORICAL_ROOTS' packages/session-migration/src/inventory.rs \
   || ! rg -q 'RELEASED_HISTORICAL_EVENT_SCHEMAS' packages/session-migration/src/inventory.rs \
   || ! rg -q 'released_historical_root_inventory_is_sorted_unique_and_exact' packages/session-migration/src/inventory.rs \
   || ! rg -q 'RELEASED_EVENT_VARIANTS' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'released_event_schema_ranges_match_all_ref_inventory_boundaries' packages/session-migration/src/inventory.rs \
   || ! rg -q 'released_event_variant_treatments_are_sorted_unique_and_total' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'RELEASED_EVENT_VARIANTS.len\(\), 60' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'inventoried_retired_families_materialize_as_inert_current_history' packages/session-migration/src/execution.rs \
   || ! rg -q 'every inventoried retired variant must be an explicit reviewed decision' packages/session-migration/src/inventory.rs \
   || ! rg -q 'RELEASED_MIGRATION_IDS' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'ReleasedMigrationTreatment' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'RetiredSuperseded' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'GlobalOnly' packages/session-migration/src/inventory.rs \
   || ! rg -q 'RELEASED_PERSISTED_TABLES' packages/session-migration/src/inventory.rs \
   || ! rg -q 'RELEASED_RECORD_TREATMENTS' packages/session-migration/src/inventory.rs \
   || ! rg -q 'every_released_table_has_exactly_one_record_treatment' packages/session-migration/src/inventory.rs \
   || ! rg -q 'covered_authoritative_records' packages/session-migration/fixtures/manifest.json \
   || ! rg -q 'released_fixture_authoritative_record_coverage' packages/session-migration/src/inventory.rs \
   || ! rg -q 'permanent_fixture_manifest_rejects_duplicate_and_empty_coverage' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'UnsupportedEventKind' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'EventKindNotReleasedInSchema' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'DuplicateExactCoverage' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'insert_exact_coverage' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'covered_schema_event_pairs' packages/session-migration/src/execution.rs \
   || ! rg -q 'released_fixture_coverage_gaps' packages/session-migration/src/inventory.rs \
   || ! rg -q 'gaps.writer_epochs, BTreeSet::from\(\[1, 3, 4\]\)' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'writer_schema_pairs' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'covered_writer_schema_pairs' packages/session-migration/fixtures/manifest.json \
+  || ! rg -q 'writer_schema_event_combinations' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'RELEASED_WRITER_SCHEMA_COMBINATIONS' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'released_writer_schema_combinations_are_sorted_unique_and_exact' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'writer_edges' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'covered_roots' packages/session-migration/fixtures/manifest.json \
+  || ! rg -q 'covered_root_writer_pairs' packages/session-migration/fixtures/manifest.json \
+  || ! rg -q 'covered_tables' packages/session-migration/fixtures/manifest.json \
+  || ! rg -q 'covered_table_treatments' packages/session-migration/fixtures/manifest.json \
+  || ! rg -q 'migratable fixture must exercise every table treatment' packages/session-migration/src/execution.rs \
+  || ! rg -q 'writer_schema_pairs.contains\(&\(1, 1\)\)' packages/session-migration/src/planning.rs \
+  || ! rg -q 'migration_ledger_endpoints[[:space:]].*contains\("001_events_table"\)' packages/session-migration/src/planning.rs -U \
+  || ! rg -q 'migration_ledger_endpoints' packages/session-migration/fixtures/manifest.json \
+  || ! rg -q 'covered_migration_ledger_prefixes' packages/session-migration/fixtures/manifest.json \
+  || ! rg -q 'retired-events.jsonl' packages/session-migration/fixtures/manifest.json \
+  || ! rg -q 'migration_ledger_endpoints:' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'NonSessionMigrationEndpoint' packages/session-migration/src/inventory.rs \
   || ! sed -n '/async fn schema_28_historical_events_normalize_to_current_writable_storage/,/^    }/p' packages/session/src/db.rs | grep -q 'read preserved fixture draft' \
   || ! rg -q 'released_migration_and_table_inventories_are_sorted_unique_and_domain_complete' packages/session-migration/src/inventory.rs \
   || ! rg -q 'pub struct MigrationClassificationEvidence' packages/session-migration/src/validation.rs \
@@ -213,6 +243,9 @@ if ! rg -q 'CURRENT_WRITER_EPOCH: u32 = 5' packages/session-migration/src/invent
   || ! rg -q 'evidence: bcode_session_migration::MigrationClassificationEvidence' packages/session/src/db.rs \
   || ! rg -q 'migration_ledger_validation_rejects_unknown_and_non_contiguous_history' packages/session-migration/src/validation.rs \
   || ! rg -q 'validate_migration_ledger' packages/session/src/db.rs \
+  || ! rg -q 'completed_migration_ids' packages/session/src/db.rs \
+  || rg -n 'status != "completed"|migration \{id\} has status' packages/session/src/db.rs \
+    >/tmp/bcode-current-migration-ledger-status-policy-violations.txt \
   || ! rg -q 'source_storage_classification_owns_contract_and_writer_policy' packages/session-migration/src/validation.rs \
   || ! rg -q 'classify_source_storage' packages/session/src/db.rs \
   || rg -n 'migration history claims the storage contract|classify_writer_epoch\(' packages/session/src/db.rs \
@@ -225,12 +258,15 @@ if ! rg -q 'CURRENT_WRITER_EPOCH: u32 = 5' packages/session-migration/src/invent
   || ! rg -q 'ReleasedRecordTreatmentRow' packages/session-migration/src/planning.rs \
   || ! rg -q 'ReleasedRootTreatmentRow' packages/session-migration/src/planning.rs \
   || ! rg -q 'released_format_matrix_is_complete_unique_and_current_writable' packages/session-migration/src/planning.rs \
+  || ! rg -q 'fixture_release_gate_reports_exact_missing_dimensions' packages/session-migration/src/planning.rs \
+  || ! rg -q 'validate_released_fixture_coverage' packages/session-migration/src/planning.rs \
   || ! rg -q 'plan_writer_epoch_migration' packages/session-migration/src/planning.rs \
   || rg -n 'CURRENT_WRITER_EPOCH|RELEASED_HISTORICAL_EVENT_SCHEMAS|MIGRATION_STEPS' packages/session/src \
     --glob '*.rs' | rg -v 'CURRENT_SESSION_STORAGE_WRITER_EPOCH' \
     >/tmp/bcode-current-historical-inventory-violations.txt \
   || ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =' packages/session/src/lease.rs \
-  || ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5' packages/ipc/src/lib.rs \
+  || ! rg -q 'bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH' packages/session/src/lease.rs \
+  || ! rg -q 'bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH' packages/ipc/src/lib.rs \
   || ! rg -q 'session_event_schema_version' packages/ipc/src/lib.rs \
   || ! rg -q 'session_compatibility_state' packages/session/src/db.rs \
   || ! rg -q 'CompatibilityDegraded' packages/session/src/db.rs \
@@ -244,14 +280,19 @@ if ! rg -q 'CURRENT_WRITER_EPOCH: u32 = 5' packages/session-migration/src/invent
   violations=1
 fi
 
-if ! rg -q 'historical_codec_never_applies_schema_28_rules_to_other_schemas' packages/session-migration/src/execution.rs \
+if ! rg -q 'historical_codec_only_applies_family_rules_to_released_schema_ranges' packages/session-migration/src/execution.rs \
   || ! rg -q 'pub fn normalize_canonical_event' packages/session-migration/src/execution.rs \
+  || ! rg -q 'all_released_context_usage_shapes_use_the_frozen_codec' packages/session-migration/src/execution.rs \
+  || ! rg -q 'context_usage_without_required_request_identity_is_preserved_inert' packages/session-migration/src/execution.rs \
+  || ! rg -q 'released_context_usage_shapes_migrate_to_writable_current_occupancy' packages/session/src/db.rs \
   || ! rg -q 'schema_28_store_fixture_classifies_affected_historical_events' packages/session-migration/src/execution.rs \
   || ! rg -q 'pub struct ReleasedFixtureManifest' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'ClassificationOnlyClaimsStoreCoverage' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'historical_store_event_kinds' packages/session-migration/src/inventory.rs \
   || ! rg -q 'load_released_fixture_manifest' packages/session-migration/src/inventory.rs \
   || ! rg -q 'permanent_fixture_manifest_is_exhaustive_and_inventory_valid' packages/session-migration/src/inventory.rs \
   || ! rg -q 'fixture_manifest_enforces_complete_sanitized_inventory' packages/session-migration/src/execution.rs \
-  || ! rg -q 'pub mod schema_28' packages/session-migration/src/codec.rs \
+  || ! rg -q 'pub mod historical_event_families' packages/session-migration/src/codec.rs \
   || ! rg -q 'pub enum HistoricalDecode' packages/session-migration/src/classification.rs \
   || ! test -f packages/session-migration/fixtures/manifest.json; then
   echo "Session historical-codec violation: released schema rules and exact fixture classifications must remain explicit." >&2
@@ -342,6 +383,19 @@ if sed -n '/pub async fn session_history_page(/,/^    }/p' packages/session/src/
   || sed -n '/pub async fn open_existing_turso_in_root/,/^    }/p' packages/session/src/db.rs \
     | grep -Eq 'migrate_session_storage|rebuild_migration_projections'; then
   echo "Session current-read violation: catalog, bounded history, and current open paths must not migrate or full replay." >&2
+  violations=1
+fi
+
+if sed '/#\[cfg(test)\]/,$d' packages/session/src/db.rs \
+    | rg -q 'pub async fn migrate_turso_in_root(_observed)?' \
+  || rg -n 'migrate_turso_in_root(_observed)?' packages/cli/src packages/server/src --glob '*.rs'; then
+  echo "Session migration API-surface violation: low-level historical migration entry points must remain internal to the current target adapter and tests." >&2
+  violations=1
+fi
+
+if sed -n '/async fn reindex_session_model_context/,/async fn run_session_repair_command/p' packages/cli/src/lib.rs \
+  | rg -q 'migrate_turso_in_root'; then
+  echo "Session reindex boundary violation: explicit current reindex must require strict current storage and must not run historical migration." >&2
   violations=1
 fi
 
@@ -519,7 +573,7 @@ if ! rg -q 'acquire_session_maintenance_guard\(root, session_id\)' packages/sess
 fi
 
 if ! rg -q 'pub async fn open_existing_turso_in_root' packages/session/src/db.rs \
-  || ! rg -q 'pub async fn migrate_turso_in_root' packages/session/src/db.rs; then
+  || ! rg -q 'pub\(crate\) async fn migrate_turso_in_root' packages/session/src/db.rs; then
   echo "Session open-mode violation: runtime/read and maintenance migration opens must remain explicit." >&2
   violations=1
 fi
@@ -614,8 +668,10 @@ if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 15' packages/ipc/src/lib.rs \
   violations=1
 fi
 
-if ! rg -q 'pub mod schema_28' packages/session-migration/src/codec.rs \
-  || ! rg -q '28 => schema_28::decode' packages/session-migration/src/execution.rs \
+if ! rg -q 'pub mod historical_event_families' packages/session-migration/src/codec.rs \
+  || ! sed -n '/fn decode_for_migration(/,/^}/p' packages/session-migration/src/execution.rs | grep -q 'return historical_event_families::decode_schema_28' \
+  || ! rg -q 'historical_event_families::decode_context_usage_observed' packages/session-migration/src/execution.rs \
+  || ! rg -q 'source_kind == "context_usage_observed" && envelope.schema_version\(\) <= 31' packages/session-migration/src/execution.rs \
   || ! rg -q 'ToolArtifactDto' packages/session-migration/src/codec.rs \
   || rg -n 'Artifact \{ artifact: Box<ToolArtifact> \}' packages/session-migration/src/codec.rs >/tmp/bcode-mutable-historical-artifact-dto.txt \
   || ! rg -q 'normalize_canonical_event' packages/session/src/db.rs \
@@ -647,6 +703,8 @@ if ! rg -q 'pub mod schema_28' packages/session-migration/src/codec.rs \
   || ! sed -n '/let migration_outcome =/,/validate_storage_writer_contract/p' packages/session/src/db.rs | awk '/write_session_migration_receipt/{receipt=NR} /set_storage_writer_contract/{epoch=NR} END {exit !(receipt && epoch && receipt < epoch)}' \
   || ! rg -q 'set_storage_writer_contract\(&\*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH\)' packages/session/src/db.rs \
   || ! rg -q 'CONVERTED_TOOL_CALL_FINISHED' packages/session-migration/src/execution.rs \
+  || ! rg -q 'let current = decode_current\(payload\)' packages/session-migration/src/execution.rs \
+  || ! sed -n '/fn decode_for_migration(/,/^}/p' packages/session-migration/src/execution.rs | grep -q 'is_released_historical_event_schema' \
   || ! rg -q 'authoritative_state_conversion_tracks_resets_and_reconciled_observations' packages/session-migration/src/execution.rs \
   || ! rg -q 'state.authoritative.ingest\(event\)' packages/session/src/db.rs \
   || rg -n 'fn project_migration_context_occupancy_event' packages/session/src/db.rs \
@@ -752,7 +810,7 @@ if ! rg -q 'streaming_backup_handles_nested_empty_and_large_files' packages/sess
   violations=1
 fi
 
-migration_metric_sources="$(cat packages/session/src/migration_execution.rs; sed -n '/async fn migrate_legacy_session_for_load(/,/^    }/p' packages/session/src/lib.rs; sed -n '/pub async fn migrate_turso_in_root_observed(/,/pub async fn open_turso_in_root/p; /async fn migrate_session_storage(/,/^}/p; /async fn rebuild_migration_projections(/,/^}/p; /async fn validate_migrated_storage(/,/^}/p; /async fn project_migration_event(/,/^}/p' packages/session/src/db.rs)"
+migration_metric_sources="$(cat packages/session/src/migration_execution.rs; sed -n '/async fn migrate_legacy_session_for_load(/,/^    }/p' packages/session/src/lib.rs; sed -n '/pub(crate) async fn migrate_turso_in_root_observed(/,/pub async fn open_turso_in_root/p; /async fn migrate_session_storage(/,/^}/p; /async fn rebuild_migration_projections(/,/^}/p; /async fn validate_migrated_storage(/,/^}/p; /async fn project_migration_event(/,/^}/p' packages/session/src/db.rs)"
 for metric in \
   session.migration.ownership_duration_ms \
   session.migration.backup.plan_duration_ms \

@@ -10,6 +10,9 @@
 //! model, auth profile, format version, and compatibility key match. The portable summary is the
 //! required fallback for every other surface.
 
+/// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5;
+
 use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
 pub use bcode_tool_models::{
     ToolContributionArtifact, ToolContributionEnvelope, ToolContributionEvent,

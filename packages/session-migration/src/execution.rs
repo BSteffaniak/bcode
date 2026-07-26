@@ -1,7 +1,7 @@
 //! Historical canonical normalization and conversion into current session events.
 
 use crate::classification::{HistoricalDecode, HistoricalEventMetadata};
-use crate::codec::{HistoricalEnvelope, schema_28};
+use crate::codec::{HistoricalEnvelope, historical_event_families};
 use bcode_session_models::{RequestContextOccupancy, SessionEvent, SessionEventKind};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
@@ -229,14 +229,36 @@ fn decode_for_migration(
     payload: &str,
     decode_current: impl FnOnce(&str) -> Result<SessionEvent, String>,
 ) -> Result<HistoricalDecode, HistoricalSessionEventError> {
-    if let Ok(event) = decode_current(payload) {
-        return Ok(HistoricalDecode::Current(event));
-    }
-
+    let current = decode_current(payload);
     let envelope = serde_json::from_str::<HistoricalEnvelope>(payload)?;
-    match envelope.schema_version() {
-        28 => schema_28::decode(&envelope),
-        schema_version => Err(HistoricalSessionEventError::UnsupportedSchema { schema_version }),
+    let source_kind = envelope.source_kind_name()?;
+    if source_kind == "tool_call_finished" && envelope.schema_version() <= 39 {
+        return historical_event_families::decode_tool_call_finished(&envelope);
+    }
+    if source_kind == "context_usage_observed" && envelope.schema_version() <= 31 {
+        return historical_event_families::decode_context_usage_observed(&envelope);
+    }
+    if envelope.schema_version() == 28 && source_kind == "tool_invocation_stream" {
+        return historical_event_families::decode_schema_28(&envelope);
+    }
+    if crate::RELEASED_EVENT_VARIANTS.iter().any(|variant| {
+        variant.kind == source_kind
+            && variant.treatment == crate::ReleasedEventTreatment::RetiredKnown
+    }) {
+        return envelope.decode_retired_known();
+    }
+    match current {
+        Ok(event) => Ok(HistoricalDecode::Current(event)),
+        Err(reason) if crate::is_released_historical_event_schema(envelope.schema_version()) => {
+            Err(HistoricalSessionEventError::InvalidEvent {
+                schema_version: envelope.schema_version(),
+                event_kind: envelope.source_kind_name()?.to_owned(),
+                reason,
+            })
+        }
+        Err(_) => Err(HistoricalSessionEventError::UnsupportedSchema {
+            schema_version: envelope.schema_version(),
+        }),
     }
 }
 
@@ -314,6 +336,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn fixture_manifest_enforces_complete_sanitized_inventory() {
         let fixture_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let manifest = crate::load_released_fixture_manifest(&fixture_root)
@@ -321,7 +344,12 @@ mod tests {
         assert_eq!(manifest.format_version, 1);
 
         for fixture in manifest.fixtures {
-            assert!(!fixture.source_writer_epochs.is_empty());
+            if fixture.migratable_store {
+                assert!(!fixture.source_writer_epochs.is_empty());
+            } else {
+                assert!(fixture.source_writer_epochs.is_empty());
+            }
+            assert!(!fixture.historical_payloads || fixture.migratable_store);
             let contents =
                 std::fs::read_to_string(fixture_root.join(&fixture.path)).expect("listed fixture");
             let payloads = contents.lines().collect::<Vec<_>>();
@@ -352,19 +380,51 @@ mod tests {
                     .collect::<BTreeSet<_>>(),
                 fixture.covered_event_kinds.into_iter().collect()
             );
-            assert!(!fixture.covered_authoritative_records.is_empty());
+            let actual_pairs = envelopes
+                .iter()
+                .flat_map(|event| {
+                    event
+                        .kind
+                        .keys()
+                        .map(|kind| crate::ReleasedFixtureSchemaEventPair {
+                            event_schema: event.schema_version,
+                            event_kind: kind.clone(),
+                        })
+                })
+                .collect::<BTreeSet<_>>();
+            let declared_pairs = fixture
+                .covered_schema_event_pairs
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            assert_eq!(actual_pairs, declared_pairs);
+            assert!(
+                !fixture.covered_authoritative_records.is_empty() || !fixture.migratable_store,
+                "migratable fixture must cover authoritative records"
+            );
+            if fixture.migratable_store {
+                assert_eq!(
+                    fixture.covered_tables.len(),
+                    crate::RELEASED_RECORD_TREATMENTS.len(),
+                    "migratable fixture must exercise every table treatment"
+                );
+                assert_eq!(
+                    fixture.covered_table_treatments.len(),
+                    crate::RELEASED_RECORD_TREATMENTS.len(),
+                    "migratable fixture must declare every exact table treatment"
+                );
+            }
 
             let historical_payloads = payloads
                 .iter()
                 .zip(&envelopes)
                 .filter(|(_, event)| {
                     event.kind.keys().any(|kind| {
-                        matches!(
-                            kind.as_str(),
-                            "tool_invocation_stream"
-                                | "tool_call_finished"
-                                | "context_usage_observed"
-                        )
+                        crate::RELEASED_EVENT_VARIANTS.iter().any(|variant| {
+                            variant.kind == kind
+                                && variant.treatment
+                                    != crate::ReleasedEventTreatment::CurrentEquivalent
+                        })
                     })
                 })
                 .map(|(payload, _)| *payload)
@@ -445,6 +505,48 @@ mod tests {
     }
 
     #[test]
+    fn retired_semantic_tool_results_are_preserved_as_structured_json() {
+        let shell = format!(
+            r#"{{"schema_version":28,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"tool_call_finished":{{"tool_call_id":"call","result":"done","semantic_result":{{"type":"shell_run","result":{{"mode":"terminal","exit_code":0,"output_tail":"done","columns":120,"rows":30}}}}}}}}}}"#
+        );
+        let HistoricalDecode::Converted { event, .. } =
+            decode_for_migration(&shell, reject_current).expect("shell result")
+        else {
+            panic!("expected converted shell result");
+        };
+        let SessionEventKind::ToolInvocationResultRecorded { record } = event.kind else {
+            panic!("expected result record");
+        };
+        let Some(ToolInvocationResult::Json { value }) = record.result else {
+            panic!("expected structured JSON preservation");
+        };
+        let value: serde_json::Value = serde_json::from_str(&value).expect("preserved JSON");
+        assert_eq!(value["type"], "shell_run");
+        assert_eq!(value["result"]["mode"], "terminal");
+        assert_eq!(value["result"]["output_tail"], "done");
+        assert_eq!(value["result"]["columns"], 120);
+
+        let file_change = format!(
+            r#"{{"schema_version":28,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"tool_call_finished":{{"tool_call_id":"call","result":"changed","semantic_result":{{"type":"file_change","result":{{"tool_name":"filesystem.write","summary":"wrote file","path":"README.md"}}}}}}}}}}"#
+        );
+        let HistoricalDecode::Converted { event, .. } =
+            decode_for_migration(&file_change, reject_current).expect("file result")
+        else {
+            panic!("expected converted file result");
+        };
+        let SessionEventKind::ToolInvocationResultRecorded { record } = event.kind else {
+            panic!("expected result record");
+        };
+        let Some(ToolInvocationResult::Json { value }) = record.result else {
+            panic!("expected structured JSON preservation");
+        };
+        let value: serde_json::Value = serde_json::from_str(&value).expect("preserved JSON");
+        assert_eq!(value["type"], "file_change");
+        assert_eq!(value["result"]["tool_name"], "filesystem.write");
+        assert_eq!(value["result"]["path"], "README.md");
+    }
+
+    #[test]
     fn schema_28_flat_context_usage_converts_to_current_observation() {
         let payload = format!(
             r#"{{"schema_version":28,"sequence":8,"timestamp_ms":9,"session_id":"{SESSION_ID}","kind":{{"context_usage_observed":{{"snapshot":{{"provider_plugin_id":"provider","model_id":"model","input_tokens":123,"context_through_sequence":4,"request_id":"request","model_turn_id":"turn","round":0,"request_fingerprint":"fingerprint","auth_profile":"profile","estimated_input_tokens":120,"context_format_version":null,"compatibility_key":null,"source":"estimated"}}}}}}}}"#
@@ -471,6 +573,36 @@ mod tests {
             RequestContextTokenCount::Estimated(123)
         );
         assert_eq!(observation.local_estimate.tokens, 120);
+    }
+
+    #[test]
+    fn inventoried_retired_families_materialize_as_inert_current_history() {
+        for event_kind in [
+            "interactive_tool_request_created",
+            "interactive_tool_request_resolved",
+            "legacy_event",
+            "legacy_tool_invocation_presentation",
+            "legacy_turn_finished",
+            "legacy_turn_started",
+            "plugin_automation_turn_finished",
+            "plugin_automation_turn_started",
+            "tool_invocation_presentation",
+        ] {
+            let payload = format!(
+                r#"{{"schema_version":29,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"{event_kind}":{{"preserved":true}}}}}}"#
+            );
+            let HistoricalDecode::RetiredKnown { event, metadata } =
+                decode_for_migration(&payload, reject_current).expect("retired family")
+            else {
+                panic!("expected retired-known {event_kind}");
+            };
+            assert_eq!(metadata.source_kind, event_kind);
+            assert!(matches!(
+                event.kind,
+                SessionEventKind::OpaqueEvent { ref event_type, ref payload }
+                    if event_type == event_kind && payload["preserved"] == true
+            ));
+        }
     }
 
     #[test]
@@ -631,13 +763,139 @@ mod tests {
     }
 
     #[test]
-    fn historical_codec_never_applies_schema_28_rules_to_other_schemas() {
+    fn historical_codec_only_applies_family_rules_to_released_schema_ranges() {
         let payload = format!(
-            r#"{{"schema_version":27,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"tool_call_finished":{{"tool_call_id":"call","result":"done"}}}}}}"#
+            r#"{{"schema_version":40,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"tool_call_finished":{{"tool_call_id":"call","result":"done"}}}}}}"#
         );
         assert!(matches!(
             decode_for_migration(&payload, reject_current),
-            Err(HistoricalSessionEventError::UnsupportedSchema { schema_version: 27 })
+            Err(HistoricalSessionEventError::UnsupportedSchema { schema_version: 40 })
+        ));
+
+        let payload = format!(
+            r#"{{"schema_version":32,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"context_usage_observed":{{"snapshot":{{"invocation":{{"provider_plugin_id":"provider","effective_model_id":"model","request_id":"request","model_turn_id":"turn","round":0,"request_fingerprint":"fingerprint"}},"context_through_sequence":0,"context_input_tokens":1,"local_request_estimate_tokens":1,"source":"estimated"}}}}}}}}"#
+        );
+        assert!(matches!(
+            decode_for_migration(&payload, reject_current),
+            Err(HistoricalSessionEventError::InvalidEvent {
+                schema_version: 32,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn all_released_flat_tool_completion_schemas_use_the_frozen_codec() {
+        for schema_version in crate::RELEASED_HISTORICAL_EVENT_SCHEMAS
+            .iter()
+            .copied()
+            .filter(|schema_version| *schema_version <= 39)
+        {
+            let payload = format!(
+                r#"{{"schema_version":{schema_version},"sequence":1,"session_id":"{SESSION_ID}","kind":{{"tool_call_finished":{{"tool_call_id":"call","result":"done"}}}}}}"#
+            );
+            assert!(matches!(
+                decode_for_migration(&payload, reject_current),
+                Ok(HistoricalDecode::Converted { event, metadata })
+                    if metadata.source_schema == schema_version
+                        && metadata.source_kind == "tool_call_finished"
+                        && matches!(
+                            &event.kind,
+                            SessionEventKind::ToolInvocationResultRecorded { record }
+                                if record.invocation_id == "call"
+                                    && record.model_output == "done"
+                                    && !record.is_error
+                                    && record.result.is_none()
+                        )
+            ));
+        }
+    }
+
+    #[test]
+    fn all_released_context_usage_shapes_use_the_frozen_codec() {
+        for schema_version in crate::RELEASED_HISTORICAL_EVENT_SCHEMAS
+            .iter()
+            .copied()
+            .filter(|schema_version| (26..=29).contains(schema_version))
+        {
+            let payload = format!(
+                r#"{{"schema_version":{schema_version},"sequence":1,"session_id":"{SESSION_ID}","kind":{{"context_usage_observed":{{"snapshot":{{"provider_plugin_id":"provider","model_id":"model","input_tokens":123,"context_through_sequence":0,"request_id":"request","model_turn_id":"turn","round":0,"request_fingerprint":"fingerprint","estimated_input_tokens":120,"source":"estimated"}}}}}}}}"#
+            );
+            assert!(matches!(
+                decode_for_migration(&payload, reject_current),
+                Ok(HistoricalDecode::Converted { event, metadata })
+                    if metadata.source_schema == schema_version
+                        && metadata.source_kind == "context_usage_observed"
+                        && matches!(
+                            &event.kind,
+                            SessionEventKind::RequestContextObserved { observation }
+                                if observation.request.request_id == "request"
+                                    && observation.context_tokens
+                                        == RequestContextTokenCount::Estimated(123)
+                                    && observation.local_estimate.tokens == 120
+                        )
+            ));
+        }
+
+        for schema_version in [30_u16, 31] {
+            let payload = format!(
+                r#"{{"schema_version":{schema_version},"sequence":1,"session_id":"{SESSION_ID}","kind":{{"context_usage_observed":{{"snapshot":{{"invocation":{{"provider_plugin_id":"provider","requested_model_id":"alias","effective_model_id":"model","request_id":"request","model_turn_id":"turn","round":2,"request_fingerprint":"fingerprint","provider_turn_id":"provider-turn","effective_auth_profile":"profile","context_epoch":3}},"context_through_sequence":0,"context_input_tokens":123,"local_request_estimate_tokens":120,"source":"provider"}}}}}}}}"#
+            );
+            assert!(matches!(
+                decode_for_migration(&payload, reject_current),
+                Ok(HistoricalDecode::Converted { event, metadata })
+                    if metadata.source_schema == schema_version
+                        && metadata.source_kind == "context_usage_observed"
+                        && matches!(
+                            &event.kind,
+                            SessionEventKind::RequestContextObserved { observation }
+                                if observation.request.request_id == "request"
+                                    && observation.request.requested_model_id.as_deref()
+                                        == Some("alias")
+                                    && observation.request.context_epoch == 3
+                                    && observation.context_tokens
+                                        == RequestContextTokenCount::ProviderExact(123)
+                                    && observation.local_estimate.tokens == 120
+                        )
+            ));
+        }
+    }
+
+    #[test]
+    fn context_usage_without_required_request_identity_is_preserved_inert() {
+        let payload = format!(
+            r#"{{"schema_version":26,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"context_usage_observed":{{"snapshot":{{"provider_plugin_id":"provider","model_id":"model","input_tokens":123,"context_through_sequence":0,"source":"provider"}}}}}}}}"#
+        );
+        assert!(matches!(
+            decode_for_migration(&payload, reject_current),
+            Ok(HistoricalDecode::RetiredKnown { event, metadata })
+                if metadata.source_schema == 26
+                    && metadata.source_kind == "context_usage_observed"
+                    && matches!(
+                        &event.kind,
+                        SessionEventKind::OpaqueEvent { event_type, payload }
+                            if event_type == "context_usage_observed"
+                                && payload["snapshot"]["input_tokens"] == 123
+                    )
+        ));
+    }
+
+    #[test]
+    fn early_context_usage_defaults_missing_local_estimate_to_observed_tokens() {
+        let payload = format!(
+            r#"{{"schema_version":26,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"context_usage_observed":{{"snapshot":{{"provider_plugin_id":"provider","model_id":"model","input_tokens":123,"context_through_sequence":0,"request_id":"request","model_turn_id":"turn","round":0,"request_fingerprint":"fingerprint","source":"estimated"}}}}}}}}"#
+        );
+        assert!(matches!(
+            decode_for_migration(&payload, reject_current),
+            Ok(HistoricalDecode::Converted { event, metadata })
+                if metadata.source_schema == 26
+                    && matches!(
+                        &event.kind,
+                        SessionEventKind::RequestContextObserved { observation }
+                            if observation.context_tokens
+                                == RequestContextTokenCount::Estimated(123)
+                                && observation.local_estimate.tokens == 123
+                    )
         ));
     }
 
@@ -648,7 +906,7 @@ mod tests {
         );
         assert!(matches!(
             decode_for_migration(&payload, reject_current),
-            Err(HistoricalSessionEventError::UnsupportedEventKind { .. })
+            Err(HistoricalSessionEventError::InvalidEvent { .. })
         ));
     }
 }

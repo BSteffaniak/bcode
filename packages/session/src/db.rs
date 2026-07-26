@@ -841,7 +841,8 @@ impl SessionDb {
     /// # Errors
     ///
     /// Returns an error if the database cannot be opened, migrated, or reprojected.
-    pub async fn migrate_turso_in_root(
+    #[cfg(test)]
+    pub(crate) async fn migrate_turso_in_root(
         session_id: SessionId,
         root: &Path,
         maintenance: &crate::lease::SessionMaintenanceGuard,
@@ -863,7 +864,8 @@ impl SessionDb {
     /// # Errors
     ///
     /// Returns an error if the database cannot be opened, migrated, or reprojected.
-    pub async fn migrate_turso_in_root_observed(
+    #[cfg(test)]
+    pub(crate) async fn migrate_turso_in_root_observed(
         session_id: SessionId,
         root: &Path,
         maintenance: &crate::lease::SessionMaintenanceGuard,
@@ -1569,23 +1571,25 @@ impl SessionDb {
             .map(|migration| migration.id().to_owned())
             .collect::<Vec<_>>();
         let applied = if self.db.table_exists(SESSION_MIGRATIONS_TABLE).await? {
-            self.db
+            let rows = self
+                .db
                 .select(SESSION_MIGRATIONS_TABLE)
                 .columns(&["id", "status"])
                 .execute(&**self.db)
                 .await?
                 .into_iter()
                 .map(|row| {
-                    let id = required_string(&row, "id")?;
-                    let status = required_string(&row, "status")?;
-                    if status != "completed" {
-                        return Err(SessionDbError::MigrationHistoryIncompatible {
-                            reason: format!("migration {id} has status {status}"),
-                        });
-                    }
-                    Ok(id)
+                    Ok(bcode_session_migration::MigrationLedgerRow {
+                        id: required_string(&row, "id")?,
+                        status: required_string(&row, "status")?,
+                    })
                 })
-                .collect::<SessionDbResult<BTreeSet<_>>>()?
+                .collect::<SessionDbResult<Vec<_>>>()?;
+            bcode_session_migration::completed_migration_ids(rows).map_err(|error| {
+                SessionDbError::MigrationHistoryIncompatible {
+                    reason: error.to_string(),
+                }
+            })?
         } else {
             BTreeSet::new()
         };
@@ -5986,6 +5990,135 @@ mod tests {
                 .map_or(0, |histogram| histogram.count),
             1
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn released_context_usage_shapes_migrate_to_writable_current_occupancy() {
+        for schema_version in [26_u16, 30, 31] {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let session_id = SessionId::new();
+            let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+                .await
+                .expect("open fixture DB");
+            db.append_event(&event(
+                session_id,
+                0,
+                SessionEventKind::ModelChanged {
+                    provider: "provider".to_owned(),
+                    model: "model".to_owned(),
+                },
+            ))
+            .await
+            .expect("append source boundary");
+            let snapshot = if schema_version == 26 {
+                serde_json::json!({
+                    "provider_plugin_id": "provider",
+                    "model_id": "model",
+                    "input_tokens": 123,
+                    "context_through_sequence": 0,
+                    "request_id": "request",
+                    "model_turn_id": "turn",
+                    "round": 2,
+                    "request_fingerprint": "fingerprint",
+                    "auth_profile": "profile",
+                    "source": "estimated"
+                })
+            } else {
+                serde_json::json!({
+                    "invocation": {
+                        "provider_plugin_id": "provider",
+                        "requested_model_id": "alias",
+                        "effective_model_id": "model",
+                        "request_id": "request",
+                        "model_turn_id": "turn",
+                        "round": 2,
+                        "request_fingerprint": "fingerprint",
+                        "provider_turn_id": "provider-turn",
+                        "effective_auth_profile": "profile",
+                        "context_epoch": 0
+                    },
+                    "context_through_sequence": 0,
+                    "context_input_tokens": 123,
+                    "local_request_estimate_tokens": 120,
+                    "source": "estimated"
+                })
+            };
+            let payload = serde_json::json!({
+                "schema_version": schema_version,
+                "sequence": 1,
+                "timestamp_ms": 2,
+                "session_id": session_id,
+                "kind": {
+                    "context_usage_observed": {
+                        "snapshot": snapshot
+                    }
+                }
+            })
+            .to_string();
+            insert_raw_payload(&db, 1, "context_usage_observed", schema_version, &payload).await;
+            db.database()
+                .update("session_storage_contract")
+                .value("writer_epoch", DatabaseValue::Int64(2))
+                .where_eq(
+                    "contract_id",
+                    DatabaseValue::Int32(SESSION_STORAGE_CONTRACT_ID),
+                )
+                .execute(db.database())
+                .await
+                .expect("mark historical writer");
+            drop(db);
+
+            let maintenance =
+                crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
+                    .expect("maintenance guard");
+            let write = crate::lease::acquire_maintenance_session_write_lock(
+                &maintenance,
+                temp_dir.path(),
+                session_id,
+            )
+            .expect("write guard");
+            let migrated = SessionDb::migrate_turso_in_root_observed(
+                session_id,
+                temp_dir.path(),
+                &maintenance,
+                &write,
+                MetricsRegistry::in_memory(),
+                None,
+            )
+            .await
+            .expect("historical context fixture should migrate");
+            migrated
+                .validate_write_readiness()
+                .await
+                .expect("migrated fixture should be writable");
+            let events = migrated.all_events_strict().await.expect("strict history");
+            assert!(matches!(
+                &events[1].kind,
+                SessionEventKind::RequestContextObserved { observation }
+                    if observation.request.request_id == "request"
+                        && observation.context_tokens
+                            == RequestContextTokenCount::Estimated(123)
+                        && observation.local_estimate.tokens
+                            == if schema_version == 26 { 123 } else { 120 }
+            ));
+            let occupancy = migrated
+                .current_context_occupancy()
+                .await
+                .expect("context occupancy")
+                .expect("converted observation should project");
+            assert_eq!(occupancy.observation_sequence, 1);
+            migrated
+                .append_event(&event(
+                    session_id,
+                    2,
+                    SessionEventKind::AssistantMessage {
+                        text: "writable after context migration".to_owned(),
+                    },
+                ))
+                .await
+                .expect("append after migration");
+        }
     }
 
     #[tokio::test]

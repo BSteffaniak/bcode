@@ -4,11 +4,38 @@ use crate::inventory::{
     CURRENT_WRITER_EPOCH, MIGRATION_STEPS, MigrationStepDescriptor, RELEASED_EVENT_VARIANTS,
     RELEASED_HISTORICAL_EVENT_SCHEMAS, RELEASED_HISTORICAL_ROOTS,
     RELEASED_HISTORICAL_WRITER_EPOCHS, RELEASED_RECORD_TREATMENTS, ReleasedEventTreatment,
-    ReleasedRecordTreatment, ReleasedRootTreatment,
+    ReleasedFixtureCoverageGaps, ReleasedFixtureManifest, ReleasedRecordTreatment,
+    ReleasedRootTreatment, released_fixture_coverage_gaps,
 };
 use thiserror::Error;
 
-/// One complete treatment row for a released persisted event variant.
+/// Failure to prove that released fixtures cover every mandatory migration dimension.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("released fixture coverage is incomplete")]
+pub struct ReleasedFixtureCoverageError {
+    /// Exact missing released inventory dimensions.
+    pub gaps: Box<ReleasedFixtureCoverageGaps>,
+}
+
+/// Require fixture coverage for every released writer edge, writer/schema/event combination, and
+/// session migration-ledger endpoint, plus every preserved authoritative record.
+///
+/// # Errors
+///
+/// Returns exact missing dimensions when the fixture inventory is incomplete.
+pub fn validate_released_fixture_coverage(
+    manifest: &ReleasedFixtureManifest,
+) -> Result<(), ReleasedFixtureCoverageError> {
+    let gaps = released_fixture_coverage_gaps(manifest);
+    if gaps.is_empty() {
+        Ok(())
+    } else {
+        Err(ReleasedFixtureCoverageError {
+            gaps: Box::new(gaps),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReleasedEventTreatmentRow {
     /// Stable serde event-kind name.
@@ -71,7 +98,7 @@ pub struct ReleasedFormatMigrationMatrixRow {
     pub record_treatments: Vec<ReleasedRecordTreatmentRow>,
 }
 
-/// Build the Cartesian released writer/schema migration matrix.
+/// Build the complete persistent writer/schema migration matrix.
 ///
 /// Every row is guaranteed to end at the current writer because rows are produced only after
 /// resolving a complete monotonic writer plan.
@@ -93,6 +120,7 @@ pub fn released_format_migration_matrix()
                 migration_step_ids: plan.steps.iter().map(|step| step.id).collect(),
                 event_treatments: RELEASED_EVENT_VARIANTS
                     .iter()
+                    .filter(|variant| variant.supports_schema(*event_schema))
                     .map(|variant| ReleasedEventTreatmentRow {
                         kind: variant.kind,
                         treatment: variant.treatment,
@@ -241,6 +269,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fixture_release_gate_reports_exact_missing_dimensions() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let manifest = crate::load_released_fixture_manifest(&root).expect("fixture manifest");
+        let error = validate_released_fixture_coverage(&manifest)
+            .expect_err("current fixture inventory is intentionally incomplete");
+        assert_eq!(
+            error.gaps.writer_epochs,
+            std::collections::BTreeSet::from([1, 3, 4])
+        );
+        assert!(error.gaps.writer_schema_pairs.contains(&(1, 1)));
+        assert!(error.gaps.writer_schema_pairs.contains(&(1, 32)));
+        assert!(!error.gaps.writer_schema_pairs.contains(&(2, 28)));
+        assert!(error.gaps.writer_schema_event_combinations.contains(&(
+            1,
+            1,
+            "assistant_message".to_owned()
+        )));
+        assert_eq!(
+            error.gaps.writer_edges,
+            std::collections::BTreeSet::from([(1, 2), (3, 4), (4, 5)])
+        );
+        assert!(
+            error
+                .gaps
+                .migration_ledger_endpoints
+                .contains("001_events_table")
+        );
+        assert!(error.gaps.event_schemas.contains(&1));
+        assert!(error.gaps.event_kinds.contains("assistant_message"));
+        assert!(error.gaps.authoritative_records.is_empty());
+    }
+
+    #[test]
     fn released_format_matrix_is_complete_unique_and_current_writable() {
         let matrix = released_format_migration_matrix().expect("released matrix");
         assert_eq!(
@@ -253,7 +314,13 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(identities.len(), matrix.len());
         for row in matrix {
-            assert_eq!(row.event_treatments.len(), RELEASED_EVENT_VARIANTS.len());
+            assert_eq!(
+                row.event_treatments.len(),
+                RELEASED_EVENT_VARIANTS
+                    .iter()
+                    .filter(|variant| variant.supports_schema(row.event_schema))
+                    .count()
+            );
             assert_eq!(
                 row.record_treatments.len(),
                 RELEASED_RECORD_TREATMENTS.len()
@@ -265,6 +332,7 @@ mod tests {
                     .collect::<Vec<_>>(),
                 RELEASED_EVENT_VARIANTS
                     .iter()
+                    .filter(|variant| variant.supports_schema(row.event_schema))
                     .map(|variant| variant.kind)
                     .collect::<Vec<_>>()
             );
