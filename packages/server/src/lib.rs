@@ -14107,94 +14107,105 @@ async fn publish_tool_request_draft_live(
             .increment_counter("server.live_state.request_draft_redacted_total");
         return;
     }
+    let mut mutex_hold_ns = 0_u64;
     let accepted = state
         .active_tool_request_drafts
         .lock()
         .is_ok_and(|mut registry| {
-            let current = registry.drafts.get(&key);
-            let terminal = registry.terminal_revisions.get(&key).copied();
-            if terminal.is_some_and(|(generation, revision)| {
-                event.generation < generation
-                    || (event.generation == generation && event.revision <= revision)
-            }) || current.is_some_and(|current| {
-                event.generation < current.event.generation
-                    || (event.generation == current.event.generation
-                        && (event.revision < current.event.revision
-                            || (event.revision == current.event.revision
-                                && !(terminal_update && event.revision == u64::MAX))))
-            }) {
-                return false;
-            }
-            let mut preview = current
-                .filter(|current| current.event.generation == event.generation)
-                .map_or_else(String::new, |current| current.preview.clone());
-            let mut preview_start_offset = current
-                .filter(|current| current.event.generation == event.generation)
-                .map_or(0, |current| current.preview_start_offset);
-            match &event.operation {
-                bcode_session_models::ToolRequestDraftOperation::Append { offset, text } => {
-                    if *offset != preview_start_offset.saturating_add(preview.len()) {
-                        return false;
-                    }
-                    preview.push_str(text);
+            let lock_started = Instant::now();
+            let accepted = (|| {
+                let current = registry.drafts.get(&key);
+                let terminal = registry.terminal_revisions.get(&key).copied();
+                if terminal.is_some_and(|(generation, revision)| {
+                    event.generation < generation
+                        || (event.generation == generation && event.revision <= revision)
+                }) || current.is_some_and(|current| {
+                    event.generation < current.event.generation
+                        || (event.generation == current.event.generation
+                            && (event.revision < current.event.revision
+                                || (event.revision == current.event.revision
+                                    && !(terminal_update && event.revision == u64::MAX))))
+                }) {
+                    return false;
                 }
-                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
-                    start_offset,
-                    text,
-                } => {
-                    preview_start_offset = *start_offset;
-                    preview.clone_from(text);
-                }
-                bcode_session_models::ToolRequestDraftOperation::Remove { .. } => {
-                    if let Some(removed) = registry.drafts.remove(&key) {
-                        let bytes = registry.session_bytes.entry(session_id).or_default();
-                        *bytes = bytes.saturating_sub(removed.preview.len());
-                        if *bytes == 0 {
-                            registry.session_bytes.remove(&session_id);
+                let mut preview = current
+                    .filter(|current| current.event.generation == event.generation)
+                    .map_or_else(String::new, |current| current.preview.clone());
+                let mut preview_start_offset = current
+                    .filter(|current| current.event.generation == event.generation)
+                    .map_or(0, |current| current.preview_start_offset);
+                match &event.operation {
+                    bcode_session_models::ToolRequestDraftOperation::Append { offset, text } => {
+                        if *offset != preview_start_offset.saturating_add(preview.len()) {
+                            return false;
                         }
+                        preview.push_str(text);
                     }
-                    registry
-                        .terminal_revisions
-                        .insert(key, (event.generation, event.revision.saturating_add(1)));
-                    return true;
+                    bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset,
+                        text,
+                    } => {
+                        preview_start_offset = *start_offset;
+                        preview.clone_from(text);
+                    }
+                    bcode_session_models::ToolRequestDraftOperation::Remove { .. } => {
+                        if let Some(removed) = registry.drafts.remove(&key) {
+                            let bytes = registry.session_bytes.entry(session_id).or_default();
+                            *bytes = bytes.saturating_sub(removed.preview.len());
+                            if *bytes == 0 {
+                                registry.session_bytes.remove(&session_id);
+                            }
+                        }
+                        registry
+                            .terminal_revisions
+                            .insert(key, (event.generation, event.revision.saturating_add(1)));
+                        return true;
+                    }
                 }
-            }
 
-            let previous_bytes = current.map_or(0, |current| current.preview.len());
-            let session_count = registry
-                .drafts
-                .keys()
-                .filter(|draft_key| draft_key.session() == session_id)
-                .count();
-            if current.is_none() && session_count >= MAX_ACTIVE_TOOL_REQUEST_DRAFTS_PER_SESSION {
-                return false;
-            }
-            registry.terminal_revisions.remove(&key);
-            let next_session_bytes = registry
-                .session_bytes
-                .get(&session_id)
-                .copied()
-                .unwrap_or_default()
-                .saturating_sub(previous_bytes)
-                .saturating_add(preview.len());
-            if next_session_bytes > MAX_ACTIVE_TOOL_REQUEST_DRAFT_BYTES_PER_SESSION {
-                return false;
-            }
+                let previous_bytes = current.map_or(0, |current| current.preview.len());
+                let session_count = registry
+                    .drafts
+                    .keys()
+                    .filter(|draft_key| draft_key.session() == session_id)
+                    .count();
+                if current.is_none() && session_count >= MAX_ACTIVE_TOOL_REQUEST_DRAFTS_PER_SESSION
+                {
+                    return false;
+                }
+                registry.terminal_revisions.remove(&key);
+                let next_session_bytes = registry
+                    .session_bytes
+                    .get(&session_id)
+                    .copied()
+                    .unwrap_or_default()
+                    .saturating_sub(previous_bytes)
+                    .saturating_add(preview.len());
+                if next_session_bytes > MAX_ACTIVE_TOOL_REQUEST_DRAFT_BYTES_PER_SESSION {
+                    return false;
+                }
 
-            registry.drafts.insert(
-                key,
-                ActiveToolRequestDraft {
-                    event: event.clone(),
-                    preview,
-                    preview_start_offset,
-                    last_updated_at: Instant::now(),
-                },
-            );
-            registry
-                .session_bytes
-                .insert(session_id, next_session_bytes);
-            true
+                registry.drafts.insert(
+                    key,
+                    ActiveToolRequestDraft {
+                        event: event.clone(),
+                        preview,
+                        preview_start_offset,
+                        last_updated_at: Instant::now(),
+                    },
+                );
+                registry
+                    .session_bytes
+                    .insert(session_id, next_session_bytes);
+                true
+            })();
+            mutex_hold_ns = u64::try_from(lock_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+            accepted
         });
+    state.metrics.record_histogram(
+        "server.live_state.request_draft_mutex_hold_ns",
+        mutex_hold_ns,
+    );
     if accepted {
         if terminal_update {
             state
@@ -18790,7 +18801,7 @@ async fn append_tool_contribution_event(
                     .sessions
                     .publish_live_event(
                         session_id,
-                        SessionLiveEventKind::ToolContribution { event },
+                        SessionLiveEventKind::ToolContributionPlaced { envelope },
                     )
                     .await;
             }
@@ -26941,6 +26952,43 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn request_draft_registry_records_mutex_hold_time_without_payload_labels() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(Some("mutex telemetry".to_owned()), test_working_directory())
+            .await
+            .expect("session")
+            .id;
+        let state = test_server_state(sessions);
+        publish_tool_request_draft_live(
+            &state,
+            session_id,
+            request_draft_event(
+                "call-mutex",
+                1,
+                1,
+                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: "bounded".to_owned(),
+                },
+            ),
+        )
+        .await;
+        let metrics = state.metrics.snapshot();
+        let histogram = metrics
+            .histograms
+            .get("server.live_state.request_draft_mutex_hold_ns")
+            .expect("mutex hold histogram");
+        assert_eq!(histogram.count, 1);
+        assert!(
+            metrics
+                .histograms
+                .keys()
+                .all(|key| !key.contains("call-mutex") && !key.contains("bounded"))
+        );
+    }
+
+    #[tokio::test]
     async fn request_draft_cancellation_emits_remove_and_clears_checkpoint() {
         let sessions = SessionManager::default();
         let session_id = sessions
@@ -30004,6 +30052,108 @@ library = "test"
         assert!(outcome.provider_error.is_some());
     }
 
+    #[tokio::test]
+    async fn provider_assembly_timeout_removes_active_request_draft() {
+        let mut state = test_server_state(SessionManager::default());
+        state.model_streaming.no_progress_warning_secs = 0;
+        state.model_streaming.no_progress_timeout_secs = 0;
+        let session_id = state
+            .sessions
+            .create_session(
+                Some("provider assembly timeout".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let mut attachment = state
+            .sessions
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("attach");
+        let mut progress = ModelStreamProgress::default();
+        progress.start_tool_call(
+            "call-timeout".to_owned(),
+            "filesystem.write".to_owned(),
+            Some("bcode.filesystem".to_owned()),
+        );
+        progress.record_tool_call_delta("call-timeout", "{\"path\":\"partial");
+        let checkpoint = progress
+            .take_tool_request_draft_event("turn-timeout", "call-timeout")
+            .expect("draft checkpoint");
+        publish_tool_request_draft_live(&state, session_id, checkpoint).await;
+        assert_eq!(
+            active_tool_request_draft_snapshot_events(&state, session_id).len(),
+            1
+        );
+
+        let cancel_state = TurnCancelState::default();
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(0);
+        let current_turn = Arc::new(Mutex::new(None));
+        let mut command_context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued_followups,
+            current_turn,
+        );
+        let mut outcome = ModelPollOutcome::default();
+        let mut warned = false;
+        assert!(
+            wait_for_model_progress_or_timeout(
+                &state,
+                session_id,
+                Duration::ZERO,
+                &mut warned,
+                &cancel_state,
+                progress.tool_progress_snapshot(),
+                &mut outcome,
+                &mut command_context,
+            )
+            .await
+            .is_none()
+        );
+        finish_all_tool_request_drafts(
+            &state,
+            session_id,
+            "turn-timeout",
+            &mut progress,
+            bcode_session_models::ToolRequestDraftTerminalReason::Invalid,
+        )
+        .await;
+
+        assert!(active_tool_request_draft_snapshot_events(&state, session_id).is_empty());
+        assert!(
+            progress
+                .tool_request_draft_checkpoints("turn-timeout")
+                .is_empty()
+        );
+        assert!(matches!(
+            attachment.live_events.recv().await.expect("checkpoint").kind,
+            SessionLiveEventKind::ToolRequestDraft { event }
+                if !matches!(event.operation, bcode_session_models::ToolRequestDraftOperation::Remove { .. })
+        ));
+        let removal = loop {
+            let event = attachment
+                .live_events
+                .recv()
+                .await
+                .expect("timeout removal");
+            if let SessionLiveEventKind::ToolRequestDraft { event } = event.kind {
+                break event;
+            }
+        };
+        assert!(matches!(
+            removal.operation,
+            bcode_session_models::ToolRequestDraftOperation::Remove {
+                reason: bcode_session_models::ToolRequestDraftTerminalReason::Invalid
+            }
+        ));
+    }
+
     #[test]
     fn model_no_progress_timeout_is_a_structured_retryable_error() {
         let message = "model provider made no progress for 300 seconds before timeout while assembling shell.run arguments · 2.0 KiB received".to_string();
@@ -31367,6 +31517,75 @@ library = "test"
         .await;
         assert!(late, "late sibling must inherit the latched batch decision");
         assert_eq!(state.pending_permissions.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_waiting_for_permission_resolves_denied_without_tool_start() {
+        let sessions = SessionManager::default();
+        let session_id = sessions
+            .create_session(
+                Some("permission cancellation boundary".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let state = Arc::new(test_server_state(sessions));
+        let cancel_state = Arc::new(TurnCancelState::default());
+        let task_state = Arc::clone(&state);
+        let task_cancel = Arc::clone(&cancel_state);
+        let permission = tokio::spawn(async move {
+            request_tool_permission(
+                task_state.as_ref(),
+                session_id,
+                &bcode_model::ToolCall {
+                    id: "permission-cancelled".to_owned(),
+                    name: "example.tool".to_owned(),
+                    arguments: serde_json::Value::Null,
+                },
+                "example.tool",
+                "example.plugin",
+                task_cancel.as_ref(),
+                PermissionPolicyContext::default(),
+            )
+            .await
+        });
+        let pending = wait_for_pending_permissions(state.as_ref(), 1).await;
+        assert_eq!(pending[0].summary.tool_call_id, "permission-cancelled");
+        cancel_state.close();
+        assert!(!permission.await.expect("permission task"));
+        assert!(state.pending_permissions.lock().await.is_empty());
+
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("permission cancellation history");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::PermissionResolved {
+                        permission_id,
+                        approved: false,
+                    } if permission_id == &pending[0].summary.permission_id
+                ))
+                .count(),
+            1
+        );
+        assert!(!history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationLifecycle { event }
+                if event.invocation_id == "permission-cancelled"
+                    && event.stage
+                        == bcode_session_models::ToolInvocationLifecycleStage::Started
+        )));
+        assert!(!history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationResultRecorded { record }
+                if record.invocation_id == "permission-cancelled"
+        )));
     }
 
     #[tokio::test]
@@ -37655,14 +37874,17 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .await
                 .expect("transient upsert")
                 .kind,
-            SessionLiveEventKind::ToolContribution {
-                event: match contribution(
-                    1,
-                    bcode_session_models::ToolContributionPersistence::Transient,
-                ) {
-                    ScopedTurnEvent::Contribution(event) => event,
-                    _ => unreachable!(),
-                },
+            SessionLiveEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Hidden,
+                    match contribution(
+                        1,
+                        bcode_session_models::ToolContributionPersistence::Transient,
+                    ) {
+                        ScopedTurnEvent::Contribution(event) => event,
+                        _ => unreachable!(),
+                    },
+                ),
             }
         );
         assert!(matches!(
@@ -38218,8 +38440,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .await
                 .expect("live contribution")
                 .kind,
-            SessionLiveEventKind::ToolContribution {
-                event: contribution.clone(),
+            SessionLiveEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Hidden,
+                    contribution.clone(),
+                ),
             }
         );
         assert!(
@@ -38282,7 +38507,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 .await
                 .expect("updated contribution")
                 .kind,
-            SessionLiveEventKind::ToolContribution { event: updated }
+            SessionLiveEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Hidden,
+                    updated,
+                ),
+            }
         );
 
         let _ = append_tool_contribution_event(

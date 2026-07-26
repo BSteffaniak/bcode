@@ -2552,12 +2552,6 @@ impl BmuxApp {
                 self.viewport.preserve_for_append();
                 self.sync_shared_message_items();
             }
-            SessionLiveEventKind::ToolContribution {
-                event: contribution,
-            } => self.apply_live_contribution(
-                contribution,
-                bcode_session_models::ToolContributionPlacement::Hidden,
-            ),
             SessionLiveEventKind::ToolContributionPlaced { envelope } => {
                 self.apply_live_contribution(&envelope.contribution, envelope.placement);
             }
@@ -2634,17 +2628,7 @@ impl BmuxApp {
             self.transcript.remove_shared_item(&item_id);
             return;
         }
-        let shared_item = self
-            .shared_tool_contribution_item(contribution)
-            .unwrap_or_else(|| {
-                panic!(
-                    "shared session view must project visible live contribution {}:{} at sequence {}",
-                    contribution.invocation_id,
-                    contribution.contribution_id,
-                    contribution.sequence
-                )
-            });
-        self.transcript.upsert_shared_item(shared_item);
+        self.sync_shared_tool_presentation_slot(&item_id);
     }
 
     fn apply_durable_contribution(
@@ -3465,30 +3449,6 @@ impl BmuxApp {
                                     | bcode_session_view_models::ToolInvocationViewStatus::Cancelled
                                     | bcode_session_view_models::ToolInvocationViewStatus::Failed
                             )
-                )
-            })
-            .map(terminal_item_from_shared)
-    }
-
-    fn shared_tool_contribution_item(
-        &self,
-        contribution: &bcode_session_models::ToolContributionEvent,
-    ) -> Option<TranscriptItem> {
-        self.session_view
-            .snapshot()
-            .transcript
-            .items
-            .iter()
-            .rev()
-            .find(|item| {
-                matches!(
-                    &item.kind,
-                    bcode_session_view_models::TranscriptViewItemKind::ToolContribution {
-                        contribution: item_contribution,
-                        ..
-                    } if item_contribution.invocation_id == contribution.invocation_id
-                        && item_contribution.contribution_id == contribution.contribution_id
-                        && item_contribution.sequence == contribution.sequence
                 )
             })
             .map(terminal_item_from_shared)
@@ -6633,19 +6593,22 @@ mod tests {
         let mut app = BmuxApp::new_with_history(None, &[], &[], false);
         let live = |sequence, operation, sentinel| bcode_session_models::SessionLiveEvent {
             session_id,
-            kind: SessionLiveEventKind::ToolContribution {
-                event: bcode_session_models::ToolContributionEvent {
-                    invocation_id: "call".to_owned(),
-                    contribution_id: "surface".to_owned(),
-                    sequence,
-                    producer_id: "future.producer".to_owned(),
-                    schema: "future.unknown/schema".to_owned(),
-                    schema_version: 77,
-                    operation,
-                    persistence: bcode_session_models::ToolContributionPersistence::Transient,
-                    artifact: None,
-                    payload: serde_json::json!({"sentinel": sentinel}),
-                },
+            kind: SessionLiveEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Hidden,
+                    bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call".to_owned(),
+                        contribution_id: "surface".to_owned(),
+                        sequence,
+                        producer_id: "future.producer".to_owned(),
+                        schema: "future.unknown/schema".to_owned(),
+                        schema_version: 77,
+                        operation,
+                        persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                        artifact: None,
+                        payload: serde_json::json!({"sentinel": sentinel}),
+                    },
+                ),
             },
         };
 

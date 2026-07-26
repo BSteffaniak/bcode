@@ -625,7 +625,7 @@ mod tests {
                     text: "draft".to_owned(),
                 },
             ))
-            .is_none()
+            .is_some()
         );
         assert!(
             supersedable_event_key(&request_draft_event(
@@ -640,14 +640,16 @@ mod tests {
     }
 
     #[test]
-    fn request_drafts_bypass_tui_superseding_to_preserve_append_order() {
+    fn request_drafts_collapse_to_latest_checkpoint_per_placement_aware_key() {
         let session_id = SessionId::new();
+        let (sender, receiver) = mpsc::unbounded_channel();
+        let mut pending = BTreeMap::new();
         for revision in 1..=10_000 {
             let mut event = request_draft_event(
                 session_id,
                 revision,
                 bcode_session_models::ToolRequestDraftOperation::Checkpoint {
-                    start_offset: usize::try_from(revision).expect("bounded revision"),
+                    start_offset: 0,
                     text: revision.to_string(),
                 },
             );
@@ -660,8 +662,15 @@ mod tests {
                 unreachable!("request draft event");
             };
             draft.tool_call_id = format!("call-{}", revision % 256);
-            assert!(supersedable_event_key(&event).is_none());
+            pending.insert(
+                supersedable_event_key(&event).expect("request draft key"),
+                event,
+            );
         }
+        assert_eq!(pending.len(), 256);
+        assert!(flush_superseded_progress(&sender, &mut pending));
+        assert!(pending.is_empty());
+        assert_eq!(receiver.len(), 256);
     }
 
     #[test]

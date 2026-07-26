@@ -5395,20 +5395,23 @@ mod tests {
             manager
                 .publish_live_event(
                     session.id,
-                    SessionLiveEventKind::ToolContribution {
-                        event: bcode_session_models::ToolContributionEvent {
-                            invocation_id: "call-1".to_owned(),
-                            contribution_id: "transient-volume".to_owned(),
-                            sequence: u64::try_from(sequence).expect("sequence"),
-                            producer_id: "fixture.plugin".to_owned(),
-                            schema: "fixture.transient-volume".to_owned(),
-                            schema_version: 1,
-                            operation: bcode_session_models::ToolContributionOperation::Upsert,
-                            persistence:
-                                bcode_session_models::ToolContributionPersistence::Transient,
-                            artifact: None,
-                            payload: serde_json::json!({"chunk": "x".repeat(4_096)}),
-                        },
+                    SessionLiveEventKind::ToolContributionPlaced {
+                        envelope: bcode_session_models::ToolContributionEnvelope::new(
+                            bcode_session_models::ToolContributionPlacement::Hidden,
+                            bcode_session_models::ToolContributionEvent {
+                                invocation_id: "call-1".to_owned(),
+                                contribution_id: "transient-volume".to_owned(),
+                                sequence: u64::try_from(sequence).expect("sequence"),
+                                producer_id: "fixture.plugin".to_owned(),
+                                schema: "fixture.transient-volume".to_owned(),
+                                schema_version: 1,
+                                operation: bcode_session_models::ToolContributionOperation::Upsert,
+                                persistence:
+                                    bcode_session_models::ToolContributionPersistence::Transient,
+                                artifact: None,
+                                payload: serde_json::json!({"chunk": "x".repeat(4_096)}),
+                            },
+                        ),
                     },
                 )
                 .await

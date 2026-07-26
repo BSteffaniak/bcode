@@ -1364,10 +1364,6 @@ pub enum SessionLiveEventKind {
         /// Structured reasoning operation.
         event: ReasoningActivityEvent,
     },
-    /// Opaque renderer contribution published only to currently attached clients.
-    ///
-    /// Transient contributions are never persisted, indexed, or replayed.
-    ToolContribution { event: ToolContributionEvent },
     /// Renderer contribution with explicit placement published only to attached clients.
     ToolContributionPlaced { envelope: ToolContributionEnvelope },
     /// Authoritative current context occupancy after a durable projection update.

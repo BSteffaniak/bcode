@@ -7423,17 +7423,6 @@ fn print_session_live_event(event: &SessionLiveEvent) {
 
 fn session_live_event_description(event: &SessionLiveEvent) -> String {
     match &event.kind {
-        SessionLiveEventKind::ToolContribution {
-            event: contribution,
-        } => format!(
-            "live contribution {}:{} sequence={} schema={}@{} operation={:?}",
-            contribution.invocation_id,
-            contribution.contribution_id,
-            contribution.sequence,
-            contribution.schema,
-            contribution.schema_version,
-            contribution.operation,
-        ),
         SessionLiveEventKind::ToolContributionPlaced { envelope } => format!(
             "live contribution {:?} {}:{} sequence={} schema={}@{} operation={:?}",
             envelope.placement,
@@ -8354,12 +8343,6 @@ mod context_compaction_tests {
         let descriptions = [
             session_live_event_description(&SessionLiveEvent {
                 session_id,
-                kind: SessionLiveEventKind::ToolContribution {
-                    event: contribution.clone(),
-                },
-            }),
-            session_live_event_description(&SessionLiveEvent {
-                session_id,
                 kind: SessionLiveEventKind::ToolContributionPlaced {
                     envelope: bcode_session_models::ToolContributionEnvelope::new(
                         bcode_session_models::ToolContributionPlacement::Progress,
@@ -8393,8 +8376,8 @@ mod context_compaction_tests {
 
         assert!(descriptions[0].contains("call-1:surface"));
         assert!(descriptions[0].contains("future.unknown/schema@42"));
-        assert!(descriptions[1].contains("Progress"));
-        assert!(descriptions[2].contains("generation=1"));
+        assert!(descriptions[0].contains("Progress"));
+        assert!(descriptions[1].contains("generation=1"));
         for description in descriptions {
             assert!(!description.contains("opaque_cli"));
             assert!(!description.contains("private_draft_cli"));

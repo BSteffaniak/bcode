@@ -1906,18 +1906,12 @@ fn absorb_bcode_event(
             true
         }
         BcodeEvent::SessionLive(event) if Some(event.session_id) == chat.session_id => {
-            match &event.kind {
-                bcode_session_models::SessionLiveEventKind::ToolContribution {
-                    event: contribution,
-                } => loop_state
+            if let bcode_session_models::SessionLiveEventKind::ToolContributionPlaced { envelope } =
+                &event.kind
+            {
+                loop_state
                     .artifact_stream
-                    .observe_contribution(event.session_id, contribution),
-                bcode_session_models::SessionLiveEventKind::ToolContributionPlaced { envelope } => {
-                    loop_state
-                        .artifact_stream
-                        .observe_contribution(event.session_id, &envelope.contribution);
-                }
-                _ => {}
+                    .observe_contribution(event.session_id, &envelope.contribution);
             }
             chat.app.absorb_session_live_event(&event);
             true

@@ -1329,14 +1329,6 @@ impl SessionView {
             SessionLiveEventKind::AssistantReasoningActivity { turn_id, event } => {
                 self.apply_live_reasoning_activity(turn_id, event);
             }
-            SessionLiveEventKind::ToolContribution {
-                event: contribution,
-            } => self.apply_contribution_event(
-                0,
-                None,
-                contribution,
-                bcode_session_models::ToolContributionPlacement::Hidden,
-            ),
             SessionLiveEventKind::ToolContributionPlaced { envelope } => {
                 self.apply_contribution_event(0, None, &envelope.contribution, envelope.placement);
             }
@@ -3031,6 +3023,77 @@ mod tests {
     }
 
     #[test]
+    fn coalesced_and_full_cadence_updates_converge_to_the_same_semantic_state() {
+        let session_id = SessionId::new();
+        let draft = |revision, text: &str| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-cadence".to_owned(),
+                    tool_call_id: "call-cadence".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Request,
+                    generation: 1,
+                    revision,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: text.to_owned(),
+                    },
+                    argument_bytes: text.len(),
+                    truncated: false,
+                },
+            },
+        };
+        let mut full_cadence = SessionView::new();
+        full_cadence.apply_live_event(&draft(1, "first"));
+        full_cadence.apply_live_event(&draft(2, "second"));
+        full_cadence.apply_live_event(&draft(3, "latest"));
+        let mut coalesced = SessionView::new();
+        coalesced.apply_live_event(&draft(3, "latest"));
+
+        assert_eq!(
+            full_cadence.tool_request_drafts,
+            coalesced.tool_request_drafts
+        );
+        let full_item = &full_cadence.snapshot().transcript.items[0];
+        let coalesced_item = &coalesced.snapshot().transcript.items[0];
+        assert_eq!(full_item.id, coalesced_item.id);
+        assert_eq!(full_item.kind, coalesced_item.kind);
+        assert_eq!(full_item.streaming, coalesced_item.streaming);
+
+        let remove = SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-cadence".to_owned(),
+                    tool_call_id: "call-cadence".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Request,
+                    generation: 1,
+                    revision: 4,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Remove {
+                        reason: bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+                    },
+                    argument_bytes: 6,
+                    truncated: false,
+                },
+            },
+        };
+        full_cadence.apply_live_event(&remove);
+        coalesced.apply_live_event(&remove);
+        assert!(full_cadence.tool_request_drafts.is_empty());
+        assert!(coalesced.tool_request_drafts.is_empty());
+        assert!(full_cadence.snapshot().transcript.items.is_empty());
+        assert!(coalesced.snapshot().transcript.items.is_empty());
+    }
+
+    #[test]
     fn shared_live_delivery_attach_checkpoint_cancellation_and_finalization_are_equivalent() {
         let session_id = SessionId::new();
         let draft = |revision, operation| SessionLiveEvent {
@@ -3275,19 +3338,22 @@ mod tests {
         let mut view = SessionView::new();
         let live = |sequence, operation, payload| SessionLiveEvent {
             session_id,
-            kind: SessionLiveEventKind::ToolContribution {
-                event: bcode_session_models::ToolContributionEvent {
-                    invocation_id: "call".to_owned(),
-                    contribution_id: "surface".to_owned(),
-                    sequence,
-                    producer_id: "future.producer".to_owned(),
-                    schema: "future.unknown/schema".to_owned(),
-                    schema_version: 77,
-                    operation,
-                    persistence: bcode_session_models::ToolContributionPersistence::Transient,
-                    artifact: None,
-                    payload,
-                },
+            kind: SessionLiveEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Hidden,
+                    bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call".to_owned(),
+                        contribution_id: "surface".to_owned(),
+                        sequence,
+                        producer_id: "future.producer".to_owned(),
+                        schema: "future.unknown/schema".to_owned(),
+                        schema_version: 77,
+                        operation,
+                        persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                        artifact: None,
+                        payload,
+                    },
+                ),
             },
         };
 
@@ -4120,19 +4186,22 @@ mod tests {
         );
         let contribution = |sequence| SessionLiveEvent {
             session_id,
-            kind: SessionLiveEventKind::ToolContribution {
-                event: bcode_session_models::ToolContributionEvent {
-                    invocation_id: "call-1".to_owned(),
-                    contribution_id: "surface".to_owned(),
-                    sequence,
-                    producer_id: "future.producer".to_owned(),
-                    schema: "future.unknown/schema".to_owned(),
-                    schema_version: 77,
-                    operation: bcode_session_models::ToolContributionOperation::Upsert,
-                    persistence: bcode_session_models::ToolContributionPersistence::Transient,
-                    artifact: None,
-                    payload: serde_json::json!({"sequence": sequence}),
-                },
+            kind: SessionLiveEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Hidden,
+                    bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call-1".to_owned(),
+                        contribution_id: "surface".to_owned(),
+                        sequence,
+                        producer_id: "future.producer".to_owned(),
+                        schema: "future.unknown/schema".to_owned(),
+                        schema_version: 77,
+                        operation: bcode_session_models::ToolContributionOperation::Upsert,
+                        persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                        artifact: None,
+                        payload: serde_json::json!({"sequence": sequence}),
+                    },
+                ),
             },
         };
         view.apply_live_event(&contribution(1));
