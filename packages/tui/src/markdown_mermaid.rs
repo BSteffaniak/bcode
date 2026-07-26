@@ -208,6 +208,13 @@ impl MarkdownMermaidPresentationStore {
                         },
                     },
                 );
+            } else if !terminal_supported {
+                if let Some(cancellation) = self.workers.remove(&input.cache_key) {
+                    cancellation.cancel();
+                }
+                if let Some(entry) = self.entries.get_mut(&input.contribution_id) {
+                    entry.state = MarkdownMermaidPresentationState::TerminalUnsupported;
+                }
             }
         }
     }
@@ -539,6 +546,61 @@ mod tests {
         assert!(matches!(state, MarkdownMermaidPresentationState::Failed(_)));
         assert!(state.fallback("flowchart").contains("bad diagram"));
         assert!(state.fallback("flowchart").contains("flowchart"));
+    }
+
+    #[test]
+    fn lifecycle_matrix_covers_replacement_resize_scroll_clip_and_unsupported_protocol() {
+        let mut store = MarkdownMermaidPresentationStore::default();
+        let initial = [input("diagram", "v1", true)];
+        store.reconcile(&initial, true);
+        assert_eq!(store.schedule(&initial).len(), 1);
+        let mut cache = MermaidRenderCache::default();
+        store.complete("v1", Ok(rendered("v1")), &mut cache);
+
+        let first = store
+            .ready_placement("diagram", Rect::new(2, 3, 20, 8), Rect::new(4, 4, 10, 4))
+            .expect("first placement");
+        let ImageContribution::Present(first) = first else {
+            panic!("expected image placement");
+        };
+        assert_eq!(first.destination, Rect::new(2, 3, 20, 8));
+        assert_eq!(first.clip, Rect::new(4, 4, 10, 4));
+
+        let moved = store
+            .ready_placement("diagram", Rect::new(2, 9, 12, 8), Rect::new(0, 10, 8, 3))
+            .expect("moved placement");
+        let ImageContribution::Present(moved) = moved else {
+            panic!("expected moved image placement");
+        };
+        assert_eq!(moved.key, first.key);
+        assert_eq!(moved.destination, Rect::new(2, 9, 12, 8));
+        assert_eq!(moved.clip, Rect::new(0, 10, 8, 3));
+
+        let replacement = [input("diagram", "v2", true)];
+        store.reconcile(&replacement, true);
+        assert_eq!(
+            store.state("diagram"),
+            Some(&MarkdownMermaidPresentationState::Idle)
+        );
+        assert_eq!(store.schedule(&replacement).len(), 1);
+
+        store.reconcile(&replacement, false);
+        assert_eq!(
+            store.state("diagram"),
+            Some(&MarkdownMermaidPresentationState::TerminalUnsupported)
+        );
+        assert!(
+            store
+                .ready_placement("diagram", Rect::new(0, 0, 4, 4), Rect::new(0, 0, 4, 4))
+                .is_none()
+        );
+        assert!(
+            store
+                .state("diagram")
+                .expect("unsupported state")
+                .fallback("flowchart LR\nA --> B")
+                .contains("flowchart LR")
+        );
     }
 
     #[test]
