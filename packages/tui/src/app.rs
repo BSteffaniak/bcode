@@ -2574,19 +2574,6 @@ impl BmuxApp {
         }
     }
 
-    fn contribution_has_renderer(
-        &self,
-        contribution: &bcode_session_models::ToolContributionEvent,
-    ) -> bool {
-        self.plugin_presentation().is_some_and(|presentation| {
-            presentation.accepts_visual(
-                &contribution.producer_id,
-                &contribution.schema,
-                contribution.schema_version,
-            )
-        })
-    }
-
     fn apply_live_contribution(
         &mut self,
         contribution: &bcode_session_models::ToolContributionEvent,
@@ -2598,13 +2585,7 @@ impl BmuxApp {
             (placement == bcode_session_models::ToolContributionPlacement::Supplemental)
                 .then_some(contribution.contribution_id.as_str()),
         );
-        if contribution.operation == bcode_session_models::ToolContributionOperation::Remove
-            || placement == bcode_session_models::ToolContributionPlacement::Hidden
-        {
-            self.sync_shared_tool_presentation_slot(&item_id);
-            return;
-        }
-        let backs_existing_contribution = contribution.artifact.as_ref().is_some_and(|artifact| {
+        if contribution.artifact.as_ref().is_some_and(|artifact| {
             let Some(presentation) = self.plugin_presentation() else {
                 return false;
             };
@@ -2623,8 +2604,7 @@ impl BmuxApp {
                             artifact.content_type.as_deref(),
                         )
                 })
-        });
-        if backs_existing_contribution || !self.contribution_has_renderer(contribution) {
+        }) {
             self.transcript.remove_shared_item(&item_id);
             return;
         }
@@ -2633,7 +2613,7 @@ impl BmuxApp {
 
     fn apply_durable_contribution(
         &mut self,
-        event_sequence: u64,
+        _event_sequence: u64,
         contribution: &bcode_session_models::ToolContributionEvent,
         placement: bcode_session_models::ToolContributionPlacement,
     ) {
@@ -2643,13 +2623,7 @@ impl BmuxApp {
             (placement == bcode_session_models::ToolContributionPlacement::Supplemental)
                 .then_some(contribution.contribution_id.as_str()),
         );
-        if contribution.operation == bcode_session_models::ToolContributionOperation::Remove
-            || placement == bcode_session_models::ToolContributionPlacement::Hidden
-        {
-            self.sync_shared_tool_presentation_slot(&item_id);
-            return;
-        }
-        self.push_required_shared_terminal_item(event_sequence, "durable tool contribution");
+        self.sync_shared_tool_presentation_slot(&item_id);
     }
 
     #[allow(clippy::too_many_lines)]
