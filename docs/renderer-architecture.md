@@ -91,8 +91,10 @@ attach/resync active checkpoint ────────────────
 
 Request drafts are keyed by turn, tool call, and generation for transport ordering, while their
 visible identity is the plugin-declared semantic placement slot. Contiguous append batches use UTF-8
-byte offsets; a gap or lag requires a bounded replacement checkpoint. A request-targeted draft is
-retired when the complete durable request takes authority. A result-targeted draft instead remains
+byte offsets; a gap or lag requires a bounded replacement checkpoint. The server publishes latest
+state on a transport-owned 16 ms cadence with no byte threshold; the filesystem adapter bounds even
+a 256 KiB single-line preview to at most 25 rows, 16 KiB total rendered text, and 8 KiB per row. A
+request-targeted draft is retired when the complete durable request takes authority. A result-targeted draft instead remains
 the result-slot preview through permission and execution. Publishing the authoritative
 `ToolInvocationResultRecorded` replaces that same result slot before the server retires the live
 draft, so renderers never observe an intentional blank handoff frame.
@@ -105,8 +107,10 @@ Slot source precedence is renderer-neutral:
   durable result contribution, result-targeted live draft, then absent.
 
 Once a canonical final result owns the result slot, stale drafts, lower-authority contributions, and
-lifecycle progress cannot overwrite or remove it. Durable request/result replay reconstructs the same
-final slot identities; live drafts are intentionally absent after daemon restart.
+lifecycle progress cannot overwrite or remove it. On attach/reconnect, durable permission or waiting
+execution state and the bounded active draft checkpoint are applied together, restoring the latest
+preview without replaying the full log. Durable request/result replay reconstructs the same final
+slot identities; live drafts are intentionally absent after daemon restart.
 
 Execution progress uses one replaceable slot per invocation/contribution identity. Terminal removal
 dominates stale updates. TUI adapters may provide terminal-native frames and HyperChad adapters may

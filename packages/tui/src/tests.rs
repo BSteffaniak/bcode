@@ -4793,6 +4793,8 @@ fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
     });
     let draft = render_app_text(&mut app);
     assert_eq!(draft.matches("Filesystem write · assembling").count(), 1);
+    assert!(draft.contains("hello"), "{draft}");
+    assert!(!draft.contains("File change · duration"), "{draft}");
     let draft_item = app
         .transcript()
         .iter()
@@ -4873,6 +4875,7 @@ fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
         1,
         "{final_text}"
     );
+    assert!(final_text.contains("hello"), "{final_text}");
 }
 
 #[test]
