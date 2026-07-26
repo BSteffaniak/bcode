@@ -5859,6 +5859,48 @@ fn filesystem_write_request_renders_from_contribution() {
 }
 
 #[test]
+fn historical_filesystem_change_request_renders_without_history_rewrite() {
+    let session_id = SessionId::new();
+    let history = vec![
+        event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-legacy-edit".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                tool_name: "filesystem.edit".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ),
+        request_contribution_event(
+            session_id,
+            2,
+            "call-legacy-edit",
+            "bcode.filesystem",
+            "bcode.filesystem.change",
+            serde_json::json!({
+                "operation": "filesystem.edit",
+                "path": "src/lib.rs",
+                "old_text": "before\n",
+                "new_text": "after\n",
+            }),
+        ),
+    ];
+    let original = history.clone();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+
+    let rendered = render_app_text(&mut app);
+
+    assert_eq!(history, original);
+    assert!(rendered.contains("src/lib.rs"), "{rendered}");
+    assert!(rendered.contains("before"), "{rendered}");
+    assert!(rendered.contains("after"), "{rendered}");
+    assert!(!rendered.contains("arguments"), "{rendered}");
+}
+
+#[test]
 fn filesystem_edit_request_renders_from_contribution() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);

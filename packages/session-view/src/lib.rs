@@ -3698,6 +3698,101 @@ mod tests {
     }
 
     #[test]
+    fn historical_filesystem_change_request_replays_without_rewriting_history() {
+        let session_id = SessionId::new();
+        let events = vec![
+            event(
+                session_id,
+                1,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-edit".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    tool_name: "filesystem.edit".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::ToolContributionPlaced {
+                    envelope: bcode_session_models::ToolContributionEnvelope::new(
+                        bcode_session_models::ToolContributionPlacement::Request,
+                        bcode_session_models::ToolContributionEvent {
+                            invocation_id: "call-edit".to_owned(),
+                            contribution_id: "filesystem-change-request".to_owned(),
+                            sequence: 1,
+                            producer_id: "bcode.filesystem".to_owned(),
+                            schema: "bcode.filesystem.change".to_owned(),
+                            schema_version: 1,
+                            operation: bcode_session_models::ToolContributionOperation::Upsert,
+                            persistence: bcode_session_models::ToolContributionPersistence::Durable,
+                            artifact: None,
+                            payload: serde_json::json!({
+                                "operation": "filesystem.edit",
+                                "path": "src/lib.rs",
+                                "old_text": "before\n",
+                                "new_text": "after\n"
+                            }),
+                        },
+                    ),
+                },
+            ),
+            event(
+                session_id,
+                3,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-edit".to_owned(),
+                        model_output: "edited src/lib.rs".to_owned(),
+                        is_error: false,
+                        result: None,
+                    },
+                },
+            ),
+        ];
+        let original = events.clone();
+
+        let snapshot = build_session_view_snapshot(&events);
+
+        assert_eq!(
+            events, original,
+            "projection must not rewrite historical events"
+        );
+        let request_id = TranscriptViewItemId::tool_presentation_slot(
+            "call-edit",
+            bcode_session_models::ToolContributionPlacement::Request,
+            None,
+        );
+        assert!(matches!(
+            snapshot
+                .transcript
+                .items
+                .iter()
+                .find(|item| item.id == request_id)
+                .map(|item| &item.kind),
+            Some(TranscriptViewItemKind::ToolContribution { contribution, .. })
+                if contribution.schema == "bcode.filesystem.change"
+                    && contribution.payload["old_text"] == "before\n"
+                    && contribution.payload["new_text"] == "after\n"
+        ));
+        let result_id = TranscriptViewItemId::tool_presentation_slot(
+            "call-edit",
+            bcode_session_models::ToolContributionPlacement::Result,
+            None,
+        );
+        assert!(matches!(
+            snapshot
+                .transcript
+                .items
+                .iter()
+                .find(|item| item.id == result_id)
+                .map(|item| &item.kind),
+            Some(TranscriptViewItemKind::ToolInvocation { .. })
+        ));
+    }
+
+    #[test]
     fn durable_tool_request_reconciles_live_draft_without_duplicate_rows() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
