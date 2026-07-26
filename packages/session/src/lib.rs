@@ -15,6 +15,7 @@
 //! repairing the complete event log.
 
 mod actor;
+mod attachment;
 mod current_schema;
 pub mod db;
 pub mod lease;
@@ -26,6 +27,10 @@ pub mod repair;
 mod store_executor;
 
 use actor::{AttachMode, SessionHandle};
+pub use attachment::{
+    SessionAttachment, SessionEventSubscription, SessionMutationCommitted,
+    SessionProjectionWindowAttachment,
+};
 use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ExecutionSessionContextMode,
@@ -1068,38 +1073,6 @@ impl SessionCatalogEntry {
             },
         }
     }
-}
-
-#[derive(Debug)]
-pub struct SessionAttachment {
-    pub session: SessionSummary,
-    pub history: Vec<SessionEvent>,
-    pub input_history: Vec<SessionInputHistoryEntry>,
-    pub events: broadcast::Receiver<SessionEvent>,
-    pub live_events: broadcast::Receiver<SessionLiveEvent>,
-}
-
-/// Non-mutating event subscription for a session.
-#[derive(Debug)]
-pub struct SessionEventSubscription {
-    pub session: SessionSummary,
-    pub events: broadcast::Receiver<SessionEvent>,
-    pub live_events: broadcast::Receiver<SessionLiveEvent>,
-}
-
-/// Notification emitted after a durable session mutation is committed.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionMutationCommitted {
-    pub session_id: SessionId,
-    pub event: SessionEvent,
-    pub summary: SessionSummary,
-}
-
-/// Active session attachment plus projection-window metadata.
-#[derive(Debug)]
-pub struct SessionProjectionWindowAttachment {
-    pub attachment: SessionAttachment,
-    pub projection_window: ProjectionWindow,
 }
 
 impl Default for SessionManager {
