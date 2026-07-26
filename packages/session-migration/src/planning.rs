@@ -1,7 +1,60 @@
 //! Complete migration planning from released writer epochs to the current writer.
 
-use crate::inventory::{CURRENT_WRITER_EPOCH, MIGRATION_STEPS, MigrationStepDescriptor};
+use crate::inventory::{
+    CURRENT_WRITER_EPOCH, MIGRATION_STEPS, MigrationStepDescriptor, RELEASED_EVENT_VARIANTS,
+    RELEASED_HISTORICAL_EVENT_SCHEMAS, RELEASED_HISTORICAL_WRITER_EPOCHS,
+    RELEASED_RECORD_TREATMENTS, ReleasedEventTreatment, ReleasedRecordTreatment,
+};
 use thiserror::Error;
+
+/// One complete writer/schema migration-matrix row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasedFormatMigrationMatrixRow {
+    /// Released source writer epoch.
+    pub source_writer_epoch: u32,
+    /// Released historical event schema.
+    pub event_schema: u16,
+    /// Ordered writer transitions ending at the current writer.
+    pub migration_step_ids: Vec<&'static str>,
+    /// Event treatments required by the released inventory.
+    pub event_treatments: Vec<ReleasedEventTreatment>,
+    /// Non-event record treatments required by the released inventory.
+    pub record_treatments: Vec<ReleasedRecordTreatment>,
+}
+
+/// Build the Cartesian released writer/schema migration matrix.
+///
+/// Every row is guaranteed to end at the current writer because rows are produced only after
+/// resolving a complete monotonic writer plan.
+///
+/// # Errors
+///
+/// Returns an error if any released writer lacks a complete path to the current writer.
+pub fn released_format_migration_matrix()
+-> Result<Vec<ReleasedFormatMigrationMatrixRow>, MigrationPlanError> {
+    let mut matrix = Vec::with_capacity(
+        RELEASED_HISTORICAL_WRITER_EPOCHS.len() * RELEASED_HISTORICAL_EVENT_SCHEMAS.len(),
+    );
+    for source_writer_epoch in RELEASED_HISTORICAL_WRITER_EPOCHS {
+        let plan = plan_writer_epoch_migration(*source_writer_epoch)?;
+        for event_schema in RELEASED_HISTORICAL_EVENT_SCHEMAS {
+            matrix.push(ReleasedFormatMigrationMatrixRow {
+                source_writer_epoch: *source_writer_epoch,
+                event_schema: *event_schema,
+                migration_step_ids: plan.steps.iter().map(|step| step.id).collect(),
+                event_treatments: RELEASED_EVENT_VARIANTS
+                    .iter()
+                    .map(|variant| variant.treatment)
+                    .collect(),
+                record_treatments: RELEASED_RECORD_TREATMENTS
+                    .iter()
+                    .map(|record| record.treatment)
+                    .collect(),
+            });
+        }
+    }
+    Ok(matrix)
+}
 
 /// Complete ordered writer migration selected for one session.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -131,6 +184,34 @@ pub fn plan_writer_epoch_migration(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn released_format_matrix_is_complete_unique_and_current_writable() {
+        let matrix = released_format_migration_matrix().expect("released matrix");
+        assert_eq!(
+            matrix.len(),
+            RELEASED_HISTORICAL_WRITER_EPOCHS.len() * RELEASED_HISTORICAL_EVENT_SCHEMAS.len()
+        );
+        let identities = matrix
+            .iter()
+            .map(|row| (row.source_writer_epoch, row.event_schema))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(identities.len(), matrix.len());
+        for row in matrix {
+            assert_eq!(row.event_treatments.len(), RELEASED_EVENT_VARIANTS.len());
+            assert_eq!(
+                row.record_treatments.len(),
+                RELEASED_RECORD_TREATMENTS.len()
+            );
+            assert!(!row.migration_step_ids.is_empty());
+            let plan = plan_writer_epoch_migration(row.source_writer_epoch).expect("writer plan");
+            assert_eq!(plan.target_writer_epoch, CURRENT_WRITER_EPOCH);
+            assert_eq!(
+                row.migration_step_ids,
+                plan.steps.iter().map(|step| step.id).collect::<Vec<_>>()
+            );
+        }
+    }
 
     #[test]
     fn every_released_writer_epoch_has_a_complete_monotonic_plan() {

@@ -265,6 +265,7 @@ mod tests {
                     .collect::<BTreeSet<_>>(),
                 fixture.covered_event_kinds.into_iter().collect()
             );
+            assert!(!fixture.covered_authoritative_records.is_empty());
 
             let historical_payloads = payloads
                 .iter()

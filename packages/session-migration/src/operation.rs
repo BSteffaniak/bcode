@@ -6,12 +6,76 @@ use bcode_session_models::{
 };
 use std::collections::BTreeMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, watch};
 
 const DEFAULT_TERMINAL_RETENTION: Duration = Duration::from_mins(10);
 const DEFAULT_MAX_TERMINAL_OPERATIONS: usize = 128;
+const DEFAULT_PROGRESS_UNIT_INTERVAL: u64 = 1024 * 1024;
+
+/// Throttled publisher for one reconnectable migration operation.
+#[derive(Debug, Clone)]
+pub struct SessionMigrationProgressReporter {
+    operation: Arc<SessionMigrationOperation>,
+    last_reported: Arc<StdMutex<Option<(SessionMigrationStage, u64)>>>,
+}
+
+impl SessionMigrationProgressReporter {
+    /// Create a reporter for one detached operation.
+    #[must_use]
+    pub fn new(operation: Arc<SessionMigrationOperation>) -> Self {
+        Self {
+            operation,
+            last_reported: Arc::new(StdMutex::new(None)),
+        }
+    }
+
+    /// Return the stable operation identity used by backup and receipt evidence.
+    #[must_use]
+    pub fn operation_id(&self) -> SessionOpenOperationId {
+        self.operation.snapshot().operation_id
+    }
+
+    /// Publish one update, throttling intermediate determinate progress by the default interval.
+    pub fn publish(&self, update: SessionMigrationProgress) {
+        if let (Some(completed), Some(total)) = (update.completed_units, update.total_units) {
+            let boundary = completed == 0 || completed == total;
+            let should_publish = self.last_reported.lock().map_or(boundary, |mut last| {
+                let publish = boundary
+                    || last.is_none_or(|(last_stage, last_completed)| {
+                        last_stage != update.stage
+                            || completed.saturating_sub(last_completed)
+                                >= DEFAULT_PROGRESS_UNIT_INTERVAL
+                    });
+                if publish {
+                    *last = Some((update.stage, completed));
+                }
+                publish
+            });
+            if !should_publish {
+                return;
+            }
+        }
+        self.operation.publish_progress(update);
+    }
+
+    /// Publish an indeterminate migration stage.
+    pub fn stage(&self, stage: SessionMigrationStage, message: impl Into<String>) {
+        self.publish(SessionMigrationProgress {
+            stage,
+            completed_units: None,
+            total_units: None,
+            unit: None,
+            message: message.into(),
+        });
+    }
+
+    /// Publish the retained verified backup path.
+    pub fn backup_verified(&self, path: std::path::PathBuf) {
+        self.operation.publish_backup_path(path);
+    }
+}
 
 /// One detached session migration operation with reconnectable snapshots.
 #[derive(Debug)]
@@ -305,6 +369,47 @@ mod tests {
             outcome: None,
             backup_path: None,
         }
+    }
+
+    #[test]
+    fn progress_reporter_throttles_intermediate_updates_and_preserves_boundaries() {
+        let operation = Arc::new(SessionMigrationOperation::new(snapshot(SessionId::new())));
+        let reporter = SessionMigrationProgressReporter::new(Arc::clone(&operation));
+        for completed in [
+            0,
+            1,
+            DEFAULT_PROGRESS_UNIT_INTERVAL - 1,
+            DEFAULT_PROGRESS_UNIT_INTERVAL,
+        ] {
+            reporter.publish(SessionMigrationProgress {
+                stage: SessionMigrationStage::CopyingBackup,
+                completed_units: Some(completed),
+                total_units: Some(DEFAULT_PROGRESS_UNIT_INTERVAL * 2),
+                unit: Some(bcode_session_models::SessionMigrationProgressUnit::Bytes),
+                message: completed.to_string(),
+            });
+        }
+        reporter.publish(SessionMigrationProgress {
+            stage: SessionMigrationStage::CopyingBackup,
+            completed_units: Some(DEFAULT_PROGRESS_UNIT_INTERVAL * 2),
+            total_units: Some(DEFAULT_PROGRESS_UNIT_INTERVAL * 2),
+            unit: Some(bcode_session_models::SessionMigrationProgressUnit::Bytes),
+            message: "complete".to_owned(),
+        });
+        let completed = operation
+            .history()
+            .into_iter()
+            .filter_map(|snapshot| snapshot.progress.completed_units)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completed,
+            [
+                0,
+                DEFAULT_PROGRESS_UNIT_INTERVAL,
+                DEFAULT_PROGRESS_UNIT_INTERVAL * 2
+            ]
+        );
+        assert_eq!(reporter.operation_id(), operation.snapshot().operation_id);
     }
 
     #[tokio::test]

@@ -11,6 +11,7 @@
         "retired_known": 1,
         "current_passthrough": 2
       },
+      "covered_authoritative_records": ["session_drafts"],
       "covered_event_kinds": [
         "session_created",
         "tool_call_requested",

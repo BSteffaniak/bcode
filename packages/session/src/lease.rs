@@ -318,6 +318,13 @@ pub fn acquire_session_maintenance_guard(
     Ok(SessionMaintenanceGuard { coordinator })
 }
 
+#[cfg(test)]
+fn abort_at_lease_handoff_boundary() {
+    if std::env::var_os("BCODE_MIGRATION_LEASE_HANDOFF_CRASH").is_some() {
+        std::process::abort();
+    }
+}
+
 /// Atomically replace exclusive maintenance ownership with a compatible session lease.
 ///
 /// The maintenance coordinator remains locked while owner metadata is written, so another writer
@@ -351,6 +358,8 @@ pub fn transition_session_maintenance_to_lease(
     let owner = SessionLeaseOwner::new(session_id, context);
     let owner_path = access_dir.join(format!("{}.json", owner.lease_token));
     write_owner_metadata(&owner_path, &owner)?;
+    #[cfg(test)]
+    abort_at_lease_handoff_boundary();
     drop(maintenance);
     Ok(SessionLeaseGuard { owner_path, owner })
 }
@@ -981,6 +990,58 @@ mod tests {
                 .expect_err("maintenance must refuse live owner"),
             SessionLeaseError::OwnedByOtherDaemon { .. }
         ));
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for lease_handoff_process_crash_leaves_recoverable_owner"]
+    fn lease_handoff_crash_helper() {
+        let root =
+            PathBuf::from(std::env::var_os("BCODE_MIGRATION_LEASE_HANDOFF_ROOT").expect("root"));
+        let session_id = std::env::var("BCODE_MIGRATION_LEASE_HANDOFF_SESSION_ID")
+            .expect("session ID")
+            .parse::<SessionId>()
+            .expect("valid session ID");
+        let maintenance =
+            acquire_session_maintenance_guard(&root, session_id).expect("maintenance guard");
+        transition_session_maintenance_to_lease(
+            maintenance,
+            &root,
+            session_id,
+            &context("handoff-crash", 7),
+        )
+        .expect("handoff crash boundary must abort first");
+    }
+
+    #[test]
+    fn lease_handoff_process_crash_leaves_recoverable_owner() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("current test binary"))
+                .args([
+                    "--exact",
+                    "lease::tests::lease_handoff_crash_helper",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("BCODE_MIGRATION_LEASE_HANDOFF_ROOT", temp_dir.path())
+                .env(
+                    "BCODE_MIGRATION_LEASE_HANDOFF_SESSION_ID",
+                    session_id.to_string(),
+                )
+                .env("BCODE_MIGRATION_LEASE_HANDOFF_CRASH", "1")
+                .status()
+                .expect("run handoff crash child");
+        assert!(
+            !status.success(),
+            "handoff helper must terminate abnormally"
+        );
+
+        let owners = active_session_owners(temp_dir.path(), session_id).expect("owner scan");
+        assert!(owners.is_empty(), "dead handoff owner must be pruned");
+        let retry = acquire_session_lease(temp_dir.path(), session_id, &context("retry", 7))
+            .expect("retry ownership after handoff crash");
+        assert_eq!(retry.owner().storage_writer_epoch, Some(7));
     }
 
     #[test]

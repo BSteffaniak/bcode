@@ -136,7 +136,18 @@ pub fn build_migration_backup_request(
     })
 }
 
-/// Request to create a verified retained migration backup using the standard storage layout.
+/// Canonical source-history evidence and classification outcome collected by the current store.
+pub struct MigrationSourceEvidence<E> {
+    /// Canonical source facts used to verify a retained backup.
+    pub canonical: MigrationBackupCanonicalEvidence,
+    /// Converted event counts keyed by `schema:kind`.
+    pub converted_events: BTreeMap<String, u64>,
+    /// Retired-known event counts keyed by `schema:kind`.
+    pub retired_known_events: BTreeMap<String, u64>,
+    /// First classification failure, when the source requires repair.
+    pub classification_error: Option<E>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MigrationBackupRequest {
     /// Canonical sessions storage root.
@@ -268,6 +279,12 @@ pub enum MigrationBackupError {
     /// Filesystem backup work failed.
     #[error(transparent)]
     Io(#[from] std::io::Error),
+}
+
+fn abort_at_backup_crash_boundary(boundary: &str) {
+    if std::env::var("BCODE_MIGRATION_BACKUP_CRASH_PHASE").as_deref() == Ok(boundary) {
+        std::process::abort();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -467,6 +484,7 @@ fn create_verified_migration_backup_blocking(
             SessionMigrationProgressUnit::Bytes,
             "Copying retained backup",
         );
+        abort_at_backup_crash_boundary("before_copy");
         fs::create_dir_all(destination)?;
         let started = Instant::now();
         let source_hashes =
@@ -616,6 +634,7 @@ fn copy_and_hash_backup_files(
                 ));
             }
             writer.write_all(&buffer[..read])?;
+            abort_at_backup_crash_boundary("during_copy");
             total_written = total_written.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
             publish_progress(
                 progress,
@@ -642,6 +661,7 @@ fn verify_backup_files(
     total_bytes: u64,
 ) -> std::io::Result<()> {
     let mut verified_bytes = 0_u64;
+    abort_at_backup_crash_boundary("before_verification");
     for file in files {
         let destination_path = destination.join(&file.relative_path);
         if fs::metadata(&destination_path)?.len() != file.bytes {
@@ -651,6 +671,7 @@ fn verify_backup_files(
             )));
         }
         let actual = hash_file(&destination_path)?;
+        abort_at_backup_crash_boundary("during_verification");
         if source_hashes.get(&file.relative_path) != Some(&actual) {
             return Err(std::io::Error::other(format!(
                 "backup hash verification failed for {}",
@@ -698,6 +719,89 @@ fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "subprocess helper for backup_process_crash_boundaries_preserve_source"]
+    fn backup_crash_helper() {
+        let source =
+            PathBuf::from(std::env::var_os("BCODE_MIGRATION_BACKUP_CRASH_SOURCE").expect("source"));
+        let destination = PathBuf::from(
+            std::env::var_os("BCODE_MIGRATION_BACKUP_CRASH_DESTINATION").expect("destination"),
+        );
+        create_verified_migration_backup_blocking(
+            &source,
+            &destination,
+            BackupCopyFault::None,
+            None,
+        )
+        .expect("backup crash phase must abort first");
+    }
+
+    fn run_backup_crash_child(source: &Path, destination: &Path, phase: &str) {
+        let status =
+            std::process::Command::new(std::env::current_exe().expect("current test binary"))
+                .args([
+                    "--exact",
+                    "backup::tests::backup_crash_helper",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("BCODE_MIGRATION_BACKUP_CRASH_SOURCE", source)
+                .env("BCODE_MIGRATION_BACKUP_CRASH_DESTINATION", destination)
+                .env("BCODE_MIGRATION_BACKUP_CRASH_PHASE", phase)
+                .status()
+                .expect("run backup crash child");
+        assert!(!status.success(), "backup helper must terminate abnormally");
+    }
+
+    #[test]
+    fn backup_process_crash_boundaries_preserve_source() {
+        for phase in [
+            "before_copy",
+            "during_copy",
+            "before_verification",
+            "during_verification",
+        ] {
+            let temp = tempfile::tempdir().expect("temp dir");
+            let source = temp.path().join("source");
+            let destination = temp.path().join("destination");
+            fs::create_dir_all(&source).expect("source");
+            let bytes = vec![0x5a; BACKUP_BUFFER_BYTES * 2 + 7];
+            fs::write(source.join("session.db"), &bytes).expect("source DB");
+            run_backup_crash_child(&source, &destination, phase);
+            assert_eq!(fs::read(source.join("session.db")).expect("source"), bytes);
+            match phase {
+                "before_copy" | "during_copy" => {
+                    assert!(
+                        !destination.exists()
+                            || !destination.join(MIGRATION_BACKUP_MANIFEST_FILE).exists(),
+                        "copy crash must not expose a verified backup"
+                    );
+                }
+                "before_verification" | "during_verification" => {
+                    assert!(destination.exists());
+                    assert!(
+                        !destination.join(MIGRATION_BACKUP_MANIFEST_FILE).exists(),
+                        "verification crash must not expose a verified manifest"
+                    );
+                }
+                _ => unreachable!("fixed crash phase"),
+            }
+            let retry_destination = temp.path().join("retry-destination");
+            let retried = create_verified_migration_backup_blocking(
+                &source,
+                &retry_destination,
+                BackupCopyFault::None,
+                None,
+            )
+            .expect("retry backup with a fresh destination");
+            assert_eq!(retried.result.files, 1);
+            assert_eq!(
+                fs::read(retry_destination.join("session.db")).expect("retried backup"),
+                bytes
+            );
+        }
+    }
 
     #[test]
     fn backup_request_builder_owns_target_epoch_and_plan() {

@@ -23,12 +23,14 @@ mod validation;
 pub use backup::{
     BackupProgressCallback, MigrationBackupCanonicalEvidence, MigrationBackupError,
     MigrationBackupFileEvidence, MigrationBackupManifest, MigrationBackupRequest,
-    MigrationBackupRequestError, MigrationBackupRequestPlan, RetainedMigrationBackup,
-    RetainedMigrationBackupDiagnosis, VerifiedMigrationBackup, build_migration_backup_request,
-    create_retained_migration_backup, create_verified_migration_backup,
-    latest_retained_migration_backup,
+    MigrationBackupRequestError, MigrationBackupRequestPlan, MigrationSourceEvidence,
+    RetainedMigrationBackup, RetainedMigrationBackupDiagnosis, VerifiedMigrationBackup,
+    build_migration_backup_request, create_retained_migration_backup,
+    create_verified_migration_backup, latest_retained_migration_backup,
 };
-pub use operation::{SessionMigrationOperation, SessionMigrationOperations};
+pub use operation::{
+    SessionMigrationOperation, SessionMigrationOperations, SessionMigrationProgressReporter,
+};
 pub use service::SessionMigrationService;
 pub use storage::{
     HistoricalStorageDiagnosis, HistoricalStorageDiagnosisStatus, HistoricalStorageError,
@@ -38,10 +40,13 @@ pub use storage::{
     recover_accidental_epoch_session_root,
 };
 pub use validation::{
+    MigrationClassificationEvidence, MigrationLedgerFacts, MigrationLedgerValidationError,
     MigrationProjectionValidation, MigrationTargetValidation, MigrationTargetValidationError,
     SessionMigrationCanonicalReceiptEvidence, SessionMigrationReceipt,
-    SessionMigrationReceiptRequest, WriterEpochCompatibility, WriterFinalizationError,
-    build_session_migration_receipt, classify_writer_epoch, validate_migration_target,
+    SessionMigrationReceiptRequest, SourceStorageCompatibility, SourceStorageCompatibilityError,
+    StorageContractFacts, StorageContractRow, ValidatedMigrationLedger, WriterEpochCompatibility,
+    WriterFinalizationError, build_session_migration_receipt, classify_source_storage,
+    classify_writer_epoch, validate_migration_ledger, validate_migration_target,
     validate_writer_finalization,
 };
 
@@ -56,13 +61,17 @@ pub use execution::{
 };
 pub use inventory::{
     CURRENT_EVENT_SCHEMA, CURRENT_WRITER_EPOCH, MIGRATION_STEPS, MigrationStepDescriptor,
-    RELEASED_HISTORICAL_EVENT_SCHEMAS, RELEASED_HISTORICAL_WRITER_EPOCHS, RELEASED_MIGRATION_IDS,
-    RELEASED_PERSISTED_TABLES, ReleasedFixtureClassificationCounts, ReleasedFixtureDescriptor,
-    ReleasedFixtureInventoryError, ReleasedFixtureManifest, ReleasedMigrationDescriptor,
-    ReleasedMigrationDomain, is_released_historical_event_schema, load_released_fixture_manifest,
-    released_fixture_schema_coverage, released_fixture_writer_coverage,
+    RELEASED_EVENT_VARIANTS, RELEASED_HISTORICAL_EVENT_SCHEMAS, RELEASED_HISTORICAL_WRITER_EPOCHS,
+    RELEASED_MIGRATION_IDS, RELEASED_PERSISTED_TABLES, RELEASED_RECORD_TREATMENTS,
+    ReleasedEventTreatment, ReleasedEventVariantDescriptor, ReleasedFixtureClassificationCounts,
+    ReleasedFixtureDescriptor, ReleasedFixtureInventoryError, ReleasedFixtureManifest,
+    ReleasedMigrationDescriptor, ReleasedMigrationDomain, ReleasedRecordDescriptor,
+    ReleasedRecordTreatment, is_released_historical_event_schema, load_released_fixture_manifest,
+    released_fixture_authoritative_record_coverage, released_fixture_schema_coverage,
+    released_fixture_writer_coverage,
 };
 pub use planning::{
-    MigrationPlan, MigrationPlanError, MigrationPlanService, plan_writer_epoch_migration,
-    plan_writer_epoch_migration_with_registry,
+    MigrationPlan, MigrationPlanError, MigrationPlanService, ReleasedFormatMigrationMatrixRow,
+    plan_writer_epoch_migration, plan_writer_epoch_migration_with_registry,
+    released_format_migration_matrix,
 };

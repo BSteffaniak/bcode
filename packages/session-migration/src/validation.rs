@@ -1,6 +1,6 @@
 use crate::{CURRENT_WRITER_EPOCH, MigrationPlanError, plan_writer_epoch_migration};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 
 /// One current projection checkpoint observed after migration.
@@ -154,7 +154,180 @@ pub fn validate_migration_target(
     Ok(())
 }
 
-/// Migration-owned classification of an observed durable writer epoch.
+/// Migration-ledger facts collected without historical interpretation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationLedgerFacts {
+    /// Ordered migration identifiers known to the current target schema.
+    pub known_migration_ids: Vec<String>,
+    /// Completed migration identifiers observed in the source store.
+    pub completed_migration_ids: BTreeSet<String>,
+}
+
+/// Result of validating source migration-ledger shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ValidatedMigrationLedger {
+    /// Number of completed migrations forming the known prefix.
+    pub completed_prefix_len: usize,
+    /// Total number of migrations required by the current target schema.
+    pub current_migration_count: usize,
+}
+
+/// Failure to interpret a source migration ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum MigrationLedgerValidationError {
+    /// A completed migration is not known by this build.
+    #[error("unknown migration {0}")]
+    UnknownMigration(String),
+    /// Completed migrations do not form an ordered known prefix.
+    #[error("completed migrations are not a contiguous known prefix")]
+    NonContiguousPrefix,
+}
+
+/// Validate migration-ledger membership and prefix ordering.
+///
+/// # Errors
+///
+/// Returns an error for unknown migration identifiers or a non-contiguous completed prefix.
+pub fn validate_migration_ledger(
+    facts: &MigrationLedgerFacts,
+) -> Result<ValidatedMigrationLedger, MigrationLedgerValidationError> {
+    let known = facts
+        .known_migration_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    if let Some(unknown) = facts
+        .completed_migration_ids
+        .iter()
+        .find(|id| !known.contains(*id))
+    {
+        return Err(MigrationLedgerValidationError::UnknownMigration(
+            unknown.clone(),
+        ));
+    }
+    let completed_prefix_len = facts
+        .known_migration_ids
+        .iter()
+        .take_while(|id| facts.completed_migration_ids.contains(*id))
+        .count();
+    if facts.completed_migration_ids.len() != completed_prefix_len {
+        return Err(MigrationLedgerValidationError::NonContiguousPrefix);
+    }
+    Ok(ValidatedMigrationLedger {
+        completed_prefix_len,
+        current_migration_count: facts.known_migration_ids.len(),
+    })
+}
+
+/// Storage-contract facts collected without historical compatibility policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageContractFacts {
+    /// Whether the current contract table exists.
+    pub table_exists: bool,
+    /// Current contract row facts, when present.
+    pub contract: Option<StorageContractRow>,
+}
+
+/// Durable storage-contract row facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageContractRow {
+    /// Contract schema version.
+    pub schema_version: u64,
+    /// Writer epoch recorded by the source store.
+    pub writer_epoch: u64,
+}
+
+/// Migration-owned source storage classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceStorageCompatibility {
+    /// The source implements the complete current contract.
+    Current { writer_epoch: u64 },
+    /// The source is a released historical store with a migration path.
+    ReleasedHistorical { writer_epoch: u64 },
+}
+
+/// Failure to classify a source storage contract.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum SourceStorageCompatibilityError {
+    /// The ledger is current but its required contract table is absent.
+    #[error("migration history claims the storage contract exists, but its table is missing")]
+    MissingContractTable,
+    /// The ledger is current but its required contract row is absent.
+    #[error(
+        "migration history claims the storage contract was initialized, but its row is missing"
+    )]
+    MissingContractRow,
+    /// The source contract schema is unsupported.
+    #[error("unsupported storage contract schema {actual}; expected {expected}")]
+    ContractSchema { actual: u64, expected: u64 },
+    /// The source writer epoch is unsupported by this build.
+    #[error("unsupported session writer epoch {actual}; expected {expected}")]
+    WriterEpoch { actual: u64, expected: u64 },
+}
+
+/// Classify source storage from ledger and contract facts.
+///
+/// # Errors
+///
+/// Returns an error for inconsistent current ledgers, unsupported contract schemas, and writers
+/// without a released migration path.
+pub fn classify_source_storage(
+    ledger: ValidatedMigrationLedger,
+    contract: StorageContractFacts,
+    expected_contract_schema: u64,
+    legacy_writer_epoch: u32,
+) -> Result<SourceStorageCompatibility, SourceStorageCompatibilityError> {
+    let ledger_current = ledger.completed_prefix_len == ledger.current_migration_count;
+    if !contract.table_exists {
+        return if ledger_current {
+            Err(SourceStorageCompatibilityError::MissingContractTable)
+        } else {
+            Ok(SourceStorageCompatibility::ReleasedHistorical {
+                writer_epoch: u64::from(legacy_writer_epoch),
+            })
+        };
+    }
+    let Some(contract) = contract.contract else {
+        return if ledger_current {
+            Err(SourceStorageCompatibilityError::MissingContractRow)
+        } else {
+            Ok(SourceStorageCompatibility::ReleasedHistorical {
+                writer_epoch: u64::from(legacy_writer_epoch),
+            })
+        };
+    };
+    if contract.schema_version != expected_contract_schema {
+        return Err(SourceStorageCompatibilityError::ContractSchema {
+            actual: contract.schema_version,
+            expected: expected_contract_schema,
+        });
+    }
+    let Ok(writer_epoch) = u32::try_from(contract.writer_epoch) else {
+        return Err(SourceStorageCompatibilityError::WriterEpoch {
+            actual: contract.writer_epoch,
+            expected: u64::from(CURRENT_WRITER_EPOCH),
+        });
+    };
+    match classify_writer_epoch(writer_epoch) {
+        WriterEpochCompatibility::Current if ledger_current => {
+            Ok(SourceStorageCompatibility::Current {
+                writer_epoch: contract.writer_epoch,
+            })
+        }
+        WriterEpochCompatibility::Current | WriterEpochCompatibility::ReleasedHistorical => {
+            Ok(SourceStorageCompatibility::ReleasedHistorical {
+                writer_epoch: contract.writer_epoch,
+            })
+        }
+        WriterEpochCompatibility::UnknownFuture | WriterEpochCompatibility::Unsupported => {
+            Err(SourceStorageCompatibilityError::WriterEpoch {
+                actual: contract.writer_epoch,
+                expected: u64::from(CURRENT_WRITER_EPOCH),
+            })
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriterEpochCompatibility {
     /// The store already uses the current writer epoch.
@@ -219,7 +392,17 @@ pub const fn validate_writer_finalization(
     Ok(())
 }
 
-/// Canonical evidence used for either side of a completed migration receipt.
+/// Classification totals produced while normalizing canonical history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MigrationClassificationEvidence {
+    /// Digest over ordered source payloads before normalization.
+    pub source_payload_digest_sha256: String,
+    /// Converted event counts keyed by `schema:kind`.
+    pub converted_events: BTreeMap<String, u64>,
+    /// Retired-known event counts keyed by `schema:kind`.
+    pub retired_known_events: BTreeMap<String, u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionMigrationCanonicalReceiptEvidence {
     /// Canonical event count.
@@ -309,6 +492,104 @@ pub fn build_session_migration_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_storage_classification_owns_contract_and_writer_policy() {
+        let partial = ValidatedMigrationLedger {
+            completed_prefix_len: 2,
+            current_migration_count: 3,
+        };
+        let current = ValidatedMigrationLedger {
+            completed_prefix_len: 3,
+            current_migration_count: 3,
+        };
+        assert_eq!(
+            classify_source_storage(
+                partial,
+                StorageContractFacts {
+                    table_exists: false,
+                    contract: None,
+                },
+                1,
+                2,
+            ),
+            Ok(SourceStorageCompatibility::ReleasedHistorical { writer_epoch: 2 })
+        );
+        assert_eq!(
+            classify_source_storage(
+                current,
+                StorageContractFacts {
+                    table_exists: true,
+                    contract: Some(StorageContractRow {
+                        schema_version: 1,
+                        writer_epoch: u64::from(CURRENT_WRITER_EPOCH),
+                    }),
+                },
+                1,
+                2,
+            ),
+            Ok(SourceStorageCompatibility::Current {
+                writer_epoch: u64::from(CURRENT_WRITER_EPOCH),
+            })
+        );
+        assert_eq!(
+            classify_source_storage(
+                current,
+                StorageContractFacts {
+                    table_exists: false,
+                    contract: None,
+                },
+                1,
+                2,
+            ),
+            Err(SourceStorageCompatibilityError::MissingContractTable)
+        );
+        assert!(matches!(
+            classify_source_storage(
+                partial,
+                StorageContractFacts {
+                    table_exists: true,
+                    contract: Some(StorageContractRow {
+                        schema_version: 1,
+                        writer_epoch: u64::from(CURRENT_WRITER_EPOCH + 1),
+                    }),
+                },
+                1,
+                2,
+            ),
+            Err(SourceStorageCompatibilityError::WriterEpoch { .. })
+        ));
+    }
+
+    #[test]
+    fn migration_ledger_validation_rejects_unknown_and_non_contiguous_history() {
+        let known = vec!["001".to_owned(), "002".to_owned(), "003".to_owned()];
+        assert_eq!(
+            validate_migration_ledger(&MigrationLedgerFacts {
+                known_migration_ids: known.clone(),
+                completed_migration_ids: BTreeSet::from(["001".to_owned(), "002".to_owned()]),
+            })
+            .expect("prefix"),
+            ValidatedMigrationLedger {
+                completed_prefix_len: 2,
+                current_migration_count: 3,
+            }
+        );
+        assert!(matches!(
+            validate_migration_ledger(&MigrationLedgerFacts {
+                known_migration_ids: known.clone(),
+                completed_migration_ids: BTreeSet::from(["999".to_owned()]),
+            }),
+            Err(MigrationLedgerValidationError::UnknownMigration(id)) if id == "999"
+        ));
+        assert_eq!(
+            validate_migration_ledger(&MigrationLedgerFacts {
+                known_migration_ids: known,
+                completed_migration_ids: BTreeSet::from(["001".to_owned(), "003".to_owned()]),
+            }),
+            Err(MigrationLedgerValidationError::NonContiguousPrefix)
+        );
+    }
 
     #[test]
     fn strict_target_validation_rejects_stale_incompatible_and_unresolved_state() {

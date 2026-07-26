@@ -744,12 +744,8 @@ impl GlobalSessionDb {
 pub type SessionMigrationProgressCallback =
     Arc<dyn Fn(bcode_session_models::SessionMigrationProgress) + Send + Sync>;
 
-pub(crate) struct MigrationSourceEvidence {
-    pub canonical: bcode_session_migration::MigrationBackupCanonicalEvidence,
-    pub converted_events: BTreeMap<String, u64>,
-    pub retired_known_events: BTreeMap<String, u64>,
-    pub classification_error: Option<SessionDbError>,
-}
+pub(crate) type MigrationSourceEvidence =
+    bcode_session_migration::MigrationSourceEvidence<SessionDbError>;
 
 /// Backend-agnostic handle for one isolated session database.
 #[derive(Debug, Clone)]
@@ -1572,7 +1568,6 @@ impl SessionDb {
             .into_iter()
             .map(|migration| migration.id().to_owned())
             .collect::<Vec<_>>();
-        let known_set = known_migrations.iter().cloned().collect::<BTreeSet<_>>();
         let applied = if self.db.table_exists(SESSION_MIGRATIONS_TABLE).await? {
             self.db
                 .select(SESSION_MIGRATIONS_TABLE)
@@ -1594,79 +1589,71 @@ impl SessionDb {
         } else {
             BTreeSet::new()
         };
-        if let Some(unknown) = applied.iter().find(|id| !known_set.contains(*id)) {
-            return Err(SessionDbError::MigrationHistoryIncompatible {
-                reason: format!("unknown migration {unknown}"),
-            });
-        }
-        let applied_count = known_migrations
-            .iter()
-            .take_while(|id| applied.contains(*id))
-            .count();
-        if applied.len() != applied_count {
-            return Err(SessionDbError::MigrationHistoryIncompatible {
-                reason: "completed migrations are not a contiguous known prefix".to_owned(),
-            });
-        }
-
+        let ledger = bcode_session_migration::validate_migration_ledger(
+            &bcode_session_migration::MigrationLedgerFacts {
+                known_migration_ids: known_migrations,
+                completed_migration_ids: applied,
+            },
+        )
+        .map_err(|error| SessionDbError::MigrationHistoryIncompatible {
+            reason: error.to_string(),
+        })?;
         let contract_table_exists = self.db.table_exists("session_storage_contract").await?;
-        if !contract_table_exists {
-            if applied_count == known_migrations.len() {
-                return Err(SessionDbError::MigrationHistoryIncompatible {
-                    reason: "migration history claims the storage contract exists, but its table is missing".to_owned(),
-                });
-            }
-            return Ok(SessionStorageCompatibility::KnownLegacy {
-                writer_epoch: u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH),
-            });
-        }
-        let row = self
-            .db
-            .select("session_storage_contract")
-            .columns(&["schema_version", "writer_epoch"])
-            .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
-            .execute_first(&**self.db)
-            .await?;
-        let Some(row) = row.as_ref() else {
-            if applied_count == known_migrations.len() {
-                return Err(SessionDbError::MigrationHistoryIncompatible {
-                    reason: "migration history claims the storage contract was initialized, but its row is missing".to_owned(),
-                });
-            }
-            return Ok(SessionStorageCompatibility::KnownLegacy {
-                writer_epoch: u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH),
-            });
+        let contract = if contract_table_exists {
+            self.db
+                .select("session_storage_contract")
+                .columns(&["schema_version", "writer_epoch"])
+                .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
+                .execute_first(&**self.db)
+                .await?
+                .as_ref()
+                .map(|row| {
+                    Ok::<_, SessionDbError>(bcode_session_migration::StorageContractRow {
+                        schema_version: required_non_negative_u64(row, "schema_version")?,
+                        writer_epoch: required_non_negative_u64(row, "writer_epoch")?,
+                    })
+                })
+                .transpose()?
+        } else {
+            None
         };
-        let schema_version = required_non_negative_u64(row, "schema_version")?;
-        if schema_version != u64::from(SESSION_STORAGE_CONTRACT_SCHEMA_VERSION) {
-            return Err(SessionDbError::ProjectionIncompatible {
-                projection: "session_storage_contract",
-                actual: schema_version,
-                expected: u64::from(SESSION_STORAGE_CONTRACT_SCHEMA_VERSION),
-            });
-        }
-        let writer_epoch = required_non_negative_u64(row, "writer_epoch")?;
-        if writer_epoch == u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH) {
-            if applied_count != known_migrations.len() {
-                return Ok(SessionStorageCompatibility::KnownLegacy { writer_epoch });
-            }
-            return Ok(SessionStorageCompatibility::Current { writer_epoch });
-        }
-        let writer_epoch_u32 =
-            u32::try_from(writer_epoch).map_err(|_| SessionDbError::WriterIncompatible {
-                actual: Some(writer_epoch),
-                expected: u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH),
-            })?;
-        if matches!(
-            bcode_session_migration::classify_writer_epoch(writer_epoch_u32),
-            bcode_session_migration::WriterEpochCompatibility::ReleasedHistorical
+        match bcode_session_migration::classify_source_storage(
+            ledger,
+            bcode_session_migration::StorageContractFacts {
+                table_exists: contract_table_exists,
+                contract,
+            },
+            u64::from(SESSION_STORAGE_CONTRACT_SCHEMA_VERSION),
+            LEGACY_SESSION_STORAGE_WRITER_EPOCH,
         ) {
-            return Ok(SessionStorageCompatibility::KnownLegacy { writer_epoch });
+            Ok(bcode_session_migration::SourceStorageCompatibility::Current { writer_epoch }) => {
+                Ok(SessionStorageCompatibility::Current { writer_epoch })
+            }
+            Ok(bcode_session_migration::SourceStorageCompatibility::ReleasedHistorical {
+                writer_epoch,
+            }) => Ok(SessionStorageCompatibility::KnownLegacy { writer_epoch }),
+            Err(bcode_session_migration::SourceStorageCompatibilityError::ContractSchema {
+                actual,
+                expected,
+            }) => Err(SessionDbError::ProjectionIncompatible {
+                projection: "session_storage_contract",
+                actual,
+                expected,
+            }),
+            Err(bcode_session_migration::SourceStorageCompatibilityError::WriterEpoch {
+                actual,
+                expected,
+            }) => Err(SessionDbError::WriterIncompatible {
+                actual: Some(actual),
+                expected,
+            }),
+            Err(error @ (bcode_session_migration::SourceStorageCompatibilityError::MissingContractTable
+                | bcode_session_migration::SourceStorageCompatibilityError::MissingContractRow)) => {
+                Err(SessionDbError::MigrationHistoryIncompatible {
+                    reason: error.to_string(),
+                })
+            }
         }
-        Err(SessionDbError::WriterIncompatible {
-            actual: Some(writer_epoch),
-            expected: u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH),
-        })
     }
 
     /// Return the durable storage writer epoch recorded by this session database.
@@ -2694,15 +2681,18 @@ async fn write_session_migration_receipt(
             source: bcode_session_migration::SessionMigrationCanonicalReceiptEvidence {
                 event_count,
                 event_tail,
-                event_digest_sha256: migration_outcome.source_payload_digest_sha256.clone(),
+                event_digest_sha256: migration_outcome
+                    .evidence
+                    .source_payload_digest_sha256
+                    .clone(),
             },
             target: bcode_session_migration::SessionMigrationCanonicalReceiptEvidence {
                 event_count,
                 event_tail,
                 event_digest_sha256: digest,
             },
-            converted_events: migration_outcome.converted_events.clone(),
-            retired_known_events: migration_outcome.retired_known_events.clone(),
+            converted_events: migration_outcome.evidence.converted_events.clone(),
+            retired_known_events: migration_outcome.evidence.retired_known_events.clone(),
             completed_at_ms: bcode_session_models::current_unix_timestamp_ms(),
         },
     )
@@ -2854,9 +2844,7 @@ async fn migrate_session_storage(
 
 struct MigrationReplayOutcome {
     tail: Option<SessionEvent>,
-    source_payload_digest_sha256: String,
-    converted_events: BTreeMap<String, u64>,
-    retired_known_events: BTreeMap<String, u64>,
+    evidence: bcode_session_migration::MigrationClassificationEvidence,
 }
 
 fn validate_migration_event_identity(
@@ -2995,9 +2983,11 @@ async fn rebuild_migration_projections(
     let (converted_events, retired_known_events) = normalization_summary.into_counts();
     Ok(MigrationReplayOutcome {
         tail,
-        source_payload_digest_sha256: format!("{:x}", source_digest.finalize()),
-        converted_events,
-        retired_known_events,
+        evidence: bcode_session_migration::MigrationClassificationEvidence {
+            source_payload_digest_sha256: format!("{:x}", source_digest.finalize()),
+            converted_events,
+            retired_known_events,
+        },
     })
 }
 
@@ -5907,6 +5897,51 @@ mod tests {
                 ))
                 .await
                 .expect("append after source-epoch migration");
+            drop(migrated);
+            let reopened = SessionDb::open_existing_turso_in_root(session_id, temp_dir.path())
+                .await
+                .expect("reopen after first migrated append");
+            reopened
+                .validate_write_readiness()
+                .await
+                .expect("reopened migrated source epoch should remain writable");
+            reopened
+                .append_event(&event(
+                    session_id,
+                    2,
+                    SessionEventKind::AssistantMessage {
+                        text: format!("reopened migration from epoch {source_writer_epoch}"),
+                    },
+                ))
+                .await
+                .expect("append after migrated reopen");
+            drop(reopened);
+            let reopened_again =
+                SessionDb::open_existing_turso_in_root(session_id, temp_dir.path())
+                    .await
+                    .expect("second reopen after migration");
+            reopened_again
+                .validate_write_readiness()
+                .await
+                .expect("second reopened migration should remain writable");
+            assert_eq!(
+                reopened_again
+                    .all_events_strict()
+                    .await
+                    .expect("strict reopened history")
+                    .len(),
+                3
+            );
+            reopened_again
+                .append_event(&event(
+                    session_id,
+                    3,
+                    SessionEventKind::AssistantMessage {
+                        text: format!("second reopened migration from epoch {source_writer_epoch}"),
+                    },
+                ))
+                .await
+                .expect("append after second migrated reopen");
         }
     }
 
@@ -5982,6 +6017,9 @@ mod tests {
             .await
             .expect("open fixture DB");
         insert_schema_28_store_fixture(&db).await;
+        db.set_session_composer_draft("sanitized migration fixture draft", 6)
+            .await
+            .expect("persist authoritative fixture draft");
         db.database()
             .update("session_storage_contract")
             .value("writer_epoch", DatabaseValue::Int64(2))
@@ -6030,6 +6068,13 @@ mod tests {
             .validate_write_readiness()
             .await
             .expect("migrated store should be writable");
+        assert_eq!(
+            migrated
+                .session_composer_draft()
+                .await
+                .expect("read preserved fixture draft"),
+            Some("sanitized migration fixture draft".to_owned())
+        );
         let events = migrated.all_events_strict().await.expect("strict history");
         assert_eq!(events.len(), 5);
         assert!(events.iter().all(|event| {
@@ -8860,6 +8905,30 @@ mod tests {
                         reopened.storage_writer_epoch().await.expect("writer epoch"),
                         u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)
                     );
+                    drop(reopened);
+                    let maintenance = crate::lease::acquire_session_maintenance_guard(
+                        temp_dir.path(),
+                        session_id,
+                    )
+                    .expect("retry maintenance guard");
+                    let write = crate::lease::acquire_maintenance_session_write_lock(
+                        &maintenance,
+                        temp_dir.path(),
+                        session_id,
+                    )
+                    .expect("retry write guard");
+                    let retried = SessionDb::migrate_turso_in_root(
+                        session_id,
+                        temp_dir.path(),
+                        &maintenance,
+                        &write,
+                    )
+                    .await
+                    .expect("retry interrupted migration");
+                    retried
+                        .validate_write_readiness()
+                        .await
+                        .expect("retried migration is write ready");
                 }
                 "after_commit" | "post_commit_checkpoint" => {
                     assert!(matches!(

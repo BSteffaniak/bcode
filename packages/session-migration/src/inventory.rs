@@ -29,6 +29,9 @@ pub struct ReleasedFixtureDescriptor {
     pub expected_classifications: ReleasedFixtureClassificationCounts,
     /// Exact event-kind inventory represented by the fixture.
     pub covered_event_kinds: Vec<String>,
+    /// Preserved authoritative non-event records covered by this fixture.
+    #[serde(default)]
+    pub covered_authoritative_records: Vec<String>,
 }
 
 /// Expected normalization treatment counts for a fixture.
@@ -82,6 +85,47 @@ pub enum ReleasedFixtureInventoryError {
         /// Unsupported event schema.
         event_schema: u16,
     },
+    /// A fixture contains no canonical event schemas.
+    #[error("released fixture {} declares no event schemas", .0.display())]
+    MissingEventSchema(PathBuf),
+    /// A fixture contains no event-kind coverage.
+    #[error("released fixture {} declares no event kinds", .0.display())]
+    MissingEventKind(PathBuf),
+    /// A fixture declares a duplicate writer epoch, schema, event kind, or authoritative record.
+    #[error("released fixture {} contains duplicate {field} value {value}", path.display())]
+    DuplicateCoverageValue {
+        /// Fixture path.
+        path: PathBuf,
+        /// Manifest field containing the duplicate.
+        field: &'static str,
+        /// Duplicate rendered value.
+        value: String,
+    },
+    #[error("released fixture {} references unsupported authoritative record {record}", path.display())]
+    UnsupportedAuthoritativeRecord {
+        /// Fixture path.
+        path: PathBuf,
+        /// Unsupported record table.
+        record: String,
+    },
+}
+
+fn validate_fixture_values_unique(
+    path: &Path,
+    field: &'static str,
+    values: impl IntoIterator<Item = String>,
+) -> Result<(), ReleasedFixtureInventoryError> {
+    let mut unique = BTreeSet::new();
+    for value in values {
+        if !unique.insert(value.clone()) {
+            return Err(ReleasedFixtureInventoryError::DuplicateCoverageValue {
+                path: path.to_path_buf(),
+                field,
+                value,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Load and validate the permanent fixture manifest against released inventory and disk paths.
@@ -116,6 +160,36 @@ pub fn load_released_fixture_manifest(
                 fixture.path.clone(),
             ));
         }
+        if fixture.event_schemas.is_empty() {
+            return Err(ReleasedFixtureInventoryError::MissingEventSchema(
+                fixture.path.clone(),
+            ));
+        }
+        if fixture.covered_event_kinds.is_empty() {
+            return Err(ReleasedFixtureInventoryError::MissingEventKind(
+                fixture.path.clone(),
+            ));
+        }
+        validate_fixture_values_unique(
+            &fixture.path,
+            "source_writer_epochs",
+            fixture.source_writer_epochs.iter().map(ToString::to_string),
+        )?;
+        validate_fixture_values_unique(
+            &fixture.path,
+            "event_schemas",
+            fixture.event_schemas.iter().map(ToString::to_string),
+        )?;
+        validate_fixture_values_unique(
+            &fixture.path,
+            "covered_event_kinds",
+            fixture.covered_event_kinds.iter().cloned(),
+        )?;
+        validate_fixture_values_unique(
+            &fixture.path,
+            "covered_authoritative_records",
+            fixture.covered_authoritative_records.iter().cloned(),
+        )?;
         for writer_epoch in &fixture.source_writer_epochs {
             if RELEASED_HISTORICAL_WRITER_EPOCHS
                 .binary_search(writer_epoch)
@@ -125,6 +199,19 @@ pub fn load_released_fixture_manifest(
                     path: fixture.path.clone(),
                     writer_epoch: *writer_epoch,
                 });
+            }
+        }
+        for record in &fixture.covered_authoritative_records {
+            if !RELEASED_RECORD_TREATMENTS.iter().any(|descriptor| {
+                descriptor.table == record
+                    && descriptor.treatment == ReleasedRecordTreatment::Preserve
+            }) {
+                return Err(
+                    ReleasedFixtureInventoryError::UnsupportedAuthoritativeRecord {
+                        path: fixture.path.clone(),
+                        record: record.clone(),
+                    },
+                );
             }
         }
         for event_schema in &fixture.event_schemas {
@@ -174,6 +261,359 @@ pub fn released_fixture_schema_coverage(
     }
     coverage
 }
+
+/// Return preserved authoritative-record fixture coverage.
+#[must_use]
+pub fn released_fixture_authoritative_record_coverage(
+    manifest: &ReleasedFixtureManifest,
+) -> BTreeMap<String, usize> {
+    let mut coverage = BTreeMap::new();
+    for fixture in &manifest.fixtures {
+        for record in &fixture.covered_authoritative_records {
+            *coverage.entry(record.clone()).or_insert(0) += 1;
+        }
+    }
+    coverage
+}
+
+/// Migration treatment for one authoritative historical non-event record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleasedRecordTreatment {
+    /// Rebuild the row from normalized canonical history.
+    RebuildFromCanonical,
+    /// Preserve the row exactly across migration.
+    Preserve,
+    /// Replace the row with migration-owned current contract/audit state.
+    FinalizeCurrent,
+    /// Global-domain state is outside per-session migration.
+    GlobalOnly,
+    /// Historical derived state is intentionally discarded and rebuilt elsewhere.
+    RetireDerived,
+}
+
+/// One authoritative or derived non-event record found in released storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleasedRecordDescriptor {
+    /// Durable table identity.
+    pub table: &'static str,
+    /// Migration treatment for the table's rows.
+    pub treatment: ReleasedRecordTreatment,
+}
+
+/// Complete treatment inventory for released persisted tables.
+pub const RELEASED_RECORD_TREATMENTS: &[ReleasedRecordDescriptor] = &[
+    ReleasedRecordDescriptor {
+        table: "artifact_references",
+        treatment: ReleasedRecordTreatment::RebuildFromCanonical,
+    },
+    ReleasedRecordDescriptor {
+        table: "composer_drafts",
+        treatment: ReleasedRecordTreatment::GlobalOnly,
+    },
+    ReleasedRecordDescriptor {
+        table: "context_occupancy_projection",
+        treatment: ReleasedRecordTreatment::RebuildFromCanonical,
+    },
+    ReleasedRecordDescriptor {
+        table: "events",
+        treatment: ReleasedRecordTreatment::Preserve,
+    },
+    ReleasedRecordDescriptor {
+        table: "input_messages",
+        treatment: ReleasedRecordTreatment::RebuildFromCanonical,
+    },
+    ReleasedRecordDescriptor {
+        table: "model_context_entries",
+        treatment: ReleasedRecordTreatment::RebuildFromCanonical,
+    },
+    ReleasedRecordDescriptor {
+        table: "model_context_projection_state",
+        treatment: ReleasedRecordTreatment::RebuildFromCanonical,
+    },
+    ReleasedRecordDescriptor {
+        table: "projection_checkpoints",
+        treatment: ReleasedRecordTreatment::RebuildFromCanonical,
+    },
+    ReleasedRecordDescriptor {
+        table: "runtime_work",
+        treatment: ReleasedRecordTreatment::RebuildFromCanonical,
+    },
+    ReleasedRecordDescriptor {
+        table: "session_compatibility_issues",
+        treatment: ReleasedRecordTreatment::RebuildFromCanonical,
+    },
+    ReleasedRecordDescriptor {
+        table: "session_compatibility_state",
+        treatment: ReleasedRecordTreatment::RebuildFromCanonical,
+    },
+    ReleasedRecordDescriptor {
+        table: "session_drafts",
+        treatment: ReleasedRecordTreatment::Preserve,
+    },
+    ReleasedRecordDescriptor {
+        table: "session_migration_receipts",
+        treatment: ReleasedRecordTreatment::FinalizeCurrent,
+    },
+    ReleasedRecordDescriptor {
+        table: "session_state",
+        treatment: ReleasedRecordTreatment::RebuildFromCanonical,
+    },
+    ReleasedRecordDescriptor {
+        table: "session_storage_contract",
+        treatment: ReleasedRecordTreatment::FinalizeCurrent,
+    },
+    ReleasedRecordDescriptor {
+        table: "sessions",
+        treatment: ReleasedRecordTreatment::GlobalOnly,
+    },
+    ReleasedRecordDescriptor {
+        table: "snapshots",
+        treatment: ReleasedRecordTreatment::RetireDerived,
+    },
+    ReleasedRecordDescriptor {
+        table: "tool_runs",
+        treatment: ReleasedRecordTreatment::RebuildFromCanonical,
+    },
+    ReleasedRecordDescriptor {
+        table: "transcript_items",
+        treatment: ReleasedRecordTreatment::RebuildFromCanonical,
+    },
+    ReleasedRecordDescriptor {
+        table: "turn_receipts",
+        treatment: ReleasedRecordTreatment::RebuildFromCanonical,
+    },
+];
+
+/// Treatment required for one released persisted event variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleasedEventTreatment {
+    /// Strict current decoding preserves active semantics.
+    CurrentEquivalent,
+    /// Migration must explicitly convert historical semantics.
+    ExplicitConversion,
+    /// Migration preserves the event as recognized inert current history.
+    RetiredKnown,
+}
+
+/// One released persisted event variant and its migration treatment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleasedEventVariantDescriptor {
+    /// Stable serde event-kind name.
+    pub kind: &'static str,
+    /// Required migration treatment.
+    pub treatment: ReleasedEventTreatment,
+}
+
+/// Persisted event variants represented by the current schema and historical adapters.
+///
+/// Historical schema-28 variants are listed with explicit conversion/inert treatment. All other
+/// variants are current-equivalent and remain subject to per-schema fixture completion.
+pub const RELEASED_EVENT_VARIANTS: &[ReleasedEventVariantDescriptor] = &[
+    ReleasedEventVariantDescriptor {
+        kind: "agent_changed",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "assistant_delta",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "assistant_message",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "assistant_reasoning_activity",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "assistant_reasoning_delta",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "assistant_reasoning_message",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "client_attached",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "client_detached",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "context_compacted",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "context_usage_observed",
+        treatment: ReleasedEventTreatment::ExplicitConversion,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "execution_session_created",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "model_changed",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "model_turn_cancel_requested",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "model_turn_finished",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "model_turn_started",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "model_usage",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "opaque_event",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "permission_requested",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "permission_resolved",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "plugin_status_note",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "provider_context_compacted",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "ralph_lifecycle",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "reasoning_changed",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "request_context_observed",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "runtime_work_cancel_requested",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "runtime_work_finished",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "runtime_work_progress",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "runtime_work_started",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "session_created",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "session_forked",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "session_imported",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "session_renamed",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "skill_activated",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "skill_context_loaded",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "skill_deactivated",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "skill_invocation_failed",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "skill_invoked",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "skill_suggested",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "system_message",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "tool_call_finished",
+        treatment: ReleasedEventTreatment::ExplicitConversion,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "tool_call_requested",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "tool_contribution",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "tool_contribution_placed",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "tool_exchange_requested",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "tool_exchange_resolved",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "tool_invocation_lifecycle",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "tool_invocation_result_recorded",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "tool_invocation_stream",
+        treatment: ReleasedEventTreatment::RetiredKnown,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "trace_event",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "user_message",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "working_directory_changed",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+];
 
 /// Migration-ledger domain that owns one released migration identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -478,6 +918,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn every_released_table_has_exactly_one_record_treatment() {
+        assert_eq!(
+            RELEASED_RECORD_TREATMENTS.len(),
+            RELEASED_PERSISTED_TABLES.len()
+        );
+        assert!(
+            RELEASED_RECORD_TREATMENTS
+                .windows(2)
+                .all(|pair| pair[0].table < pair[1].table)
+        );
+        assert_eq!(
+            RELEASED_RECORD_TREATMENTS
+                .iter()
+                .map(|record| record.table)
+                .collect::<Vec<_>>(),
+            RELEASED_PERSISTED_TABLES
+        );
+        assert_eq!(
+            RELEASED_RECORD_TREATMENTS
+                .iter()
+                .filter(|record| record.treatment == ReleasedRecordTreatment::Preserve)
+                .map(|record| record.table)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["events", "session_drafts"])
+        );
+    }
+
+    #[test]
+    fn released_event_variant_treatments_are_sorted_unique_and_total() {
+        assert!(
+            RELEASED_EVENT_VARIANTS
+                .windows(2)
+                .all(|pair| pair[0].kind < pair[1].kind)
+        );
+        assert_eq!(RELEASED_EVENT_VARIANTS.len(), 51);
+        let explicit = RELEASED_EVENT_VARIANTS
+            .iter()
+            .filter(|variant| variant.treatment == ReleasedEventTreatment::ExplicitConversion)
+            .map(|variant| variant.kind)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            explicit,
+            BTreeSet::from(["context_usage_observed", "tool_call_finished"])
+        );
+        let retired = RELEASED_EVENT_VARIANTS
+            .iter()
+            .filter(|variant| variant.treatment == ReleasedEventTreatment::RetiredKnown)
+            .map(|variant| variant.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(retired, ["tool_invocation_stream"]);
+    }
+
+    #[test]
     fn released_migration_and_table_inventories_are_sorted_unique_and_domain_complete() {
         assert_eq!(RELEASED_MIGRATION_IDS.len(), 38);
         assert!(
@@ -526,6 +1019,52 @@ mod tests {
             released_fixture_schema_coverage(&manifest).get(&28),
             Some(&1)
         );
+        assert_eq!(
+            released_fixture_authoritative_record_coverage(&manifest).get("session_drafts"),
+            Some(&1)
+        );
+    }
+
+    #[test]
+    fn permanent_fixture_manifest_rejects_duplicate_and_empty_coverage() {
+        let root = tempfile::tempdir().expect("fixture root");
+        std::fs::create_dir(root.path().join("stores")).expect("stores");
+        std::fs::write(root.path().join("stores/fixture.jsonl"), "{}\n").expect("fixture");
+        let manifest_path = root.path().join("manifest.json");
+        let manifest = serde_json::json!({
+            "format_version": 1,
+            "fixtures": [{
+                "path": "stores/fixture.jsonl",
+                "source_writer_epochs": [2, 2],
+                "event_schemas": [28],
+                "expected_event_count": 1,
+                "expected_classifications": {
+                    "converted": 0,
+                    "retired_known": 0,
+                    "current_passthrough": 1
+                },
+                "covered_event_kinds": ["session_created"]
+            }]
+        });
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).expect("JSON"))
+            .expect("manifest");
+        assert!(matches!(
+            load_released_fixture_manifest(root.path()),
+            Err(ReleasedFixtureInventoryError::DuplicateCoverageValue {
+                field: "source_writer_epochs",
+                ..
+            })
+        ));
+
+        let mut manifest = manifest;
+        manifest["fixtures"][0]["source_writer_epochs"] = serde_json::json!([2]);
+        manifest["fixtures"][0]["event_schemas"] = serde_json::json!([]);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).expect("JSON"))
+            .expect("manifest");
+        assert!(matches!(
+            load_released_fixture_manifest(root.path()),
+            Err(ReleasedFixtureInventoryError::MissingEventSchema(_))
+        ));
     }
 
     #[test]

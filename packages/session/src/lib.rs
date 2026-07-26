@@ -18,6 +18,7 @@ mod actor;
 pub mod db;
 pub mod lease;
 pub mod migration_adapter;
+mod migration_execution;
 pub mod persisted;
 pub mod projection;
 pub mod repair;
@@ -42,7 +43,7 @@ use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{
-    Arc, Mutex as StdMutex,
+    Arc,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -167,140 +168,10 @@ fn record_session_event_domain_metrics(metrics: &MetricsRegistry, event: &Sessio
     }
 }
 
-const MIGRATION_PROGRESS_BYTE_INTERVAL: u64 = 1024 * 1024;
-
-#[derive(Debug, Clone)]
-struct MigrationProgressReporter {
-    operation: Arc<bcode_session_migration::SessionMigrationOperation>,
-    last_reported: Arc<StdMutex<Option<(SessionMigrationStage, u64)>>>,
-}
-
-impl MigrationProgressReporter {
-    fn new(operation: Arc<bcode_session_migration::SessionMigrationOperation>) -> Self {
-        Self {
-            operation,
-            last_reported: Arc::new(StdMutex::new(None)),
-        }
-    }
-
-    fn stage(&self, stage: SessionMigrationStage, message: impl Into<String>) {
-        self.operation.publish_progress(SessionMigrationProgress {
-            stage,
-            completed_units: None,
-            total_units: None,
-            unit: None,
-            message: message.into(),
-        });
-    }
-
-    fn determinate(
-        &self,
-        stage: SessionMigrationStage,
-        completed: u64,
-        total: u64,
-        unit: bcode_session_models::SessionMigrationProgressUnit,
-        message: impl Into<String>,
-        interval: u64,
-    ) {
-        let should_publish = completed == 0
-            || completed == total
-            || self.last_reported.lock().is_ok_and(|mut last| {
-                let publish = last.is_none_or(|(last_stage, last_completed)| {
-                    last_stage != stage || completed.saturating_sub(last_completed) >= interval
-                });
-                if publish {
-                    *last = Some((stage, completed));
-                }
-                publish
-            });
-        if should_publish {
-            self.operation.publish_progress(SessionMigrationProgress {
-                stage,
-                completed_units: Some(completed),
-                total_units: Some(total),
-                unit: Some(unit),
-                message: message.into(),
-            });
-        }
-    }
-
-    fn backup_verified(&self, path: PathBuf) {
-        self.operation.publish_backup_path(path);
-    }
-}
-
 fn ensure_loaded_metric_labels(result: &str) -> MetricLabels {
     let mut labels = MetricLabels::new();
     labels.insert("result".to_owned(), result.to_owned());
     labels
-}
-
-async fn create_verified_migration_backup(
-    root: &Path,
-    session_id: SessionId,
-    writer_epoch: u64,
-    operation_id: SessionOpenOperationId,
-    source_evidence: db::MigrationSourceEvidence,
-    metrics: &MetricsRegistry,
-    progress: Option<&MigrationProgressReporter>,
-) -> Result<PathBuf, SessionError> {
-    let backup_progress = progress.cloned().map(|progress| {
-        Arc::new(move |update: SessionMigrationProgress| {
-            if let (Some(completed), Some(total), Some(unit)) =
-                (update.completed_units, update.total_units, update.unit)
-            {
-                progress.determinate(
-                    update.stage,
-                    completed,
-                    total,
-                    unit,
-                    update.message,
-                    MIGRATION_PROGRESS_BYTE_INTERVAL,
-                );
-            }
-        }) as bcode_session_migration::BackupProgressCallback
-    });
-    let request = bcode_session_migration::build_migration_backup_request(
-        bcode_session_migration::MigrationBackupRequestPlan {
-            sessions_root: root.to_path_buf(),
-            session_id,
-            operation_id: operation_id.to_string(),
-            source_writer_epoch: writer_epoch,
-            canonical_source: source_evidence.canonical,
-            converted_events: source_evidence.converted_events,
-            retired_known_events: source_evidence.retired_known_events,
-        },
-    )
-    .map_err(|error| SessionError::MigrationBackup {
-        session_id,
-        reason: error.to_string(),
-    })?;
-    let result =
-        bcode_session_migration::create_retained_migration_backup(request, backup_progress)
-            .await
-            .map_err(|error| SessionError::MigrationBackup {
-                session_id,
-                reason: error.to_string(),
-            })?;
-    metrics.record_histogram(
-        "session.migration.backup.plan_duration_ms",
-        duration_millis(result.plan_duration),
-    );
-    metrics.record_histogram(
-        "session.migration.backup.copy_duration_ms",
-        duration_millis(result.copy_duration),
-    );
-    metrics.record_histogram(
-        "session.migration.backup.verify_duration_ms",
-        duration_millis(result.verify_duration),
-    );
-    metrics.add_counter("session.migration.backup.files_total", result.files);
-    metrics.add_counter("session.migration.backup.bytes_total", result.bytes);
-    Ok(result.path)
-}
-
-fn duration_millis(duration: std::time::Duration) -> u64 {
-    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn terminal_session_open_snapshot(
@@ -1247,16 +1118,6 @@ impl Default for SessionManager {
     }
 }
 
-struct OwnedLegacyMigration<'a> {
-    session_id: SessionId,
-    root: &'a Path,
-    writer_epoch: u64,
-    maintenance: &'a lease::SessionMaintenanceGuard,
-    write: &'a lease::SessionWriteGuard,
-    started: &'a bcode_metrics::MetricsTimer,
-    progress: Option<&'a MigrationProgressReporter>,
-}
-
 async fn classify_known_current_session_open(
     session_id: SessionId,
     db: &db::SessionDb,
@@ -1521,7 +1382,7 @@ impl SessionManager {
             let operation = self
                 .migration_operations
                 .start_or_join(initial, move |operation| async move {
-                    let reporter = MigrationProgressReporter::new(operation);
+                    let reporter = migration_execution::MigrationExecutionProgress::new(operation);
                     match manager
                         .ensure_session_loaded_with_progress(session_id, Some(&reporter))
                         .await
@@ -1668,7 +1529,7 @@ impl SessionManager {
     async fn ensure_session_loaded_with_progress(
         &self,
         session_id: SessionId,
-        progress: Option<&MigrationProgressReporter>,
+        progress: Option<&migration_execution::MigrationExecutionProgress>,
     ) -> Result<(), SessionError> {
         let gate = self.session_load_gate(session_id).await;
         let _guard = gate.lock().await;
@@ -1678,7 +1539,7 @@ impl SessionManager {
     async fn ensure_session_loaded_inner(
         &self,
         session_id: SessionId,
-        progress: Option<&MigrationProgressReporter>,
+        progress: Option<&migration_execution::MigrationExecutionProgress>,
     ) -> Result<(), SessionError> {
         let total_timer = self.metrics.timer();
         let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
@@ -1705,7 +1566,7 @@ impl SessionManager {
         session_id: SessionId,
         handle: SessionHandle,
         total_timer: bcode_metrics::MetricsTimer,
-        progress: Option<&MigrationProgressReporter>,
+        progress: Option<&migration_execution::MigrationExecutionProgress>,
     ) -> Result<(), SessionError> {
         let Some(store) = &self.store else {
             record_ensure_loaded_duration(&self.metrics, "cached", total_timer.elapsed_ms());
@@ -1756,7 +1617,7 @@ impl SessionManager {
         &self,
         session_id: SessionId,
         store: &SessionStoreExecutor,
-        progress: Option<&MigrationProgressReporter>,
+        progress: Option<&migration_execution::MigrationExecutionProgress>,
     ) -> Result<SessionLeaseGuard, SessionError> {
         use db::SessionStorageCompatibility::{Current, KnownLegacy};
 
@@ -1835,7 +1696,7 @@ impl SessionManager {
         root: &Path,
         writer_epoch: u64,
         attempt: u8,
-        progress: Option<&MigrationProgressReporter>,
+        progress: Option<&migration_execution::MigrationExecutionProgress>,
     ) -> Result<SessionLeaseLoadOutcome, SessionError> {
         use db::SessionStorageCompatibility::{Current, KnownLegacy};
 
@@ -1884,15 +1745,18 @@ impl SessionManager {
             .storage_compatibility()
             .await?;
         if matches!(rechecked, KnownLegacy { .. }) {
-            self.migrate_owned_legacy_storage(OwnedLegacyMigration {
-                session_id,
-                root,
-                writer_epoch,
-                maintenance: &maintenance,
-                write: &write,
-                started: &started,
-                progress,
-            })
+            migration_execution::execute_owned_legacy_storage(
+                migration_execution::OwnedLegacyMigration {
+                    session_id,
+                    root,
+                    writer_epoch,
+                    maintenance: &maintenance,
+                    write: &write,
+                    started: &started,
+                    progress: progress.cloned(),
+                },
+                &self.metrics,
+            )
             .await?;
         }
         drop(write);
@@ -1907,119 +1771,11 @@ impl SessionManager {
         Ok(SessionLeaseLoadOutcome::Acquired(Box::new(lease)))
     }
 
-    #[allow(clippy::too_many_lines)]
-    async fn migrate_owned_legacy_storage(
-        &self,
-        migration: OwnedLegacyMigration<'_>,
-    ) -> Result<(), SessionError> {
-        let OwnedLegacyMigration {
-            session_id,
-            root,
-            writer_epoch,
-            maintenance,
-            write,
-            started,
-            progress,
-        } = migration;
-        let operation_id = progress.map_or_else(SessionOpenOperationId::new, |progress| {
-            progress.operation.snapshot().operation_id
-        });
-        let source = db::SessionDb::open_existing_turso_in_root(session_id, root).await?;
-        let mut source_evidence = source.migration_source_evidence().await?;
-        drop(source);
-        let classification_error = source_evidence.classification_error.take();
-        let backup_path = create_verified_migration_backup(
-            root,
-            session_id,
-            writer_epoch,
-            operation_id,
-            source_evidence,
-            &self.metrics,
-            progress,
-        )
-        .await?;
-        if let Some(progress) = progress {
-            progress.backup_verified(backup_path.clone());
-            progress.stage(
-                SessionMigrationStage::PreparingSchema,
-                "Preparing session storage schema",
-            );
-        }
-        if let Some(error) = classification_error {
-            if let Some(progress) = progress {
-                progress.stage(
-                    SessionMigrationStage::ReadingCanonicalHistory,
-                    "Canonical source history requires repair",
-                );
-            }
-            return Err(error.into());
-        }
-        tracing::info!(
-            target: "bcode_session::migration",
-            %session_id,
-            backup_path = %backup_path.display(),
-            "verified pre-migration session backup"
-        );
-        let db_progress = progress.map(|progress| {
-            let progress = progress.clone();
-            Arc::new(move |update| progress.operation.publish_progress(update))
-                as db::SessionMigrationProgressCallback
-        });
-        let migrated = db::SessionDb::migrate_turso_in_root_observed_with_operation(
-            session_id,
-            root,
-            maintenance,
-            write,
-            self.metrics.clone(),
-            db_progress,
-            Some(operation_id),
-        )
-        .await
-        .inspect_err(|error| {
-            self.metrics
-                .increment_counter("session.manager.storage_migration.failed_total");
-            tracing::warn!(
-                target: "bcode_session::migration",
-                %session_id,
-                %error,
-                "automatic legacy session migration failed"
-            );
-        })?;
-        let readiness_timer = self.metrics.timer();
-        if let Some(progress) = progress {
-            progress.stage(
-                SessionMigrationStage::ValidatingWriteReadiness,
-                "Validating session write readiness",
-            );
-        }
-        migrated.validate_write_readiness().await?;
-        self.metrics.record_histogram(
-            "session.migration.write_readiness_duration_ms",
-            readiness_timer.elapsed_ms(),
-        );
-        drop(migrated);
-        self.metrics
-            .increment_counter("session.manager.storage_migration.completed_total");
-        self.metrics.record_histogram(
-            "session.manager.storage_migration.duration_ms",
-            started.elapsed_ms(),
-        );
-        tracing::info!(
-            target: "bcode_session::migration",
-            %session_id,
-            writer_epoch,
-            target_writer_epoch = db::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
-            duration_ms = started.elapsed_ms(),
-            "automatic legacy session migration completed"
-        );
-        Ok(())
-    }
-
     async fn acquire_missing_session_lease(
         &self,
         session_id: SessionId,
         store: &SessionStoreExecutor,
-        progress: Option<&MigrationProgressReporter>,
+        progress: Option<&migration_execution::MigrationExecutionProgress>,
     ) -> Result<bool, SessionError> {
         if self.inner.lock().await.leases.contains_key(&session_id) {
             return Ok(false);
@@ -2074,7 +1830,7 @@ impl SessionManager {
         session_id: SessionId,
         store: &SessionStoreExecutor,
         total_timer: bcode_metrics::MetricsTimer,
-        progress: Option<&MigrationProgressReporter>,
+        progress: Option<&migration_execution::MigrationExecutionProgress>,
     ) -> Result<(), SessionError> {
         let load_timer = self.metrics.timer();
         let lease_timer = self.metrics.timer();
