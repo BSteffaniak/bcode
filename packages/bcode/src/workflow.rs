@@ -8,15 +8,15 @@ use crate::{
     StructuredOutputOptions,
 };
 pub use bcode_workflow::{
-    AbortTaskOnDrop, ArtifactReference, EdgeDefinition, EdgeKind, Field, NodeDefinition, NodeKind,
-    NodeRunState, ParallelFailurePolicy, Predicate, PredicateExpression, ResourceAccess,
-    ResourceClaim, RetryPolicy, Step, StepContext, ValueSchema, Workflow, WorkflowApprovalResolver,
-    WorkflowBuilder, WorkflowCancellation, WorkflowDefinition, WorkflowDefinitionIdentity,
-    WorkflowError, WorkflowEvent, WorkflowEventReceiver, WorkflowEventSender, WorkflowGrantScope,
-    WorkflowOutcome, WorkflowPlan, WorkflowPolicyGrant, WorkflowPolicyPreflight,
-    WorkflowPolicyRequest, WorkflowRunObserver, WorkflowRunSnapshot, WorkflowSpec,
-    WorkflowToolCapability, authorize_workflow_policy, fan_out, field, parallel, parallel_named,
-    parallel_named_with_policy, preflight_workflow_policy, workflow_event_channel,
+    AbortTaskOnDrop, AgentExecutionTarget, ArtifactReference, EdgeDefinition, EdgeKind, Field,
+    NodeDefinition, NodeKind, NodeRunState, ParallelFailurePolicy, Predicate, PredicateExpression,
+    ResourceAccess, ResourceClaim, RetryPolicy, Step, StepContext, ValueSchema, Workflow,
+    WorkflowApprovalResolver, WorkflowBuilder, WorkflowCancellation, WorkflowDefinition,
+    WorkflowDefinitionIdentity, WorkflowError, WorkflowEvent, WorkflowEventReceiver,
+    WorkflowEventSender, WorkflowGrantScope, WorkflowOutcome, WorkflowPlan, WorkflowPolicyGrant,
+    WorkflowPolicyPreflight, WorkflowPolicyRequest, WorkflowRunObserver, WorkflowRunSnapshot,
+    WorkflowSpec, WorkflowToolCapability, authorize_workflow_policy, fan_out, field, parallel,
+    parallel_named, parallel_named_with_policy, preflight_workflow_policy, workflow_event_channel,
 };
 use schemars::JsonSchema;
 use serde::{Serialize, de::DeserializeOwned};
@@ -52,6 +52,7 @@ pub struct AgentStep<I, O> {
     agent_profile_configured: bool,
     tool_restriction: Option<Vec<String>>,
     read_only_tools: bool,
+    execution_target: AgentExecutionTarget,
     resources: Vec<ResourceClaim>,
     timeout: Option<Duration>,
     _types: PhantomData<fn(I) -> O>,
@@ -111,6 +112,7 @@ where
             agent_profile_configured: false,
             tool_restriction: None,
             read_only_tools: false,
+            execution_target: AgentExecutionTarget::FreshIsolated,
             resources: Vec::new(),
             timeout: None,
             _types: PhantomData,
@@ -186,6 +188,13 @@ where
     #[must_use]
     pub fn resources(mut self, claims: impl IntoIterator<Item = ResourceClaim>) -> Self {
         self.resources = claims.into_iter().collect();
+        self
+    }
+
+    /// Execute this agent sequentially in the workflow run's parent session.
+    #[must_use]
+    pub const fn shared_parent_sequential(mut self) -> Self {
+        self.execution_target = AgentExecutionTarget::SharedParentSequential;
         self
     }
 
@@ -274,6 +283,7 @@ where
         let agent_profile_configured = self.agent_profile_configured;
         let tool_restriction = self.tool_restriction;
         let read_only_tools = self.read_only_tools;
+        let execution_target = self.execution_target;
         let resources = self.resources;
         let timeout = self.timeout;
         let agent = {
@@ -297,6 +307,7 @@ where
             "max_repairs": max_repairs,
             "tools": tool_restriction,
             "read_only": read_only_tools,
+            "execution_target": execution_target,
             "timeout_ms": timeout.map(|value| u64::try_from(value.as_millis()).unwrap_or(u64::MAX)),
         });
         let step_name = name.clone();

@@ -379,6 +379,7 @@ struct LoopSurface {
     limit: TextInputState,
     field: Field,
     pending_workflow_start: Option<PluginWorkflowStartRequest>,
+    failed_workflow_start: Option<PluginWorkflowStartRequest>,
     pending_workflow_lookup: bool,
     active_workflow: Option<bcode_plugin_sdk::tui::PluginWorkflowSummary>,
     status: String,
@@ -396,6 +397,7 @@ impl LoopSurface {
             limit: text_state(&DEFAULT_MAX_ITERATIONS.to_string()),
             field: Field::Prompt,
             pending_workflow_start: None,
+            failed_workflow_start: None,
             pending_workflow_lookup: false,
             active_workflow: None,
             status: "checking for an active loop…".to_owned(),
@@ -432,6 +434,15 @@ impl LoopSurface {
     }
 
     fn start(&mut self) -> PluginTuiAction {
+        if self.pending_workflow_start.is_some() {
+            "a durable loop start is already in progress".clone_into(&mut self.status);
+            return PluginTuiAction::Redraw;
+        }
+        if let Some(request) = self.failed_workflow_start.take() {
+            self.pending_workflow_start = Some(request);
+            "retrying durable loop workflow start".clone_into(&mut self.status);
+            return PluginTuiAction::Redraw;
+        }
         let Some(session_id) = self.session_id else {
             "an active persisted session is required".clone_into(&mut self.status);
             return PluginTuiAction::Redraw;
@@ -642,8 +653,10 @@ impl PluginTuiSurface for LoopSurface {
                     })),
                 },
                 Err(error) => {
-                    self.pending_workflow_start = Some(request);
-                    self.status = format!("failed to start durable loop workflow: {error}");
+                    self.failed_workflow_start = Some(request);
+                    self.status = format!(
+                        "failed to start durable loop workflow: {error}; submit again to retry"
+                    );
                     PluginTuiAction::Redraw
                 }
             }
@@ -789,7 +802,7 @@ fn loop_workflow_spec(
         serde_json::json!({
             "agent_id": null,
             "agent_profile_configured": false,
-            "system_prompt": "Implement the requested work. Preserve the workflow envelope fields, increment iteration, set condition_met false, and provide no evaluation evidence.",
+            "system_prompt": "Implement the requested work. Preserve the workflow envelope fields including iteration, set condition_met false, and provide no evaluation evidence.",
             "prompt_mode": "json_input",
             "read_only": false,
             "tools": null,
@@ -811,11 +824,17 @@ fn loop_workflow_spec(
         }),
         |state: LoopWorkflowIteration, _context| async move { Ok(state) },
     );
-    let cycle = implementation.then(evaluation).repeat_while(
-        "loop.repeat",
-        bcode_workflow::field::<LoopWorkflowIteration>("condition_met").eq(false),
-        input.max_iterations,
-    );
+    let cycle =
+        implementation
+            .agent_execution_target(bcode_workflow::AgentExecutionTarget::SharedParentSequential)
+            .then(evaluation.agent_execution_target(
+                bcode_workflow::AgentExecutionTarget::SharedParentSequential,
+            ))
+            .repeat_while(
+                "loop.repeat",
+                bcode_workflow::field::<LoopWorkflowIteration>("condition_met").eq(false),
+                input.max_iterations,
+            );
     let workflow = bcode_workflow::WorkflowBuilder::new(WORKFLOW_KIND, cycle)
         .build()
         .map_err(|error| error.to_string())?;
@@ -893,6 +912,37 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct FailingHost {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl PluginTuiHost for FailingHost {
+        fn spawn(&self, _task: bcode_plugin_sdk::tui::PluginTask) {}
+        fn spawn_blocking(&self, _task: Box<dyn FnOnce() + Send + 'static>) {}
+        fn request_redraw(&self) {}
+
+        fn associated_workflow(
+            &self,
+            _lookup: bcode_plugin_sdk::tui::PluginWorkflowLookup,
+        ) -> bcode_plugin_sdk::tui::PluginWorkflowLookupFuture {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn start_workflow(
+            &self,
+            _request: PluginWorkflowStartRequest,
+        ) -> bcode_plugin_sdk::tui::PluginWorkflowStartFuture {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Err(bcode_plugin_sdk::tui::PluginTuiHostError::Internal(
+                    "rejected".to_string(),
+                ))
+            })
+        }
+    }
+
     #[test]
     fn commands_cover_the_loop_lifecycle() {
         let commands = commands();
@@ -910,6 +960,52 @@ mod tests {
         let spec = loop_workflow_spec(&input).expect("spec");
         let definition = spec.definition();
         assert_eq!(
+            definition.nodes["loop.implementation"].configuration["execution_target"],
+            "shared_parent_sequential"
+        );
+        assert_eq!(
+            definition.nodes["loop.evaluation"].configuration["execution_target"],
+            "shared_parent_sequential"
+        );
+        assert_ne!(
+            spec.identity().definition_id,
+            bcode_workflow::WorkflowSpec::new(
+                WORKFLOW_KIND,
+                &bcode_workflow::WorkflowBuilder::new(
+                    WORKFLOW_KIND,
+                    bcode_workflow::Step::configured_task(
+                        "loop.implementation",
+                        bcode_workflow::NodeKind::Agent,
+                        serde_json::json!({
+                            "prompt_mode": "json_input",
+                            "read_only": false,
+                        }),
+                        |state: LoopWorkflowIteration, _context| async move { Ok(state) },
+                    )
+                    .then(bcode_workflow::Step::configured_task(
+                        "loop.evaluation",
+                        bcode_workflow::NodeKind::Agent,
+                        serde_json::json!({
+                            "prompt_mode": "json_input",
+                            "read_only": true,
+                        }),
+                        |state: LoopWorkflowIteration, _context| async move { Ok(state) },
+                    ))
+                    .repeat_while(
+                        "loop.repeat",
+                        bcode_workflow::field::<LoopWorkflowIteration>("condition_met").eq(false),
+                        input.max_iterations,
+                    ),
+                )
+                .build()
+                .expect("isolated workflow"),
+            )
+            .expect("isolated spec")
+            .identity()
+            .definition_id,
+            "execution target must participate in exact definition identity"
+        );
+        assert_eq!(
             definition.nodes["loop.implementation"].kind,
             bcode_workflow::NodeKind::Agent
         );
@@ -922,8 +1018,16 @@ mod tests {
             bcode_workflow::NodeKind::Repeat
         );
         assert_eq!(
+            definition.nodes["loop.implementation"].configuration["read_only"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
             definition.nodes["loop.evaluation"].configuration["read_only"],
             serde_json::json!(true)
+        );
+        assert!(
+            definition.nodes["loop.implementation"].configuration["tools"].is_null(),
+            "implementation keeps the current session's unrestricted tool policy"
         );
         assert!(definition.edges.iter().any(|edge| matches!(
             edge.kind,
@@ -962,6 +1066,51 @@ mod tests {
         assert_eq!(request.input["implementation_prompt"], "implement");
         assert_eq!(request.input["max_iterations"], 2);
         assert_eq!(request.binding.scope_key, session_id.to_string());
+    }
+
+    #[tokio::test]
+    async fn failed_start_waits_for_explicit_retry() {
+        let session_id = SessionId::new();
+        let host = FailingHost::default();
+        let mut surface = LoopSurface::new(Some(session_id));
+        surface.prompt = text_state("implement");
+        surface.condition = text_state("done");
+        surface.limit = text_state("2");
+        assert!(matches!(
+            surface.drain_effects(&host).await,
+            PluginTuiAction::Redraw
+        ));
+        assert_eq!(surface.start(), PluginTuiAction::Redraw);
+        assert!(matches!(
+            surface.drain_effects(&host).await,
+            PluginTuiAction::Redraw
+        ));
+        assert_eq!(host.attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(surface.pending_workflow_start.is_none());
+        assert!(surface.failed_workflow_start.is_some());
+        assert!(
+            surface
+                .status
+                .contains("failed to start durable loop workflow")
+        );
+        assert_eq!(surface.drain_effects(&host).await, PluginTuiAction::None);
+        assert_eq!(
+            host.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "failed starts must not retry automatically"
+        );
+        assert_eq!(surface.start(), PluginTuiAction::Redraw);
+        assert!(surface.failed_workflow_start.is_none());
+        assert!(surface.pending_workflow_start.is_some());
+        assert!(matches!(
+            surface.drain_effects(&host).await,
+            PluginTuiAction::Redraw
+        ));
+        assert_eq!(
+            host.attempts.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "explicit retry should reuse the failed request"
+        );
     }
 
     #[test]

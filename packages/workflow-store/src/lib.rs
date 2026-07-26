@@ -2789,8 +2789,9 @@ impl WorkflowStore {
                     "workflow repeat configuration is missing max_iterations".to_string(),
                 )
             })?;
-        let should_repeat = evaluate_predicate(&predicate, input)?
-            && activation.dependency_generation.saturating_add(1) < max_iterations;
+        let should_repeat = evaluate_predicate(&predicate, input)?;
+        let within_iteration_bound =
+            activation.dependency_generation.saturating_add(1) < max_iterations;
         transaction.execute(
             "UPDATE workflow_activations SET status = 'completed', output_id = ?4 \
              WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND status = 'pending'",
@@ -2819,7 +2820,7 @@ impl WorkflowStore {
             ),
         )?;
         let mut activated = Vec::new();
-        if should_repeat {
+        if should_repeat && within_iteration_bound {
             let next_generation = activation.dependency_generation.saturating_add(1);
             for edge in definition.edges.iter().filter(|edge| {
                 edge.from == activation.node_id
@@ -2850,6 +2851,24 @@ impl WorkflowStore {
                 )?;
                 activated.push(next);
             }
+        } else if should_repeat {
+            transaction.execute(
+                "UPDATE workflow_runs SET status = 'failed', updated_at_ms = ?2 \
+                 WHERE run_id = ?1 AND status = 'running'",
+                (&activation.run_id, settled_at_ms),
+            )?;
+            append_event(
+                &transaction,
+                &activation.run_id,
+                "run_failed",
+                &serde_json::json!({
+                    "node_id": activation.node_id,
+                    "reason": "repeat_iteration_limit_exhausted",
+                    "max_iterations": max_iterations,
+                })
+                .to_string(),
+                settled_at_ms,
+            )?;
         } else {
             transaction.execute(
                 "UPDATE workflow_runs SET status = 'completed', updated_at_ms = ?2 \
@@ -2871,7 +2890,8 @@ impl WorkflowStore {
             &serde_json::json!({
                 "node_id": activation.node_id,
                 "activation_id": activation.activation_id,
-                "repeat": should_repeat,
+                "repeat": should_repeat && within_iteration_bound,
+                "iteration_bound_exhausted": should_repeat && !within_iteration_bound,
             })
             .to_string(),
             settled_at_ms,
@@ -5955,7 +5975,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_repeat_control_settlement_advances_generation_then_completes() {
+    fn durable_repeat_control_settlement_advances_generation_then_fails_at_bound() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
         let definition = repeat_definition();
@@ -6027,7 +6047,15 @@ mod tests {
                 .expect("run")
                 .expect("run")
                 .status,
-            RunStatus::Completed
+            RunStatus::Failed
+        );
+        assert!(
+            store
+                .event_history("repeat-run", None, 20)
+                .expect("events")
+                .iter()
+                .any(|event| event.event_type == "run_failed"
+                    && event.payload["reason"] == "repeat_iteration_limit_exhausted")
         );
     }
 

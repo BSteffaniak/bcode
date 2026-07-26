@@ -64,6 +64,22 @@ impl TuiInput {
     }
 }
 
+#[cfg(test)]
+impl TuiInput {
+    pub(crate) fn from_events(events: Vec<Event>) -> Self {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        for event in events {
+            sender.send(Ok(Some(event))).expect("test input receiver");
+        }
+        drop(sender);
+        Self {
+            receiver,
+            shutdown: Arc::new(AtomicBool::new(false)),
+            thread: None,
+        }
+    }
+}
+
 impl Drop for TuiInput {
     fn drop(&mut self) {
         self.request_shutdown();

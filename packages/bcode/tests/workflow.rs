@@ -169,6 +169,56 @@ async fn agent_step_requests_and_validates_structured_output() {
             .configuration["system_prompt"],
         "Review without modifying the repository"
     );
+    assert_eq!(
+        workflow
+            .definition()
+            .node("review")
+            .expect("agent node")
+            .configuration["execution_target"],
+        "fresh_isolated"
+    );
+}
+
+#[test]
+fn shared_parent_agent_target_is_explicit_and_changes_definition_identity() {
+    let isolated = WorkflowBuilder::new(
+        "targeted-agent",
+        agent::<ReviewTask, Review, _, _>("review", || bcode::testing::ScriptedProvider::new([]))
+            .build(),
+    )
+    .build()
+    .expect("isolated workflow");
+    let shared = WorkflowBuilder::new(
+        "targeted-agent",
+        agent::<ReviewTask, Review, _, _>("review", || bcode::testing::ScriptedProvider::new([]))
+            .shared_parent_sequential()
+            .build(),
+    )
+    .build()
+    .expect("shared workflow");
+
+    assert_eq!(
+        shared
+            .definition()
+            .node("review")
+            .expect("agent node")
+            .configuration["execution_target"],
+        "shared_parent_sequential"
+    );
+    assert_ne!(
+        bcode_workflow::WorkflowDefinitionIdentity::from_definition(
+            "targeted-agent",
+            isolated.definition()
+        )
+        .expect("isolated identity")
+        .definition_id,
+        bcode_workflow::WorkflowDefinitionIdentity::from_definition(
+            "targeted-agent",
+            shared.definition()
+        )
+        .expect("shared identity")
+        .definition_id
+    );
 }
 
 #[tokio::test]

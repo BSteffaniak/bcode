@@ -48,6 +48,32 @@ impl BcodePluginTuiHost {
     }
 }
 
+fn workflow_start_request(
+    request: PluginWorkflowStartRequest,
+) -> Result<bcode_ipc::WorkflowStartRequest, PluginTuiHostError> {
+    let parent_scope = request.parent_session_id.to_string();
+    if request.binding.scope_key != parent_scope {
+        return Err(PluginTuiHostError::InvalidRequest(
+            "workflow binding scope must match the active parent session".to_string(),
+        ));
+    }
+    Ok(bcode_ipc::WorkflowStartRequest {
+        identity: request.identity,
+        definition: request.definition,
+        run_id: request.run_id,
+        parent_session_id: request.parent_session_id,
+        input: request.input,
+        binding: bcode_workflow_store::WorkflowRunBinding {
+            owner_plugin_id: request.binding.owner_plugin_id,
+            workflow_kind: request.binding.workflow_kind,
+            scope_key: request.binding.scope_key,
+            display_label: request.binding.display_label,
+            single_active: request.binding.single_active,
+        },
+        limits: bcode_workflow_store::WorkflowRunLimits::default(),
+    })
+}
+
 impl PluginTuiHost for BcodePluginTuiHost {
     fn spawn(&self, task: PluginTask) {
         let redraw_sender = self.redraw_sender.clone();
@@ -80,28 +106,8 @@ impl PluginTuiHost for BcodePluginTuiHost {
     fn start_workflow(&self, request: PluginWorkflowStartRequest) -> PluginWorkflowStartFuture {
         let client = self.client.clone();
         Box::pin(async move {
-            let parent_scope = request.parent_session_id.to_string();
-            if request.binding.scope_key != parent_scope {
-                return Err(PluginTuiHostError::InvalidRequest(
-                    "workflow binding scope must match the active parent session".to_string(),
-                ));
-            }
             let started = client
-                .start_workflow(bcode_ipc::WorkflowStartRequest {
-                    identity: request.identity,
-                    definition: request.definition,
-                    run_id: request.run_id,
-                    parent_session_id: request.parent_session_id,
-                    input: request.input,
-                    binding: bcode_workflow_store::WorkflowRunBinding {
-                        owner_plugin_id: request.binding.owner_plugin_id,
-                        workflow_kind: request.binding.workflow_kind,
-                        scope_key: request.binding.scope_key,
-                        display_label: request.binding.display_label,
-                        single_active: request.binding.single_active,
-                    },
-                    limits: bcode_workflow_store::WorkflowRunLimits::default(),
-                })
+                .start_workflow(workflow_start_request(request)?)
                 .await
                 .map_err(|error| PluginTuiHostError::Internal(error.to_string()))?;
             Ok(PluginWorkflowStartResponse {
@@ -461,14 +467,26 @@ pub async fn run_plugin_surface_with_input_and_client<W: Write>(
     let mut should_exit = false;
 
     while !should_exit {
-        if helpers::resize_from_terminal(terminal)? {
+        if !cfg!(test) && helpers::resize_from_terminal(terminal)? {
             needs_redraw = true;
         }
-        if surface.poll(&host).requests_redraw() {
-            needs_redraw = true;
+        apply_plugin_surface_action(
+            surface.poll(&host),
+            &mut needs_redraw,
+            &mut close_outcome,
+            &mut should_exit,
+        );
+        if should_exit {
+            continue;
         }
-        if surface.drain_effects(&host).await.requests_redraw() {
-            needs_redraw = true;
+        apply_plugin_surface_action(
+            surface.drain_effects(&host).await,
+            &mut needs_redraw,
+            &mut close_outcome,
+            &mut should_exit,
+        );
+        if should_exit {
+            continue;
         }
         if needs_redraw {
             terminal.draw(|frame| {
@@ -486,21 +504,12 @@ pub async fn run_plugin_surface_with_input_and_client<W: Write>(
                 if handle_host_event(terminal, &event) {
                     needs_redraw = true;
                 }
-                match surface.handle_event(&event, &host) {
-                    PluginTuiAction::None => {}
-                    PluginTuiAction::Redraw => needs_redraw = true,
-                    PluginTuiAction::Close { outcome } => {
-                        close_outcome = outcome;
-                        should_exit = true;
-                    }
-                    PluginTuiAction::OpenSurface { .. } => {
-                        needs_redraw = true;
-                    }
-                    PluginTuiAction::RunCommand { command } => {
-                        close_outcome = Some(serde_json::json!({ "run_command": command }));
-                        should_exit = true;
-                    }
-                }
+                apply_plugin_surface_action(
+                    surface.handle_event(&event, &host),
+                    &mut needs_redraw,
+                    &mut close_outcome,
+                    &mut should_exit,
+                );
             }
             redraw = redraw_receiver.recv() => {
                 if redraw.is_some() {
@@ -513,6 +522,26 @@ pub async fn run_plugin_surface_with_input_and_client<W: Write>(
     Ok(close_outcome)
 }
 
+fn apply_plugin_surface_action(
+    action: PluginTuiAction,
+    needs_redraw: &mut bool,
+    close_outcome: &mut Option<serde_json::Value>,
+    should_exit: &mut bool,
+) {
+    match action {
+        PluginTuiAction::None => {}
+        PluginTuiAction::Redraw | PluginTuiAction::OpenSurface { .. } => *needs_redraw = true,
+        PluginTuiAction::Close { outcome } => {
+            *close_outcome = outcome;
+            *should_exit = true;
+        }
+        PluginTuiAction::RunCommand { command } => {
+            *close_outcome = Some(serde_json::json!({ "run_command": command }));
+            *should_exit = true;
+        }
+    }
+}
+
 fn handle_host_event<W: Write>(terminal: &mut Terminal<&mut W>, event: &Event) -> bool {
     match event {
         Event::Resize(size) => {
@@ -521,5 +550,232 @@ fn handle_host_event<W: Write>(terminal: &mut Terminal<&mut W>, event: &Event) -
         }
         Event::Focus(FocusEvent::Gained | FocusEvent::Lost) | Event::Tick => true,
         Event::Key(_) | Event::Mouse(_) | Event::Paste(_) | Event::User(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_plugin_surface_action, workflow_start_request};
+    use bcode_plugin_sdk::tui::{
+        PluginTuiAction, PluginWorkflowBinding, PluginWorkflowStartRequest,
+    };
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn loop_surface_closes_after_live_host_and_daemon_admit_workflow() {
+        use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
+        use bmux_tui::event::Event;
+        use bmux_tui::geometry::Rect;
+        use bmux_tui::terminal::Terminal;
+
+        let socket_dir = tempfile::tempdir().expect("socket dir");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let server_endpoint = endpoint.clone();
+        let plugin = bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/loop-plugin/bcode-plugin.toml"),
+            bcode_loop_plugin::static_plugin(),
+        );
+        let mut server = tokio::spawn(async move {
+            loop {
+                match bcode_server::run_embedded_with_static_bundled(
+                    server_endpoint.clone(),
+                    std::slice::from_ref(&plugin),
+                )
+                .await
+                {
+                    Err(bcode_server::ServerError::Config(_)) => {
+                        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    }
+                    result => break result,
+                }
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint.clone());
+        let ready = async {
+            loop {
+                if client.server_status().await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        };
+        tokio::select! {
+            result = &mut server => panic!("server exited before ready: {result:?}"),
+            result = tokio::time::timeout(std::time::Duration::from_secs(10), ready) => {
+                result.expect("server ready");
+            }
+        }
+        let session = client
+            .create_session_in_working_directory(
+                Some("surface loop".to_string()),
+                std::env::current_dir().expect("cwd"),
+            )
+            .await
+            .expect("session");
+        let mut surface = bcode_loop_plugin::tui_registry()
+            .open(
+                "loop.start",
+                bcode_plugin_sdk::tui::PluginTuiSurfaceOpenRequest {
+                    instance_id: "loop-start".to_string(),
+                    repo_path: None,
+                    target: None,
+                    options: serde_json::json!({"session_id": session.id}),
+                },
+            )
+            .await
+            .expect("surface");
+        let key = |key| {
+            Event::Key(KeyStroke {
+                key,
+                modifiers: Modifiers::NONE,
+            })
+        };
+        let mut events = "implement"
+            .chars()
+            .map(|ch| key(KeyCode::Char(ch)))
+            .collect::<Vec<_>>();
+        events.push(key(KeyCode::Tab));
+        events.extend("done".chars().map(|ch| key(KeyCode::Char(ch))));
+        events.push(key(KeyCode::Tab));
+        events.push(key(KeyCode::Enter));
+        let mut input = crate::terminal_events::TuiInput::from_events(events);
+        let mut output = Vec::new();
+        let mut terminal = Terminal::new(&mut output, Rect::new(0, 0, 100, 30));
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            super::run_plugin_surface_with_input_and_client(
+                &mut terminal,
+                &mut input,
+                surface.as_mut(),
+                client.clone(),
+            ),
+        )
+        .await
+        .expect("surface close timeout")
+        .expect("surface host");
+        assert!(
+            outcome
+                .as_ref()
+                .and_then(|value| value["run_id"].as_str())
+                .is_some()
+        );
+        assert!(
+            client
+                .associated_workflow_run(bcode_ipc::WorkflowRunBindingLookup {
+                    owner_plugin_id: "bcode.loop".to_string(),
+                    workflow_kind: "bcode.loop".to_string(),
+                    scope_key: session.id.to_string(),
+                })
+                .await
+                .expect("associated run")
+                .is_some()
+        );
+        client.server_stop().await.expect("stop server");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+    }
+
+    #[test]
+    fn loop_surface_request_crosses_real_host_start_boundary() {
+        let session_id = bcode_session_models::SessionId::new();
+        let definition = bcode_workflow::WorkflowBuilder::new(
+            "surface-loop",
+            bcode_workflow::Step::map("step", |value: bool| Ok(value)),
+        )
+        .build()
+        .expect("workflow");
+        let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+            "bcode.loop",
+            definition.definition(),
+        )
+        .expect("identity");
+        let request = PluginWorkflowStartRequest {
+            identity: identity.clone(),
+            definition: definition.definition().clone(),
+            run_id: Some("surface-loop-run".to_string()),
+            parent_session_id: session_id,
+            input: serde_json::json!(true),
+            binding: PluginWorkflowBinding {
+                owner_plugin_id: "bcode.loop".to_string(),
+                workflow_kind: "bcode.loop".to_string(),
+                scope_key: session_id.to_string(),
+                display_label: Some("Loop".to_string()),
+                single_active: true,
+            },
+        };
+        let ipc = workflow_start_request(request).expect("host request");
+        assert_eq!(ipc.identity, identity);
+        assert_eq!(ipc.parent_session_id, session_id);
+        assert_eq!(ipc.binding.owner_plugin_id, "bcode.loop");
+        assert_eq!(ipc.binding.scope_key, session_id.to_string());
+
+        let expected = serde_json::json!({"run_id": "surface-loop-run"});
+        let mut needs_redraw = false;
+        let mut outcome = None;
+        let mut should_exit = false;
+        apply_plugin_surface_action(
+            PluginTuiAction::Close {
+                outcome: Some(expected.clone()),
+            },
+            &mut needs_redraw,
+            &mut outcome,
+            &mut should_exit,
+        );
+        assert!(should_exit);
+        assert_eq!(outcome, Some(expected));
+    }
+
+    #[test]
+    fn asynchronous_surface_close_is_not_reduced_to_redraw() {
+        let expected = serde_json::json!({"status": "started"});
+        let mut needs_redraw = false;
+        let mut outcome = None;
+        let mut should_exit = false;
+
+        apply_plugin_surface_action(
+            PluginTuiAction::Close {
+                outcome: Some(expected.clone()),
+            },
+            &mut needs_redraw,
+            &mut outcome,
+            &mut should_exit,
+        );
+
+        assert!(should_exit);
+        assert_eq!(outcome, Some(expected));
+        assert!(!needs_redraw);
+    }
+
+    #[test]
+    fn asynchronous_surface_actions_share_host_semantics() {
+        let mut needs_redraw = false;
+        let mut outcome = None;
+        let mut should_exit = false;
+        apply_plugin_surface_action(
+            PluginTuiAction::OpenSurface {
+                surface_id: "next".to_string(),
+            },
+            &mut needs_redraw,
+            &mut outcome,
+            &mut should_exit,
+        );
+        assert!(needs_redraw);
+        assert!(!should_exit);
+
+        needs_redraw = false;
+        apply_plugin_surface_action(
+            PluginTuiAction::RunCommand {
+                command: "/loop status".to_string(),
+            },
+            &mut needs_redraw,
+            &mut outcome,
+            &mut should_exit,
+        );
+        assert!(should_exit);
+        assert_eq!(
+            outcome,
+            Some(serde_json::json!({"run_command": "/loop status"}))
+        );
+        assert!(!needs_redraw);
     }
 }

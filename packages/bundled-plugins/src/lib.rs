@@ -143,7 +143,7 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     #[cfg(feature = "static-bundled-question-plugin")]
     plugins.push(question_plugin());
     #[cfg(feature = "static-bundled-loop-plugin")]
-    plugins.push(loop_plugin());
+    plugins.push(static_loop_plugin());
     #[cfg(feature = "static-bundled-ralph-plugin")]
     plugins.push(ralph_plugin());
     #[cfg(feature = "static-bundled-read-plugin")]
@@ -299,7 +299,7 @@ fn question_plugin() -> bcode_plugin::StaticBundledPlugin {
 }
 
 #[cfg(feature = "static-bundled-loop-plugin")]
-fn loop_plugin() -> bcode_plugin::StaticBundledPlugin {
+pub fn static_loop_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/loop-plugin/bcode-plugin.toml"),
         bcode_loop_plugin::static_plugin(),

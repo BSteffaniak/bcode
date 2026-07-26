@@ -37,6 +37,7 @@ bcode_skill_models        = { workspace = true }
 bcode_syntax_render       = { workspace = true }
 bcode_tool                = { workspace = true }
 bcode_tui_components      = { workspace = true }
+bcode_workflow            = { workspace = true }
 bcode_workflow_store      = { workspace = true }
 bcode_worktree_models     = { workspace = true }
 bmux_keyboard             = { workspace = true }
@@ -62,6 +63,7 @@ uuid                      = { workspace = true, features = ["v4"] }
 [dev-dependencies]
 bcode_filesystem_plugin = { workspace = true, features = ["static-bundled"] }
 bcode_git_plugin        = { workspace = true, features = ["static-bundled"] }
+bcode_loop_plugin       = { workspace = true, features = ["static-bundled"] }
 bcode_question_plugin   = { workspace = true, features = ["static-bundled"] }
 bcode_shell_plugin      = { workspace = true, features = ["static-bundled"] }
 bcode_vim_edit_plugin   = { workspace = true, features = ["static-bundled"] }

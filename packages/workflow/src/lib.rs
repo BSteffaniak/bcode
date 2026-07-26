@@ -1368,6 +1368,17 @@ impl ResourceClaim {
     }
 }
 
+/// Execution target for a daemon-hosted workflow agent node.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentExecutionTarget {
+    /// Execute in a fresh isolated child session.
+    #[default]
+    FreshIsolated,
+    /// Execute sequentially in the workflow run's parent session.
+    SharedParentSequential,
+}
+
 /// Serializable description of one workflow node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeDefinition {
@@ -1849,6 +1860,39 @@ where
             leaf_node_id: Some(id),
             _types: PhantomData,
         }
+    }
+
+    /// Select where a daemon-hosted agent leaf executes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called on a composed flow or a non-agent leaf.
+    #[must_use]
+    pub fn agent_execution_target(mut self, target: AgentExecutionTarget) -> Self {
+        let leaf = self
+            .leaf_node_id
+            .as_ref()
+            .expect("agent execution target can only be set on a leaf step");
+        let node = self
+            .fragment
+            .nodes
+            .iter_mut()
+            .find(|node| &node.id == leaf)
+            .expect("leaf node should be present");
+        assert_eq!(
+            node.kind,
+            NodeKind::Agent,
+            "agent execution target requires an agent node"
+        );
+        let configuration = node
+            .configuration
+            .as_object_mut()
+            .expect("agent node configuration must be an object");
+        configuration.insert(
+            "execution_target".to_string(),
+            serde_json::to_value(target).expect("agent execution target should serialize"),
+        );
+        self
     }
 
     /// Declare resources acquired atomically before this leaf step executes.
@@ -3215,6 +3259,31 @@ fn ensure_acyclic(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    #[should_panic(expected = "agent execution target requires an agent node")]
+    fn agent_execution_target_rejects_non_agent_leaf() {
+        let _ = Step::map("task", |value: u32| Ok(value))
+            .agent_execution_target(AgentExecutionTarget::SharedParentSequential);
+    }
+
+    #[test]
+    fn agent_execution_target_serializes_explicitly() {
+        let step = Step::configured_task(
+            "agent",
+            NodeKind::Agent,
+            serde_json::json!({"prompt_mode": "json_input"}),
+            |value: u32, _context| async move { Ok(value) },
+        )
+        .agent_execution_target(AgentExecutionTarget::SharedParentSequential);
+        let workflow = WorkflowBuilder::new("target", step)
+            .build()
+            .expect("workflow");
+        assert_eq!(
+            workflow.definition().nodes["agent"].configuration["execution_target"],
+            "shared_parent_sequential"
+        );
+    }
 
     #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
     struct Input {

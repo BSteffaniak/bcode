@@ -483,6 +483,9 @@ fn fake_response_text(
     let Some(structured) = request.structured_output.as_ref() else {
         return Ok(format!("fake: {user_text}"));
     };
+    if let Some(value) = configured_fake_structured_output(request, structured, user_text)? {
+        return Ok(value);
+    }
     let validator =
         jsonschema::validator_for(&structured.schema).map_err(|error| ProviderError {
             code: "invalid_structured_output_schema".to_string(),
@@ -534,6 +537,97 @@ fn fake_response_text(
         sources: Box::default(),
         retry: None,
     })
+}
+
+fn fake_structured_output_error(error: &dyn std::fmt::Display) -> ProviderError {
+    ProviderError {
+        code: "invalid_fake_structured_output".to_string(),
+        category: ProviderErrorCategory::InvalidRequest,
+        message: error.to_string(),
+        retryable: false,
+        provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
+        retry: None,
+    }
+}
+
+fn configured_fake_structured_output(
+    request: &ModelTurnRequest,
+    structured: &bcode_model::StructuredOutputRequest,
+    user_text: &str,
+) -> Result<Option<String>, ProviderError> {
+    let Some(configured) = request
+        .provider_context
+        .settings
+        .get("fake_structured_output_json")
+    else {
+        return Ok(None);
+    };
+    let value = if let Some(threshold) = configured.strip_prefix("loop_until:") {
+        let threshold = threshold
+            .parse::<u64>()
+            .map_err(|error| fake_structured_output_error(&error))?;
+        let mut value: serde_json::Value =
+            serde_json::from_str(user_text.rsplit("\n\n").next().unwrap_or(user_text))
+                .map_err(|error| fake_structured_output_error(&error))?;
+        let evaluation = user_text.starts_with("Read-only loop completion evaluation.");
+        let iteration = value
+            .get("iteration")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        if evaluation {
+            value["condition_met"] = serde_json::json!(iteration >= threshold);
+            value["evidence"] = serde_json::json!([format!("evaluated iteration {iteration}")]);
+            value["summary"] = serde_json::json!(format!("iteration {iteration} evaluated"));
+        } else {
+            value["iteration"] = serde_json::json!(iteration);
+            value["condition_met"] = serde_json::json!(false);
+            value["evidence"] = serde_json::json!([]);
+            value["summary"] = serde_json::json!("");
+        }
+        value
+    } else {
+        configured
+            .strip_prefix("echo_input:")
+            .map_or_else(
+                || serde_json::from_str(configured),
+                |_| serde_json::from_str(user_text.rsplit("\n\n").next().unwrap_or(user_text)),
+            )
+            .map_err(|error| fake_structured_output_error(&error))?
+    };
+    let validator =
+        jsonschema::validator_for(&structured.schema).map_err(|error| ProviderError {
+            code: "invalid_structured_output_schema".to_string(),
+            category: ProviderErrorCategory::InvalidRequest,
+            message: error.to_string(),
+            retryable: false,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
+            retry: None,
+        })?;
+    if !validator.is_valid(&value) {
+        return Ok(None);
+    }
+    serde_json::to_string(&value)
+        .map(Some)
+        .map_err(|error| ProviderError {
+            code: "structured_output_encode_failed".to_string(),
+            category: ProviderErrorCategory::ProviderInternal,
+            message: error.to_string(),
+            retryable: false,
+            provider_message: None,
+            failure: None,
+            request_id: None,
+            diagnostic_context: Box::default(),
+            sources: Box::default(),
+            retry: None,
+        })
 }
 
 fn fake_value_for_schema(schema: &serde_json::Value, depth: usize) -> Option<serde_json::Value> {

@@ -507,6 +507,21 @@ if rg -U 'labels\.insert\([\s\S]{0,120}"(tool_call_id|call_id|batch_id|invocatio
   violations=1
 fi
 
+if rg -n 'loop_role|bcode\.loop' packages/server/src/lib.rs \
+  | awk -F: '$1 < 23000 { print; found=1 } END { exit found ? 0 : 1 }' \
+  >/tmp/bcode-loop-workflow-host-special-case.txt; then
+  echo "Runtime architecture violation: generic workflow agent routing contains loop-specific behavior." >&2
+  cat /tmp/bcode-loop-workflow-host-special-case.txt >&2
+  violations=1
+fi
+rm -f /tmp/bcode-loop-workflow-host-special-case.txt
+
+if ! grep -F 'AgentExecutionTarget::SharedParentSequential' plugins/loop-plugin/src/lib.rs >/dev/null \
+  || ! grep -F 'admit_shared_execution_session' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: durable loop lost generic shared-parent execution." >&2
+  violations=1
+fi
+
 if rg -n 'tool_call_policy\.parallel = options\.parallel|tool_call_policy\.parallel = parallel_tool_calls' packages/agent-runtime/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: canonical runtime upgrades negotiated provider parallel capability from scheduler configuration." >&2
   violations=1
