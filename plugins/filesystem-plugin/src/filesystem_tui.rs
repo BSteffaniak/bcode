@@ -689,10 +689,8 @@ mod tests {
 
     #[test]
     fn request_draft_adapter_bounds_huge_string_rendering() {
-        let preview = format!(
-            r#"{{"path":"src/lib.rs","contents":"{}"}}"#,
-            "x".repeat(256 * 1024)
-        );
+        let huge_line = "x".repeat(256 * 1024);
+        let preview = format!(r#"{{"path":"src/lib.rs","contents":"{huge_line}"}}"#);
         let payload = serde_json::json!({
             "preview": preview,
             "argument_bytes": preview.len(),
@@ -721,6 +719,10 @@ mod tests {
         assert!(
             rendered_bytes < 16 * 1024,
             "rendered {rendered_bytes} bytes"
+        );
+        assert!(
+            rows.iter().all(|row| line_text(row).len() < 8 * 1024),
+            "one long source line escaped the per-row bound"
         );
     }
 

@@ -34131,6 +34131,18 @@ library = "test"
             ),
         )
         .await;
+        append_tool_invocation_lifecycle_event(
+            &state,
+            session_id,
+            bcode_session_models::ToolInvocationLifecycleEvent {
+                invocation_id: "call-reconnect".to_owned(),
+                sequence: 1,
+                stage: bcode_session_models::ToolInvocationLifecycleStage::Waiting,
+                message: Some("waiting during reconnect".to_owned()),
+                metadata: serde_json::Value::Null,
+            },
+        )
+        .await;
 
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(2), connection.recv_event())
@@ -34195,6 +34207,12 @@ library = "test"
             panic!("expected current live checkpoint after reconnect");
         };
         replacement.apply_live_event(&reconnect_live);
+        assert!(
+            replacement
+                .snapshot()
+                .active_invocations
+                .contains_key("call-reconnect")
+        );
         assert!(replacement.snapshot().transcript.items.iter().any(|item| {
             matches!(
                 &item.kind,
