@@ -19,6 +19,7 @@ mod attachment;
 mod current_schema;
 pub mod db;
 pub mod lease;
+mod manifest;
 pub mod migration_adapter;
 mod migration_execution;
 pub mod persisted;
@@ -43,7 +44,10 @@ use bcode_session_models::{
     SessionSummary, SessionTitleSource, SessionTokenUsage, SessionTraceEvent, SessionVisibility,
 };
 use lease::{SessionLeaseGuard, SessionLeaseOwnerContext};
-use serde::{Deserialize, Serialize};
+pub use manifest::{
+    CURRENT_SESSION_FORMAT_EPOCH, SESSION_FORMAT_FAMILY, SESSION_MANIFEST_SCHEMA_VERSION,
+};
+use manifest::{SessionFormatMarker, SessionManifest};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::ErrorKind;
@@ -493,26 +497,6 @@ pub struct SessionStore {
     pub(crate) metrics: MetricsRegistry,
     lease_owner: SessionLeaseOwnerContext,
 }
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SessionFormatMarker {
-    family: String,
-    epoch: u32,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct SessionManifest {
-    schema_version: u32,
-    session_format: SessionFormatMarker,
-    summary: SessionSummary,
-}
-
-/// Current bounded session-manifest metadata schema.
-pub const SESSION_MANIFEST_SCHEMA_VERSION: u32 = 2;
-/// Stable family identifier for canonical Bcode session stores.
-pub const SESSION_FORMAT_FAMILY: &str = "bcode.session";
-/// Current canonical session format epoch.
-pub const CURRENT_SESSION_FORMAT_EPOCH: u32 = 2;
 
 impl SessionStore {
     /// Create an event store rooted at the provided directory.
