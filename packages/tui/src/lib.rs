@@ -98,6 +98,7 @@ mod tool_render_projection_tests;
 pub(crate) mod transcript;
 pub(crate) mod transcript_document;
 pub(crate) mod transcript_layout;
+pub(crate) mod transcript_markdown_cache;
 pub(crate) mod transcript_projection;
 pub(crate) mod transcript_resident_window;
 pub(crate) mod transcript_viewport;

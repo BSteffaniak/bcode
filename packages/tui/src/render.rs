@@ -45,9 +45,10 @@ fn plugin_visual_context(
 
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use bcode_markdown_render::render_markdown;
 use bcode_markdown_render::{
-    MarkdownContributionKind, MarkdownDocumentContext, MarkdownRenderOptions, render_markdown,
-    render_markdown_lines,
+    MarkdownContributionKind, MarkdownDocumentContext, MarkdownRenderOptions, render_markdown_lines,
 };
 use bcode_plugin_sdk::tui::PluginTuiVisualRenderMode;
 use bcode_session_view_models::TextFormat;
@@ -164,16 +165,25 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
         return;
     }
 
+    let resident_item_ids = app
+        .transcript()
+        .iter()
+        .map(|item| item.id().get())
+        .collect::<std::collections::BTreeSet<_>>();
+    app.transcript_markdown_cache()
+        .retain_resident(&resident_item_ids);
     let theme = TuiTheme::for_app(app);
     render_header(app, layout.header, frame, theme);
     render_composer(app, layout.composer, frame, theme);
     let focused_regions = transcript_markdown_regions(app, layout.body);
-    let footnote_rows = transcript_markdown_footnote_rows(app, layout.body.width);
-    app.reconcile_markdown_footnote_rows(footnote_rows);
-    let fragment_rows = transcript_markdown_fragment_rows(app, layout.body.width);
-    app.reconcile_markdown_fragments(fragment_rows);
-    let resident_details = transcript_markdown_details_ids(app, layout.body.width);
-    app.reconcile_markdown_details(&resident_details);
+    if app.begin_markdown_semantics_reconciliation(layout.body.width) {
+        let footnote_rows = transcript_markdown_footnote_rows(app, layout.body.width);
+        app.reconcile_markdown_footnote_rows(footnote_rows);
+        let fragment_rows = transcript_markdown_fragment_rows(app, layout.body.width);
+        app.reconcile_markdown_fragments(fragment_rows);
+        let resident_details = transcript_markdown_details_ids(app, layout.body.width);
+        app.reconcile_markdown_details(&resident_details);
+    }
     let mut visible = Vec::new();
     let mut seen_ids = std::collections::BTreeSet::new();
     for region in focused_regions {
@@ -934,7 +944,14 @@ fn markdown_render_options(
             ..MarkdownDocumentContext::default()
         });
     }
-    options.with_details_open(app.markdown_details_open().clone())
+    let document_prefix = format!("transcript:{}:", item.id().get());
+    let details_open = app
+        .markdown_details_open()
+        .iter()
+        .filter(|(id, _)| id.starts_with(&document_prefix))
+        .map(|(id, open)| (id.clone(), *open))
+        .collect();
+    options.with_details_open(details_open)
 }
 
 fn render_transcript(app: &BmuxApp, area: Rect, frame: &mut Frame<'_>) {
@@ -1026,12 +1043,9 @@ fn transcript_markdown_footnote_rows(
         ) else {
             continue;
         };
-        let content_offset = transcript_markdown_content_row_offset(item, width);
-        let rendered = render_markdown(
-            item.text(),
-            &markdown_render_options(app, item, width.saturating_sub(2).max(1)),
-        );
-        for geometry in rendered.geometry {
+        let content_offset = transcript_markdown_content_row_offset(app, item, index, width);
+        let rendered = transcript_markdown_projection(app, item, width);
+        for geometry in &rendered.geometry {
             let is_footnote = rendered.contributions.iter().any(|contribution| {
                 contribution.id == geometry.contribution_id
                     && matches!(
@@ -1042,7 +1056,7 @@ fn transcript_markdown_footnote_rows(
             });
             if is_footnote && let Some(rect) = geometry.rects.first() {
                 rows.insert(
-                    geometry.contribution_id,
+                    geometry.contribution_id.clone(),
                     entry_start
                         .saturating_add(content_offset)
                         .saturating_add(usize::from(rect.y)),
@@ -1068,13 +1082,10 @@ fn transcript_markdown_fragment_rows(
         ) else {
             continue;
         };
-        let content_offset = transcript_markdown_content_row_offset(item, width);
-        let rendered = render_markdown(
-            item.text(),
-            &markdown_render_options(app, item, width.saturating_sub(2).max(1)),
-        );
-        for anchor in rendered.anchors {
-            fragments.entry(anchor.fragment).or_insert_with(|| {
+        let content_offset = transcript_markdown_content_row_offset(app, item, index, width);
+        let rendered = transcript_markdown_projection(app, item, width);
+        for anchor in &rendered.anchors {
+            fragments.entry(anchor.fragment.clone()).or_insert_with(|| {
                 entry_start
                     .saturating_add(content_offset)
                     .saturating_add(usize::from(anchor.row))
@@ -1100,26 +1111,33 @@ fn transcript_markdown_details_ids_for_items(
         .iter()
         .filter(|item| item.text_format() == TextFormat::Markdown)
         .flat_map(|item| {
-            render_markdown(
-                item.text(),
-                &markdown_render_options(app, item, width.saturating_sub(2).max(1)),
-            )
-            .contributions
-            .into_iter()
-            .filter_map(|contribution| {
-                matches!(contribution.kind, MarkdownContributionKind::Details { .. })
-                    .then_some(contribution.id)
-            })
+            transcript_markdown_projection(app, item, width)
+                .contributions
+                .iter()
+                .filter(|contribution| {
+                    matches!(contribution.kind, MarkdownContributionKind::Details { .. })
+                })
+                .map(|contribution| contribution.id.clone())
+                .collect::<Vec<_>>()
         })
         .collect()
+}
+
+fn visible_markdown_entry_indexes(app: &BmuxApp, area: Rect) -> std::collections::BTreeSet<usize> {
+    app.transcript_layout()
+        .visible_transcript_entry_indexes(app.transcript_top_row(area.height), area.height)
 }
 
 /// Collect resident rich Markdown contributions and their current visible geometry.
 #[must_use]
 pub fn transcript_markdown_rich_regions(app: &BmuxApp, area: Rect) -> Vec<MarkdownRichRegion> {
     let top_row = app.transcript_top_row(area.height);
+    let visible_indexes = visible_markdown_entry_indexes(app, area);
     let mut rich = Vec::new();
-    for (index, item) in app.transcript().iter().enumerate() {
+    for index in visible_indexes {
+        let Some(item) = app.transcript().get(index) else {
+            continue;
+        };
         if item.text_format() != TextFormat::Markdown {
             continue;
         }
@@ -1129,12 +1147,9 @@ pub fn transcript_markdown_rich_regions(app: &BmuxApp, area: Rect) -> Vec<Markdo
         ) else {
             continue;
         };
-        let content_offset = transcript_markdown_content_row_offset(item, area.width);
-        let rendered = render_markdown(
-            item.text(),
-            &markdown_render_options(app, item, area.width.saturating_sub(2).max(1)),
-        );
-        for contribution in rendered.contributions {
+        let content_offset = transcript_markdown_content_row_offset(app, item, index, area.width);
+        let rendered = transcript_markdown_projection(app, item, area.width);
+        for contribution in &rendered.contributions {
             if !matches!(
                 contribution.kind,
                 MarkdownContributionKind::Image { .. } | MarkdownContributionKind::Mermaid { .. }
@@ -1163,8 +1178,8 @@ pub fn transcript_markdown_rich_regions(app: &BmuxApp, area: Rect) -> Vec<Markdo
                     })
                 });
             rich.push(MarkdownRichRegion {
-                contribution_id: contribution.id,
-                contribution_kind: contribution.kind,
+                contribution_id: contribution.id.clone(),
+                contribution_kind: contribution.kind.clone(),
                 visible_rect,
             });
         }
@@ -1174,8 +1189,12 @@ pub fn transcript_markdown_rich_regions(app: &BmuxApp, area: Rect) -> Vec<Markdo
 
 fn transcript_markdown_regions(app: &BmuxApp, area: Rect) -> Vec<MarkdownTranscriptRegion> {
     let top_row = app.transcript_top_row(area.height);
+    let visible_indexes = visible_markdown_entry_indexes(app, area);
     let mut regions = Vec::new();
-    for (index, item) in app.transcript().iter().enumerate() {
+    for index in visible_indexes {
+        let Some(item) = app.transcript().get(index) else {
+            continue;
+        };
         if item.text_format() != TextFormat::Markdown {
             continue;
         }
@@ -1185,11 +1204,8 @@ fn transcript_markdown_regions(app: &BmuxApp, area: Rect) -> Vec<MarkdownTranscr
         ) else {
             continue;
         };
-        let content_offset = transcript_markdown_content_row_offset(item, area.width);
-        let rendered = render_markdown(
-            item.text(),
-            &markdown_render_options(app, item, area.width.saturating_sub(2).max(1)),
-        );
+        let content_offset = transcript_markdown_content_row_offset(app, item, index, area.width);
+        let rendered = transcript_markdown_projection(app, item, area.width);
         for geometry in &rendered.geometry {
             let Some(contribution) = rendered
                 .contributions
@@ -1231,19 +1247,32 @@ fn transcript_markdown_regions(app: &BmuxApp, area: Rect) -> Vec<MarkdownTranscr
     regions
 }
 
-fn transcript_markdown_content_row_offset(item: &TranscriptItem, width: u16) -> usize {
-    let rows = transcript_item_rows(
-        std::slice::from_ref(item),
-        0,
-        width,
-        None,
-        TuiDiffViewerConfig::default(),
-    );
-    let rendered = render_markdown_lines(
-        item.text(),
-        MarkdownRenderOptions::new(width.saturating_sub(2).max(1)).with_streaming(item.streaming()),
-    );
-    rows.len().saturating_sub(rendered.len()).saturating_sub(1)
+fn transcript_markdown_projection(
+    app: &BmuxApp,
+    item: &TranscriptItem,
+    width: u16,
+) -> std::sync::Arc<bcode_markdown_render::MarkdownRenderResult> {
+    app.transcript_markdown_cache().project(
+        item,
+        markdown_render_options(app, item, width.saturating_sub(2).max(1)),
+    )
+}
+
+fn transcript_markdown_content_row_offset(
+    app: &BmuxApp,
+    item: &TranscriptItem,
+    index: usize,
+    width: u16,
+) -> usize {
+    let entry_rows = app
+        .transcript_layout()
+        .entry_row_count(
+            super::transcript_layout::VisibleTranscriptSource::Transcript,
+            index,
+        )
+        .unwrap_or_default();
+    let markdown_rows = transcript_markdown_projection(app, item, width).lines.len();
+    entry_rows.saturating_sub(markdown_rows).saturating_sub(1)
 }
 
 #[cfg(test)]
@@ -1259,7 +1288,18 @@ fn markdown_hit_regions_for_item(
             .with_document_id(format!("transcript:{}", item.id().get()))
             .with_streaming(item.streaming()),
     );
-    let content_offset = transcript_markdown_content_row_offset(item, area.width);
+    let content_offset = {
+        let rows = transcript_item_rows(
+            std::slice::from_ref(item),
+            0,
+            area.width,
+            None,
+            TuiDiffViewerConfig::default(),
+        );
+        rows.len()
+            .saturating_sub(rendered.lines.len())
+            .saturating_sub(1)
+    };
     rendered
         .geometry
         .iter()
@@ -1430,22 +1470,6 @@ fn markdown_hit_regions_follow_scroll_resize_and_replacement() {
             .iter()
             .any(|old| old.id == region.id && old.area == region.area)
     }));
-}
-
-pub fn transcript_markdown_contribution_ids(item: &TranscriptItem, width: u16) -> Vec<String> {
-    if item.text_format() != TextFormat::Markdown {
-        return Vec::new();
-    }
-    render_markdown(
-        item.text(),
-        &MarkdownRenderOptions::new(width.max(1))
-            .with_document_id(format!("transcript:{}", item.id().get()))
-            .with_streaming(item.streaming()),
-    )
-    .contributions
-    .into_iter()
-    .map(|contribution| contribution.id)
-    .collect()
 }
 
 pub fn transcript_item_rows(
@@ -2150,28 +2174,6 @@ fn generic_tool_headers_render_elapsed_and_duration() {
 
     assert!(request_text.contains("Tool · example.run · elapsed 2.0s"));
     assert!(result_text.contains("Tool result · example.run · ok · duration 2.5s"));
-}
-
-#[cfg(test)]
-#[test]
-fn transcript_markdown_contributions_are_item_qualified_and_width_stable() {
-    let first = TranscriptItem::with_format(
-        "You",
-        "[Guide](guide.md) ![Diagram](diagram.png)".to_owned(),
-        TextFormat::Markdown,
-    );
-    let second = TranscriptItem::with_format("You", first.text().to_owned(), TextFormat::Markdown);
-
-    let wide = transcript_markdown_contribution_ids(&first, 80);
-    let narrow = transcript_markdown_contribution_ids(&first, 20);
-    let other = transcript_markdown_contribution_ids(&second, 80);
-
-    assert_eq!(wide, narrow);
-    assert!(
-        wide.iter()
-            .all(|id| id.starts_with(&format!("transcript:{}:", first.id().get())))
-    );
-    assert_ne!(wide, other);
 }
 
 #[cfg(test)]

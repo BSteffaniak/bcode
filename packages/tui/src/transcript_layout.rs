@@ -297,6 +297,26 @@ impl TranscriptLayoutCache {
         self.entries.entry_start_row(source, entry_index)
     }
 
+    pub fn entry_row_count(
+        &self,
+        source: VisibleTranscriptSource,
+        entry_index: usize,
+    ) -> Option<usize> {
+        self.entries.entry_row_count(source, entry_index)
+    }
+
+    /// Return committed transcript entry indexes intersecting a row range.
+    #[must_use]
+    pub fn visible_transcript_entry_indexes(&self, top_row: usize, height: u16) -> BTreeSet<usize> {
+        self.entries
+            .visible_lines_from_top(top_row, height)
+            .into_iter()
+            .filter_map(|line| {
+                (line.source == VisibleTranscriptSource::Transcript).then_some(line.entry_index)
+            })
+            .collect()
+    }
+
     /// Return a stable pointer to the first cached row of a transcript entry for cache-reuse tests.
     #[cfg(test)]
     #[must_use]

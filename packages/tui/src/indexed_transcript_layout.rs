@@ -341,6 +341,17 @@ impl IndexedTranscriptLayout {
         output
     }
 
+    pub fn entry_row_count(
+        &self,
+        source: VisibleTranscriptSource,
+        entry_index: usize,
+    ) -> Option<usize> {
+        self.section(source)
+            .entries
+            .get(entry_index)
+            .map(|entry| entry.rows.len())
+    }
+
     pub fn line(&self, visible: VisibleTranscriptLine) -> Option<&Line> {
         self.section(visible.source)
             .line(visible.entry_index, visible.row_in_entry)

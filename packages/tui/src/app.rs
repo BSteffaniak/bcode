@@ -243,6 +243,7 @@ pub struct BmuxApp {
     tool_call_contexts: BTreeMap<String, ToolCallContext>,
     pending_submissions: PendingSubmissions,
     transcript_layout: TranscriptLayoutCache,
+    transcript_markdown_cache: crate::transcript_markdown_cache::TranscriptMarkdownCache,
     elapsed_layout_revision: u64,
     elapsed_dirty_visuals: BTreeSet<String>,
     viewport: TranscriptViewport,
@@ -276,6 +277,7 @@ pub struct BmuxApp {
     markdown_source_view: Option<(String, String)>,
     markdown_details_open: BTreeMap<String, bool>,
     markdown_presentation_revision: u64,
+    markdown_semantics_reconciled: Option<(u64, u64, u16)>,
     footnote_return_targets: BTreeMap<String, String>,
     markdown_footnote_rows: BTreeMap<String, usize>,
     pending_markdown_focus: Option<String>,
@@ -447,6 +449,8 @@ impl BmuxApp {
             tool_call_contexts: BTreeMap::new(),
             pending_submissions: PendingSubmissions::default(),
             transcript_layout: TranscriptLayoutCache::default(),
+            transcript_markdown_cache:
+                crate::transcript_markdown_cache::TranscriptMarkdownCache::default(),
             elapsed_layout_revision: 0,
             elapsed_dirty_visuals: BTreeSet::new(),
             viewport: TranscriptViewport::default(),
@@ -480,6 +484,7 @@ impl BmuxApp {
             markdown_source_view: None,
             markdown_details_open: BTreeMap::new(),
             markdown_presentation_revision: 0,
+            markdown_semantics_reconciled: None,
             footnote_return_targets: BTreeMap::new(),
             markdown_footnote_rows: BTreeMap::new(),
             pending_markdown_focus: None,
@@ -528,6 +533,20 @@ impl BmuxApp {
     #[must_use]
     pub fn plugin_presentation(&self) -> Option<&crate::plugin_tui::PluginTuiPresentation> {
         self.plugin_presentation.as_deref()
+    }
+
+    /// Return whether resident Markdown semantic indexes need reconciliation.
+    pub fn begin_markdown_semantics_reconciliation(&mut self, width: u16) -> bool {
+        let key = (
+            self.transcript.revision(),
+            self.markdown_presentation_revision,
+            width,
+        );
+        if self.markdown_semantics_reconciled == Some(key) {
+            return false;
+        }
+        self.markdown_semantics_reconciled = Some(key);
+        true
     }
 
     /// Reconcile keyboard focus with visible actionable Markdown contributions.
@@ -1505,6 +1524,14 @@ impl BmuxApp {
     #[must_use]
     pub const fn transcript_layout_mut(&mut self) -> &mut TranscriptLayoutCache {
         &mut self.transcript_layout
+    }
+
+    /// Return the retained Markdown projection cache.
+    #[must_use]
+    pub const fn transcript_markdown_cache(
+        &self,
+    ) -> &crate::transcript_markdown_cache::TranscriptMarkdownCache {
+        &self.transcript_markdown_cache
     }
 
     /// Return the number of transcript rows hidden below the viewport.
