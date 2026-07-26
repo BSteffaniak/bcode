@@ -22,6 +22,9 @@ Supported modes are:
 Every mode retains neutral reasoning activity chrome when activity evidence exists, including
 opaque-only, interrupted, and failed activities. Filtering is silent: Bcode does not announce
 suppressed or unavailable representations and does not fall back from summary to raw or vice versa.
+Renderer-neutral and non-TUI clients can select the equivalent `ReasoningPresentationPolicy`
+(`all`, `summary`, `raw`, or `hidden`); HyperChad defaults to `all`. This policy is local and never
+changes provider request construction.
 Use `/thinking mode all|summary|raw`, `/thinking show|hide`, and `/thinking status` to inspect or
 change the local TUI policy. Provider plugins should follow the structured reasoning mapping rules
 in [`docs/model-provider-contract.md`](docs/model-provider-contract.md).

@@ -8250,6 +8250,7 @@ mod tests {
         let encoded = serde_json::to_string(&history).expect("history should serialize");
         assert!(!encoded.contains("encrypted_content"));
         assert!(!encoded.contains("provider_state"));
+        assert!(!encoded.contains("encrypted-sentinel-do-not-expose"));
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }

@@ -283,6 +283,34 @@ impl SessionView {
         }
     }
 
+    /// Set a complete renderer-local reasoning presentation policy.
+    pub fn set_reasoning_presentation_policy(
+        &mut self,
+        policy: bcode_session_view_models::ReasoningPresentationPolicy,
+    ) {
+        let (visible, mode) = match policy {
+            bcode_session_view_models::ReasoningPresentationPolicy::All => {
+                (true, bcode_session_view_models::ReasoningDisplayMode::All)
+            }
+            bcode_session_view_models::ReasoningPresentationPolicy::Summary => (
+                true,
+                bcode_session_view_models::ReasoningDisplayMode::Summary,
+            ),
+            bcode_session_view_models::ReasoningPresentationPolicy::Raw => {
+                (true, bcode_session_view_models::ReasoningDisplayMode::Raw)
+            }
+            bcode_session_view_models::ReasoningPresentationPolicy::Hidden => {
+                (false, self.snapshot.thinking.mode)
+            }
+        };
+        if self.snapshot.thinking.visible != visible || self.snapshot.thinking.mode != mode {
+            self.snapshot.thinking.visible = visible;
+            self.snapshot.thinking.mode = mode;
+            self.refresh_reasoning_items();
+            self.bump_revision();
+        }
+    }
+
     /// Set the renderer-selected readable reasoning representation.
     pub fn set_reasoning_display_mode(
         &mut self,
@@ -4277,6 +4305,61 @@ mod tests {
                 assert_eq!(message.text, "It means shared semantic state.");
             }
             other => panic!("unexpected item: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn complete_presentation_policy_filters_reasoning_without_removing_activity() {
+        let session_id = SessionId::new();
+        let activity = || SessionEventKind::AssistantReasoningActivity {
+            turn_id: "turn-1".to_owned(),
+            activity: bcode_session_models::ReasoningActivity {
+                activity_id: "reasoning-1".to_owned(),
+                order: 0,
+                status: bcode_session_models::ReasoningActivityStatus::Completed,
+                parts: vec![
+                    bcode_session_models::ReasoningPart {
+                        part_id: "summary-0".to_owned(),
+                        kind: bcode_session_models::ReasoningContentKind::Summary,
+                        role: bcode_session_models::ReasoningContentRole::Milestone,
+                        order: 0,
+                        text: "Summary".to_owned(),
+                    },
+                    bcode_session_models::ReasoningPart {
+                        part_id: "raw-0".to_owned(),
+                        kind: bcode_session_models::ReasoningContentKind::Raw,
+                        role: bcode_session_models::ReasoningContentRole::Detail,
+                        order: 1,
+                        text: "Raw".to_owned(),
+                    },
+                ],
+                opaque: true,
+            },
+        };
+
+        for (policy, expected) in [
+            (
+                bcode_session_view_models::ReasoningPresentationPolicy::All,
+                "Summary\n\nRaw",
+            ),
+            (
+                bcode_session_view_models::ReasoningPresentationPolicy::Summary,
+                "Summary",
+            ),
+            (
+                bcode_session_view_models::ReasoningPresentationPolicy::Raw,
+                "Raw",
+            ),
+            (
+                bcode_session_view_models::ReasoningPresentationPolicy::Hidden,
+                "",
+            ),
+        ] {
+            let mut view = SessionView::new();
+            view.set_reasoning_presentation_policy(policy);
+            view.apply_event(&event(session_id, 1, activity()));
+            assert_eq!(view.snapshot().transcript.items.len(), 1);
+            assert_reasoning_text(&view.snapshot().transcript.items[0], expected, false);
         }
     }
 

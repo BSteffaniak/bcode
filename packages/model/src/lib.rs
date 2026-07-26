@@ -20,6 +20,7 @@ use bcode_session_models::SessionId;
 use hyperchad_docs_config_derive::{ConfigDoc, ConfigDocEnum};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 mod context_management;
 pub use context_management::{
@@ -2208,7 +2209,7 @@ pub struct ImageRefContent {
 }
 
 /// Normalized provider stream event.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderTurnEvent {
     TurnStarted,
@@ -2216,6 +2217,8 @@ pub enum ProviderTurnEvent {
         text: String,
     },
     ReasoningDelta {
+        /// Legacy untyped reasoning text. This compatibility variant loses representation kind,
+        /// part identity, ordering, and lifecycle; new producers use [`Self::ReasoningActivity`].
         text: String,
     },
     /// Provider-neutral reasoning activity operation.
@@ -2270,6 +2273,30 @@ pub enum ProviderTurnEvent {
         stop_reason: StopReason,
     },
     Cancelled,
+}
+
+impl fmt::Debug for ProviderTurnEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ProviderMetadata { key, value } => formatter
+                .debug_struct("ProviderMetadata")
+                .field("key", key)
+                .field("value", &provider_metadata_debug_value(key, value))
+                .finish(),
+            event => match serde_json::to_value(event) {
+                Ok(value) => fmt::Debug::fmt(&value, formatter),
+                Err(_) => formatter.write_str("ProviderTurnEvent(<unavailable>)"),
+            },
+        }
+    }
+}
+
+fn provider_metadata_debug_value<'a>(key: &str, value: &'a str) -> &'a str {
+    if key.starts_with("diagnostic.") {
+        value
+    } else {
+        "[REDACTED]"
+    }
 }
 
 /// Provider-reported request projection metadata.
@@ -2738,7 +2765,7 @@ mod tests {
         ModelPricingUnit, ModelTokenPrice, ModelTurnRequest, ModelVisibility,
         ModelVisibilitySource, NegotiatedFeatureSupport, ParallelToolCallCapabilities,
         ProviderError, ProviderErrorCategory, ProviderErrorSource, ProviderOperationRequirement,
-        ProviderRequestContext, ProviderRequestExtension, RequestedModelFeature,
+        ProviderRequestContext, ProviderRequestExtension, ProviderTurnEvent, RequestedModelFeature,
         StructuredOutputMode, TokenUsage, ToolCallRequestPolicy, ToolChoice, ToolChoiceMode,
     };
 
@@ -3082,6 +3109,25 @@ mod tests {
                 None
             );
         }
+    }
+
+    #[test]
+    fn provider_metadata_debug_redacts_private_values() {
+        let sentinel = "encrypted-sentinel-do-not-log";
+        let event = ProviderTurnEvent::ProviderMetadata {
+            key: "provider_state".to_owned(),
+            value: sentinel.to_owned(),
+        };
+        let debug = format!("{event:?}");
+        assert!(debug.contains("provider_state"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(sentinel));
+
+        let diagnostic = ProviderTurnEvent::ProviderMetadata {
+            key: "diagnostic.safe".to_owned(),
+            value: "visible".to_owned(),
+        };
+        assert!(format!("{diagnostic:?}").contains("visible"));
     }
 
     #[test]

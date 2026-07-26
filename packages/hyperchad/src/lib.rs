@@ -28,7 +28,8 @@ use bcode_session_models::{
 use bcode_session_view::{SessionView, execute_session_view_action};
 use bcode_session_view_models::{
     ComposerDraftViewScope, InteractionViewSummary, MessageAcceptanceDispositionView,
-    PromptPlacementView, SessionViewAction, SessionViewPatch, SessionViewSnapshot,
+    PromptPlacementView, ReasoningPresentationPolicy, SessionViewAction, SessionViewPatch,
+    SessionViewSnapshot,
 };
 use hyperchad::router::{RoutePath, RouteRequest, Router};
 use serde::Deserialize;
@@ -48,6 +49,7 @@ pub struct HyperChadAppState {
     history_windows: Arc<Mutex<BTreeMap<SessionId, ProjectionWindowRequest>>>,
     interaction_controllers: Arc<Mutex<LocalInteractionControllers>>,
     interaction_submissions: Arc<Mutex<BTreeSet<String>>>,
+    reasoning_presentation_policy: ReasoningPresentationPolicy,
     renderer_tx: Arc<Mutex<Option<tokio::sync::mpsc::Sender<ScopedSnapshotUpdate>>>>,
 }
 
@@ -61,6 +63,10 @@ impl std::fmt::Debug for HyperChadAppState {
             .field("history_windows", &self.history_windows)
             .field("interaction_controllers", &self.interaction_controllers)
             .field("interaction_submissions", &self.interaction_submissions)
+            .field(
+                "reasoning_presentation_policy",
+                &self.reasoning_presentation_policy,
+            )
             .field(
                 "renderer_configured",
                 &self.renderer_tx.lock().map_or(true, |tx| tx.is_some()),
@@ -139,6 +145,7 @@ struct SessionWatchContext {
     last_sent_snapshot: Arc<Mutex<Option<SessionViewSnapshot>>>,
     history_windows: Arc<Mutex<BTreeMap<SessionId, ProjectionWindowRequest>>>,
     interaction_controllers: Arc<Mutex<LocalInteractionControllers>>,
+    reasoning_presentation_policy: ReasoningPresentationPolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -268,6 +275,20 @@ impl HyperChadAppState {
     /// Create `HyperChad` application state from a daemon client and access capability.
     #[must_use]
     pub fn new(client: BcodeClient, access_token: impl Into<Arc<str>>) -> Self {
+        Self::with_reasoning_presentation_policy(
+            client,
+            access_token,
+            ReasoningPresentationPolicy::All,
+        )
+    }
+
+    /// Create `HyperChad` application state with a renderer-local reasoning policy.
+    #[must_use]
+    pub fn with_reasoning_presentation_policy(
+        client: BcodeClient,
+        access_token: impl Into<Arc<str>>,
+        reasoning_presentation_policy: ReasoningPresentationPolicy,
+    ) -> Self {
         let client = client.with_interaction_adapters(local_interaction_adapters());
         Self {
             client,
@@ -276,6 +297,7 @@ impl HyperChadAppState {
             history_windows: Arc::new(Mutex::new(BTreeMap::new())),
             interaction_controllers: Arc::new(Mutex::new(LocalInteractionControllers::default())),
             interaction_submissions: Arc::new(Mutex::new(BTreeSet::new())),
+            reasoning_presentation_policy,
             renderer_tx: Arc::new(Mutex::new(None)),
         }
     }
@@ -325,6 +347,7 @@ impl HyperChadAppState {
         let history_windows = Arc::clone(&self.history_windows);
         let interaction_controllers = Arc::clone(&self.interaction_controllers);
         let watched_sessions = Arc::clone(&self.watched_sessions);
+        let reasoning_presentation_policy = self.reasoning_presentation_policy;
         tokio::spawn(async move {
             if let Err(error) = Box::pin(watch_session_updates(SessionWatchContext {
                 client,
@@ -334,6 +357,7 @@ impl HyperChadAppState {
                 last_sent_snapshot: Arc::new(Mutex::new(None)),
                 history_windows,
                 interaction_controllers,
+                reasoning_presentation_policy,
             }))
             .await
             {
@@ -412,8 +436,13 @@ impl HyperChadAppState {
         let attached =
             attach_hyperchad_projection_window_with_request(&mut connection, session_id, request)
                 .await?;
-        session_view_from_attached_history(&self.client, attached, &self.interaction_controllers)
-            .await
+        session_view_from_attached_history(
+            &self.client,
+            attached,
+            &self.interaction_controllers,
+            self.reasoning_presentation_policy,
+        )
+        .await
     }
 }
 
@@ -421,8 +450,10 @@ async fn session_view_from_attached_history(
     client: &BcodeClient,
     attached: AttachedSessionHistory,
     interaction_controllers: &Arc<Mutex<LocalInteractionControllers>>,
+    reasoning_presentation_policy: ReasoningPresentationPolicy,
 ) -> Result<SessionViewSnapshot, ClientError> {
     let mut view = view_from_attached_history(&attached);
+    view.set_reasoning_presentation_policy(reasoning_presentation_policy);
     hydrate_session_model_status(client, attached.session.id, &mut view).await?;
     hydrate_pending_permissions(client, attached.session.id, &mut view).await?;
     hydrate_pending_interactions(
@@ -1144,6 +1175,7 @@ impl HyperChadAppState {
             &self.client,
             attached,
             &self.interaction_controllers,
+            self.reasoning_presentation_policy,
         )
         .await
         {
@@ -1635,6 +1667,7 @@ async fn attach_watched_session(
     client: &BcodeClient,
     session_id: SessionId,
     interaction_controllers: &Arc<Mutex<LocalInteractionControllers>>,
+    reasoning_presentation_policy: ReasoningPresentationPolicy,
 ) -> Result<(SessionWatcher, AttachedSessionHistory, SessionView), ClientError> {
     let mut watcher = client
         .watch_session_projection_window(session_id, hyperchad_projection_window_request())
@@ -1643,6 +1676,7 @@ async fn attach_watched_session(
         .take_initial()
         .ok_or(ClientError::UnexpectedResponse)?;
     let mut view = view_from_attached_history(&attached);
+    view.set_reasoning_presentation_policy(reasoning_presentation_policy);
     hydrate_session_model_status(client, session_id, &mut view).await?;
     hydrate_pending_permissions(client, session_id, &mut view).await?;
     hydrate_pending_interactions(client, session_id, &mut view, interaction_controllers).await?;
@@ -1683,6 +1717,7 @@ async fn watched_session_snapshot(
     view: &SessionView,
     history_windows: &Arc<Mutex<BTreeMap<SessionId, ProjectionWindowRequest>>>,
     interaction_controllers: &Arc<Mutex<LocalInteractionControllers>>,
+    reasoning_presentation_policy: ReasoningPresentationPolicy,
 ) -> Result<SessionViewSnapshot, ClientError> {
     let history_request = history_windows
         .lock()
@@ -1694,7 +1729,13 @@ async fn watched_session_snapshot(
         let historical =
             attach_hyperchad_projection_window_with_request(&mut connection, session_id, request)
                 .await?;
-        session_view_from_attached_history(client, historical, interaction_controllers).await
+        session_view_from_attached_history(
+            client,
+            historical,
+            interaction_controllers,
+            reasoning_presentation_policy,
+        )
+        .await
     } else {
         Ok(snapshot_from_view(view, attached))
     }
@@ -1740,6 +1781,7 @@ async fn attach_watch_with_retry(
             &context.client,
             context.session_id,
             &context.interaction_controllers,
+            context.reasoning_presentation_policy,
         )
         .await
         {
@@ -1815,6 +1857,7 @@ async fn send_connection_update(
         view,
         &context.history_windows,
         &context.interaction_controllers,
+        context.reasoning_presentation_policy,
     )
     .await
     .unwrap_or_else(|_| snapshot_from_view(view, attached));
@@ -1846,6 +1889,7 @@ async fn send_watched_snapshot(
         view,
         &context.history_windows,
         &context.interaction_controllers,
+        context.reasoning_presentation_policy,
     )
     .await?;
     snapshot.catalog_status = catalog_view_status(session_list.catalog_status);

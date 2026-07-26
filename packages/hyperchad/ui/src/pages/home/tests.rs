@@ -813,6 +813,7 @@ fn system_skill_and_compaction_items_render_as_notices() {
 
 #[test]
 fn structured_reasoning_activity_renders_terminal_status_chrome() {
+    let sentinel = "encrypted-sentinel-do-not-expose";
     for (status, expected) in [
         (
             bcode_session_models::ReasoningActivityStatus::Completed,
@@ -840,6 +841,7 @@ fn structured_reasoning_activity_renders_terminal_status_chrome() {
         let rendered = format!("{:?}", transcript_item_body(&kind));
         assert!(rendered.contains(expected));
         assert!(!rendered.contains("Empty message"));
+        assert!(!rendered.contains(sentinel));
     }
 }
 

@@ -9992,6 +9992,55 @@ mod tests {
     }
 
     #[test]
+    fn responses_reasoning_text_done_completes_raw_part_without_output_item_done() {
+        let turn = TurnState::default();
+        let mut tool_calls = BTreeMap::new();
+        let mut reasoning_items = BTreeMap::new();
+        let mut saw_tool_call = false;
+        let name_map = BTreeMap::new();
+        let processor = test_responses_stream_processor(&turn, &name_map);
+
+        for line in [
+            r#"data: {"type":"response.reasoning_text.delta","output_index":2,"item_id":"rs_raw","content_index":3,"delta":"partial"}"#,
+            r#"data: {"type":"response.reasoning_text.done","output_index":2,"item_id":"rs_raw","content_index":3,"text":"authoritative raw detail","sequence_number":9}"#,
+        ] {
+            process_responses_stream_line(
+                line,
+                &processor,
+                &mut tool_calls,
+                &mut reasoning_items,
+                &mut saw_tool_call,
+            )
+            .expect("raw reasoning event should process");
+        }
+
+        let events = turn.drain();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                    activity_id,
+                    activity_order: 2,
+                    part_id,
+                    kind: bcode_session_models::ReasoningContentKind::Raw,
+                    role: bcode_session_models::ReasoningContentRole::Detail,
+                    part_order: 3,
+                    text,
+                }
+            } if activity_id == "rs_raw"
+                && part_id == "raw-3"
+                && text == "authoritative raw detail"
+        )));
+        assert_eq!(
+            reasoning_items
+                .get(&2)
+                .and_then(|item| item.content.get(&3))
+                .map(String::as_str),
+            Some("authoritative raw detail")
+        );
+    }
+
+    #[test]
     fn responses_completed_emits_encrypted_reasoning_provider_state() {
         let turn = TurnState::default();
         let mut tool_calls = BTreeMap::new();

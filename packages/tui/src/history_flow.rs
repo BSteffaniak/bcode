@@ -315,6 +315,10 @@ enum SupersedableEventKey {
         invocation_id: String,
         contribution_id: String,
     },
+    ToolRequestDraft {
+        tool_call_id: String,
+        placement: &'static str,
+    },
 }
 
 fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
@@ -351,6 +355,25 @@ fn supersedable_event_key(event: &BcodeEvent) -> Option<SupersedableEventKey> {
                 Some(SupersedableEventKey::ToolContribution {
                     invocation_id: envelope.contribution.invocation_id.clone(),
                     contribution_id: envelope.contribution.contribution_id.clone(),
+                })
+            }
+            bcode_session_models::SessionLiveEventKind::ToolRequestDraft { event }
+                if !matches!(
+                    event.operation,
+                    bcode_session_models::ToolRequestDraftOperation::Remove { .. }
+                ) =>
+            {
+                Some(SupersedableEventKey::ToolRequestDraft {
+                    tool_call_id: event.tool_call_id.clone(),
+                    placement: match event.placement {
+                        bcode_session_models::ToolContributionPlacement::Request => "request",
+                        bcode_session_models::ToolContributionPlacement::Progress => "progress",
+                        bcode_session_models::ToolContributionPlacement::Result => "result",
+                        bcode_session_models::ToolContributionPlacement::Supplemental => {
+                            "supplemental"
+                        }
+                        bcode_session_models::ToolContributionPlacement::Hidden => "hidden",
+                    },
                 })
             }
             _ => None,
@@ -616,7 +639,7 @@ mod tests {
             ))
             .is_none()
         );
-        assert!(
+        assert_eq!(
             supersedable_event_key(&request_draft_event(
                 session_id,
                 1,
@@ -624,8 +647,11 @@ mod tests {
                     start_offset: 0,
                     text: "draft".to_owned(),
                 },
-            ))
-            .is_some()
+            )),
+            Some(SupersedableEventKey::ToolRequestDraft {
+                tool_call_id: "call-1".to_owned(),
+                placement: "request",
+            })
         );
         assert!(
             supersedable_event_key(&request_draft_event(
@@ -662,6 +688,13 @@ mod tests {
                 unreachable!("request draft event");
             };
             draft.tool_call_id = format!("call-{}", revision % 256);
+            assert_eq!(
+                supersedable_event_key(&event),
+                Some(SupersedableEventKey::ToolRequestDraft {
+                    tool_call_id: format!("call-{}", revision % 256),
+                    placement: "request",
+                })
+            );
             pending.insert(
                 supersedable_event_key(&event).expect("request draft key"),
                 event,

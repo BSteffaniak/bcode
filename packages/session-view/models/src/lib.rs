@@ -775,6 +775,9 @@ pub enum TranscriptViewItemKind {
     /// Assistant-authored chat message.
     AssistantMessage { message: ChatMessageView },
     /// Assistant reasoning/thinking content retained for legacy compatibility.
+    ///
+    /// This projection has already lost representation kind, part identity, order, and lifecycle.
+    /// Structured producers use [`Self::ReasoningActivity`].
     ReasoningMessage { message: ChatMessageView },
     /// Provider-neutral structured reasoning activity.
     ReasoningActivity { activity: ReasoningActivityView },
@@ -1287,6 +1290,23 @@ pub struct ComposerViewState {
     pub can_submit: bool,
     /// Human-readable disabled reason when submit is unavailable.
     pub disabled_reason: Option<String>,
+}
+
+/// Renderer-selected reasoning presentation policy.
+///
+/// This policy is local to a renderer/client and never changes provider request construction.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningPresentationPolicy {
+    /// Display every readable representation exposed by the provider.
+    #[default]
+    All,
+    /// Display provider summaries and milestones only.
+    Summary,
+    /// Display raw or detailed reasoning only.
+    Raw,
+    /// Hide readable reasoning while preserving neutral activity chrome.
+    Hidden,
 }
 
 /// Renderer-selected readable reasoning representation.

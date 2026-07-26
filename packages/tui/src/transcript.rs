@@ -1333,6 +1333,7 @@ mod tests {
 
     #[test]
     fn structured_reasoning_activity_adapts_terminal_lifecycle_chrome() {
+        let sentinel = "encrypted-sentinel-do-not-expose";
         for (status, expected) in [
             (
                 bcode_session_models::ReasoningActivityStatus::Completed,
@@ -1370,6 +1371,7 @@ mod tests {
             let terminal = terminal_item_from_shared(&item);
             assert_eq!(terminal.role(), expected);
             assert!(terminal.text().is_empty());
+            assert!(!format!("{terminal:?}").contains(sentinel));
         }
     }
 

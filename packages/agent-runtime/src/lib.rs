@@ -390,7 +390,7 @@ pub struct AgentTurnResponse {
 }
 
 /// Normalized runtime event exposed independently from provider-specific details.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum AgentRuntimeEvent {
     /// The provider accepted the turn.
@@ -398,6 +398,9 @@ pub enum AgentRuntimeEvent {
     /// Assistant text delta.
     TextDelta(String),
     /// Legacy untyped reasoning text delta.
+    ///
+    /// This compatibility event loses representation kind, part identity, order, and lifecycle.
+    /// New providers and consumers should use [`Self::ReasoningActivity`].
     ReasoningDelta(String),
     /// Provider-neutral reasoning activity operation.
     ReasoningActivity(bcode_session_models::ReasoningActivityEvent),
@@ -461,6 +464,29 @@ pub enum AgentRuntimeEvent {
     },
     /// Turn was cancelled.
     Cancelled,
+}
+
+impl std::fmt::Debug for AgentRuntimeEvent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProviderMetadata { key, value } => formatter
+                .debug_struct("ProviderMetadata")
+                .field("key", key)
+                .field(
+                    "value",
+                    &if key.starts_with("diagnostic.") {
+                        value.as_str()
+                    } else {
+                        "[REDACTED]"
+                    },
+                )
+                .finish(),
+            event => match serde_json::to_value(event) {
+                Ok(value) => std::fmt::Debug::fmt(&value, formatter),
+                Err(_) => formatter.write_str("AgentRuntimeEvent(<unavailable>)"),
+            },
+        }
+    }
 }
 
 /// Item produced by a streaming text-generation turn.
@@ -2186,7 +2212,11 @@ impl AgentRuntime {
 
 enum EventDisposition {
     Continue(AgentRuntimeEvent),
-    Finished { stop_reason: StopReason },
+    /// Provider continuation state is adapter/host-private and must not cross public runtime APIs.
+    PrivateMetadata,
+    Finished {
+        stop_reason: StopReason,
+    },
     Cancelled(AgentRuntimeEvent),
 }
 
@@ -2267,6 +2297,7 @@ where
             events.push(event);
             Ok(None)
         }
+        EventDisposition::PrivateMetadata => Ok(None),
         EventDisposition::Finished { stop_reason } => {
             provider
                 .finish_turn(context.provider_plugin_id, context.finish_request)
@@ -3835,9 +3866,15 @@ fn normalize_provider_event(
         ProviderTurnEvent::ContextCompacted { .. } => Ok(EventDisposition::Continue(
             AgentRuntimeEvent::ContextCompacted,
         )),
-        ProviderTurnEvent::ProviderMetadata { key, value } => Ok(EventDisposition::Continue(
-            AgentRuntimeEvent::ProviderMetadata { key, value },
-        )),
+        ProviderTurnEvent::ProviderMetadata { key, value } => {
+            if key == "provider_state" {
+                Ok(EventDisposition::PrivateMetadata)
+            } else {
+                Ok(EventDisposition::Continue(
+                    AgentRuntimeEvent::ProviderMetadata { key, value },
+                ))
+            }
+        }
         ProviderTurnEvent::RetryScheduled {
             message,
             retry_at_unix,
@@ -4498,7 +4535,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canonical_loop_defaults_unknown_provider_parallel_capability_to_sequential() {
+    async fn canonical_loop_preserves_unknown_provider_parallel_policy() {
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let mut provider = MultiRoundProvider::new(
             [vec![ProviderTurnEvent::TurnFinished {
@@ -4531,9 +4568,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(requests.len(), 1);
         assert_eq!(
-            requests[0].tool_call_policy.parallel,
-            Some(false),
-            "unknown provider/model capability must default to sequential before invocation"
+            requests[0].tool_call_policy.parallel, None,
+            "unknown provider/model capability must remain unknown before provider invocation"
         );
         drop(requests);
     }
@@ -6832,6 +6868,66 @@ mod tests {
             ))
         ));
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_continuation_state_does_not_cross_runtime_public_events() {
+        let sentinel = "encrypted-sentinel-do-not-expose";
+        let provider = FakeProvider::new([
+            ProviderTurnEvent::ProviderMetadata {
+                key: "provider_state".to_owned(),
+                value: sentinel.to_owned(),
+            },
+            ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::EndTurn,
+            },
+        ]);
+        let runtime = AgentRuntime::new();
+        let mut stream =
+            runtime.run_streaming_text_turn(provider, AgentTurnRequest::new("test-model", "hello"));
+        let mut terminal = None;
+
+        while let Some(item) = stream.next().await {
+            match item {
+                AgentRuntimeStreamItem::Finished(response) => {
+                    terminal = Some(response);
+                    break;
+                }
+                AgentRuntimeStreamItem::Error(error) => panic!("unexpected stream error: {error}"),
+                AgentRuntimeStreamItem::Event(event) => {
+                    assert!(!format!("{event:?}").contains(sentinel));
+                    assert!(!matches!(
+                        event,
+                        AgentRuntimeEvent::ProviderMetadata { ref key, .. }
+                            if key == "provider_state"
+                    ));
+                }
+            }
+        }
+
+        let terminal = terminal.expect("turn should finish");
+        let encoded = serde_json::to_string(&terminal).expect("serialize terminal response");
+        assert!(!encoded.contains(sentinel));
+        assert!(!encoded.contains("provider_state"));
+    }
+
+    #[test]
+    fn runtime_provider_metadata_debug_redacts_private_values() {
+        let sentinel = "encrypted-sentinel-do-not-log";
+        let event = AgentRuntimeEvent::ProviderMetadata {
+            key: "provider_state".to_owned(),
+            value: sentinel.to_owned(),
+        };
+        let debug = format!("{event:?}");
+        assert!(debug.contains("provider_state"));
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains(sentinel));
+
+        let diagnostic = AgentRuntimeEvent::ProviderMetadata {
+            key: "diagnostic.safe".to_owned(),
+            value: "visible".to_owned(),
+        };
+        assert!(format!("{diagnostic:?}").contains("visible"));
     }
 
     #[tokio::test]

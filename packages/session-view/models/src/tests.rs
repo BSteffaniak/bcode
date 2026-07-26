@@ -26,6 +26,7 @@ fn tool_presentation_slot_ids_are_stable_and_supplementals_are_independent() {
 
 #[test]
 fn structured_reasoning_activity_round_trips_through_renderer_wire_model() {
+    let sentinel = "encrypted-sentinel-do-not-expose";
     let item = TranscriptViewItem {
         id: TranscriptViewItemId::reasoning("turn-1", "reasoning-1"),
         revision: 2,
@@ -56,6 +57,25 @@ fn structured_reasoning_activity_round_trips_through_renderer_wire_model() {
     assert_eq!(decoded, item);
     assert!(!encoded.contains("encrypted_content"));
     assert!(!encoded.contains("provider_state"));
+    assert!(!encoded.contains(sentinel));
+}
+
+#[test]
+fn reasoning_presentation_policy_has_stable_wire_values() {
+    for (policy, wire) in [
+        (ReasoningPresentationPolicy::All, r#""all""#),
+        (ReasoningPresentationPolicy::Summary, r#""summary""#),
+        (ReasoningPresentationPolicy::Raw, r#""raw""#),
+        (ReasoningPresentationPolicy::Hidden, r#""hidden""#),
+    ] {
+        let encoded = serde_json::to_string(&policy).expect("serialize reasoning policy");
+        assert_eq!(encoded, wire);
+        assert_eq!(
+            serde_json::from_str::<ReasoningPresentationPolicy>(wire)
+                .expect("deserialize reasoning policy"),
+            policy
+        );
+    }
 }
 
 #[test]

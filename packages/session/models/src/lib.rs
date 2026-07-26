@@ -1356,6 +1356,9 @@ pub enum SessionLiveEventKind {
     /// Coalesced assistant text produced by an active model turn.
     AssistantTextDelta { turn_id: String, text: String },
     /// Coalesced provider-exposed reasoning text produced by an active model turn.
+    ///
+    /// Legacy compatibility adapter: the text has no representation kind, part identity, or
+    /// lifecycle. New producers must emit [`Self::AssistantReasoningActivity`].
     AssistantReasoningDelta { turn_id: String, text: String },
     /// Provider-neutral reasoning activity operation produced by an active model turn.
     AssistantReasoningActivity {
@@ -2085,10 +2088,16 @@ pub enum SessionEventKind {
         failed_at_ms: u64,
     },
     /// Provider-exposed reasoning text delta.
+    ///
+    /// Legacy persisted compatibility shape. It loses representation kind, part identity, order,
+    /// and lifecycle; new sessions use [`Self::AssistantReasoningActivity`].
     AssistantReasoningDelta {
         text: String,
     },
     /// Completed provider-exposed reasoning text.
+    ///
+    /// Legacy persisted compatibility shape with the same structural loss as
+    /// [`Self::AssistantReasoningDelta`].
     AssistantReasoningMessage {
         text: String,
     },
@@ -2296,6 +2305,33 @@ mod tests {
             assert_eq!(decoded.activity_order(), 2);
             assert!(!encoded.contains("encrypted_content"));
             assert!(!encoded.contains("provider_state"));
+        }
+    }
+
+    #[test]
+    fn opaque_reasoning_evidence_has_no_provider_payload_metadata() {
+        let sentinel = "encrypted-sentinel-do-not-expose";
+        let event = ReasoningActivityEvent::OpaqueObserved {
+            activity_id: "reasoning-1".to_owned(),
+            activity_order: 7,
+        };
+        let encoded = serde_json::to_string(&event).expect("serialize opaque evidence");
+        assert!(encoded.contains(r#""type":"opaque_observed""#));
+        assert!(encoded.contains(r#""activity_id":"reasoning-1""#));
+        assert!(!encoded.contains(sentinel));
+        for forbidden in [
+            "encrypted_content",
+            "provider_state",
+            "payload",
+            "length",
+            "hash",
+            "prefix",
+            "secret",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "unexpected field: {forbidden}"
+            );
         }
     }
 

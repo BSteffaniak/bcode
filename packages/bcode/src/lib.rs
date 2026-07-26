@@ -4800,7 +4800,10 @@ pub enum FrontendEvent {
     TurnStarted,
     /// Visible assistant text delta.
     TextDelta(String),
-    /// Visible reasoning delta.
+    /// Legacy visible reasoning delta.
+    ///
+    /// This compatibility projection loses representation kind, part identity, order, and
+    /// lifecycle. New frontends should consume [`Self::ReasoningActivity`].
     ReasoningDelta(String),
     /// Provider-neutral reasoning activity operation.
     ReasoningActivity(bcode_session_models::ReasoningActivityEvent),
