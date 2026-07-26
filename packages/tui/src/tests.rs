@@ -5833,6 +5833,27 @@ fn filesystem_write_request_renders_from_contribution() {
     ));
 
     let rendered = render_app_text(&mut app);
+
+    let request_id = bcode_session_view_models::TranscriptViewItemId::tool_presentation_slot(
+        "call-write",
+        bcode_session_models::ToolContributionPlacement::Request,
+        None,
+    );
+    let shared_request_count = app
+        .session_view_snapshot()
+        .transcript
+        .items
+        .iter()
+        .filter(|item| item.id == request_id)
+        .count();
+    assert_eq!(shared_request_count, 1);
+    assert_eq!(
+        app.transcript()
+            .iter()
+            .filter(|item| item.source_view_item_id() == Some(&request_id))
+            .count(),
+        shared_request_count
+    );
     assert!(rendered.contains("created from raw args"), "{rendered}");
     assert!(!rendered.contains("arguments"), "{rendered}");
 }
