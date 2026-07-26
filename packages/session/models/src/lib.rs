@@ -795,7 +795,8 @@ pub struct TurnExecutionCorrelation {
 /// Persisted provider-neutral structured-output request for one admitted turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnStructuredOutputRequest {
-    /// Human-readable output object name.
+    /// Provider-portable output object name containing only ASCII letters, digits, underscores,
+    /// and hyphens.
     pub name: String,
     /// JSON schema the provider should satisfy.
     pub schema: serde_json::Value,
@@ -876,8 +877,50 @@ const MAX_TURN_PROVIDER_PLUGIN_ID_BYTES: usize = 256;
 const MAX_TURN_MODEL_ID_BYTES: usize = 512;
 const MAX_TURN_TOOL_ALLOWLIST_ENTRIES: usize = 256;
 const MAX_TURN_TOOL_NAME_BYTES: usize = 256;
-const MAX_TURN_STRUCTURED_OUTPUT_NAME_BYTES: usize = 256;
+/// Maximum bytes in a provider-portable structured-output name.
+pub const MAX_TURN_STRUCTURED_OUTPUT_NAME_BYTES: usize = 64;
 const MAX_TURN_STRUCTURED_OUTPUT_SCHEMA_BYTES: usize = 256 * 1024;
+
+/// Return whether a structured-output name is portable across supported providers.
+#[must_use]
+pub fn is_valid_structured_output_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_TURN_STRUCTURED_OUTPUT_NAME_BYTES
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// Derive a bounded provider-portable structured-output name from a diagnostic identity.
+#[must_use]
+pub fn structured_output_name(identity: &str) -> String {
+    let mut normalized = String::with_capacity(identity.len());
+    for character in identity.chars() {
+        normalized.push(
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
+                character
+            } else {
+                '_'
+            },
+        );
+    }
+    if normalized.is_empty() {
+        return "structured_output".to_string();
+    }
+    if normalized.len() <= MAX_TURN_STRUCTURED_OUTPUT_NAME_BYTES {
+        return normalized;
+    }
+    let hash = identity
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            hash.wrapping_mul(0x0000_0100_0000_01b3) ^ u64::from(*byte)
+        });
+    let suffix = format!("_{hash:016x}");
+    normalized.truncate(MAX_TURN_STRUCTURED_OUTPUT_NAME_BYTES - suffix.len());
+    normalized.push_str(&suffix);
+    normalized
+}
 
 /// Generic turn-admission metadata validation error.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -903,6 +946,7 @@ pub enum TurnAdmissionMetadataError {
     EmptyModelId,
     ModelIdTooLong,
     EmptyStructuredOutputName,
+    InvalidStructuredOutputName,
     StructuredOutputNameTooLong,
     StructuredOutputSchemaTooLarge,
     InvalidStructuredOutputSchema,
@@ -936,6 +980,9 @@ impl Display for TurnAdmissionMetadataError {
             Self::EmptyModelId => "turn model ID must not be empty",
             Self::ModelIdTooLong => "turn model ID is too long",
             Self::EmptyStructuredOutputName => "turn structured-output name must not be empty",
+            Self::InvalidStructuredOutputName => {
+                "turn structured-output name may contain only ASCII letters, digits, underscores, and hyphens"
+            }
             Self::StructuredOutputNameTooLong => "turn structured-output name is too long",
             Self::StructuredOutputSchemaTooLarge => "turn structured-output schema is too large",
             Self::InvalidStructuredOutputSchema => {
@@ -946,6 +993,29 @@ impl Display for TurnAdmissionMetadataError {
 }
 
 impl std::error::Error for TurnAdmissionMetadataError {}
+
+fn validate_structured_output_request(
+    request: &TurnStructuredOutputRequest,
+) -> Result<(), TurnAdmissionMetadataError> {
+    if request.name.is_empty() {
+        return Err(TurnAdmissionMetadataError::EmptyStructuredOutputName);
+    }
+    if request.name.len() > MAX_TURN_STRUCTURED_OUTPUT_NAME_BYTES {
+        return Err(TurnAdmissionMetadataError::StructuredOutputNameTooLong);
+    }
+    if !is_valid_structured_output_name(&request.name) {
+        return Err(TurnAdmissionMetadataError::InvalidStructuredOutputName);
+    }
+    let schema_bytes = serde_json::to_vec(&request.schema)
+        .map_err(|_| TurnAdmissionMetadataError::InvalidStructuredOutputSchema)?;
+    if schema_bytes.len() > MAX_TURN_STRUCTURED_OUTPUT_SCHEMA_BYTES {
+        return Err(TurnAdmissionMetadataError::StructuredOutputSchemaTooLarge);
+    }
+    if !request.schema.is_object() {
+        return Err(TurnAdmissionMetadataError::InvalidStructuredOutputSchema);
+    }
+    Ok(())
+}
 
 impl TurnAdmissionMetadata {
     /// Validate bounded generic admission metadata.
@@ -1039,20 +1109,7 @@ impl TurnAdmissionMetadata {
             }
         }
         if let Some(request) = &self.execution.structured_output {
-            if request.name.is_empty() {
-                return Err(TurnAdmissionMetadataError::EmptyStructuredOutputName);
-            }
-            if request.name.len() > MAX_TURN_STRUCTURED_OUTPUT_NAME_BYTES {
-                return Err(TurnAdmissionMetadataError::StructuredOutputNameTooLong);
-            }
-            let schema_bytes = serde_json::to_vec(&request.schema)
-                .map_err(|_| TurnAdmissionMetadataError::InvalidStructuredOutputSchema)?;
-            if schema_bytes.len() > MAX_TURN_STRUCTURED_OUTPUT_SCHEMA_BYTES {
-                return Err(TurnAdmissionMetadataError::StructuredOutputSchemaTooLarge);
-            }
-            if !request.schema.is_object() {
-                return Err(TurnAdmissionMetadataError::InvalidStructuredOutputSchema);
-            }
+            validate_structured_output_request(request)?;
         }
         Ok(())
     }
@@ -2651,6 +2708,22 @@ mod tests {
             Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion)
         );
 
+        let invalid_name = TurnAdmissionMetadata {
+            execution: TurnExecutionOptions {
+                structured_output: Some(TurnStructuredOutputRequest {
+                    name: "crate::Result".to_string(),
+                    schema: serde_json::json!({"type": "object"}),
+                    strict: false,
+                }),
+                ..TurnExecutionOptions::default()
+            },
+            ..TurnAdmissionMetadata::default()
+        };
+        assert_eq!(
+            invalid_name.validate(),
+            Err(TurnAdmissionMetadataError::InvalidStructuredOutputName)
+        );
+
         let invalid_schema = TurnAdmissionMetadata {
             execution: TurnExecutionOptions {
                 structured_output: Some(TurnStructuredOutputRequest {
@@ -2666,6 +2739,23 @@ mod tests {
             invalid_schema.validate(),
             Err(TurnAdmissionMetadataError::InvalidStructuredOutputSchema)
         );
+    }
+
+    #[test]
+    fn structured_output_names_are_provider_portable_and_bounded() {
+        assert!(is_valid_structured_output_name("loop_iteration-v1"));
+        assert!(!is_valid_structured_output_name("crate::Result"));
+        assert_eq!(
+            structured_output_name("bcode_loop_plugin::LoopWorkflowIteration"),
+            "bcode_loop_plugin__LoopWorkflowIteration"
+        );
+        assert_eq!(structured_output_name("::"), "__");
+        assert_eq!(structured_output_name(""), "structured_output");
+        let first = structured_output_name(&format!("{}a", "x".repeat(100)));
+        let second = structured_output_name(&format!("{}b", "x".repeat(100)));
+        assert!(first.len() <= 64);
+        assert!(is_valid_structured_output_name(&first));
+        assert_ne!(first, second);
     }
 
     #[test]

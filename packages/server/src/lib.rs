@@ -15273,7 +15273,7 @@ async fn build_model_turn_request(
             .negotiate(state.tool_execution.parallel, bcode_model::ToolChoice::Auto),
         structured_output: execution.structured_output.as_ref().map(|request| {
             bcode_model::StructuredOutputRequest {
-                name: request.name.clone(),
+                name: bcode_session_models::structured_output_name(&request.name),
                 schema: request.schema.clone(),
                 strict: request.strict,
             }
@@ -21265,7 +21265,9 @@ async fn dispatch_workflow_agent_turn(
                 .and_then(serde_json::Value::as_str)
                 .map(ToString::to_string),
             structured_output: Some(TurnStructuredOutputRequest {
-                name: request.activation.node.output.type_name.clone(),
+                name: bcode_session_models::structured_output_name(
+                    &request.activation.node.output.type_name,
+                ),
                 schema: request.activation.node.output.schema.clone(),
                 strict: configuration
                     .get("strict")
@@ -35985,6 +35987,14 @@ library = "test"
         }
     }
 
+    #[test]
+    fn workflow_structured_output_name_is_provider_portable() {
+        let type_name = "bcode_loop_plugin::LoopWorkflowIteration";
+        let name = bcode_session_models::structured_output_name(type_name);
+        assert_eq!(name, "bcode_loop_plugin__LoopWorkflowIteration");
+        assert!(bcode_session_models::is_valid_structured_output_name(&name));
+    }
+
     #[tokio::test]
     async fn workflow_and_manual_turns_share_one_fifo_runtime_queue() {
         let session_id = SessionId::new();
@@ -43243,7 +43253,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
         let execution = bcode_session_models::TurnExecutionOptions {
             structured_output: Some(bcode_session_models::TurnStructuredOutputRequest {
-                name: "answer".to_string(),
+                name: "crate::Answer/v1".to_string(),
                 schema: serde_json::json!({
                     "type": "object",
                     "properties": {"value": {"type": "string"}},
@@ -43285,7 +43295,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(
             prepared.request.structured_output,
             Some(bcode_model::StructuredOutputRequest {
-                name: "answer".to_string(),
+                name: "crate__Answer_v1".to_string(),
                 schema: execution.structured_output.expect("request").schema,
                 strict: true,
             })

@@ -1818,7 +1818,8 @@ pub struct NativeWebSearchResult {
 /// Provider-neutral structured output request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StructuredOutputRequest {
-    /// Human-readable output object name.
+    /// Provider-portable output object name containing only ASCII letters, digits, underscores,
+    /// and hyphens.
     pub name: String,
     /// JSON schema the provider should satisfy.
     pub schema: serde_json::Value,

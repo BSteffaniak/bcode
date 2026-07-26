@@ -1652,6 +1652,7 @@ impl<T> StreamObjectBuilder<T> {
             strict,
             max_repairs,
         } = options;
+        let name = bcode_session_models::structured_output_name(&name);
         if max_repairs > 0 {
             return ObjectStream {
                 stream: None,
@@ -1999,7 +2000,8 @@ pub enum BcodeError {
 /// Structured-output generation options.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StructuredOutputOptions {
-    /// Human-readable object/schema name sent to providers that support native structured output.
+    /// Human-readable, provider-portable object/schema name containing only ASCII letters,
+    /// digits, underscores, and hyphens.
     pub name: String,
     /// JSON schema used for provider-native structured output and local validation.
     pub schema: serde_json::Value,
@@ -2022,11 +2024,12 @@ impl StructuredOutputOptions {
     {
         let schema = schemars::schema_for!(T);
         Self {
-            name: std::any::type_name::<T>()
-                .rsplit("::")
-                .next()
-                .unwrap_or("StructuredOutput")
-                .to_string(),
+            name: bcode_session_models::structured_output_name(
+                std::any::type_name::<T>()
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or("StructuredOutput"),
+            ),
             schema: serde_json::to_value(schema)
                 .expect("schemars schema should serialize to JSON value"),
             strict: true,
@@ -2035,10 +2038,13 @@ impl StructuredOutputOptions {
     }
 
     /// Build options from an explicit JSON schema.
+    ///
+    /// The supplied name is normalized to the provider-portable structured-output identifier
+    /// contract.
     #[must_use]
     pub fn json_schema(name: impl Into<String>, schema: serde_json::Value) -> Self {
         Self {
-            name: name.into(),
+            name: bcode_session_models::structured_output_name(&name.into()),
             schema,
             strict: true,
             max_repairs: 0,
@@ -6539,6 +6545,10 @@ impl Agent {
         P: ModelProviderInvoker,
     {
         let prompt = prompt.into();
+        let options = StructuredOutputOptions {
+            name: bcode_session_models::structured_output_name(&options.name),
+            ..options
+        };
         let schema = options.schema.clone();
         let structured_output = bcode_model::StructuredOutputRequest {
             name: options.name.clone(),

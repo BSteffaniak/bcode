@@ -2851,6 +2851,15 @@ fn validate_openai_request(
     settings: &Settings,
     request: &ModelTurnRequest,
 ) -> Result<(), ProviderError> {
+    if let Some(structured) = &request.structured_output
+        && !bcode_session_models::is_valid_structured_output_name(&structured.name)
+    {
+        return Err(provider_error(
+            "invalid_structured_output_name",
+            ProviderErrorCategory::InvalidRequest,
+            "structured-output names may contain only ASCII letters, digits, underscores, and hyphens and must not exceed 64 bytes",
+        ));
+    }
     validate_openai_tool_choice(request)?;
     if request.parameters.reasoning_budget_tokens.is_some() {
         return Err(provider_error(
@@ -7888,6 +7897,42 @@ mod tests {
                 case.name == required_case && case.outcome == ProviderConformanceOutcome::Passed
             }));
         }
+    }
+
+    #[test]
+    fn structured_output_name_must_be_openai_portable() {
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        let mut request = test_request(Vec::new());
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "bcode_loop_plugin::LoopWorkflowIteration".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        });
+        let error = validate_openai_request(&settings, &request)
+            .expect_err("invalid name must fail before transport");
+        assert_eq!(error.code, "invalid_structured_output_name");
+
+        request.structured_output.as_mut().expect("request").name =
+            "bcode_loop_plugin__LoopWorkflowIteration".to_string();
+        validate_openai_request(&settings, &request).expect("portable name");
+        let body = build_responses_request(&settings, &request, "model").expect("request");
+        assert_eq!(
+            body["text"]["format"]["name"],
+            "bcode_loop_plugin__LoopWorkflowIteration"
+        );
+
+        let chat_settings = test_settings(
+            test_api_key_auth(),
+            OpenAiCompatibleDialect::ChatCompletions,
+        );
+        let chat = serde_json::to_value(
+            build_chat_completion_request(&chat_settings, &request, "model").expect("chat request"),
+        )
+        .expect("chat JSON");
+        assert_eq!(
+            chat["response_format"]["json_schema"]["name"],
+            "bcode_loop_plugin__LoopWorkflowIteration"
+        );
     }
 
     #[test]

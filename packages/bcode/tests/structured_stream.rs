@@ -14,6 +14,15 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+#[test]
+fn explicit_structured_output_name_is_normalized_for_providers() {
+    let options = StructuredOutputOptions::json_schema(
+        "crate::Result/v1",
+        serde_json::json!({"type": "object"}),
+    );
+    assert_eq!(options.name, "crate__Result_v1");
+}
+
 #[derive(Debug, Deserialize, JsonSchema, PartialEq, Eq)]
 struct Output {
     name: String,
