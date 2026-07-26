@@ -32,6 +32,16 @@ writable-lifecycle coverage. Migration classification must preserve each payload
 `OpaqueEvent` history without reviving obsolete interactive-tool, plugin-automation,
 presentation, turn, or stream behavior.
 
+## Released explicit-conversion boundaries
+
+`stores/released-explicit-conversions.jsonl` contains sanitized classification fixtures for the
+first and last released flat tool-result shapes (schemas 1 and 39), the early flat context-usage
+shape (schema 26), and both invocation-wrapped context-usage schemas (30 and 31). These rows pin the
+exact historical DTO boundaries without claiming complete-store writer, ledger, table, root, or
+writable-lifecycle coverage. Store-level writable lifecycle coverage for context schemas 26, 30,
+and 31 lives in the session migration tests, where each shape rebuilds current occupancy and accepts
+a subsequent append.
+
 ## Manifest
 
 `manifest.json` is the machine-enforced inventory for permanent sanitized fixtures. Every listed

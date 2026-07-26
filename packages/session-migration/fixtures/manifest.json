@@ -3,13 +3,24 @@
   "fixtures": [
     {
       "path": "stores/schema-28-tool-context.jsonl",
-      "source_writer_epochs": [2],
-      "covered_writer_schema_pairs": [
-        { "writer_epoch": 2, "event_schema": 28 }
+      "source_writer_epochs": [
+        2
       ],
-      "migration_ledger_endpoints": ["023_reset_legacy_context_occupancy_projection"],
-      "covered_migration_ledger_prefixes": ["023_reset_legacy_context_occupancy_projection"],
-      "event_schemas": [28],
+      "covered_writer_schema_pairs": [
+        {
+          "writer_epoch": 2,
+          "event_schema": 28
+        }
+      ],
+      "migration_ledger_endpoints": [
+        "023_reset_legacy_context_occupancy_projection"
+      ],
+      "covered_migration_ledger_prefixes": [
+        "023_reset_legacy_context_occupancy_projection"
+      ],
+      "event_schemas": [
+        28
+      ],
       "migratable_store": true,
       "historical_payloads": true,
       "expected_event_count": 5,
@@ -19,16 +30,38 @@
         "current_passthrough": 2
       },
       "covered_schema_event_pairs": [
-        { "event_schema": 28, "event_kind": "session_created" },
-        { "event_schema": 28, "event_kind": "tool_call_requested" },
-        { "event_schema": 28, "event_kind": "tool_invocation_stream" },
-        { "event_schema": 28, "event_kind": "tool_call_finished" },
-        { "event_schema": 28, "event_kind": "context_usage_observed" }
+        {
+          "event_schema": 28,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "context_usage_observed"
+        }
       ],
-      "covered_authoritative_records": ["session_drafts"],
-      "covered_roots": ["session-storage/writer-epoch-2"],
+      "covered_authoritative_records": [
+        "session_drafts"
+      ],
+      "covered_roots": [
+        "session-storage/writer-epoch-2"
+      ],
       "covered_root_writer_pairs": [
-        { "root": "session-storage/writer-epoch-2", "writer_epoch": 2 }
+        {
+          "root": "session-storage/writer-epoch-2",
+          "writer_epoch": 2
+        }
       ],
       "covered_tables": [
         "artifact_references",
@@ -53,26 +86,86 @@
         "turn_receipts"
       ],
       "covered_table_treatments": [
-        { "table": "artifact_references", "treatment": "rebuild_from_canonical" },
-        { "table": "composer_drafts", "treatment": "global_only" },
-        { "table": "context_occupancy_projection", "treatment": "rebuild_from_canonical" },
-        { "table": "events", "treatment": "preserve" },
-        { "table": "input_messages", "treatment": "rebuild_from_canonical" },
-        { "table": "model_context_entries", "treatment": "rebuild_from_canonical" },
-        { "table": "model_context_projection_state", "treatment": "rebuild_from_canonical" },
-        { "table": "projection_checkpoints", "treatment": "rebuild_from_canonical" },
-        { "table": "runtime_work", "treatment": "rebuild_from_canonical" },
-        { "table": "session_compatibility_issues", "treatment": "rebuild_from_canonical" },
-        { "table": "session_compatibility_state", "treatment": "rebuild_from_canonical" },
-        { "table": "session_drafts", "treatment": "preserve" },
-        { "table": "session_migration_receipts", "treatment": "finalize_current" },
-        { "table": "session_state", "treatment": "rebuild_from_canonical" },
-        { "table": "session_storage_contract", "treatment": "finalize_current" },
-        { "table": "sessions", "treatment": "global_only" },
-        { "table": "snapshots", "treatment": "retire_derived" },
-        { "table": "tool_runs", "treatment": "rebuild_from_canonical" },
-        { "table": "transcript_items", "treatment": "rebuild_from_canonical" },
-        { "table": "turn_receipts", "treatment": "rebuild_from_canonical" }
+        {
+          "table": "artifact_references",
+          "treatment": "rebuild_from_canonical"
+        },
+        {
+          "table": "composer_drafts",
+          "treatment": "global_only"
+        },
+        {
+          "table": "context_occupancy_projection",
+          "treatment": "rebuild_from_canonical"
+        },
+        {
+          "table": "events",
+          "treatment": "preserve"
+        },
+        {
+          "table": "input_messages",
+          "treatment": "rebuild_from_canonical"
+        },
+        {
+          "table": "model_context_entries",
+          "treatment": "rebuild_from_canonical"
+        },
+        {
+          "table": "model_context_projection_state",
+          "treatment": "rebuild_from_canonical"
+        },
+        {
+          "table": "projection_checkpoints",
+          "treatment": "rebuild_from_canonical"
+        },
+        {
+          "table": "runtime_work",
+          "treatment": "rebuild_from_canonical"
+        },
+        {
+          "table": "session_compatibility_issues",
+          "treatment": "rebuild_from_canonical"
+        },
+        {
+          "table": "session_compatibility_state",
+          "treatment": "rebuild_from_canonical"
+        },
+        {
+          "table": "session_drafts",
+          "treatment": "preserve"
+        },
+        {
+          "table": "session_migration_receipts",
+          "treatment": "finalize_current"
+        },
+        {
+          "table": "session_state",
+          "treatment": "rebuild_from_canonical"
+        },
+        {
+          "table": "session_storage_contract",
+          "treatment": "finalize_current"
+        },
+        {
+          "table": "sessions",
+          "treatment": "global_only"
+        },
+        {
+          "table": "snapshots",
+          "treatment": "retire_derived"
+        },
+        {
+          "table": "tool_runs",
+          "treatment": "rebuild_from_canonical"
+        },
+        {
+          "table": "transcript_items",
+          "treatment": "rebuild_from_canonical"
+        },
+        {
+          "table": "turn_receipts",
+          "treatment": "rebuild_from_canonical"
+        }
       ],
       "covered_event_kinds": [
         "session_created",
@@ -88,7 +181,11 @@
       "covered_writer_schema_pairs": [],
       "migration_ledger_endpoints": [],
       "covered_migration_ledger_prefixes": [],
-      "event_schemas": [21, 29, 32],
+      "event_schemas": [
+        21,
+        29,
+        32
+      ],
       "migratable_store": false,
       "historical_payloads": false,
       "expected_event_count": 11,
@@ -98,17 +195,50 @@
         "current_passthrough": 1
       },
       "covered_schema_event_pairs": [
-        { "event_schema": 29, "event_kind": "interactive_tool_request_created" },
-        { "event_schema": 29, "event_kind": "interactive_tool_request_resolved" },
-        { "event_schema": 32, "event_kind": "legacy_event" },
-        { "event_schema": 29, "event_kind": "legacy_tool_invocation_presentation" },
-        { "event_schema": 32, "event_kind": "legacy_turn_finished" },
-        { "event_schema": 32, "event_kind": "legacy_turn_started" },
-        { "event_schema": 29, "event_kind": "plugin_automation_turn_finished" },
-        { "event_schema": 29, "event_kind": "plugin_automation_turn_started" },
-        { "event_schema": 29, "event_kind": "session_created" },
-        { "event_schema": 21, "event_kind": "tool_invocation_presentation" },
-        { "event_schema": 29, "event_kind": "tool_invocation_stream" }
+        {
+          "event_schema": 29,
+          "event_kind": "interactive_tool_request_created"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "interactive_tool_request_resolved"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "legacy_event"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "legacy_tool_invocation_presentation"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "legacy_turn_finished"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "legacy_turn_started"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "plugin_automation_turn_finished"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "plugin_automation_turn_started"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "tool_invocation_presentation"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "tool_invocation_stream"
+        }
       ],
       "covered_authoritative_records": [],
       "covered_roots": [],
@@ -127,6 +257,59 @@
         "session_created",
         "tool_invocation_presentation",
         "tool_invocation_stream"
+      ]
+    },
+    {
+      "path": "stores/released-explicit-conversions.jsonl",
+      "source_writer_epochs": [],
+      "covered_writer_schema_pairs": [],
+      "migration_ledger_endpoints": [],
+      "covered_migration_ledger_prefixes": [],
+      "event_schemas": [
+        1,
+        26,
+        30,
+        31,
+        39
+      ],
+      "migratable_store": false,
+      "historical_payloads": false,
+      "expected_event_count": 5,
+      "expected_classifications": {
+        "converted": 5,
+        "retired_known": 0,
+        "current_passthrough": 0
+      },
+      "covered_schema_event_pairs": [
+        {
+          "event_schema": 1,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "context_usage_observed"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "context_usage_observed"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "context_usage_observed"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "tool_call_finished"
+        }
+      ],
+      "covered_authoritative_records": [],
+      "covered_roots": [],
+      "covered_root_writer_pairs": [],
+      "covered_tables": [],
+      "covered_table_treatments": [],
+      "covered_event_kinds": [
+        "context_usage_observed",
+        "tool_call_finished"
       ]
     }
   ]

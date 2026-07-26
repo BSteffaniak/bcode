@@ -2146,8 +2146,13 @@ mod tests {
                 .migration_ledger_prefixes
                 .contains("023_reset_legacy_context_occupancy_projection")
         );
+        assert!(!gaps.event_schemas.contains(&1));
+        assert!(!gaps.event_schemas.contains(&26));
         assert!(!gaps.event_schemas.contains(&28));
         assert!(!gaps.event_schemas.contains(&29));
+        assert!(!gaps.event_schemas.contains(&30));
+        assert!(!gaps.event_schemas.contains(&31));
+        assert!(!gaps.event_schemas.contains(&39));
         assert!(gaps.event_schemas.contains(&27));
         assert!(gaps.event_kinds.contains("assistant_message"));
         assert!(!gaps.event_kinds.contains("assistant_reasoning_activity"));
