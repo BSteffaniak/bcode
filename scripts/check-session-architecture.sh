@@ -282,6 +282,8 @@ fi
 
 if ! rg -q 'historical_codec_only_applies_family_rules_to_released_schema_ranges' packages/session-migration/src/execution.rs \
   || ! rg -q 'pub fn normalize_canonical_event' packages/session-migration/src/execution.rs \
+  || ! rg -q 'if !descriptor.supports_schema\(envelope.schema_version\(\)\)' packages/session-migration/src/execution.rs \
+  || ! rg -q 'historical_codec_only_applies_family_rules_to_released_schema_ranges' packages/session-migration/src/execution.rs \
   || ! rg -q 'all_released_context_usage_shapes_use_the_frozen_codec' packages/session-migration/src/execution.rs \
   || ! rg -q 'context_usage_without_required_request_identity_is_preserved_inert' packages/session-migration/src/execution.rs \
   || ! rg -q 'released_context_usage_shapes_migrate_to_writable_current_occupancy' packages/session/src/db.rs \

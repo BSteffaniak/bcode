@@ -29,7 +29,10 @@ pub struct ReleasedFixtureDescriptor {
     /// Exact migration-ledger prefix endpoints represented by this fixture.
     #[serde(default)]
     pub covered_migration_ledger_prefixes: Vec<String>,
-    /// Event schemas represented by this fixture.
+    /// Every canonical event schema represented by the fixture. Complete-store fixtures must
+    /// declare these exactly; classification-only fixtures may additionally declare schema
+    /// coverage in `covered_schema_event_pairs` when one representative payload is proven
+    /// structurally identical across multiple released schemas.
     pub event_schemas: Vec<u16>,
     /// Whether this fixture is a complete migratable store input rather than classification-only
     /// canonical payload coverage.
@@ -655,15 +658,28 @@ pub fn load_released_fixture_manifest(
             .iter()
             .map(|pair| pair.event_kind.clone())
             .collect::<BTreeSet<_>>();
-        if paired_schemas != fixture.event_schemas.iter().copied().collect()
-            || paired_kinds != fixture.covered_event_kinds.iter().cloned().collect()
-        {
+        let fixture_schemas = fixture
+            .event_schemas
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let fixture_kinds = fixture
+            .covered_event_kinds
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let invalid_schema_coverage = if fixture.migratable_store {
+            paired_schemas != fixture_schemas
+        } else {
+            !fixture_schemas.is_subset(&paired_schemas)
+        };
+        if invalid_schema_coverage || paired_kinds != fixture_kinds {
             return Err(ReleasedFixtureInventoryError::SchemaEventCoverageMismatch(
                 fixture.path.clone(),
             ));
         }
         for pair in &fixture.covered_schema_event_pairs {
-            if !fixture.event_schemas.contains(&pair.event_schema)
+            if (fixture.migratable_store && !fixture.event_schemas.contains(&pair.event_schema))
                 || !fixture.covered_event_kinds.contains(&pair.event_kind)
             {
                 return Err(ReleasedFixtureInventoryError::SchemaEventCoverageMismatch(
@@ -927,6 +943,21 @@ fn historical_store_event_coverage_gaps(manifest: &ReleasedFixtureManifest) -> B
         .collect()
 }
 
+fn fixture_schema_coverage(manifest: &ReleasedFixtureManifest) -> BTreeSet<u16> {
+    manifest
+        .fixtures
+        .iter()
+        .flat_map(|fixture| {
+            fixture.event_schemas.iter().copied().chain(
+                fixture
+                    .covered_schema_event_pairs
+                    .iter()
+                    .map(|pair| pair.event_schema),
+            )
+        })
+        .collect()
+}
+
 /// Return exact released inventory dimensions not represented by permanent fixtures.
 #[must_use]
 pub fn released_fixture_coverage_gaps(
@@ -935,9 +966,7 @@ pub fn released_fixture_coverage_gaps(
     let covered_writers = released_fixture_writer_coverage(manifest)
         .into_keys()
         .collect::<BTreeSet<_>>();
-    let covered_schemas = released_fixture_schema_coverage(manifest)
-        .into_keys()
-        .collect::<BTreeSet<_>>();
+    let covered_schemas = fixture_schema_coverage(manifest);
     let covered_writer_schema_pairs = fixture_writer_schema_pairs(manifest);
     let covered_writer_schema_event_combinations =
         fixture_writer_schema_event_combinations(manifest);
@@ -1236,7 +1265,8 @@ fn released_event_schema_range(kind: &str) -> (u16, u16) {
         | "skill_invoked"
         | "skill_suggested" => (9, 39),
         "context_compacted" => (6, 39),
-        "context_usage_observed" | "provider_context_compacted" => (26, 39),
+        "context_usage_observed" => (26, 31),
+        "provider_context_compacted" => (26, 39),
         "execution_session_created" | "opaque_event" => (39, 39),
         "interactive_tool_request_created" | "interactive_tool_request_resolved" => (25, 35),
         "legacy_event"
@@ -2153,7 +2183,7 @@ mod tests {
         assert!(!gaps.event_schemas.contains(&30));
         assert!(!gaps.event_schemas.contains(&31));
         assert!(!gaps.event_schemas.contains(&39));
-        assert!(gaps.event_schemas.contains(&27));
+        assert!(!gaps.event_schemas.contains(&27));
         assert!(gaps.event_kinds.contains("assistant_message"));
         assert!(!gaps.event_kinds.contains("assistant_reasoning_activity"));
         assert!(

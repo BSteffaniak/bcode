@@ -26,21 +26,25 @@ Expected migration treatment:
 ## Confirmed retired event families
 
 `stores/retired-events.jsonl` contains synthetic classification coverage for every released event
-family removed from the active runtime. Each row uses a schema that actually released that family;
-it is not a complete store fixture and therefore claims no writer, ledger, root, table, or
-writable-lifecycle coverage. Migration classification must preserve each payload as inert current
-`OpaqueEvent` history without reviving obsolete interactive-tool, plugin-automation,
-presentation, turn, or stream behavior.
+family removed from the active runtime. Each representative row uses a schema that actually
+released that family; the manifest additionally declares every released schema in that family's
+exact inventory range, and the fixture gate replays each declared schema/kind pair by changing only
+the stable envelope schema. It is not a complete store fixture and therefore claims no writer,
+ledger, root, table, or writable-lifecycle coverage. Migration classification must preserve each
+payload as inert current `OpaqueEvent` history without reviving obsolete interactive-tool,
+plugin-automation, presentation, turn, or stream behavior.
 
 ## Released explicit-conversion boundaries
 
 `stores/released-explicit-conversions.jsonl` contains sanitized classification fixtures for the
 first and last released flat tool-result shapes (schemas 1 and 39), the early flat context-usage
-shape (schema 26), and both invocation-wrapped context-usage schemas (30 and 31). These rows pin the
-exact historical DTO boundaries without claiming complete-store writer, ledger, table, root, or
-writable-lifecycle coverage. Store-level writable lifecycle coverage for context schemas 26, 30,
-and 31 lives in the session migration tests, where each shape rebuilds current occupancy and accepts
-a subsequent append.
+shape (schema 26), and both invocation-wrapped context-usage schemas (30 and 31). The manifest also
+claims every intervening released schema for those exact unchanged event families; the fixture gate
+replays each declared schema/kind pair by substituting only the stable envelope schema and requiring
+successful migration decoding. These rows pin the exact historical DTO boundaries without claiming
+complete-store writer, ledger, table, root, or writable-lifecycle coverage. Store-level writable
+lifecycle coverage for context schemas 26, 30, and 31 lives in the session migration tests, where
+each shape rebuilds current occupancy and accepts a subsequent append.
 
 ## Manifest
 

@@ -231,6 +231,11 @@ fn decode_for_migration(
 ) -> Result<HistoricalDecode, HistoricalSessionEventError> {
     let current = decode_current(payload);
     let envelope = serde_json::from_str::<HistoricalEnvelope>(payload)?;
+    if !crate::is_released_historical_event_schema(envelope.schema_version()) {
+        return Err(HistoricalSessionEventError::UnsupportedSchema {
+            schema_version: envelope.schema_version(),
+        });
+    }
     let source_kind = envelope.source_kind_name()?;
     if source_kind == "tool_call_finished" && envelope.schema_version() <= 39 {
         return historical_event_families::decode_tool_call_finished(&envelope);
@@ -241,10 +246,21 @@ fn decode_for_migration(
     if envelope.schema_version() == 28 && source_kind == "tool_invocation_stream" {
         return historical_event_families::decode_schema_28(&envelope);
     }
-    if crate::RELEASED_EVENT_VARIANTS.iter().any(|variant| {
-        variant.kind == source_kind
-            && variant.treatment == crate::ReleasedEventTreatment::RetiredKnown
-    }) {
+    let descriptor = crate::RELEASED_EVENT_VARIANTS
+        .iter()
+        .find(|variant| variant.kind == source_kind)
+        .copied()
+        .ok_or_else(|| HistoricalSessionEventError::UnsupportedEventKind {
+            schema_version: envelope.schema_version(),
+            event_kind: source_kind.to_owned(),
+        })?;
+    if !descriptor.supports_schema(envelope.schema_version()) {
+        return Err(HistoricalSessionEventError::UnsupportedEventKind {
+            schema_version: envelope.schema_version(),
+            event_kind: source_kind.to_owned(),
+        });
+    }
+    if descriptor.treatment == crate::ReleasedEventTreatment::RetiredKnown {
         return envelope.decode_retired_known();
     }
     match current {
@@ -371,14 +387,14 @@ mod tests {
                     .iter()
                     .map(|event| event.schema_version)
                     .collect::<BTreeSet<_>>(),
-                fixture.event_schemas.into_iter().collect()
+                fixture.event_schemas.iter().copied().collect()
             );
             assert_eq!(
                 envelopes
                     .iter()
                     .flat_map(|event| event.kind.keys().cloned())
                     .collect::<BTreeSet<_>>(),
-                fixture.covered_event_kinds.into_iter().collect()
+                fixture.covered_event_kinds.iter().cloned().collect()
             );
             let actual_pairs = envelopes
                 .iter()
@@ -397,7 +413,28 @@ mod tests {
                 .iter()
                 .cloned()
                 .collect::<BTreeSet<_>>();
-            assert_eq!(actual_pairs, declared_pairs);
+            if fixture.migratable_store {
+                assert_eq!(actual_pairs, declared_pairs);
+            } else {
+                assert!(actual_pairs.is_subset(&declared_pairs));
+                for pair in declared_pairs.difference(&actual_pairs) {
+                    let template_index = envelopes
+                        .iter()
+                        .position(|event| event.kind.contains_key(&pair.event_kind))
+                        .expect("declared schema/kind pair must have a template payload");
+                    let mut value =
+                        serde_json::from_str::<serde_json::Value>(payloads[template_index])
+                            .expect("fixture payload JSON");
+                    value["schema_version"] = serde_json::json!(pair.event_schema);
+                    let payload = serde_json::to_string(&value).expect("fixture payload JSON");
+                    decode_for_migration(&payload, reject_current).unwrap_or_else(|error| {
+                        panic!(
+                            "declared classification pair {}:{} must decode: {error}",
+                            pair.event_schema, pair.event_kind
+                        )
+                    });
+                }
+            }
             assert!(
                 !fixture.covered_authoritative_records.is_empty() || !fixture.migratable_store,
                 "migratable fixture must cover authoritative records"
@@ -577,19 +614,19 @@ mod tests {
 
     #[test]
     fn inventoried_retired_families_materialize_as_inert_current_history() {
-        for event_kind in [
-            "interactive_tool_request_created",
-            "interactive_tool_request_resolved",
-            "legacy_event",
-            "legacy_tool_invocation_presentation",
-            "legacy_turn_finished",
-            "legacy_turn_started",
-            "plugin_automation_turn_finished",
-            "plugin_automation_turn_started",
-            "tool_invocation_presentation",
+        for (event_kind, schema_version) in [
+            ("interactive_tool_request_created", 29),
+            ("interactive_tool_request_resolved", 29),
+            ("legacy_event", 32),
+            ("legacy_tool_invocation_presentation", 29),
+            ("legacy_turn_finished", 32),
+            ("legacy_turn_started", 32),
+            ("plugin_automation_turn_finished", 29),
+            ("plugin_automation_turn_started", 29),
+            ("tool_invocation_presentation", 21),
         ] {
             let payload = format!(
-                r#"{{"schema_version":29,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"{event_kind}":{{"preserved":true}}}}}}"#
+                r#"{{"schema_version":{schema_version},"sequence":1,"session_id":"{SESSION_ID}","kind":{{"{event_kind}":{{"preserved":true}}}}}}"#
             );
             let HistoricalDecode::RetiredKnown { event, metadata } =
                 decode_for_migration(&payload, reject_current).expect("retired family")
@@ -777,8 +814,19 @@ mod tests {
         );
         assert!(matches!(
             decode_for_migration(&payload, reject_current),
-            Err(HistoricalSessionEventError::InvalidEvent {
+            Err(HistoricalSessionEventError::UnsupportedEventKind {
                 schema_version: 32,
+                ..
+            })
+        ));
+
+        let payload = format!(
+            r#"{{"schema_version":1,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"tool_invocation_stream":{{"event":{{"status":{{"tool_call_id":"call","sequence":1,"message":"working"}}}}}}}}}}"#
+        );
+        assert!(matches!(
+            decode_for_migration(&payload, reject_current),
+            Err(HistoricalSessionEventError::UnsupportedEventKind {
+                schema_version: 1,
                 ..
             })
         ));
@@ -906,7 +954,7 @@ mod tests {
         );
         assert!(matches!(
             decode_for_migration(&payload, reject_current),
-            Err(HistoricalSessionEventError::InvalidEvent { .. })
+            Err(HistoricalSessionEventError::UnsupportedEventKind { .. })
         ));
     }
 }

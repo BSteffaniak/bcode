@@ -197,10 +197,78 @@
       "covered_schema_event_pairs": [
         {
           "event_schema": 29,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "interactive_tool_request_created"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "interactive_tool_request_created"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "interactive_tool_request_created"
+        },
+        {
+          "event_schema": 28,
           "event_kind": "interactive_tool_request_created"
         },
         {
           "event_schema": 29,
+          "event_kind": "interactive_tool_request_created"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "interactive_tool_request_created"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "interactive_tool_request_created"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "interactive_tool_request_created"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "interactive_tool_request_created"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "interactive_tool_request_resolved"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "interactive_tool_request_resolved"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "interactive_tool_request_resolved"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "interactive_tool_request_resolved"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "interactive_tool_request_resolved"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "interactive_tool_request_resolved"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "interactive_tool_request_resolved"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "interactive_tool_request_resolved"
+        },
+        {
+          "event_schema": 35,
           "event_kind": "interactive_tool_request_resolved"
         },
         {
@@ -208,7 +276,67 @@
           "event_kind": "legacy_event"
         },
         {
+          "event_schema": 35,
+          "event_kind": "legacy_event"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "legacy_event"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "legacy_event"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "legacy_event"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "legacy_tool_invocation_presentation"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "legacy_tool_invocation_presentation"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "legacy_tool_invocation_presentation"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "legacy_tool_invocation_presentation"
+        },
+        {
           "event_schema": 29,
+          "event_kind": "legacy_tool_invocation_presentation"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "legacy_tool_invocation_presentation"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "legacy_tool_invocation_presentation"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "legacy_tool_invocation_presentation"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "legacy_tool_invocation_presentation"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "legacy_tool_invocation_presentation"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "legacy_tool_invocation_presentation"
+        },
+        {
+          "event_schema": 39,
           "event_kind": "legacy_tool_invocation_presentation"
         },
         {
@@ -216,7 +344,39 @@
           "event_kind": "legacy_turn_finished"
         },
         {
+          "event_schema": 35,
+          "event_kind": "legacy_turn_finished"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "legacy_turn_finished"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "legacy_turn_finished"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "legacy_turn_finished"
+        },
+        {
           "event_schema": 32,
+          "event_kind": "legacy_turn_started"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "legacy_turn_started"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "legacy_turn_started"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "legacy_turn_started"
+        },
+        {
+          "event_schema": 39,
           "event_kind": "legacy_turn_started"
         },
         {
@@ -224,19 +384,151 @@
           "event_kind": "plugin_automation_turn_finished"
         },
         {
+          "event_schema": 30,
+          "event_kind": "plugin_automation_turn_finished"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "plugin_automation_turn_finished"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "plugin_automation_turn_finished"
+        },
+        {
           "event_schema": 29,
           "event_kind": "plugin_automation_turn_started"
         },
         {
-          "event_schema": 29,
-          "event_kind": "session_created"
+          "event_schema": 30,
+          "event_kind": "plugin_automation_turn_started"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "plugin_automation_turn_started"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "plugin_automation_turn_started"
         },
         {
           "event_schema": 21,
           "event_kind": "tool_invocation_presentation"
         },
         {
+          "event_schema": 22,
+          "event_kind": "tool_invocation_presentation"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "tool_invocation_presentation"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "tool_invocation_presentation"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "tool_invocation_presentation"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
           "event_schema": 29,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 39,
           "event_kind": "tool_invocation_stream"
         }
       ],
@@ -286,7 +578,159 @@
           "event_kind": "tool_call_finished"
         },
         {
+          "event_schema": 2,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 3,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 4,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "tool_call_finished"
+        },
+        {
           "event_schema": 26,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "tool_call_finished"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "context_usage_observed"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "context_usage_observed"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "context_usage_observed"
+        },
+        {
+          "event_schema": 29,
           "event_kind": "context_usage_observed"
         },
         {
@@ -296,10 +740,6 @@
         {
           "event_schema": 31,
           "event_kind": "context_usage_observed"
-        },
-        {
-          "event_schema": 39,
-          "event_kind": "tool_call_finished"
         }
       ],
       "covered_authoritative_records": [],

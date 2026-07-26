@@ -297,7 +297,7 @@ mod tests {
                 .contains("001_events_table")
         );
         assert!(!error.gaps.event_schemas.contains(&1));
-        assert!(error.gaps.event_schemas.contains(&2));
+        assert!(!error.gaps.event_schemas.contains(&2));
         assert!(error.gaps.event_kinds.contains("assistant_message"));
         assert!(error.gaps.authoritative_records.is_empty());
     }
