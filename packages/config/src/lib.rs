@@ -1750,6 +1750,10 @@ pub struct TuiConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub mouse: TuiMouseConfig,
+    /// Rich Markdown image and diagram presentation configuration.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub markdown: TuiMarkdownConfig,
     /// Provider-exposed reasoning / thinking display configuration.
     #[config_doc(nested)]
     #[serde(default)]
@@ -2195,6 +2199,31 @@ pub enum TuiThinkingMode {
     Summary,
     /// Show raw provider reasoning when available.
     Raw,
+}
+
+/// Terminal Markdown rich-presentation configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "markdown")]
+pub struct TuiMarkdownConfig {
+    /// Permit fetching classified HTTP(S) image sources for visible resident transcript items.
+    #[serde(default)]
+    pub network_images: bool,
+    /// Permit process-isolated Mermaid rendering for visible resident transcript items.
+    #[serde(default = "default_tui_markdown_mermaid")]
+    pub mermaid: bool,
+}
+
+impl Default for TuiMarkdownConfig {
+    fn default() -> Self {
+        Self {
+            network_images: false,
+            mermaid: default_tui_markdown_mermaid(),
+        }
+    }
+}
+
+const fn default_tui_markdown_mermaid() -> bool {
+    true
 }
 
 /// Terminal UI mouse interaction configuration.
@@ -4829,6 +4858,7 @@ fn write_tui_toml(output: &mut String, tui: &TuiConfig) {
         write_tui_keybinding_section(output, "session_picker", &tui.keybindings.session_picker);
     }
     write_tui_mouse_toml(output, &tui.mouse);
+    write_tui_markdown_toml(output, tui.markdown);
     writeln!(output, "[tui.thinking]").expect("writing to string should not fail");
     writeln!(output, "show = {}", tui.thinking.show).expect("writing to string should not fail");
     writeln!(
@@ -4845,6 +4875,16 @@ const fn tui_thinking_mode_name(mode: TuiThinkingMode) -> &'static str {
         TuiThinkingMode::Summary => "summary",
         TuiThinkingMode::Raw => "raw",
     }
+}
+
+fn write_tui_markdown_toml(output: &mut String, markdown: TuiMarkdownConfig) {
+    if markdown == TuiMarkdownConfig::default() {
+        return;
+    }
+    writeln!(output, "[tui.markdown]").expect("writing to string should not fail");
+    writeln!(output, "network_images = {}", markdown.network_images)
+        .expect("writing to string should not fail");
+    writeln!(output, "mermaid = {}", markdown.mermaid).expect("writing to string should not fail");
 }
 
 fn write_tui_mouse_toml(output: &mut String, mouse: &TuiMouseConfig) {
@@ -6398,6 +6438,24 @@ message_contains = "Unsupported content type"
             rule.r#match.message_contains.as_deref(),
             Some("Unsupported content type")
         );
+    }
+
+    #[test]
+    fn tui_markdown_capabilities_are_explicit_and_secure_by_default() {
+        let defaults = BcodeConfig::default().tui.markdown;
+        assert!(!defaults.network_images);
+        assert!(defaults.mermaid);
+
+        let config: BcodeConfig = toml::from_str(
+            r"
+[tui.markdown]
+network_images = true
+mermaid = false
+",
+        )
+        .expect("config should parse");
+        assert!(config.tui.markdown.network_images);
+        assert!(!config.tui.markdown.mermaid);
     }
 
     #[test]

@@ -256,6 +256,18 @@ pub enum MarkdownLinkDestinationPresentation {
     ReadableFallback,
 }
 
+/// Mermaid contribution behavior for one render.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum MermaidRenderMode {
+    /// Preserve highlighted source without a rich contribution request.
+    #[default]
+    Disabled,
+    /// Emit a typed request for asynchronous presentation.
+    Contribution,
+    /// Render synchronously for explicit non-interactive callers and tests.
+    Inline,
+}
+
 /// Options controlling terminal Markdown rendering.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkdownRenderOptions {
@@ -265,12 +277,16 @@ pub struct MarkdownRenderOptions {
     pub theme: MarkdownTheme,
     /// Trusted context used only to resolve relative destinations.
     pub document_context: Option<MarkdownDocumentContext>,
-    /// Whether the Mermaid backend should be used for Mermaid fences.
-    pub mermaid_enabled: bool,
+    /// Mermaid contribution behavior.
+    pub mermaid: MermaidRenderMode,
     /// Maximum Mermaid SVG width in pixels.
     pub mermaid_width: u32,
     /// Maximum Mermaid SVG height in pixels.
     pub mermaid_height: u32,
+    /// Number of terminal rows reserved for each image contribution.
+    pub image_reserved_rows: u16,
+    /// Number of terminal rows reserved for each Mermaid contribution.
+    pub mermaid_reserved_rows: u16,
     /// Stable identity of the owning document or transcript item.
     pub document_id: Option<String>,
     /// Whether the source is an incomplete streaming document.
@@ -290,9 +306,11 @@ impl Default for MarkdownRenderOptions {
             width: 80,
             theme: MarkdownTheme::default(),
             document_context: None,
-            mermaid_enabled: false,
+            mermaid: MermaidRenderMode::Disabled,
             mermaid_width: 1600,
             mermaid_height: 1200,
+            image_reserved_rows: 1,
+            mermaid_reserved_rows: 1,
             document_id: None,
             streaming: false,
             link_destination_presentation: MarkdownLinkDestinationPresentation::LabelOnly,
@@ -359,10 +377,27 @@ impl MarkdownRenderOptions {
         self
     }
 
-    /// Return options with bounded Mermaid rendering enabled.
+    /// Return options with Mermaid contribution requests enabled without rendering inline.
+    #[must_use]
+    pub const fn with_mermaid_contributions(mut self, width: u32, height: u32) -> Self {
+        self.mermaid = MermaidRenderMode::Contribution;
+        self.mermaid_width = width;
+        self.mermaid_height = height;
+        self
+    }
+
+    /// Return options with stable rich-presentation row reservations.
+    #[must_use]
+    pub fn with_rich_reserved_rows(mut self, image_rows: u16, mermaid_rows: u16) -> Self {
+        self.image_reserved_rows = image_rows.max(1);
+        self.mermaid_reserved_rows = mermaid_rows.max(1);
+        self
+    }
+
+    /// Return options with bounded synchronous Mermaid rendering enabled.
     #[must_use]
     pub const fn with_mermaid(mut self, width: u32, height: u32) -> Self {
-        self.mermaid_enabled = true;
+        self.mermaid = MermaidRenderMode::Inline;
         self.mermaid_width = width;
         self.mermaid_height = height;
         self
@@ -1159,13 +1194,15 @@ fn markdown_layout_signature(
     geometry: &[MarkdownContributionGeometry],
 ) -> String {
     format!(
-        "markdown-layout-v3:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        "markdown-layout-v3:{}:{}:{}:{}:{:?}:{}:{}:{}:{}:{}:{}:{}:{}",
         options.width,
         stable_text_hash(markdown),
         stable_text_hash(&format!("{:?}", options.theme)),
         stable_text_hash(&format!("{:?}", options.document_context)),
-        options.mermaid_enabled,
+        options.mermaid,
         options.mermaid_width,
+        options.image_reserved_rows,
+        options.mermaid_reserved_rows,
         options.streaming,
         options.details_interactive,
         stable_text_hash(&format!("{:?}", options.details_open)),
@@ -2004,8 +2041,14 @@ fn render_markdown_projection(
     let table_alignments = table_alignments(markdown);
     let alert_kinds = alert_kinds(markdown);
     let container = markdown_to_container_with_options(markdown, hyperchad_markdown_options());
-    let mut renderer =
-        TerminalMarkdownRenderer::new(options.width, options.theme, table_alignments, alert_kinds);
+    let mut renderer = TerminalMarkdownRenderer::new(
+        options.width,
+        options.theme,
+        table_alignments,
+        alert_kinds,
+        options.image_reserved_rows,
+        options.mermaid_reserved_rows,
+    );
     renderer.render_container_children(
         &container,
         TextStyle {
@@ -2319,7 +2362,7 @@ fn finish_mermaid_contribution(
         let request =
             MermaidRenderRequest::svg(text.clone(), options.mermaid_width, options.mermaid_height);
         let cache_key = request.cache_key();
-        let rendering = if options.mermaid_enabled {
+        let rendering = if matches!(options.mermaid, MermaidRenderMode::Inline) {
             match render_mermaid(&request, &MermaidCancellationToken::default()) {
                 Ok(rendered) => match rendered.output {
                     MermaidRenderedOutput::Svg(svg) => MermaidContributionRendering::Svg(svg),
@@ -2657,6 +2700,8 @@ struct TerminalMarkdownRenderer {
     next_table_index: usize,
     alert_kinds: Rc<Vec<Option<BlockQuoteKind>>>,
     next_blockquote_index: Rc<Cell<usize>>,
+    image_reserved_rows: usize,
+    mermaid_reserved_rows: usize,
     theme: MarkdownTheme,
 }
 
@@ -2666,6 +2711,8 @@ impl TerminalMarkdownRenderer {
         theme: MarkdownTheme,
         table_alignments: Vec<Vec<Alignment>>,
         alert_kinds: Vec<Option<BlockQuoteKind>>,
+        image_reserved_rows: u16,
+        mermaid_reserved_rows: u16,
     ) -> Self {
         Self {
             width: usize::from(width.max(1)),
@@ -2680,6 +2727,8 @@ impl TerminalMarkdownRenderer {
             next_table_index: 0,
             alert_kinds: Rc::new(alert_kinds),
             next_blockquote_index: Rc::new(Cell::new(0)),
+            image_reserved_rows: usize::from(image_reserved_rows.max(1)),
+            mermaid_reserved_rows: usize::from(mermaid_reserved_rows.max(1)),
             theme,
         }
     }
@@ -2698,6 +2747,8 @@ impl TerminalMarkdownRenderer {
             next_table_index: 0,
             alert_kinds: Rc::clone(&self.alert_kinds),
             next_blockquote_index: Rc::clone(&self.next_blockquote_index),
+            image_reserved_rows: self.image_reserved_rows,
+            mermaid_reserved_rows: self.mermaid_reserved_rows,
             theme: self.theme,
         }
     }
@@ -2742,7 +2793,12 @@ impl TerminalMarkdownRenderer {
                     .or_else(|| alt.as_deref().filter(|value| !value.is_empty()))
                     .or_else(|| source.as_deref().filter(|value| !value.is_empty()))
                     .unwrap_or("image");
-                self.render_marked_text(&format!("[image: {image}]"), style, "image");
+                self.render_marked_reserved_text(
+                    &format!("[image: {image}]"),
+                    style,
+                    "image",
+                    self.image_reserved_rows,
+                );
             } else {
                 self.render_container(child, style);
             }
@@ -2808,7 +2864,12 @@ impl TerminalMarkdownRenderer {
                     .filter(|value| !value.is_empty())
                     .or_else(|| source.as_deref().filter(|value| !value.is_empty()))
                     .unwrap_or("image");
-                self.render_marked_text(&format!("[image: {image}]"), style, "image");
+                self.render_marked_reserved_text(
+                    &format!("[image: {image}]"),
+                    style,
+                    "image",
+                    self.image_reserved_rows,
+                );
             }
             _ => {
                 self.render_special_block_container(container, style);
@@ -2823,10 +2884,24 @@ impl TerminalMarkdownRenderer {
         self.record_geometry(kind, start_row, start_column);
     }
 
-    fn render_marked_text(&mut self, text: &str, style: TextStyle, kind: &str) {
+    fn render_marked_reserved_text(
+        &mut self,
+        text: &str,
+        style: TextStyle,
+        kind: &str,
+        reserved_rows: usize,
+    ) {
         let start_row = self.rows.len();
         let start_column = self.current_width;
         self.push_text(text, style);
+        if reserved_rows <= 1 {
+            self.record_geometry(kind, start_row, start_column);
+            return;
+        }
+        self.flush_line();
+        while self.rows.len().saturating_sub(start_row) < reserved_rows {
+            self.rows.push(Line::from_spans(vec![Span::raw(" ")]));
+        }
         self.record_geometry(kind, start_row, start_column);
     }
 
@@ -3023,6 +3098,16 @@ impl TerminalMarkdownRenderer {
         self.rows
             .push(Line::from_spans(vec![Span::styled("└─", border_style)]));
         self.ensure_blank_line();
+        if language == Some("mermaid") {
+            while self
+                .rows
+                .len()
+                .saturating_sub(geometry_start.map_or(0, |value| value.0))
+                < self.mermaid_reserved_rows
+            {
+                self.rows.push(Line::from_spans(vec![Span::raw(" ")]));
+            }
+        }
         if let Some((start_row, start_column, geometry_start)) = geometry_start {
             self.geometry.borrow_mut().truncate(geometry_start);
             self.record_geometry("mermaid", start_row, start_column);
@@ -3305,7 +3390,7 @@ fn lines_for_table_cell(
     style: TextStyle,
     theme: MarkdownTheme,
 ) -> Vec<Vec<Span>> {
-    let mut renderer = TerminalMarkdownRenderer::new(u16::MAX, theme, Vec::new(), Vec::new());
+    let mut renderer = TerminalMarkdownRenderer::new(u16::MAX, theme, Vec::new(), Vec::new(), 1, 1);
     renderer.in_table_collection = true;
     renderer.render_container_children(container, style.merge_container(container, theme));
     renderer.flush_line();
@@ -3564,9 +3649,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        MarkdownContributionKind, MarkdownDestination, MarkdownRenderOptions, MarkdownTheme,
-        TableRow, aligned_padding, markdown_to_plain_text, render_markdown, render_markdown_lines,
-        table_column_widths, table_content_line, text_display_width,
+        MarkdownContribution, MarkdownContributionKind, MarkdownDestination, MarkdownRenderOptions,
+        MarkdownTheme, MermaidContributionRendering, TableRow, aligned_padding,
+        markdown_to_plain_text, render_markdown, render_markdown_lines, table_column_widths,
+        table_content_line, text_display_width,
     };
     use bmux_tui::prelude::{Color, Modifier, Span, Style};
     use pulldown_cmark::Alignment;
@@ -4102,10 +4188,82 @@ mod tests {
     }
 
     #[test]
+    fn rich_reservations_are_stable_and_geometry_affecting() {
+        let image = render_markdown(
+            "![alt](image.png)",
+            &MarkdownRenderOptions::new(40).with_rich_reserved_rows(4, 8),
+        );
+        assert_eq!(image.lines.len(), 4);
+        assert_eq!(image.geometry[0].rects[0].height, 1);
+        let image_bottom = image.geometry[0]
+            .rects
+            .iter()
+            .map(|rect| rect.y.saturating_add(rect.height))
+            .max()
+            .unwrap();
+        assert_eq!(image_bottom, 4);
+
+        let mermaid = render_markdown(
+            "```mermaid\nflowchart LR\nA --> B\n```",
+            &MarkdownRenderOptions::new(40)
+                .with_mermaid_contributions(1600, 1200)
+                .with_rich_reserved_rows(4, 8),
+        );
+        let mermaid_geometry = &mermaid.geometry[0];
+        let mermaid_bottom = mermaid_geometry
+            .rects
+            .iter()
+            .map(|rect| rect.y.saturating_add(rect.height))
+            .max()
+            .unwrap();
+        assert!(mermaid_bottom >= 8);
+
+        let compact = render_markdown(
+            "![alt](image.png)",
+            &MarkdownRenderOptions::new(40).with_rich_reserved_rows(1, 1),
+        );
+        assert_ne!(image.layout_signature, compact.layout_signature);
+    }
+
+    #[test]
+    fn asynchronous_mermaid_mode_emits_typed_request_without_inline_rendering() {
+        let source = "```mermaid\nflowchart LR\nA --> B\n```";
+        let disabled = render_markdown(source, &MarkdownRenderOptions::new(40));
+        assert!(matches!(
+            disabled.contributions.as_slice(),
+            [MarkdownContribution {
+                kind: MarkdownContributionKind::Mermaid {
+                    rendering: MermaidContributionRendering::Disabled,
+                    ..
+                },
+                ..
+            }]
+        ));
+
+        let asynchronous = render_markdown(
+            source,
+            &MarkdownRenderOptions::new(40).with_mermaid_contributions(1600, 1200),
+        );
+        assert!(matches!(
+            asynchronous.contributions.as_slice(),
+            [MarkdownContribution {
+                kind: MarkdownContributionKind::Mermaid {
+                    rendering: MermaidContributionRendering::Disabled,
+                    ..
+                },
+                ..
+            }]
+        ));
+        assert_eq!(asynchronous.geometry.len(), 1);
+    }
+
+    #[test]
     fn contribution_geometry_tracks_details_footnotes_and_mermaid() {
         let result = render_markdown(
             "<details><summary>More</summary>Body</details>\n\nText[^note].\n\n[^note]: Definition.\n\n```mermaid\nflowchart LR\nA --> B\n```",
-            &MarkdownRenderOptions::new(40).with_document_id("item"),
+            &MarkdownRenderOptions::new(40)
+                .with_document_id("item")
+                .with_mermaid_contributions(1600, 1200),
         );
         let ids = result
             .geometry

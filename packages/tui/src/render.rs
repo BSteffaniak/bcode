@@ -109,7 +109,7 @@ impl TuiTheme {
 pub struct FrameLayout {
     area: Rect,
     header: Rect,
-    body: Rect,
+    pub(crate) body: Rect,
     latest_bar: Option<Rect>,
     status: Rect,
     composer: Rect,
@@ -922,7 +922,12 @@ fn markdown_render_options(
     let mut options = MarkdownRenderOptions::new(width)
         .with_document_id(format!("transcript:{}", item.id().get()))
         .with_streaming(item.streaming())
-        .with_link_destination_fallbacks(true);
+        .with_link_destination_fallbacks(true)
+        .with_mermaid_contributions(1600, 1200)
+        .with_rich_reserved_rows(
+            crate::markdown_image::RESERVED_IMAGE_ROWS,
+            crate::markdown_mermaid::RESERVED_MERMAID_ROWS,
+        );
     if let Some(base_directory) = app.working_directory() {
         options = options.with_document_context(MarkdownDocumentContext {
             base_directory: Some(base_directory.to_path_buf()),
@@ -963,6 +968,17 @@ struct MarkdownTranscriptRegion {
     contribution_kind: MarkdownContributionKind,
     rect_index: usize,
     rect: Rect,
+}
+
+/// One rich Markdown contribution projected into the current transcript frame.
+#[derive(Debug, Clone)]
+pub struct MarkdownRichRegion {
+    /// Stable owner-qualified contribution identity.
+    pub contribution_id: String,
+    /// Typed semantic payload.
+    pub contribution_kind: MarkdownContributionKind,
+    /// Clipped visible geometry, or `None` for resident off-screen contributions.
+    pub visible_rect: Option<Rect>,
 }
 
 fn render_transcript_markdown_hits(
@@ -1096,6 +1112,64 @@ fn transcript_markdown_details_ids_for_items(
             })
         })
         .collect()
+}
+
+/// Collect resident rich Markdown contributions and their current visible geometry.
+#[must_use]
+pub fn transcript_markdown_rich_regions(app: &BmuxApp, area: Rect) -> Vec<MarkdownRichRegion> {
+    let top_row = app.transcript_top_row(area.height);
+    let mut rich = Vec::new();
+    for (index, item) in app.transcript().iter().enumerate() {
+        if item.text_format() != TextFormat::Markdown {
+            continue;
+        }
+        let Some(entry_start) = app.transcript_layout().entry_start_row(
+            super::transcript_layout::VisibleTranscriptSource::Transcript,
+            index,
+        ) else {
+            continue;
+        };
+        let content_offset = transcript_markdown_content_row_offset(item, area.width);
+        let rendered = render_markdown(
+            item.text(),
+            &markdown_render_options(app, item, area.width.saturating_sub(2).max(1)),
+        );
+        for contribution in rendered.contributions {
+            if !matches!(
+                contribution.kind,
+                MarkdownContributionKind::Image { .. } | MarkdownContributionKind::Mermaid { .. }
+            ) {
+                continue;
+            }
+            let visible_rect = rendered
+                .geometry
+                .iter()
+                .find(|geometry| geometry.contribution_id == contribution.id)
+                .and_then(|geometry| {
+                    geometry.rects.iter().find_map(|rect| {
+                        let global_row = entry_start
+                            .saturating_add(content_offset)
+                            .saturating_add(usize::from(rect.y));
+                        let viewport_row = global_row.checked_sub(top_row)?;
+                        let projected = Rect::new(
+                            area.x.saturating_add(2).saturating_add(rect.x),
+                            area.y
+                                .saturating_add(u16::try_from(viewport_row).unwrap_or(u16::MAX)),
+                            rect.width,
+                            rect.height,
+                        )
+                        .intersection(area);
+                        (!projected.is_empty()).then_some(projected)
+                    })
+                });
+            rich.push(MarkdownRichRegion {
+                contribution_id: contribution.id,
+                contribution_kind: contribution.kind,
+                visible_rect,
+            });
+        }
+    }
+    rich
 }
 
 fn transcript_markdown_regions(app: &BmuxApp, area: Rect) -> Vec<MarkdownTranscriptRegion> {

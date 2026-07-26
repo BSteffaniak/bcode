@@ -196,6 +196,7 @@ bmux_codec = { default-features = false, features = [
     "compression-lz4",
     "compression-zstd",
 ], git = "https://github.com/BSteffaniak/bmux.git", rev = "3cd77c2cdad4fcbe006612213621f8f90fe73ec7" }
+bmux_image = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "3cd77c2cdad4fcbe006612213621f8f90fe73ec7" }
 bmux_ipc = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "3cd77c2cdad4fcbe006612213621f8f90fe73ec7" }
 bmux_keyboard = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "3cd77c2cdad4fcbe006612213621f8f90fe73ec7" }
 bmux_plugin = { default-features = false, git = "https://github.com/BSteffaniak/bmux.git", rev = "3cd77c2cdad4fcbe006612213621f8f90fe73ec7" }

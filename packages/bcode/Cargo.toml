@@ -15,6 +15,11 @@ name              = "bcode"
 path              = "src/main.rs"
 required-features = ["app"]
 
+[[bin]]
+name              = "bcode-mermaid-worker"
+path              = "../mermaid-render/src/bin/worker.rs"
+required-features = ["app"]
+
 [[example]]
 name              = "embedded_fake_provider"
 required-features = ["embedded-plugins", "static-bundled-fake-provider-plugin"]
@@ -42,6 +47,7 @@ bcode_client                            = { workspace = true, optional = true }
 bcode_config                            = { workspace = true, optional = true }
 bcode_eval                              = { workspace = true, optional = true }
 bcode_fake_provider_plugin              = { workspace = true, optional = true }
+bcode_mermaid_render                    = { workspace = true, optional = true }
 bcode_metrics                           = { workspace = true, optional = true }
 bcode_model                             = { workspace = true }
 bcode_openai_compatible_provider_plugin = { workspace = true, optional = true }
@@ -82,6 +88,7 @@ app = [
     "web-renderer",
     "static-bundled-plugins",
     "bundled-ocr-tesseract",
+    "dep:bcode_mermaid_render",
 ]
 bundled-ocr-tesseract = ["bundled-ocr-tesseract-default"]
 bundled-ocr-tesseract-all = [

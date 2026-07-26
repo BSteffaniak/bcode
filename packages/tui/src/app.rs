@@ -960,8 +960,13 @@ impl BmuxApp {
 
     /// Apply terminal UI configuration.
     pub fn apply_tui_config(&mut self, config: TuiConfig) {
+        let markdown_changed = self.tui_config.markdown != config.markdown;
         self.apply_thinking_config(config.thinking);
         self.tui_config = config;
+        if markdown_changed {
+            self.markdown_presentation_revision =
+                self.markdown_presentation_revision.saturating_add(1);
+        }
         self.sync_theme_target(Instant::now());
     }
 
@@ -4736,6 +4741,19 @@ mod tests {
 
         assert_eq!(app.transcript_top_row(10), top_row);
         assert_eq!(app.scroll_offset(), 47 - top_row - 10);
+    }
+
+    #[test]
+    fn markdown_capability_changes_invalidate_presentation_layout() {
+        let mut app = BmuxApp::new_with_history(None, &[], &[], false);
+        let initial = app.markdown_presentation_revision();
+        let mut config = app.tui_config().clone();
+        config.markdown.network_images = true;
+        app.apply_tui_config(config.clone());
+        assert_eq!(app.markdown_presentation_revision(), initial + 1);
+
+        app.apply_tui_config(config);
+        assert_eq!(app.markdown_presentation_revision(), initial + 1);
     }
 
     #[test]

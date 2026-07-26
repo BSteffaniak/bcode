@@ -168,6 +168,22 @@ fn public_worker_adapter_rejects_malformed_and_oversized_responses() {
 }
 
 #[test]
+#[cfg(unix)]
+fn public_worker_adapter_maps_worker_crash_to_typed_protocol_failure() {
+    let crashed = scripted_worker("#!/bin/sh\nexit 7\n");
+    let request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 800, 600);
+
+    assert!(matches!(
+        render_mermaid_with_worker(
+            crashed.path(),
+            &request,
+            &MermaidCancellationToken::default()
+        ),
+        Err(MermaidRenderError::InvalidWorkerResponse { .. })
+    ));
+}
+
+#[test]
 fn public_worker_adapter_round_trips_and_maps_failures() {
     let worker = std::path::Path::new(env!("CARGO_BIN_EXE_bcode-mermaid-worker"));
     let request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 800, 600);
@@ -175,6 +191,12 @@ fn public_worker_adapter_round_trips_and_maps_failures() {
         render_mermaid_with_worker(worker, &request, &MermaidCancellationToken::default()).unwrap();
     let MermaidRenderedOutput::Svg(svg) = rendered.output;
     assert!(String::from_utf8(svg).unwrap().contains("<svg"));
+
+    let directive = MermaidRenderRequest::svg("%%{init: {}}%%\nflowchart LR\nA --> B", 800, 600);
+    assert!(matches!(
+        render_mermaid_with_worker(worker, &directive, &MermaidCancellationToken::default()),
+        Err(MermaidRenderError::DirectiveNotAllowed)
+    ));
 
     let invalid = MermaidRenderRequest::svg("not a diagram", 800, 600);
     assert!(matches!(

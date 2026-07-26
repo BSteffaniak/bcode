@@ -126,6 +126,15 @@ struct ChatLoopState {
     interactive_surface_queue: InteractiveSurfaceQueue,
     plugin_runtime: Option<PluginRuntimeHost>,
     artifact_stream: ArtifactStreamCoordinator,
+    markdown_presentation: Option<super::markdown_image::MarkdownPresentationRuntime>,
+    markdown_mermaid: Option<super::markdown_mermaid::MarkdownMermaidRuntime>,
+    markdown_image_tasks:
+        Vec<tokio::task::JoinHandle<super::markdown_image::MarkdownImageLoadCompletion>>,
+    markdown_mermaid_tasks:
+        Vec<tokio::task::JoinHandle<super::markdown_mermaid::MarkdownMermaidCompletion>>,
+    markdown_image_compositor: bmux_image::tui::TuiImageCompositor,
+    markdown_image_capabilities: bmux_image::HostImageCapabilities,
+    markdown_image_config: bmux_image::ImageConfig,
     telemetry: super::telemetry::TuiTelemetry,
     frame_index: u64,
 }
@@ -149,6 +158,13 @@ impl ChatLoopState {
             interactive_surface_queue: InteractiveSurfaceQueue::default(),
             plugin_runtime: None,
             artifact_stream: ArtifactStreamCoordinator::new(passive_client.clone()),
+            markdown_presentation: super::markdown_image::MarkdownPresentationRuntime::new().ok(),
+            markdown_mermaid: super::markdown_mermaid::MarkdownMermaidRuntime::packaged().ok(),
+            markdown_image_tasks: Vec::new(),
+            markdown_mermaid_tasks: Vec::new(),
+            markdown_image_compositor: bmux_image::tui::TuiImageCompositor::new(),
+            markdown_image_capabilities: bmux_image::host_caps::detect_from_env(),
+            markdown_image_config: bmux_image::ImageConfig::default(),
             telemetry: super::telemetry::TuiTelemetry::new(passive_client.clone(), metrics_enabled),
             frame_index: 0,
         }
@@ -162,8 +178,51 @@ impl ChatLoopState {
         self.effects.poll_finished().await
     }
 
+    async fn poll_markdown_completions(&mut self) -> bool {
+        let mut changed = false;
+        let mut index = 0;
+        while index < self.markdown_image_tasks.len() {
+            if !self.markdown_image_tasks[index].is_finished() {
+                index += 1;
+                continue;
+            }
+            let task = self.markdown_image_tasks.swap_remove(index);
+            if let Ok(completion) = task.await
+                && let Some(markdown) = &mut self.markdown_presentation
+            {
+                changed |= markdown.complete(completion);
+            }
+        }
+        let mut index = 0;
+        while index < self.markdown_mermaid_tasks.len() {
+            if !self.markdown_mermaid_tasks[index].is_finished() {
+                index += 1;
+                continue;
+            }
+            let task = self.markdown_mermaid_tasks.swap_remove(index);
+            if let Ok(completion) = task.await
+                && let Some(mermaid) = &mut self.markdown_mermaid
+            {
+                changed |= mermaid.complete(completion);
+            }
+        }
+        changed
+    }
+
     fn abort_all_effects(&mut self) {
         self.effects.abort_all();
+        if let Some(markdown) = &mut self.markdown_presentation {
+            markdown.cancel_all();
+        }
+        if let Some(mermaid) = &mut self.markdown_mermaid {
+            mermaid.cancel_all();
+        }
+        for task in self.markdown_image_tasks.drain(..) {
+            task.abort();
+        }
+        for task in self.markdown_mermaid_tasks.drain(..) {
+            task.abort();
+        }
     }
 
     fn start_effect(&mut self, effect: TuiEffect) -> bool {
@@ -342,6 +401,9 @@ async fn run_chat_loop<W: Write>(
             needs_redraw = true;
         }
         if drain_artifact_completions(chat, loop_state, ARTIFACT_COMPLETION_DRAIN_BUDGET) {
+            needs_redraw = true;
+        }
+        if loop_state.poll_markdown_completions().await {
             needs_redraw = true;
         }
 
@@ -1533,6 +1595,149 @@ fn next_redraw_at(last_redraw: Instant) -> Instant {
         .unwrap_or(last_redraw)
 }
 
+fn markdown_destination_cache_source(
+    destination: &bcode_markdown_render::MarkdownDestination,
+) -> String {
+    match destination {
+        bcode_markdown_render::MarkdownDestination::Web(url) => url.as_str().to_owned(),
+        bcode_markdown_render::MarkdownDestination::LocalPath(path) => {
+            path.to_string_lossy().into_owned()
+        }
+        bcode_markdown_render::MarkdownDestination::Fragment(fragment) => format!("#{fragment}"),
+        bcode_markdown_render::MarkdownDestination::UnresolvedRelative(source) => source.clone(),
+        bcode_markdown_render::MarkdownDestination::Inert { reason } => format!("inert:{reason:?}"),
+    }
+}
+
+#[derive(Debug)]
+struct MarkdownFramePresentation {
+    rich: Vec<render::MarkdownRichRegion>,
+    image_removed: Vec<String>,
+    mermaid_removed: Vec<String>,
+}
+
+const fn markdown_image_destination_rect(placeholder: Rect) -> Rect {
+    placeholder
+}
+
+const fn markdown_mermaid_destination_rect(placeholder: Rect) -> Rect {
+    placeholder
+}
+
+fn write_markdown_fallback(frame: &mut bmux_tui::frame::Frame<'_>, area: Rect, fallback: &str) {
+    if area.is_empty() {
+        return;
+    }
+    let width = usize::from(area.width);
+    let lines = fallback.lines().collect::<Vec<_>>();
+    for row in 0..area.height {
+        let text = lines.get(usize::from(row)).copied().unwrap_or_default();
+        let text = bmux_tui::text_width::truncate_to_display_width(text, width);
+        frame.write_line(
+            Rect::new(area.x, area.y.saturating_add(row), area.width, 1),
+            &bmux_tui::prelude::Line::raw(text),
+        );
+    }
+}
+
+fn image_region_fallback(
+    runtime: &super::markdown_image::MarkdownPresentationRuntime,
+    contribution_id: &str,
+    contribution: &bcode_markdown_render::MarkdownContributionKind,
+) -> Option<String> {
+    let bcode_markdown_render::MarkdownContributionKind::Image {
+        alt,
+        source,
+        linked_destination,
+        ..
+    } = contribution
+    else {
+        return None;
+    };
+    runtime
+        .images
+        .fallback(contribution_id, alt, source, linked_destination.as_ref())
+}
+
+fn reconcile_markdown_presentation(
+    chat: &ActiveChat,
+    loop_state: &mut ChatLoopState,
+    area: Rect,
+) -> MarkdownFramePresentation {
+    let rich = render::transcript_markdown_rich_regions(&chat.app, area);
+    let terminal_supported = loop_state.markdown_image_capabilities.any_supported();
+    let image_inputs = rich
+        .iter()
+        .filter_map(|region| match &region.contribution_kind {
+            bcode_markdown_render::MarkdownContributionKind::Image { source, .. } => {
+                Some(super::markdown_image::MarkdownImagePresentationInput {
+                    contribution_id: region.contribution_id.clone(),
+                    cache_key: super::markdown_image::MarkdownImageCacheKey::new(
+                        &markdown_destination_cache_source(source),
+                        "decoded-rgba8",
+                    ),
+                    destination: source.clone(),
+                    residency: if region.visible_rect.is_some() {
+                        super::markdown_image::MarkdownImageResidency::Visible
+                    } else {
+                        super::markdown_image::MarkdownImageResidency::Hidden
+                    },
+                })
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mermaid_inputs = if chat.app.tui_config().markdown.mermaid {
+        rich.iter()
+            .filter_map(|region| match &region.contribution_kind {
+                bcode_markdown_render::MarkdownContributionKind::Mermaid {
+                    source,
+                    cache_key,
+                    ..
+                } => Some(super::markdown_mermaid::MarkdownMermaidInput {
+                    contribution_id: region.contribution_id.clone(),
+                    cache_key: cache_key.clone(),
+                    source: source.clone(),
+                    visible: region.visible_rect.is_some(),
+                    prefetch: false,
+                }),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let image_removed =
+        loop_state
+            .markdown_presentation
+            .as_mut()
+            .map_or_else(Vec::new, |runtime| {
+                let (removed, tasks) = runtime.reconcile_and_start(
+                    &image_inputs,
+                    super::markdown_image::MarkdownImagePresentationPolicy {
+                        interactive_resident_frame: true,
+                        network_enabled: chat.app.tui_config().markdown.network_images,
+                        terminal_supported,
+                    },
+                );
+                loop_state.markdown_image_tasks.extend(tasks);
+                removed
+            });
+    let mermaid_removed = loop_state
+        .markdown_mermaid
+        .as_mut()
+        .map_or_else(Vec::new, |runtime| {
+            let (removed, tasks) = runtime.reconcile_and_start(&mermaid_inputs, terminal_supported);
+            loop_state.markdown_mermaid_tasks.extend(tasks);
+            removed
+        });
+    MarkdownFramePresentation {
+        rich,
+        image_removed,
+        mermaid_removed,
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn draw_chat_frame<W: Write>(
     terminal: &mut Terminal<&mut W>,
@@ -1552,6 +1757,14 @@ fn draw_chat_frame<W: Write>(
     let prepared =
         render::prepare_frame_with_bottom_dock(&mut chat.app, terminal.area(), dock_height);
     let layout = prepared.map(|(layout, _dock)| layout);
+    let rich_presentation = layout.map_or_else(
+        || MarkdownFramePresentation {
+            rich: Vec::new(),
+            image_removed: Vec::new(),
+            mermaid_removed: Vec::new(),
+        },
+        |layout| reconcile_markdown_presentation(chat, loop_state, layout.body),
+    );
     let surface_area = prepared.map_or_else(
         || {
             Rect::new(
@@ -1630,6 +1843,58 @@ fn draw_chat_frame<W: Write>(
         if let Some(layout) = layout {
             render::render_prepared(&mut chat.app, frame, layout);
         }
+        for contribution_id in &rich_presentation.image_removed {
+            super::markdown_image::MarkdownImagePresentationStore::remove_from_frame(
+                contribution_id,
+                frame,
+            );
+        }
+        for contribution_id in &rich_presentation.mermaid_removed {
+            super::markdown_mermaid::MarkdownMermaidPresentationStore::remove_from_frame(
+                contribution_id,
+                frame,
+            );
+        }
+        for region in &rich_presentation.rich {
+            let Some(visible_rect) = region.visible_rect else {
+                continue;
+            };
+            match &region.contribution_kind {
+                bcode_markdown_render::MarkdownContributionKind::Image { .. } => {
+                    if let Some(runtime) = &loop_state.markdown_presentation {
+                        let destination = markdown_image_destination_rect(visible_rect);
+                        if !runtime.images.present_ready(
+                            &region.contribution_id,
+                            destination,
+                            layout.map_or(visible_rect, |layout| layout.body),
+                            frame,
+                        ) && let Some(fallback) = image_region_fallback(
+                            runtime,
+                            &region.contribution_id,
+                            &region.contribution_kind,
+                        ) {
+                            write_markdown_fallback(frame, destination, &fallback);
+                        }
+                    }
+                }
+                bcode_markdown_render::MarkdownContributionKind::Mermaid { .. } => {
+                    if let Some(runtime) = &loop_state.markdown_mermaid {
+                        if let Some(placement) = runtime.presentations.ready_placement(
+                            &region.contribution_id,
+                            markdown_mermaid_destination_rect(visible_rect),
+                            layout.map_or(visible_rect, |layout| layout.body),
+                        ) {
+                            frame.push_image(placement);
+                        } else if let Some(fallback) =
+                            runtime.presentations.fallback(&region.contribution_id)
+                        {
+                            write_markdown_fallback(frame, visible_rect, &fallback);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         if let Some(slash_palette) = &loop_state.slash_palette {
             slash_palette_render::render_palette(
                 slash_palette,
@@ -1654,6 +1919,23 @@ fn draw_chat_frame<W: Write>(
             surface.render(surface_area, frame);
         }
     })?;
+    loop_state
+        .markdown_image_compositor
+        .apply_delta(terminal.image_delta());
+    let terminal_area = terminal.area();
+    let image_scene = terminal.image_scene().clone();
+    loop_state.markdown_image_compositor.render(
+        terminal.writer_mut(),
+        &image_scene,
+        bmux_image::compositor::PaneRect {
+            x: terminal_area.x,
+            y: terminal_area.y,
+            w: terminal_area.width,
+            h: terminal_area.height,
+        },
+        &loop_state.markdown_image_capabilities,
+        &loop_state.markdown_image_config,
+    )?;
     let draw_ms = elapsed_millis(draw_started);
     let total_ms = elapsed_millis(frame_started);
     loop_state.telemetry.add_counter("tui.frame.total", 1);
@@ -2785,6 +3067,48 @@ fn paste_clipboard_image(chat: &mut ActiveChat) {
 mod scheduler_tests {
     use super::*;
     use bmux_keyboard::KeyCode;
+    #[test]
+    fn markdown_fallback_overwrites_and_clears_reserved_rows() {
+        let mut buffer = bmux_tui::buffer::Buffer::empty(Rect::new(0, 0, 12, 3));
+        let mut frame = bmux_tui::frame::Frame::new(&mut buffer);
+        write_markdown_fallback(&mut frame, Rect::new(0, 0, 12, 3), "failed\nsource");
+
+        let rendered = (0..3)
+            .map(|row| {
+                (0..12)
+                    .filter_map(|column| {
+                        frame
+                            .buffer()
+                            .get(bmux_tui::geometry::Point::new(column, row))
+                            .map(|cell| cell.symbol.as_str())
+                    })
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        assert!(rendered[0].starts_with("failed"));
+        assert!(rendered[1].starts_with("source"));
+        assert!(rendered[2].trim().is_empty());
+    }
+
+    #[test]
+    fn rich_destination_geometry_preserves_renderer_reserved_rectangle() {
+        let placeholder = Rect::new(3, 4, 20, 5);
+        assert_eq!(markdown_image_destination_rect(placeholder), placeholder);
+        assert_eq!(markdown_mermaid_destination_rect(placeholder), placeholder);
+    }
+
+    #[test]
+    fn markdown_destination_cache_source_is_typed_and_stable() {
+        let web = bcode_markdown_render::resolve_markdown_destination(
+            "https://example.com/image.png",
+            None,
+        );
+        assert_eq!(
+            markdown_destination_cache_source(&web),
+            "https://example.com/image.png"
+        );
+    }
+
     fn test_chat() -> ActiveChat {
         let (event_sender, event_receiver) = tokio::sync::mpsc::unbounded_channel();
         ActiveChat {

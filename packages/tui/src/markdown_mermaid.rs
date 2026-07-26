@@ -17,6 +17,62 @@ pub const MAX_MERMAID_PREFETCH: usize = 4;
 /// Fixed rows reserved before and after Mermaid rendering.
 pub const RESERVED_MERMAID_ROWS: u16 = 8;
 
+/// Runtime Mermaid presentation state owned by the interactive chat loop.
+#[derive(Debug)]
+pub struct MarkdownMermaidRuntime {
+    /// Resident per-contribution lifecycle state.
+    pub presentations: MarkdownMermaidPresentationStore,
+    /// Bounded successful render cache.
+    pub cache: MermaidRenderCache,
+    /// Process-isolated renderer adapter.
+    pub renderer: bcode_mermaid_render::IsolatedMermaidRenderer,
+}
+
+impl MarkdownMermaidRuntime {
+    /// Create runtime state using the renderer packaged beside Bcode.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed unavailable error when packaged renderer discovery fails.
+    pub fn packaged() -> Result<Self, MermaidRenderError> {
+        Ok(Self {
+            presentations: MarkdownMermaidPresentationStore::default(),
+            cache: MermaidRenderCache::default(),
+            renderer: bcode_mermaid_render::IsolatedMermaidRenderer::packaged()?,
+        })
+    }
+
+    /// Reconcile resident owners, hydrate cache hits, and start newly eligible renders.
+    ///
+    /// Returns removed contribution IDs and blocking worker tasks. Callers must
+    /// emit removals in the next BMUX frame and poll every returned task.
+    pub fn reconcile_and_start(
+        &mut self,
+        inputs: &[MarkdownMermaidInput],
+        terminal_supported: bool,
+    ) -> (
+        Vec<String>,
+        Vec<tokio::task::JoinHandle<MarkdownMermaidCompletion>>,
+    ) {
+        let removed = self.presentations.reconcile(inputs, terminal_supported);
+        self.presentations.hydrate_from_cache(&mut self.cache);
+        let work = self.presentations.schedule(inputs);
+        let tasks = spawn_mermaid_work(&self.renderer, work);
+        (removed, tasks)
+    }
+
+    /// Apply one asynchronous worker completion if its owner is still current.
+    pub fn complete(&mut self, completion: MarkdownMermaidCompletion) -> bool {
+        self.presentations
+            .complete(&completion.cache_key, completion.result, &mut self.cache)
+    }
+
+    /// Cancel all active workers before the interactive runtime is dropped.
+    pub fn cancel_all(&mut self) {
+        self.presentations.reconcile(&[], true);
+    }
+}
+
 /// Rasterized Mermaid image suitable for BMUX protocol-neutral transport.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedMermaidImage {
@@ -170,18 +226,26 @@ pub struct MarkdownMermaidPresentationStore {
 }
 
 impl MarkdownMermaidPresentationStore {
-    /// Reconcile the bounded resident projection and cancel stale workers.
-    pub fn reconcile(&mut self, inputs: &[MarkdownMermaidInput], terminal_supported: bool) {
+    /// Reconcile the bounded resident projection, cancel stale workers, and return removed owners.
+    pub fn reconcile(
+        &mut self,
+        inputs: &[MarkdownMermaidInput],
+        terminal_supported: bool,
+    ) -> Vec<String> {
+        let previous = self.entries.keys().cloned().collect::<BTreeSet<_>>();
         let active_ids = inputs
             .iter()
-            .map(|input| input.contribution_id.as_str())
+            .map(|input| input.contribution_id.clone())
             .collect::<BTreeSet<_>>();
         let active_keys = inputs
             .iter()
             .map(|input| input.cache_key.as_str())
             .collect::<BTreeSet<_>>();
-        self.entries
-            .retain(|id, _| active_ids.contains(id.as_str()));
+        let mut removed = previous
+            .difference(&active_ids)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        self.entries.retain(|id, _| active_ids.contains(id));
         self.workers.retain(|key, cancellation| {
             if active_keys.contains(key.as_str()) {
                 true
@@ -196,6 +260,9 @@ impl MarkdownMermaidPresentationStore {
                 .get(&input.contribution_id)
                 .is_none_or(|entry| entry.cache_key != input.cache_key);
             if reset {
+                if self.entries.contains_key(&input.contribution_id) {
+                    removed.insert(input.contribution_id.clone());
+                }
                 self.entries.insert(
                     input.contribution_id.clone(),
                     MermaidEntry {
@@ -215,8 +282,21 @@ impl MarkdownMermaidPresentationStore {
                 if let Some(entry) = self.entries.get_mut(&input.contribution_id) {
                     entry.state = MarkdownMermaidPresentationState::TerminalUnsupported;
                 }
+            } else if self
+                .entries
+                .get(&input.contribution_id)
+                .is_some_and(|entry| {
+                    matches!(
+                        entry.state,
+                        MarkdownMermaidPresentationState::TerminalUnsupported
+                    )
+                })
+                && let Some(entry) = self.entries.get_mut(&input.contribution_id)
+            {
+                entry.state = MarkdownMermaidPresentationState::Idle;
             }
         }
+        removed.into_iter().collect()
     }
 
     /// Start workers only for visible/bounded-prefetch idle contributions.
@@ -274,13 +354,19 @@ impl MarkdownMermaidPresentationStore {
     }
 
     /// Complete one worker and update every owner sharing its cache key.
+    ///
+    /// Returns `true` when the completed key still belonged to resident state.
+    /// Late results for cancelled or replaced keys are discarded without
+    /// repopulating the cache.
     pub fn complete(
         &mut self,
         key: &str,
         result: Result<MermaidRendered, MermaidRenderError>,
         cache: &mut MermaidRenderCache,
-    ) {
-        self.workers.remove(key);
+    ) -> bool {
+        if self.workers.remove(key).is_none() {
+            return false;
+        }
         match result {
             Ok(rendered) => {
                 cache.insert(rendered.clone());
@@ -317,6 +403,7 @@ impl MarkdownMermaidPresentationStore {
                 }
             }
         }
+        true
     }
 
     /// Return state for one resident contribution.
@@ -351,6 +438,20 @@ impl MarkdownMermaidPresentationStore {
             .map(|entry| entry.source.as_str())
     }
 
+    /// Return readable source-preserving fallback text for one contribution.
+    #[must_use]
+    pub fn fallback(&self, contribution_id: &str) -> Option<String> {
+        let entry = self.entries.get(contribution_id)?;
+        Some(entry.state.fallback(&entry.source))
+    }
+
+    /// Emit explicit removal for a stable diagram key no longer present in this frame.
+    pub fn remove_from_frame(contribution_id: &str, frame: &mut bmux_tui::frame::Frame<'_>) {
+        frame.push_image(ImageContribution::Remove(ImageKey::new(format!(
+            "markdown-mermaid:{contribution_id}"
+        ))));
+    }
+
     /// Return clipped BMUX destination geometry for a ready diagram.
     #[must_use]
     pub fn ready_placement(
@@ -372,6 +473,41 @@ impl MarkdownMermaidPresentationStore {
     }
 }
 
+/// Complete one scheduled process-isolated Mermaid render.
+#[derive(Debug)]
+pub struct MarkdownMermaidCompletion {
+    /// Versioned request cache key.
+    pub cache_key: String,
+    /// Typed renderer result.
+    pub result: Result<MermaidRendered, MermaidRenderError>,
+}
+
+/// Start scheduled Mermaid work on blocking tasks outside the frame renderer.
+#[must_use]
+pub fn spawn_mermaid_work(
+    renderer: &bcode_mermaid_render::IsolatedMermaidRenderer,
+    work: Vec<MarkdownMermaidWork>,
+) -> Vec<tokio::task::JoinHandle<MarkdownMermaidCompletion>> {
+    work.into_iter()
+        .map(|work| {
+            let renderer = renderer.clone();
+            tokio::task::spawn_blocking(move || {
+                let request =
+                    bcode_mermaid_render::MermaidRenderRequest::svg(work.source, 1600, 1200);
+                let cache_key = work.cache_key;
+                let result = if request.cache_key() == cache_key {
+                    renderer.render(&request, &work.cancellation)
+                } else {
+                    Err(MermaidRenderError::InvalidWorkerResponse {
+                        message: "scheduled Mermaid cache key does not match its source".to_owned(),
+                    })
+                };
+                MarkdownMermaidCompletion { cache_key, result }
+            })
+        })
+        .collect()
+}
+
 /// One newly scheduled Mermaid worker request.
 #[derive(Debug, Clone)]
 pub struct MarkdownMermaidWork {
@@ -391,12 +527,15 @@ mod tests {
         MermaidRenderCache, MermaidRenderError, MermaidRenderRequest, MermaidRendered,
         MermaidRenderedOutput,
     };
+    use bmux_tui::buffer::Buffer;
+    use bmux_tui::frame::Frame;
     use bmux_tui::geometry::Rect;
     use bmux_tui::image::{ImageContribution, ImagePayload, ImagePixelFormat};
 
     use super::{
         MAX_MERMAID_PREFETCH, MarkdownMermaidInput, MarkdownMermaidPresentationState,
-        MarkdownMermaidPresentationStore, RESERVED_MERMAID_ROWS,
+        MarkdownMermaidPresentationStore, MarkdownMermaidRuntime, RESERVED_MERMAID_ROWS,
+        spawn_mermaid_work,
     };
 
     fn input(id: &str, key: &str, may_render: bool) -> MarkdownMermaidInput {
@@ -484,7 +623,7 @@ mod tests {
             Some(&MarkdownMermaidPresentationState::Rendering)
         );
         let mut cache = MermaidRenderCache::default();
-        store.complete("k2", Ok(rendered("k2")), &mut cache);
+        assert!(store.complete("k2", Ok(rendered("k2")), &mut cache));
         assert!(matches!(
             store.state("visible"),
             Some(MarkdownMermaidPresentationState::Ready(_))
@@ -512,13 +651,125 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn runtime_reconcile_starts_and_completes_current_worker_failure() {
+        let request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 1600, 1200);
+        let inputs = [input("diagram", &request.cache_key(), true)];
+        let mut runtime = MarkdownMermaidRuntime {
+            presentations: MarkdownMermaidPresentationStore::default(),
+            cache: MermaidRenderCache::default(),
+            renderer: bcode_mermaid_render::IsolatedMermaidRenderer::from_path(
+                "/definitely/missing/diagram-renderer",
+            ),
+        };
+        let (removed, tasks) = runtime.reconcile_and_start(&inputs, true);
+        assert!(removed.is_empty());
+        let [task] = tasks.try_into().expect("one worker task");
+
+        assert!(runtime.complete(task.await.unwrap()));
+        assert!(matches!(
+            runtime.presentations.state("diagram"),
+            Some(MarkdownMermaidPresentationState::Failed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn runtime_discards_worker_completion_after_owner_removal() {
+        let request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 1600, 1200);
+        let inputs = [input("diagram", &request.cache_key(), true)];
+        let mut runtime = MarkdownMermaidRuntime {
+            presentations: MarkdownMermaidPresentationStore::default(),
+            cache: MermaidRenderCache::default(),
+            renderer: bcode_mermaid_render::IsolatedMermaidRenderer::from_path(
+                "/definitely/missing/diagram-renderer",
+            ),
+        };
+        let (_, tasks) = runtime.reconcile_and_start(&inputs, true);
+        let [task] = tasks.try_into().expect("one worker task");
+        let (removed, _) = runtime.reconcile_and_start(&[], true);
+        assert_eq!(removed, ["diagram"]);
+
+        assert!(!runtime.complete(task.await.unwrap()));
+        assert!(runtime.cache.is_empty());
+    }
+
+    #[tokio::test]
+    async fn isolated_worker_start_failure_completes_as_typed_visible_diagnostic() {
+        let request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 1600, 1200);
+        let inputs = [input("diagram", &request.cache_key(), true)];
+        let mut store = MarkdownMermaidPresentationStore::default();
+        store.reconcile(&inputs, true);
+        let work = store.schedule(&inputs);
+        let renderer = bcode_mermaid_render::IsolatedMermaidRenderer::from_path(
+            "/definitely/missing/diagram-renderer",
+        );
+        let [task] = spawn_mermaid_work(&renderer, work)
+            .try_into()
+            .expect("one worker task");
+        let completion = task.await.expect("worker task");
+        let mut cache = MermaidRenderCache::default();
+        assert!(store.complete(&completion.cache_key, completion.result, &mut cache));
+
+        let state = store.state("diagram").expect("diagram state");
+        assert!(matches!(state, MarkdownMermaidPresentationState::Failed(_)));
+        assert!(state.fallback("flowchart").contains("worker unavailable"));
+    }
+
+    #[test]
+    fn store_fallback_preserves_typed_mermaid_failure_and_source() {
+        let mut store = MarkdownMermaidPresentationStore::default();
+        let inputs = [input("diagram", "key", true)];
+        store.reconcile(&inputs, true);
+        assert_eq!(store.schedule(&inputs).len(), 1);
+        let mut cache = MermaidRenderCache::default();
+        assert!(store.complete(
+            "key",
+            Err(MermaidRenderError::InvalidDiagram {
+                message: "invalid node".to_owned(),
+            }),
+            &mut cache,
+        ));
+
+        let fallback = store.fallback("diagram").expect("resident fallback");
+        assert!(fallback.contains("invalid node"));
+        assert!(fallback.contains("flowchart LR"));
+    }
+
+    #[test]
+    fn removed_owner_emits_explicit_stable_bmux_removal() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 4));
+        let mut frame = Frame::new(&mut buffer);
+
+        MarkdownMermaidPresentationStore::remove_from_frame("owner:diagram:1", &mut frame);
+
+        assert!(matches!(
+            frame.images(),
+            [ImageContribution::Remove(key)]
+                if key.as_str() == "markdown-mermaid:owner:diagram:1"
+        ));
+    }
+
+    #[test]
+    fn late_cancelled_worker_completion_is_discarded_without_cache_repopulation() {
+        let mut store = MarkdownMermaidPresentationStore::default();
+        let inputs = [input("diagram", "key", true)];
+        store.reconcile(&inputs, true);
+        assert_eq!(store.schedule(&inputs).len(), 1);
+        store.reconcile(&[], true);
+        let mut cache = MermaidRenderCache::default();
+
+        assert!(!store.complete("key", Ok(rendered("key")), &mut cache));
+        assert!(cache.is_empty());
+    }
+
     #[test]
     fn stale_workers_cancel_cache_reuses_and_failures_stay_visible() {
         let mut store = MarkdownMermaidPresentationStore::default();
         let active = [input("diagram", "key", true)];
         store.reconcile(&active, true);
         let work = store.schedule(&active).pop().expect("scheduled work");
-        store.reconcile(&[], true);
+        let removed = store.reconcile(&[], true);
+        assert_eq!(removed, ["diagram"]);
         assert!(work.cancellation.is_cancelled());
 
         let mut cache = MermaidRenderCache::default();
@@ -535,13 +786,13 @@ mod tests {
         let failed = [input("failed", "failed", true)];
         store.reconcile(&failed, true);
         assert_eq!(store.schedule(&failed).len(), 1);
-        store.complete(
+        assert!(store.complete(
             "failed",
             Err(MermaidRenderError::InvalidDiagram {
                 message: "bad diagram".to_owned(),
             }),
             &mut cache,
-        );
+        ));
         let state = store.state("failed").expect("failure state");
         assert!(matches!(state, MarkdownMermaidPresentationState::Failed(_)));
         assert!(state.fallback("flowchart").contains("bad diagram"));
@@ -555,7 +806,9 @@ mod tests {
         store.reconcile(&initial, true);
         assert_eq!(store.schedule(&initial).len(), 1);
         let mut cache = MermaidRenderCache::default();
-        store.complete("v1", Ok(rendered("v1")), &mut cache);
+        assert!(store.complete("v1", Ok(rendered("v1")), &mut cache));
+        let unchanged = store.reconcile(&initial, true);
+        assert!(unchanged.is_empty());
 
         let first = store
             .ready_placement("diagram", Rect::new(2, 3, 20, 8), Rect::new(4, 4, 10, 4))
@@ -577,7 +830,8 @@ mod tests {
         assert_eq!(moved.clip, Rect::new(0, 10, 8, 3));
 
         let replacement = [input("diagram", "v2", true)];
-        store.reconcile(&replacement, true);
+        let removed = store.reconcile(&replacement, true);
+        assert_eq!(removed, ["diagram"]);
         assert_eq!(
             store.state("diagram"),
             Some(&MarkdownMermaidPresentationState::Idle)
@@ -589,6 +843,12 @@ mod tests {
             store.state("diagram"),
             Some(&MarkdownMermaidPresentationState::TerminalUnsupported)
         );
+        assert!(store.reconcile(&replacement, true).is_empty());
+        assert_eq!(
+            store.state("diagram"),
+            Some(&MarkdownMermaidPresentationState::Idle)
+        );
+        store.reconcile(&replacement, false);
         assert!(
             store
                 .ready_placement("diagram", Rect::new(0, 0, 4, 4), Rect::new(0, 0, 4, 4))

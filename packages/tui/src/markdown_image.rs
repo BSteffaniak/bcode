@@ -57,6 +57,73 @@ pub struct MarkdownImagePresentationPolicy {
     pub terminal_supported: bool,
 }
 
+/// Runtime Markdown rich-presentation state owned by the interactive chat loop.
+#[derive(Debug)]
+pub struct MarkdownPresentationRuntime {
+    /// Resident image lifecycle state.
+    pub images: MarkdownImagePresentationStore,
+    /// Bounded decoded image cache.
+    pub image_cache: MarkdownImageCache,
+    /// Active image cancellation ownership.
+    pub image_inflight: MarkdownImageInflight,
+    /// Bounded image transport/decoder.
+    pub image_loader: MarkdownImageLoader,
+}
+
+impl MarkdownPresentationRuntime {
+    /// Create runtime state for interactive transcript presentation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bounded HTTP client cannot be constructed.
+    pub fn new() -> Result<Self, MarkdownImageLoadError> {
+        Ok(Self {
+            images: MarkdownImagePresentationStore::default(),
+            image_cache: MarkdownImageCache::default(),
+            image_inflight: MarkdownImageInflight::default(),
+            image_loader: MarkdownImageLoader::new()?,
+        })
+    }
+
+    /// Reconcile resident owners, hydrate cache hits, and start newly eligible loads.
+    ///
+    /// Returns removed contribution IDs and asynchronous load tasks. Callers
+    /// must emit removals in the next BMUX frame and poll every returned task.
+    pub fn reconcile_and_start(
+        &mut self,
+        inputs: &[MarkdownImagePresentationInput],
+        policy: MarkdownImagePresentationPolicy,
+    ) -> (
+        Vec<String>,
+        Vec<tokio::task::JoinHandle<MarkdownImageLoadCompletion>>,
+    ) {
+        let removed = self
+            .images
+            .reconcile_with_inflight(inputs, policy, &mut self.image_inflight);
+        self.images.hydrate_from_cache(&mut self.image_cache);
+        let requests = self
+            .images
+            .schedule_loads(inputs, policy, &mut self.image_inflight);
+        let tasks = spawn_image_loads(&self.image_loader, requests);
+        (removed, tasks)
+    }
+
+    /// Apply one asynchronous load completion if its owner is still current.
+    pub fn complete(&mut self, completion: MarkdownImageLoadCompletion) -> bool {
+        self.images.complete_load(
+            &completion.cache_key,
+            completion.result,
+            &mut self.image_cache,
+            &mut self.image_inflight,
+        )
+    }
+
+    /// Cancel all owned work before the interactive runtime is dropped.
+    pub fn cancel_all(&mut self) {
+        self.image_inflight.cancel_all();
+    }
+}
+
 /// Per-contribution Markdown image presentation state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkdownImagePresentationState {
@@ -120,6 +187,38 @@ pub struct MarkdownImageLoadRequest {
     pub cancellation: MarkdownImageCancellationToken,
 }
 
+/// Completion from one asynchronous bounded image load.
+#[derive(Debug)]
+pub struct MarkdownImageLoadCompletion {
+    /// Stable decoded-payload cache key.
+    pub cache_key: MarkdownImageCacheKey,
+    /// Typed load result.
+    pub result: Result<DecodedMarkdownImage, MarkdownImageLoadFailure>,
+}
+
+/// Start scheduled image loads outside frame rendering.
+#[must_use]
+pub fn spawn_image_loads(
+    loader: &MarkdownImageLoader,
+    requests: Vec<MarkdownImageLoadRequest>,
+) -> Vec<tokio::task::JoinHandle<MarkdownImageLoadCompletion>> {
+    requests
+        .into_iter()
+        .map(|request| {
+            let loader = loader.clone();
+            tokio::spawn(async move {
+                let result = loader
+                    .load_cancellable(&request.destination, &request.cancellation)
+                    .await;
+                MarkdownImageLoadCompletion {
+                    cache_key: request.cache_key,
+                    result,
+                }
+            })
+        })
+        .collect()
+}
+
 /// Resident per-contribution image presentation state.
 #[derive(Debug, Default)]
 pub struct MarkdownImagePresentationStore {
@@ -142,19 +241,27 @@ impl MarkdownImagePresentationStore {
         &mut self,
         inputs: &[MarkdownImagePresentationInput],
         policy: MarkdownImagePresentationPolicy,
-    ) {
+    ) -> Vec<String> {
+        let previous = self.entries.keys().cloned().collect::<BTreeSet<_>>();
         let active = inputs
             .iter()
-            .map(|input| input.contribution_id.as_str())
+            .map(|input| input.contribution_id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut removed = previous
+            .difference(&active)
+            .cloned()
             .collect::<BTreeSet<_>>();
         self.entries
-            .retain(|contribution_id, _| active.contains(contribution_id.as_str()));
+            .retain(|contribution_id, _| active.contains(contribution_id));
         for input in inputs {
             let reset = self
                 .entries
                 .get(&input.contribution_id)
                 .is_none_or(|entry| entry.cache_key != input.cache_key);
             if reset {
+                if self.entries.contains_key(&input.contribution_id) {
+                    removed.insert(input.contribution_id.clone());
+                }
                 self.entries.insert(
                     input.contribution_id.clone(),
                     MarkdownImagePresentationEntry {
@@ -162,8 +269,11 @@ impl MarkdownImagePresentationStore {
                         state: MarkdownImagePresentationState::initial(&input.destination, policy),
                     },
                 );
+            } else if let Some(entry) = self.entries.get_mut(&input.contribution_id) {
+                entry.state.reconcile_policy(&input.destination, policy);
             }
         }
+        removed.into_iter().collect()
     }
 
     /// Reconcile ownership and cancel in-flight work no longer referenced by a resident owner.
@@ -172,13 +282,23 @@ impl MarkdownImagePresentationStore {
         inputs: &[MarkdownImagePresentationInput],
         policy: MarkdownImagePresentationPolicy,
         inflight: &mut MarkdownImageInflight,
-    ) {
-        self.reconcile(inputs, policy);
+    ) -> Vec<String> {
+        let removed = self.reconcile(inputs, policy);
         let active_keys = inputs
             .iter()
+            .filter(|input| {
+                policy.interactive_resident_frame
+                    && policy.terminal_supported
+                    && (policy.network_enabled
+                        || !matches!(
+                            markdown_image_load_decision(&input.destination),
+                            MarkdownImageLoadDecision::Remote(_)
+                        ))
+            })
             .map(|input| input.cache_key.clone())
             .collect::<BTreeSet<_>>();
         inflight.retain(&active_keys);
+        removed
     }
 
     /// Schedule loads only for visible or explicitly bounded-prefetch residents.
@@ -229,14 +349,20 @@ impl MarkdownImagePresentationStore {
     }
 
     /// Complete a load and update every resident owner sharing its cache key.
+    ///
+    /// Returns `true` when the completed key was still in flight. Late results
+    /// for cancelled or replaced keys are discarded without repopulating the
+    /// decoded cache.
     pub fn complete_load(
         &mut self,
         key: &MarkdownImageCacheKey,
         result: Result<DecodedMarkdownImage, MarkdownImageLoadFailure>,
         cache: &mut MarkdownImageCache,
         inflight: &mut MarkdownImageInflight,
-    ) {
-        inflight.finish(key);
+    ) -> bool {
+        if !inflight.finish(key) {
+            return false;
+        }
         match result {
             Ok(image) => {
                 cache.insert(key.clone(), image.clone());
@@ -258,6 +384,7 @@ impl MarkdownImagePresentationStore {
                 }
             }
         }
+        true
     }
 
     /// Hydrate idle resident states from the bounded decoded cache.
@@ -309,6 +436,23 @@ impl MarkdownImagePresentationStore {
         self.entries.get(contribution_id).map(|entry| &entry.state)
     }
 
+    /// Return a readable state-aware fallback for one resident contribution.
+    #[must_use]
+    pub fn fallback(
+        &self,
+        contribution_id: &str,
+        alt: &str,
+        source: &MarkdownDestination,
+        linked_destination: Option<&MarkdownDestination>,
+    ) -> Option<String> {
+        let state = self.state(contribution_id)?;
+        Some(if linked_destination.is_some() {
+            state.linked_badge_fallback(alt, source, linked_destination)
+        } else {
+            state.fallback(alt, source)
+        })
+    }
+
     /// Return mutable presentation state for one resident contribution.
     pub fn state_mut(
         &mut self,
@@ -333,6 +477,21 @@ impl MarkdownImagePresentationStore {
 }
 
 impl MarkdownImagePresentationState {
+    fn reconcile_policy(
+        &mut self,
+        destination: &MarkdownDestination,
+        policy: MarkdownImagePresentationPolicy,
+    ) {
+        let policy_state = Self::initial(destination, policy);
+        match policy_state {
+            Self::TerminalUnsupported | Self::NetworkDisabled => *self = policy_state,
+            Self::Idle if matches!(self, Self::TerminalUnsupported | Self::NetworkDisabled) => {
+                *self = Self::Idle;
+            }
+            Self::Idle | Self::Loading | Self::Ready(_) | Self::Failed(_) => {}
+        }
+    }
+
     /// Derive the initial non-eager state from typed destination and capabilities.
     #[must_use]
     pub fn initial(
@@ -825,6 +984,12 @@ impl MarkdownImageCacheKey {
     pub fn new(source: &str, context: &str) -> Self {
         Self(format!("markdown-image-v1:{source}:{context}"))
     }
+
+    /// Return the stable key text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// Validated decoded image suitable for BMUX protocol-neutral presentation.
@@ -978,8 +1143,10 @@ impl MarkdownImageInflight {
     }
 
     /// Finish completed work for `key` without cancelling it.
-    pub fn finish(&mut self, key: &MarkdownImageCacheKey) {
-        self.loads.remove(key);
+    ///
+    /// Returns whether the key was still active.
+    pub fn finish(&mut self, key: &MarkdownImageCacheKey) -> bool {
+        self.loads.remove(key).is_some()
     }
 
     /// Cancel and remove work that is no longer owned by a resident/current item.
@@ -1118,8 +1285,8 @@ mod tests {
         MarkdownImageLoadError, MarkdownImageLoadFailure, MarkdownImageLoadGuard,
         MarkdownImageLoader, MarkdownImagePresentationInput, MarkdownImagePresentationPolicy,
         MarkdownImagePresentationState, MarkdownImagePresentationStore, MarkdownImageResidency,
-        RESERVED_IMAGE_ROWS, decode_markdown_image, markdown_image_load_decision,
-        markdown_image_reserved_rows, validate_dimensions,
+        MarkdownPresentationRuntime, RESERVED_IMAGE_ROWS, decode_markdown_image,
+        markdown_image_load_decision, markdown_image_reserved_rows, validate_dimensions,
     };
     use bcode_markdown_render::{
         MarkdownDestination, MarkdownDestinationRejection, resolve_markdown_destination,
@@ -1256,8 +1423,8 @@ mod tests {
         assert!(!retained.is_cancelled());
         assert!(inflight.cancellation_token(&key(1)).is_none());
         assert!(inflight.start(key(1)));
-        inflight.finish(&key(1));
-        inflight.finish(&key(2));
+        assert!(inflight.finish(&key(1)));
+        assert!(inflight.finish(&key(2)));
         assert!(inflight.is_empty());
     }
 
@@ -1277,6 +1444,98 @@ mod tests {
         inflight.cancel_all();
         assert!(remaining.is_cancelled());
         assert!(inflight.is_empty());
+    }
+
+    #[test]
+    fn capability_loss_cancels_inflight_remote_work() {
+        let remote = resolve_markdown_destination("https://example.com/image.png", None);
+        let input = [MarkdownImagePresentationInput {
+            contribution_id: "image".to_owned(),
+            cache_key: key(1),
+            destination: remote,
+            residency: MarkdownImageResidency::Visible,
+        }];
+        let enabled = MarkdownImagePresentationPolicy {
+            interactive_resident_frame: true,
+            network_enabled: true,
+            terminal_supported: true,
+        };
+        let disabled = MarkdownImagePresentationPolicy {
+            network_enabled: false,
+            ..enabled
+        };
+        let mut store = MarkdownImagePresentationStore::default();
+        let mut inflight = MarkdownImageInflight::default();
+        store.reconcile_with_inflight(&input, enabled, &mut inflight);
+        let request = store
+            .schedule_loads(&input, enabled, &mut inflight)
+            .pop()
+            .expect("scheduled load");
+
+        store.reconcile_with_inflight(&input, disabled, &mut inflight);
+
+        assert!(request.cancellation.is_cancelled());
+        assert!(inflight.is_empty());
+        assert_eq!(
+            store.state("image"),
+            Some(&MarkdownImagePresentationState::NetworkDisabled)
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_reconcile_starts_and_completes_current_local_load() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        std::fs::write(&path, png(2, 3)).unwrap();
+        let input = [MarkdownImagePresentationInput {
+            contribution_id: "image".to_owned(),
+            cache_key: MarkdownImageCacheKey::new(&path.to_string_lossy(), "document"),
+            destination: MarkdownDestination::LocalPath(path),
+            residency: MarkdownImageResidency::Visible,
+        }];
+        let policy = MarkdownImagePresentationPolicy {
+            interactive_resident_frame: true,
+            network_enabled: false,
+            terminal_supported: true,
+        };
+        let mut runtime = MarkdownPresentationRuntime::new().unwrap();
+        let (removed, tasks) = runtime.reconcile_and_start(&input, policy);
+        assert!(removed.is_empty());
+        let [task] = tasks.try_into().expect("one image task");
+
+        assert!(runtime.complete(task.await.unwrap()));
+        assert!(matches!(
+            runtime.images.state("image"),
+            Some(MarkdownImagePresentationState::Ready(_))
+        ));
+        let (_removed, tasks) = runtime.reconcile_and_start(&input, policy);
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_discards_completion_after_owner_removal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("image.png");
+        std::fs::write(&path, png(2, 3)).unwrap();
+        let input = [MarkdownImagePresentationInput {
+            contribution_id: "image".to_owned(),
+            cache_key: MarkdownImageCacheKey::new(&path.to_string_lossy(), "document"),
+            destination: MarkdownDestination::LocalPath(path),
+            residency: MarkdownImageResidency::Visible,
+        }];
+        let policy = MarkdownImagePresentationPolicy {
+            interactive_resident_frame: true,
+            network_enabled: false,
+            terminal_supported: true,
+        };
+        let mut runtime = MarkdownPresentationRuntime::new().unwrap();
+        let (_, tasks) = runtime.reconcile_and_start(&input, policy);
+        let [task] = tasks.try_into().expect("one image task");
+        let (removed, _) = runtime.reconcile_and_start(&[], policy);
+        assert_eq!(removed, ["image"]);
+
+        assert!(!runtime.complete(task.await.unwrap()));
+        assert!(runtime.image_cache.is_empty());
     }
 
     #[test]
@@ -1330,7 +1589,7 @@ mod tests {
         store.reconcile_with_inflight(&inputs, policy, &mut inflight);
         let requests = store.schedule_loads(&inputs, policy, &mut inflight);
         assert_eq!(requests.len(), 1);
-        store.complete_load(&key, Ok(image(7, 4)), &mut cache, &mut inflight);
+        assert!(store.complete_load(&key, Ok(image(7, 4)), &mut cache, &mut inflight));
         assert!(matches!(
             store.state("first"),
             Some(MarkdownImagePresentationState::Ready(_))
@@ -1354,18 +1613,44 @@ mod tests {
             store.schedule_loads(&failed, policy, &mut inflight).len(),
             1
         );
-        store.complete_load(
+        assert!(store.complete_load(
             &failed_key,
             Err(MarkdownImageLoadFailure::Load(
                 MarkdownImageLoadError::TimedOut,
             )),
             &mut cache,
             &mut inflight,
-        );
+        ));
         assert!(matches!(
             store.state("failed"),
             Some(MarkdownImagePresentationState::Failed(message)) if message.contains("timed out")
         ));
+    }
+
+    #[test]
+    fn late_cancelled_load_completion_is_discarded_without_cache_repopulation() {
+        let remote = resolve_markdown_destination("https://example.com/image.png", None);
+        let policy = MarkdownImagePresentationPolicy {
+            interactive_resident_frame: true,
+            network_enabled: true,
+            terminal_supported: true,
+        };
+        let key = MarkdownImageCacheKey::new("image.png", "document");
+        let input = [MarkdownImagePresentationInput {
+            contribution_id: "image".to_owned(),
+            cache_key: key.clone(),
+            destination: remote,
+            residency: MarkdownImageResidency::Visible,
+        }];
+        let mut store = MarkdownImagePresentationStore::default();
+        let mut cache = MarkdownImageCache::default();
+        let mut inflight = MarkdownImageInflight::default();
+        store.reconcile_with_inflight(&input, policy, &mut inflight);
+        assert_eq!(store.schedule_loads(&input, policy, &mut inflight).len(), 1);
+        store.reconcile_with_inflight(&[], policy, &mut inflight);
+
+        assert!(!store.complete_load(&key, Ok(image(2, 2)), &mut cache, &mut inflight));
+        assert!(cache.get(&key).is_none());
     }
 
     #[test]
@@ -1621,6 +1906,8 @@ mod tests {
         let mut store = MarkdownImagePresentationStore::default();
         store.reconcile(&[input("owner:image:1", "a.png")], policy);
         assert_eq!(store.len(), 1);
+        let unchanged = store.reconcile(&[input("owner:image:1", "a.png")], policy);
+        assert!(unchanged.is_empty());
         assert!(
             store
                 .state_mut("owner:image:1")
@@ -1635,18 +1922,83 @@ mod tests {
             Some(&MarkdownImagePresentationState::Loading)
         );
 
-        // A changed source/cache identity resets state.
-        store.reconcile(&[input("owner:image:1", "changed.png")], policy);
+        // A changed source/cache identity resets state and requires removing the old BMUX payload.
+        let removed = store.reconcile(&[input("owner:image:1", "changed.png")], policy);
+        assert_eq!(removed, ["owner:image:1"]);
         assert_eq!(
             store.state("owner:image:1"),
             Some(&MarkdownImagePresentationState::Idle)
         );
 
-        store.reconcile(&[input("replacement:image:1", "changed.png")], policy);
+        let removed = store.reconcile(&[input("replacement:image:1", "changed.png")], policy);
+        assert_eq!(removed, ["owner:image:1"]);
         assert!(store.state("owner:image:1").is_none());
         assert_eq!(store.len(), 1);
-        store.reconcile(&[], policy);
+        let removed = store.reconcile(&[], policy);
+        assert_eq!(removed, ["replacement:image:1"]);
         assert!(store.is_empty());
+    }
+
+    #[test]
+    fn unchanged_owner_reconciles_capability_policy_and_recovers_to_idle() {
+        let remote = resolve_markdown_destination("https://example.com/image.png", None);
+        let input = [MarkdownImagePresentationInput {
+            contribution_id: "image".to_owned(),
+            cache_key: MarkdownImageCacheKey::new("image.png", "document"),
+            destination: remote,
+            residency: MarkdownImageResidency::Visible,
+        }];
+        let enabled = MarkdownImagePresentationPolicy {
+            interactive_resident_frame: true,
+            network_enabled: true,
+            terminal_supported: true,
+        };
+        let unsupported = MarkdownImagePresentationPolicy {
+            terminal_supported: false,
+            ..enabled
+        };
+        let mut store = MarkdownImagePresentationStore::default();
+        store.reconcile(&input, enabled);
+        store
+            .state_mut("image")
+            .expect("image state")
+            .ready(image(2, 2));
+
+        assert!(store.reconcile(&input, unsupported).is_empty());
+        assert_eq!(
+            store.state("image"),
+            Some(&MarkdownImagePresentationState::TerminalUnsupported)
+        );
+        assert!(store.reconcile(&input, enabled).is_empty());
+        assert_eq!(
+            store.state("image"),
+            Some(&MarkdownImagePresentationState::Idle)
+        );
+    }
+
+    #[test]
+    fn store_fallback_uses_resident_state_and_compact_link_destination() {
+        let source = resolve_markdown_destination("https://example.com/image.png", None);
+        let destination = resolve_markdown_destination("https://example.com", None);
+        let policy = MarkdownImagePresentationPolicy {
+            interactive_resident_frame: true,
+            network_enabled: false,
+            terminal_supported: true,
+        };
+        let input = [MarkdownImagePresentationInput {
+            contribution_id: "image".to_owned(),
+            cache_key: MarkdownImageCacheKey::new("image.png", "document"),
+            destination: source.clone(),
+            residency: MarkdownImageResidency::Visible,
+        }];
+        let mut store = MarkdownImagePresentationStore::default();
+        store.reconcile(&input, policy);
+
+        let fallback = store
+            .fallback("image", "badge", &source, Some(&destination))
+            .expect("resident fallback");
+        assert!(fallback.contains("image network disabled"));
+        assert!(fallback.contains("https://example.com/"));
     }
 
     #[test]

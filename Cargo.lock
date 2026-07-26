@@ -1291,6 +1291,7 @@ dependencies = [
  "bcode_eval",
  "bcode_fake_provider_plugin",
  "bcode_hello_plugin",
+ "bcode_mermaid_render",
  "bcode_metrics",
  "bcode_model",
  "bcode_openai_compatible_provider_plugin",
@@ -2574,6 +2575,7 @@ dependencies = [
  "bcode_workflow",
  "bcode_workflow_store",
  "bcode_worktree_models",
+ "bmux_image",
  "bmux_keyboard",
  "bmux_terminal_grid",
  "bmux_text_edit",
@@ -2914,6 +2916,20 @@ dependencies = [
  "lz4_flex",
  "serde",
  "zstd",
+]
+
+[[package]]
+name = "bmux_image"
+version = "0.0.1-alpha.1"
+source = "git+https://github.com/BSteffaniak/bmux.git?rev=3cd77c2cdad4fcbe006612213621f8f90fe73ec7#3cd77c2cdad4fcbe006612213621f8f90fe73ec7"
+dependencies = [
+ "bmux_attach_image_protocol",
+ "bmux_ipc",
+ "bmux_tui",
+ "image",
+ "serde",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -416,6 +416,77 @@ fn spawn_worker(
     Ok((child, guard))
 }
 
+/// Environment override for the packaged private Mermaid renderer executable.
+pub const MERMAID_RENDERER_PATH_ENV: &str = "BCODE_MERMAID_WORKER_PATH";
+
+/// Process-isolated Mermaid renderer with packaging-owned executable discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IsolatedMermaidRenderer {
+    executable: std::path::PathBuf,
+}
+
+impl IsolatedMermaidRenderer {
+    /// Resolve the renderer packaged beside the current Bcode executable.
+    ///
+    /// `BCODE_MERMAID_WORKER_PATH` may explicitly override the packaged path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed unavailable error when the current executable directory
+    /// cannot be resolved.
+    pub fn packaged() -> Result<Self, MermaidRenderError> {
+        if let Some(path) =
+            std::env::var_os(MERMAID_RENDERER_PATH_ENV).filter(|value| !value.is_empty())
+        {
+            return Ok(Self::from_path(path));
+        }
+        let executable =
+            std::env::current_exe().map_err(|error| MermaidRenderError::WorkerUnavailable {
+                message: format!("cannot resolve current executable: {error}"),
+            })?;
+        let directory =
+            executable
+                .parent()
+                .ok_or_else(|| MermaidRenderError::WorkerUnavailable {
+                    message: "current executable has no parent directory".to_owned(),
+                })?;
+        let name = if cfg!(windows) {
+            "bcode-mermaid-worker.exe"
+        } else {
+            "bcode-mermaid-worker"
+        };
+        Ok(Self::from_path(directory.join(name)))
+    }
+
+    /// Use an explicit renderer executable path.
+    #[must_use]
+    pub fn from_path(path: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            executable: path.into(),
+        }
+    }
+
+    /// Return the configured executable path.
+    #[must_use]
+    pub fn executable(&self) -> &std::path::Path {
+        &self.executable
+    }
+
+    /// Render through the process-isolated, resource-limited protocol.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed validation, startup, protocol, timeout, cancellation, or
+    /// renderer failures.
+    pub fn render(
+        &self,
+        request: &MermaidRenderRequest,
+        cancellation: &MermaidCancellationToken,
+    ) -> Result<MermaidRendered, MermaidRenderError> {
+        render_mermaid_with_worker(&self.executable, request, cancellation)
+    }
+}
+
 /// Render a Mermaid request through the private worker executable.
 ///
 /// The caller supplies the worker path explicitly so application packaging owns
@@ -838,9 +909,9 @@ mod backend {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CACHE_BYTES, MAX_CACHE_ENTRIES, MermaidCancellationToken, MermaidRenderCache,
-        MermaidRenderError, MermaidRenderRequest, MermaidRendered, MermaidRenderedOutput,
-        render_mermaid,
+        IsolatedMermaidRenderer, MAX_CACHE_BYTES, MAX_CACHE_ENTRIES, MermaidCancellationToken,
+        MermaidRenderCache, MermaidRenderError, MermaidRenderRequest, MermaidRendered,
+        MermaidRenderedOutput, render_mermaid,
     };
 
     fn cached_render(key: &str, bytes: usize) -> MermaidRendered {
@@ -860,6 +931,23 @@ mod tests {
         assert!(svg.contains("<svg"));
         assert!(svg.contains('A'));
         assert_eq!(rendered.cache_key, request.cache_key());
+    }
+
+    #[test]
+    fn isolated_renderer_rejects_missing_executable_with_typed_error() {
+        let renderer = IsolatedMermaidRenderer::from_path("/definitely/missing/diagram-renderer");
+        let request = MermaidRenderRequest::svg("flowchart LR\nA --> B", 800, 600);
+
+        assert!(matches!(
+            renderer.render(&request, &MermaidCancellationToken::default()),
+            Err(MermaidRenderError::WorkerUnavailable { .. })
+        ));
+    }
+
+    #[test]
+    fn isolated_renderer_reuses_explicit_path() {
+        let renderer = IsolatedMermaidRenderer::from_path("renderer");
+        assert_eq!(renderer.executable(), std::path::Path::new("renderer"));
     }
 
     #[test]

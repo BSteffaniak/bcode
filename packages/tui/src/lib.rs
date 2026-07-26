@@ -152,6 +152,9 @@ pub enum TuiError {
     /// JSON error.
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+    /// BMUX image compositor failure.
+    #[error("image compositor error: {0}")]
+    ImageCompositor(#[from] bmux_image::tui::TuiImageError),
     /// I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
