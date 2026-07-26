@@ -201,12 +201,89 @@ pub struct ValidatedMigrationLedger {
     pub current_migration_count: usize,
 }
 
+/// Validate one released ledger-prefix fixture case independently from the current target ledger.
+///
+/// Materialized-current cases must contain an ordered prefix ending at their declared endpoint.
+/// Retired-superseded cases must contain only that historical identity. This validation is used by
+/// permanent fixture coverage and does not interpret either shape as the live current ledger.
+///
+/// # Errors
+///
+/// Returns an error when the endpoint is unknown, global-only, has a mismatched treatment, or its
+/// completed identifiers do not form the required case shape.
+pub fn validate_released_ledger_prefix_fixture_case(
+    case: &crate::ReleasedLedgerPrefixFixtureCase,
+) -> Result<(), MigrationLedgerValidationError> {
+    let Some(endpoint) = crate::RELEASED_MIGRATION_IDS
+        .iter()
+        .find(|migration| migration.id == case.endpoint)
+    else {
+        return Err(MigrationLedgerValidationError::UnknownMigration(
+            case.endpoint.to_owned(),
+        ));
+    };
+    if endpoint.domain != crate::ReleasedMigrationDomain::Session
+        || endpoint.treatment != case.endpoint_treatment
+    {
+        return Err(MigrationLedgerValidationError::InvalidReleasedFixtureCase {
+            endpoint: case.endpoint.to_owned(),
+        });
+    }
+    let Some(expected_case) = crate::released_session_ledger_prefix_fixture_cases()
+        .into_iter()
+        .find(|expected| expected.endpoint == case.endpoint)
+    else {
+        return Err(MigrationLedgerValidationError::InvalidReleasedFixtureCase {
+            endpoint: case.endpoint.to_owned(),
+        });
+    };
+    if expected_case.completed_migration_ids != case.completed_migration_ids {
+        return Err(MigrationLedgerValidationError::InvalidReleasedFixtureCase {
+            endpoint: case.endpoint.to_owned(),
+        });
+    }
+    match endpoint.treatment {
+        crate::ReleasedMigrationTreatment::MaterializeCurrent => {
+            if case.completed_migration_ids.last() != Some(&case.endpoint)
+                || case.completed_migration_ids.iter().any(|id| {
+                    !crate::RELEASED_MIGRATION_IDS.iter().any(|migration| {
+                        migration.id == *id
+                            && migration.domain == crate::ReleasedMigrationDomain::Session
+                            && migration.treatment
+                                == crate::ReleasedMigrationTreatment::MaterializeCurrent
+                    })
+                })
+            {
+                return Err(MigrationLedgerValidationError::InvalidReleasedFixtureCase {
+                    endpoint: case.endpoint.to_owned(),
+                });
+            }
+        }
+        crate::ReleasedMigrationTreatment::RetiredSuperseded => {
+            if case.completed_migration_ids != [case.endpoint] {
+                return Err(MigrationLedgerValidationError::InvalidReleasedFixtureCase {
+                    endpoint: case.endpoint.to_owned(),
+                });
+            }
+        }
+        crate::ReleasedMigrationTreatment::GlobalOnly => {
+            return Err(MigrationLedgerValidationError::InvalidReleasedFixtureCase {
+                endpoint: case.endpoint.to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Failure to interpret a source migration ledger.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum MigrationLedgerValidationError {
     /// A source migration is not durably complete.
     #[error("migration {id} has status {status}")]
     IncompleteMigration { id: String, status: String },
+    /// A released fixture case does not match its migration treatment or endpoint.
+    #[error("invalid released ledger fixture case ending at {endpoint}")]
+    InvalidReleasedFixtureCase { endpoint: String },
     /// A completed migration is not known by this build.
     #[error("unknown migration {0}")]
     UnknownMigration(String),
@@ -248,6 +325,64 @@ pub fn validate_migration_ledger(
     Ok(ValidatedMigrationLedger {
         completed_prefix_len,
         current_migration_count: facts.known_migration_ids.len(),
+    })
+}
+
+/// Classify policy-free target facts using migration-owned released-format policy.
+///
+/// # Errors
+///
+/// Returns an error for unknown or non-contiguous ledgers, inconsistent current contracts, and
+/// unsupported writer epochs.
+pub fn classify_target_storage(
+    facts: &bcode_session_migration_target::StorageCompatibilityFacts,
+) -> Result<
+    bcode_session_migration_target::StorageCompatibility,
+    bcode_session_migration_target::StorageCompatibilityError,
+> {
+    let completed_migration_ids =
+        completed_migration_ids(facts.migration_rows.iter().map(|row| MigrationLedgerRow {
+            id: row.id.clone(),
+            status: row.status.clone(),
+        }))
+        .map_err(|_| bcode_session_migration_target::StorageCompatibilityError::IncompleteLedger)?;
+    let ledger = validate_migration_ledger(&MigrationLedgerFacts {
+        known_migration_ids: facts.current_migration_ids.clone(),
+        completed_migration_ids,
+    })
+    .map_err(|error| {
+        bcode_session_migration_target::StorageCompatibilityError::Classification(error.to_string())
+    })?;
+    let compatibility = classify_source_storage(
+        ledger,
+        StorageContractFacts {
+            table_exists: facts.contract_table_exists,
+            contract: facts.writer_epoch.map(|writer_epoch| StorageContractRow {
+                schema_version: facts.contract_schema_version.unwrap_or_default(),
+                writer_epoch,
+            }),
+        },
+        facts.expected_contract_schema_version,
+        facts.legacy_writer_epoch,
+    )
+    .map_err(|error| match error {
+        SourceStorageCompatibilityError::WriterEpoch { actual, expected } => {
+            bcode_session_migration_target::StorageCompatibilityError::WriterEpoch {
+                actual,
+                expected,
+            }
+        }
+        error => bcode_session_migration_target::StorageCompatibilityError::Classification(
+            error.to_string(),
+        ),
+    })?;
+    Ok(match compatibility {
+        SourceStorageCompatibility::Current { writer_epoch } => {
+            bcode_session_migration_target::StorageCompatibility::Current { writer_epoch }
+        }
+        SourceStorageCompatibility::ReleasedHistorical { writer_epoch } => {
+            bcode_session_migration_target::StorageCompatibility::MigrationRequired { writer_epoch }
+        }
     })
 }
 
@@ -524,6 +659,31 @@ pub fn build_session_migration_receipt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn released_ledger_fixture_validation_rejects_mismatched_case_shapes() {
+        let invalid = crate::ReleasedLedgerPrefixFixtureCase {
+            endpoint: "023_reset_legacy_context_occupancy_projection",
+            completed_migration_ids: vec!["023_reset_legacy_context_occupancy_projection"],
+            endpoint_treatment: crate::ReleasedMigrationTreatment::MaterializeCurrent,
+        };
+        assert!(matches!(
+            validate_released_ledger_prefix_fixture_case(&invalid),
+            Err(MigrationLedgerValidationError::InvalidReleasedFixtureCase { .. })
+        ));
+        let retired = crate::ReleasedLedgerPrefixFixtureCase {
+            endpoint: "001_session_event_store_and_projections",
+            completed_migration_ids: vec![
+                "001_session_event_store_and_projections",
+                "001_events_table",
+            ],
+            endpoint_treatment: crate::ReleasedMigrationTreatment::RetiredSuperseded,
+        };
+        assert!(matches!(
+            validate_released_ledger_prefix_fixture_case(&retired),
+            Err(MigrationLedgerValidationError::InvalidReleasedFixtureCase { .. })
+        ));
+    }
 
     #[test]
     fn source_storage_classification_owns_contract_and_writer_policy() {

@@ -6,19 +6,16 @@
 //! intentionally keeps Turso-specific details at connection boundaries and uses
 //! `switchy` database traits for migrations and repository operations.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fs,
-    path::Path,
-    sync::Arc,
-    time::Duration,
-};
+use std::{collections::BTreeMap, fs, path::Path, sync::Arc, time::Duration};
 
+use crate::current_schema::{global_migrations, session_migrations};
 use crate::persisted::{
     CompatibleSessionEvent, PersistedSessionEventError, decode_session_event,
     decode_session_event_compatible, encode_session_event,
 };
+use async_trait::async_trait;
 use bcode_session_migration::{CanonicalNormalizationSummary, normalize_canonical_event};
+use bcode_session_migration_target::MigrationTarget as _;
 use sha2::{Digest as _, Sha256};
 
 use bcode_database_observability::ObservedDatabase;
@@ -35,12 +32,7 @@ use switchy::{
         Database, DatabaseError, DatabaseValue,
         query::{FilterableQuery, SortDirection},
     },
-    schema::{
-        MigrationError,
-        discovery::code::{CodeMigration, CodeMigrationSource},
-        migration::MigrationSource,
-        runner::MigrationRunner,
-    },
+    schema::{MigrationError, migration::MigrationSource, runner::MigrationRunner},
 };
 use thiserror::Error;
 
@@ -927,21 +919,22 @@ impl SessionDb {
         #[cfg(test)]
         abort_at_migration_crash_boundary("transaction_start");
         let tx = db.db.begin_transaction().await?;
+        let mut target = SessionMigrationTarget::new(&*tx, &metrics);
         report_migration_stage(
             progress.as_ref(),
             bcode_session_models::SessionMigrationStage::PreparingSchema,
             "Preparing session storage schema",
         );
         let schema_timer = metrics.timer();
-        run_session_migrations(&*tx).await?;
+        target.materialize_current_schema().await?;
         metrics.record_histogram(
             "session.migration.schema_duration_ms",
             schema_timer.elapsed_ms(),
         );
         let migration_outcome =
-            migrate_session_storage(&*tx, session_id, &metrics, progress.as_ref(), fault).await?;
-        inject_migration_fault(fault, MigrationFaultPhase::Receipt)?;
-        write_session_migration_receipt(
+            migrate_session_storage(&mut target, session_id, &metrics, progress.as_ref(), fault)
+                .await?;
+        let receipt = build_target_migration_receipt(
             &*tx,
             session_id,
             source_writer_epoch,
@@ -949,6 +942,8 @@ impl SessionDb {
             &migration_outcome,
         )
         .await?;
+        inject_migration_fault(fault, MigrationFaultPhase::Receipt)?;
+        target.persist_migration_receipt(&receipt).await?;
         #[cfg(test)]
         abort_at_migration_crash_boundary("before_epoch_update");
         inject_migration_fault(fault, MigrationFaultPhase::WriterEpochFinalization)?;
@@ -959,7 +954,7 @@ impl SessionDb {
         .map_err(|error| SessionDbError::MigrationHistoryIncompatible {
             reason: error.to_string(),
         })?;
-        set_storage_writer_contract(&*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await?;
+        target.finalize_writer_contract().await?;
         #[cfg(test)]
         abort_at_migration_crash_boundary("after_epoch_update_before_commit");
         validate_storage_writer_contract(&*tx).await?;
@@ -1563,45 +1558,32 @@ impl SessionDb {
     /// Returns an error for unknown migration history, dirty migrations, malformed contracts,
     /// unsupported contract schemas, or future writer epochs.
     #[allow(clippy::too_many_lines)]
-    pub async fn storage_compatibility(&self) -> SessionDbResult<SessionStorageCompatibility> {
-        let known_migrations = session_migrations()
+    pub async fn storage_compatibility_facts(
+        &self,
+    ) -> SessionDbResult<bcode_session_migration_target::StorageCompatibilityFacts> {
+        let current_migration_ids = session_migrations()
             .migrations()
             .await?
             .into_iter()
             .map(|migration| migration.id().to_owned())
             .collect::<Vec<_>>();
-        let applied = if self.db.table_exists(SESSION_MIGRATIONS_TABLE).await? {
-            let rows = self
-                .db
+        let migration_rows = if self.db.table_exists(SESSION_MIGRATIONS_TABLE).await? {
+            self.db
                 .select(SESSION_MIGRATIONS_TABLE)
                 .columns(&["id", "status"])
                 .execute(&**self.db)
                 .await?
                 .into_iter()
                 .map(|row| {
-                    Ok(bcode_session_migration::MigrationLedgerRow {
+                    Ok(bcode_session_migration_target::MigrationLedgerRow {
                         id: required_string(&row, "id")?,
                         status: required_string(&row, "status")?,
                     })
                 })
-                .collect::<SessionDbResult<Vec<_>>>()?;
-            bcode_session_migration::completed_migration_ids(rows).map_err(|error| {
-                SessionDbError::MigrationHistoryIncompatible {
-                    reason: error.to_string(),
-                }
-            })?
+                .collect::<SessionDbResult<Vec<_>>>()?
         } else {
-            BTreeSet::new()
+            Vec::new()
         };
-        let ledger = bcode_session_migration::validate_migration_ledger(
-            &bcode_session_migration::MigrationLedgerFacts {
-                known_migration_ids: known_migrations,
-                completed_migration_ids: applied,
-            },
-        )
-        .map_err(|error| SessionDbError::MigrationHistoryIncompatible {
-            reason: error.to_string(),
-        })?;
         let contract_table_exists = self.db.table_exists("session_storage_contract").await?;
         let contract = if contract_table_exists {
             self.db
@@ -1612,51 +1594,51 @@ impl SessionDb {
                 .await?
                 .as_ref()
                 .map(|row| {
-                    Ok::<_, SessionDbError>(bcode_session_migration::StorageContractRow {
-                        schema_version: required_non_negative_u64(row, "schema_version")?,
-                        writer_epoch: required_non_negative_u64(row, "writer_epoch")?,
-                    })
+                    Ok::<_, SessionDbError>((
+                        required_non_negative_u64(row, "schema_version")?,
+                        required_non_negative_u64(row, "writer_epoch")?,
+                    ))
                 })
                 .transpose()?
         } else {
             None
         };
-        match bcode_session_migration::classify_source_storage(
-            ledger,
-            bcode_session_migration::StorageContractFacts {
-                table_exists: contract_table_exists,
-                contract,
-            },
-            u64::from(SESSION_STORAGE_CONTRACT_SCHEMA_VERSION),
-            LEGACY_SESSION_STORAGE_WRITER_EPOCH,
+        Ok(bcode_session_migration_target::StorageCompatibilityFacts {
+            current_migration_ids,
+            migration_rows,
+            contract_table_exists,
+            contract_schema_version: contract.map(|(schema, _)| schema),
+            writer_epoch: contract.map(|(_, writer)| writer),
+            expected_contract_schema_version: u64::from(SESSION_STORAGE_CONTRACT_SCHEMA_VERSION),
+            legacy_writer_epoch: LEGACY_SESSION_STORAGE_WRITER_EPOCH,
+        })
+    }
+
+    /// Classify durable storage compatibility through migration-owned policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for damaged, unknown, or unsupported storage facts.
+    pub async fn storage_compatibility(&self) -> SessionDbResult<SessionStorageCompatibility> {
+        match bcode_session_migration::classify_target_storage(
+            &self.storage_compatibility_facts().await?,
         ) {
-            Ok(bcode_session_migration::SourceStorageCompatibility::Current { writer_epoch }) => {
+            Ok(bcode_session_migration_target::StorageCompatibility::Current { writer_epoch }) => {
                 Ok(SessionStorageCompatibility::Current { writer_epoch })
             }
-            Ok(bcode_session_migration::SourceStorageCompatibility::ReleasedHistorical {
+            Ok(bcode_session_migration_target::StorageCompatibility::MigrationRequired {
                 writer_epoch,
             }) => Ok(SessionStorageCompatibility::KnownLegacy { writer_epoch }),
-            Err(bcode_session_migration::SourceStorageCompatibilityError::ContractSchema {
-                actual,
-                expected,
-            }) => Err(SessionDbError::ProjectionIncompatible {
-                projection: "session_storage_contract",
-                actual,
-                expected,
-            }),
-            Err(bcode_session_migration::SourceStorageCompatibilityError::WriterEpoch {
+            Err(bcode_session_migration_target::StorageCompatibilityError::WriterEpoch {
                 actual,
                 expected,
             }) => Err(SessionDbError::WriterIncompatible {
                 actual: Some(actual),
                 expected,
             }),
-            Err(error @ (bcode_session_migration::SourceStorageCompatibilityError::MissingContractTable
-                | bcode_session_migration::SourceStorageCompatibilityError::MissingContractRow)) => {
-                Err(SessionDbError::MigrationHistoryIncompatible {
-                    reason: error.to_string(),
-                })
-            }
+            Err(error) => Err(SessionDbError::MigrationHistoryIncompatible {
+                reason: error.to_string(),
+            }),
         }
     }
 
@@ -2506,15 +2488,14 @@ impl SessionDb {
     pub async fn last_event_sequence(&self) -> SessionDbResult<Option<u64>> {
         let row = self
             .db
-            .select("events")
-            .columns(&["event_seq"])
-            .sort("event_seq", SortDirection::Desc)
-            .limit(1)
-            .execute_first(&**self.db)
-            .await?;
+            .query_raw("SELECT MAX(event_seq) AS event_seq FROM events")
+            .await?
+            .into_iter()
+            .next();
         row.as_ref()
-            .map(|row| required_i64(row, "event_seq").map(i64_to_u64))
-            .transpose()
+            .and_then(|row| optional_i64(row, "event_seq"))
+            .map(i64_to_u64)
+            .map_or(Ok(None), |value| Ok(Some(value)))
     }
 
     /// Resolve one finalized artifact reference from the bounded materialized projection.
@@ -2648,13 +2629,13 @@ async fn run_session_migrations(db: &dyn Database) -> Result<(), MigrationError>
     runner.run(db).await
 }
 
-async fn write_session_migration_receipt(
+async fn build_target_migration_receipt(
     db: &dyn Database,
     session_id: SessionId,
     source_writer_epoch: u64,
     operation_id: Option<bcode_session_models::SessionOpenOperationId>,
     migration_outcome: &MigrationReplayOutcome,
-) -> SessionDbResult<()> {
+) -> SessionDbResult<bcode_session_migration_target::MigrationReceipt> {
     let source_writer_epoch =
         u32::try_from(source_writer_epoch).map_err(|_| SessionDbError::WriterIncompatible {
             actual: Some(source_writer_epoch),
@@ -2703,22 +2684,22 @@ async fn write_session_migration_receipt(
     .map_err(|error| SessionDbError::MigrationHistoryIncompatible {
         reason: error.to_string(),
     })?;
-    db.insert("session_migration_receipts")
-        .value("operation_id", receipt.operation_id.clone())
-        .value("session_id", session_id.to_string())
-        .value(
-            "source_writer_epoch",
-            DatabaseValue::Int64(i64::from(receipt.source_writer_epoch)),
-        )
-        .value(
-            "target_writer_epoch",
-            DatabaseValue::Int64(i64::from(receipt.target_writer_epoch)),
-        )
-        .value("receipt", serde_json::to_string(&receipt)?)
-        .value("completed_at_ms", seq_to_value(receipt.completed_at_ms))
-        .execute(db)
-        .await?;
-    Ok(())
+    Ok(bcode_session_migration_target::MigrationReceipt {
+        operation_id: receipt.operation_id,
+        session_id,
+        source_writer_epoch: receipt.source_writer_epoch,
+        target_writer_epoch: receipt.target_writer_epoch,
+        migration_step_ids: receipt.migration_step_ids,
+        source_event_count: receipt.source_event_count,
+        source_event_tail: receipt.source_event_tail,
+        source_payload_digest_sha256: receipt.source_event_digest_sha256,
+        target_event_count: receipt.target_event_count,
+        target_event_tail: receipt.target_event_tail,
+        target_payload_digest_sha256: receipt.target_event_digest_sha256,
+        converted_events: receipt.converted_events,
+        retired_known_events: receipt.retired_known_events,
+        completed_at_ms: receipt.completed_at_ms,
+    })
 }
 
 async fn set_storage_writer_contract(db: &dyn Database, writer_epoch: u32) -> SessionDbResult<()> {
@@ -2819,13 +2800,13 @@ async fn validate_all_projection_checkpoints_at_tail(
 }
 
 async fn migrate_session_storage(
-    db: &dyn Database,
+    target: &mut SessionMigrationTarget<'_>,
     session_id: SessionId,
     metrics: &MetricsRegistry,
     progress: Option<&SessionMigrationProgressCallback>,
     fault: MigrationFaultPhase,
 ) -> SessionDbResult<MigrationReplayOutcome> {
-    let event_total = last_event_sequence_from_database(db)
+    let event_total = last_event_sequence_from_database(target.db)
         .await?
         .map_or(0, |tail| tail.saturating_add(1));
     report_migration_progress(
@@ -2837,12 +2818,12 @@ async fn migrate_session_storage(
     );
     metrics.add_counter("session.migration.canonical_events_total", event_total);
     let replay =
-        rebuild_migration_projections(db, event_total, session_id, metrics, progress, fault)
+        rebuild_migration_projections(target, event_total, session_id, metrics, progress, fault)
             .await?;
     inject_migration_fault(fault, MigrationFaultPhase::FinalValidation)?;
     #[cfg(test)]
     abort_at_migration_crash_boundary("final_validation");
-    validate_migrated_storage(db, replay.tail.as_ref(), metrics, progress).await?;
+    validate_migrated_storage(target, replay.tail.as_ref(), metrics, progress).await?;
     Ok(replay)
 }
 
@@ -2872,30 +2853,13 @@ fn validate_migration_event_identity(
 
 #[allow(clippy::too_many_lines)]
 async fn rebuild_migration_projections(
-    db: &dyn Database,
+    target: &mut SessionMigrationTarget<'_>,
     event_total: u64,
     session_id: SessionId,
     metrics: &MetricsRegistry,
     progress: Option<&SessionMigrationProgressCallback>,
     fault: MigrationFaultPhase,
 ) -> SessionDbResult<MigrationReplayOutcome> {
-    for table in [
-        "session_compatibility_issues",
-        "session_compatibility_state",
-        "turn_receipts",
-        "model_context_entries",
-        "model_context_projection_state",
-        "context_occupancy_projection",
-        "projection_checkpoints",
-        "artifact_references",
-        "runtime_work",
-        "tool_runs",
-        "transcript_items",
-        "input_messages",
-        "session_state",
-    ] {
-        db.delete(table).execute(db).await?;
-    }
     let replay_timer = metrics.timer();
     let mut state = MigrationProjectionState::new();
     let mut source_digest = Sha256::new();
@@ -2903,7 +2867,9 @@ async fn rebuild_migration_projections(
     let mut tail = None;
     let mut completed = 0_u64;
     while completed < event_total {
-        let page = canonical_migration_page(db, completed, event_total).await?;
+        let page = target
+            .canonical_page(completed, MIGRATION_EVENT_PAGE_SIZE)
+            .await?;
         if page.is_empty() {
             return Err(SessionDbError::InvalidCanonicalSequence {
                 expected: completed,
@@ -2911,14 +2877,14 @@ async fn rebuild_migration_projections(
             });
         }
         for row in page {
-            let event_seq = required_non_negative_u64(&row, "event_seq")?;
+            let event_seq = row.sequence;
             if event_seq != completed {
                 return Err(SessionDbError::InvalidCanonicalSequence {
                     expected: completed,
                     actual: event_seq,
                 });
             }
-            let payload = required_string(&row, "payload")?;
+            let payload = row.payload;
             let payload_length = u64::try_from(payload.len()).unwrap_or(u64::MAX);
             source_digest.update(payload_length.to_le_bytes());
             source_digest.update(payload.as_bytes());
@@ -2942,20 +2908,19 @@ async fn rebuild_migration_projections(
             validate_migration_event_identity(&normalized.event, event_seq, session_id)?;
             let event = normalized.event;
             let current_payload = encode_session_event(&event)?;
-            db.update("events")
-                .value("event_type", event_kind_name(&event.kind))
-                .value(
-                    "schema_version",
-                    DatabaseValue::Int32(i32::from(event.schema_version)),
-                )
-                .value("payload", current_payload)
-                .where_eq("event_seq", seq_to_value(event_seq))
-                .execute(db)
+            target
+                .replace_canonical_row(bcode_session_migration_target::CanonicalRow {
+                    sequence: event_seq,
+                    event_kind: event_kind_name(&event.kind).to_owned(),
+                    schema_version: event.schema_version,
+                    payload: current_payload,
+                })
                 .await?;
             inject_migration_fault(fault, MigrationFaultPhase::Projection)?;
             #[cfg(test)]
             abort_at_migration_crash_boundary("projection_rebuild");
-            project_migration_event(db, &event, metrics, &mut state).await?;
+            target.ingest_projectors(&event).await?;
+            state.authoritative.ingest(&event);
             completed = completed.saturating_add(1);
             if completed == event_total || completed.is_multiple_of(100) {
                 report_migration_progress(
@@ -2969,9 +2934,17 @@ async fn rebuild_migration_projections(
             tail = Some(event);
         }
     }
-    if let Some(tail) = tail.as_ref() {
-        finalize_migration_context_occupancy(db, tail, &state).await?;
-    }
+    target
+        .write_authoritative_state(
+            state.authoritative.context_epoch,
+            state
+                .authoritative
+                .context_occupancy
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()?,
+        )
+        .await?;
     report_migration_progress(
         progress,
         bcode_session_models::SessionMigrationStage::RebuildingProjections,
@@ -3080,7 +3053,7 @@ async fn migration_target_validation_facts(
 }
 
 async fn validate_migrated_storage(
-    db: &dyn Database,
+    target: &mut SessionMigrationTarget<'_>,
     tail: Option<&SessionEvent>,
     metrics: &MetricsRegistry,
     progress: Option<&SessionMigrationProgressCallback>,
@@ -3091,15 +3064,10 @@ async fn validate_migrated_storage(
         bcode_session_models::SessionMigrationStage::ValidatingProjections,
         "Validating rebuilt session indexes",
     );
-    if let Some(tail) = tail {
-        finalize_migration_session_state(db, tail).await?;
-        finalize_migration_model_context(db, tail).await?;
-        project_migration_materialized_checkpoints_at_tail(db, tail).await?;
-        project_session_compatibility_state(db, tail).await?;
-    }
     let canonical_tail = tail.map(|event| event.sequence);
-    let target = migration_target_validation_facts(db, canonical_tail).await?;
-    bcode_session_migration::validate_migration_target(&target).map_err(|error| {
+    target.finalize_projectors(canonical_tail).await?;
+    let validation = target.validate_strict_current().await?;
+    bcode_session_migration::validate_strict_target(&validation).map_err(|error| {
         SessionDbError::MigrationHistoryIncompatible {
             reason: error.to_string(),
         }
@@ -3167,6 +3135,199 @@ async fn project_migration_event(
     Ok(())
 }
 
+/// Current session implementation of the policy-free migration-target API.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct SessionMigrationTarget<'a> {
+    db: &'a dyn Database,
+    metrics: &'a MetricsRegistry,
+    projection_state: MigrationProjectionState,
+    pending_tail: Option<SessionEvent>,
+}
+
+impl<'a> SessionMigrationTarget<'a> {
+    #[must_use]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn new(db: &'a dyn Database, metrics: &'a MetricsRegistry) -> Self {
+        Self {
+            db,
+            metrics,
+            projection_state: MigrationProjectionState::new(),
+            pending_tail: None,
+        }
+    }
+}
+
+#[async_trait]
+impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<'_> {
+    type Error = SessionDbError;
+
+    async fn materialize_current_schema(&mut self) -> Result<(), Self::Error> {
+        run_session_migrations(self.db).await?;
+        for table in [
+            "session_compatibility_issues",
+            "session_compatibility_state",
+            "turn_receipts",
+            "model_context_entries",
+            "model_context_projection_state",
+            "context_occupancy_projection",
+            "projection_checkpoints",
+            "artifact_references",
+            "runtime_work",
+            "tool_runs",
+            "transcript_items",
+            "input_messages",
+            "session_state",
+        ] {
+            self.db.delete(table).execute(self.db).await?;
+        }
+        Ok(())
+    }
+
+    async fn canonical_page(
+        &mut self,
+        start_sequence: u64,
+        limit: usize,
+    ) -> Result<Vec<bcode_session_migration_target::CanonicalRow>, Self::Error> {
+        let rows = self
+            .db
+            .select("events")
+            .columns(&["event_seq", "event_type", "schema_version", "payload"])
+            .where_gte("event_seq", seq_to_value(start_sequence))
+            .sort("event_seq", SortDirection::Asc)
+            .limit(limit.min(MIGRATION_EVENT_PAGE_SIZE))
+            .execute(self.db)
+            .await?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(bcode_session_migration_target::CanonicalRow {
+                    sequence: required_non_negative_u64(&row, "event_seq")?,
+                    event_kind: required_string(&row, "event_type")?,
+                    schema_version: u16::try_from(required_non_negative_u64(
+                        &row,
+                        "schema_version",
+                    )?)
+                    .map_err(|_| SessionDbError::InvalidRow {
+                        column: "events.schema_version".to_owned(),
+                    })?,
+                    payload: required_string(&row, "payload")?,
+                })
+            })
+            .collect()
+    }
+
+    async fn replace_canonical_row(
+        &mut self,
+        row: bcode_session_migration_target::CanonicalRow,
+    ) -> Result<(), Self::Error> {
+        self.db
+            .update("events")
+            .value("event_type", row.event_kind)
+            .value(
+                "schema_version",
+                DatabaseValue::Int32(i32::from(row.schema_version)),
+            )
+            .value("payload", row.payload)
+            .where_eq("event_seq", seq_to_value(row.sequence))
+            .execute(self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn write_authoritative_state(
+        &mut self,
+        context_epoch: u64,
+        context_occupancy_json: Option<String>,
+    ) -> Result<(), Self::Error> {
+        self.projection_state.authoritative.context_epoch = context_epoch;
+        self.projection_state.authoritative.context_occupancy = context_occupancy_json
+            .map(|json| serde_json::from_str(&json))
+            .transpose()?;
+        Ok(())
+    }
+
+    async fn ingest_projectors(&mut self, event: &SessionEvent) -> Result<(), Self::Error> {
+        project_migration_event(self.db, event, self.metrics, &mut self.projection_state).await?;
+        self.pending_tail = Some(event.clone());
+        Ok(())
+    }
+
+    async fn finalize_projectors(
+        &mut self,
+        canonical_tail: Option<u64>,
+    ) -> Result<(), Self::Error> {
+        match (canonical_tail, self.pending_tail.as_ref()) {
+            (None, None) => Ok(()),
+            (Some(expected), Some(tail)) if tail.sequence == expected => {
+                finalize_migration_session_state(self.db, tail).await?;
+                finalize_migration_model_context(self.db, tail).await?;
+                finalize_migration_context_occupancy(self.db, tail, &self.projection_state).await?;
+                project_migration_materialized_checkpoints_at_tail(self.db, tail).await?;
+                project_session_compatibility_state(self.db, tail).await
+            }
+            _ => Err(SessionDbError::MigrationHistoryIncompatible {
+                reason: "migration target canonical tail does not match projector ingestion"
+                    .to_owned(),
+            }),
+        }
+    }
+
+    async fn validate_strict_current(
+        &mut self,
+    ) -> Result<bcode_session_migration_target::StrictValidation, Self::Error> {
+        let canonical_tail = last_event_sequence_from_database(self.db).await?;
+        let facts = migration_target_validation_facts(self.db, canonical_tail).await?;
+        Ok(bcode_session_migration_target::StrictValidation {
+            canonical_tail: facts.canonical_tail,
+            projections: facts
+                .projections
+                .into_iter()
+                .map(
+                    |projection| bcode_session_migration_target::ProjectionValidation {
+                        projection: projection.projection,
+                        actual_schema_version: projection.actual_schema_version,
+                        expected_schema_version: projection.expected_schema_version,
+                        checkpoint: projection.checkpoint,
+                    },
+                )
+                .collect(),
+            model_context_schema_version: facts.model_context_schema_version,
+            expected_model_context_schema_version: facts.expected_model_context_schema_version,
+            model_context_checkpoint: facts.model_context_checkpoint,
+            compatibility_schema_version: facts.compatibility_schema_version,
+            expected_compatibility_schema_version: facts.expected_compatibility_schema_version,
+            compatibility_checkpoint: facts.compatibility_checkpoint,
+            compatibility_resolved: facts.compatibility_resolved,
+        })
+    }
+
+    async fn persist_migration_receipt(
+        &mut self,
+        receipt: &bcode_session_migration_target::MigrationReceipt,
+    ) -> Result<(), Self::Error> {
+        self.db
+            .insert("session_migration_receipts")
+            .value("operation_id", receipt.operation_id.clone())
+            .value("session_id", receipt.session_id.to_string())
+            .value(
+                "source_writer_epoch",
+                DatabaseValue::Int64(i64::from(receipt.source_writer_epoch)),
+            )
+            .value(
+                "target_writer_epoch",
+                DatabaseValue::Int64(i64::from(receipt.target_writer_epoch)),
+            )
+            .value("receipt", serde_json::to_string(receipt)?)
+            .value("completed_at_ms", seq_to_value(receipt.completed_at_ms))
+            .execute(self.db)
+            .await?;
+        Ok(())
+    }
+
+    async fn finalize_writer_contract(&mut self) -> Result<(), Self::Error> {
+        set_storage_writer_contract(self.db, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await
+    }
+}
+
 fn report_migration_stage(
     progress: Option<&SessionMigrationProgressCallback>,
     stage: bcode_session_models::SessionMigrationStage,
@@ -3199,23 +3360,6 @@ fn report_migration_progress(
             message: message.to_owned(),
         });
     }
-}
-
-async fn canonical_migration_page(
-    db: &dyn Database,
-    start_sequence: u64,
-    event_total: u64,
-) -> SessionDbResult<Vec<switchy::database::Row>> {
-    let remaining = event_total.saturating_sub(start_sequence);
-    let remaining = usize::try_from(remaining).unwrap_or(usize::MAX);
-    db.select("events")
-        .columns(&["event_seq", "payload"])
-        .where_gte("event_seq", seq_to_value(start_sequence))
-        .sort("event_seq", SortDirection::Asc)
-        .limit(remaining.min(MIGRATION_EVENT_PAGE_SIZE))
-        .execute(db)
-        .await
-        .map_err(SessionDbError::from)
 }
 
 async fn strict_events_from_database(db: &dyn Database) -> SessionDbResult<Vec<SessionEvent>> {
@@ -3253,262 +3397,6 @@ async fn rebuild_model_context_projection(db: &dyn Database) -> SessionDbResult<
         project_model_context_event(db, event).await?;
     }
     Ok(events.len())
-}
-
-fn global_migrations() -> CodeMigrationSource<'static> {
-    let mut source = CodeMigrationSource::new();
-    add_sql_migration(
-        &mut source,
-        "001_global_sessions_table",
-        "CREATE TABLE IF NOT EXISTS sessions (\n    session_id TEXT PRIMARY KEY NOT NULL,\n    db_path TEXT NOT NULL,\n    title TEXT,\n    working_directory TEXT,\n    created_at_ms INTEGER NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    state TEXT NOT NULL DEFAULT 'active',\n    projection_status TEXT NOT NULL DEFAULT 'fresh'\n)",
-        "DROP TABLE IF EXISTS sessions",
-    );
-    add_sql_migration(
-        &mut source,
-        "002_global_sessions_updated_at_index",
-        "CREATE INDEX IF NOT EXISTS idx_sessions_updated_at_ms ON sessions(updated_at_ms)",
-        "DROP INDEX IF EXISTS idx_sessions_updated_at_ms",
-    );
-    add_sql_migration(
-        &mut source,
-        "003_global_composer_drafts_table",
-        "CREATE TABLE IF NOT EXISTS composer_drafts (\n    scope_kind TEXT NOT NULL,\n    scope_key TEXT NOT NULL,\n    launch_working_directory TEXT,\n    session_id TEXT,\n    text TEXT NOT NULL,\n    updated_at_ms INTEGER NOT NULL,\n    PRIMARY KEY(scope_kind, scope_key)\n)",
-        "DROP TABLE IF EXISTS composer_drafts",
-    );
-    source
-}
-
-fn session_migrations() -> CodeMigrationSource<'static> {
-    let mut source = CodeMigrationSource::new();
-    add_session_base_migrations(&mut source);
-    add_session_runtime_migrations(&mut source);
-    add_session_execution_migrations(&mut source);
-    source
-}
-
-fn add_session_execution_migrations(source: &mut CodeMigrationSource<'static>) {
-    add_sql_migration(
-        source,
-        "030_session_state_visibility_column",
-        "ALTER TABLE session_state ADD COLUMN visibility TEXT",
-        "ALTER TABLE session_state DROP COLUMN visibility",
-    );
-    add_sql_migration(
-        source,
-        "031_session_state_execution_provenance_column",
-        "ALTER TABLE session_state ADD COLUMN execution_provenance TEXT",
-        "ALTER TABLE session_state DROP COLUMN execution_provenance",
-    );
-    add_sql_migration(
-        source,
-        "032_terminal_tool_lifecycle_projection",
-        "UPDATE session_storage_contract SET writer_epoch = writer_epoch WHERE contract_id = 1",
-        "UPDATE session_storage_contract SET writer_epoch = writer_epoch WHERE contract_id = 1",
-    );
-    add_sql_migration(
-        source,
-        "033_session_migration_receipts_table",
-        "CREATE TABLE IF NOT EXISTS session_migration_receipts (\n    operation_id TEXT PRIMARY KEY NOT NULL,\n    session_id TEXT NOT NULL,\n    source_writer_epoch INTEGER NOT NULL,\n    target_writer_epoch INTEGER NOT NULL,\n    receipt TEXT NOT NULL,\n    completed_at_ms INTEGER NOT NULL\n)",
-        "DROP TABLE IF EXISTS session_migration_receipts",
-    );
-}
-
-fn add_session_base_migrations(source: &mut CodeMigrationSource<'static>) {
-    add_sql_migration(
-        source,
-        "001_events_table",
-        "CREATE TABLE IF NOT EXISTS events (\n    event_seq INTEGER PRIMARY KEY NOT NULL,\n    event_type TEXT NOT NULL,\n    schema_version INTEGER NOT NULL,\n    created_at_ms INTEGER,\n    causation_id TEXT,\n    correlation_id TEXT,\n    payload TEXT NOT NULL\n)",
-        "DROP TABLE IF EXISTS events",
-    );
-    add_sql_migration(
-        source,
-        "002_events_event_type_index",
-        "CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type)",
-        "DROP INDEX IF EXISTS idx_events_event_type",
-    );
-    add_sql_migration(
-        source,
-        "003_session_state_table",
-        "CREATE TABLE IF NOT EXISTS session_state (\n    session_id TEXT PRIMARY KEY NOT NULL,\n    last_event_seq INTEGER NOT NULL,\n    current_model TEXT,\n    current_provider TEXT,\n    working_directory TEXT,\n    title TEXT,\n    updated_at_ms INTEGER\n)",
-        "DROP TABLE IF EXISTS session_state",
-    );
-    add_sql_migration(
-        source,
-        "004_input_messages_table",
-        "CREATE TABLE IF NOT EXISTS input_messages (\n    input_seq INTEGER PRIMARY KEY NOT NULL,\n    event_seq INTEGER NOT NULL,\n    created_at_ms INTEGER,\n    text TEXT NOT NULL,\n    working_directory TEXT,\n    model TEXT,\n    FOREIGN KEY(event_seq) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS input_messages",
-    );
-    add_sql_migration(
-        source,
-        "005_input_messages_event_seq_index",
-        "CREATE INDEX IF NOT EXISTS idx_input_messages_event_seq ON input_messages(event_seq)",
-        "DROP INDEX IF EXISTS idx_input_messages_event_seq",
-    );
-    add_sql_migration(
-        source,
-        "006_transcript_items_table",
-        "CREATE TABLE IF NOT EXISTS transcript_items (\n    transcript_seq INTEGER PRIMARY KEY NOT NULL,\n    event_seq_start INTEGER NOT NULL,\n    event_seq_end INTEGER NOT NULL,\n    role TEXT NOT NULL,\n    kind TEXT NOT NULL,\n    status TEXT NOT NULL,\n    content TEXT,\n    created_at_ms INTEGER,\n    FOREIGN KEY(event_seq_start) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS transcript_items",
-    );
-    add_sql_migration(
-        source,
-        "007_transcript_items_event_range_index",
-        "CREATE INDEX IF NOT EXISTS idx_transcript_items_event_range ON transcript_items(event_seq_start, event_seq_end)",
-        "DROP INDEX IF EXISTS idx_transcript_items_event_range",
-    );
-    add_sql_migration(
-        source,
-        "008_tool_runs_table",
-        "CREATE TABLE IF NOT EXISTS tool_runs (\n    tool_call_id TEXT PRIMARY KEY NOT NULL,\n    event_seq_start INTEGER NOT NULL,\n    event_seq_end INTEGER,\n    status TEXT NOT NULL,\n    tool_name TEXT,\n    started_at_ms INTEGER,\n    completed_at_ms INTEGER,\n    output_bytes INTEGER,\n    is_error INTEGER,\n    FOREIGN KEY(event_seq_start) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS tool_runs",
-    );
-    add_sql_migration(
-        source,
-        "009_tool_runs_status_index",
-        "CREATE INDEX IF NOT EXISTS idx_tool_runs_status ON tool_runs(status)",
-        "DROP INDEX IF EXISTS idx_tool_runs_status",
-    );
-    add_sql_migration(
-        source,
-        "010_projection_checkpoints_table",
-        "CREATE TABLE IF NOT EXISTS projection_checkpoints (\n    projection_name TEXT PRIMARY KEY NOT NULL,\n    last_event_seq INTEGER NOT NULL,\n    projection_version INTEGER NOT NULL,\n    updated_at_ms INTEGER\n)",
-        "DROP TABLE IF EXISTS projection_checkpoints",
-    );
-    add_sql_migration(
-        source,
-        "011_snapshots_table",
-        "CREATE TABLE IF NOT EXISTS snapshots (\n    snapshot_name TEXT PRIMARY KEY NOT NULL,\n    last_event_seq INTEGER NOT NULL,\n    schema_version INTEGER NOT NULL,\n    payload TEXT NOT NULL,\n    updated_at_ms INTEGER\n)",
-        "DROP TABLE IF EXISTS snapshots",
-    );
-}
-
-#[allow(clippy::too_many_lines)]
-fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
-    add_sql_migration(
-        source,
-        "012_runtime_work_table",
-        "CREATE TABLE IF NOT EXISTS runtime_work (\n    work_id TEXT PRIMARY KEY NOT NULL,\n    event_seq_start INTEGER NOT NULL,\n    event_seq_end INTEGER,\n    parent_work_id TEXT,\n    kind TEXT NOT NULL,\n    label TEXT NOT NULL,\n    status TEXT NOT NULL,\n    started_at_ms INTEGER,\n    finished_at_ms INTEGER,\n    message TEXT,\n    cancellable INTEGER NOT NULL DEFAULT 0,\n    FOREIGN KEY(event_seq_start) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS runtime_work",
-    );
-    add_sql_migration(
-        source,
-        "013_runtime_work_status_index",
-        "CREATE INDEX IF NOT EXISTS idx_runtime_work_status ON runtime_work(status)",
-        "DROP INDEX IF EXISTS idx_runtime_work_status",
-    );
-    add_sql_migration(
-        source,
-        "014_runtime_work_parent_index",
-        "CREATE INDEX IF NOT EXISTS idx_runtime_work_parent_work_id ON runtime_work(parent_work_id)",
-        "DROP INDEX IF EXISTS idx_runtime_work_parent_work_id",
-    );
-    add_sql_migration(
-        source,
-        "015_session_drafts_table",
-        "CREATE TABLE IF NOT EXISTS session_drafts (\n    session_id TEXT PRIMARY KEY NOT NULL,\n    text TEXT NOT NULL,\n    updated_at_ms INTEGER NOT NULL\n)",
-        "DROP TABLE IF EXISTS session_drafts",
-    );
-    add_sql_migration(
-        source,
-        "016_session_state_reasoning_effort_column",
-        "ALTER TABLE session_state ADD COLUMN reasoning_effort TEXT",
-        "ALTER TABLE session_state DROP COLUMN reasoning_effort",
-    );
-    add_sql_migration(
-        source,
-        "017_session_state_reasoning_summary_column",
-        "ALTER TABLE session_state ADD COLUMN reasoning_summary TEXT",
-        "ALTER TABLE session_state DROP COLUMN reasoning_summary",
-    );
-    add_sql_migration(
-        source,
-        "018_model_context_projection_state_table",
-        "CREATE TABLE IF NOT EXISTS model_context_projection_state (\n    projection_id INTEGER PRIMARY KEY NOT NULL,\n    schema_version INTEGER NOT NULL,\n    last_event_seq INTEGER NOT NULL\n)",
-        "DROP TABLE IF EXISTS model_context_projection_state",
-    );
-    add_sql_migration(
-        source,
-        "019_model_context_entries_table",
-        "CREATE TABLE IF NOT EXISTS model_context_entries (\n    event_seq INTEGER PRIMARY KEY NOT NULL,\n    event_type TEXT NOT NULL,\n    payload TEXT NOT NULL,\n    FOREIGN KEY(event_seq) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS model_context_entries",
-    );
-    add_sql_migration(
-        source,
-        "020_model_context_entries_event_type_index",
-        "CREATE INDEX IF NOT EXISTS idx_model_context_entries_event_type ON model_context_entries(event_type)",
-        "DROP INDEX IF EXISTS idx_model_context_entries_event_type",
-    );
-    add_sql_migration(
-        source,
-        "021_artifact_references_table",
-        "CREATE TABLE IF NOT EXISTS artifact_references (\n    artifact_id TEXT NOT NULL,\n    reference_key TEXT NOT NULL,\n    producer_plugin_id TEXT NOT NULL,\n    schema TEXT NOT NULL,\n    schema_version INTEGER NOT NULL,\n    storage_uri TEXT,\n    content_type TEXT,\n    byte_len INTEGER,\n    availability TEXT,\n    complete INTEGER,\n    checksum_sha256 TEXT,\n    finalized_event_seq INTEGER NOT NULL,\n    PRIMARY KEY(artifact_id, reference_key),\n    FOREIGN KEY(finalized_event_seq) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS artifact_references",
-    );
-    add_sql_migration(
-        source,
-        "022_context_occupancy_projection_table",
-        "CREATE TABLE IF NOT EXISTS context_occupancy_projection (\n    projection_id INTEGER PRIMARY KEY NOT NULL,\n    schema_version INTEGER NOT NULL,\n    context_epoch INTEGER NOT NULL,\n    occupancy_json TEXT\n);\nINSERT OR IGNORE INTO context_occupancy_projection (projection_id, schema_version, context_epoch, occupancy_json) SELECT 1, 1, COALESCE(MAX(event_seq), 0), NULL FROM events WHERE event_type IN ('model_changed', 'context_compacted', 'provider_context_compacted');\nINSERT OR IGNORE INTO projection_checkpoints (projection_name, last_event_seq, projection_version, updated_at_ms) SELECT 'context_occupancy', COALESCE(MAX(event_seq), 0), 1, 0 FROM events",
-        "DROP TABLE IF EXISTS context_occupancy_projection",
-    );
-    add_sql_migration(
-        source,
-        "023_reset_legacy_context_occupancy_projection",
-        "UPDATE context_occupancy_projection SET schema_version = 3, occupancy_json = NULL WHERE schema_version < 3",
-        "UPDATE context_occupancy_projection SET schema_version = 2, occupancy_json = NULL WHERE schema_version = 3",
-    );
-    add_sql_migration(
-        source,
-        "024_reset_request_context_occupancy_projection",
-        "UPDATE context_occupancy_projection SET schema_version = 4, occupancy_json = NULL WHERE schema_version < 4",
-        "UPDATE context_occupancy_projection SET schema_version = 3, occupancy_json = NULL WHERE schema_version = 4",
-    );
-    add_sql_migration(
-        source,
-        "025_turn_receipts_table",
-        "CREATE TABLE IF NOT EXISTS turn_receipts (\n    producer TEXT NOT NULL,\n    idempotency_key TEXT NOT NULL,\n    accepted_event_seq INTEGER NOT NULL,\n    turn_id TEXT NOT NULL,\n    work_id TEXT NOT NULL,\n    PRIMARY KEY(producer, idempotency_key),\n    FOREIGN KEY(accepted_event_seq) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS turn_receipts",
-    );
-    add_sql_migration(
-        source,
-        "026_session_storage_contract_table",
-        "CREATE TABLE IF NOT EXISTS session_storage_contract (\n    contract_id INTEGER PRIMARY KEY NOT NULL,\n    schema_version INTEGER NOT NULL,\n    writer_epoch INTEGER NOT NULL,\n    updated_by_build TEXT\n)",
-        "DROP TABLE IF EXISTS session_storage_contract",
-    );
-    add_sql_migration(
-        source,
-        "027_initialize_session_storage_contract",
-        "INSERT OR IGNORE INTO session_storage_contract (contract_id, schema_version, writer_epoch, updated_by_build) VALUES (1, 1, 1, NULL)",
-        "DELETE FROM session_storage_contract WHERE contract_id = 1",
-    );
-    add_session_compatibility_migrations(source);
-}
-
-fn add_session_compatibility_migrations(source: &mut CodeMigrationSource<'static>) {
-    add_sql_migration(
-        source,
-        "028_session_compatibility_state",
-        "CREATE TABLE IF NOT EXISTS session_compatibility_state (\n    projection_id INTEGER PRIMARY KEY NOT NULL,\n    schema_version INTEGER NOT NULL,\n    last_event_seq INTEGER NOT NULL\n)",
-        "DROP TABLE IF EXISTS session_compatibility_state",
-    );
-    add_sql_migration(
-        source,
-        "029_session_compatibility_issues",
-        "CREATE TABLE IF NOT EXISTS session_compatibility_issues (\n    event_seq INTEGER PRIMARY KEY NOT NULL,\n    event_kind TEXT NOT NULL,\n    event_schema_version INTEGER NOT NULL,\n    compatibility TEXT NOT NULL,\n    remediation TEXT NOT NULL,\n    FOREIGN KEY(event_seq) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS session_compatibility_issues",
-    );
-}
-
-fn add_sql_migration(
-    source: &mut CodeMigrationSource<'static>,
-    id: &str,
-    up_sql: &str,
-    down_sql: &str,
-) {
-    source.add_migration(CodeMigration::new(
-        id.to_string(),
-        Box::new(up_sql.to_string()),
-        Some(Box::new(down_sql.to_string())),
-    ));
 }
 
 async fn validate_storage_writer_contract_for_epoch(
@@ -3552,15 +3440,14 @@ async fn validate_storage_writer_contract(db: &dyn Database) -> SessionDbResult<
 
 async fn last_event_sequence_from_database(db: &dyn Database) -> SessionDbResult<Option<u64>> {
     let row = db
-        .select("events")
-        .columns(&["event_seq"])
-        .sort("event_seq", SortDirection::Desc)
-        .limit(1)
-        .execute_first(db)
-        .await?;
+        .query_raw("SELECT MAX(event_seq) AS event_seq FROM events")
+        .await?
+        .into_iter()
+        .next();
     row.as_ref()
-        .map(|row| required_i64(row, "event_seq").map(i64_to_u64))
-        .transpose()
+        .and_then(|row| optional_i64(row, "event_seq"))
+        .map(i64_to_u64)
+        .map_or(Ok(None), |value| Ok(Some(value)))
 }
 
 async fn validate_model_context_precondition(
@@ -5055,6 +4942,7 @@ mod tests {
         RequestContextTokenCount,
     };
     use sha2::Digest;
+    use std::collections::BTreeSet;
 
     fn session_storage_files(root: &Path, session_id: SessionId) -> BTreeMap<String, Vec<u8>> {
         let session_dir = root.join(session_id.to_string());
@@ -5139,6 +5027,156 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn current_migration_target_implementation_exercises_every_operation() {
+        use bcode_session_migration_target::MigrationTarget as _;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session DB");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("target API".to_owned()),
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        ))
+        .await
+        .expect("append event");
+        db.database()
+            .delete("session_migration_receipts")
+            .execute(db.database())
+            .await
+            .expect("clear receipts");
+        let metrics = MetricsRegistry::in_memory();
+        let mut target = SessionMigrationTarget::new(db.database(), &metrics);
+        target
+            .materialize_current_schema()
+            .await
+            .expect("materialize schema");
+        let mut rows = target.canonical_page(0, 1).await.expect("canonical page");
+        assert_eq!(rows.len(), 1);
+        let row = rows.pop().expect("canonical row");
+        target
+            .replace_canonical_row(row)
+            .await
+            .expect("replace canonical row");
+        let current_event = event(
+            session_id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: Some("target API".to_owned()),
+                working_directory: temp_dir.path().to_path_buf(),
+            },
+        );
+        target
+            .ingest_projectors(&current_event)
+            .await
+            .expect("ingest projectors");
+        target
+            .write_authoritative_state(0, None)
+            .await
+            .expect("write authoritative state");
+        target
+            .finalize_projectors(Some(0))
+            .await
+            .expect("finalize projectors");
+        let validation = target
+            .validate_strict_current()
+            .await
+            .expect("strict validation facts");
+        bcode_session_migration::validate_strict_target(&validation)
+            .expect("strict current target");
+        let operation_id = bcode_session_models::SessionOpenOperationId::new();
+        target
+            .persist_migration_receipt(&bcode_session_migration_target::MigrationReceipt {
+                operation_id: operation_id.to_string(),
+                session_id,
+                source_writer_epoch: 4,
+                target_writer_epoch: CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+                migration_step_ids: vec!["fixture-step".to_owned()],
+                source_event_count: 1,
+                source_event_tail: Some(0),
+                source_payload_digest_sha256: "source".to_owned(),
+                target_event_count: 1,
+                target_event_tail: Some(0),
+                target_payload_digest_sha256: "target".to_owned(),
+                converted_events: BTreeMap::new(),
+                retired_known_events: BTreeMap::new(),
+                completed_at_ms: 1,
+            })
+            .await
+            .expect("persist receipt");
+        target
+            .finalize_writer_contract()
+            .await
+            .expect("finalize writer");
+        let receipt = db
+            .database()
+            .select("session_migration_receipts")
+            .columns(&["operation_id"])
+            .where_eq("operation_id", operation_id.to_string())
+            .execute_first(db.database())
+            .await
+            .expect("receipt query");
+        assert!(receipt.is_some());
+        db.validate_write_readiness()
+            .await
+            .expect("target remains writable");
+    }
+
+    #[test]
+    fn current_migration_target_capability_surface_is_complete_and_policy_free() {
+        use bcode_session_migration_target::CurrentMigrationTargetCapability as Capability;
+
+        assert_eq!(
+            bcode_session_migration_target::current_migration_target_capabilities(),
+            BTreeSet::from([
+                Capability::MaterializeCurrentSchema,
+                Capability::ReadBoundedCanonicalPage,
+                Capability::ReplaceCanonicalRow,
+                Capability::WriteAuthoritativeState,
+                Capability::IngestProjectors,
+                Capability::FinalizeProjectors,
+                Capability::ValidateStrictCurrent,
+                Capability::PersistMigrationReceipt,
+                Capability::FinalizeWriterContract,
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn released_materialized_ledger_fixture_cases_match_current_schema_order() {
+        let current_ids = session_migrations()
+            .migrations()
+            .await
+            .expect("current session migrations")
+            .into_iter()
+            .map(|migration| migration.id().to_owned())
+            .collect::<Vec<_>>();
+        let cases = bcode_session_migration::released_session_ledger_prefix_fixture_cases();
+        let complete = cases
+            .iter()
+            .filter(|case| {
+                case.endpoint_treatment
+                    == bcode_session_migration::ReleasedMigrationTreatment::MaterializeCurrent
+            })
+            .max_by_key(|case| case.completed_migration_ids.len())
+            .expect("complete materialized ledger fixture");
+        assert_eq!(
+            complete
+                .completed_migration_ids
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            current_ids
+        );
     }
 
     #[tokio::test]
@@ -5768,6 +5806,415 @@ mod tests {
                 .get("session.migration.converted_context_usage_observed_events_total"),
             Some(&14)
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn released_writer_schema_matrix_fixture_migrates_under_every_writer_epoch() {
+        let fixture = include_str!(
+            "../../session-migration/fixtures/stores/released-writer-schema-matrix.jsonl"
+        );
+        let fixture_event_count = fixture.lines().count();
+        assert_eq!(fixture_event_count, 36);
+
+        for source_writer_epoch in 1..CURRENT_SESSION_STORAGE_WRITER_EPOCH {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let session_id: SessionId = "00000000-0000-0000-0000-000000000003"
+                .parse()
+                .expect("fixture session ID");
+            let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+                .await
+                .expect("open fixture DB");
+            for payload in fixture.lines() {
+                let value = serde_json::from_str::<serde_json::Value>(payload)
+                    .expect("writer/schema fixture JSON");
+                let sequence = value["sequence"].as_u64().expect("fixture sequence");
+                let schema_version = value["schema_version"]
+                    .as_u64()
+                    .and_then(|version| u16::try_from(version).ok())
+                    .expect("fixture schema");
+                let event_type = value["kind"]
+                    .as_object()
+                    .and_then(|kind| kind.keys().next())
+                    .expect("fixture event kind");
+                insert_raw_payload(&db, sequence, event_type, schema_version, payload).await;
+            }
+            db.database()
+                .update("session_storage_contract")
+                .value(
+                    "writer_epoch",
+                    DatabaseValue::Int64(i64::from(source_writer_epoch)),
+                )
+                .where_eq(
+                    "contract_id",
+                    DatabaseValue::Int32(SESSION_STORAGE_CONTRACT_ID),
+                )
+                .execute(db.database())
+                .await
+                .expect("mark source writer epoch");
+            drop(db);
+
+            let maintenance =
+                crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
+                    .expect("maintenance guard");
+            let write = crate::lease::acquire_maintenance_session_write_lock(
+                &maintenance,
+                temp_dir.path(),
+                session_id,
+            )
+            .expect("write guard");
+            let migrated =
+                SessionDb::migrate_turso_in_root(session_id, temp_dir.path(), &maintenance, &write)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "writer epoch {source_writer_epoch} matrix migration failed: {error}"
+                        )
+                    });
+            migrated
+                .validate_write_readiness()
+                .await
+                .expect("matrix migration should be writable");
+            assert_eq!(
+                migrated
+                    .all_events_strict()
+                    .await
+                    .expect("strict matrix history")
+                    .len(),
+                fixture_event_count
+            );
+            migrated
+                .append_event(&event(
+                    session_id,
+                    u64::try_from(fixture_event_count).expect("fixture event count"),
+                    SessionEventKind::AssistantMessage {
+                        text: format!("first append after writer epoch {source_writer_epoch}"),
+                    },
+                ))
+                .await
+                .expect("append after matrix migration");
+            drop(migrated);
+            drop(write);
+            drop(maintenance);
+
+            let reopened = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+                .await
+                .expect("reopen migrated matrix fixture");
+            reopened
+                .validate_write_readiness()
+                .await
+                .expect("reopened matrix fixture should remain writable");
+            reopened
+                .append_event(&event(
+                    session_id,
+                    u64::try_from(fixture_event_count + 1).expect("fixture event count"),
+                    SessionEventKind::AssistantMessage {
+                        text: format!("second append after writer epoch {source_writer_epoch}"),
+                    },
+                ))
+                .await
+                .expect("append after matrix reopen");
+            drop(reopened);
+
+            let reopened_again = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+                .await
+                .expect("second matrix reopen");
+            reopened_again
+                .validate_write_readiness()
+                .await
+                .expect("twice-reopened matrix fixture should remain writable");
+            assert_eq!(
+                reopened_again
+                    .all_events_strict()
+                    .await
+                    .expect("strict twice-reopened matrix history")
+                    .len(),
+                fixture_event_count + 2
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn released_current_equivalent_fixture_migrates_under_every_writer_epoch() {
+        let fixture = include_str!(
+            "../../session-migration/fixtures/stores/released-current-equivalent-events.jsonl"
+        );
+        let fixture_event_count = fixture.lines().count();
+        assert_eq!(fixture_event_count, 47);
+
+        for source_writer_epoch in 1..CURRENT_SESSION_STORAGE_WRITER_EPOCH {
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let session_id: SessionId = "00000000-0000-0000-0000-000000000004"
+                .parse()
+                .expect("fixture session ID");
+            let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+                .await
+                .expect("open fixture DB");
+            for payload in fixture.lines() {
+                let value = serde_json::from_str::<serde_json::Value>(payload)
+                    .expect("current-equivalent fixture JSON");
+                let sequence = value["sequence"].as_u64().expect("fixture sequence");
+                let schema_version = value["schema_version"]
+                    .as_u64()
+                    .and_then(|version| u16::try_from(version).ok())
+                    .expect("fixture schema");
+                let event_type = value["kind"]
+                    .as_object()
+                    .and_then(|kind| kind.keys().next())
+                    .expect("fixture event kind");
+                insert_raw_payload(&db, sequence, event_type, schema_version, payload).await;
+            }
+            db.database()
+                .update("session_storage_contract")
+                .value(
+                    "writer_epoch",
+                    DatabaseValue::Int64(i64::from(source_writer_epoch)),
+                )
+                .where_eq(
+                    "contract_id",
+                    DatabaseValue::Int32(SESSION_STORAGE_CONTRACT_ID),
+                )
+                .execute(db.database())
+                .await
+                .expect("mark source writer epoch");
+            drop(db);
+
+            let maintenance =
+                crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
+                    .expect("maintenance guard");
+            let write = crate::lease::acquire_maintenance_session_write_lock(
+                &maintenance,
+                temp_dir.path(),
+                session_id,
+            )
+            .expect("write guard");
+            let migrated =
+                SessionDb::migrate_turso_in_root(session_id, temp_dir.path(), &maintenance, &write)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "writer epoch {source_writer_epoch} current-equivalent migration failed: {error}"
+                        )
+                    });
+            migrated
+                .validate_write_readiness()
+                .await
+                .expect("current-equivalent migration should be writable");
+            assert_eq!(
+                migrated
+                    .all_events_strict()
+                    .await
+                    .expect("strict current-equivalent history")
+                    .len(),
+                fixture_event_count
+            );
+            migrated
+                .append_event(&event(
+                    session_id,
+                    u64::try_from(fixture_event_count).expect("fixture event count"),
+                    SessionEventKind::AssistantMessage {
+                        text: format!("append after writer epoch {source_writer_epoch}"),
+                    },
+                ))
+                .await
+                .expect("append after current-equivalent migration");
+            drop(migrated);
+            drop(write);
+            drop(maintenance);
+
+            let reopened = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+                .await
+                .expect("reopen current-equivalent DB");
+            reopened
+                .validate_write_readiness()
+                .await
+                .expect("reopened current-equivalent fixture should remain writable");
+            reopened
+                .append_event(&event(
+                    session_id,
+                    u64::try_from(fixture_event_count + 1).expect("fixture event count"),
+                    SessionEventKind::AssistantMessage {
+                        text: format!("second append after writer epoch {source_writer_epoch}"),
+                    },
+                ))
+                .await
+                .expect("append after current-equivalent reopen");
+            drop(reopened);
+
+            let reopened_again = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+                .await
+                .expect("second current-equivalent reopen");
+            reopened_again
+                .validate_write_readiness()
+                .await
+                .expect("twice-reopened current-equivalent fixture should remain writable");
+            assert_eq!(
+                reopened_again
+                    .all_events_strict()
+                    .await
+                    .expect("strict twice-reopened current-equivalent history")
+                    .len(),
+                fixture_event_count + 2
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn released_conversion_and_retired_fixtures_migrate_under_every_writer_epoch() {
+        let fixtures = [
+            (
+                "released explicit conversions",
+                include_str!(
+                    "../../session-migration/fixtures/stores/released-explicit-conversions.jsonl"
+                ),
+            ),
+            (
+                "released retired events",
+                include_str!("../../session-migration/fixtures/stores/retired-events.jsonl"),
+            ),
+        ];
+
+        for (fixture_name, fixture) in fixtures {
+            let fixture_event_count = fixture.lines().count();
+            assert!(fixture_event_count > 0);
+            let fixture_session_id = fixture
+                .lines()
+                .next()
+                .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+                .and_then(|value| value["session_id"].as_str().map(str::to_owned))
+                .and_then(|session_id| session_id.parse::<SessionId>().ok())
+                .expect("fixture session ID");
+
+            for source_writer_epoch in 1..CURRENT_SESSION_STORAGE_WRITER_EPOCH {
+                let temp_dir = tempfile::tempdir().expect("temp dir");
+                let db = SessionDb::open_turso_in_root(fixture_session_id, temp_dir.path())
+                    .await
+                    .expect("open fixture DB");
+                for payload in fixture.lines() {
+                    let value = serde_json::from_str::<serde_json::Value>(payload)
+                        .expect("released event-family fixture JSON");
+                    let sequence = value["sequence"].as_u64().expect("fixture sequence");
+                    let schema_version = value["schema_version"]
+                        .as_u64()
+                        .and_then(|version| u16::try_from(version).ok())
+                        .expect("fixture schema");
+                    let event_type = value["kind"]
+                        .as_object()
+                        .and_then(|kind| kind.keys().next())
+                        .expect("fixture event kind");
+                    insert_raw_payload(&db, sequence, event_type, schema_version, payload).await;
+                }
+                db.database()
+                    .update("session_storage_contract")
+                    .value(
+                        "writer_epoch",
+                        DatabaseValue::Int64(i64::from(source_writer_epoch)),
+                    )
+                    .where_eq(
+                        "contract_id",
+                        DatabaseValue::Int32(SESSION_STORAGE_CONTRACT_ID),
+                    )
+                    .execute(db.database())
+                    .await
+                    .expect("mark source writer epoch");
+                drop(db);
+
+                let maintenance = crate::lease::acquire_session_maintenance_guard(
+                    temp_dir.path(),
+                    fixture_session_id,
+                )
+                .expect("maintenance guard");
+                let write = crate::lease::acquire_maintenance_session_write_lock(
+                    &maintenance,
+                    temp_dir.path(),
+                    fixture_session_id,
+                )
+                .expect("write guard");
+                let migrated = SessionDb::migrate_turso_in_root(
+                    fixture_session_id,
+                    temp_dir.path(),
+                    &maintenance,
+                    &write,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "{fixture_name} at writer epoch {source_writer_epoch} failed migration: {error}"
+                    )
+                });
+                migrated
+                    .validate_write_readiness()
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{fixture_name} at writer epoch {source_writer_epoch} was not writable: {error}"
+                        )
+                    });
+                assert_eq!(
+                    migrated
+                        .all_events_strict()
+                        .await
+                        .expect("strict migrated fixture history")
+                        .len(),
+                    fixture_event_count
+                );
+                migrated
+                    .append_event(&event(
+                        fixture_session_id,
+                        u64::try_from(fixture_event_count).expect("fixture event count"),
+                        SessionEventKind::AssistantMessage {
+                            text: format!(
+                                "append after {fixture_name} writer epoch {source_writer_epoch}"
+                            ),
+                        },
+                    ))
+                    .await
+                    .expect("append after fixture migration");
+                drop(migrated);
+                drop(write);
+                drop(maintenance);
+
+                let reopened = SessionDb::open_turso_in_root(fixture_session_id, temp_dir.path())
+                    .await
+                    .expect("reopen migrated fixture");
+                reopened
+                    .validate_write_readiness()
+                    .await
+                    .expect("reopened fixture should remain writable");
+                reopened
+                    .append_event(&event(
+                        fixture_session_id,
+                        u64::try_from(fixture_event_count + 1).expect("fixture event count"),
+                        SessionEventKind::AssistantMessage {
+                            text: format!(
+                                "second append after {fixture_name} writer epoch {source_writer_epoch}"
+                            ),
+                        },
+                    ))
+                    .await
+                    .expect("append after fixture reopen");
+                drop(reopened);
+
+                let reopened_again =
+                    SessionDb::open_turso_in_root(fixture_session_id, temp_dir.path())
+                        .await
+                        .expect("second fixture reopen");
+                reopened_again
+                    .validate_write_readiness()
+                    .await
+                    .expect("twice-reopened fixture should remain writable");
+                assert_eq!(
+                    reopened_again
+                        .all_events_strict()
+                        .await
+                        .expect("strict twice-reopened fixture history")
+                        .len(),
+                    fixture_event_count + 2
+                );
+            }
+        }
     }
 
     #[tokio::test]

@@ -11,12 +11,14 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_session_models = { workspace = true }
-serde                = { workspace = true, features = ["derive", "std"] }
-serde_json           = { workspace = true, features = ["std"] }
-sha2                 = { workspace = true }
-thiserror            = { workspace = true }
-tokio                = { workspace = true, features = ["macros", "rt", "sync"] }
+async-trait                    = { workspace = true }
+bcode_session_migration_target = { workspace = true }
+bcode_session_models           = { workspace = true }
+serde                          = { workspace = true, features = ["derive", "std"] }
+serde_json                     = { workspace = true, features = ["std"] }
+sha2                           = { workspace = true }
+thiserror                      = { workspace = true }
+tokio                          = { workspace = true, features = ["macros", "rt", "sync"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

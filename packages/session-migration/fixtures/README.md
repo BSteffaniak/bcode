@@ -23,6 +23,15 @@ Expected migration treatment:
   streaming behavior.
 * flat `context_usage_observed` converts to `RequestContextObserved`.
 
+## Confirmed current-equivalent event families
+
+`stores/released-current-equivalent-events.jsonl` contains one complete, sanitized payload for every
+released historical event family whose active semantics are preserved by strict current decoding.
+The fixture uses each family's earliest released schema. The fixture gate strictly deserializes
+every row as a current `SessionEvent`, verifies the event kind is unchanged, and rejects malformed
+stand-ins as coverage. Together with the explicit-conversion and retired-family fixtures, this gives
+every released event family a permanent valid payload rather than relying on generated `{}` probes.
+
 ## Confirmed retired event families
 
 `stores/retired-events.jsonl` contains synthetic classification coverage for every released event
@@ -46,13 +55,38 @@ complete-store writer, ledger, table, root, or writable-lifecycle coverage. Stor
 lifecycle coverage for context schemas 26, 30, and 31 lives in the session migration tests, where
 each shape rebuilds current occupancy and accepts a subsequent append.
 
+## Released current-equivalent schema coverage
+
+`stores/released-writer-schema-matrix.jsonl` contains one contiguous sanitized canonical history
+with at least one strict-current-compatible event at every released historical event schema. Its
+manifest classification claims prove every released schema can traverse the strict
+current-equivalent path without claiming one specific writer epoch, ledger prefix, or table/root
+treatment. The session migration lifecycle test materializes this same permanent history under
+every released writer epoch, migrates it to current storage, strictly reads it, appends, reopens,
+appends again, and validates a second reopen. Thus writer/schema cross-product and writable adoption
+are proven at store level without duplicating 144 identical fixture files or making overlapping
+exact-coverage claims in the manifest.
+
+The migration crate additionally owns deterministic ledger fixture cases for every released
+per-session migration identity. Current-materialized identities use exact ordered prefixes ending at
+the declared endpoint. The two superseded identities use standalone historical cases, preventing
+tests from pretending they were members of the current schema ledger.
+
 ## Manifest
 
 `manifest.json` is the machine-enforced inventory for permanent sanitized fixtures. Every listed
 path must exist, contain exactly the declared contiguous event count and schemas, cover exactly the
-declared writer/schema and schema/kind pairs, and produce the declared migration classifications.
-Classification-only fixtures cannot claim store-level writer, ledger, root, table, authoritative,
-or writable-lifecycle coverage. Fixture files not listed in the manifest fail the inventory test.
+declared schema/kind pairs, and produce the declared migration classifications. Matrix-owner
+fixtures additionally declare the released writer epochs under which their permanent payloads are
+materialized by lifecycle tests; ownership is duplicate-rejecting across writer/schema/event
+combinations, with explicit exclusions only for setup rows owned by another fixture. Classification-
+only fixtures cannot claim ledger, root, table, or authoritative coverage. Fixture files not listed
+in the manifest fail the inventory test.
+
+The policy-free `bcode_session_migration_target` package owns the exact nine-operation capability
+inventory plus the shared current event-schema and writer contracts. Both the current session
+implementation and historical migration crate depend on this package. Historical source policy,
+format inventory, and migration orchestration are forbidden from entering it.
 
 A complete migration must normalize all canonical payloads to the current event schema, rebuild
 current projections, produce zero compatibility issues, pass write readiness, and permit a new

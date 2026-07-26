@@ -15,6 +15,7 @@
 //! repairing the complete event log.
 
 mod actor;
+mod current_schema;
 pub mod db;
 pub mod lease;
 pub mod migration_adapter;
@@ -1644,15 +1645,24 @@ impl SessionManager {
                             expected: u64::from(db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
                         });
                     }
-                    self.migrate_legacy_session_for_load(
+                    match migration_execution::prepare_owned_session_storage(
                         session_id,
-                        store,
                         &root,
+                        store.lease_owner(),
                         writer_epoch,
                         attempt,
                         progress,
+                        &self.metrics,
                     )
                     .await?
+                    {
+                        migration_execution::PreparedSessionLease::Acquired(lease) => {
+                            SessionLeaseLoadOutcome::Acquired(lease)
+                        }
+                        migration_execution::PreparedSessionLease::Retry => {
+                            SessionLeaseLoadOutcome::Retry
+                        }
+                    }
                 }
             };
             if let SessionLeaseLoadOutcome::Acquired(lease) = outcome {
@@ -1687,88 +1697,6 @@ impl SessionManager {
                 Ok(SessionLeaseLoadOutcome::Retry)
             }
         }
-    }
-
-    async fn migrate_legacy_session_for_load(
-        &self,
-        session_id: SessionId,
-        store: &SessionStoreExecutor,
-        root: &Path,
-        writer_epoch: u64,
-        attempt: u8,
-        progress: Option<&migration_execution::MigrationExecutionProgress>,
-    ) -> Result<SessionLeaseLoadOutcome, SessionError> {
-        use db::SessionStorageCompatibility::{Current, KnownLegacy};
-
-        let started = self.metrics.timer();
-        self.metrics
-            .increment_counter("session.manager.storage_migration.attempted_total");
-        tracing::info!(
-            target: "bcode_session::migration",
-            %session_id,
-            writer_epoch,
-            target_writer_epoch = db::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
-            "attempting automatic legacy session migration"
-        );
-        let ownership_timer = self.metrics.timer();
-        if let Some(progress) = progress {
-            progress.stage(
-                SessionMigrationStage::WaitingForOwnership,
-                "Waiting for exclusive session ownership",
-            );
-        }
-        let maintenance = match lease::acquire_session_maintenance_guard(root, session_id) {
-            Ok(maintenance) => maintenance,
-            Err(error @ lease::SessionLeaseError::OwnedByOtherDaemon { .. }) => {
-                self.metrics
-                    .increment_counter("session.manager.storage_migration.blocked_owner_total");
-                let rechecked = db::SessionDb::open_existing_turso_in_root(session_id, root)
-                    .await?
-                    .storage_compatibility()
-                    .await?;
-                if matches!(rechecked, Current { .. }) && attempt < 2 {
-                    self.metrics
-                        .increment_counter("session.manager.storage_migration.race_retry_total");
-                    return Ok(SessionLeaseLoadOutcome::Retry);
-                }
-                return Err(error.into());
-            }
-            Err(error) => return Err(error.into()),
-        };
-        self.metrics.record_histogram(
-            "session.migration.ownership_duration_ms",
-            ownership_timer.elapsed_ms(),
-        );
-        let write = lease::acquire_maintenance_session_write_lock(&maintenance, root, session_id)?;
-        let rechecked = db::SessionDb::open_existing_turso_in_root(session_id, root)
-            .await?
-            .storage_compatibility()
-            .await?;
-        if matches!(rechecked, KnownLegacy { .. }) {
-            migration_execution::execute_owned_legacy_storage(
-                migration_execution::OwnedLegacyMigration {
-                    session_id,
-                    root,
-                    writer_epoch,
-                    maintenance: &maintenance,
-                    write: &write,
-                    started: &started,
-                    progress: progress.cloned(),
-                },
-                &self.metrics,
-            )
-            .await?;
-        }
-        drop(write);
-        let lease = lease::transition_session_maintenance_to_lease(
-            maintenance,
-            root,
-            session_id,
-            store.lease_owner(),
-        )?;
-        let current = db::SessionDb::open_existing_turso_in_root(session_id, root).await?;
-        current.validate_write_readiness().await?;
-        Ok(SessionLeaseLoadOutcome::Acquired(Box::new(lease)))
     }
 
     async fn acquire_missing_session_lease(
@@ -4940,7 +4868,7 @@ mod tests {
         assert!(matches!(
             prepared.outcome,
             Some(SessionOpenTerminalOutcome::RepairRequired { ref reason })
-                if reason.contains("unsupported historical session event schema")
+                if reason.contains("invalid historical session event kind")
         ));
         assert_eq!(manager.active_session_migration_count().await, 0);
         assert!(
@@ -7420,6 +7348,9 @@ mod tests {
                 .await
                 .expect("current runtime lease");
             manager.inner.lock().await.leases.insert(session_id, lease);
+            let _current_db = db::SessionDb::open_existing_turso_in_root(session_id, &root)
+                .await
+                .expect("current benchmark DB");
             let mut durations = Vec::with_capacity(RUNS);
             for _ in 0..RUNS {
                 let started = std::time::Instant::now();

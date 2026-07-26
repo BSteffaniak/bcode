@@ -1,9 +1,10 @@
-//! Durable JSON compatibility DTOs for persisted session events.
+//! Durable JSON codec for the current session event schema.
 //!
-//! These types intentionally live in the session package instead of the IPC
-//! package. Persistence DTOs may use JSON-oriented serde behavior for
-//! compatibility and migration, while IPC DTOs must remain safe for the
-//! non-self-describing `bmux_codec` wire format.
+//! These persistence DTOs intentionally live in the session package instead of IPC because the
+//! durable JSON and non-self-describing wire formats have different requirements. Historical
+//! conversion and retired-event policy live exclusively in `bcode_session_migration`; this module
+//! decodes current-equivalent shapes and provides generic opaque-envelope reads for unknown/future
+//! user-facing history.
 
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProviderContextSnapshot,
@@ -186,16 +187,15 @@ const fn compatibility_issue(
     }
 }
 
-/// Decode a persisted event best-effort for bounded metadata discovery.
+/// Return whether one persisted event has a trustworthy stable envelope for bounded metadata
+/// discovery.
 ///
-/// Unlike [`decode_session_event_compatible`], this helper discards structural
-/// errors. It is reserved for best-effort catalog/metadata scans where one
-/// damaged row must not hide the canonical session directory.
+/// This intentionally exposes no historical semantic decoding. Unknown and future events are
+/// represented opaquely by `decode_session_event_compatible`; structurally damaged rows return
+/// `false` so catalog discovery can continue without hiding the session directory.
 #[must_use]
-pub fn decode_session_event_degraded(payload: &str) -> Option<SessionEvent> {
-    decode_session_event_compatible(payload)
-        .ok()
-        .map(CompatibleSessionEvent::into_event)
+pub fn has_trustworthy_session_event_envelope(payload: &str) -> bool {
+    decode_session_event_compatible(payload).is_ok()
 }
 
 fn decode_opaque_session_event(
@@ -1422,14 +1422,14 @@ mod tests {
     }
 
     #[test]
-    fn degraded_decode_rejects_untrustworthy_opaque_envelopes() {
+    fn bounded_metadata_envelope_check_rejects_untrustworthy_records() {
         for payload in [
             r#"{"schema_version":39,"sequence":1,"session_id":"not-a-session-id","kind":{"future":{}}}"#,
             r#"{"schema_version":39,"sequence":1,"session_id":"00000000-0000-0000-0000-000000000001","kind":{}}"#,
             r#"{"schema_version":39,"sequence":1,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"one":{},"two":{}}}"#,
             "not json",
         ] {
-            assert!(decode_session_event_degraded(payload).is_none());
+            assert!(!has_trustworthy_session_event_envelope(payload));
         }
     }
 

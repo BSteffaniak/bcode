@@ -18,6 +18,7 @@ mod operation;
 mod planning;
 mod service;
 mod storage;
+mod target;
 mod validation;
 
 pub use backup::{
@@ -39,6 +40,9 @@ pub use storage::{
     diagnose_accidental_epoch_session_root, inspect_accidental_epoch_session_root,
     recover_accidental_epoch_session_root,
 };
+pub use target::{
+    MigrationTargetExecutionError, finalize_validated_target, validate_strict_target,
+};
 pub use validation::{
     MigrationClassificationEvidence, MigrationLedgerFacts, MigrationLedgerRow,
     MigrationLedgerValidationError, MigrationProjectionValidation, MigrationTargetValidation,
@@ -46,9 +50,16 @@ pub use validation::{
     SessionMigrationReceipt, SessionMigrationReceiptRequest, SourceStorageCompatibility,
     SourceStorageCompatibilityError, StorageContractFacts, StorageContractRow,
     ValidatedMigrationLedger, WriterEpochCompatibility, WriterFinalizationError,
-    build_session_migration_receipt, classify_source_storage, classify_writer_epoch,
-    completed_migration_ids, validate_migration_ledger, validate_migration_target,
+    build_session_migration_receipt, classify_source_storage, classify_target_storage,
+    classify_writer_epoch, completed_migration_ids, validate_migration_ledger,
+    validate_migration_target, validate_released_ledger_prefix_fixture_case,
     validate_writer_finalization,
+};
+
+pub use bcode_session_migration_target::{
+    CURRENT_EVENT_SCHEMA as CURRENT_TARGET_EVENT_SCHEMA,
+    CURRENT_WRITER_EPOCH as CURRENT_TARGET_WRITER_EPOCH, CurrentMigrationTargetCapability,
+    current_migration_target_capabilities,
 };
 
 pub use classification::HistoricalEventMetadata;
@@ -68,13 +79,14 @@ pub use inventory::{
     ReleasedEventVariantDescriptor, ReleasedFixtureClassificationCounts,
     ReleasedFixtureCoverageGaps, ReleasedFixtureDescriptor, ReleasedFixtureInventoryError,
     ReleasedFixtureManifest, ReleasedFixtureRootWriterPair, ReleasedFixtureSchemaEventPair,
-    ReleasedFixtureTableTreatment, ReleasedFixtureWriterSchemaPair, ReleasedMigrationDescriptor,
-    ReleasedMigrationDomain, ReleasedMigrationTreatment, ReleasedRecordDescriptor,
-    ReleasedRecordTreatment, ReleasedRootDescriptor, ReleasedRootTreatment,
-    ReleasedWriterSchemaDescriptor, is_released_historical_event_schema,
-    load_released_fixture_manifest, released_fixture_authoritative_record_coverage,
-    released_fixture_coverage_gaps, released_fixture_schema_coverage,
-    released_fixture_writer_coverage,
+    ReleasedFixtureTableTreatment, ReleasedFixtureWriterSchemaPair,
+    ReleasedLedgerPrefixFixtureCase, ReleasedMigrationDescriptor, ReleasedMigrationDomain,
+    ReleasedMigrationTreatment, ReleasedRecordDescriptor, ReleasedRecordTreatment,
+    ReleasedRootDescriptor, ReleasedRootTreatment, ReleasedWriterSchemaDescriptor,
+    is_released_historical_event_schema, load_released_fixture_manifest,
+    released_fixture_authoritative_record_coverage, released_fixture_coverage_gaps,
+    released_fixture_schema_coverage, released_fixture_writer_coverage,
+    released_session_ledger_prefix_fixture_cases,
 };
 pub use planning::{
     MigrationPlan, MigrationPlanError, MigrationPlanService, ReleasedEventTreatmentRow,

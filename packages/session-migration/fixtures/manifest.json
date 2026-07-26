@@ -3,15 +3,8 @@
   "fixtures": [
     {
       "path": "stores/schema-28-tool-context.jsonl",
-      "source_writer_epochs": [
-        2
-      ],
-      "covered_writer_schema_pairs": [
-        {
-          "writer_epoch": 2,
-          "event_schema": 28
-        }
-      ],
+      "source_writer_epochs": [],
+      "covered_writer_schema_pairs": [],
       "migration_ledger_endpoints": [
         "023_reset_legacy_context_occupancy_projection"
       ],
@@ -173,7 +166,15 @@
         "tool_invocation_stream",
         "tool_call_finished",
         "context_usage_observed"
-      ]
+      ],
+      "lifecycle_matrix": {
+        "source_writer_epochs": [
+          2
+        ],
+        "owns_writer_schema": false,
+        "owns_writer_schema_event": false,
+        "schema_event_exclusions": []
+      }
     },
     {
       "path": "stores/retired-events.jsonl",
@@ -195,10 +196,6 @@
         "current_passthrough": 1
       },
       "covered_schema_event_pairs": [
-        {
-          "event_schema": 29,
-          "event_kind": "session_created"
-        },
         {
           "event_schema": 25,
           "event_kind": "interactive_tool_request_created"
@@ -530,6 +527,10 @@
         {
           "event_schema": 39,
           "event_kind": "tool_invocation_stream"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "session_created"
         }
       ],
       "covered_authoritative_records": [],
@@ -549,7 +550,23 @@
         "session_created",
         "tool_invocation_presentation",
         "tool_invocation_stream"
-      ]
+      ],
+      "lifecycle_matrix": {
+        "source_writer_epochs": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "owns_writer_schema": false,
+        "owns_writer_schema_event": true,
+        "schema_event_exclusions": [
+          {
+            "event_schema": 29,
+            "event_kind": "session_created"
+          }
+        ]
+      }
     },
     {
       "path": "stores/released-explicit-conversions.jsonl",
@@ -682,10 +699,6 @@
           "event_kind": "tool_call_finished"
         },
         {
-          "event_schema": 28,
-          "event_kind": "tool_call_finished"
-        },
-        {
           "event_schema": 29,
           "event_kind": "tool_call_finished"
         },
@@ -726,10 +739,6 @@
           "event_kind": "context_usage_observed"
         },
         {
-          "event_schema": 28,
-          "event_kind": "context_usage_observed"
-        },
-        {
           "event_schema": 29,
           "event_kind": "context_usage_observed"
         },
@@ -740,6 +749,14 @@
         {
           "event_schema": 31,
           "event_kind": "context_usage_observed"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "context_usage_observed"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "tool_call_finished"
         }
       ],
       "covered_authoritative_records": [],
@@ -750,7 +767,4700 @@
       "covered_event_kinds": [
         "context_usage_observed",
         "tool_call_finished"
-      ]
+      ],
+      "lifecycle_matrix": {
+        "source_writer_epochs": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "owns_writer_schema": false,
+        "owns_writer_schema_event": true,
+        "schema_event_exclusions": []
+      }
+    },
+    {
+      "path": "stores/released-writer-schema-matrix.jsonl",
+      "source_writer_epochs": [],
+      "covered_writer_schema_pairs": [],
+      "migration_ledger_endpoints": [],
+      "covered_migration_ledger_prefixes": [],
+      "event_schemas": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        31,
+        32,
+        35,
+        37,
+        38,
+        39
+      ],
+      "migratable_store": false,
+      "historical_payloads": false,
+      "expected_event_count": 36,
+      "expected_classifications": {
+        "converted": 0,
+        "retired_known": 0,
+        "current_passthrough": 36
+      },
+      "covered_schema_event_pairs": [
+        {
+          "event_schema": 1,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 2,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 3,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 4,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "assistant_message"
+        }
+      ],
+      "covered_authoritative_records": [],
+      "covered_roots": [],
+      "covered_root_writer_pairs": [],
+      "covered_tables": [],
+      "covered_table_treatments": [],
+      "covered_event_kinds": [
+        "assistant_message",
+        "session_created"
+      ],
+      "lifecycle_matrix": {
+        "source_writer_epochs": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "owns_writer_schema": true,
+        "owns_writer_schema_event": false,
+        "schema_event_exclusions": []
+      }
+    },
+    {
+      "path": "stores/released-current-equivalent-events.jsonl",
+      "source_writer_epochs": [],
+      "covered_writer_schema_pairs": [],
+      "migration_ledger_endpoints": [],
+      "covered_migration_ledger_prefixes": [],
+      "event_schemas": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        9,
+        11,
+        15,
+        16,
+        17,
+        18,
+        22,
+        23,
+        25,
+        26,
+        29,
+        32,
+        35,
+        37,
+        38,
+        39
+      ],
+      "migratable_store": false,
+      "historical_payloads": false,
+      "expected_event_count": 47,
+      "expected_classifications": {
+        "converted": 0,
+        "retired_known": 0,
+        "current_passthrough": 47
+      },
+      "covered_schema_event_pairs": [
+        {
+          "event_schema": 3,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 4,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "agent_changed"
+        },
+        {
+          "event_schema": 1,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 2,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 3,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 4,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "assistant_delta"
+        },
+        {
+          "event_schema": 1,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 2,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 3,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 4,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "assistant_message"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "assistant_reasoning_delta"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "assistant_reasoning_message"
+        },
+        {
+          "event_schema": 1,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 2,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 3,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 4,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "client_attached"
+        },
+        {
+          "event_schema": 1,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 2,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 3,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 4,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "client_detached"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "context_compacted"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "execution_session_created"
+        },
+        {
+          "event_schema": 1,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 2,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 3,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 4,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "model_changed"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "model_turn_cancel_requested"
+        },
+        {
+          "event_schema": 4,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "model_turn_finished"
+        },
+        {
+          "event_schema": 4,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "model_turn_started"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "model_usage"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "opaque_event"
+        },
+        {
+          "event_schema": 2,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 3,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 4,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "permission_requested"
+        },
+        {
+          "event_schema": 2,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 3,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 4,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "permission_resolved"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "plugin_status_note"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "plugin_status_note"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "plugin_status_note"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "plugin_status_note"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "plugin_status_note"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "plugin_status_note"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "plugin_status_note"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "plugin_status_note"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "provider_context_compacted"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "provider_context_compacted"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "provider_context_compacted"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "provider_context_compacted"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "provider_context_compacted"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "provider_context_compacted"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "provider_context_compacted"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "provider_context_compacted"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "provider_context_compacted"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "provider_context_compacted"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "provider_context_compacted"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "ralph_lifecycle"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "ralph_lifecycle"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "ralph_lifecycle"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "ralph_lifecycle"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "ralph_lifecycle"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "ralph_lifecycle"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "ralph_lifecycle"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "ralph_lifecycle"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "ralph_lifecycle"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "ralph_lifecycle"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "ralph_lifecycle"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "ralph_lifecycle"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "ralph_lifecycle"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "ralph_lifecycle"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "reasoning_changed"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "reasoning_changed"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "reasoning_changed"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "reasoning_changed"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "reasoning_changed"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "reasoning_changed"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "reasoning_changed"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "reasoning_changed"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "reasoning_changed"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "reasoning_changed"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "reasoning_changed"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "reasoning_changed"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "request_context_observed"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "request_context_observed"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "request_context_observed"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "request_context_observed"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "request_context_observed"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "runtime_work_cancel_requested"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "runtime_work_finished"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "runtime_work_progress"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "runtime_work_started"
+        },
+        {
+          "event_schema": 1,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 2,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 3,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 4,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "session_forked"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "session_forked"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "session_forked"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "session_forked"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "session_forked"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "session_forked"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "session_forked"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "session_forked"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "session_forked"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "session_forked"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "session_forked"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "session_forked"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "session_forked"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "session_forked"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "session_forked"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "session_imported"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "session_renamed"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "skill_activated"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "skill_context_loaded"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "skill_deactivated"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "skill_invocation_failed"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "skill_invoked"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "skill_suggested"
+        },
+        {
+          "event_schema": 1,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 2,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 3,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 4,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "system_message"
+        },
+        {
+          "event_schema": 1,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 2,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 3,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 4,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "tool_call_requested"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "tool_contribution"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "tool_contribution"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "tool_contribution"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "tool_contribution"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "tool_contribution_placed"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "tool_contribution_placed"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "tool_exchange_requested"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "tool_exchange_requested"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "tool_exchange_requested"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "tool_exchange_requested"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "tool_exchange_resolved"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "tool_exchange_resolved"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "tool_exchange_resolved"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "tool_exchange_resolved"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "tool_invocation_lifecycle"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "tool_invocation_lifecycle"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "tool_invocation_lifecycle"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "tool_invocation_lifecycle"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "tool_invocation_result_recorded"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "tool_invocation_result_recorded"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "tool_invocation_result_recorded"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "trace_event"
+        },
+        {
+          "event_schema": 1,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 2,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 3,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 4,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 5,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 6,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 7,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 8,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 9,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 10,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 11,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 12,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 13,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 14,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "user_message"
+        },
+        {
+          "event_schema": 15,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 16,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 17,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 18,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 19,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 20,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 21,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 22,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 23,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 24,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 25,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 26,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 27,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 29,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 30,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 31,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 32,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 35,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 37,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 38,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 39,
+          "event_kind": "working_directory_changed"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "session_created"
+        },
+        {
+          "event_schema": 28,
+          "event_kind": "tool_call_requested"
+        }
+      ],
+      "covered_authoritative_records": [],
+      "covered_roots": [],
+      "covered_root_writer_pairs": [],
+      "covered_tables": [],
+      "covered_table_treatments": [],
+      "covered_event_kinds": [
+        "agent_changed",
+        "assistant_delta",
+        "assistant_message",
+        "assistant_reasoning_delta",
+        "assistant_reasoning_message",
+        "client_attached",
+        "client_detached",
+        "context_compacted",
+        "execution_session_created",
+        "model_changed",
+        "model_turn_cancel_requested",
+        "model_turn_finished",
+        "model_turn_started",
+        "model_usage",
+        "opaque_event",
+        "permission_requested",
+        "permission_resolved",
+        "plugin_status_note",
+        "provider_context_compacted",
+        "ralph_lifecycle",
+        "reasoning_changed",
+        "request_context_observed",
+        "runtime_work_cancel_requested",
+        "runtime_work_finished",
+        "runtime_work_progress",
+        "runtime_work_started",
+        "session_created",
+        "session_forked",
+        "session_imported",
+        "session_renamed",
+        "skill_activated",
+        "skill_context_loaded",
+        "skill_deactivated",
+        "skill_invocation_failed",
+        "skill_invoked",
+        "skill_suggested",
+        "system_message",
+        "tool_call_requested",
+        "tool_contribution",
+        "tool_contribution_placed",
+        "tool_exchange_requested",
+        "tool_exchange_resolved",
+        "tool_invocation_lifecycle",
+        "tool_invocation_result_recorded",
+        "trace_event",
+        "user_message",
+        "working_directory_changed"
+      ],
+      "lifecycle_matrix": {
+        "source_writer_epochs": [
+          1,
+          2,
+          3,
+          4
+        ],
+        "owns_writer_schema": false,
+        "owns_writer_schema_event": true,
+        "schema_event_exclusions": []
+      }
     }
   ]
 }

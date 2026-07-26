@@ -1,0 +1,23 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Current session persistence capabilities used by session migration"
+edition     = { workspace = true }
+keywords    = ["bcode", "session", "migration"]
+license     = { workspace = true }
+name        = "bcode_session_migration_target"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+async-trait          = { workspace = true }
+bcode_session_models = { workspace = true }
+serde                = { workspace = true, features = ["derive"] }
+thiserror            = { workspace = true }
+
+[dev-dependencies]
+
+[features]
+default          = []
+fail-on-warnings = []

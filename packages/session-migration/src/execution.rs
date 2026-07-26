@@ -366,7 +366,10 @@ mod tests {
 
         for fixture in manifest.fixtures {
             if fixture.migratable_store {
-                assert!(!fixture.source_writer_epochs.is_empty());
+                assert!(
+                    !fixture.source_writer_epochs.is_empty()
+                        || !fixture.lifecycle_matrix.source_writer_epochs.is_empty()
+                );
             } else {
                 assert!(fixture.source_writer_epochs.is_empty());
             }
@@ -432,12 +435,35 @@ mod tests {
                             .expect("fixture payload JSON");
                     value["schema_version"] = serde_json::json!(pair.event_schema);
                     let payload = serde_json::to_string(&value).expect("fixture payload JSON");
-                    decode_for_migration(&payload, reject_current).unwrap_or_else(|error| {
-                        panic!(
-                            "declared classification pair {}:{} must decode: {error}",
-                            pair.event_schema, pair.event_kind
-                        )
-                    });
+                    let treatment = crate::RELEASED_EVENT_VARIANTS
+                        .iter()
+                        .find(|variant| variant.kind == pair.event_kind)
+                        .expect("declared event kind treatment")
+                        .treatment;
+                    if treatment == crate::ReleasedEventTreatment::CurrentEquivalent {
+                        let event = serde_json::from_str::<SessionEvent>(&payload).unwrap_or_else(
+                            |error| {
+                                panic!(
+                                    "declared current-equivalent pair {}:{} must strictly decode: {error}",
+                                    pair.event_schema, pair.event_kind
+                                )
+                            },
+                        );
+                        let actual_kind = serde_json::to_value(&event.kind)
+                            .expect("strictly decoded event kind must serialize")
+                            .as_object()
+                            .and_then(|kind| kind.keys().next())
+                            .cloned()
+                            .expect("strictly decoded event kind");
+                        assert_eq!(actual_kind, pair.event_kind);
+                    } else {
+                        decode_for_migration(&payload, reject_current).unwrap_or_else(|error| {
+                            panic!(
+                                "declared classification pair {}:{} must decode: {error}",
+                                pair.event_schema, pair.event_kind
+                            )
+                        });
+                    }
                 }
             }
             assert!(
@@ -471,6 +497,22 @@ mod tests {
                 })
                 .map(|(payload, _)| *payload)
                 .collect::<Vec<_>>();
+            for (payload, envelope) in payloads.iter().zip(&envelopes) {
+                if !historical_payloads.contains(payload) {
+                    let event = serde_json::from_str::<SessionEvent>(payload)
+                        .expect("current-equivalent fixture payload must strictly decode");
+                    let actual_kind = serde_json::to_value(&event.kind)
+                        .expect("strictly decoded event kind must serialize")
+                        .as_object()
+                        .and_then(|kind| kind.keys().next())
+                        .cloned()
+                        .expect("strictly decoded event kind");
+                    assert!(
+                        envelope.kind.contains_key(&actual_kind),
+                        "strict current decoding changed fixture event kind {actual_kind}"
+                    );
+                }
+            }
             assert_eq!(
                 payloads.len() - historical_payloads.len(),
                 fixture.expected_classifications.current_passthrough

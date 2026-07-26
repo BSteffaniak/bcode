@@ -82,6 +82,95 @@ pub struct OwnedLegacyMigration<'a> {
     pub(crate) progress: Option<MigrationExecutionProgress>,
 }
 
+/// Result of acquiring exclusive ownership and preparing current writable storage.
+pub enum PreparedSessionLease {
+    /// Current writable storage was acquired.
+    Acquired(Box<lease::SessionLeaseGuard>),
+    /// Storage changed while ownership was being acquired; the caller should reclassify and retry.
+    Retry,
+}
+
+/// Acquire exclusive ownership, execute migration when still required, and adopt a runtime lease.
+///
+/// # Errors
+///
+/// Returns an error when ownership is held elsewhere, migration fails, lease handoff fails, or the
+/// resulting current store does not pass strict write readiness.
+pub async fn prepare_owned_session_storage(
+    session_id: SessionId,
+    root: &Path,
+    lease_owner: &lease::SessionLeaseOwnerContext,
+    writer_epoch: u64,
+    attempt: u8,
+    progress: Option<&MigrationExecutionProgress>,
+    metrics: &MetricsRegistry,
+) -> Result<PreparedSessionLease, SessionError> {
+    use db::SessionStorageCompatibility::{Current, KnownLegacy};
+
+    let started = metrics.timer();
+    metrics.increment_counter("session.manager.storage_migration.attempted_total");
+    tracing::info!(
+        target: "bcode_session::migration",
+        %session_id,
+        writer_epoch,
+        target_writer_epoch = db::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
+        "attempting automatic legacy session migration"
+    );
+    let ownership_timer = metrics.timer();
+    if let Some(progress) = progress {
+        progress.stage(
+            SessionMigrationStage::WaitingForOwnership,
+            "Waiting for exclusive session ownership",
+        );
+    }
+    let maintenance = match lease::acquire_session_maintenance_guard(root, session_id) {
+        Ok(maintenance) => maintenance,
+        Err(error @ lease::SessionLeaseError::OwnedByOtherDaemon { .. }) => {
+            metrics.increment_counter("session.manager.storage_migration.blocked_owner_total");
+            let rechecked = db::SessionDb::open_existing_turso_in_root(session_id, root)
+                .await?
+                .storage_compatibility()
+                .await?;
+            if matches!(rechecked, Current { .. }) && attempt < 2 {
+                metrics.increment_counter("session.manager.storage_migration.race_retry_total");
+                return Ok(PreparedSessionLease::Retry);
+            }
+            return Err(error.into());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    metrics.record_histogram(
+        "session.migration.ownership_duration_ms",
+        ownership_timer.elapsed_ms(),
+    );
+    let write = lease::acquire_maintenance_session_write_lock(&maintenance, root, session_id)?;
+    let rechecked = db::SessionDb::open_existing_turso_in_root(session_id, root)
+        .await?
+        .storage_compatibility()
+        .await?;
+    if matches!(rechecked, KnownLegacy { .. }) {
+        execute_owned_legacy_storage(
+            OwnedLegacyMigration {
+                session_id,
+                root,
+                writer_epoch,
+                maintenance: &maintenance,
+                write: &write,
+                started: &started,
+                progress: progress.cloned(),
+            },
+            metrics,
+        )
+        .await?;
+    }
+    drop(write);
+    let runtime_lease =
+        lease::transition_session_maintenance_to_lease(maintenance, root, session_id, lease_owner)?;
+    let current = db::SessionDb::open_existing_turso_in_root(session_id, root).await?;
+    current.validate_write_readiness().await?;
+    Ok(PreparedSessionLease::Acquired(Box::new(runtime_lease)))
+}
+
 /// Execute one exclusively owned historical migration through the current target API.
 ///
 /// # Errors

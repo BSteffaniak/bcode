@@ -17,8 +17,11 @@ pub struct ReleasedFixtureCoverageError {
     pub gaps: Box<ReleasedFixtureCoverageGaps>,
 }
 
-/// Require fixture coverage for every released writer edge, writer/schema/event combination, and
-/// session migration-ledger endpoint, plus every preserved authoritative record.
+/// Require complete released-format fixture coverage.
+///
+/// This includes every writer edge, writer/schema/event combination, migration-ledger endpoint,
+/// and preserved authoritative record. Ledger-only formats may use migration-owned non-payload
+/// cases rather than JSONL event fixtures.
 ///
 /// # Errors
 ///
@@ -269,37 +272,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fixture_release_gate_reports_exact_missing_dimensions() {
+    fn fixture_release_gate_accepts_complete_exact_coverage() {
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
         let manifest = crate::load_released_fixture_manifest(&root).expect("fixture manifest");
-        let error = validate_released_fixture_coverage(&manifest)
-            .expect_err("current fixture inventory is intentionally incomplete");
-        assert_eq!(
-            error.gaps.writer_epochs,
-            std::collections::BTreeSet::from([1, 3, 4])
-        );
-        assert!(error.gaps.writer_schema_pairs.contains(&(1, 1)));
-        assert!(error.gaps.writer_schema_pairs.contains(&(1, 32)));
-        assert!(!error.gaps.writer_schema_pairs.contains(&(2, 28)));
-        assert!(error.gaps.writer_schema_event_combinations.contains(&(
-            1,
-            1,
-            "assistant_message".to_owned()
-        )));
-        assert_eq!(
-            error.gaps.writer_edges,
-            std::collections::BTreeSet::from([(1, 2), (3, 4), (4, 5)])
-        );
-        assert!(
-            error
-                .gaps
-                .migration_ledger_endpoints
-                .contains("001_events_table")
-        );
-        assert!(!error.gaps.event_schemas.contains(&1));
-        assert!(!error.gaps.event_schemas.contains(&2));
-        assert!(error.gaps.event_kinds.contains("assistant_message"));
-        assert!(error.gaps.authoritative_records.is_empty());
+        validate_released_fixture_coverage(&manifest)
+            .expect("permanent fixtures must cover every released inventory dimension");
     }
 
     #[test]

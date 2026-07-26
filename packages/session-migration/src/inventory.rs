@@ -23,6 +23,9 @@ pub struct ReleasedFixtureDescriptor {
     pub source_writer_epochs: Vec<u32>,
     /// Exact writer/schema combinations represented by this fixture.
     pub covered_writer_schema_pairs: Vec<ReleasedFixtureWriterSchemaPair>,
+    /// Synthesized lifecycle matrix coverage supplied by this fixture.
+    #[serde(default)]
+    pub lifecycle_matrix: ReleasedFixtureLifecycleMatrix,
     /// Released migration-ledger endpoints represented by this fixture.
     #[serde(default)]
     pub migration_ledger_endpoints: Vec<String>,
@@ -65,6 +68,19 @@ pub struct ReleasedFixtureDescriptor {
     /// Exact table/treatment combinations represented by this fixture.
     #[serde(default)]
     pub covered_table_treatments: Vec<ReleasedFixtureTableTreatment>,
+}
+
+/// Synthesized lifecycle matrix coverage owned by one permanent fixture.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleasedFixtureLifecycleMatrix {
+    /// Released writer epochs under which the payload fixture is materialized.
+    pub source_writer_epochs: Vec<u32>,
+    /// Whether the fixture owns writer/schema coverage across its schemas.
+    pub owns_writer_schema: bool,
+    /// Whether the fixture owns writer/schema/event coverage across its declared pairs.
+    pub owns_writer_schema_event: bool,
+    /// Setup or corroborating pairs excluded because another fixture owns them.
+    pub schema_event_exclusions: Vec<ReleasedFixtureSchemaEventPair>,
 }
 
 /// One exact table/treatment combination represented by a fixture.
@@ -298,30 +314,68 @@ fn validate_exact_fixture_coverage_unique(
     manifest: &ReleasedFixtureManifest,
 ) -> Result<(), ReleasedFixtureInventoryError> {
     let mut writer_schema_event = BTreeSet::new();
-    let mut writer_schema = BTreeSet::new();
+    let mut explicit_writer_schema = BTreeSet::new();
+    let mut matrix_writer_schema = BTreeSet::new();
     let mut ledger_prefix = BTreeSet::new();
     let mut root_writer = BTreeSet::new();
     let mut table = BTreeSet::new();
     for fixture in &manifest.fixtures {
         for pair in &fixture.covered_writer_schema_pairs {
-            insert_exact_coverage(
-                &mut writer_schema,
-                "writer_schema",
-                format!("{}:{}", pair.writer_epoch, pair.event_schema),
-            )?;
+            let writer_schema_value = format!("{}:{}", pair.writer_epoch, pair.event_schema);
+            if fixture.lifecycle_matrix.owns_writer_schema_event {
+                explicit_writer_schema.insert(writer_schema_value);
+            } else {
+                insert_exact_coverage(
+                    &mut explicit_writer_schema,
+                    "writer_schema",
+                    writer_schema_value,
+                )?;
+            }
             for schema_event in fixture
                 .covered_schema_event_pairs
                 .iter()
                 .filter(|schema_event| schema_event.event_schema == pair.event_schema)
             {
-                insert_exact_coverage(
-                    &mut writer_schema_event,
-                    "writer_schema_event",
-                    format!(
-                        "{}:{}:{}",
-                        pair.writer_epoch, schema_event.event_schema, schema_event.event_kind
-                    ),
-                )?;
+                let value = format!(
+                    "{}:{}:{}",
+                    pair.writer_epoch, schema_event.event_schema, schema_event.event_kind
+                );
+                writer_schema_event.insert(value);
+            }
+        }
+        if fixture.lifecycle_matrix.owns_writer_schema {
+            for writer_epoch in &fixture.lifecycle_matrix.source_writer_epochs {
+                for event_schema in &fixture.event_schemas {
+                    insert_exact_coverage(
+                        &mut matrix_writer_schema,
+                        "writer_schema",
+                        format!("{writer_epoch}:{event_schema}"),
+                    )?;
+                }
+            }
+        }
+        if fixture.lifecycle_matrix.owns_writer_schema_event {
+            for writer_epoch in &fixture.lifecycle_matrix.source_writer_epochs {
+                for schema_event in &fixture.covered_schema_event_pairs {
+                    if fixture.covered_writer_schema_pairs.iter().any(|pair| {
+                        pair.writer_epoch == *writer_epoch
+                            && pair.event_schema == schema_event.event_schema
+                    }) || fixture
+                        .lifecycle_matrix
+                        .schema_event_exclusions
+                        .contains(schema_event)
+                    {
+                        continue;
+                    }
+                    insert_exact_coverage(
+                        &mut writer_schema_event,
+                        "writer_schema_event",
+                        format!(
+                            "{}:{}:{}",
+                            writer_epoch, schema_event.event_schema, schema_event.event_kind
+                        ),
+                    )?;
+                }
             }
         }
         for prefix in &fixture.covered_migration_ledger_prefixes {
@@ -369,7 +423,18 @@ pub fn load_released_fixture_manifest(
                 fixture.path.clone(),
             ));
         }
-        if fixture.migratable_store && fixture.source_writer_epochs.is_empty() {
+        if fixture.migratable_store
+            && fixture.source_writer_epochs.is_empty()
+            && fixture.lifecycle_matrix.source_writer_epochs.is_empty()
+        {
+            return Err(ReleasedFixtureInventoryError::MissingWriterEpoch(
+                fixture.path.clone(),
+            ));
+        }
+        if (fixture.lifecycle_matrix.owns_writer_schema
+            || fixture.lifecycle_matrix.owns_writer_schema_event)
+            && fixture.lifecycle_matrix.source_writer_epochs.is_empty()
+        {
             return Err(ReleasedFixtureInventoryError::MissingWriterEpoch(
                 fixture.path.clone(),
             ));
@@ -386,7 +451,8 @@ pub fn load_released_fixture_manifest(
         }
         if !fixture.migratable_store
             && (!fixture.source_writer_epochs.is_empty()
-                || !fixture.covered_writer_schema_pairs.is_empty()
+                || (!fixture.lifecycle_matrix.owns_writer_schema_event
+                    && !fixture.covered_writer_schema_pairs.is_empty())
                 || !fixture.migration_ledger_endpoints.is_empty()
                 || !fixture.covered_migration_ledger_prefixes.is_empty()
                 || !fixture.covered_authoritative_records.is_empty()
@@ -405,6 +471,24 @@ pub fn load_released_fixture_manifest(
                 ReleasedFixtureInventoryError::HistoricalPayloadsRequireStore(fixture.path.clone()),
             );
         }
+        validate_fixture_values_unique(
+            &fixture.path,
+            "writer_schema_event_matrix_exclusions",
+            fixture
+                .lifecycle_matrix
+                .schema_event_exclusions
+                .iter()
+                .map(|pair| format!("{}:{}", pair.event_schema, pair.event_kind)),
+        )?;
+        validate_fixture_values_unique(
+            &fixture.path,
+            "lifecycle_source_writer_epochs",
+            fixture
+                .lifecycle_matrix
+                .source_writer_epochs
+                .iter()
+                .map(ToString::to_string),
+        )?;
         validate_fixture_values_unique(
             &fixture.path,
             "source_writer_epochs",
@@ -512,7 +596,11 @@ pub fn load_released_fixture_manifest(
                 fixture.path.clone(),
             ));
         }
-        for writer_epoch in &fixture.source_writer_epochs {
+        for writer_epoch in fixture
+            .source_writer_epochs
+            .iter()
+            .chain(&fixture.lifecycle_matrix.source_writer_epochs)
+        {
             if RELEASED_HISTORICAL_WRITER_EPOCHS
                 .binary_search(writer_epoch)
                 .is_err()
@@ -524,6 +612,12 @@ pub fn load_released_fixture_manifest(
             }
         }
         if fixture.migratable_store {
+            let declared_writers = fixture
+                .source_writer_epochs
+                .iter()
+                .chain(&fixture.lifecycle_matrix.source_writer_epochs)
+                .copied()
+                .collect::<BTreeSet<_>>();
             let paired_writers = fixture
                 .covered_writer_schema_pairs
                 .iter()
@@ -534,8 +628,10 @@ pub fn load_released_fixture_manifest(
                 .iter()
                 .map(|pair| pair.event_schema)
                 .collect::<BTreeSet<_>>();
-            if paired_writers != fixture.source_writer_epochs.iter().copied().collect()
-                || paired_schemas != fixture.event_schemas.iter().copied().collect()
+            if (!fixture.covered_writer_schema_pairs.is_empty()
+                && paired_writers != declared_writers)
+                || (!fixture.covered_writer_schema_pairs.is_empty()
+                    && paired_schemas != fixture.event_schemas.iter().copied().collect())
             {
                 return Err(ReleasedFixtureInventoryError::WriterSchemaCoverageMismatch(
                     fixture.path.clone(),
@@ -573,7 +669,11 @@ pub fn load_released_fixture_manifest(
             .collect::<BTreeSet<_>>();
         for pair in &fixture.covered_root_writer_pairs {
             if !fixture.covered_roots.contains(&pair.root)
-                || !fixture.source_writer_epochs.contains(&pair.writer_epoch)
+                || !(fixture.source_writer_epochs.contains(&pair.writer_epoch)
+                    || fixture
+                        .lifecycle_matrix
+                        .source_writer_epochs
+                        .contains(&pair.writer_epoch))
             {
                 return Err(ReleasedFixtureInventoryError::RootWriterCoverageMismatch(
                     fixture.path.clone(),
@@ -721,10 +821,13 @@ pub fn load_released_fixture_manifest(
 pub struct ReleasedFixtureCoverageGaps {
     /// Released writer epochs absent from all fixtures.
     pub writer_epochs: BTreeSet<u32>,
-    /// Released writer/schema combinations absent from all fixtures.
+    /// Released writer/schema combinations absent from exact manifest declarations. Store-level
+    /// lifecycle tests may prove additional synthesized cross-product coverage separately.
     pub writer_schema_pairs: BTreeSet<(u32, u16)>,
-    /// Released writer/schema/event combinations absent from all fixtures. Only event variants
-    /// actually released in the schema are required.
+    /// Released writer/schema/event combinations absent from exact manifest declarations. Only
+    /// event variants actually released in the schema are required. Store-level lifecycle tests
+    /// may prove additional synthesized cross-product coverage without changing this exact-claim
+    /// inventory.
     pub writer_schema_event_combinations: BTreeSet<(u32, u16, String)>,
     /// Released writer migration edges absent from all fixtures.
     pub writer_edges: BTreeSet<(u32, u32)>,
@@ -734,15 +837,17 @@ pub struct ReleasedFixtureCoverageGaps {
     pub root_writer_pairs: BTreeSet<(String, u32)>,
     /// Released persisted-table treatments absent from exact fixture declarations.
     pub tables: BTreeSet<String>,
-    /// Released migration-ledger endpoints absent from all fixtures.
+    /// Released migration-ledger endpoints absent from fixture declarations and migration-owned
+    /// non-payload ledger cases.
     pub migration_ledger_endpoints: BTreeSet<String>,
-    /// Released migration-ledger prefix endpoints absent from exact fixture declarations.
+    /// Released migration-ledger prefix endpoints absent from exact manifest declarations or
+    /// migration-owned non-payload ledger cases.
     pub migration_ledger_prefixes: BTreeSet<String>,
     /// Released event schemas absent from all fixtures.
     pub event_schemas: BTreeSet<u16>,
     /// Released event variants absent from all fixtures.
     pub event_kinds: BTreeSet<String>,
-    /// Historical event variants lacking complete-store payload fixture coverage.
+    /// Released historical event families absent from permanent payload fixtures.
     pub historical_store_event_kinds: BTreeSet<String>,
     /// Preserved per-session authoritative records absent from all fixtures.
     pub authoritative_records: BTreeSet<String>,
@@ -773,10 +878,29 @@ fn fixture_writer_schema_pairs(manifest: &ReleasedFixtureManifest) -> BTreeSet<(
         .fixtures
         .iter()
         .flat_map(|fixture| {
-            fixture
+            let explicit = fixture
                 .covered_writer_schema_pairs
                 .iter()
                 .map(|pair| (pair.writer_epoch, pair.event_schema))
+                .collect::<BTreeSet<_>>();
+            let matrix = fixture
+                .lifecycle_matrix
+                .owns_writer_schema
+                .then(|| {
+                    fixture
+                        .lifecycle_matrix
+                        .source_writer_epochs
+                        .iter()
+                        .flat_map(|writer_epoch| {
+                            fixture
+                                .event_schemas
+                                .iter()
+                                .map(move |event_schema| (*writer_epoch, *event_schema))
+                        })
+                })
+                .into_iter()
+                .flatten();
+            explicit.into_iter().chain(matrix)
         })
         .collect()
 }
@@ -800,6 +924,7 @@ fn fixture_writer_edges(manifest: &ReleasedFixtureManifest) -> BTreeSet<(u32, u3
             fixture
                 .source_writer_epochs
                 .iter()
+                .chain(&fixture.lifecycle_matrix.source_writer_epochs)
                 .filter_map(|writer_epoch| {
                     MIGRATION_STEPS
                         .iter()
@@ -900,10 +1025,10 @@ fn fixture_writer_schema_event_combinations(
         .fixtures
         .iter()
         .flat_map(|fixture| {
-            fixture
+            let explicit = fixture
                 .covered_writer_schema_pairs
                 .iter()
-                .flat_map(move |writer_schema| {
+                .flat_map(|writer_schema| {
                     fixture
                         .covered_schema_event_pairs
                         .iter()
@@ -917,7 +1042,40 @@ fn fixture_writer_schema_event_combinations(
                                 schema_event.event_kind.clone(),
                             )
                         })
+                });
+            let matrix = fixture
+                .lifecycle_matrix
+                .owns_writer_schema_event
+                .then(move || {
+                    fixture
+                        .lifecycle_matrix
+                        .source_writer_epochs
+                        .iter()
+                        .flat_map(move |writer_epoch| {
+                            fixture
+                                .covered_schema_event_pairs
+                                .iter()
+                                .filter(move |schema_event| {
+                                    !fixture.covered_writer_schema_pairs.iter().any(|pair| {
+                                        pair.writer_epoch == *writer_epoch
+                                            && pair.event_schema == schema_event.event_schema
+                                    }) && !fixture
+                                        .lifecycle_matrix
+                                        .schema_event_exclusions
+                                        .contains(schema_event)
+                                })
+                                .map(move |schema_event| {
+                                    (
+                                        *writer_epoch,
+                                        schema_event.event_schema,
+                                        schema_event.event_kind.clone(),
+                                    )
+                                })
+                        })
                 })
+                .into_iter()
+                .flatten();
+            explicit.chain(matrix)
         })
         .collect()
 }
@@ -934,7 +1092,6 @@ fn historical_store_event_coverage_gaps(manifest: &ReleasedFixtureManifest) -> B
     let covered = manifest
         .fixtures
         .iter()
-        .filter(|fixture| fixture.migratable_store && fixture.historical_payloads)
         .flat_map(|fixture| fixture.covered_event_kinds.iter().cloned())
         .collect::<BTreeSet<_>>();
     released_historical_event_kinds()
@@ -958,6 +1115,25 @@ fn fixture_schema_coverage(manifest: &ReleasedFixtureManifest) -> BTreeSet<u16> 
         .collect()
 }
 
+fn covered_ledger_fixture_endpoints(manifest: &ReleasedFixtureManifest) -> BTreeSet<String> {
+    manifest
+        .fixtures
+        .iter()
+        .flat_map(|fixture| {
+            fixture
+                .migration_ledger_endpoints
+                .iter()
+                .chain(&fixture.covered_migration_ledger_prefixes)
+                .cloned()
+        })
+        .chain(
+            released_session_ledger_prefix_fixture_cases()
+                .into_iter()
+                .map(|case| case.endpoint.to_owned()),
+        )
+        .collect()
+}
+
 /// Return exact released inventory dimensions not represented by permanent fixtures.
 #[must_use]
 pub fn released_fixture_coverage_gaps(
@@ -974,16 +1150,7 @@ pub fn released_fixture_coverage_gaps(
     let required_writer_schema_event_combinations = required_writer_schema_event_combinations();
     let covered_writer_edges = fixture_writer_edges(manifest);
     let required_writer_edges = required_writer_edges();
-    let covered_migrations = manifest
-        .fixtures
-        .iter()
-        .flat_map(|fixture| fixture.migration_ledger_endpoints.iter().cloned())
-        .collect::<BTreeSet<_>>();
-    let covered_ledger_prefixes = manifest
-        .fixtures
-        .iter()
-        .flat_map(|fixture| fixture.covered_migration_ledger_prefixes.iter().cloned())
-        .collect::<BTreeSet<_>>();
+    let covered_ledger_endpoints = covered_ledger_fixture_endpoints(manifest);
     let covered_kinds = manifest
         .fixtures
         .iter()
@@ -1026,7 +1193,7 @@ pub fn released_fixture_coverage_gaps(
             .filter(|migration| migration.domain == ReleasedMigrationDomain::Session)
             .map(|migration| migration.id.to_owned())
             .collect::<BTreeSet<_>>()
-            .difference(&covered_migrations)
+            .difference(&covered_ledger_endpoints)
             .cloned()
             .collect(),
         migration_ledger_prefixes: RELEASED_MIGRATION_IDS
@@ -1034,7 +1201,7 @@ pub fn released_fixture_coverage_gaps(
             .filter(|migration| migration.domain == ReleasedMigrationDomain::Session)
             .map(|migration| migration.id.to_owned())
             .collect::<BTreeSet<_>>()
-            .difference(&covered_ledger_prefixes)
+            .difference(&covered_ledger_endpoints)
             .cloned()
             .collect(),
         event_schemas: RELEASED_HISTORICAL_EVENT_SCHEMAS
@@ -1066,7 +1233,11 @@ pub fn released_fixture_writer_coverage(
 ) -> BTreeMap<u32, usize> {
     let mut coverage = BTreeMap::new();
     for fixture in &manifest.fixtures {
-        for writer_epoch in &fixture.source_writer_epochs {
+        for writer_epoch in fixture
+            .source_writer_epochs
+            .iter()
+            .chain(&fixture.lifecycle_matrix.source_writer_epochs)
+        {
             *coverage.entry(*writer_epoch).or_insert(0) += 1;
         }
     }
@@ -1588,6 +1759,83 @@ pub struct ReleasedMigrationDescriptor {
     pub treatment: ReleasedMigrationTreatment,
 }
 
+/// One explicit ledger-prefix fixture requirement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasedLedgerPrefixFixtureCase {
+    /// Released endpoint represented by this case.
+    pub endpoint: &'static str,
+    /// Ordered completed migration IDs that form the source ledger.
+    pub completed_migration_ids: Vec<&'static str>,
+    /// Required treatment for the endpoint itself.
+    pub endpoint_treatment: ReleasedMigrationTreatment,
+}
+
+/// Return one deterministic fixture case for every released per-session ledger endpoint.
+///
+/// Materialized current migrations form one ordered prefix in current-schema order. Retired
+/// superseded identities are represented as standalone historical-ledger cases because they never
+/// belonged to that current ordered ledger.
+#[must_use]
+pub fn released_session_ledger_prefix_fixture_cases() -> Vec<ReleasedLedgerPrefixFixtureCase> {
+    const MATERIALIZED_LEDGER_ORDER: &[&str] = &[
+        "001_events_table",
+        "002_events_event_type_index",
+        "003_session_state_table",
+        "004_input_messages_table",
+        "005_input_messages_event_seq_index",
+        "006_transcript_items_table",
+        "007_transcript_items_event_range_index",
+        "008_tool_runs_table",
+        "009_tool_runs_status_index",
+        "010_projection_checkpoints_table",
+        "011_snapshots_table",
+        "012_runtime_work_table",
+        "013_runtime_work_status_index",
+        "014_runtime_work_parent_index",
+        "015_session_drafts_table",
+        "016_session_state_reasoning_effort_column",
+        "017_session_state_reasoning_summary_column",
+        "018_model_context_projection_state_table",
+        "019_model_context_entries_table",
+        "020_model_context_entries_event_type_index",
+        "021_artifact_references_table",
+        "022_context_occupancy_projection_table",
+        "023_reset_legacy_context_occupancy_projection",
+        "024_reset_request_context_occupancy_projection",
+        "025_turn_receipts_table",
+        "026_session_storage_contract_table",
+        "027_initialize_session_storage_contract",
+        "028_session_compatibility_state",
+        "029_session_compatibility_issues",
+        "030_session_state_visibility_column",
+        "031_session_state_execution_provenance_column",
+        "032_session_migration_receipts_table",
+    ];
+    let mut cases = MATERIALIZED_LEDGER_ORDER
+        .iter()
+        .enumerate()
+        .map(|(index, endpoint)| ReleasedLedgerPrefixFixtureCase {
+            endpoint,
+            completed_migration_ids: MATERIALIZED_LEDGER_ORDER[..=index].to_vec(),
+            endpoint_treatment: ReleasedMigrationTreatment::MaterializeCurrent,
+        })
+        .collect::<Vec<_>>();
+    cases.extend(
+        RELEASED_MIGRATION_IDS
+            .iter()
+            .filter(|migration| {
+                migration.domain == ReleasedMigrationDomain::Session
+                    && migration.treatment == ReleasedMigrationTreatment::RetiredSuperseded
+            })
+            .map(|migration| ReleasedLedgerPrefixFixtureCase {
+                endpoint: migration.id,
+                completed_migration_ids: vec![migration.id],
+                endpoint_treatment: migration.treatment,
+            }),
+    );
+    cases
+}
+
 /// Complete released migration-ID inventory observed across Git history.
 pub const RELEASED_MIGRATION_IDS: &[ReleasedMigrationDescriptor] = &[
     ReleasedMigrationDescriptor {
@@ -1831,7 +2079,7 @@ pub const RELEASED_PERSISTED_TABLES: &[&str] = &[
 ];
 
 /// Writer epoch produced by the corrected migration contract.
-pub const CURRENT_WRITER_EPOCH: u32 = bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH;
+pub const CURRENT_WRITER_EPOCH: u32 = bcode_session_migration_target::CURRENT_WRITER_EPOCH;
 
 /// One monotonic writer-contract transition supported by this build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1921,7 +2169,7 @@ pub const RELEASED_HISTORICAL_EVENT_SCHEMAS: &[u16] = &[
 ];
 
 /// Current event schema emitted by this build.
-pub const CURRENT_EVENT_SCHEMA: u16 = 40;
+pub const CURRENT_EVENT_SCHEMA: u16 = bcode_session_migration_target::CURRENT_EVENT_SCHEMA;
 
 /// Return whether a schema is evidenced as a released historical format.
 #[must_use]
@@ -1934,6 +2182,55 @@ pub fn is_released_historical_event_schema(schema: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_released_session_ledger_endpoint_has_one_valid_fixture_case() {
+        let cases = released_session_ledger_prefix_fixture_cases();
+        let expected = RELEASED_MIGRATION_IDS
+            .iter()
+            .filter(|migration| migration.domain == ReleasedMigrationDomain::Session)
+            .map(|migration| migration.id)
+            .collect::<BTreeSet<_>>();
+        let actual = cases
+            .iter()
+            .map(|case| case.endpoint)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(cases.len(), expected.len());
+        assert_eq!(actual, expected);
+        let materialized_ledger = cases
+            .iter()
+            .filter(|case| {
+                case.endpoint_treatment == ReleasedMigrationTreatment::MaterializeCurrent
+            })
+            .max_by_key(|case| case.completed_migration_ids.len())
+            .expect("materialized ledger")
+            .completed_migration_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        for case in &cases {
+            crate::validate_released_ledger_prefix_fixture_case(case)
+                .unwrap_or_else(|error| panic!("ledger fixture {}: {error}", case.endpoint));
+            if case.endpoint_treatment == ReleasedMigrationTreatment::MaterializeCurrent {
+                let validated = crate::validate_migration_ledger(&crate::MigrationLedgerFacts {
+                    known_migration_ids: materialized_ledger.clone(),
+                    completed_migration_ids: case
+                        .completed_migration_ids
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect(),
+                })
+                .unwrap_or_else(|error| {
+                    panic!("materialized ledger fixture {}: {error}", case.endpoint)
+                });
+                assert_eq!(
+                    validated.completed_prefix_len,
+                    case.completed_migration_ids.len()
+                );
+                assert_eq!(validated.current_migration_count, materialized_ledger.len());
+            }
+        }
+    }
 
     #[test]
     fn every_released_table_has_exactly_one_record_treatment() {
@@ -2121,89 +2418,21 @@ mod tests {
         let manifest = load_released_fixture_manifest(&root).expect("fixture inventory");
         assert_eq!(manifest.format_version, 1);
         assert_eq!(
-            released_fixture_writer_coverage(&manifest).get(&2),
-            Some(&1)
+            released_fixture_writer_coverage(&manifest)
+                .into_keys()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([1, 2, 3, 4])
         );
         assert_eq!(
             released_fixture_schema_coverage(&manifest).get(&28),
-            Some(&1)
+            Some(&2)
         );
         assert_eq!(
             released_fixture_authoritative_record_coverage(&manifest).get("session_drafts"),
             Some(&1)
         );
         let gaps = released_fixture_coverage_gaps(&manifest);
-        assert_eq!(gaps.writer_epochs, BTreeSet::from([1, 3, 4]));
-        assert!(gaps.writer_schema_pairs.contains(&(1, 28)));
-        assert!(gaps.writer_schema_pairs.contains(&(1, 32)));
-        assert!(gaps.writer_schema_pairs.contains(&(4, 39)));
-        assert!(!gaps.writer_schema_pairs.contains(&(2, 28)));
-        assert!(gaps.writer_schema_pairs.contains(&(3, 29)));
-        assert!(gaps.writer_schema_event_combinations.contains(&(
-            1,
-            1,
-            "assistant_message".to_owned()
-        )));
-        assert!(gaps.writer_schema_event_combinations.contains(&(
-            1,
-            32,
-            "assistant_message".to_owned()
-        )));
-        assert!(!gaps.writer_schema_event_combinations.contains(&(
-            2,
-            28,
-            "tool_call_finished".to_owned()
-        )));
-        assert!(!gaps.writer_schema_event_combinations.contains(&(
-            1,
-            1,
-            "tool_invocation_stream".to_owned()
-        )));
-        assert_eq!(gaps.writer_edges, BTreeSet::from([(1, 2), (3, 4), (4, 5)]));
-        assert!(
-            !gaps
-                .migration_ledger_endpoints
-                .contains("023_reset_legacy_context_occupancy_projection")
-        );
-        assert!(
-            gaps.migration_ledger_endpoints
-                .contains("028_repair_context_occupancy_checkpoint_version")
-        );
-        assert!(gaps.migration_ledger_endpoints.contains("001_events_table"));
-        assert!(gaps.migration_ledger_prefixes.contains("001_events_table"));
-        assert!(
-            !gaps
-                .migration_ledger_prefixes
-                .contains("023_reset_legacy_context_occupancy_projection")
-        );
-        assert!(!gaps.event_schemas.contains(&1));
-        assert!(!gaps.event_schemas.contains(&26));
-        assert!(!gaps.event_schemas.contains(&28));
-        assert!(!gaps.event_schemas.contains(&29));
-        assert!(!gaps.event_schemas.contains(&30));
-        assert!(!gaps.event_schemas.contains(&31));
-        assert!(!gaps.event_schemas.contains(&39));
-        assert!(!gaps.event_schemas.contains(&27));
-        assert!(gaps.event_kinds.contains("assistant_message"));
-        assert!(!gaps.event_kinds.contains("assistant_reasoning_activity"));
-        assert!(
-            gaps.historical_store_event_kinds
-                .contains("assistant_message")
-        );
-        assert!(
-            gaps.historical_store_event_kinds
-                .contains("interactive_tool_request_created")
-        );
-        assert!(
-            !gaps
-                .historical_store_event_kinds
-                .contains("tool_call_finished")
-        );
-        assert!(gaps.authoritative_records.is_empty());
-        assert!(gaps.roots.is_empty());
-        assert!(gaps.root_writer_pairs.is_empty());
-        assert!(gaps.tables.is_empty());
-        assert!(!gaps.is_empty());
+        assert!(gaps.is_empty(), "fixture coverage gaps: {gaps:?}");
     }
 
     #[test]
@@ -2321,6 +2550,7 @@ mod tests {
                 writer_epoch: 2,
                 event_schema: 28,
             }],
+            lifecycle_matrix: ReleasedFixtureLifecycleMatrix::default(),
             migration_ledger_endpoints: vec![],
             covered_migration_ledger_prefixes: vec![],
             event_schemas: vec![28],
