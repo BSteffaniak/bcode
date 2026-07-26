@@ -24,8 +24,8 @@ use sha2::{Digest as _, Sha256};
 use bcode_database_observability::ObservedDatabase;
 use bcode_metrics::{DatabaseMetrics, DatabaseOperation, MetricsRegistry};
 use bcode_session_models::{
-    ExecutionSessionProvenance, RequestContextOccupancy, RuntimeWorkKind, RuntimeWorkStatus,
-    SessionEvent, SessionEventCompatibilityIssue, SessionEventKind, SessionHistoryCursor,
+    ExecutionSessionProvenance, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent,
+    SessionEventCompatibilityIssue, SessionEventKind, SessionHistoryCursor,
     SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionId,
     SessionInputHistoryEntry, SessionSummary, SessionTitleSource, SessionVisibility,
     ToolInvocationResult, WorkId,
@@ -3109,16 +3109,17 @@ async fn validate_migrated_storage(
 
 struct MigrationProjectionState {
     model_context_checkpoint: Option<u64>,
-    context_epoch: u64,
-    context_occupancy: Option<RequestContextOccupancy>,
+    authoritative: bcode_session_migration::AuthoritativeMigrationState,
 }
 
 impl MigrationProjectionState {
     const fn new() -> Self {
         Self {
             model_context_checkpoint: None,
-            context_epoch: 0,
-            context_occupancy: None,
+            authoritative: bcode_session_migration::AuthoritativeMigrationState {
+                context_epoch: 0,
+                context_occupancy: None,
+            },
         }
     }
 }
@@ -3142,7 +3143,7 @@ async fn project_migration_event(
         timer.elapsed_ms(),
     );
     let timer = metrics.timer();
-    project_migration_context_occupancy_event(event, state);
+    state.authoritative.ingest(event);
     metrics.record_histogram(
         "session.migration.projector.context_occupancy_duration_ms",
         timer.elapsed_ms(),
@@ -3939,29 +3940,6 @@ async fn project_model_context_event(
     Ok(())
 }
 
-fn project_migration_context_occupancy_event(
-    event: &SessionEvent,
-    state: &mut MigrationProjectionState,
-) {
-    let (context_epoch, occupancy) = match &event.kind {
-        SessionEventKind::ModelChanged { .. }
-        | SessionEventKind::ContextCompacted { .. }
-        | SessionEventKind::ProviderContextCompacted { .. } => (event.sequence, None),
-        SessionEventKind::RequestContextObserved { observation } => (
-            state.context_epoch,
-            RequestContextOccupancy::reconcile(
-                state.context_occupancy.as_ref(),
-                state.context_epoch,
-                event.sequence,
-                observation.clone(),
-            ),
-        ),
-        _ => (state.context_epoch, state.context_occupancy.clone()),
-    };
-    state.context_epoch = context_epoch;
-    state.context_occupancy = occupancy;
-}
-
 async fn finalize_migration_context_occupancy(
     db: &dyn Database,
     tail: &SessionEvent,
@@ -3973,10 +3951,14 @@ async fn finalize_migration_context_occupancy(
             "schema_version",
             DatabaseValue::Int64(i64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION)),
         )
-        .value("context_epoch", seq_to_value(state.context_epoch))
+        .value(
+            "context_epoch",
+            seq_to_value(state.authoritative.context_epoch),
+        )
         .value(
             "occupancy_json",
             state
+                .authoritative
                 .context_occupancy
                 .as_ref()
                 .map(serde_json::to_string)

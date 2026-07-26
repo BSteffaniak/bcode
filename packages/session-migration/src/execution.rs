@@ -2,7 +2,7 @@
 
 use crate::classification::{HistoricalDecode, HistoricalEventMetadata};
 use crate::codec::{HistoricalEnvelope, schema_28};
-use bcode_session_models::SessionEvent;
+use bcode_session_models::{RequestContextOccupancy, SessionEvent, SessionEventKind};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use thiserror::Error;
@@ -100,7 +100,38 @@ impl CanonicalNormalizationSummary {
     }
 }
 
-/// Result of normalizing one canonical payload for migration.
+/// Migration-owned authoritative state derived while traversing normalized canonical events.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuthoritativeMigrationState {
+    /// Current context generation.
+    pub context_epoch: u64,
+    /// Reconciled current request-context occupancy.
+    pub context_occupancy: Option<RequestContextOccupancy>,
+}
+
+impl AuthoritativeMigrationState {
+    /// Ingest one normalized current event into authoritative migration state.
+    pub fn ingest(&mut self, event: &SessionEvent) {
+        let (context_epoch, occupancy) = match &event.kind {
+            SessionEventKind::ModelChanged { .. }
+            | SessionEventKind::ContextCompacted { .. }
+            | SessionEventKind::ProviderContextCompacted { .. } => (event.sequence, None),
+            SessionEventKind::RequestContextObserved { observation } => (
+                self.context_epoch,
+                RequestContextOccupancy::reconcile(
+                    self.context_occupancy.as_ref(),
+                    self.context_epoch,
+                    event.sequence,
+                    observation.clone(),
+                ),
+            ),
+            _ => (self.context_epoch, self.context_occupancy.clone()),
+        };
+        self.context_epoch = context_epoch;
+        self.context_occupancy = occupancy;
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedCanonicalEvent {
     /// Current event ready for canonical replacement and projector ingestion.
@@ -212,7 +243,10 @@ fn decode_for_migration(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_session_models::{RequestContextTokenCount, SessionEventKind, ToolInvocationResult};
+    use bcode_session_models::{
+        LocalContextEstimate, ModelRequestIdentity, RequestContextObservation,
+        RequestContextTokenCount, SessionEventKind, ToolInvocationResult,
+    };
     use serde::Deserialize;
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
@@ -224,6 +258,59 @@ mod tests {
         schema_version: u16,
         sequence: u64,
         kind: BTreeMap<String, serde_json::Value>,
+    }
+
+    #[test]
+    fn authoritative_state_conversion_tracks_resets_and_reconciled_observations() {
+        let session_id = SESSION_ID.parse().expect("session ID");
+        let mut state = AuthoritativeMigrationState::default();
+        let observed = SessionEvent {
+            schema_version: crate::CURRENT_EVENT_SCHEMA,
+            sequence: 1,
+            timestamp_ms: 9,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::RequestContextObserved {
+                observation: RequestContextObservation {
+                    request: ModelRequestIdentity {
+                        provider_plugin_id: "provider".to_owned(),
+                        requested_model_id: Some("model".to_owned()),
+                        effective_model_id: "model".to_owned(),
+                        request_id: "request".to_owned(),
+                        model_turn_id: "turn".to_owned(),
+                        round: 0,
+                        request_fingerprint: "fingerprint".to_owned(),
+                        effective_auth_profile: None,
+                        context_format_version: None,
+                        compatibility_key: None,
+                        context_epoch: 0,
+                    },
+                    context_through_sequence: 0,
+                    context_tokens: RequestContextTokenCount::Estimated(10),
+                    local_estimate: LocalContextEstimate {
+                        tokens: 10,
+                        algorithm_version: 1,
+                    },
+                },
+            },
+        };
+        state.ingest(&observed);
+        assert!(state.context_occupancy.is_some());
+
+        let reset = SessionEvent {
+            schema_version: crate::CURRENT_EVENT_SCHEMA,
+            sequence: 2,
+            timestamp_ms: 10,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::ModelChanged {
+                provider: "provider".to_owned(),
+                model: "next-model".to_owned(),
+            },
+        };
+        state.ingest(&reset);
+        assert_eq!(state.context_epoch, 2);
+        assert!(state.context_occupancy.is_none());
     }
 
     #[test]

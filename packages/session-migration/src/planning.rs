@@ -2,10 +2,59 @@
 
 use crate::inventory::{
     CURRENT_WRITER_EPOCH, MIGRATION_STEPS, MigrationStepDescriptor, RELEASED_EVENT_VARIANTS,
-    RELEASED_HISTORICAL_EVENT_SCHEMAS, RELEASED_HISTORICAL_WRITER_EPOCHS,
-    RELEASED_RECORD_TREATMENTS, ReleasedEventTreatment, ReleasedRecordTreatment,
+    RELEASED_HISTORICAL_EVENT_SCHEMAS, RELEASED_HISTORICAL_ROOTS,
+    RELEASED_HISTORICAL_WRITER_EPOCHS, RELEASED_RECORD_TREATMENTS, ReleasedEventTreatment,
+    ReleasedRecordTreatment, ReleasedRootTreatment,
 };
 use thiserror::Error;
+
+/// One complete treatment row for a released persisted event variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleasedEventTreatmentRow {
+    /// Stable serde event-kind name.
+    pub kind: &'static str,
+    /// Required migration treatment.
+    pub treatment: ReleasedEventTreatment,
+}
+
+/// One complete treatment row for a released persisted table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleasedRecordTreatmentRow {
+    /// Durable table identity.
+    pub table: &'static str,
+    /// Required migration treatment.
+    pub treatment: ReleasedRecordTreatment,
+}
+
+/// One complete treatment row for a released persisted root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleasedRootTreatmentRow {
+    /// Root path relative to the state directory.
+    pub path: &'static str,
+    /// Required migration treatment.
+    pub treatment: ReleasedRootTreatment,
+}
+
+/// Complete released inventory treatments that do not vary by writer/schema matrix row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReleasedInventoryTreatments {
+    /// Historical root treatments.
+    pub root_treatments: Vec<ReleasedRootTreatmentRow>,
+}
+
+/// Return complete treatments for released inventory dimensions outside writer/schema rows.
+#[must_use]
+pub fn released_inventory_treatments() -> ReleasedInventoryTreatments {
+    ReleasedInventoryTreatments {
+        root_treatments: RELEASED_HISTORICAL_ROOTS
+            .iter()
+            .map(|root| ReleasedRootTreatmentRow {
+                path: root.path,
+                treatment: root.treatment,
+            })
+            .collect(),
+    }
+}
 
 /// One complete writer/schema migration-matrix row.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,9 +66,9 @@ pub struct ReleasedFormatMigrationMatrixRow {
     /// Ordered writer transitions ending at the current writer.
     pub migration_step_ids: Vec<&'static str>,
     /// Event treatments required by the released inventory.
-    pub event_treatments: Vec<ReleasedEventTreatment>,
+    pub event_treatments: Vec<ReleasedEventTreatmentRow>,
     /// Non-event record treatments required by the released inventory.
-    pub record_treatments: Vec<ReleasedRecordTreatment>,
+    pub record_treatments: Vec<ReleasedRecordTreatmentRow>,
 }
 
 /// Build the Cartesian released writer/schema migration matrix.
@@ -44,11 +93,17 @@ pub fn released_format_migration_matrix()
                 migration_step_ids: plan.steps.iter().map(|step| step.id).collect(),
                 event_treatments: RELEASED_EVENT_VARIANTS
                     .iter()
-                    .map(|variant| variant.treatment)
+                    .map(|variant| ReleasedEventTreatmentRow {
+                        kind: variant.kind,
+                        treatment: variant.treatment,
+                    })
                     .collect(),
                 record_treatments: RELEASED_RECORD_TREATMENTS
                     .iter()
-                    .map(|record| record.treatment)
+                    .map(|record| ReleasedRecordTreatmentRow {
+                        table: record.table,
+                        treatment: record.treatment,
+                    })
                     .collect(),
             });
         }
@@ -203,6 +258,26 @@ mod tests {
                 row.record_treatments.len(),
                 RELEASED_RECORD_TREATMENTS.len()
             );
+            assert_eq!(
+                row.event_treatments
+                    .iter()
+                    .map(|treatment| treatment.kind)
+                    .collect::<Vec<_>>(),
+                RELEASED_EVENT_VARIANTS
+                    .iter()
+                    .map(|variant| variant.kind)
+                    .collect::<Vec<_>>()
+            );
+            assert_eq!(
+                row.record_treatments
+                    .iter()
+                    .map(|treatment| treatment.table)
+                    .collect::<Vec<_>>(),
+                RELEASED_RECORD_TREATMENTS
+                    .iter()
+                    .map(|record| record.table)
+                    .collect::<Vec<_>>()
+            );
             assert!(!row.migration_step_ids.is_empty());
             let plan = plan_writer_epoch_migration(row.source_writer_epoch).expect("writer plan");
             assert_eq!(plan.target_writer_epoch, CURRENT_WRITER_EPOCH);
@@ -211,6 +286,14 @@ mod tests {
                 plan.steps.iter().map(|step| step.id).collect::<Vec<_>>()
             );
         }
+        let roots = released_inventory_treatments();
+        assert_eq!(
+            roots.root_treatments,
+            [ReleasedRootTreatmentRow {
+                path: "session-storage/writer-epoch-2",
+                treatment: ReleasedRootTreatment::RelocateToCanonical,
+            }]
+        );
     }
 
     #[test]

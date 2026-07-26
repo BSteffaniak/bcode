@@ -191,9 +191,12 @@ if ! rg -q 'create_verified_migration_backup' packages/session/src/migration_exe
 fi
 
 if ! rg -q 'CURRENT_WRITER_EPOCH: u32 = 5' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'RELEASED_HISTORICAL_ROOTS' packages/session-migration/src/inventory.rs \
   || ! rg -q 'RELEASED_HISTORICAL_EVENT_SCHEMAS' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'released_historical_root_inventory_is_sorted_unique_and_exact' packages/session-migration/src/inventory.rs \
   || ! rg -q 'RELEASED_EVENT_VARIANTS' packages/session-migration/src/inventory.rs \
   || ! rg -q 'released_event_variant_treatments_are_sorted_unique_and_total' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'every inventoried retired variant must be an explicit reviewed decision' packages/session-migration/src/inventory.rs \
   || ! rg -q 'RELEASED_MIGRATION_IDS' packages/session-migration/src/inventory.rs \
   || ! rg -q 'RELEASED_PERSISTED_TABLES' packages/session-migration/src/inventory.rs \
   || ! rg -q 'RELEASED_RECORD_TREATMENTS' packages/session-migration/src/inventory.rs \
@@ -201,6 +204,8 @@ if ! rg -q 'CURRENT_WRITER_EPOCH: u32 = 5' packages/session-migration/src/invent
   || ! rg -q 'covered_authoritative_records' packages/session-migration/fixtures/manifest.json \
   || ! rg -q 'released_fixture_authoritative_record_coverage' packages/session-migration/src/inventory.rs \
   || ! rg -q 'permanent_fixture_manifest_rejects_duplicate_and_empty_coverage' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'released_fixture_coverage_gaps' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'gaps.writer_epochs, BTreeSet::from\(\[1, 3, 4\]\)' packages/session-migration/src/inventory.rs \
   || ! sed -n '/async fn schema_28_historical_events_normalize_to_current_writable_storage/,/^    }/p' packages/session/src/db.rs | grep -q 'read preserved fixture draft' \
   || ! rg -q 'released_migration_and_table_inventories_are_sorted_unique_and_domain_complete' packages/session-migration/src/inventory.rs \
   || ! rg -q 'pub struct MigrationClassificationEvidence' packages/session-migration/src/validation.rs \
@@ -216,6 +221,9 @@ if ! rg -q 'CURRENT_WRITER_EPOCH: u32 = 5' packages/session-migration/src/invent
     >/tmp/bcode-current-migration-ledger-policy-violations.txt \
   || ! rg -q 'type MigrationSourceEvidence =.*' packages/session/src/db.rs \
   || ! rg -q 'released_format_migration_matrix' packages/session-migration/src/planning.rs \
+  || ! rg -q 'ReleasedEventTreatmentRow' packages/session-migration/src/planning.rs \
+  || ! rg -q 'ReleasedRecordTreatmentRow' packages/session-migration/src/planning.rs \
+  || ! rg -q 'ReleasedRootTreatmentRow' packages/session-migration/src/planning.rs \
   || ! rg -q 'released_format_matrix_is_complete_unique_and_current_writable' packages/session-migration/src/planning.rs \
   || ! rg -q 'plan_writer_epoch_migration' packages/session-migration/src/planning.rs \
   || rg -n 'CURRENT_WRITER_EPOCH|RELEASED_HISTORICAL_EVENT_SCHEMAS|MIGRATION_STEPS' packages/session/src \
@@ -350,7 +358,10 @@ fi
 
 if rg -n 'join\("session-storage"\)|writer-epoch-' packages/session/src --glob '*.rs' \
   >/tmp/bcode-current-historical-session-root-violations.txt \
-  || ! rg -q 'join\("session-storage"\).*join\("writer-epoch-2"\)' packages/session-migration/src/storage.rs \
+  || ! rg -q 'RELEASED_HISTORICAL_ROOTS\[0\]' packages/session-migration/src/storage.rs \
+  || sed '/#\[cfg(test)\]/,$d' packages/session-migration/src/storage.rs \
+    | rg -n 'join\("session-storage"\).*join\("writer-epoch-2"\)' \
+    >/tmp/bcode-hardcoded-historical-root-violations.txt \
   || ! rg -q 'diagnose_accidental_epoch_session_root' packages/session-migration/src/storage.rs \
   || ! rg -q 'recover_accidental_epoch_session_root' packages/session-migration/src/storage.rs \
   || ! rg -q 'historical_session_has_active_owner' packages/session/src/migration_adapter.rs \
@@ -636,6 +647,10 @@ if ! rg -q 'pub mod schema_28' packages/session-migration/src/codec.rs \
   || ! sed -n '/let migration_outcome =/,/validate_storage_writer_contract/p' packages/session/src/db.rs | awk '/write_session_migration_receipt/{receipt=NR} /set_storage_writer_contract/{epoch=NR} END {exit !(receipt && epoch && receipt < epoch)}' \
   || ! rg -q 'set_storage_writer_contract\(&\*tx, CURRENT_SESSION_STORAGE_WRITER_EPOCH\)' packages/session/src/db.rs \
   || ! rg -q 'CONVERTED_TOOL_CALL_FINISHED' packages/session-migration/src/execution.rs \
+  || ! rg -q 'authoritative_state_conversion_tracks_resets_and_reconciled_observations' packages/session-migration/src/execution.rs \
+  || ! rg -q 'state.authoritative.ingest\(event\)' packages/session/src/db.rs \
+  || rg -n 'fn project_migration_context_occupancy_event' packages/session/src/db.rs \
+    >/tmp/bcode-current-authoritative-migration-policy-violations.txt \
   || ! rg -q 'CONVERTED_CONTEXT_USAGE_OBSERVED' packages/session-migration/src/execution.rs \
   || ! rg -q 'RETIRED_TOOL_INVOCATION_STREAM' packages/session-migration/src/execution.rs \
   || ! rg -q 'report.descriptors\[counter\].label_keys.is_empty' packages/session/src/db.rs \

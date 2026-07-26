@@ -56,22 +56,26 @@ pub use diagnosis::{
     SessionMigrationOwnerDiagnosis, classify_session_diagnosis,
 };
 pub use execution::{
-    CanonicalNormalizationSummary, HistoricalSessionEventError, NormalizedCanonicalEvent, metric,
-    normalize_canonical_event, ordered_payload_digest,
+    AuthoritativeMigrationState, CanonicalNormalizationSummary, HistoricalSessionEventError,
+    NormalizedCanonicalEvent, metric, normalize_canonical_event, ordered_payload_digest,
 };
 pub use inventory::{
     CURRENT_EVENT_SCHEMA, CURRENT_WRITER_EPOCH, MIGRATION_STEPS, MigrationStepDescriptor,
-    RELEASED_EVENT_VARIANTS, RELEASED_HISTORICAL_EVENT_SCHEMAS, RELEASED_HISTORICAL_WRITER_EPOCHS,
-    RELEASED_MIGRATION_IDS, RELEASED_PERSISTED_TABLES, RELEASED_RECORD_TREATMENTS,
-    ReleasedEventTreatment, ReleasedEventVariantDescriptor, ReleasedFixtureClassificationCounts,
-    ReleasedFixtureDescriptor, ReleasedFixtureInventoryError, ReleasedFixtureManifest,
-    ReleasedMigrationDescriptor, ReleasedMigrationDomain, ReleasedRecordDescriptor,
-    ReleasedRecordTreatment, is_released_historical_event_schema, load_released_fixture_manifest,
-    released_fixture_authoritative_record_coverage, released_fixture_schema_coverage,
+    RELEASED_EVENT_VARIANTS, RELEASED_HISTORICAL_EVENT_SCHEMAS, RELEASED_HISTORICAL_ROOTS,
+    RELEASED_HISTORICAL_WRITER_EPOCHS, RELEASED_MIGRATION_IDS, RELEASED_PERSISTED_TABLES,
+    RELEASED_RECORD_TREATMENTS, ReleasedEventTreatment, ReleasedEventVariantDescriptor,
+    ReleasedFixtureClassificationCounts, ReleasedFixtureCoverageGaps, ReleasedFixtureDescriptor,
+    ReleasedFixtureInventoryError, ReleasedFixtureManifest, ReleasedMigrationDescriptor,
+    ReleasedMigrationDomain, ReleasedRecordDescriptor, ReleasedRecordTreatment,
+    ReleasedRootDescriptor, ReleasedRootTreatment, is_released_historical_event_schema,
+    load_released_fixture_manifest, released_fixture_authoritative_record_coverage,
+    released_fixture_coverage_gaps, released_fixture_schema_coverage,
     released_fixture_writer_coverage,
 };
 pub use planning::{
-    MigrationPlan, MigrationPlanError, MigrationPlanService, ReleasedFormatMigrationMatrixRow,
-    plan_writer_epoch_migration, plan_writer_epoch_migration_with_registry,
-    released_format_migration_matrix,
+    MigrationPlan, MigrationPlanError, MigrationPlanService, ReleasedEventTreatmentRow,
+    ReleasedFormatMigrationMatrixRow, ReleasedInventoryTreatments, ReleasedRecordTreatmentRow,
+    ReleasedRootTreatmentRow, plan_writer_epoch_migration,
+    plan_writer_epoch_migration_with_registry, released_format_migration_matrix,
+    released_inventory_treatments,
 };

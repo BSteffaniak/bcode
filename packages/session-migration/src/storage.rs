@@ -1,3 +1,4 @@
+use crate::RELEASED_HISTORICAL_ROOTS;
 use bcode_session_models::SessionId;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -76,7 +77,10 @@ pub enum HistoricalStorageError<E> {
 /// Return the exact removed writer-epoch root for explicit diagnosis and recovery.
 #[must_use]
 pub fn accidental_epoch_session_root(state_dir: &Path) -> PathBuf {
-    state_dir.join("session-storage").join("writer-epoch-2")
+    RELEASED_HISTORICAL_ROOTS[0]
+        .path
+        .split('/')
+        .fold(state_dir.to_path_buf(), |root, segment| root.join(segment))
 }
 
 /// Diagnose and classify the removed writer-epoch root without mutation.
@@ -216,6 +220,20 @@ fn remove_empty_dir(path: PathBuf) {
 mod tests {
     use super::*;
     use std::convert::Infallible;
+
+    #[test]
+    fn historical_root_path_is_driven_by_released_inventory() {
+        let state = tempfile::tempdir().expect("state");
+        assert_eq!(
+            accidental_epoch_session_root(state.path()),
+            state.path().join("session-storage").join("writer-epoch-2")
+        );
+        assert_eq!(RELEASED_HISTORICAL_ROOTS.len(), 1);
+        assert_eq!(
+            RELEASED_HISTORICAL_ROOTS[0].treatment,
+            crate::ReleasedRootTreatment::RelocateToCanonical
+        );
+    }
 
     #[test]
     fn diagnosis_prioritizes_conflicts_then_owners_then_pending_recovery() {

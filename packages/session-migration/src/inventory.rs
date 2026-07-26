@@ -234,7 +234,84 @@ pub fn load_released_fixture_manifest(
     Ok(manifest)
 }
 
-/// Return fixture coverage by released writer epoch.
+/// Missing permanent fixture coverage relative to released inventory.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReleasedFixtureCoverageGaps {
+    /// Released writer epochs absent from all fixtures.
+    pub writer_epochs: BTreeSet<u32>,
+    /// Released event schemas absent from all fixtures.
+    pub event_schemas: BTreeSet<u16>,
+    /// Released event variants absent from all fixtures.
+    pub event_kinds: BTreeSet<String>,
+    /// Preserved per-session authoritative records absent from all fixtures.
+    pub authoritative_records: BTreeSet<String>,
+}
+
+impl ReleasedFixtureCoverageGaps {
+    /// Return whether every released fixture dimension is covered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.writer_epochs.is_empty()
+            && self.event_schemas.is_empty()
+            && self.event_kinds.is_empty()
+            && self.authoritative_records.is_empty()
+    }
+}
+
+/// Return exact released inventory dimensions not represented by permanent fixtures.
+#[must_use]
+pub fn released_fixture_coverage_gaps(
+    manifest: &ReleasedFixtureManifest,
+) -> ReleasedFixtureCoverageGaps {
+    let covered_writers = released_fixture_writer_coverage(manifest)
+        .into_keys()
+        .collect::<BTreeSet<_>>();
+    let covered_schemas = released_fixture_schema_coverage(manifest)
+        .into_keys()
+        .collect::<BTreeSet<_>>();
+    let covered_kinds = manifest
+        .fixtures
+        .iter()
+        .flat_map(|fixture| fixture.covered_event_kinds.iter().cloned())
+        .collect::<BTreeSet<_>>();
+    let covered_records = released_fixture_authoritative_record_coverage(manifest)
+        .into_keys()
+        .collect::<BTreeSet<_>>();
+    let required_records = RELEASED_RECORD_TREATMENTS
+        .iter()
+        .filter(|record| record.treatment == ReleasedRecordTreatment::Preserve)
+        .filter(|record| record.table != "events")
+        .map(|record| record.table.to_owned())
+        .collect::<BTreeSet<_>>();
+    ReleasedFixtureCoverageGaps {
+        writer_epochs: RELEASED_HISTORICAL_WRITER_EPOCHS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .difference(&covered_writers)
+            .copied()
+            .collect(),
+        event_schemas: RELEASED_HISTORICAL_EVENT_SCHEMAS
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>()
+            .difference(&covered_schemas)
+            .copied()
+            .collect(),
+        event_kinds: RELEASED_EVENT_VARIANTS
+            .iter()
+            .map(|variant| variant.kind.to_owned())
+            .collect::<BTreeSet<_>>()
+            .difference(&covered_kinds)
+            .cloned()
+            .collect(),
+        authoritative_records: required_records
+            .difference(&covered_records)
+            .cloned()
+            .collect(),
+    }
+}
+
 #[must_use]
 pub fn released_fixture_writer_coverage(
     manifest: &ReleasedFixtureManifest,
@@ -829,7 +906,28 @@ pub const RELEASED_MIGRATION_IDS: &[ReleasedMigrationDescriptor] = &[
     },
 ];
 
-/// Historical tables observed in released session/catalog migrations.
+/// Treatment assigned to one retired persisted root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleasedRootTreatment {
+    /// Relocate an unambiguous session atomically into canonical storage.
+    RelocateToCanonical,
+}
+
+/// One historical persisted root and its mandatory treatment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReleasedRootDescriptor {
+    /// Root path relative to the state directory.
+    pub path: &'static str,
+    /// Migration treatment for sessions discovered under the root.
+    pub treatment: ReleasedRootTreatment,
+}
+
+/// Historical persisted roots observed in released storage layouts.
+pub const RELEASED_HISTORICAL_ROOTS: &[ReleasedRootDescriptor] = &[ReleasedRootDescriptor {
+    path: "session-storage/writer-epoch-2",
+    treatment: ReleasedRootTreatment::RelocateToCanonical,
+}];
+
 pub const RELEASED_PERSISTED_TABLES: &[&str] = &[
     "artifact_references",
     "composer_drafts",
@@ -967,7 +1065,27 @@ mod tests {
             .filter(|variant| variant.treatment == ReleasedEventTreatment::RetiredKnown)
             .map(|variant| variant.kind)
             .collect::<Vec<_>>();
-        assert_eq!(retired, ["tool_invocation_stream"]);
+        assert_eq!(
+            retired,
+            ["tool_invocation_stream"],
+            "every inventoried retired variant must be an explicit reviewed decision"
+        );
+    }
+
+    #[test]
+    fn released_historical_root_inventory_is_sorted_unique_and_exact() {
+        assert!(
+            RELEASED_HISTORICAL_ROOTS
+                .windows(2)
+                .all(|pair| pair[0].path < pair[1].path)
+        );
+        assert_eq!(
+            RELEASED_HISTORICAL_ROOTS,
+            [ReleasedRootDescriptor {
+                path: "session-storage/writer-epoch-2",
+                treatment: ReleasedRootTreatment::RelocateToCanonical,
+            }]
+        );
     }
 
     #[test]
@@ -1023,6 +1141,13 @@ mod tests {
             released_fixture_authoritative_record_coverage(&manifest).get("session_drafts"),
             Some(&1)
         );
+        let gaps = released_fixture_coverage_gaps(&manifest);
+        assert_eq!(gaps.writer_epochs, BTreeSet::from([1, 3, 4]));
+        assert!(!gaps.event_schemas.contains(&28));
+        assert!(gaps.event_schemas.contains(&27));
+        assert!(gaps.event_kinds.contains("assistant_message"));
+        assert!(gaps.authoritative_records.is_empty());
+        assert!(!gaps.is_empty());
     }
 
     #[test]
