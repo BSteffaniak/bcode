@@ -142,10 +142,8 @@ extern "C" fn service_cancellation_wait_callback(
     if user_data.is_null() {
         return false;
     }
-    let state = unsafe { &*user_data.cast::<ServiceCallbackState<'_>>() };
-    state
-        .cancellation
-        .wait_cancelled(Duration::from_millis(timeout_ms))
+    let cancellation = unsafe { &*user_data.cast::<bcode_plugin_sdk::ServiceCancellation>() };
+    cancellation.wait_cancelled(Duration::from_millis(timeout_ms))
 }
 
 /// Plugin manifest loaded from `bcode-plugin.toml`.
@@ -929,6 +927,7 @@ impl LoadedPlugin {
             cancellation: cancellation.clone(),
         };
         let event_user_data = (&raw mut callback_state).cast::<std::ffi::c_void>();
+        let cancellation_user_data = std::ptr::from_ref(cancellation).cast_mut().cast();
         let status = self.invoke_service_raw(
             input.as_ptr(),
             input.len(),
@@ -940,7 +939,7 @@ impl LoadedPlugin {
             Some(service_bridge_callback),
             event_user_data,
             Some(service_cancellation_wait_callback),
-            event_user_data,
+            cancellation_user_data,
         );
         if output_len > output_capacity {
             return Err(PluginLoadError::ServiceResponseTooLarge {
@@ -4070,6 +4069,7 @@ fn default_event_symbol() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static BLOCKED_BRIDGE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     use bcode_plugin_sdk::{SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_OK};
     use semver::Version;
     use std::path::PathBuf;
@@ -4964,12 +4964,16 @@ library = "libexample_plugin.dylib"
     }
 
     fn assert_blocked_plugin_bridge_wakes_on_cancellation(plugin: LoadedPlugin) {
+        let _blocked_bridge_guard = BLOCKED_BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let plugin = Arc::new(plugin);
         let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
         let task_plugin = Arc::clone(&plugin);
         let task_cancellation = cancellation.clone();
         let started = Arc::new(AtomicBool::new(false));
         let task_started = Arc::clone(&started);
+        let (woke_tx, woke_rx) = std::sync::mpsc::sync_channel(1);
         let task = std::thread::spawn(move || {
             task_plugin.invoke_service_with_bridge(
                 "example-hello/v1",
@@ -4979,6 +4983,7 @@ library = "libexample_plugin.dylib"
                 |_, callback_cancellation| {
                     task_started.store(true, Ordering::SeqCst);
                     if callback_cancellation.wait_cancelled(Duration::from_secs(5)) {
+                        let _ = woke_tx.send(());
                         Err("cancelled".to_string())
                     } else {
                         panic!("ABI bridge callback did not wake on cancellation")
@@ -4996,14 +5001,15 @@ library = "libexample_plugin.dylib"
             std::thread::yield_now();
         }
 
-        let cancel_started = Instant::now();
         cancellation.cancel();
+        woke_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("ABI bridge callback did not wake promptly on cancellation");
         let response = task
             .join()
             .expect("bridge invocation thread should join")
             .expect("bridge invocation should return a plugin response");
 
-        assert!(cancel_started.elapsed() < Duration::from_secs(1));
         assert_eq!(
             response.error.as_ref().map(|error| error.code.as_str()),
             Some("bridge_failed")
@@ -5181,6 +5187,9 @@ library = "libexample_plugin.dylib"
 
     #[test]
     fn blocked_static_bridge_call_wakes_on_cancellation() {
+        let _blocked_bridge_guard = BLOCKED_BRIDGE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let plugin = Arc::new(LoadedPlugin {
             config: ResolvedPluginConfig::default(),
             manifest: test_manifest("bridge"),

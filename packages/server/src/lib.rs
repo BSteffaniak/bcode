@@ -23127,6 +23127,7 @@ fn default_session_artifact_dir(session_id: SessionId) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static WORKFLOW_RUNTIME_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     #[allow(clippy::wildcard_imports)]
     use crate::context_compaction::*;
     use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent};
@@ -25064,9 +25065,25 @@ library = "test"
         state: &ServerState,
         session_id: SessionId,
         trigger: &SessionEvent,
-        runtime_context: ClientRuntimeContext,
+        mut runtime_context: ClientRuntimeContext,
         steering: String,
     ) -> ModelTurnCompletion {
+        let signal = session_id.to_string();
+        runtime_context
+            .provider_context
+            .settings
+            .insert("fake_compaction_summary_signal".to_owned(), signal.clone());
+        state
+            .session_model_selections
+            .lock()
+            .await
+            .entry(session_id)
+            .and_modify(|selection| {
+                selection
+                    .provider_context
+                    .settings
+                    .insert("fake_compaction_summary_signal".to_owned(), signal.clone());
+            });
         let mut permit = SessionTurnPermit::new(session_id);
         let (_followup_tx, mut followup_rx) = mpsc::channel(1);
         let (steering_tx, mut steering_rx) = mpsc::channel(1);
@@ -25080,7 +25097,7 @@ library = "test"
             Arc::new(Mutex::new(None)),
         );
         let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
-        bcode_fake_provider_plugin::reset_fake_compaction_started();
+        bcode_fake_provider_plugin::reset_fake_compaction_summary_signal(&signal);
         let turn = run_model_turn(
             state,
             &mut permit,
@@ -25092,7 +25109,7 @@ library = "test"
             None,
         );
         let append_steering = async {
-            while !bcode_fake_provider_plugin::fake_compaction_summary_started() {
+            while !bcode_fake_provider_plugin::fake_compaction_summary_signal_started(&signal) {
                 tokio::task::yield_now().await;
             }
             steering_tx
@@ -34764,6 +34781,7 @@ library = "test"
     #[tokio::test]
     #[allow(clippy::too_many_lines, clippy::items_after_statements)]
     async fn parallel_agent_branches_recover_independently_without_duplicate_turns() {
+        let _workflow_runtime_guard = WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
         let session_root = tempfile::tempdir().expect("session root");
         let workflow_root = tempfile::tempdir().expect("workflow root");
         let sessions = SessionManager::persistent_lazy(session_root.path());
@@ -36587,6 +36605,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn active_workflow_agent_cancellation_reaches_turn_and_durable_attempt() {
+        let _workflow_runtime_guard = WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
         let sessions = SessionManager::default();
         let parent = sessions
             .create_session(Some("workflow-parent".to_string()), PathBuf::from("."))
@@ -39035,6 +39054,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             AutomaticCompactionStrategy::ProviderManaged
         );
 
+        let _fake_compaction_guard = bcode_fake_provider_plugin::fake_compaction_test_guard().await;
         bcode_fake_provider_plugin::reset_fake_compaction_started();
         let completion = run_model_turn(
             &state,
@@ -39735,6 +39755,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ..SessionModelSelection::default()
         };
         let cancel_state = TurnCancelState::default();
+        let _fake_compaction_guard = bcode_fake_provider_plugin::fake_compaction_test_guard().await;
         bcode_fake_provider_plugin::reset_fake_compaction_started();
 
         let compaction = compact_session_context_with_limit(
@@ -39813,6 +39834,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             ..SessionModelSelection::default()
         };
         let cancel_state = TurnCancelState::default();
+        let _fake_compaction_guard = bcode_fake_provider_plugin::fake_compaction_test_guard().await;
         bcode_fake_provider_plugin::reset_fake_compaction_started();
 
         let compaction = compact_session_context_with_limit(
@@ -40082,6 +40104,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             &queued_followups,
             Arc::new(Mutex::new(None)),
         );
+        let _fake_compaction_guard = bcode_fake_provider_plugin::fake_compaction_test_guard().await;
         bcode_fake_provider_plugin::reset_fake_compaction_started();
 
         let compaction = maybe_auto_compact_session_context(
@@ -40172,6 +40195,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             diagnostic_context: Box::default(),
             sources: Box::default(),
         };
+        let _fake_compaction_guard = bcode_fake_provider_plugin::fake_compaction_test_guard().await;
         bcode_fake_provider_plugin::reset_fake_compaction_started();
 
         let compaction = compact_session_after_context_overflow(

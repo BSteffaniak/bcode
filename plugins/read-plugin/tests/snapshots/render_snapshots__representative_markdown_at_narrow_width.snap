@@ -3,20 +3,21 @@ source: plugins/read-plugin/tests/render_snapshots.rs
 expression: "render(r#\"# Narrow\n\nA paragraph with **strong text**, *emphasis*, [a link](https://example.com), `inline code`, and Unicode 🦀 café.\n\n> quoted words wrap safely\n\n- [x] complete\n- [ ] pending\n\n| Column one | Column two |\n| --- | --- |\n| a long value | another long value |\n\n```rust\nlet answer = 42;\n```\"#,\n24,)"
 ---
 00 │ Narrow
-01 │ 
-02 │ A paragraph with strong 
-03 │ text, emphasis, a link, 
+01 │
+02 │ A paragraph with strong
+03 │ text, emphasis, a link,
 04 │ inline code, and Unicode
 05 │  🦀 café.
-06 │ │ quoted words wrap safe
-07 │ │ ly
-08 │ 
-09 │ •  ☑ complete
-10 │ •  ☐ pending
-11 │ 
-12 │ Column one: a long value
-13 │ Column two: another long value
-14 │ 
-15 │ ┌─ rust
-16 │ │ let answer = 42;
-17 │ └─
+06 │
+07 │ │ quoted words wrap safe
+08 │ │ ly
+09 │
+10 │ •  ☑ complete
+11 │ •  ☐ pending
+12 │
+13 │ Column one: a long value
+14 │ Column two: another long value
+15 │
+16 │ ┌─ rust
+17 │ │ let answer = 42;
+18 │ └─

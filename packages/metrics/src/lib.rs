@@ -607,6 +607,7 @@ struct MetricsEventWriter {
     sender: mpsc::SyncSender<MetricsWriterCommand>,
     dropped_events: AtomicU64,
     failed: Arc<AtomicBool>,
+    shutdown: AtomicBool,
 }
 
 static METRICS_EVENT_WRITERS: OnceLock<Mutex<BTreeMap<PathBuf, Arc<MetricsEventWriter>>>> =
@@ -1545,6 +1546,7 @@ impl MetricsEventLog {
             sender,
             dropped_events: AtomicU64::new(0),
             failed,
+            shutdown: AtomicBool::new(false),
         });
         writers.insert(normalized_root.clone(), Arc::clone(&writer));
         let writer_root = normalized_root.clone();
@@ -1606,11 +1608,12 @@ impl MetricsEventLog {
     fn append_event(&self, event: &MetricEvent) {
         // Preserve already accepted telemetry under pressure: reject the newest event rather than
         // blocking the caller or displacing an event whose persistence was previously promised.
-        if self
-            .writer
-            .sender
-            .try_send(MetricsWriterCommand::Event(event.clone()))
-            .is_err()
+        if self.writer.shutdown.load(Ordering::Acquire)
+            || self
+                .writer
+                .sender
+                .try_send(MetricsWriterCommand::Event(event.clone()))
+                .is_err()
         {
             self.writer.dropped_events.fetch_add(1, Ordering::Relaxed);
         }
@@ -1633,6 +1636,7 @@ impl MetricsEventLog {
     }
 
     fn shutdown(&self) -> MetricsPersistenceStatus {
+        self.writer.shutdown.store(true, Ordering::Release);
         let writers = METRICS_EVENT_WRITERS.get_or_init(|| Mutex::new(BTreeMap::new()));
         let mut writers = writers
             .lock()
@@ -2863,6 +2867,7 @@ mod tests {
                 sender,
                 dropped_events: AtomicU64::new(0),
                 failed: Arc::new(AtomicBool::new(false)),
+                shutdown: AtomicBool::new(false),
             }),
         };
 

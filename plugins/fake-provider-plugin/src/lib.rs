@@ -20,13 +20,24 @@ use bcode_model::{
 use bcode_plugin_sdk::prelude::*;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 static FAKE_COMPACTION_STARTED: AtomicBool = AtomicBool::new(false);
 static FAKE_COMPACTION_SUMMARY_STARTED: AtomicBool = AtomicBool::new(false);
+#[cfg(feature = "static-bundled")]
+static FAKE_COMPACTION_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+static FAKE_COMPACTION_SUMMARY_SIGNALS: LazyLock<Mutex<BTreeSet<String>>> =
+    LazyLock::new(|| Mutex::new(BTreeSet::new()));
 static FAKE_MANAGED_COMPACTION_EMITTED: AtomicBool = AtomicBool::new(false);
 static FAKE_LAST_PARALLEL_TOOL_POLICY: AtomicBool = AtomicBool::new(false);
+
+/// Acquire exclusive access to process-wide fake compaction test signals.
+#[cfg(feature = "static-bundled")]
+pub async fn fake_compaction_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    FAKE_COMPACTION_TEST_LOCK.lock().await
+}
 
 /// Reset the provider-compaction start signal used by static runtime tests.
 #[cfg(feature = "static-bundled")]
@@ -35,6 +46,25 @@ pub fn reset_fake_compaction_started() {
     FAKE_COMPACTION_SUMMARY_STARTED.store(false, Ordering::Release);
     FAKE_MANAGED_COMPACTION_EMITTED.store(false, Ordering::Release);
     FAKE_LAST_PARALLEL_TOOL_POLICY.store(false, Ordering::Release);
+}
+
+/// Reset the compaction-summary signal for one test-owned key.
+#[cfg(feature = "static-bundled")]
+pub fn reset_fake_compaction_summary_signal(key: &str) {
+    FAKE_COMPACTION_SUMMARY_SIGNALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(key);
+}
+
+/// Return whether a keyed fake compaction-summary model turn has started.
+#[cfg(feature = "static-bundled")]
+#[must_use]
+pub fn fake_compaction_summary_signal_started(key: &str) -> bool {
+    FAKE_COMPACTION_SUMMARY_SIGNALS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(key)
 }
 
 /// Return the last provider-visible parallel tool-call policy observed by the fake adapter.
@@ -260,7 +290,7 @@ impl FakeProviderPlugin {
             .get("bcode_request_kind")
             .is_some_and(|kind| kind == "compaction");
         if is_compaction_request {
-            FAKE_COMPACTION_SUMMARY_STARTED.store(true, Ordering::Release);
+            mark_fake_compaction_summary_started(&request);
         }
         let mut state = self
             .state
@@ -1184,6 +1214,20 @@ fn last_tool_result(messages: &[ModelMessage]) -> Option<String> {
             _ => None,
         })
     })
+}
+
+fn mark_fake_compaction_summary_started(request: &ModelTurnRequest) {
+    FAKE_COMPACTION_SUMMARY_STARTED.store(true, Ordering::Release);
+    if let Some(key) = request
+        .provider_context
+        .settings
+        .get("fake_compaction_summary_signal")
+    {
+        FAKE_COMPACTION_SUMMARY_SIGNALS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone());
+    }
 }
 
 fn fake_context_format() -> ProviderContextFormat {

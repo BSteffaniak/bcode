@@ -10,7 +10,9 @@ fn render(markdown: &str, width: u16) -> String {
                 .iter()
                 .map(|span| span.content.as_str())
                 .collect::<String>();
-            format!("{index:02} │ {content}")
+            let content = content.trim_end();
+            let separator = if content.is_empty() { "" } else { " " };
+            format!("{index:02} │{separator}{content}")
         })
         .collect::<Vec<_>>()
         .join("\n")

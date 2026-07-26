@@ -2197,16 +2197,20 @@ fn visual_adapter_fixture(schema: &str) -> serde_json::Value {
             "command": "cargo test",
             "cwd": "/tmp/fixture"
         }),
-        "bcode.filesystem.request-draft.write" => serde_json::json!({
-            "preview": r#"{"path":"/tmp/fixture.rs","contents":"fixture"}"#,
-            "argument_bytes": 55,
-            "truncated": false
-        }),
-        "bcode.filesystem.request-draft.edit" => serde_json::json!({
-            "preview": r#"{"path":"/tmp/fixture.rs","old_text":"old","new_text":"new"}"#,
-            "argument_bytes": 72,
-            "truncated": false
-        }),
+        "bcode.filesystem.request-draft.write" => {
+            return serde_json::json!({
+                "preview": r#"{"path":"/tmp/fixture.rs","contents":"fixture"}"#,
+                "argument_bytes": 55,
+                "truncated": false
+            });
+        }
+        "bcode.filesystem.request-draft.edit" => {
+            return serde_json::json!({
+                "preview": r#"{"path":"/tmp/fixture.rs","old_text":"old","new_text":"new"}"#,
+                "argument_bytes": 72,
+                "truncated": false
+            });
+        }
         "bcode.filesystem.change" => serde_json::json!({
             "path": "/tmp/fixture.rs",
             "old_text": "old",

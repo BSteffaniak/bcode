@@ -3,28 +3,29 @@ source: plugins/read-plugin/tests/render_snapshots.rs
 expression: "render(r#\"# Heading\n\nParagraph with **bold**, *emphasis*, ~~strike~~, [link](https://example.com), `inline code`, and Unicode 🦀 café.\n\n> [!NOTE]\n> Blockquote alert.\n\n1. Ordered\n2. List\n\n- Unordered\n- [x] Done\n- [ ] Pending\n\n| Wide heading | Other heading |\n| --- | --- |\n| value | another value |\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```\n\n[malformed](<\"#,\n80,)"
 ---
 00 │ Heading
-01 │ 
+01 │
 02 │ Paragraph with bold, emphasis, strike, link, inline code, and Unicode 🦀 café.
-03 │ │ ⓘ NOTE
-04 │ │  Blockquote alert.
-05 │ 
-06 │ 1.  Ordered
-07 │ 2.  List
-08 │ 
-09 │ •  Unordered
-10 │ •  ☑ Done
-11 │ •  ☐ Pending
-12 │ 
-13 │ ┌──────────────┬───────────────┐
-14 │ │ Wide heading │ Other heading │
-15 │ ├──────────────┼───────────────┤
-16 │ │ value        │ another value │
-17 │ └──────────────┴───────────────┘
-18 │ 
-19 │ ┌─ rust
-20 │ │ fn main() {
-21 │ │     println!("hello");
-22 │ │ }
-23 │ └─
-24 │ 
-25 │ [malformed](<
+03 │
+04 │ │ ⓘ NOTE
+05 │ │  Blockquote alert.
+06 │
+07 │ 1.  Ordered
+08 │ 2.  List
+09 │
+10 │ •  Unordered
+11 │ •  ☑ Done
+12 │ •  ☐ Pending
+13 │
+14 │ ┌──────────────┬───────────────┐
+15 │ │ Wide heading │ Other heading │
+16 │ ├──────────────┼───────────────┤
+17 │ │ value        │ another value │
+18 │ └──────────────┴───────────────┘
+19 │
+20 │ ┌─ rust
+21 │ │ fn main() {
+22 │ │     println!("hello");
+23 │ │ }
+24 │ └─
+25 │
+26 │ [malformed](<

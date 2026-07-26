@@ -1706,6 +1706,7 @@ impl AgentRuntime {
         if !options.parallel {
             request.tool_call_policy.parallel = Some(false);
         }
+        request.tool_call_policy.parallel.get_or_insert(false);
         let negotiated_parallel_policy = request.tool_call_policy.parallel;
         let mut rounds = ToolRoundState::new(request.max_tool_rounds);
         let turn_cancellation = request.cancellation.clone();
