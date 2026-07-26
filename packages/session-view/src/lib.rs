@@ -4327,6 +4327,89 @@ mod tests {
     }
 
     #[test]
+    fn failure_with_and_without_typed_result_has_one_authoritative_result_slot() {
+        for typed_result in [false, true] {
+            let session_id = SessionId::new();
+            let mut view = SessionView::new();
+            view.apply_event(&event(
+                session_id,
+                1,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-1".to_owned(),
+                    producer_plugin_id: Some("example.plugin".to_owned()),
+                    tool_name: "example.tool".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                },
+            ));
+            view.apply_live_event(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::ToolRequestDraft {
+                    event: bcode_session_models::ToolRequestDraftEvent {
+                        turn_id: "turn-1".to_owned(),
+                        tool_call_id: "call-1".to_owned(),
+                        tool_name: "example.tool".to_owned(),
+                        producer_plugin_id: Some("example.plugin".to_owned()),
+                        schema: "example.request-draft".to_owned(),
+                        schema_version: 1,
+                        placement: bcode_session_models::ToolContributionPlacement::Result,
+                        generation: 1,
+                        revision: 1,
+                        operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                            start_offset: 0,
+                            text: "preview".to_owned(),
+                        },
+                        argument_bytes: 7,
+                        truncated: false,
+                    },
+                },
+            });
+            view.apply_event(&event(
+                session_id,
+                2,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "failed".to_owned(),
+                        is_error: true,
+                        result: typed_result.then(|| ToolInvocationResult::Text {
+                            text: "typed failure".to_owned(),
+                        }),
+                    },
+                },
+            ));
+
+            let result_id = TranscriptViewItemId::tool_presentation_slot(
+                "call-1",
+                bcode_session_models::ToolContributionPlacement::Result,
+                None,
+            );
+            let result_items = view
+                .snapshot()
+                .transcript
+                .items
+                .iter()
+                .filter(|item| item.id == result_id)
+                .collect::<Vec<_>>();
+            assert_eq!(result_items.len(), 1);
+            let TranscriptViewItemKind::ToolInvocation { tool } = &result_items[0].kind else {
+                panic!("failure must replace the preview with a tool result");
+            };
+            assert!(matches!(
+                tool.status,
+                ToolInvocationViewStatus::Finished | ToolInvocationViewStatus::Failed
+            ));
+            assert_eq!(tool.is_error, Some(true));
+            assert_eq!(
+                tool.result,
+                typed_result.then(|| ToolResultView::Text {
+                    text: "typed failure".to_owned(),
+                })
+            );
+        }
+    }
+
+    #[test]
     fn generic_lifecycle_projection_tracks_only_active_invocations_and_rejects_revival() {
         let session_id = SessionId::new();
         let lifecycle = |sequence, stage| {

@@ -26989,6 +26989,65 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn every_pre_result_terminal_reason_clears_active_request_draft_registry() {
+        let state = test_server_state(SessionManager::default());
+        let session_id = SessionId::new();
+        for (index, reason) in [
+            bcode_session_models::ToolRequestDraftTerminalReason::Cancelled,
+            bcode_session_models::ToolRequestDraftTerminalReason::Invalid,
+            bcode_session_models::ToolRequestDraftTerminalReason::Superseded,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let call_id = format!("call-terminal-{index}");
+            let mut progress = ModelStreamProgress::default();
+            progress.start_tool_call(
+                call_id.clone(),
+                "filesystem.write".to_owned(),
+                Some("bcode.filesystem".to_owned()),
+            );
+            progress.record_tool_call_delta(&call_id, "{\"path\":\"partial");
+            let checkpoint = progress
+                .take_tool_request_draft_event("turn-terminal", &call_id)
+                .expect("terminal draft checkpoint");
+            publish_tool_request_draft_live(&state, session_id, checkpoint).await;
+            assert_eq!(
+                active_tool_request_draft_snapshot_events(&state, session_id).len(),
+                1
+            );
+
+            finish_all_tool_request_drafts(
+                &state,
+                session_id,
+                "turn-terminal",
+                &mut progress,
+                reason,
+            )
+            .await;
+
+            assert!(active_tool_request_draft_snapshot_events(&state, session_id).is_empty());
+            assert!(
+                progress
+                    .tool_request_draft_checkpoints("turn-terminal")
+                    .is_empty()
+            );
+            let registry = state
+                .active_tool_request_drafts
+                .lock()
+                .expect("request draft registry");
+            assert!(
+                registry
+                    .drafts
+                    .keys()
+                    .all(|key| key.session() != session_id)
+            );
+            assert!(!registry.session_bytes.contains_key(&session_id));
+            drop(registry);
+        }
+    }
+
+    #[tokio::test]
     async fn request_draft_cancellation_emits_remove_and_clears_checkpoint() {
         let sessions = SessionManager::default();
         let session_id = sessions
