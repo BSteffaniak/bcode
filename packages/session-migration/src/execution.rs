@@ -231,6 +231,16 @@ fn decode_for_migration(
 ) -> Result<HistoricalDecode, HistoricalSessionEventError> {
     let current = decode_current(payload);
     let envelope = serde_json::from_str::<HistoricalEnvelope>(payload)?;
+    if envelope.schema_version() == crate::CURRENT_EVENT_SCHEMA {
+        return match current {
+            Ok(event) => Ok(HistoricalDecode::Current(event)),
+            Err(reason) => Err(HistoricalSessionEventError::InvalidEvent {
+                schema_version: envelope.schema_version(),
+                event_kind: envelope.source_kind_name()?.to_owned(),
+                reason,
+            }),
+        };
+    }
     if !crate::is_released_historical_event_schema(envelope.schema_version()) {
         return Err(HistoricalSessionEventError::UnsupportedSchema {
             schema_version: envelope.schema_version(),
@@ -265,15 +275,10 @@ fn decode_for_migration(
     }
     match current {
         Ok(event) => Ok(HistoricalDecode::Current(event)),
-        Err(reason) if crate::is_released_historical_event_schema(envelope.schema_version()) => {
-            Err(HistoricalSessionEventError::InvalidEvent {
-                schema_version: envelope.schema_version(),
-                event_kind: envelope.source_kind_name()?.to_owned(),
-                reason,
-            })
-        }
-        Err(_) => Err(HistoricalSessionEventError::UnsupportedSchema {
+        Err(reason) => Err(HistoricalSessionEventError::InvalidEvent {
             schema_version: envelope.schema_version(),
+            event_kind: envelope.source_kind_name()?.to_owned(),
+            reason,
         }),
     }
 }
@@ -802,11 +807,22 @@ mod tests {
     #[test]
     fn historical_codec_only_applies_family_rules_to_released_schema_ranges() {
         let payload = format!(
+            r#"{{"schema_version":41,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"tool_call_finished":{{"tool_call_id":"call","result":"done"}}}}}}"#
+        );
+        assert!(matches!(
+            decode_for_migration(&payload, reject_current),
+            Err(HistoricalSessionEventError::UnsupportedSchema { schema_version: 41 })
+        ));
+
+        let payload = format!(
             r#"{{"schema_version":40,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"tool_call_finished":{{"tool_call_id":"call","result":"done"}}}}}}"#
         );
         assert!(matches!(
             decode_for_migration(&payload, reject_current),
-            Err(HistoricalSessionEventError::UnsupportedSchema { schema_version: 40 })
+            Err(HistoricalSessionEventError::InvalidEvent {
+                schema_version: 40,
+                ..
+            })
         ));
 
         let payload = format!(
@@ -830,6 +846,50 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn strict_current_payload_bypasses_historical_inventory() {
+        let payload = format!(
+            r#"{{"schema_version":40,"sequence":1,"timestamp_ms":2,"session_id":"{SESSION_ID}","kind":{{"assistant_message":{{"text":"current"}}}}}}"#
+        );
+        assert!(matches!(
+            decode_for_migration(&payload, |payload| {
+                serde_json::from_str(payload).map_err(|error| error.to_string())
+            }),
+            Ok(HistoricalDecode::Current(SessionEvent {
+                schema_version: 40,
+                sequence: 1,
+                kind: SessionEventKind::AssistantMessage { ref text },
+                ..
+            })) if text == "current"
+        ));
+    }
+
+    #[test]
+    fn every_current_equivalent_pair_requires_strict_current_compatibility() {
+        for descriptor in crate::RELEASED_EVENT_VARIANTS.iter().filter(|descriptor| {
+            descriptor.treatment == crate::ReleasedEventTreatment::CurrentEquivalent
+        }) {
+            for schema_version in crate::RELEASED_HISTORICAL_EVENT_SCHEMAS
+                .iter()
+                .copied()
+                .filter(|schema_version| descriptor.supports_schema(*schema_version))
+            {
+                let payload = format!(
+                    r#"{{"schema_version":{schema_version},"sequence":1,"session_id":"{SESSION_ID}","kind":{{"{}":{{}}}}}}"#,
+                    descriptor.kind
+                );
+                assert!(matches!(
+                    decode_for_migration(&payload, reject_current),
+                    Err(HistoricalSessionEventError::InvalidEvent {
+                        schema_version: actual,
+                        ref event_kind,
+                        ..
+                    }) if actual == schema_version && event_kind == descriptor.kind
+                ));
+            }
+        }
     }
 
     #[test]
