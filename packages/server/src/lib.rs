@@ -2493,6 +2493,33 @@ async fn recover_abandoned_session_runtime_work(
     Ok(())
 }
 
+fn workflow_store_error_response(error: &WorkflowStoreError) -> ErrorResponse {
+    match error {
+        WorkflowStoreError::RunNotFound { .. } => {
+            ErrorResponse::new("workflow_run_not_found", error.to_string())
+        }
+        WorkflowStoreError::InvalidRunTransition { .. } => {
+            ErrorResponse::new("workflow_invalid_transition", error.to_string())
+        }
+        WorkflowStoreError::CancellationPreventsControl => {
+            ErrorResponse::new("workflow_cancellation_prevents_control", error.to_string())
+        }
+        WorkflowStoreError::Database(_)
+        | WorkflowStoreError::Io(_)
+        | WorkflowStoreError::Serialization(_)
+        | WorkflowStoreError::InvalidData(_) => {
+            ErrorResponse::new("workflow_unavailable", error.to_string())
+        }
+    }
+}
+
+fn request_error_response(error: &ServerError) -> ErrorResponse {
+    match error {
+        ServerError::WorkflowStore(error) => workflow_store_error_response(error),
+        _ => ErrorResponse::new("request_failed", error.to_string()),
+    }
+}
+
 async fn handle_client(stream: LocalIpcStream, state: Arc<ServerState>) -> Result<(), ServerError> {
     let client_id = ClientId::new();
     state.register_client(client_id).await;
@@ -2531,7 +2558,7 @@ async fn handle_registered_client(
         }
 
         let request = decode_request(&envelope.payload)?;
-        Box::pin(handle_request(
+        let result = Box::pin(handle_request(
             request,
             envelope.request_id,
             client_id,
@@ -2539,7 +2566,23 @@ async fn handle_registered_client(
             &writer,
             &mut attached_session,
         ))
-        .await?;
+        .await;
+        if let Err(error) = result {
+            if matches!(error, ServerError::Transport(_) | ServerError::Codec(_)) {
+                return Err(error);
+            }
+            tracing::warn!(
+                request_id = envelope.request_id,
+                %error,
+                "client request failed"
+            );
+            send_response(
+                &writer,
+                envelope.request_id,
+                Response::Err(request_error_response(&error)),
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -38066,6 +38109,125 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     } if started == &work_id
                 ))
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn completed_workflow_resume_returns_error_and_keeps_ipc_connection_open() {
+        let sessions = SessionManager::default();
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("workflow store");
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "boolean".to_string(),
+            schema: serde_json::json!({"type": "boolean"}),
+        };
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: 1,
+            name: "completed-control".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([(
+                "wait".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "wait".to_string(),
+                    name: "wait".to_string(),
+                    kind: bcode_workflow::NodeKind::Input,
+                    input: schema.clone(),
+                    output: schema,
+                    resources: Vec::new(),
+                    configuration: serde_json::json!({}),
+                },
+            )]),
+            entries: vec!["wait".to_string()],
+            exits: vec!["wait".to_string()],
+            edges: Vec::new(),
+        };
+        store
+            .persist_definition("completed-control", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "completed-control-run".to_string(),
+                definition_id: "completed-control".to_string(),
+                definition_version: 1,
+                workspace_snapshot: ".".to_string(),
+                parent_session_id: None,
+                binding: None,
+                input: Some(serde_json::json!(false)),
+                created_at_ms: 1,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let activation = store
+            .waiting_activations("completed-control-run", 1)
+            .expect("pending activation")
+            .pop()
+            .expect("entry activation");
+        let result = store
+            .provide_input(
+                "completed-control-run",
+                "wait",
+                &activation.activation_id,
+                serde_json::json!(true),
+                2,
+            )
+            .expect("complete run");
+        assert_eq!(
+            result.run_status,
+            bcode_workflow_store::RunStatus::Completed
+        );
+
+        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+            sessions, store,
+        ));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("client connection");
+            handle_client(stream, server_state)
+                .await
+                .expect("handle client");
+        });
+
+        let mut stream = LocalIpcStream::connect(&endpoint).await.expect("connect");
+        let resume = bcode_ipc::request_envelope(
+            1,
+            &Request::ResumeWorkflowRun {
+                run_id: "completed-control-run".to_string(),
+            },
+        )
+        .expect("resume request");
+        bcode_ipc::send_envelope(&mut stream, &resume)
+            .await
+            .expect("send resume");
+        let response = bcode_ipc::recv_envelope(&mut stream)
+            .await
+            .expect("resume response");
+        let response = bcode_ipc::decode_response(&response.payload).expect("decode response");
+        assert!(matches!(
+            response,
+            Response::Err(ErrorResponse { code, message })
+                if code == "workflow_invalid_transition"
+                    && message.contains("completed to running")
+        ));
+
+        let ping = bcode_ipc::request_envelope(2, &Request::Ping).expect("ping request");
+        bcode_ipc::send_envelope(&mut stream, &ping)
+            .await
+            .expect("send ping");
+        let response = bcode_ipc::recv_envelope(&mut stream)
+            .await
+            .expect("ping response");
+        assert!(matches!(
+            bcode_ipc::decode_response(&response.payload).expect("decode ping"),
+            Response::Ok(ResponsePayload::Pong)
+        ));
+        drop(stream);
+        server.await.expect("server task");
     }
 
     #[tokio::test]

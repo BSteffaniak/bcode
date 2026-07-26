@@ -38,6 +38,12 @@ pub enum RunStatus {
     RepairRequired,
 }
 
+impl std::fmt::Display for RunStatus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 impl RunStatus {
     const fn as_str(self) -> &'static str {
         match self {
@@ -732,6 +738,18 @@ pub enum WorkflowStoreError {
     /// Definition serialization failed.
     #[error("workflow definition serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
+    /// The requested workflow run does not exist.
+    #[error("workflow run not found: {run_id}")]
+    RunNotFound { run_id: String },
+    /// A lifecycle control action is invalid for the run's current state.
+    #[error("workflow run cannot transition from {current} to {target}")]
+    InvalidRunTransition {
+        current: RunStatus,
+        target: RunStatus,
+    },
+    /// A durable cancellation request prevents further lifecycle changes.
+    #[error("workflow cancellation prevents run state changes")]
+    CancellationPreventsControl,
     /// Persisted data violated the storage contract.
     #[error("invalid workflow store data: {0}")]
     InvalidData(String),
@@ -2938,9 +2956,9 @@ impl WorkflowStore {
             .optional()?
             .is_none()
         {
-            return Err(WorkflowStoreError::InvalidData(format!(
-                "workflow run not found: {run_id}"
-            )));
+            return Err(WorkflowStoreError::RunNotFound {
+                run_id: run_id.to_string(),
+            });
         }
         transaction.commit()?;
         Ok(changed == 1)
@@ -4740,22 +4758,21 @@ fn transition_run_control_state(
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?)),
         )
         .optional()?
-        .ok_or_else(|| WorkflowStoreError::InvalidData(format!("workflow run not found: {run_id}")))?;
+        .ok_or_else(|| WorkflowStoreError::RunNotFound {
+            run_id: run_id.to_string(),
+        })?;
     let status = parse_run_status(&status)?;
     if cancellation_requested {
-        return Err(WorkflowStoreError::InvalidData(
-            "workflow cancellation prevents run state changes".to_string(),
-        ));
+        return Err(WorkflowStoreError::CancellationPreventsControl);
     }
     if status == target {
         return Ok(false);
     }
     if status != expected {
-        return Err(WorkflowStoreError::InvalidData(format!(
-            "workflow run cannot transition from {} to {}",
-            status.as_str(),
-            target.as_str()
-        )));
+        return Err(WorkflowStoreError::InvalidRunTransition {
+            current: status,
+            target,
+        });
     }
     transaction.execute(
         "UPDATE workflow_runs SET status = ?2, updated_at_ms = ?3 WHERE run_id = ?1",
@@ -6211,6 +6228,41 @@ mod tests {
                 .status,
             RunStatus::RepairRequired
         );
+    }
+
+    #[test]
+    fn terminal_run_rejects_resume_with_typed_transition_error() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET status = 'completed' WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("complete run");
+
+        let error = store
+            .resume_run("run-1", 20)
+            .expect_err("completed run must not resume");
+        assert!(matches!(
+            error,
+            WorkflowStoreError::InvalidRunTransition {
+                current: RunStatus::Completed,
+                target: RunStatus::Running,
+            }
+        ));
+    }
+
+    #[test]
+    fn missing_run_control_uses_typed_not_found_error() {
+        let (_temp, mut store) = initialized_store();
+        let error = store
+            .pause_run("missing-run", 20)
+            .expect_err("missing run must fail");
+        assert!(matches!(
+            error,
+            WorkflowStoreError::RunNotFound { run_id } if run_id == "missing-run"
+        ));
     }
 
     #[test]

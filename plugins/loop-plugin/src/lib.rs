@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use bcode_client::BcodeClient;
+use bcode_client::{BcodeClient, ClientError};
 use bcode_command::{
     COMMAND_INTERFACE_ID, CommandAction, CommandContribution, CommandEffect, CommandOwner,
     CommandSurface, InvokeCommandRequest, InvokeCommandResponse, OP_INVOKE_COMMAND,
@@ -123,26 +123,56 @@ fn workflow_binding_key(session_id: SessionId) -> bcode_ipc::WorkflowRunBindingL
     }
 }
 
+#[derive(Debug)]
+enum LoopIpcError {
+    Client(ClientError),
+    Worker(String),
+}
+
+impl std::fmt::Display for LoopIpcError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client(error) => error.fmt(formatter),
+            Self::Worker(error) => formatter.write_str(error),
+        }
+    }
+}
+
 fn associated_workflow_run(
     session_id: SessionId,
-) -> Result<Option<bcode_workflow_store::WorkflowRunSummary>, String> {
+) -> Result<Option<bcode_workflow_store::WorkflowRunSummary>, LoopIpcError> {
     run_async(async move {
         BcodeClient::default_endpoint()
             .associated_workflow_run(workflow_binding_key(session_id))
             .await
-            .map_err(|error| error.to_string())
     })
 }
 
 fn control_associated_workflow_run(
     session_id: SessionId,
     action: bcode_ipc::WorkflowRunControlAction,
-) -> Result<(Option<bcode_workflow_store::WorkflowRunSummary>, bool), String> {
+) -> Result<(Option<bcode_workflow_store::WorkflowRunSummary>, bool), LoopIpcError> {
     run_async(async move {
         BcodeClient::default_endpoint()
             .control_associated_workflow_run(workflow_binding_key(session_id), action)
             .await
-            .map_err(|error| error.to_string())
+    })
+}
+
+fn terminal_workflow_control_message(
+    run: &bcode_workflow_store::WorkflowRunSummary,
+) -> Option<String> {
+    matches!(
+        run.status,
+        bcode_workflow_store::RunStatus::Completed
+            | bcode_workflow_store::RunStatus::Failed
+            | bcode_workflow_store::RunStatus::Cancelled
+    )
+    .then(|| {
+        format!(
+            "loop workflow is already {}; start a new loop to run it again",
+            format!("{:?}", run.status).to_ascii_lowercase()
+        )
     })
 }
 
@@ -191,6 +221,19 @@ fn control_loop(
             status_response(unsupported_legacy_message())
         }
         Ok((None, _)) => status_response("no loop found for this session"),
+        Err(LoopIpcError::Client(ClientError::Server { code, .. }))
+            if code == "workflow_invalid_transition" =>
+        {
+            match associated_workflow_run(session_id) {
+                Ok(Some(run)) => terminal_workflow_control_message(&run).map_or_else(
+                    || status_response(&format_workflow_status(&run)),
+                    |message| status_response(&message),
+                ),
+                Ok(None) => status_response("no loop found for this session"),
+                Err(error) => status_response(&format!("workflow lifecycle unavailable: {error}")),
+            }
+        }
+        Err(LoopIpcError::Client(ClientError::Server { message, .. })) => status_response(&message),
         Err(error) => status_response(&format!("workflow lifecycle unavailable: {error}")),
     }
 }
@@ -295,20 +338,21 @@ fn status_response(message: &str) -> InvokeCommandResponse {
     }
 }
 
-fn run_async<F, T>(future: F) -> Result<T, String>
+fn run_async<F, T>(future: F) -> Result<T, LoopIpcError>
 where
-    F: std::future::Future<Output = Result<T, String>> + Send + 'static,
+    F: std::future::Future<Output = Result<T, ClientError>> + Send + 'static,
     T: Send + 'static,
 {
     std::thread::spawn(move || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|error| error.to_string())?
+            .map_err(|error| LoopIpcError::Worker(error.to_string()))?
             .block_on(future)
+            .map_err(LoopIpcError::Client)
     })
     .join()
-    .map_err(|_| "loop plugin async worker panicked".to_string())?
+    .map_err(|_| LoopIpcError::Worker("loop plugin async worker panicked".to_string()))?
 }
 
 fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
@@ -941,6 +985,27 @@ mod tests {
                 ))
             })
         }
+    }
+
+    #[test]
+    fn terminal_workflow_control_message_explains_completed_runs() {
+        let run = bcode_workflow_store::WorkflowRunSummary {
+            run_id: "completed-loop".to_string(),
+            definition_id: "loop".to_string(),
+            definition_version: 1,
+            workspace_snapshot: ".".to_string(),
+            parent_session_id: None,
+            binding: None,
+            status: bcode_workflow_store::RunStatus::Completed,
+            cancellation_requested_at_ms: None,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+        };
+
+        assert_eq!(
+            terminal_workflow_control_message(&run).as_deref(),
+            Some("loop workflow is already completed; start a new loop to run it again")
+        );
     }
 
     #[test]

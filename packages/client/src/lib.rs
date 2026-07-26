@@ -2794,22 +2794,7 @@ impl BcodeClient {
     }
 
     async fn send_request(&self, request: Request) -> Result<ResponsePayload, ClientError> {
-        let mut last_error = None;
-        for _ in 0..3 {
-            match self.send_request_once(request.clone()).await {
-                Ok(response) => return Ok(response),
-                Err(error)
-                    if self.daemon_availability == DaemonAvailability::AutoStart
-                        && error.is_daemon_unavailable() =>
-                {
-                    last_error = Some(error);
-                    self.ensure_daemon_available().await?;
-                    tokio::time::sleep(CLIENT_DAEMON_RETRY_DELAY).await;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        Err(last_error.unwrap_or(ClientError::UnexpectedResponse))
+        self.send_request_once(request).await
     }
 
     async fn send_request_once(&self, request: Request) -> Result<ResponsePayload, ClientError> {
@@ -3834,6 +3819,52 @@ mod client_timeout_tests {
             next_request.is_ok_and(|request| request.is_err()),
             "observer sent another wait request after receiver drop"
         );
+        std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn application_request_is_not_replayed_after_response_eof() {
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bcd-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("single-send.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+        let daemon = matching_daemon_status();
+        let accepted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let server_accepted = std::sync::Arc::clone(&accepted);
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept client");
+            server_accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let hello = bcode_ipc::recv_envelope(&mut stream).await.expect("hello");
+            let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                protocol_version: bcode_ipc::ProtocolVersion(bcode_ipc::CURRENT_PROTOCOL_VERSION),
+                client_id: bcode_session_models::ClientId::new(),
+                daemon,
+            });
+            let envelope =
+                bcode_ipc::response_envelope(hello.request_id, &response).expect("hello response");
+            bcode_ipc::send_envelope(&mut stream, &envelope)
+                .await
+                .expect("send hello");
+            let request = bcode_ipc::recv_envelope(&mut stream)
+                .await
+                .expect("application request");
+            assert!(matches!(
+                bcode_ipc::decode_request(&request.payload).expect("decode request"),
+                bcode_ipc::Request::Ping
+            ));
+            drop(stream);
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+
+        let client = BcodeClient::new(endpoint)
+            .with_daemon_availability(super::DaemonAvailability::AutoStart)
+            .with_request_timeout(Duration::from_secs(1));
+        let error = client.ping().await.expect_err("response EOF must fail");
+        assert!(matches!(error, ClientError::Codec(_)));
+        server.await.expect("server task");
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
         std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
     }
 
