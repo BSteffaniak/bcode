@@ -4318,6 +4318,152 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One table-driven fixture covers cancellation at each invocation boundary.
+    fn cancellation_before_request_during_permission_and_during_execution_is_terminal() {
+        for cancellation_point in ["before-request", "permission", "execution"] {
+            let session_id = SessionId::new();
+            let mut view = SessionView::new();
+            let result_id = TranscriptViewItemId::tool_presentation_slot(
+                "call-cancel",
+                bcode_session_models::ToolContributionPlacement::Result,
+                None,
+            );
+            view.apply_live_event(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::ToolRequestDraft {
+                    event: bcode_session_models::ToolRequestDraftEvent {
+                        turn_id: "turn-1".to_owned(),
+                        tool_call_id: "call-cancel".to_owned(),
+                        tool_name: "filesystem.write".to_owned(),
+                        producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                        schema: "bcode.filesystem.request-draft.write".to_owned(),
+                        schema_version: 1,
+                        placement: bcode_session_models::ToolContributionPlacement::Result,
+                        generation: 1,
+                        revision: 1,
+                        operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                            start_offset: 0,
+                            text: "preview".to_owned(),
+                        },
+                        argument_bytes: 7,
+                        truncated: false,
+                    },
+                },
+            });
+            if cancellation_point != "before-request" {
+                view.apply_event(&event(
+                    session_id,
+                    1,
+                    SessionEventKind::ToolCallRequested {
+                        tool_call_id: "call-cancel".to_owned(),
+                        producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                        tool_name: "filesystem.write".to_owned(),
+                        arguments_json: "{}".to_owned(),
+                        working_directory: None,
+                    },
+                ));
+            }
+            if cancellation_point == "permission" {
+                view.apply_event(&event(
+                    session_id,
+                    2,
+                    SessionEventKind::PermissionRequested {
+                        permission_id: "permission-cancel".to_owned(),
+                        tool_call_id: "call-cancel".to_owned(),
+                        producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                        tool_name: "filesystem.write".to_owned(),
+                        arguments_json: "{}".to_owned(),
+                        batch: None,
+                        policy_source: None,
+                        policy_reason: Some("approval required".to_owned()),
+                    },
+                ));
+            } else if cancellation_point == "execution" {
+                view.apply_event(&event(
+                    session_id,
+                    2,
+                    SessionEventKind::ToolInvocationLifecycle {
+                        event: bcode_session_models::ToolInvocationLifecycleEvent {
+                            invocation_id: "call-cancel".to_owned(),
+                            sequence: 2,
+                            stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+                            message: None,
+                            metadata: serde_json::Value::Null,
+                        },
+                    },
+                ));
+            }
+            view.apply_event(&event(
+                session_id,
+                3,
+                SessionEventKind::ToolInvocationLifecycle {
+                    event: bcode_session_models::ToolInvocationLifecycleEvent {
+                        invocation_id: "call-cancel".to_owned(),
+                        sequence: 3,
+                        stage: bcode_session_models::ToolInvocationLifecycleStage::Cancelled,
+                        message: Some(format!("cancelled at {cancellation_point}")),
+                        metadata: serde_json::Value::Null,
+                    },
+                },
+            ));
+            view.apply_live_event(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::ToolRequestDraft {
+                    event: bcode_session_models::ToolRequestDraftEvent {
+                        turn_id: "turn-1".to_owned(),
+                        tool_call_id: "call-cancel".to_owned(),
+                        tool_name: "filesystem.write".to_owned(),
+                        producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                        schema: "bcode.filesystem.request-draft.write".to_owned(),
+                        schema_version: 1,
+                        placement: bcode_session_models::ToolContributionPlacement::Result,
+                        generation: 1,
+                        revision: u64::MAX,
+                        operation: bcode_session_models::ToolRequestDraftOperation::Remove {
+                            reason: bcode_session_models::ToolRequestDraftTerminalReason::Cancelled,
+                        },
+                        argument_bytes: 7,
+                        truncated: false,
+                    },
+                },
+            });
+
+            if cancellation_point == "before-request" {
+                assert_eq!(
+                    view.snapshot()
+                        .transcript
+                        .items
+                        .iter()
+                        .filter(|item| item.id == result_id)
+                        .count(),
+                    0
+                );
+                assert!(!view.snapshot().tools.contains_key("call-cancel"));
+            } else {
+                let result_items = view
+                    .snapshot()
+                    .transcript
+                    .items
+                    .iter()
+                    .filter(|item| item.id == result_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(result_items.len(), 1, "{cancellation_point}");
+                assert!(matches!(
+                    &result_items[0].kind,
+                    TranscriptViewItemKind::ToolInvocation { tool }
+                        if tool.status == ToolInvocationViewStatus::Cancelled
+                ));
+            }
+            assert!(
+                !view
+                    .snapshot()
+                    .active_invocations
+                    .contains_key("call-cancel")
+            );
+        }
+    }
+
+    #[test]
     fn reconnect_replay_reconstructs_cancelled_tool_without_duplicate_lifecycle_state() {
         let session_id = SessionId::new();
         let events = [
