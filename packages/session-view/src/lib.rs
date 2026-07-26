@@ -3341,6 +3341,124 @@ mod tests {
     }
 
     #[test]
+    fn newer_generation_replaces_preview_and_older_generation_cannot_revive() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let draft = |generation, revision, text: &str| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: format!("turn-{generation}"),
+                    tool_call_id: "call-write".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Result,
+                    generation,
+                    revision,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: text.to_owned(),
+                    },
+                    argument_bytes: text.len(),
+                    truncated: false,
+                },
+            },
+        };
+
+        view.apply_live_event(&draft(1, 8, "old preview"));
+        view.apply_live_event(&draft(2, 1, "replacement preview"));
+        view.apply_live_event(&draft(1, 9, "revived old preview"));
+
+        let projected = view
+            .tool_request_drafts
+            .get("call-write")
+            .expect("current request draft");
+        assert_eq!(projected.generation, 2);
+        assert_eq!(projected.revision, 1);
+        assert_eq!(projected.preview, "replacement preview");
+        let slot_id = TranscriptViewItemId::tool_presentation_slot(
+            "call-write",
+            bcode_session_models::ToolContributionPlacement::Result,
+            None,
+        );
+        assert!(matches!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .find(|item| item.id == slot_id)
+                .map(|item| &item.kind),
+            Some(TranscriptViewItemKind::ToolRequestDraft { draft })
+                if draft.generation == 2 && draft.preview == "replacement preview"
+        ));
+    }
+
+    #[test]
+    fn interleaved_request_drafts_remain_isolated() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let draft = |tool_call_id: &str, revision, offset, text: &str| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: tool_call_id.to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Result,
+                    generation: 1,
+                    revision,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Append {
+                        offset,
+                        text: text.to_owned(),
+                    },
+                    argument_bytes: offset.saturating_add(text.len()),
+                    truncated: false,
+                },
+            },
+        };
+
+        view.apply_live_event(&draft("call-a", 1, 0, "alpha"));
+        view.apply_live_event(&draft("call-b", 1, 0, "bravo"));
+        view.apply_live_event(&draft("call-a", 2, 5, " one"));
+        view.apply_live_event(&draft("call-b", 2, 5, " two"));
+
+        assert_eq!(view.tool_request_drafts["call-a"].preview, "alpha one");
+        assert_eq!(view.tool_request_drafts["call-b"].preview, "bravo two");
+        let snapshot = view.snapshot();
+        assert_eq!(
+            snapshot
+                .transcript
+                .items
+                .iter()
+                .filter(|item| matches!(item.kind, TranscriptViewItemKind::ToolRequestDraft { .. }))
+                .count(),
+            2
+        );
+        for (tool_call_id, expected) in [("call-a", "alpha one"), ("call-b", "bravo two")] {
+            let slot_id = TranscriptViewItemId::tool_presentation_slot(
+                tool_call_id,
+                bcode_session_models::ToolContributionPlacement::Result,
+                None,
+            );
+            assert!(matches!(
+                snapshot
+                    .transcript
+                    .items
+                    .iter()
+                    .find(|item| item.id == slot_id)
+                    .map(|item| &item.kind),
+                Some(TranscriptViewItemKind::ToolRequestDraft { draft })
+                    if draft.tool_call_id == tool_call_id && draft.preview == expected
+            ));
+        }
+    }
+
+    #[test]
     fn durable_tool_request_reconciles_live_draft_without_duplicate_rows() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
@@ -3490,6 +3608,181 @@ mod tests {
                 matches!(item.kind, TranscriptViewItemKind::ToolRequestDraft { .. })
             })
         );
+    }
+
+    #[test]
+    fn final_result_without_lifecycle_completion_retires_result_draft() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Result,
+                    generation: 1,
+                    revision: 1,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: r#"{"path":"README.md","contents":"new"}"#.to_owned(),
+                    },
+                    argument_bytes: 37,
+                    truncated: false,
+                },
+            },
+        });
+        let slot_id = TranscriptViewItemId::tool_presentation_slot(
+            "call-1",
+            bcode_session_models::ToolContributionPlacement::Result,
+            None,
+        );
+        assert!(matches!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .find(|item| item.id == slot_id)
+                .map(|item| &item.kind),
+            Some(TranscriptViewItemKind::ToolRequestDraft { .. })
+        ));
+
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                tool_name: "filesystem.write".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-1".to_owned(),
+                    model_output: "written".to_owned(),
+                    is_error: false,
+                    result: Some(ToolInvocationResult::Text {
+                        text: "written".to_owned(),
+                    }),
+                },
+            },
+        ));
+
+        let slot_items = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .filter(|item| item.id == slot_id)
+            .collect::<Vec<_>>();
+        assert_eq!(slot_items.len(), 1);
+        assert!(matches!(
+            slot_items[0].kind,
+            TranscriptViewItemKind::ToolInvocation { .. }
+        ));
+        assert!(view.snapshot().active_invocations.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_completion_before_final_result_preserves_preview_until_replacement() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Result,
+                    generation: 1,
+                    revision: 1,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: r#"{"path":"README.md","contents":"new"}"#.to_owned(),
+                    },
+                    argument_bytes: 37,
+                    truncated: false,
+                },
+            },
+        });
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                tool_name: "filesystem.write".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "call-1".to_owned(),
+                    sequence: 1,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Completed,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        ));
+        let slot_id = TranscriptViewItemId::tool_presentation_slot(
+            "call-1",
+            bcode_session_models::ToolContributionPlacement::Result,
+            None,
+        );
+        assert!(matches!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .find(|item| item.id == slot_id)
+                .map(|item| &item.kind),
+            Some(TranscriptViewItemKind::ToolRequestDraft { .. })
+        ));
+
+        view.apply_event(&event(
+            session_id,
+            3,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-1".to_owned(),
+                    model_output: "written".to_owned(),
+                    is_error: false,
+                    result: Some(ToolInvocationResult::Text {
+                        text: "written".to_owned(),
+                    }),
+                },
+            },
+        ));
+        let slot_items = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .filter(|item| item.id == slot_id)
+            .collect::<Vec<_>>();
+        assert_eq!(slot_items.len(), 1);
+        assert!(matches!(
+            slot_items[0].kind,
+            TranscriptViewItemKind::ToolInvocation { .. }
+        ));
     }
 
     #[test]

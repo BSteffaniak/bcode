@@ -11219,7 +11219,6 @@ async fn handle_resolve_permission_batch(
 
 const MODEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MODEL_STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
-const MODEL_STREAM_FLUSH_BYTES: usize = 512;
 const TOOL_ARGUMENTS_DECODE_FAILED_CODE: &str = "tool_arguments_decode_failed";
 const MODEL_NO_PROGRESS_TIMEOUT_CODE: &str = "model_no_progress_timeout";
 const MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION: &str = "The previous model turn emitted malformed JSON for a tool call, so the tool did not run. Reissue the intended tool call with valid JSON arguments. Do not explain unless the user explicitly asked for an explanation.";
@@ -11413,11 +11412,8 @@ impl ModelStreamAccumulator {
     }
 
     fn should_flush(&self) -> bool {
-        self.pending_text
-            .len()
-            .saturating_add(self.pending_legacy_reasoning.len())
-            >= MODEL_STREAM_FLUSH_BYTES
-            || self.last_flush.elapsed() >= MODEL_STREAM_FLUSH_INTERVAL
+        (!self.pending_text.is_empty() || !self.pending_legacy_reasoning.is_empty())
+            && self.last_flush.elapsed() >= MODEL_STREAM_FLUSH_INTERVAL
     }
 
     async fn flush_if_ready(&mut self, state: &ServerState) {
@@ -22414,6 +22410,10 @@ fn forward_session_events(
         tokio::pin!(flush_timer);
         loop {
             tokio::select! {
+                biased;
+                // Prioritize elapsed frame deadlines over a continuously ready live-event stream.
+                // Without this, a provider flood can starve frame publication until the stream
+                // drains, turning the 16 ms window into multi-second visible latency.
                 () = &mut flush_timer, if !pending_live.is_empty() => {
                     if let Err(error) = flush_pending_live_events(&sink, &mut pending_live).await {
                         if !is_expected_disconnect(&error) {
@@ -27773,6 +27773,22 @@ library = "test"
         assert_eq!(taken[0].activity_id, "complete");
         assert_eq!(outcome.reasoning_activities.len(), 1);
         assert!(outcome.reasoning_activities.contains_key("unfinished"));
+    }
+
+    #[test]
+    fn model_stream_flush_is_cadence_driven_not_byte_driven() {
+        let mut stream = ModelStreamAccumulator::new(
+            SessionId::new(),
+            "turn-1",
+            Arc::new(TurnCancelState::default()),
+        );
+        stream.push_text(&"x".repeat(1024 * 1024));
+
+        assert!(!stream.should_flush());
+        stream.last_flush = Instant::now()
+            .checked_sub(MODEL_STREAM_FLUSH_INTERVAL)
+            .expect("flush interval fits monotonic clock");
+        assert!(stream.should_flush());
     }
 
     #[test]
@@ -33788,7 +33804,7 @@ library = "test"
                     revision,
                     bcode_session_models::ToolRequestDraftOperation::Checkpoint {
                         start_offset: 0,
-                        text: format!("latest-{revision}"),
+                        text: format!("{}-{revision}", "x".repeat(8 * 1024)),
                     },
                 ),
             )
@@ -33820,11 +33836,17 @@ library = "test"
                 .unwrap_or_default()
                 > 0
         );
+        let maximum_frame_latency_us = metrics
+            .histograms
+            .get("server.live_state.request_draft_frame_latency_us")
+            .and_then(|histogram| histogram.max)
+            .expect("request draft frame latency metric");
+        // A saturated debug-build loop with large checkpoints may span many 16 ms frames, but
+        // subscriber fan-out must still occur before the reconnect timeout instead of remaining
+        // starved until the entire flood drains. Focused paused-time tests cover exact cadence.
         assert!(
-            metrics
-                .histograms
-                .get("server.live_state.request_draft_frame_latency_us")
-                .is_some_and(|histogram| histogram.count > 0)
+            maximum_frame_latency_us < 10_000_000,
+            "maximum request draft frame latency was {maximum_frame_latency_us} us"
         );
         assert!(
             metrics
@@ -33882,7 +33904,7 @@ library = "test"
                 && matches!(
                     event.operation,
                     bcode_session_models::ToolRequestDraftOperation::Checkpoint { ref text, .. }
-                        if text == "latest-10000"
+                        if text.ends_with("-10000") && text.len() > 8 * 1024
                 )
         ));
         drop(keeper);
