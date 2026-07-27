@@ -4063,6 +4063,9 @@ impl SessionManager {
 
     /// Append a generic terminal invocation result record to a session.
     ///
+    /// Repeating an append for an invocation that already has a terminal result is idempotent: the
+    /// original durable event is returned and no duplicate terminal record is written.
+    ///
     /// # Errors
     ///
     /// Returns an error when the session does not exist or the event cannot be persisted.
@@ -4071,11 +4074,17 @@ impl SessionManager {
         session_id: SessionId,
         record: bcode_session_models::ToolInvocationResultRecord,
     ) -> Result<SessionEvent, SessionError> {
-        self.append_event(
-            session_id,
-            SessionEventKind::ToolInvocationResultRecorded { record },
-        )
-        .await
+        self.ensure_session_loaded(session_id).await?;
+        let handle = self.session_handle(session_id).await?;
+        let activity_timestamp_ms = self.next_activity_timestamp_ms();
+        let event = handle
+            .append_tool_invocation_result(record, activity_timestamp_ms)
+            .await?;
+        let summary = handle.summary().await?;
+        self.release_persistent_idle_session_resources(session_id)
+            .await;
+        self.publish_committed_mutation(event.clone(), summary);
+        Ok(event)
     }
 
     /// Publish a live-only event to currently attached session subscribers.
@@ -6130,6 +6139,108 @@ mod tests {
                 bmux_codec::from_bytes(&bytes).expect("payload should decode");
             assert_eq!(decoded, payload);
         }
+    }
+
+    #[tokio::test]
+    async fn terminal_tool_result_retry_returns_original_event_without_duplicate_history() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("terminal retry".to_owned()), test_working_directory())
+            .await
+            .expect("session should be created");
+        manager
+            .append_tool_call_requested(
+                session.id,
+                AppendToolCallRequestedInput {
+                    tool_call_id: "tool-retry".to_owned(),
+                    tool_name: "fixture.run".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    ..AppendToolCallRequestedInput::default()
+                },
+            )
+            .await
+            .expect("tool request should append");
+        let record = bcode_session_models::ToolInvocationResultRecord {
+            invocation_id: "tool-retry".to_owned(),
+            model_output: "first durable result".to_owned(),
+            is_error: false,
+            presentation: None,
+            result: None,
+        };
+        let first = manager
+            .append_tool_invocation_result(session.id, record)
+            .await
+            .expect("first result should append");
+        let retry = manager
+            .append_tool_invocation_result(
+                session.id,
+                bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "tool-retry".to_owned(),
+                    model_output: "retry must not replace durable result".to_owned(),
+                    is_error: true,
+                    presentation: None,
+                    result: None,
+                },
+            )
+            .await
+            .expect("retry should be idempotent");
+
+        assert_eq!(retry, first);
+        let history = manager
+            .session_history(session.id)
+            .await
+            .expect("history should load");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    SessionEventKind::ToolInvocationResultRecorded { .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::ToolInvocationResultRecorded { record }
+                if record.model_output == "first durable result" && !record.is_error
+        )));
+
+        let memory_manager = SessionManager::default();
+        let memory_session = memory_manager
+            .create_session(Some("memory retry".to_owned()), test_working_directory())
+            .await
+            .expect("memory session");
+        let memory_record = bcode_session_models::ToolInvocationResultRecord {
+            invocation_id: "memory-tool".to_owned(),
+            model_output: "memory result".to_owned(),
+            is_error: false,
+            presentation: None,
+            result: None,
+        };
+        let memory_first = memory_manager
+            .append_tool_invocation_result(memory_session.id, memory_record.clone())
+            .await
+            .expect("memory result");
+        let memory_retry = memory_manager
+            .append_tool_invocation_result(memory_session.id, memory_record)
+            .await
+            .expect("memory retry");
+        assert_eq!(memory_retry, memory_first);
+        assert_eq!(
+            memory_manager
+                .session_history(memory_session.id)
+                .await
+                .expect("memory history")
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    SessionEventKind::ToolInvocationResultRecorded { .. }
+                ))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

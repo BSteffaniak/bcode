@@ -1034,6 +1034,29 @@ impl SessionDb {
         self.tool_runs_by_status("running").await
     }
 
+    /// Return all tool-run projection rows for `tool_call_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the projection query fails or a row is malformed.
+    pub async fn tool_run(&self, tool_call_id: &str) -> SessionDbResult<Option<ToolRun>> {
+        let row = self
+            .db
+            .select("tool_runs")
+            .columns(&[
+                "tool_call_id",
+                "event_seq_start",
+                "event_seq_end",
+                "status",
+                "tool_name",
+                "is_error",
+            ])
+            .where_eq("tool_call_id", tool_call_id.to_owned())
+            .execute_first(&**self.db)
+            .await?;
+        row.as_ref().map(tool_run_from_row).transpose()
+    }
+
     /// Return tool-run projection rows matching `status`.
     ///
     /// # Errors

@@ -162,6 +162,19 @@ impl SessionHandle {
         .await?
     }
 
+    pub async fn append_tool_invocation_result(
+        &self,
+        record: bcode_session_models::ToolInvocationResultRecord,
+        activity_timestamp_ms: u64,
+    ) -> Result<SessionEvent, SessionError> {
+        self.send(|reply| SessionCommand::AppendToolInvocationResult {
+            record,
+            activity_timestamp_ms,
+            reply,
+        })
+        .await?
+    }
+
     pub async fn append_user_message(
         &self,
         client_id: ClientId,
@@ -364,6 +377,11 @@ enum SessionCommand {
         activity_timestamp_ms: u64,
         reply: oneshot::Sender<Result<SessionEvent, SessionError>>,
     },
+    AppendToolInvocationResult {
+        record: bcode_session_models::ToolInvocationResultRecord,
+        activity_timestamp_ms: u64,
+        reply: oneshot::Sender<Result<SessionEvent, SessionError>>,
+    },
     AppendUserMessage {
         client_id: ClientId,
         text: String,
@@ -487,6 +505,16 @@ impl SessionActor {
                         .await,
                 );
             }
+            SessionCommand::AppendToolInvocationResult {
+                record,
+                activity_timestamp_ms,
+                reply,
+            } => {
+                let _ = reply.send(
+                    self.append_tool_invocation_result(record, activity_timestamp_ms)
+                        .await,
+                );
+            }
             SessionCommand::AppendUserMessage {
                 client_id,
                 text,
@@ -523,6 +551,7 @@ impl SessionActor {
     async fn handle_read_command(&mut self, command: SessionCommand) -> bool {
         match command {
             SessionCommand::AppendEvent { .. }
+            | SessionCommand::AppendToolInvocationResult { .. }
             | SessionCommand::AppendUserMessage { .. }
             | SessionCommand::Attach { .. }
             | SessionCommand::SetComposerDraft { .. } => {
@@ -784,6 +813,45 @@ impl SessionActor {
         let state = SessionState::from_db_state(db_state, created_at_ms, updated_at_ms);
         self.replace_persisted_state(state);
         Ok(())
+    }
+
+    async fn append_tool_invocation_result(
+        &mut self,
+        record: bcode_session_models::ToolInvocationResultRecord,
+        activity_timestamp_ms: u64,
+    ) -> Result<SessionEvent, SessionError> {
+        if let Some(db) = self.existing_session_db().await?
+            && let Some(tool_run) = db.tool_run(&record.invocation_id).await?
+            && let Some(event_sequence) = tool_run.event_seq_end
+            && let Some(event) = db
+                .events_range(event_sequence, event_sequence, 1)
+                .await?
+                .pop()
+            && matches!(
+                &event.kind,
+                SessionEventKind::ToolInvocationResultRecorded { record: existing }
+                    if existing.invocation_id == record.invocation_id
+            )
+        {
+            return Ok(event);
+        }
+        if let Some(event) = self.state.events.as_ref().and_then(|events| {
+            events.iter().rev().find(|event| {
+                matches!(
+                    &event.kind,
+                    SessionEventKind::ToolInvocationResultRecorded { record: existing }
+                        if existing.invocation_id == record.invocation_id
+                )
+            })
+        }) {
+            return Ok(event.clone());
+        }
+        self.append_event(
+            SessionEventKind::ToolInvocationResultRecorded { record },
+            None,
+            activity_timestamp_ms,
+        )
+        .await
     }
 
     async fn append_event(
