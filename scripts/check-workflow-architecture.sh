@@ -16,6 +16,30 @@ if rg -n 'workflow\.db|CREATE TABLE.*workflow_(runs|attempts|activations|outputs
 fi
 rm -f /tmp/bcode-workflow-architecture-violations
 
+if ! rg -q 'pub fn production_admission' packages/workflow/src/lib.rs \
+  || ! rg -q 'WorkflowProductionCapabilities::current' packages/server/src/lib.rs \
+  || ! rg -q 'validate_workflow_definition_for_production' packages/server/src/lib.rs; then
+  echo "Workflow admission violation: durable registration/start must use the production capability contract." >&2
+  violations=1
+fi
+
+for required in \
+  'pub const ALL_NODE_KINDS' \
+  'pub const ALL_WORKFLOW_EDGE_KINDS' \
+  'pub const fn node_kind_name' \
+  'pub const fn workflow_edge_kind_name'; do
+  if ! rg -q "$required" packages/workflow/src/lib.rs; then
+    echo "Workflow capability coverage violation: missing exhaustive enum coverage marker: $required" >&2
+    violations=1
+  fi
+done
+
+if ! rg -q 'let node_kinds = BTreeMap::from' packages/workflow/src/lib.rs \
+  || ! rg -q 'let edge_kinds = BTreeMap::from' packages/workflow/src/lib.rs; then
+  echo "Workflow capability coverage violation: current capability maps must explicitly classify node and edge kinds." >&2
+  violations=1
+fi
+
 for required in \
   'pub fn prepare_attempt' \
   'pub fn persist_dispatch_receipt' \

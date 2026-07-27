@@ -179,6 +179,10 @@ pub enum ServerError {
     BlockingTask(#[from] tokio::task::JoinError),
     #[error("workflow store error: {0}")]
     WorkflowStore(#[from] bcode_workflow_store::WorkflowStoreError),
+    #[error("workflow definition is unsupported by this production host: {0}")]
+    WorkflowDefinitionUnsupported(String),
+    #[error("workflow capability is unavailable: {0}")]
+    WorkflowCapabilityUnavailable(String),
     #[error("model catalog error: {0}")]
     ModelCatalog(#[from] bcode_model_catalog::Error),
     #[error("model turn completion channel closed: {0}")]
@@ -2560,6 +2564,12 @@ fn workflow_store_error_response(error: &WorkflowStoreError) -> ErrorResponse {
 fn request_error_response(error: &ServerError) -> ErrorResponse {
     match error {
         ServerError::WorkflowStore(error) => workflow_store_error_response(error),
+        ServerError::WorkflowDefinitionUnsupported(_) => {
+            ErrorResponse::new("workflow_definition_unsupported", error.to_string())
+        }
+        ServerError::WorkflowCapabilityUnavailable(_) => {
+            ErrorResponse::new("workflow_capability_unavailable", error.to_string())
+        }
         _ => ErrorResponse::new("request_failed", error.to_string()),
     }
 }
@@ -10142,17 +10152,86 @@ async fn handle_cancel_session_turn(
     .await
 }
 
+fn validate_workflow_definition_for_production(
+    state: &ServerState,
+    definition: &bcode_workflow::WorkflowDefinition,
+) -> Result<(), ServerError> {
+    let capabilities = bcode_workflow::WorkflowProductionCapabilities::current();
+    let admission = definition
+        .production_admission(&capabilities)
+        .map_err(|error| ServerError::WorkflowDefinitionUnsupported(error.to_string()))?;
+    if !admission.is_supported() {
+        let summary = admission
+            .diagnostics
+            .iter()
+            .map(|diagnostic| {
+                diagnostic.node_id.as_ref().map_or_else(
+                    || format!("{}: {}", diagnostic.code, diagnostic.message),
+                    |node_id| {
+                        format!(
+                            "{} at node '{}': {}",
+                            diagnostic.code, node_id, diagnostic.message
+                        )
+                    },
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ServerError::WorkflowDefinitionUnsupported(summary));
+    }
+    for node in definition.nodes.values() {
+        if node.kind != bcode_workflow::NodeKind::PluginBlock {
+            continue;
+        }
+        let block: bcode_workflow::WorkflowBlockDefinition =
+            serde_json::from_value(node.configuration.clone()).map_err(|error| {
+                ServerError::WorkflowDefinitionUnsupported(format!(
+                    "plugin block node '{}' has invalid configuration: {error}",
+                    node.id
+                ))
+            })?;
+        block.validate().map_err(|error| {
+            ServerError::WorkflowDefinitionUnsupported(format!(
+                "plugin block node '{}' is invalid: {error}",
+                node.id
+            ))
+        })?;
+        let declared = state
+            .plugins
+            .registry()
+            .workflow_blocks()
+            .into_iter()
+            .any(|candidate| candidate == block);
+        if !declared {
+            return Err(ServerError::WorkflowCapabilityUnavailable(format!(
+                "plugin block node '{}' requires unavailable exact contract {}:{} v{} ({})",
+                node.id, block.plugin_id, block.block_id, block.block_version, block.operation
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn register_workflow_definition(
+    state: &ServerState,
+    request: &bcode_ipc::WorkflowDefinitionRegistrationRequest,
+) -> Result<bcode_workflow_store::StoredWorkflowDefinition, ServerError> {
+    validate_workflow_definition_for_production(state, &request.definition)?;
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .persist_definition(&request.definition_id, request.version, &request.definition)
+        .map_err(ServerError::from)
+}
+
 async fn handle_register_workflow_definition(
     request_id: u64,
     state: &ServerState,
     writer: &SharedWriter,
     request: bcode_ipc::WorkflowDefinitionRegistrationRequest,
 ) -> Result<(), ServerError> {
-    let definition = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .persist_definition(&request.definition_id, request.version, &request.definition)?;
+    let definition = register_workflow_definition(state, &request)?;
     send_response(
         writer,
         request_id,
@@ -10165,6 +10244,7 @@ async fn start_workflow(
     state: &Arc<ServerState>,
     request: bcode_ipc::WorkflowStartRequest,
 ) -> Result<bcode_ipc::WorkflowRunStartResponse, ServerError> {
+    validate_workflow_definition_for_production(state, &request.definition)?;
     if request.identity.kind != request.binding.workflow_kind {
         return Err(WorkflowStoreError::InvalidData(
             "workflow logical identity does not match its binding kind".to_string(),
@@ -10249,6 +10329,20 @@ async fn start_workflow_run(
     state: &Arc<ServerState>,
     request: bcode_ipc::WorkflowRunStartRequest,
 ) -> Result<bcode_ipc::WorkflowRunStartResponse, ServerError> {
+    let stored_definition = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .definition(&request.definition_id, request.definition_version)?
+        .ok_or_else(|| {
+            ServerError::WorkflowCapabilityUnavailable(format!(
+                "workflow definition not found: {} v{}",
+                request.definition_id, request.definition_version
+            ))
+        })?;
+    let definition: bcode_workflow::WorkflowDefinition =
+        serde_json::from_str(&stored_definition.definition_json)?;
+    validate_workflow_definition_for_production(state, &definition)?;
     let parent_session = state
         .sessions
         .session_summary(request.parent_session_id)
@@ -36402,6 +36496,441 @@ library = "test"
         server.abort();
     }
 
+    fn registration_state_with_workflow_store(
+        sessions: SessionManager,
+        workflow_store: bcode_workflow_store::WorkflowStore,
+    ) -> ServerState {
+        let mut state = test_server_state(sessions);
+        state.workflow_store = StdMutex::new(workflow_store);
+        state
+    }
+
+    #[test]
+    fn production_workflow_admission_rejects_ownerless_nodes_before_persistence() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(temp.path())
+            .expect("workflow store");
+        let state = registration_state_with_workflow_store(SessionManager::default(), store);
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "u32".to_string(),
+            schema: serde_json::json!({"type": "integer", "minimum": 0}),
+        };
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "ownerless".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([(
+                "task".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "task".to_string(),
+                    name: "task".to_string(),
+                    kind: bcode_workflow::NodeKind::Task,
+                    input: schema.clone(),
+                    output: schema,
+                    resources: Vec::new(),
+                    configuration: serde_json::Value::Null,
+                },
+            )]),
+            entries: vec!["task".to_string()],
+            exits: vec!["task".to_string()],
+            edges: Vec::new(),
+        };
+        let request = bcode_ipc::WorkflowDefinitionRegistrationRequest {
+            definition_id: "ownerless".to_string(),
+            version: 1,
+            definition,
+        };
+        let error = register_workflow_definition(&state, &request)
+            .expect_err("ownerless task must fail production admission");
+        assert!(matches!(
+            error,
+            ServerError::WorkflowDefinitionUnsupported(_)
+        ));
+        assert!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .definition("ownerless", 1)
+                .expect("definition lookup")
+                .is_none()
+        );
+        assert_eq!(
+            request_error_response(&error).code,
+            "workflow_definition_unsupported"
+        );
+    }
+
+    #[test]
+    fn production_workflow_admission_rejects_all_incomplete_constructs_before_persistence() {
+        let cases = [
+            (
+                bcode_workflow::NodeKind::Retry,
+                serde_json::json!({"max_attempts": 2}),
+                "retry-node",
+            ),
+            (
+                bcode_workflow::NodeKind::FanOut,
+                serde_json::json!({"max_concurrency": 2}),
+                "fan-out-node",
+            ),
+        ];
+        for (kind, configuration, definition_id) in cases {
+            let temp = tempfile::tempdir().expect("temp");
+            let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(temp.path())
+                .expect("workflow store");
+            let state = registration_state_with_workflow_store(SessionManager::default(), store);
+            let schema = bcode_workflow::ValueSchema {
+                type_name: "u32".to_string(),
+                schema: serde_json::json!({"type": "integer", "minimum": 0}),
+            };
+            let definition = bcode_workflow::WorkflowDefinition {
+                schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+                name: definition_id.to_string(),
+                input: schema.clone(),
+                output: schema.clone(),
+                nodes: BTreeMap::from([(
+                    "node".to_string(),
+                    bcode_workflow::NodeDefinition {
+                        id: "node".to_string(),
+                        name: "node".to_string(),
+                        kind,
+                        input: schema.clone(),
+                        output: schema,
+                        resources: Vec::new(),
+                        configuration,
+                    },
+                )]),
+                entries: vec!["node".to_string()],
+                exits: vec!["node".to_string()],
+                edges: Vec::new(),
+            };
+            let request = bcode_ipc::WorkflowDefinitionRegistrationRequest {
+                definition_id: definition_id.to_string(),
+                version: 1,
+                definition,
+            };
+            register_workflow_definition(&state, &request)
+                .expect_err("incomplete construct must fail registration");
+            assert!(
+                state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .definition(definition_id, 1)
+                    .expect("definition lookup")
+                    .is_none()
+            );
+        }
+    }
+
+    fn git_workflow_definition(
+        definition_id: &str,
+        block: bcode_workflow::WorkflowBlockDefinition,
+    ) -> bcode_workflow::WorkflowDefinition {
+        bcode_workflow::WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: definition_id.to_string(),
+            input: block.input.clone(),
+            output: block.output.clone(),
+            nodes: BTreeMap::from([(
+                "block".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "block".to_string(),
+                    name: "block".to_string(),
+                    kind: bcode_workflow::NodeKind::PluginBlock,
+                    input: block.input.clone(),
+                    output: block.output.clone(),
+                    resources: block.resources.clone(),
+                    configuration: serde_json::to_value(block).expect("block"),
+                },
+            )]),
+            entries: vec!["block".to_string()],
+            exits: vec!["block".to_string()],
+            edges: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn production_workflow_admission_accepts_exact_enabled_block_and_rejects_mismatches() {
+        let manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/git-plugin/bcode-plugin.toml"
+        ))
+        .expect("Git manifest");
+        let block = manifest
+            .services
+            .iter()
+            .flat_map(|service| &service.workflow_blocks)
+            .find(|block| block.block_id == "git.commit")
+            .expect("git.commit block")
+            .clone();
+        for case in ["version", "schema", "timeout"] {
+            let temp = tempfile::tempdir().expect("temp");
+            let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(temp.path())
+                .expect("workflow store");
+            let state =
+                test_server_state_with_git_and_workflow_store(SessionManager::default(), store);
+            let exact_id = format!("git-exact-{case}");
+            let exact = bcode_ipc::WorkflowDefinitionRegistrationRequest {
+                definition_id: exact_id.clone(),
+                version: 1,
+                definition: git_workflow_definition(&exact_id, block.clone()),
+            };
+            register_workflow_definition(&state, &exact).expect("exact enabled block");
+            assert!(
+                state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .definition(&exact_id, 1)
+                    .expect("definition lookup")
+                    .is_some()
+            );
+
+            let mismatch_id = format!("git-mismatch-{case}");
+            let mut mismatch = block.clone();
+            match case {
+                "version" => mismatch.block_version += 1,
+                "schema" => mismatch.input.type_name.push_str(".mismatch"),
+                "timeout" => mismatch.timeout_ms = mismatch.timeout_ms.saturating_add(1),
+                _ => unreachable!(),
+            }
+            let request = bcode_ipc::WorkflowDefinitionRegistrationRequest {
+                definition_id: mismatch_id.clone(),
+                version: 1,
+                definition: git_workflow_definition(&mismatch_id, mismatch),
+            };
+            let error = register_workflow_definition(&state, &request)
+                .expect_err("mismatched enabled block contract");
+            assert!(matches!(
+                error,
+                ServerError::WorkflowCapabilityUnavailable(_)
+            ));
+            assert!(
+                state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .definition(&mismatch_id, 1)
+                    .expect("definition lookup")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn production_workflow_registration_rejects_unsupported_edges_policies_and_agent_versions() {
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "u32".to_string(),
+            schema: serde_json::json!({"type": "integer", "minimum": 0}),
+        };
+        let node = |id: &str, kind, configuration| bcode_workflow::NodeDefinition {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind,
+            input: schema.clone(),
+            output: schema.clone(),
+            resources: Vec::new(),
+            configuration,
+        };
+        let retry_edge = bcode_workflow::WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "retry-edge".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([
+                (
+                    "first".to_string(),
+                    node(
+                        "first",
+                        bcode_workflow::NodeKind::Input,
+                        serde_json::json!({"gate_version": 1}),
+                    ),
+                ),
+                (
+                    "second".to_string(),
+                    node(
+                        "second",
+                        bcode_workflow::NodeKind::Input,
+                        serde_json::json!({"gate_version": 1}),
+                    ),
+                ),
+            ]),
+            entries: vec!["first".to_string()],
+            exits: vec!["second".to_string()],
+            edges: vec![bcode_workflow::EdgeDefinition {
+                from: "first".to_string(),
+                to: "second".to_string(),
+                kind: bcode_workflow::EdgeKind::Retry { max_attempts: 2 },
+            }],
+        };
+        let fail_fast = bcode_workflow::WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "fail-fast".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([(
+                "parallel".to_string(),
+                node(
+                    "parallel",
+                    bcode_workflow::NodeKind::Parallel,
+                    serde_json::json!({
+                        "failure_policy": "fail_fast",
+                        "left_exits": [],
+                        "right_exits": []
+                    }),
+                ),
+            )]),
+            entries: vec!["parallel".to_string()],
+            exits: vec!["parallel".to_string()],
+            edges: Vec::new(),
+        };
+        let invalid_agent = bcode_workflow::WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "invalid-agent".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([(
+                "agent".to_string(),
+                node(
+                    "agent",
+                    bcode_workflow::NodeKind::Agent,
+                    serde_json::json!({
+                        "configuration_version": 2,
+                        "prompt_mode": "custom"
+                    }),
+                ),
+            )]),
+            entries: vec!["agent".to_string()],
+            exits: vec!["agent".to_string()],
+            edges: Vec::new(),
+        };
+        for (definition_id, definition) in [
+            ("retry-edge", retry_edge),
+            ("fail-fast", fail_fast),
+            ("invalid-agent", invalid_agent),
+        ] {
+            let temp = tempfile::tempdir().expect("temp");
+            let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(temp.path())
+                .expect("workflow store");
+            let state = registration_state_with_workflow_store(SessionManager::default(), store);
+            let request = bcode_ipc::WorkflowDefinitionRegistrationRequest {
+                definition_id: definition_id.to_string(),
+                version: 1,
+                definition,
+            };
+            register_workflow_definition(&state, &request)
+                .expect_err("unsupported production construct must fail registration");
+            assert!(
+                state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .definition(definition_id, 1)
+                    .expect("definition lookup")
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn production_workflow_admission_requires_exact_enabled_block_contract() {
+        let temp = tempfile::tempdir().expect("temp");
+        let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(temp.path())
+            .expect("workflow store");
+        let state = registration_state_with_workflow_store(SessionManager::default(), store);
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "u32".to_string(),
+            schema: serde_json::json!({"type": "integer", "minimum": 0}),
+        };
+        let block = bcode_workflow::WorkflowBlockDefinition {
+            block_id: "missing.block".to_string(),
+            block_version: 1,
+            plugin_id: "bcode.missing".to_string(),
+            operation: "missing.block".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            effect: bcode_workflow::WorkflowBlockEffect::ReadOnly,
+            resources: Vec::new(),
+            authorization: bcode_workflow::WorkflowBlockAuthorization {
+                capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
+                explicit_grant_required: false,
+            },
+            timeout_ms: 1_000,
+            cancellation_supported: true,
+            reconciliation: bcode_workflow::WorkflowBlockReconciliation::IdempotentReplay,
+        };
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "missing-block".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([(
+                "block".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "block".to_string(),
+                    name: "block".to_string(),
+                    kind: bcode_workflow::NodeKind::PluginBlock,
+                    input: schema.clone(),
+                    output: schema,
+                    resources: Vec::new(),
+                    configuration: serde_json::to_value(block).expect("block"),
+                },
+            )]),
+            entries: vec!["block".to_string()],
+            exits: vec!["block".to_string()],
+            edges: Vec::new(),
+        };
+        let request = bcode_ipc::WorkflowDefinitionRegistrationRequest {
+            definition_id: "missing-block".to_string(),
+            version: 1,
+            definition,
+        };
+        let error = register_workflow_definition(&state, &request)
+            .expect_err("missing block owner must fail admission");
+        assert!(matches!(
+            error,
+            ServerError::WorkflowCapabilityUnavailable(_)
+        ));
+        assert!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .definition("missing-block", 1)
+                .expect("definition lookup")
+                .is_none()
+        );
+        let mut mismatched = request;
+        mismatched
+            .definition
+            .nodes
+            .get_mut("block")
+            .expect("block node")
+            .configuration["timeout_ms"] = serde_json::json!(2_000);
+        let mismatch_error = register_workflow_definition(&state, &mismatched)
+            .expect_err("mismatched block contract must fail admission");
+        assert!(matches!(
+            mismatch_error,
+            ServerError::WorkflowCapabilityUnavailable(_)
+        ));
+        assert!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .definition("missing-block", 1)
+                .expect("definition lookup")
+                .is_none()
+        );
+        assert_eq!(
+            request_error_response(&error).code,
+            "workflow_capability_unavailable"
+        );
+    }
+
     fn test_server_state_with_code_review_and_workflow_store(
         sessions: SessionManager,
         workflow_store: bcode_workflow_store::WorkflowStore,
@@ -39706,7 +40235,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let state = Arc::new(test_server_state(sessions));
         let workflow = bcode_workflow::WorkflowBuilder::new(
             "bound-start",
-            bcode_workflow::Step::task("node", |value: u32, _context| async move { Ok(value) }),
+            bcode_workflow::Step::<u32, u32>::input("node"),
         )
         .build()
         .expect("workflow");
@@ -39790,7 +40319,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let state = Arc::new(test_server_state(sessions));
         let definition = bcode_workflow::WorkflowBuilder::new(
             "stable-start",
-            bcode_workflow::Step::task("node", |value: u32, _context| async move { Ok(value) }),
+            bcode_workflow::Step::<u32, u32>::input("node"),
         )
         .build()
         .expect("workflow")

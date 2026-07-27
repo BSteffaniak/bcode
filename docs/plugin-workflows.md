@@ -1,6 +1,18 @@
 # Plugin-authored durable workflows
 
-Use typed workflow composition for domain behavior and let the host own durable registration, execution, discovery, and lifecycle state.
+The host validates every compiled definition against [`WorkflowProductionCapabilities`] before
+persistence or start. This production contract is intentionally narrower than the in-process SDK
+surface. The current production host accepts `Agent`, `Branch`, `Repeat`, wait-all `Parallel`,
+`PluginBlock`, `Input`, and `Approval`. Closure-backed `Task` is explicitly in-process-only;
+`Retry`, `FanOut`, retry edges, fail-fast parallel joins, and transforms are rejected until their
+complete durable implementations ship.
+
+Registration and start both rerun production admission. Plugin block nodes must resolve to one
+byte-equivalent enabled manifest declaration, so a definition cannot be persisted or started with
+an ownerless or stale block contract.
+
+Use typed workflow composition for domain behavior and let the host own durable registration,
+execution, discovery, and lifecycle state.
 
 ```rust
 let workflow = WorkflowBuilder::new(

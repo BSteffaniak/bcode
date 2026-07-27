@@ -35,6 +35,15 @@ const DEFAULT_MAX_CONCURRENCY: usize = Semaphore::MAX_PERMITS;
 /// Stable workflow definition schema version.
 pub const WORKFLOW_DEFINITION_SCHEMA_VERSION: u32 = 1;
 
+/// Stable durable-production capability contract version.
+pub const WORKFLOW_PRODUCTION_CAPABILITY_VERSION: u32 = 1;
+
+/// Stable deterministic predicate contract version.
+pub const WORKFLOW_PREDICATE_VERSION: u32 = 1;
+
+/// Stable plugin workflow-block interface version.
+pub const WORKFLOW_BLOCK_INTERFACE_VERSION: u32 = 1;
+
 /// Error returned while compiling or running a workflow.
 #[derive(Debug, Error)]
 pub enum WorkflowError {
@@ -1369,7 +1378,9 @@ impl ResourceClaim {
 }
 
 /// Execution target for a daemon-hosted workflow agent node.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentExecutionTarget {
     /// Execute in a fresh isolated child session.
@@ -1401,7 +1412,7 @@ pub struct NodeDefinition {
 }
 
 /// Generic workflow node kind.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeKind {
     /// Application-supplied typed Rust operation.
@@ -1426,6 +1437,198 @@ pub enum NodeKind {
     Approval,
 }
 
+/// Every public serialized node kind, used to enforce exhaustive production capability coverage.
+pub const ALL_NODE_KINDS: [NodeKind; 10] = [
+    NodeKind::Task,
+    NodeKind::Agent,
+    NodeKind::Branch,
+    NodeKind::Repeat,
+    NodeKind::Retry,
+    NodeKind::Parallel,
+    NodeKind::FanOut,
+    NodeKind::PluginBlock,
+    NodeKind::Input,
+    NodeKind::Approval,
+];
+
+/// Every public serialized edge kind, used to enforce exhaustive production capability coverage.
+pub const ALL_WORKFLOW_EDGE_KINDS: [WorkflowEdgeKind; 4] = [
+    WorkflowEdgeKind::Direct,
+    WorkflowEdgeKind::Conditional,
+    WorkflowEdgeKind::Back,
+    WorkflowEdgeKind::Retry,
+];
+
+/// Return the stable serialized name for a node kind.
+///
+/// This exhaustive match intentionally makes enum growth fail compilation until production
+/// capability coverage is reviewed.
+#[must_use]
+pub const fn node_kind_name(kind: NodeKind) -> &'static str {
+    match kind {
+        NodeKind::Task => "task",
+        NodeKind::Agent => "agent",
+        NodeKind::Branch => "branch",
+        NodeKind::Repeat => "repeat",
+        NodeKind::Retry => "retry",
+        NodeKind::Parallel => "parallel",
+        NodeKind::FanOut => "fan_out",
+        NodeKind::PluginBlock => "plugin_block",
+        NodeKind::Input => "input",
+        NodeKind::Approval => "approval",
+    }
+}
+
+/// Durable support level for one serialized workflow construct.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowCapabilitySupport {
+    /// The production host implements and owns this construct.
+    Supported,
+    /// The construct is available only to the lean in-process SDK.
+    InProcessOnly,
+    /// The serialized contract is reserved until production behavior is complete.
+    Unsupported,
+}
+
+/// Exact versioned capability set accepted by the durable production host.
+///
+/// The lean in-process SDK intentionally supports additional closure-backed and ephemeral
+/// constructs. Durable registration must validate against this contract before persistence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowProductionCapabilities {
+    /// Capability contract version.
+    pub capability_version: u32,
+    /// Compiled workflow definition schema version.
+    pub definition_schema_version: u32,
+    /// Deterministic predicate contract version.
+    pub predicate_version: u32,
+    /// Durable declarative transform contract version, when implemented.
+    pub transform_version: Option<u32>,
+    /// Durable automatic retry policy version, when implemented.
+    pub automatic_retry_policy_version: Option<u32>,
+    /// Durable agent configuration contract version.
+    pub agent_configuration_version: u32,
+    /// Plugin workflow-block interface version.
+    pub workflow_block_interface_version: u32,
+    /// Durable support classification for every public node kind.
+    pub node_kinds: BTreeMap<NodeKind, WorkflowCapabilitySupport>,
+    /// Durable support classification for every serialized edge kind.
+    pub edge_kinds: BTreeMap<WorkflowEdgeKind, WorkflowCapabilitySupport>,
+    /// Supported two-branch join policies.
+    pub parallel_join_policies: BTreeSet<ParallelFailurePolicy>,
+    /// Durable support classification for automatic retry scheduling.
+    pub automatic_retry: WorkflowCapabilitySupport,
+    /// Durable support classification for homogeneous fan-out.
+    pub fan_out: WorkflowCapabilitySupport,
+    /// Durable support classification for declarative transforms.
+    pub transforms: WorkflowCapabilitySupport,
+    /// Durable support classification for opaque artifact references.
+    pub artifact_references: WorkflowCapabilitySupport,
+    /// Supported durable agent execution targets.
+    pub agent_execution_targets: BTreeSet<AgentExecutionTarget>,
+}
+
+impl WorkflowProductionCapabilities {
+    /// Return the exact capability set currently implemented by the production daemon.
+    #[must_use]
+    pub fn current() -> Self {
+        let node_kinds = BTreeMap::from([
+            (NodeKind::Task, WorkflowCapabilitySupport::InProcessOnly),
+            (NodeKind::Agent, WorkflowCapabilitySupport::Supported),
+            (NodeKind::Branch, WorkflowCapabilitySupport::Supported),
+            (NodeKind::Repeat, WorkflowCapabilitySupport::Supported),
+            (NodeKind::Retry, WorkflowCapabilitySupport::Unsupported),
+            (NodeKind::Parallel, WorkflowCapabilitySupport::Supported),
+            (NodeKind::FanOut, WorkflowCapabilitySupport::Unsupported),
+            (NodeKind::PluginBlock, WorkflowCapabilitySupport::Supported),
+            (NodeKind::Input, WorkflowCapabilitySupport::Supported),
+            (NodeKind::Approval, WorkflowCapabilitySupport::Supported),
+        ]);
+        let edge_kinds = BTreeMap::from([
+            (
+                WorkflowEdgeKind::Direct,
+                WorkflowCapabilitySupport::Supported,
+            ),
+            (
+                WorkflowEdgeKind::Conditional,
+                WorkflowCapabilitySupport::Supported,
+            ),
+            (WorkflowEdgeKind::Back, WorkflowCapabilitySupport::Supported),
+            (
+                WorkflowEdgeKind::Retry,
+                WorkflowCapabilitySupport::Unsupported,
+            ),
+        ]);
+        Self {
+            capability_version: WORKFLOW_PRODUCTION_CAPABILITY_VERSION,
+            definition_schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            predicate_version: WORKFLOW_PREDICATE_VERSION,
+            transform_version: None,
+            automatic_retry_policy_version: None,
+            agent_configuration_version: 1,
+            workflow_block_interface_version: WORKFLOW_BLOCK_INTERFACE_VERSION,
+            node_kinds,
+            edge_kinds,
+            parallel_join_policies: BTreeSet::from([ParallelFailurePolicy::WaitAll]),
+            automatic_retry: WorkflowCapabilitySupport::Unsupported,
+            fan_out: WorkflowCapabilitySupport::Unsupported,
+            transforms: WorkflowCapabilitySupport::Unsupported,
+            artifact_references: WorkflowCapabilitySupport::Supported,
+            agent_execution_targets: BTreeSet::from([
+                AgentExecutionTarget::FreshIsolated,
+                AgentExecutionTarget::SharedParentSequential,
+            ]),
+        }
+    }
+
+    /// Return the durable support classification for a node kind.
+    #[must_use]
+    pub fn node_support(&self, kind: NodeKind) -> WorkflowCapabilitySupport {
+        self.node_kinds
+            .get(&kind)
+            .copied()
+            .unwrap_or(WorkflowCapabilitySupport::Unsupported)
+    }
+    /// Return the durable support classification for an edge kind.
+    #[must_use]
+    pub fn edge_support(&self, kind: WorkflowEdgeKind) -> WorkflowCapabilitySupport {
+        self.edge_kinds
+            .get(&kind)
+            .copied()
+            .unwrap_or(WorkflowCapabilitySupport::Unsupported)
+    }
+}
+
+/// One stable production-admission diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowCapabilityDiagnostic {
+    /// Machine-readable diagnostic code.
+    pub code: String,
+    /// Node associated with the diagnostic, when applicable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// Human-readable explanation.
+    pub message: String,
+}
+
+/// Result of validating a definition against durable production capabilities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowProductionAdmission {
+    /// Capability contract used for validation.
+    pub capabilities: WorkflowProductionCapabilities,
+    /// Stable diagnostics in deterministic definition order.
+    pub diagnostics: Vec<WorkflowCapabilityDiagnostic>,
+}
+
+impl WorkflowProductionAdmission {
+    /// Return whether the definition is fully supported by the production host.
+    #[must_use]
+    pub const fn is_supported(&self) -> bool {
+        self.diagnostics.is_empty()
+    }
+}
+
 /// Serializable directed workflow edge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgeDefinition {
@@ -1436,6 +1639,34 @@ pub struct EdgeDefinition {
     /// Control-flow behavior for this edge.
     #[serde(default)]
     pub kind: EdgeKind,
+}
+
+/// Serializable workflow edge behavior category used by production capability admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowEdgeKind {
+    /// Unconditional forward control flow.
+    Direct,
+    /// Predicate-selected forward control flow.
+    Conditional,
+    /// Bounded repeat back edge.
+    Back,
+    /// Automatic retry edge.
+    Retry,
+}
+
+/// Return the stable serialized name for an edge kind.
+///
+/// This exhaustive match intentionally makes enum growth fail compilation until production
+/// capability coverage is reviewed.
+#[must_use]
+pub const fn workflow_edge_kind_name(kind: WorkflowEdgeKind) -> &'static str {
+    match kind {
+        WorkflowEdgeKind::Direct => "direct",
+        WorkflowEdgeKind::Conditional => "conditional",
+        WorkflowEdgeKind::Back => "back",
+        WorkflowEdgeKind::Retry => "retry",
+    }
 }
 
 /// Serializable workflow edge behavior.
@@ -1464,6 +1695,19 @@ pub enum EdgeKind {
         /// Maximum number of body attempts, including the initial attempt.
         max_attempts: u32,
     },
+}
+
+impl EdgeKind {
+    /// Return the stable capability category for this edge.
+    #[must_use]
+    pub const fn capability_kind(&self) -> WorkflowEdgeKind {
+        match self {
+            Self::Direct => WorkflowEdgeKind::Direct,
+            Self::Conditional { .. } => WorkflowEdgeKind::Conditional,
+            Self::Back { .. } => WorkflowEdgeKind::Back,
+            Self::Retry { .. } => WorkflowEdgeKind::Retry,
+        }
+    }
 }
 
 /// Serializable deterministic predicate over a structured workflow value.
@@ -1581,6 +1825,151 @@ impl WorkflowDefinition {
     #[must_use]
     pub fn node(&self, id: &str) -> Option<&NodeDefinition> {
         self.nodes.get(id)
+    }
+
+    /// Validate this definition against the exact current durable-production capability set.
+    ///
+    /// This is intentionally stricter than [`Self::validate`], which validates the host-neutral
+    /// serialized graph shared with the in-process SDK.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the host-neutral definition itself is malformed.
+    #[allow(clippy::too_many_lines)]
+    pub fn production_admission(
+        &self,
+        capabilities: &WorkflowProductionCapabilities,
+    ) -> Result<WorkflowProductionAdmission, WorkflowError> {
+        self.validate()?;
+        let mut diagnostics = Vec::new();
+        if capabilities.capability_version != WORKFLOW_PRODUCTION_CAPABILITY_VERSION {
+            diagnostics.push(WorkflowCapabilityDiagnostic {
+                code: "unsupported_capability_version".to_string(),
+                node_id: None,
+                message: format!(
+                    "workflow capability version {} is unsupported; expected {}",
+                    capabilities.capability_version, WORKFLOW_PRODUCTION_CAPABILITY_VERSION
+                ),
+            });
+        }
+        if capabilities.definition_schema_version != self.schema_version {
+            diagnostics.push(WorkflowCapabilityDiagnostic {
+                code: "unsupported_definition_schema".to_string(),
+                node_id: None,
+                message: format!(
+                    "definition schema version {} is unsupported by production capability version {}",
+                    self.schema_version, capabilities.capability_version
+                ),
+            });
+        }
+        for node in self.nodes.values() {
+            match capabilities.node_support(node.kind) {
+                WorkflowCapabilitySupport::Supported => {}
+                WorkflowCapabilitySupport::InProcessOnly => {
+                    diagnostics.push(WorkflowCapabilityDiagnostic {
+                        code: "in_process_only_node".to_string(),
+                        node_id: Some(node.id.clone()),
+                        message: format!(
+                            "node '{}' uses {:?}, which is closure-backed and available only to the in-process SDK",
+                            node.id, node.kind
+                        ),
+                    });
+                }
+                WorkflowCapabilitySupport::Unsupported => {
+                    diagnostics.push(WorkflowCapabilityDiagnostic {
+                        code: "unsupported_node_kind".to_string(),
+                        node_id: Some(node.id.clone()),
+                        message: format!(
+                            "node '{}' uses {:?}, which has no complete durable production implementation",
+                            node.id, node.kind
+                        ),
+                    });
+                }
+            }
+            if node.kind == NodeKind::Parallel {
+                match serde_json::from_value::<ParallelFailurePolicy>(
+                    node.configuration
+                        .get("failure_policy")
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!("wait_all")),
+                ) {
+                    Ok(policy) if capabilities.parallel_join_policies.contains(&policy) => {}
+                    Ok(policy) => diagnostics.push(WorkflowCapabilityDiagnostic {
+                        code: "unsupported_parallel_policy".to_string(),
+                        node_id: Some(node.id.clone()),
+                        message: format!(
+                            "parallel node '{}' uses unsupported durable policy {policy:?}",
+                            node.id
+                        ),
+                    }),
+                    Err(error) => diagnostics.push(WorkflowCapabilityDiagnostic {
+                        code: "invalid_parallel_policy".to_string(),
+                        node_id: Some(node.id.clone()),
+                        message: format!(
+                            "parallel node '{}' has an invalid failure policy: {error}",
+                            node.id
+                        ),
+                    }),
+                }
+            }
+            if node.kind == NodeKind::Agent {
+                validate_production_agent_node(node, capabilities, &mut diagnostics);
+            }
+        }
+        for edge in &self.edges {
+            if capabilities.edge_support(edge.kind.capability_kind())
+                != WorkflowCapabilitySupport::Supported
+            {
+                diagnostics.push(WorkflowCapabilityDiagnostic {
+                    code: "unsupported_edge_kind".to_string(),
+                    node_id: Some(edge.from.clone()),
+                    message: format!(
+                        "edge '{} -> {}' uses unsupported durable kind {:?}",
+                        edge.from,
+                        edge.to,
+                        edge.kind.capability_kind()
+                    ),
+                });
+            }
+            match &edge.kind {
+                EdgeKind::Retry { .. }
+                    if capabilities.automatic_retry != WorkflowCapabilitySupport::Supported =>
+                {
+                    diagnostics.push(WorkflowCapabilityDiagnostic {
+                        code: "unsupported_retry_edge".to_string(),
+                        node_id: Some(edge.from.clone()),
+                        message: format!(
+                            "retry edge '{} -> {}' has no complete durable scheduler",
+                            edge.from, edge.to
+                        ),
+                    });
+                }
+                EdgeKind::Conditional { predicate, .. } | EdgeKind::Back { predicate, .. } => {
+                    if capabilities.predicate_version != WORKFLOW_PREDICATE_VERSION {
+                        diagnostics.push(WorkflowCapabilityDiagnostic {
+                            code: "unsupported_predicate_version".to_string(),
+                            node_id: Some(edge.from.clone()),
+                            message: format!(
+                                "predicate contract version {} is unsupported",
+                                capabilities.predicate_version
+                            ),
+                        });
+                    }
+                    if let Err(error) = validate_predicate_expression(predicate) {
+                        diagnostics.push(WorkflowCapabilityDiagnostic {
+                            code: "invalid_predicate".to_string(),
+                            node_id: Some(edge.from.clone()),
+                            message: error.to_string(),
+                        });
+                    }
+                }
+                EdgeKind::Direct | EdgeKind::Retry { .. } => {}
+            }
+        }
+        Ok(WorkflowProductionAdmission {
+            capabilities: capabilities.clone(),
+            diagnostics,
+        })
     }
 
     /// Validate a deserialized compiled workflow definition.
@@ -2339,7 +2728,7 @@ where
 }
 
 /// Failure behavior for a two-branch parallel join.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ParallelFailurePolicy {
     /// Wait for both branches to settle before returning the first branch-ordered failure.
@@ -3173,8 +3562,105 @@ fn validate_compiled_definition(definition: &WorkflowDefinition) -> Result<(), W
                 message: "repeat max_iterations must be greater than zero".to_string(),
             });
         }
+        match &edge.kind {
+            EdgeKind::Conditional { predicate, .. } | EdgeKind::Back { predicate, .. } => {
+                validate_predicate_expression(predicate)?;
+            }
+            EdgeKind::Direct | EdgeKind::Retry { .. } => {}
+        }
     }
     ensure_acyclic(&definition.name, &definition.nodes, &definition.edges)
+}
+
+fn validate_production_agent_node(
+    node: &NodeDefinition,
+    capabilities: &WorkflowProductionCapabilities,
+    diagnostics: &mut Vec<WorkflowCapabilityDiagnostic>,
+) {
+    let Some(configuration) = node.configuration.as_object() else {
+        diagnostics.push(WorkflowCapabilityDiagnostic {
+            code: "invalid_agent_configuration".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!("agent node '{}' configuration must be an object", node.id),
+        });
+        return;
+    };
+    if configuration
+        .get("configuration_version")
+        .is_some_and(|value| {
+            value.as_u64() != Some(u64::from(capabilities.agent_configuration_version))
+        })
+    {
+        diagnostics.push(WorkflowCapabilityDiagnostic {
+            code: "unsupported_agent_configuration_version".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "agent node '{}' must use configuration version {}",
+                node.id, capabilities.agent_configuration_version
+            ),
+        });
+    }
+    if configuration
+        .get("prompt_mode")
+        .and_then(serde_json::Value::as_str)
+        != Some("json_input")
+    {
+        diagnostics.push(WorkflowCapabilityDiagnostic {
+            code: "unsupported_agent_prompt_mode".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "agent node '{}' must use the durable json_input prompt mode",
+                node.id
+            ),
+        });
+    }
+    let execution_target = configuration.get("execution_target").map_or_else(
+        || Ok(AgentExecutionTarget::FreshIsolated),
+        |value| serde_json::from_value(value.clone()),
+    );
+    match execution_target {
+        Ok(target) if capabilities.agent_execution_targets.contains(&target) => {}
+        Ok(target) => diagnostics.push(WorkflowCapabilityDiagnostic {
+            code: "unsupported_agent_execution_target".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "agent node '{}' uses unsupported execution target {target:?}",
+                node.id
+            ),
+        }),
+        Err(error) => diagnostics.push(WorkflowCapabilityDiagnostic {
+            code: "invalid_agent_execution_target".to_string(),
+            node_id: Some(node.id.clone()),
+            message: format!(
+                "agent node '{}' has an invalid execution target: {error}",
+                node.id
+            ),
+        }),
+    }
+}
+
+fn validate_predicate_expression(expression: &PredicateExpression) -> Result<(), WorkflowError> {
+    match expression {
+        PredicateExpression::Equals { path, value } => {
+            if path.len() > 512 || path.split('.').any(|part| part.len() > 256) {
+                return Err(WorkflowError::Build {
+                    path: path.clone(),
+                    message: "predicate path exceeds durable bounds".to_string(),
+                });
+            }
+            let encoded = serde_json::to_vec(value).map_err(|error| WorkflowError::Build {
+                path: path.clone(),
+                message: format!("predicate value cannot be serialized: {error}"),
+            })?;
+            if encoded.len() > 65_536 {
+                return Err(WorkflowError::Build {
+                    path: path.clone(),
+                    message: "predicate value exceeds 65536 bytes".to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_control_node(node: &NodeDefinition) -> Result<(), WorkflowError> {
@@ -3265,6 +3751,240 @@ mod tests {
     fn agent_execution_target_rejects_non_agent_leaf() {
         let _ = Step::map("task", |value: u32| Ok(value))
             .agent_execution_target(AgentExecutionTarget::SharedParentSequential);
+    }
+
+    #[test]
+    fn production_capability_matrix_classifies_every_node_kind() {
+        let capabilities = WorkflowProductionCapabilities::current();
+        assert_eq!(capabilities.node_kinds.len(), ALL_NODE_KINDS.len());
+        assert_eq!(
+            capabilities
+                .node_kinds
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            ALL_NODE_KINDS.into_iter().collect()
+        );
+        assert_eq!(
+            capabilities.node_support(NodeKind::Task),
+            WorkflowCapabilitySupport::InProcessOnly
+        );
+        for kind in [
+            NodeKind::Agent,
+            NodeKind::Branch,
+            NodeKind::Repeat,
+            NodeKind::Parallel,
+            NodeKind::PluginBlock,
+            NodeKind::Input,
+            NodeKind::Approval,
+        ] {
+            assert_eq!(
+                capabilities.node_support(kind),
+                WorkflowCapabilitySupport::Supported
+            );
+        }
+        for kind in [NodeKind::Retry, NodeKind::FanOut] {
+            assert_eq!(
+                capabilities.node_support(kind),
+                WorkflowCapabilitySupport::Unsupported
+            );
+        }
+        assert_eq!(capabilities.edge_kinds.len(), ALL_WORKFLOW_EDGE_KINDS.len());
+        assert_eq!(
+            capabilities
+                .edge_kinds
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>(),
+            ALL_WORKFLOW_EDGE_KINDS.into_iter().collect()
+        );
+        for kind in [
+            WorkflowEdgeKind::Direct,
+            WorkflowEdgeKind::Conditional,
+            WorkflowEdgeKind::Back,
+        ] {
+            assert_eq!(
+                capabilities.edge_support(kind),
+                WorkflowCapabilitySupport::Supported
+            );
+        }
+        assert_eq!(
+            capabilities.edge_support(WorkflowEdgeKind::Retry),
+            WorkflowCapabilitySupport::Unsupported
+        );
+        assert_eq!(
+            capabilities.parallel_join_policies,
+            BTreeSet::from([ParallelFailurePolicy::WaitAll])
+        );
+        assert_eq!(
+            capabilities.automatic_retry,
+            WorkflowCapabilitySupport::Unsupported
+        );
+        assert_eq!(capabilities.fan_out, WorkflowCapabilitySupport::Unsupported);
+        assert_eq!(
+            capabilities.transforms,
+            WorkflowCapabilitySupport::Unsupported
+        );
+        assert_eq!(
+            capabilities.artifact_references,
+            WorkflowCapabilitySupport::Supported
+        );
+    }
+
+    #[test]
+    fn production_admission_rejects_ownerless_and_incomplete_nodes() {
+        let schema = ValueSchema::of::<u32>();
+        for (kind, configuration, code) in [
+            (
+                NodeKind::Task,
+                serde_json::Value::Null,
+                "in_process_only_node",
+            ),
+            (
+                NodeKind::Retry,
+                serde_json::json!({"max_attempts": 2}),
+                "unsupported_node_kind",
+            ),
+            (
+                NodeKind::FanOut,
+                serde_json::json!({"max_concurrency": 2}),
+                "unsupported_node_kind",
+            ),
+        ] {
+            let definition = WorkflowDefinition {
+                schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
+                name: "unsupported".to_string(),
+                input: schema.clone(),
+                output: schema.clone(),
+                nodes: BTreeMap::from([(
+                    "node".to_string(),
+                    NodeDefinition {
+                        id: "node".to_string(),
+                        name: "node".to_string(),
+                        kind,
+                        input: schema.clone(),
+                        output: schema.clone(),
+                        resources: Vec::new(),
+                        configuration,
+                    },
+                )]),
+                entries: vec!["node".to_string()],
+                exits: vec!["node".to_string()],
+                edges: Vec::new(),
+            };
+            let admission = definition
+                .production_admission(&WorkflowProductionCapabilities::current())
+                .expect("structurally valid definition");
+            assert!(admission.diagnostics.iter().any(|item| item.code == code));
+        }
+    }
+
+    #[test]
+    fn production_admission_rejects_retry_edges() {
+        let schema = ValueSchema::of::<u32>();
+        let node = |id: &str| NodeDefinition {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: NodeKind::Input,
+            input: schema.clone(),
+            output: schema.clone(),
+            resources: Vec::new(),
+            configuration: serde_json::json!({"gate_version": 1}),
+        };
+        let definition = WorkflowDefinition {
+            schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "retry-edge".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([
+                ("first".to_string(), node("first")),
+                ("second".to_string(), node("second")),
+            ]),
+            entries: vec!["first".to_string()],
+            exits: vec!["second".to_string()],
+            edges: vec![EdgeDefinition {
+                from: "first".to_string(),
+                to: "second".to_string(),
+                kind: EdgeKind::Retry { max_attempts: 2 },
+            }],
+        };
+        let admission = definition
+            .production_admission(&WorkflowProductionCapabilities::current())
+            .expect("structurally valid definition");
+        assert!(admission.diagnostics.iter().any(|item| {
+            item.code == "unsupported_edge_kind" && item.node_id.as_deref() == Some("first")
+        }));
+        assert!(
+            admission
+                .diagnostics
+                .iter()
+                .any(|item| item.code == "unsupported_retry_edge")
+        );
+    }
+
+    #[test]
+    fn production_admission_rejects_unsupported_agent_and_parallel_options() {
+        let schema = ValueSchema::of::<u32>();
+        let definition = WorkflowDefinition {
+            schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "unsupported-options".to_string(),
+            input: schema.clone(),
+            output: ValueSchema::of::<(u32, u32)>(),
+            nodes: BTreeMap::from([
+                (
+                    "agent".to_string(),
+                    NodeDefinition {
+                        id: "agent".to_string(),
+                        name: "agent".to_string(),
+                        kind: NodeKind::Agent,
+                        input: schema.clone(),
+                        output: schema.clone(),
+                        resources: Vec::new(),
+                        configuration: serde_json::json!({
+                            "configuration_version": 2,
+                            "prompt_mode": "custom"
+                        }),
+                    },
+                ),
+                (
+                    "parallel".to_string(),
+                    NodeDefinition {
+                        id: "parallel".to_string(),
+                        name: "parallel".to_string(),
+                        kind: NodeKind::Parallel,
+                        input: schema,
+                        output: ValueSchema::of::<(u32, u32)>(),
+                        resources: Vec::new(),
+                        configuration: serde_json::json!({
+                            "failure_policy": "fail_fast",
+                            "left_exits": ["agent"],
+                            "right_exits": ["agent"]
+                        }),
+                    },
+                ),
+            ]),
+            entries: vec!["agent".to_string()],
+            exits: vec!["parallel".to_string()],
+            edges: vec![EdgeDefinition {
+                from: "agent".to_string(),
+                to: "parallel".to_string(),
+                kind: EdgeKind::Direct,
+            }],
+        };
+        let admission = definition
+            .production_admission(&WorkflowProductionCapabilities::current())
+            .expect("structurally valid definition");
+        assert!(admission.diagnostics.iter().any(|item| {
+            item.code == "unsupported_agent_configuration_version"
+                && item.node_id.as_deref() == Some("agent")
+        }));
+        assert!(admission.diagnostics.iter().any(|item| {
+            item.code == "unsupported_agent_prompt_mode" && item.node_id.as_deref() == Some("agent")
+        }));
+        assert!(admission.diagnostics.iter().any(|item| {
+            item.code == "unsupported_parallel_policy"
+                && item.node_id.as_deref() == Some("parallel")
+        }));
     }
 
     #[test]

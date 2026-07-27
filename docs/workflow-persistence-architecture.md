@@ -18,6 +18,29 @@ and workflow event/projection checkpoints. Canonical session transcript database
 independent and contain only compact generic relationships or user-facing status events where a
 real integration requires them; detailed workflow rows never belong in session history.
 
+## Durable production admission
+
+The durable daemon binds registration and start validation to
+`WorkflowProductionCapabilities::current()`. That versioned capability contract covers the
+compiled definition and predicate versions, transform/retry-policy availability, agent
+configuration version, workflow-block interface version, node support classifications, parallel
+join policies, artifact references, and agent execution targets. It is deliberately distinct from
+the broader in-process SDK capability surface.
+
+Current durable support is:
+
+* supported: `Agent`, `Branch`, `Repeat`, wait-all `Parallel`, `PluginBlock`, `Input`, and
+  `Approval`;
+* in-process-only: closure-backed `Task`;
+* rejected pending complete durable behavior: `Retry`, retry edges, `FanOut`, fail-fast parallel,
+  and declarative transforms.
+
+Registration rejects unsupported definitions before persistence and resolves every plugin block to
+an exact enabled manifest declaration. Start repeats the same admission and resolution so a
+previously registered definition fails closed when its owner plugin is disabled or incompatible.
+Unsupported definitions and unavailable capabilities use the stable IPC error codes
+`workflow_definition_unsupported` and `workflow_capability_unavailable`.
+
 ## Initial normalized schema
 
 Migrations are added only with behavior that reads and writes their tables. The first durable
