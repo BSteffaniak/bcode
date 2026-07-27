@@ -21552,49 +21552,6 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
             return;
         }
     };
-    let mut registered_runs = BTreeSet::new();
-    for attempt in &attempts {
-        let run = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .run_summary(&attempt.run_id);
-        let Ok(Some(run)) = run else {
-            continue;
-        };
-        let Some(parent_session_id) = run
-            .parent_session_id
-            .as_deref()
-            .and_then(|value| SessionId::from_str(value).ok())
-        else {
-            continue;
-        };
-        let run_work_id = WorkId::new(format!("workflow:{}", attempt.run_id));
-        if registered_runs.insert(attempt.run_id.clone()) {
-            register_workflow_runtime_work(
-                state,
-                parent_session_id,
-                &attempt.run_id,
-                format!("workflow {} v{}", run.definition_id, run.definition_version),
-            )
-            .await;
-        }
-        let session_id = attempt
-            .receipt
-            .get("session_id")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|value| SessionId::from_str(value).ok())
-            .unwrap_or(parent_session_id);
-        register_workflow_node_runtime_work(
-            state,
-            session_id,
-            &run_work_id,
-            &attempt.dispatch_identity,
-            format!("workflow node {}", attempt.node_id),
-            CancellationHandle::WorkflowNode(Arc::new(TurnCancelState::default())),
-        )
-        .await;
-    }
     let observer = WorkflowTurnReceiptObserver { state };
     let store_path = state
         .workflow_store
@@ -21649,6 +21606,61 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
             }
         }
         Err(error) => tracing::warn!("failed to open workflow store at startup: {error}"),
+    }
+    let active_attempts = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .active_attempts(1_000);
+    let active_attempts = match active_attempts {
+        Ok(attempts) => attempts,
+        Err(error) => {
+            tracing::warn!("failed to rediscover active workflow attempts at startup: {error}");
+            return;
+        }
+    };
+    let mut registered_runs = BTreeSet::new();
+    for attempt in active_attempts {
+        let run = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .run_summary(&attempt.run_id);
+        let Ok(Some(run)) = run else {
+            continue;
+        };
+        let Some(parent_session_id) = run
+            .parent_session_id
+            .as_deref()
+            .and_then(|value| SessionId::from_str(value).ok())
+        else {
+            continue;
+        };
+        let run_work_id = WorkId::new(format!("workflow:{}", attempt.run_id));
+        if registered_runs.insert(attempt.run_id.clone()) {
+            register_workflow_runtime_work(
+                state,
+                parent_session_id,
+                &attempt.run_id,
+                format!("workflow {} v{}", run.definition_id, run.definition_version),
+            )
+            .await;
+        }
+        let session_id = attempt
+            .receipt
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| SessionId::from_str(value).ok())
+            .unwrap_or(parent_session_id);
+        register_workflow_node_runtime_work(
+            state,
+            session_id,
+            &run_work_id,
+            &attempt.dispatch_identity,
+            format!("workflow node {}", attempt.node_id),
+            CancellationHandle::WorkflowNode(Arc::new(TurnCancelState::default())),
+        )
+        .await;
     }
 }
 
@@ -35923,10 +35935,134 @@ library = "test"
             bcode_workflow_store::RunStatus::Completed
         );
         let parent_work = state.runtime_work.active_for_session(parent.id).await;
-        assert!(
-            parent_work
-                .iter()
-                .any(|work| work.kind == RuntimeWorkKind::Workflow)
+        assert!(parent_work.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn startup_restore_cancellation_wins_over_completed_turn() {
+        let session_root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent_lazy(session_root.path());
+        let parent = sessions
+            .create_session(Some("parent".to_string()), PathBuf::from("."))
+            .await
+            .expect("parent");
+        let child = sessions
+            .create_fresh_execution_session(
+                Some("child".to_string()),
+                ExecutionSessionProvenance {
+                    owner: "bcode.workflow".to_string(),
+                    run_id: "cancelled-restore-run".to_string(),
+                    node_id: "agent".to_string(),
+                    attempt: 1,
+                    parent_session_id: parent.id,
+                    context_mode: bcode_session_models::ExecutionSessionContextMode::FreshIsolated,
+                    workspace_snapshot: Some("snapshot-1".to_string()),
+                    parent_generation: None,
+                },
+                None,
+            )
+            .await
+            .expect("child");
+        let turn_id = format!("{}-1", child.id);
+        sessions
+            .append_model_turn_started(child.id, turn_id.clone())
+            .await
+            .expect("turn start");
+        sessions
+            .append_assistant_message(child.id, "1".to_string())
+            .await
+            .expect("output");
+        sessions
+            .append_model_turn_finished(
+                child.id,
+                turn_id.clone(),
+                ModelTurnOutcome::Completed,
+                None,
+            )
+            .await
+            .expect("terminal");
+        let state = Arc::new(test_server_state(sessions));
+        {
+            let mut store = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let definition = bcode_workflow::WorkflowBuilder::new(
+                "cancelled restore",
+                bcode_workflow::Step::task(
+                    "agent",
+                    |value: u32, _context| async move { Ok(value) },
+                ),
+            )
+            .build()
+            .expect("workflow")
+            .definition()
+            .clone();
+            store
+                .persist_definition("cancelled-restore", 1, &definition)
+                .expect("definition");
+            store
+                .create_run(&bcode_workflow_store::NewWorkflowRun {
+                    run_id: "cancelled-restore-run".to_string(),
+                    definition_id: "cancelled-restore".to_string(),
+                    definition_version: 1,
+                    workspace_snapshot: "snapshot-1".to_string(),
+                    parent_session_id: Some(parent.id.to_string()),
+                    binding: None,
+                    input: Some(serde_json::json!(1)),
+                    created_at_ms: 1,
+                    limits: bcode_workflow_store::WorkflowRunLimits::default(),
+                })
+                .expect("run");
+            let pending = store
+                .pending_activations(1)
+                .expect("pending")
+                .pop()
+                .expect("activation");
+            let prepared = store
+                .prepare_pending_activation(
+                    &pending.run_id,
+                    &pending.node_id,
+                    &pending.activation_id,
+                    bcode_workflow_store::DispatchSideEffect::Mutating,
+                    serde_json::json!({"owner": "test"}),
+                    2,
+                )
+                .expect("prepare")
+                .expect("prepared");
+            store
+                .persist_dispatch_receipt(&bcode_workflow_store::DispatchReceipt {
+                    run_id: prepared.activation.run_id,
+                    node_id: prepared.activation.node_id,
+                    activation_id: prepared.activation.activation_id,
+                    attempt: 1,
+                    dispatch_identity: prepared.dispatch_identity,
+                    receipt: serde_json::json!({
+                        "session_id": child.id,
+                        "turn_id": turn_id,
+                        "output_schema_id": "u32",
+                    }),
+                    admitted_at_ms: 3,
+                })
+                .expect("receipt");
+            store
+                .request_cancellation("cancelled-restore-run", 4)
+                .expect("cancel");
+        }
+
+        restore_workflow_runtime_work(&state).await;
+
+        assert_eq!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .run_summary("cancelled-restore-run")
+                .expect("summary")
+                .expect("run")
+                .status,
+            bcode_workflow_store::RunStatus::Cancelled
         );
     }
 

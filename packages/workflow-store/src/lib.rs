@@ -4127,13 +4127,29 @@ fn receipt_backed_attempts(
         .collect()
 }
 
+fn cancellation_requested_for_run(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+) -> Result<bool, WorkflowStoreError> {
+    transaction
+        .query_row(
+            "SELECT cancellation_requested_at_ms IS NOT NULL FROM workflow_runs WHERE run_id = ?1",
+            [run_id],
+            |row| row.get(0),
+        )
+        .map_err(WorkflowStoreError::from)
+}
+
 fn apply_attempt_observation(
     transaction: &Transaction<'_>,
     request: &AttemptReconciliationRequest,
-    observation: AttemptObservation,
+    mut observation: AttemptObservation,
     reconciled_at_ms: u64,
     summary: &mut ReceiptReconciliationSummary,
 ) -> Result<(), WorkflowStoreError> {
+    if cancellation_requested_for_run(transaction, &request.run_id)? {
+        observation = AttemptObservation::Cancelled;
+    }
     match observation {
         AttemptObservation::Admitted => {
             transition_attempt(transaction, request, "admitted", None)?;
@@ -6420,6 +6436,49 @@ mod tests {
             !store
                 .request_cancellation("run-1", 21)
                 .expect("finalize existing intent")
+        );
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn cancellation_intent_wins_over_late_success_observation() {
+        let (_temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        store.request_cancellation("run-1", 20).expect("intent");
+        assert!(
+            store
+                .mark_cancellation_signalled(&identity, 21)
+                .expect("signal")
+        );
+        let output = ValidatedOutput {
+            output_id: "late-output".to_string(),
+            run_id: "run-1".to_string(),
+            node_id: "review".to_string(),
+            activation_id: activation_id(),
+            schema_id: "u32".to_string(),
+            schema_version: 1,
+            value: serde_json::json!(1),
+            artifact_reference: None,
+            created_at_ms: 22,
+        };
+
+        let summary = store
+            .apply_attempt_observation(&identity, AttemptObservation::Succeeded { output }, 22)
+            .expect("cancelled late success");
+
+        assert_eq!(summary.cancelled, [identity]);
+        assert!(
+            store
+                .output_summaries("run-1", 10)
+                .expect("outputs")
+                .is_empty()
         );
         assert_eq!(
             store
