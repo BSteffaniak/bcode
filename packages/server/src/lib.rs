@@ -31631,6 +31631,7 @@ library = "test"
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One durable fixture proves intermediate omission, atomic closure, attach, and replay convergence.
     async fn terminal_result_persists_retained_presentation_atomically() {
         let workspace = tempfile::tempdir().expect("terminal presentation workspace");
         let sessions = SessionManager::persistent(workspace.path().join("sessions"))
@@ -31656,6 +31657,20 @@ library = "test"
             artifact: None,
             payload: serde_json::json!({"terminal": true}),
         };
+        let intermediate = bcode_tool::ToolPresentationUpdate {
+            revision: 6,
+            payload: serde_json::json!({"terminal": false}),
+            ..update.clone()
+        };
+        publish_plugin_tool_presentation_update(
+            &state,
+            session.id,
+            "call-1",
+            "test.plugin",
+            intermediate,
+        )
+        .await
+        .expect("intermediate presentation accepted");
         publish_plugin_tool_presentation_update(
             &state,
             session.id,
@@ -31695,6 +31710,25 @@ library = "test"
             })
             .expect("terminal record");
         assert_eq!(record.presentation.as_ref(), Some(&update));
+        assert_eq!(
+            attachment
+                .history
+                .iter()
+                .filter(|event| matches!(
+                    event.kind,
+                    SessionEventKind::ToolInvocationResultRecorded { .. }
+                ))
+                .count(),
+            1
+        );
+        assert!(!attachment.history.iter().any(|event| {
+            matches!(
+                &event.kind,
+                SessionEventKind::ToolInvocationResultRecorded { record }
+                    if record.presentation.as_ref().is_some_and(|presentation|
+                        presentation.revision == 6)
+            )
+        }));
         let snapshot = bcode_session_view::build_session_view_snapshot(&attachment.history);
         assert_eq!(
             snapshot

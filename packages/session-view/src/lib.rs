@@ -849,10 +849,7 @@ impl SessionView {
                             .entry(lifecycle.invocation_id.clone())
                             .or_default();
                         aggregate.terminal_status = Some(status);
-                        aggregate.presentation_scope.close();
-                        aggregate.presentations.retain(|_, update| {
-                            update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
-                        });
+                        self.close_presentation_scope(&lifecycle.invocation_id);
                     }
                 }
                 self.bump_revision();
@@ -913,10 +910,7 @@ impl SessionView {
                 } else {
                     ToolInvocationViewStatus::Finished
                 });
-                aggregate.presentation_scope.close();
-                aggregate.presentations.retain(|_, update| {
-                    update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
-                });
+                self.close_presentation_scope(&record.invocation_id);
                 self.snapshot
                     .active_invocations
                     .remove(&record.invocation_id);
@@ -2198,6 +2192,41 @@ impl SessionView {
             return;
         }
         self.push_item(id, sequence, timestamp_ms, streaming, kind);
+    }
+
+    fn close_presentation_scope(&mut self, invocation_id: &str) {
+        let Some(aggregate) = self.tool_invocations.get_mut(invocation_id) else {
+            return;
+        };
+        aggregate.presentation_scope.close();
+        let active_supplementals = aggregate
+            .presentations
+            .iter()
+            .filter_map(|(identity, update)| {
+                (update.retention == bcode_tool::ToolPresentationRetention::ActiveOnly)
+                    .then_some(identity)
+            })
+            .filter_map(|identity| match identity {
+                bcode_tool::ToolPresentationIdentity::Primary => None,
+                bcode_tool::ToolPresentationIdentity::Supplemental { item_id } => Some(
+                    TranscriptViewItemId::tool_supplemental(invocation_id, item_id),
+                ),
+            })
+            .collect::<BTreeSet<_>>();
+        aggregate.presentations.retain(|_, update| {
+            update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+        });
+        if active_supplementals.is_empty() {
+            return;
+        }
+        let item_count = self.snapshot.transcript.items.len();
+        self.snapshot
+            .transcript
+            .items
+            .retain(|item| !active_supplementals.contains(&item.id));
+        if self.snapshot.transcript.items.len() != item_count {
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        }
     }
 
     fn current_primary_presentation(
@@ -7310,6 +7339,80 @@ mod tests {
             Some(TranscriptViewItemKind::ToolInvocation { tool })
                 if tool.status == ToolInvocationViewStatus::Failed
         ));
+    }
+
+    #[test]
+    fn supplemental_active_only_is_removed_while_retained_supplemental_survives_closure() {
+        let session_id = SessionId::new();
+        let update = |item_id: &str, retention| bcode_tool::ToolPresentationUpdate {
+            invocation_id: "call-1".to_owned(),
+            producer_id: "test.plugin".to_owned(),
+            generation: 0,
+            revision: 1,
+            identity: bcode_tool::ToolPresentationIdentity::Supplemental {
+                item_id: item_id.to_owned(),
+            },
+            retention,
+            schema: "test.supplemental".to_owned(),
+            schema_version: 1,
+            artifact: None,
+            payload: serde_json::json!({"item": item_id}),
+        };
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("test.plugin".to_owned()),
+                tool_name: "test.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        for update in [
+            update(
+                "retained",
+                bcode_tool::ToolPresentationRetention::RetainLatest,
+            ),
+            update("active", bcode_tool::ToolPresentationRetention::ActiveOnly),
+        ] {
+            view.apply_live_event(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::ToolPresentationUpdated { update },
+            });
+        }
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-1".to_owned(),
+                    model_output: "done".to_owned(),
+                    is_error: false,
+                    presentation: None,
+                    result: Some(ToolInvocationResult::Text {
+                        text: "done".to_owned(),
+                    }),
+                },
+            },
+        ));
+
+        assert!(view.snapshot().transcript.items.iter().any(|item| {
+            item.id == TranscriptViewItemId::tool_supplemental("call-1", "retained")
+        }));
+        assert!(!view.snapshot().transcript.items.iter().any(|item| {
+            item.id == TranscriptViewItemId::tool_supplemental("call-1", "active")
+        }));
+        assert!(
+            view.presentation_update(
+                "call-1",
+                &bcode_tool::ToolPresentationIdentity::Supplemental {
+                    item_id: "active".to_owned(),
+                },
+            )
+            .is_none()
+        );
     }
 
     #[test]
