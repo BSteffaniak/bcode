@@ -247,6 +247,15 @@ impl TranscriptItem {
         self.source_view_item_id.as_ref()
     }
 
+    /// Return the renderer-neutral source revision, when this item adapts shared session state.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn source_view_item_revision(
+        &self,
+    ) -> Option<bcode_session_view_models::ViewRevision> {
+        self.source_view_revision
+    }
+
     fn with_source_view_item(
         mut self,
         id: bcode_session_view_models::TranscriptViewItemId,

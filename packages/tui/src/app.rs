@@ -2413,6 +2413,7 @@ impl BmuxApp {
             self.session_view.apply_event(event);
             self.apply_session_event(event, SessionEventApplication::Replay);
         }
+        self.sync_authoritative_transcript_items();
         self.sync_shared_message_items();
         self.trim_resident_transcript_window_if_needed();
     }
@@ -2427,6 +2428,7 @@ impl BmuxApp {
             self.session_view.apply_event(event);
             self.apply_session_event(event, SessionEventApplication::Replay);
         }
+        self.sync_authoritative_transcript_items();
         self.sync_shared_message_items();
     }
 
@@ -2551,6 +2553,7 @@ impl BmuxApp {
         }
         self.session_view.apply_event(event);
         self.apply_session_event(event, SessionEventApplication::Live);
+        self.sync_authoritative_transcript_items();
         self.trim_resident_transcript_window_if_needed();
     }
 
@@ -2601,6 +2604,7 @@ impl BmuxApp {
                 self.apply_shared_provider_stream_progress(event);
             }
         }
+        self.sync_authoritative_transcript_items();
     }
 
     fn apply_live_contribution(
@@ -3263,6 +3267,28 @@ impl BmuxApp {
             .unwrap_or_else(|| panic!("shared session view must project {event_kind}"));
         let item = terminal_item_from_shared(shared_item);
         self.transcript.upsert_shared_item(item);
+    }
+
+    fn sync_authoritative_transcript_items(&mut self) {
+        let shared_items = self
+            .session_view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .map(terminal_item_from_shared)
+            .collect::<Vec<_>>();
+        let source_ids = shared_items
+            .iter()
+            .filter_map(|item| item.source_view_item_id().cloned())
+            .collect::<BTreeSet<_>>();
+        self.transcript.retain(|item| {
+            item.source_view_item_id()
+                .is_none_or(|id| source_ids.contains(id))
+        });
+        for item in shared_items {
+            self.transcript.upsert_shared_item(item);
+        }
     }
 
     fn sync_shared_message_items(&mut self) {
@@ -4911,6 +4937,77 @@ mod tests {
             app.tool_elapsed_invalidation_requests(now, now_system)
                 .next()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn authoritative_sync_reconciles_replaced_and_removed_items_by_stable_id() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let contribution = |sequence, operation| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Progress,
+                    bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call-1".to_owned(),
+                        contribution_id: "progress".to_owned(),
+                        sequence,
+                        producer_id: "test.plugin".to_owned(),
+                        schema: "test.progress".to_owned(),
+                        schema_version: 1,
+                        operation,
+                        persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                        artifact: None,
+                        payload: serde_json::json!({"sequence": sequence}),
+                    },
+                ),
+            },
+        };
+
+        app.absorb_session_live_event(&contribution(
+            1,
+            bcode_session_models::ToolContributionOperation::Upsert,
+        ));
+        let id = bcode_session_view_models::TranscriptViewItemId::tool("call-1");
+        let first_revision = app
+            .transcript()
+            .iter()
+            .find(|item| item.source_view_item_id() == Some(&id))
+            .expect("primary item")
+            .source_view_item_revision()
+            .expect("primary revision");
+
+        app.absorb_session_live_event(&contribution(
+            2,
+            bcode_session_models::ToolContributionOperation::Upsert,
+        ));
+        let replacement = app
+            .transcript()
+            .iter()
+            .find(|item| item.source_view_item_id() == Some(&id))
+            .expect("replacement item");
+        assert!(
+            replacement
+                .source_view_item_revision()
+                .is_some_and(|revision| revision > first_revision)
+        );
+        assert_eq!(
+            app.transcript()
+                .iter()
+                .filter(|item| item.source_view_item_id() == Some(&id))
+                .count(),
+            1
+        );
+
+        app.absorb_session_live_event(&contribution(
+            3,
+            bcode_session_models::ToolContributionOperation::Remove,
+        ));
+        assert!(
+            app.transcript()
+                .iter()
+                .all(|item| item.source_view_item_id() != Some(&id))
         );
     }
 
