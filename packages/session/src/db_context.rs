@@ -121,3 +121,15 @@ pub const fn model_context_event_kind_name(kind: &SessionEventKind) -> &'static 
         _ => "non_model_context",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn names_preserve_structural_and_excluded_roles() {
+        assert!(is_model_context_event_type("model_turn_started"));
+        assert!(is_model_context_event_type("model_turn_finished"));
+        assert!(!is_model_context_event_type("request_context_observed"));
+    }
+}

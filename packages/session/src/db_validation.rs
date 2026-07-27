@@ -55,6 +55,27 @@ pub fn validate_projection_checkpoint_snapshot(
     Ok(())
 }
 
+pub fn validate_append_identity(
+    event: &SessionEvent,
+    canonical_tail: Option<u64>,
+) -> SessionDbResult<()> {
+    if let bcode_session_models::SessionEventKind::ToolContribution { event } = &event.kind
+        && event.persistence == bcode_session_models::ToolContributionPersistence::Transient
+    {
+        return Err(SessionDbError::TransientContribution {
+            contribution_id: event.contribution_id.clone(),
+        });
+    }
+    let expected_sequence = canonical_tail.map_or(0, |tail| tail.saturating_add(1));
+    if event.sequence != expected_sequence {
+        return Err(SessionDbError::InvalidCanonicalAppendSequence {
+            expected: expected_sequence,
+            actual: event.sequence,
+        });
+    }
+    Ok(())
+}
+
 pub fn compaction_boundary(event: &SessionEvent) -> SessionDbResult<Option<u64>> {
     let boundary = match &event.kind {
         bcode_session_models::SessionEventKind::ContextCompacted {

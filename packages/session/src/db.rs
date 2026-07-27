@@ -43,7 +43,8 @@ const fn bool_to_value(value: bool) -> DatabaseValue {
     DatabaseValue::Int32(if value { 1 } else { 0 })
 }
 use crate::db_validation::{
-    compaction_boundary, validate_canonical_event_identity, validate_projection_checkpoint_snapshot,
+    compaction_boundary, validate_append_identity, validate_canonical_event_identity,
+    validate_projection_checkpoint_snapshot,
 };
 use crate::persisted::{
     CompatibleSessionEvent, PersistedSessionEventError, decode_session_event, encode_session_event,
@@ -3371,21 +3372,8 @@ async fn validate_append_preconditions_without_writer(
     db: &dyn Database,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
-    if let SessionEventKind::ToolContribution { event } = &event.kind
-        && event.persistence == bcode_session_models::ToolContributionPersistence::Transient
-    {
-        return Err(SessionDbError::TransientContribution {
-            contribution_id: event.contribution_id.clone(),
-        });
-    }
     let canonical_tail = last_sequence(db).await?;
-    let expected_sequence = canonical_tail.map_or(0, |tail| tail.saturating_add(1));
-    if event.sequence != expected_sequence {
-        return Err(SessionDbError::InvalidCanonicalAppendSequence {
-            expected: expected_sequence,
-            actual: event.sequence,
-        });
-    }
+    validate_append_identity(event, canonical_tail)?;
     validate_model_context_precondition(db, event).await?;
     validate_context_occupancy_precondition(db, event).await?;
     validate_session_compatibility_precondition(db, canonical_tail).await?;
