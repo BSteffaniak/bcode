@@ -3965,62 +3965,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn released_materialized_ledger_fixture_cases_match_current_schema_order() {
-        let current_ids = session_migrations()
-            .migrations()
-            .await
-            .expect("current session migrations")
-            .into_iter()
-            .map(|migration| migration.id().to_owned())
-            .collect::<Vec<_>>();
-        let cases = bcode_session_migration::released_session_ledger_prefix_fixture_cases();
-        let complete = cases
-            .iter()
-            .filter(|case| {
-                case.endpoint_treatment
-                    == bcode_session_migration::ReleasedMigrationTreatment::MaterializeCurrent
-            })
-            .max_by_key(|case| case.completed_migration_ids.len())
-            .expect("complete materialized ledger fixture");
-        assert_eq!(
-            complete
-                .completed_migration_ids
-                .iter()
-                .map(ToString::to_string)
-                .collect::<Vec<_>>(),
-            current_ids
-        );
-    }
-
-    #[tokio::test]
-    async fn released_epoch_four_writer_rejects_corrected_epoch_five_store() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let session_id = SessionId::new();
-        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
-            .await
-            .expect("open epoch-five session db");
-
-        assert!(matches!(
-            validate_storage_writer_contract_for_epoch(db.database(), 4).await,
-            Err(SessionDbError::WriterIncompatible {
-                actual: Some(actual),
-                expected: 4,
-            }) if actual == u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH)
-        ));
-        assert!(matches!(
-            bcode_session_migration::plan_writer_epoch_migration_with_registry(
-                CURRENT_SESSION_STORAGE_WRITER_EPOCH,
-                4,
-                &[],
-            ),
-            Err(bcode_session_migration::MigrationPlanError::FutureWriter {
-                source_writer_epoch: CURRENT_SESSION_STORAGE_WRITER_EPOCH,
-                current_writer_epoch: 4,
-            })
-        ));
-    }
-
-    #[tokio::test]
     async fn storage_compatibility_rejects_future_writer_epoch() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();

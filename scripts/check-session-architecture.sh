@@ -557,6 +557,17 @@ if sed -n '/^\[dependencies\]/,/^\[dev-dependencies\]/p' packages/session/Cargo.
   violations=1
 fi
 
+if rg -n 'RELEASED_HISTORICAL|ReleasedMigrationTreatment|HistoricalSessionEvent|OpaqueEvent|CompatibilityDegraded|writer-epoch-|join\("session-storage"\)' \
+  packages/session/src --glob '*.rs' --glob '!db.rs' \
+  >/tmp/bcode-session-forbidden-historical-policy-violations.txt \
+  || sed -n '760,3700p' packages/session/src/db.rs \
+    | rg -n 'RELEASED_HISTORICAL|ReleasedMigrationTreatment|HistoricalSessionEvent|OpaqueEvent|CompatibilityDegraded|writer-epoch-|join\("session-storage"\)' \
+    >>/tmp/bcode-session-forbidden-historical-policy-violations.txt; then
+  echo "Session strict-current policy violation: historical inventory, legacy-root, opaque-read, and degraded compatibility policy must remain outside production bcode_session." >&2
+  cat /tmp/bcode-session-forbidden-historical-policy-violations.txt >&2 2>/dev/null || true
+  violations=1
+fi
+
 if ! rg -q "mod actor;" packages/session/src/lib.rs; then
   echo "Session module split violation: actor module must remain split from lib.rs." >&2
   violations=1
