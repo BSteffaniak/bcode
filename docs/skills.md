@@ -100,7 +100,7 @@ include_user_skills = true
 include_compat_claude_skills = true
 # max_context_bytes = 24000 # optional; omitted means unlimited
 max_skill_file_bytes = 262144
-max_resource_file_bytes = 1048576
+preview_max_chars = 2000
 follow_symlinks = true
 
 [skills.sources]
@@ -130,6 +130,7 @@ Catalog behavior:
 * `summary`: include IDs, names, descriptions, locations, sources, and optionally keywords.
 * Skills with `disable_model_invocation = true` are omitted from the catalog.
 * Skill context, catalog output, and catalog descriptions are untruncated by default. `skills.max_context_bytes`, `skills.prompt.max_bytes`, and `skills.prompt.max_description_chars` apply optional explicit limits.
+* Skill definition reads and transcript previews remain bounded by default through configurable `skills.max_skill_file_bytes` and `skills.preview_max_chars`.
 * Catalog output may include a truncation marker when `skills.prompt.max_bytes` is configured.
 
 The catalog uses an XML-style format similar to Pi/Agent Skills:
@@ -161,6 +162,7 @@ mode = "default" # default | replace
 text = ""
 # repository_instructions_max_chars = 6000 # optional; omitted means unlimited
 # repository_invariants_max_chars = 16000 # optional; omitted means unlimited
+git_status_max_chars = 4000 # bounded by default; configurable
 
 [system_prompt.sections]
 repository_invariants = true
@@ -177,6 +179,8 @@ Behavior:
 * Enabled sections are appended to either base mode.
 * `system_prompt.sections.repository_invariants = true` loads root `INVARIANTS.md` into a dedicated stable prompt section independently of ordinary repository context. Replacement mode does not disable it.
 * Repository instructions and invariants are untruncated by default. Set `system_prompt.repository_instructions_max_chars` or `system_prompt.repository_invariants_max_chars` to apply independent character limits; configured invariant truncation is explicitly marked in model context.
+* Git status is generated repository context and remains bounded by default through configurable `system_prompt.git_status_max_chars`. There is no hidden aggregate cap on dynamic repository context.
+* Historical tool-call fallback text remains bounded through configurable `model.tool_output.fallback_argument_chars` (default `6000`) without changing canonical stored arguments.
 * `system_prompt.sections.skill_catalog = false` disables catalog injection even if `[skills.prompt]` is enabled.
 * `skills.enabled = false` disables skill discovery and therefore disables the skill catalog.
 * `skills.prompt.catalog = "off"` disables only the prompt catalog while keeping skills available elsewhere.

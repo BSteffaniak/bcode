@@ -343,7 +343,7 @@ fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegis
         ));
     }
     let options = SkillRegistryOptions {
-        max_skill_file_bytes: config.skills.max_skill_file_bytes,
+        max_skill_file_bytes: config.skills.max_skill_file_bytes.get(),
         max_context_bytes: config
             .skills
             .max_context_bytes

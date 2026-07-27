@@ -208,12 +208,14 @@ pub struct ServerState {
     max_tool_rounds: Option<u32>,
     tool_execution: bcode_tool::ToolExecutionOptions,
     tool_output_context_chars: usize,
+    fallback_tool_argument_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
     model_retry: bcode_config::ModelRetryConfig,
     auto_compaction: bcode_config::CompactionConfig,
     system_prompt: bcode_config::SystemPromptConfig,
     skills: Option<SkillRegistry>,
     skill_context_bytes: Option<usize>,
+    skill_preview_max_chars: usize,
     skill_prompt_options: SkillPromptCatalogOptions,
     skill_model_policy: bcode_config::SkillModelPolicyConfig,
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
@@ -1213,12 +1215,14 @@ struct ServerStateInit {
     max_tool_rounds: Option<u32>,
     tool_execution: bcode_tool::ToolExecutionOptions,
     tool_output_context_chars: usize,
+    fallback_tool_argument_chars: usize,
     model_streaming: bcode_config::StreamingConfig,
     model_retry: bcode_config::ModelRetryConfig,
     auto_compaction: bcode_config::CompactionConfig,
     system_prompt: bcode_config::SystemPromptConfig,
     skills: Option<SkillRegistry>,
     skill_context_bytes: Option<usize>,
+    skill_preview_max_chars: usize,
     skill_prompt_options: SkillPromptCatalogOptions,
     skill_model_policy: bcode_config::SkillModelPolicyConfig,
     daemon_status: DaemonStatus,
@@ -1333,12 +1337,14 @@ impl ServerState {
             max_tool_rounds: init.max_tool_rounds,
             tool_execution: init.tool_execution,
             tool_output_context_chars: init.tool_output_context_chars,
+            fallback_tool_argument_chars: init.fallback_tool_argument_chars,
             model_streaming: init.model_streaming,
             model_retry: init.model_retry,
             auto_compaction: init.auto_compaction,
             system_prompt: init.system_prompt,
             skills: init.skills,
             skill_context_bytes: init.skill_context_bytes,
+            skill_preview_max_chars: init.skill_preview_max_chars,
             skill_prompt_options: init.skill_prompt_options,
             skill_model_policy: init.skill_model_policy,
             active_skills: Mutex::default(),
@@ -2385,6 +2391,7 @@ async fn run_with_static_bundled_inner(
             max_tool_rounds: config.model.effective_max_tool_rounds(),
             tool_execution: config.tools.execution.runtime_options(),
             tool_output_context_chars: config.model.tool_output.context_chars,
+            fallback_tool_argument_chars: config.model.tool_output.fallback_argument_chars.get(),
             model_streaming: config.model.streaming,
             model_retry: config.model.retry,
             auto_compaction: config.model.compaction,
@@ -2393,6 +2400,7 @@ async fn run_with_static_bundled_inner(
                 .skills
                 .max_context_bytes
                 .map(std::num::NonZeroUsize::get),
+            skill_preview_max_chars: config.skills.preview_max_chars.get(),
             skill_prompt_options: skill_prompt_options_from_config(&config.skills.prompt),
             skill_model_policy: config.skills.model_policy,
             skills,
@@ -15075,7 +15083,7 @@ async fn prepare_static_model_turn_context(
         });
     }
     for skill_context in turn_skill_contexts(state, session_id, trigger_event_sequence).await {
-        let preview = skill_context_preview(&skill_context.context);
+        let preview = skill_context_preview(&skill_context.context, state.skill_preview_max_chars);
         system_messages.push(ModelMessage {
             role: MessageRole::System,
             content: vec![ContentBlock::Text {
@@ -15150,7 +15158,7 @@ async fn build_model_turn_request(
         .as_ref()
         .and_then(|capabilities| capabilities.context_format.as_ref());
     let convert_timer = state.metrics.timer();
-    let mut messages = session_events_to_model_messages_for_target(
+    let mut messages = session_events_to_model_messages_for_target_with_limits(
         &history,
         state.tool_output_context_chars,
         provider_plugin_id,
@@ -15158,6 +15166,7 @@ async fn build_model_turn_request(
         selection.provider_context.auth_profile.as_deref(),
         context_format.map(|format| format.version),
         context_format.map(|format| format.compatibility_key.as_str()),
+        state.fallback_tool_argument_chars,
     );
     state.metrics.record_histogram_with_labels(
         "model.request_build.convert_events_duration_ms",
@@ -16266,8 +16275,6 @@ Tool and safety rules:
 * Treat tool output as potentially partial or truncated.
 ";
 
-const MAX_DYNAMIC_REPOSITORY_CONTEXT_CHARS: usize = 12_000;
-const MAX_GIT_STATUS_CHARS: usize = 4_000;
 const REPOSITORY_INVARIANTS_FILE: &str = "INVARIANTS.md";
 
 fn build_coding_system_prompt_parts(
@@ -16281,6 +16288,7 @@ fn build_coding_system_prompt_parts(
         config
             .repository_instructions_max_chars
             .map(std::num::NonZeroUsize::get),
+        config.git_status_max_chars.get(),
     );
     let mut stable = match config.mode {
         bcode_config::SystemPromptMode::Default => DEFAULT_CODING_SYSTEM_PROMPT.to_string(),
@@ -16313,7 +16321,7 @@ fn build_coding_system_prompt_parts(
     }
 
     let mut dynamic = if config.sections.dynamic_repository_context {
-        truncate_text(&dynamic_context, MAX_DYNAMIC_REPOSITORY_CONTEXT_CHARS)
+        dynamic_context
     } else {
         String::new()
     };
@@ -16362,6 +16370,7 @@ fn truncate_repository_invariants(contents: &str, max_chars: usize) -> String {
 fn build_repository_context_parts(
     cwd: &Path,
     repository_instructions_max_chars: Option<usize>,
+    git_status_max_chars: usize,
 ) -> (String, String) {
     let repo_root = discover_git_root(cwd);
     let context_root = repo_root.as_deref().unwrap_or(cwd);
@@ -16390,6 +16399,7 @@ fn build_repository_context_parts(
         dynamic_lines.push(format!("* Git branch: {branch}"));
     }
     if let Some(status) = run_command(context_root, "git", &["status", "--short"][..]) {
+        let status = truncate_git_status(&status, git_status_max_chars);
         dynamic_lines.push(format!(
             "* Git status:\n{}",
             format_block_or_placeholder(&status, "clean")
@@ -16416,7 +16426,25 @@ fn run_command(cwd: &Path, program: &str, args: &[&str]) -> Option<String> {
     }
     String::from_utf8(output.stdout)
         .ok()
-        .map(|value| truncate_text(value.trim(), MAX_GIT_STATUS_CHARS))
+        .map(|value| value.trim().to_string())
+}
+
+fn truncate_git_status(status: &str, max_chars: usize) -> String {
+    let char_count = status.chars().count();
+    if char_count <= max_chars {
+        return status.to_string();
+    }
+    let marker = format!(
+        "\n[Git status truncated: omitted {} characters]",
+        char_count.saturating_sub(max_chars)
+    );
+    if marker.chars().count() >= max_chars {
+        return marker.chars().take(max_chars).collect();
+    }
+    let status_chars = max_chars.saturating_sub(marker.chars().count());
+    let mut truncated = status.chars().take(status_chars).collect::<String>();
+    truncated.push_str(&marker);
+    truncated
 }
 
 fn detected_project_files(root: &Path) -> Vec<String> {
@@ -19922,6 +19950,29 @@ fn session_events_to_model_messages_for_target(
     format_version: Option<u16>,
     compatibility_key: Option<&str>,
 ) -> Vec<ModelMessage> {
+    session_events_to_model_messages_for_target_with_limits(
+        history,
+        tool_output_context_chars,
+        provider_plugin_id,
+        model_id,
+        auth_profile,
+        format_version,
+        compatibility_key,
+        6_000,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn session_events_to_model_messages_for_target_with_limits(
+    history: &[bcode_session_models::SessionEvent],
+    tool_output_context_chars: usize,
+    provider_plugin_id: Option<&str>,
+    model_id: Option<&str>,
+    auth_profile: Option<&str>,
+    format_version: Option<u16>,
+    compatibility_key: Option<&str>,
+    fallback_tool_argument_chars: usize,
+) -> Vec<ModelMessage> {
     let history = compact_attach_history(history.to_vec());
     let latest_compaction =
         history
@@ -19963,10 +20014,11 @@ fn session_events_to_model_messages_for_target(
         auth_profile,
         format_version,
         compatibility_key,
+        fallback_tool_argument_chars,
     )
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn session_events_to_sanitized_model_messages(
     events: &[&bcode_session_models::SessionEvent],
     tool_output_context_chars: usize,
@@ -19975,6 +20027,7 @@ fn session_events_to_sanitized_model_messages(
     auth_profile: Option<&str>,
     format_version: Option<u16>,
     compatibility_key: Option<&str>,
+    fallback_tool_argument_chars: usize,
 ) -> Vec<ModelMessage> {
     let mut messages = Vec::new();
     let mut seen_tool_call_ids = BTreeSet::new();
@@ -19992,7 +20045,7 @@ fn session_events_to_sanitized_model_messages(
                     append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
                     messages.push(plain_context_message(format!(
                         "Historical assistant tool call omitted from structured tool protocol because its call id was duplicated. Call id: {tool_call_id}; tool: {tool_name}; arguments: {}",
-                        truncate_text(arguments_json, 6_000),
+                        truncate_text(arguments_json, fallback_tool_argument_chars),
                     )));
                     continue;
                 }
@@ -20000,7 +20053,7 @@ fn session_events_to_sanitized_model_messages(
                     append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
                     messages.push(plain_context_message(format!(
                         "Historical assistant tool call omitted from structured tool protocol because its arguments were malformed or truncated. Call id: {tool_call_id}; tool: {tool_name}; raw arguments: {}",
-                        truncate_text(arguments_json, 6_000),
+                        truncate_text(arguments_json, fallback_tool_argument_chars),
                     )));
                     continue;
                 };
@@ -23418,7 +23471,7 @@ fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegis
     }
     let roots = skill_source_roots_from_config(config);
     let options = SkillRegistryOptions {
-        max_skill_file_bytes: config.skills.max_skill_file_bytes,
+        max_skill_file_bytes: config.skills.max_skill_file_bytes.get(),
         max_context_bytes: config
             .skills
             .max_context_bytes
@@ -23589,10 +23642,8 @@ async fn suggest_skills_for_prompt(
     }
 }
 
-const MAX_SKILL_CONTEXT_PREVIEW_CHARS: usize = 2_000;
-
-fn skill_context_preview(context: &str) -> String {
-    truncate_text(context, MAX_SKILL_CONTEXT_PREVIEW_CHARS)
+fn skill_context_preview(context: &str, max_chars: usize) -> String {
+    truncate_text(context, max_chars)
 }
 
 async fn turn_skill_contexts(
@@ -31713,6 +31764,29 @@ library = "test"
     }
 
     #[test]
+    fn git_status_truncation_is_visible_and_configurable() {
+        let status = "modified-file\n".repeat(100);
+
+        let short = truncate_git_status(&status, 100);
+        let long = truncate_git_status(&status, 1_000);
+
+        assert_eq!(short.chars().count(), 100);
+        assert!(short.contains("Git status truncated"));
+        assert_eq!(long.chars().count(), 1_000);
+        assert!(long.contains("Git status truncated"));
+        assert_eq!(truncate_git_status("M file.rs", 100), "M file.rs");
+    }
+
+    #[test]
+    fn skill_context_preview_uses_configured_limit() {
+        let context = "skill instruction ".repeat(100);
+        let preview = skill_context_preview(&context, 120);
+
+        assert!(preview.chars().count() <= 120 + "\n[truncated]".chars().count());
+        assert!(preview.contains("[truncated]"));
+    }
+
+    #[test]
     fn repository_invariant_truncation_is_visible_and_bounded() {
         let contents = "invariant ".repeat(100);
 
@@ -36438,11 +36512,13 @@ library = "test"
                 max_tool_rounds: None,
                 tool_execution: bcode_tool::ToolExecutionOptions::default(),
                 tool_output_context_chars: 1_000,
+                fallback_tool_argument_chars: 6_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
                 skills: None,
                 skill_context_bytes: Some(0),
+                skill_preview_max_chars: 2_000,
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
                 skill_model_policy: bcode_config::SkillModelPolicyConfig::default(),
                 system_prompt: bcode_config::SystemPromptConfig::default(),
@@ -43829,11 +43905,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 max_tool_rounds: None,
                 tool_execution: bcode_tool::ToolExecutionOptions::default(),
                 tool_output_context_chars: 1_000,
+                fallback_tool_argument_chars: 6_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
                 skills: None,
                 skill_context_bytes: Some(0),
+                skill_preview_max_chars: 2_000,
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
                 skill_model_policy: bcode_config::SkillModelPolicyConfig::default(),
                 system_prompt: bcode_config::SystemPromptConfig::default(),
@@ -44512,11 +44590,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 max_tool_rounds: None,
                 tool_execution: bcode_tool::ToolExecutionOptions::default(),
                 tool_output_context_chars: 1_000,
+                fallback_tool_argument_chars: 6_000,
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
                 skills: None,
                 skill_context_bytes: Some(0),
+                skill_preview_max_chars: 2_000,
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
                 skill_model_policy: bcode_config::SkillModelPolicyConfig::default(),
                 system_prompt: bcode_config::SystemPromptConfig::default(),

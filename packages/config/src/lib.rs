@@ -1102,6 +1102,9 @@ pub struct SystemPromptConfig {
     /// Omitted values load the complete file.
     #[serde(default)]
     pub repository_invariants_max_chars: Option<std::num::NonZeroUsize>,
+    /// Maximum characters of Git status included in dynamic repository context.
+    #[serde(default = "default_git_status_max_chars")]
+    pub git_status_max_chars: std::num::NonZeroUsize,
     /// Toggleable built-in system prompt sections.
     #[config_doc(nested)]
     #[serde(default)]
@@ -1115,9 +1118,14 @@ impl Default for SystemPromptConfig {
             text: None,
             repository_instructions_max_chars: None,
             repository_invariants_max_chars: None,
+            git_status_max_chars: default_git_status_max_chars(),
             sections: SystemPromptSectionsConfig::default(),
         }
     }
+}
+
+const fn default_git_status_max_chars() -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(4_000).expect("Git status limit is non-zero")
 }
 
 /// Base system prompt mode.
@@ -1192,10 +1200,10 @@ pub struct SkillsConfig {
     pub max_context_bytes: Option<std::num::NonZeroUsize>,
     /// Maximum bytes read from a single skill definition file.
     #[serde(default = "default_skill_file_bytes")]
-    pub max_skill_file_bytes: u64,
-    /// Maximum bytes read from a single skill resource file.
-    #[serde(default = "default_skill_resource_file_bytes")]
-    pub max_resource_file_bytes: u64,
+    pub max_skill_file_bytes: std::num::NonZeroU64,
+    /// Maximum characters stored in a skill context transcript preview.
+    #[serde(default = "default_skill_preview_chars")]
+    pub preview_max_chars: std::num::NonZeroUsize,
     /// Whether symlinks are followed while discovering skill files.
     #[serde(default)]
     pub follow_symlinks: bool,
@@ -1228,7 +1236,7 @@ impl Default for SkillsConfig {
             include_compat_claude_skills: true,
             max_context_bytes: None,
             max_skill_file_bytes: default_skill_file_bytes(),
-            max_resource_file_bytes: default_skill_resource_file_bytes(),
+            preview_max_chars: default_skill_preview_chars(),
             follow_symlinks: true,
             sources: SkillSourceConfig::default(),
             disabled: DisabledSkillsConfig::default(),
@@ -1391,12 +1399,12 @@ pub struct DisabledSkillsConfig {
     pub ids: BTreeSet<String>,
 }
 
-const fn default_skill_file_bytes() -> u64 {
-    256 * 1024
+const fn default_skill_file_bytes() -> std::num::NonZeroU64 {
+    std::num::NonZeroU64::new(256 * 1024).expect("skill file limit is non-zero")
 }
 
-const fn default_skill_resource_file_bytes() -> u64 {
-    1024 * 1024
+const fn default_skill_preview_chars() -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(2_000).expect("skill preview limit is non-zero")
 }
 
 const fn default_true() -> bool {
@@ -2811,12 +2819,16 @@ pub struct ToolOutputConfig {
     /// Maximum characters of each tool result included directly in model context.
     #[serde(default = "default_tool_output_context_chars")]
     pub context_chars: usize,
+    /// Maximum raw argument characters included when a historical tool call must be projected as plain text.
+    #[serde(default = "default_fallback_tool_argument_chars")]
+    pub fallback_argument_chars: std::num::NonZeroUsize,
 }
 
 impl Default for ToolOutputConfig {
     fn default() -> Self {
         Self {
             context_chars: default_tool_output_context_chars(),
+            fallback_argument_chars: default_fallback_tool_argument_chars(),
         }
     }
 }
@@ -3028,6 +3040,10 @@ pub enum CompactionBackend {
 
 const fn default_tool_output_context_chars() -> usize {
     4_000
+}
+
+const fn default_fallback_tool_argument_chars() -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(6_000).expect("fallback tool argument limit is non-zero")
 }
 
 const fn default_streaming_no_progress_warning_secs() -> u64 {
@@ -4391,6 +4407,12 @@ fn write_model_tool_output_toml(output: &mut String, tool_output: &ToolOutputCon
     output.push_str("[model.tool_output]\n");
     writeln!(output, "context_chars = {}", tool_output.context_chars)
         .expect("writing to string should not fail");
+    writeln!(
+        output,
+        "fallback_argument_chars = {}",
+        tool_output.fallback_argument_chars
+    )
+    .expect("writing to string should not fail");
     output.push('\n');
 }
 
@@ -4837,6 +4859,14 @@ fn write_system_prompt_toml(output: &mut String, system_prompt: &SystemPromptCon
     if let Some(max_chars) = system_prompt.repository_invariants_max_chars {
         writeln!(output, "repository_invariants_max_chars = {max_chars}").expect("write to string");
     }
+    if system_prompt.git_status_max_chars != default_git_status_max_chars() {
+        writeln!(
+            output,
+            "git_status_max_chars = {}",
+            system_prompt.git_status_max_chars
+        )
+        .expect("write to string");
+    }
     output.push('\n');
     if system_prompt.sections != SystemPromptSectionsConfig::default() {
         output.push_str("[system_prompt.sections]\n");
@@ -5180,13 +5210,9 @@ fn write_skills_toml(output: &mut String, skills: &SkillsConfig) {
         )
         .expect("write to string");
     }
-    if skills.max_resource_file_bytes != default_skill_resource_file_bytes() {
-        writeln!(
-            output,
-            "max_resource_file_bytes = {}",
-            skills.max_resource_file_bytes
-        )
-        .expect("write to string");
+    if skills.preview_max_chars != default_skill_preview_chars() {
+        writeln!(output, "preview_max_chars = {}", skills.preview_max_chars)
+            .expect("write to string");
     }
     if !skills.follow_symlinks {
         output.push_str("follow_symlinks = false\n");
@@ -6783,7 +6809,12 @@ disabled = ["vim_edit.apply"]
         let mut config = BcodeConfig::default();
         config.system_prompt.repository_instructions_max_chars = std::num::NonZeroUsize::new(6_000);
         config.system_prompt.repository_invariants_max_chars = std::num::NonZeroUsize::new(8_000);
+        config.system_prompt.git_status_max_chars = std::num::NonZeroUsize::new(12_000).unwrap();
         config.system_prompt.sections.repository_invariants = false;
+        config.skills.max_skill_file_bytes = std::num::NonZeroU64::new(512_000).unwrap();
+        config.skills.preview_max_chars = std::num::NonZeroUsize::new(4_000).unwrap();
+        config.model.tool_output.fallback_argument_chars =
+            std::num::NonZeroUsize::new(9_000).unwrap();
 
         let rendered = super::config_to_toml(&config);
 
@@ -6793,6 +6824,19 @@ disabled = ["vim_edit.apply"]
         );
         assert!(
             rendered.contains("repository_invariants_max_chars = 8000"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("git_status_max_chars = 12000"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("max_skill_file_bytes = 512000"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("preview_max_chars = 4000"), "{rendered}");
+        assert!(
+            rendered.contains("fallback_argument_chars = 9000"),
             "{rendered}"
         );
         assert!(
@@ -6809,6 +6853,13 @@ disabled = ["vim_edit.apply"]
             parsed.system_prompt.repository_invariants_max_chars,
             std::num::NonZeroUsize::new(8_000)
         );
+        assert_eq!(parsed.system_prompt.git_status_max_chars.get(), 12_000);
+        assert_eq!(parsed.skills.max_skill_file_bytes.get(), 512_000);
+        assert_eq!(parsed.skills.preview_max_chars.get(), 4_000);
+        assert_eq!(
+            parsed.model.tool_output.fallback_argument_chars.get(),
+            9_000
+        );
         assert!(!parsed.system_prompt.sections.repository_invariants);
     }
 
@@ -6822,6 +6873,15 @@ disabled = ["vim_edit.apply"]
         );
         assert!(toml::from_str::<BcodeConfig>("[skills]\nmax_context_bytes = 0\n").is_err());
         assert!(toml::from_str::<BcodeConfig>("[skills.prompt]\nmax_bytes = 0\n").is_err());
+        assert!(
+            toml::from_str::<BcodeConfig>("[system_prompt]\ngit_status_max_chars = 0\n").is_err()
+        );
+        assert!(toml::from_str::<BcodeConfig>("[skills]\nmax_skill_file_bytes = 0\n").is_err());
+        assert!(toml::from_str::<BcodeConfig>("[skills]\npreview_max_chars = 0\n").is_err());
+        assert!(
+            toml::from_str::<BcodeConfig>("[model.tool_output]\nfallback_argument_chars = 0\n")
+                .is_err()
+        );
     }
 
     #[test]
