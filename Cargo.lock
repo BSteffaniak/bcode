@@ -2281,6 +2281,7 @@ dependencies = [
  "bcode_session",
  "bcode_session_import",
  "bcode_session_migration",
+ "bcode_session_migration_target",
  "bcode_session_models",
  "bcode_session_view",
  "bcode_session_view_models",

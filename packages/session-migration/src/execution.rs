@@ -2,6 +2,10 @@
 
 use crate::classification::{HistoricalDecode, HistoricalEventMetadata};
 use crate::codec::{HistoricalEnvelope, historical_event_families};
+use crate::{
+    SessionMigrationCanonicalReceiptEvidence, SessionMigrationReceiptRequest,
+    build_session_migration_receipt,
+};
 use bcode_session_models::{RequestContextOccupancy, SessionEvent, SessionEventKind};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
@@ -142,6 +146,59 @@ pub struct NormalizedCanonicalEvent {
     pub retired_known: bool,
     /// Stable metric counter selected by migration-owned classification policy, when applicable.
     pub metric_counter: Option<&'static str>,
+}
+
+/// Build one durable target receipt from policy-free replay facts.
+///
+/// # Errors
+///
+/// Returns an error when the source writer epoch has no released migration plan or receipt
+/// invariants are inconsistent.
+pub fn build_target_receipt(
+    facts: bcode_session_migration_target::MigrationReceiptFacts,
+) -> Result<bcode_session_migration_target::MigrationReceipt, String> {
+    let source_writer_epoch = u32::try_from(facts.source_writer_epoch).map_err(|_| {
+        format!(
+            "source writer epoch {} is out of range",
+            facts.source_writer_epoch
+        )
+    })?;
+    let receipt = build_session_migration_receipt(SessionMigrationReceiptRequest {
+        operation_id: facts
+            .operation_id
+            .unwrap_or_else(|| "explicit-maintenance".to_owned()),
+        source_writer_epoch,
+        source: SessionMigrationCanonicalReceiptEvidence {
+            event_count: facts.event_count,
+            event_tail: facts.event_tail,
+            event_digest_sha256: facts.replay.source_payload_digest_sha256,
+        },
+        target: SessionMigrationCanonicalReceiptEvidence {
+            event_count: facts.event_count,
+            event_tail: facts.event_tail,
+            event_digest_sha256: facts.target_payload_digest_sha256,
+        },
+        converted_events: facts.replay.converted_events,
+        retired_known_events: facts.replay.retired_known_events,
+        completed_at_ms: facts.completed_at_ms,
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(bcode_session_migration_target::MigrationReceipt {
+        operation_id: receipt.operation_id,
+        session_id: facts.session_id,
+        source_writer_epoch: receipt.source_writer_epoch,
+        target_writer_epoch: receipt.target_writer_epoch,
+        migration_step_ids: receipt.migration_step_ids,
+        source_event_count: receipt.source_event_count,
+        source_event_tail: receipt.source_event_tail,
+        source_payload_digest_sha256: receipt.source_event_digest_sha256,
+        target_event_count: receipt.target_event_count,
+        target_event_tail: receipt.target_event_tail,
+        target_payload_digest_sha256: receipt.target_event_digest_sha256,
+        converted_events: receipt.converted_events,
+        retired_known_events: receipt.retired_known_events,
+        completed_at_ms: receipt.completed_at_ms,
+    })
 }
 
 /// Normalize one source row using migration-owned historical policy.

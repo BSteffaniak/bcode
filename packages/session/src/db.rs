@@ -753,10 +753,13 @@ impl SessionDb {
             metrics,
             progress,
             None,
-            Arc::new(|row| {
-                bcode_session_migration::normalize_canonical_row(row)
-                    .map_err(|error| error.to_string())
-            }),
+            bcode_session_migration_target::MigrationPolicyCallbacks {
+                normalize: Arc::new(|row| {
+                    bcode_session_migration::normalize_canonical_row(row)
+                        .map_err(|error| error.to_string())
+                }),
+                build_receipt: Arc::new(bcode_session_migration::build_target_receipt),
+            },
         )
         .await
     }
@@ -775,7 +778,7 @@ impl SessionDb {
         metrics: MetricsRegistry,
         progress: Option<SessionMigrationProgressCallback>,
         operation_id: Option<bcode_session_models::SessionOpenOperationId>,
-        normalizer: bcode_session_migration_target::CanonicalNormalizer,
+        policy: bcode_session_migration_target::MigrationPolicyCallbacks,
     ) -> SessionDbResult<Self> {
         Self::migrate_turso_in_root_observed_with_fault(
             session_id,
@@ -785,7 +788,7 @@ impl SessionDb {
             metrics,
             progress,
             operation_id,
-            normalizer,
+            policy,
             MigrationFaultPhase::Disabled,
         )
         .await
@@ -800,7 +803,7 @@ impl SessionDb {
         metrics: MetricsRegistry,
         progress: Option<SessionMigrationProgressCallback>,
         operation_id: Option<bcode_session_models::SessionOpenOperationId>,
-        normalizer: bcode_session_migration_target::CanonicalNormalizer,
+        policy: bcode_session_migration_target::MigrationPolicyCallbacks,
         fault: MigrationFaultPhase,
     ) -> SessionDbResult<Self> {
         let path = session_db_path(root, session_id);
@@ -828,7 +831,7 @@ impl SessionDb {
             session_id,
             &metrics,
             progress.as_ref(),
-            &normalizer,
+            &policy.normalize,
             fault,
         )
         .await?;
@@ -838,6 +841,7 @@ impl SessionDb {
             source_writer_epoch,
             operation_id,
             &migration_outcome,
+            &policy.build_receipt,
         )
         .await?;
         inject_migration_fault(fault, MigrationFaultPhase::Receipt)?;
@@ -2299,12 +2303,8 @@ async fn build_target_migration_receipt(
     source_writer_epoch: u64,
     operation_id: Option<bcode_session_models::SessionOpenOperationId>,
     migration_outcome: &MigrationReplayOutcome,
+    builder: &bcode_session_migration_target::MigrationReceiptBuilder,
 ) -> SessionDbResult<bcode_session_migration_target::MigrationReceipt> {
-    let source_writer_epoch =
-        u32::try_from(source_writer_epoch).map_err(|_| SessionDbError::WriterIncompatible {
-            actual: Some(source_writer_epoch),
-            expected: u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH),
-        })?;
     let rows = db
         .select("events")
         .columns(&["event_seq", "payload"])
@@ -2316,54 +2316,27 @@ async fn build_target_migration_receipt(
         .last()
         .map(|row| required_non_negative_u64(row, "event_seq"))
         .transpose()?;
-    let payloads = rows
-        .iter()
-        .map(|row| required_string(row, "payload"))
-        .collect::<SessionDbResult<Vec<_>>>()?;
-    let digest =
-        bcode_session_migration::ordered_payload_digest(payloads.iter().map(String::as_str));
-    let receipt = bcode_session_migration::build_session_migration_receipt(
-        bcode_session_migration::SessionMigrationReceiptRequest {
-            operation_id: operation_id
-                .map_or_else(|| "explicit-maintenance".to_owned(), |id| id.to_string()),
-            source_writer_epoch,
-            source: bcode_session_migration::SessionMigrationCanonicalReceiptEvidence {
-                event_count,
-                event_tail,
-                event_digest_sha256: migration_outcome
-                    .evidence
-                    .source_payload_digest_sha256
-                    .clone(),
-            },
-            target: bcode_session_migration::SessionMigrationCanonicalReceiptEvidence {
-                event_count,
-                event_tail,
-                event_digest_sha256: digest,
-            },
-            converted_events: migration_outcome.evidence.converted_events.clone(),
-            retired_known_events: migration_outcome.evidence.retired_known_events.clone(),
-            completed_at_ms: bcode_session_models::current_unix_timestamp_ms(),
-        },
-    )
-    .map_err(|error| SessionDbError::MigrationHistoryIncompatible {
-        reason: error.to_string(),
-    })?;
-    Ok(bcode_session_migration_target::MigrationReceipt {
-        operation_id: receipt.operation_id,
+    let mut digest = Sha256::new();
+    for row in &rows {
+        let payload = required_string(row, "payload")?;
+        digest.update(
+            u64::try_from(payload.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        digest.update(payload.as_bytes());
+    }
+    builder(bcode_session_migration_target::MigrationReceiptFacts {
+        operation_id: operation_id.map(|id| id.to_string()),
         session_id,
-        source_writer_epoch: receipt.source_writer_epoch,
-        target_writer_epoch: receipt.target_writer_epoch,
-        migration_step_ids: receipt.migration_step_ids,
-        source_event_count: receipt.source_event_count,
-        source_event_tail: receipt.source_event_tail,
-        source_payload_digest_sha256: receipt.source_event_digest_sha256,
-        target_event_count: receipt.target_event_count,
-        target_event_tail: receipt.target_event_tail,
-        target_payload_digest_sha256: receipt.target_event_digest_sha256,
-        converted_events: receipt.converted_events,
-        retired_known_events: receipt.retired_known_events,
-        completed_at_ms: receipt.completed_at_ms,
+        source_writer_epoch,
+        event_count,
+        event_tail,
+        target_payload_digest_sha256: format!("{:x}", digest.finalize()),
+        replay: migration_outcome.evidence.clone(),
+        completed_at_ms: bcode_session_models::current_unix_timestamp_ms(),
     })
+    .map_err(|reason| SessionDbError::MigrationHistoryIncompatible { reason })
 }
 
 async fn set_storage_writer_contract(db: &dyn Database, writer_epoch: u32) -> SessionDbResult<()> {
@@ -2443,7 +2416,7 @@ async fn migrate_session_storage(
 
 struct MigrationReplayOutcome {
     tail: Option<SessionEvent>,
-    evidence: bcode_session_migration::MigrationClassificationEvidence,
+    evidence: bcode_session_migration_target::ReplayEvidence,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2565,7 +2538,7 @@ async fn rebuild_migration_projections(
     metrics.add_counter("session.migration.projected_events_total", event_total);
     Ok(MigrationReplayOutcome {
         tail,
-        evidence: bcode_session_migration::MigrationClassificationEvidence {
+        evidence: bcode_session_migration_target::ReplayEvidence {
             source_payload_digest_sha256: format!("{:x}", source_digest.finalize()),
             converted_events,
             retired_known_events,
@@ -8195,10 +8168,13 @@ mod tests {
                     MetricsRegistry::disabled(),
                     None,
                     None,
-                    Arc::new(|row| {
-                bcode_session_migration::normalize_canonical_row(row)
-                    .map_err(|error| error.to_string())
-            }),
+                    bcode_session_migration_target::MigrationPolicyCallbacks {
+                normalize: Arc::new(|row| {
+                    bcode_session_migration::normalize_canonical_row(row)
+                        .map_err(|error| error.to_string())
+                }),
+                build_receipt: Arc::new(bcode_session_migration::build_target_receipt),
+            },
                     fault,
                 )
                 .await,

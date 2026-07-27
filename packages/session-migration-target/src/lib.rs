@@ -20,6 +20,57 @@ use std::sync::Arc;
 pub type CanonicalNormalizer =
     Arc<dyn Fn(&CanonicalRow) -> Result<NormalizedCanonicalRow, String> + Send + Sync + 'static>;
 
+/// Policy-free replay audit facts collected while materializing current storage.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReplayEvidence {
+    /// Ordered source payload digest.
+    pub source_payload_digest_sha256: String,
+    /// Converted records keyed by migration-owned source identity.
+    pub converted_events: BTreeMap<String, u64>,
+    /// Retired-known records keyed by migration-owned source identity.
+    pub retired_known_events: BTreeMap<String, u64>,
+}
+
+/// Policy-free facts supplied to the migration-owned receipt builder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MigrationReceiptFacts {
+    /// Stable operation identity, when execution is operation-backed.
+    pub operation_id: Option<String>,
+    /// Migrated session identity.
+    pub session_id: SessionId,
+    /// Source writer epoch observed before migration.
+    pub source_writer_epoch: u64,
+    /// Canonical event count after current materialization.
+    pub event_count: u64,
+    /// Canonical tail after current materialization.
+    pub event_tail: Option<u64>,
+    /// Ordered target payload digest.
+    pub target_payload_digest_sha256: String,
+    /// Replay classification facts produced by the policy-owned normalizer.
+    pub replay: ReplayEvidence,
+    /// Completion timestamp.
+    pub completed_at_ms: u64,
+}
+
+/// Migration-owned receipt construction supplied to a current target.
+pub type MigrationReceiptBuilder =
+    Arc<dyn Fn(MigrationReceiptFacts) -> Result<MigrationReceipt, String> + Send + Sync + 'static>;
+
+/// Migration-owned callbacks consumed by policy-free current target execution.
+#[derive(Clone)]
+pub struct MigrationPolicyCallbacks {
+    /// Historical/current canonical normalizer.
+    pub normalize: CanonicalNormalizer,
+    /// Durable receipt builder.
+    pub build_receipt: MigrationReceiptBuilder,
+}
+
+impl std::fmt::Debug for MigrationPolicyCallbacks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("MigrationPolicyCallbacks")
+    }
+}
+
 /// One canonical row normalized by migration-owned policy for current-target ingestion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedCanonicalRow {
