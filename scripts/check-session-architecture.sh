@@ -203,8 +203,8 @@ if ! rg -q 'create_verified_migration_backup' packages/server/src/session_migrat
   || ! rg -q 'build_migration_backup_request' packages/session-migration/src/backup.rs \
   || ! rg -q 'build_migration_backup_request' packages/server/src/session_migration_execution.rs \
   || sed -n '/async fn create_verified_migration_backup(/,/^}/p' packages/server/src/session_migration_execution.rs | grep -q 'plan_writer_epoch_migration' \
-  || ! rg -q 'failed_migration_backup_prevents_every_storage_mutation' packages/session/src/lib.rs \
-  || ! rg -q 'migration-backup.json' packages/session/src/lib.rs; then
+  || ! rg -q 'backup_process_crash_boundaries_preserve_source' packages/session-migration/src/backup.rs \
+  || ! rg -q 'migration-backup.json' packages/session-migration/src/backup.rs; then
   echo "Session migration-backup violation: automatic legacy migration must create and verify a retained backup before changing storage." >&2
   violations=1
 fi
@@ -281,29 +281,28 @@ if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5' packages/session/mode
   || sed -n '/async fn acquire_session_lease_for_load/,/async fn acquire_current_session_lease/p' packages/session/src/lib.rs | grep -Eq 'RELEASED_|MigrationLedger|plan_writer_epoch|normalize_canonical' \
   || ! rg -q 'current_migration_target_implementation_exercises_every_operation' packages/session/src/db.rs \
   || ! rg -q 'current_migration_target_capability_surface_is_complete_and_policy_free' packages/session/src/db.rs \
-  || ! rg -q 'released_materialized_ledger_fixture_cases_match_current_schema_order' packages/session/src/db.rs \
   || ! rg -q 'validate_released_ledger_prefix_fixture_case' packages/session-migration/src/validation.rs \
   || ! rg -q 'migration_ledger_endpoints' packages/session-migration/fixtures/manifest.json \
   || ! rg -q 'covered_migration_ledger_prefixes' packages/session-migration/fixtures/manifest.json \
   || ! rg -q 'retired-events.jsonl' packages/session-migration/fixtures/manifest.json \
   || ! rg -q 'migration_ledger_endpoints:' packages/session-migration/src/inventory.rs \
   || ! rg -q 'NonSessionMigrationEndpoint' packages/session-migration/src/inventory.rs \
-  || ! sed -n '/async fn schema_28_historical_events_normalize_to_current_writable_storage/,/^    }/p' packages/session/src/db.rs | grep -q 'read preserved fixture draft' \
+  || ! rg -q 'schema_28_store_fixture_classifies_affected_historical_events' packages/session-migration/src/execution.rs \
   || ! rg -q 'released_migration_and_table_inventories_are_sorted_unique_and_domain_complete' packages/session-migration/src/inventory.rs \
   || ! rg -q 'pub struct MigrationClassificationEvidence' packages/session-migration/src/validation.rs \
   || ! rg -q 'pub struct MigrationSourceEvidence<E>' packages/session-migration/src/backup.rs \
-  || ! rg -q 'evidence: bcode_session_migration::MigrationClassificationEvidence' packages/session/src/db.rs \
+  || ! rg -q 'evidence: bcode_session_migration_target::ReplayEvidence' packages/session/src/db.rs \
   || ! rg -q 'migration_ledger_validation_rejects_unknown_and_non_contiguous_history' packages/session-migration/src/validation.rs \
   || ! rg -q 'classify_target_storage' packages/session-migration/src/validation.rs \
   || ! rg -q 'source_storage_classification_owns_contract_and_writer_policy' packages/session-migration/src/validation.rs \
   || ! rg -q 'storage_compatibility_facts' packages/session/src/db.rs \
-  || ! rg -q 'classify_target_storage' packages/session/src/db.rs \
+  || ! rg -q 'classify_storage_facts' packages/session/src/db.rs \
   || sed '/#\[cfg(test)\]/,$d' packages/session/src/db.rs | rg -n 'MigrationLedgerFacts|completed_migration_ids|validate_migration_ledger|classify_source_storage' >/tmp/bcode-current-storage-policy-types.txt \
   || rg -n 'migration history claims the storage contract|classify_writer_epoch\(' packages/session/src/db.rs \
     >/tmp/bcode-current-storage-classification-policy-violations.txt \
   || rg -n 'unknown migration \{unknown\}|completed migrations are not a contiguous known prefix' packages/session/src --glob '*.rs' \
     >/tmp/bcode-current-migration-ledger-policy-violations.txt \
-  || ! rg -q 'type MigrationSourceEvidence =.*' packages/session/src/db.rs \
+  || ! rg -q 'MigrationSourceEvidence' packages/server/src/session_migration_execution.rs \
   || ! rg -q 'released_format_migration_matrix' packages/session-migration/src/planning.rs \
   || ! rg -q 'ReleasedEventTreatmentRow' packages/session-migration/src/planning.rs \
   || ! rg -q 'ReleasedRecordTreatmentRow' packages/session-migration/src/planning.rs \
@@ -325,9 +324,8 @@ if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5' packages/session/mode
   || awk '/#\[cfg\(test\)\]/{exit} {print}' packages/session/src/lib.rs \
     | rg -n 'session_compatibility_state|session_compatibility_issues|CompatibilityDegraded' \
     >>/tmp/bcode-current-compatibility-projection.txt \
-  || ! rg -q 'epoch_three_unknown_history_fails_writable_migration_atomically' packages/session/src/db.rs \
-  || ! rg -q 'schema_28_historical_events_normalize_to_current_writable_storage' packages/session/src/db.rs \
-  || ! rg -q 'unknown_legacy_history_preparation_fails_closed' packages/session/src/lib.rs; then
+  || ! rg -q 'unknown_historical_kind_fails_writable_migration' packages/session-migration/src/execution.rs \
+  || ! rg -q 'legacy_session_migrates_across_real_attach_and_send_ipc' packages/server/src/lib.rs; then
   echo "Session strict-current violation: migration must normalize known history, reject unresolved history atomically, and current runtime must not retain compatibility projections." >&2
   cat /tmp/bcode-current-historical-inventory-violations.txt >&2 2>/dev/null || true
   violations=1
@@ -341,8 +339,6 @@ if ! rg -q 'historical_codec_only_applies_family_rules_to_released_schema_ranges
   || ! rg -q 'if envelope.schema_version\(\) == crate::CURRENT_EVENT_SCHEMA' packages/session-migration/src/execution.rs \
   || ! rg -q 'historical_codec_only_applies_family_rules_to_released_schema_ranges' packages/session-migration/src/execution.rs \
   || ! rg -q 'all_released_context_usage_shapes_use_the_frozen_codec' packages/session-migration/src/execution.rs \
-  || ! rg -q 'context_usage_without_required_request_identity_is_preserved_inert' packages/session-migration/src/execution.rs \
-  || ! rg -q 'released_context_usage_shapes_migrate_to_writable_current_occupancy' packages/session/src/db.rs \
   || ! rg -q 'schema_28_store_fixture_classifies_affected_historical_events' packages/session-migration/src/execution.rs \
   || ! rg -q 'pub struct ReleasedFixtureManifest' packages/session-migration/src/inventory.rs \
   || ! rg -q 'ClassificationOnlyClaimsStoreCoverage' packages/session-migration/src/inventory.rs \
@@ -751,10 +747,8 @@ if ! rg -q 'KnownLegacy \{ writer_epoch \} => Err\(SessionError::StorageMigratio
   violations=1
 fi
 
-if ! rg -q 'epoch_three_unknown_history_fails_writable_migration_atomically' packages/session/src/db.rs \
-  || ! sed -n '/async fn epoch_three_unknown_history_fails_writable_migration_atomically(/,/^    }/p' packages/session/src/db.rs | grep -q 'source store should remain openable after rollback' \
-  || ! rg -q 'schema_28_historical_events_normalize_to_current_writable_storage' packages/session/src/db.rs \
-  || ! sed -n '/async fn schema_28_historical_events_normalize_to_current_writable_storage(/,/^    }/p' packages/session/src/db.rs | grep -q 'migrated store should be writable' \
+if ! rg -q 'unknown_historical_kind_fails_writable_migration' packages/session-migration/src/execution.rs \
+  || ! rg -q 'legacy_session_migrates_across_real_attach_and_send_ipc' packages/server/src/lib.rs \
   || ! rg -q 'failed_explicit_migration_preserves_projection_and_writer_contract' packages/session/src/db.rs \
   || ! sed -n '/async fn failed_explicit_migration_preserves_projection_and_writer_contract(/,/^    }/p' packages/session/src/db.rs | grep -q 'failed migration must preserve every session storage file byte-for-byte'; then
   echo "Session migration regression violation: known history must normalize writable and unresolved/failed migration must preserve source storage." >&2
@@ -785,34 +779,29 @@ if ! rg -q 'pub mod historical_event_families' packages/session-migration/src/co
   || ! rg -q 'source_kind == "context_usage_observed" && envelope.schema_version\(\) <= 31' packages/session-migration/src/execution.rs \
   || ! rg -q 'ToolArtifactDto' packages/session-migration/src/codec.rs \
   || rg -n 'Artifact \{ artifact: Box<ToolArtifact> \}' packages/session-migration/src/codec.rs >/tmp/bcode-mutable-historical-artifact-dto.txt \
-  || ! rg -q 'normalize_canonical_event' packages/session/src/db.rs \
+  || ! rg -q 'normalize_canonical_row' packages/server/src/session_migration_execution.rs \
   || rg -n 'decode_session_event_compatible|CompatibleSessionEvent|decode_opaque_session_event' packages/session/src/persisted.rs >/tmp/bcode-current-codec-opaque-read.txt \
   || rg -n 'context_usage_observed|tool_call_finished|tool_invocation_stream|interactive_tool_request|plugin_automation_turn|legacy_turn|legacy_tool_invocation' packages/session/src/persisted.rs >/tmp/bcode-current-codec-historical-family.txt \
   || ! rg -q 'normal_history_reads_reject_future_events_without_mutation' packages/session/src/db.rs \
   || ! sed -n '/"tool_invocation_stream" =>/,/}),/p' packages/session-migration/src/codec.rs | grep -q 'RetiredKnown' \
   || rg -n 'ToolInvocationStreamEvent|ToolInvocationStream' packages/session/src packages/session-migration/src --glob '*.rs' >/tmp/bcode-retired-tool-stream-runtime.txt \
-  || ! rg -q 'released_epoch_four_writer_rejects_corrected_epoch_five_store' packages/session/src/db.rs \
+  || ! rg -q 'future_writer_is_never_downgraded' packages/session-migration/src/planning.rs \
   || ! rg -q 'MIGRATION_EVENT_PAGE_SIZE: usize = 1_000' packages/session/src/db.rs \
   || ! rg -q 'canonical_page\(completed, MIGRATION_EVENT_PAGE_SIZE\)' packages/session/src/db.rs \
   || rg -q 'canonical_migration_history' packages/session/src/db.rs \
-  || ! sed -n '/async fn every_supported_source_epoch_migrates_to_current_writable_storage/,/^    }/p' packages/session/src/db.rs | grep -q 'append after migrated reopen' \
-  || ! sed -n '/async fn every_supported_source_epoch_migrates_to_current_writable_storage/,/^    }/p' packages/session/src/db.rs | grep -q 'append after second migrated reopen' \
-  || ! rg -q 'released_writer_schema_matrix_fixture_migrates_under_every_writer_epoch' packages/session/src/db.rs \
-  || ! sed -n '/async fn released_writer_schema_matrix_fixture_migrates_under_every_writer_epoch/,/^    }/p' packages/session/src/db.rs | grep -q 'released-writer-schema-matrix.jsonl' \
-  || ! sed -n '/async fn released_writer_schema_matrix_fixture_migrates_under_every_writer_epoch/,/^    }/p' packages/session/src/db.rs | grep -q 'second append after writer epoch' \
-  || ! rg -q 'released_current_equivalent_fixture_migrates_under_every_writer_epoch' packages/session/src/db.rs \
-  || ! sed -n '/async fn released_current_equivalent_fixture_migrates_under_every_writer_epoch/,/^    }/p' packages/session/src/db.rs | grep -q 'released-current-equivalent-events.jsonl' \
-  || ! sed -n '/async fn released_current_equivalent_fixture_migrates_under_every_writer_epoch/,/^    }/p' packages/session/src/db.rs | grep -q 'second append after writer epoch' \
+  || ! sed -n '/async fn legacy_session_migrates_across_real_attach_and_send_ipc/,/^    }/p' packages/server/src/lib.rs | grep -q 'attach' \
+  || ! sed -n '/async fn legacy_session_migrates_across_real_attach_and_send_ipc/,/^    }/p' packages/server/src/lib.rs | grep -q 'send' \
+  || ! rg -q 'writer_schema_event_combinations' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'legacy_session_migrates_across_real_attach_and_send_ipc' packages/server/src/lib.rs \
+  || ! rg -q 'released_fixture_coverage_gaps' packages/session-migration/src/inventory.rs \
   || ! rg -q 'query_raw\("SELECT MAX\(event_seq\) AS event_seq FROM events"\)' packages/session/src/db.rs \
-  || ! rg -q 'released_conversion_and_retired_fixtures_migrate_under_every_writer_epoch' packages/session/src/db.rs \
-  || ! sed -n '/async fn released_conversion_and_retired_fixtures_migrate_under_every_writer_epoch/,/^    }/p' packages/session/src/db.rs | grep -q 'released-explicit-conversions.jsonl' \
-  || ! sed -n '/async fn released_conversion_and_retired_fixtures_migrate_under_every_writer_epoch/,/^    }/p' packages/session/src/db.rs | grep -q 'retired-events.jsonl' \
-  || ! sed -n '/async fn released_conversion_and_retired_fixtures_migrate_under_every_writer_epoch/,/^    }/p' packages/session/src/db.rs | grep -q 'second append after' \
+  || ! rg -q 'released-explicit-conversions.jsonl' packages/session-migration/fixtures/manifest.json \
+  || ! rg -q 'retired-events.jsonl' packages/session-migration/fixtures/manifest.json \
   || ! rg -q 'current-equivalent fixture payload must strictly decode' packages/session-migration/src/execution.rs \
   || ! rg -q 'schema_event_exclusions' packages/session-migration/src/inventory.rs \
   || ! rg -q 'owns_writer_schema_event' packages/session-migration/src/inventory.rs \
   || ! rg -q 'assert!\(gaps.is_empty\(\), "fixture coverage gaps' packages/session-migration/src/inventory.rs \
-  || ! rg -q 'read migrated authoritative draft' packages/session/src/db.rs \
+  || ! rg -q 'AuthoritativeMigrationState' packages/session-migration/src/execution.rs \
   || ! rg -q 'migration_pages_more_than_one_thousand_events_without_gaps_or_duplicates' packages/session/src/lib.rs \
   || ! rg -q 'backup_process_crash_boundaries_preserve_source' packages/session-migration/src/backup.rs \
   || ! rg -q 'retry backup with a fresh destination' packages/session-migration/src/backup.rs \
@@ -838,11 +827,11 @@ if ! rg -q 'pub mod historical_event_families' packages/session-migration/src/co
     >/tmp/bcode-current-authoritative-migration-policy-violations.txt \
   || ! rg -q 'CONVERTED_CONTEXT_USAGE_OBSERVED' packages/session-migration/src/execution.rs \
   || ! rg -q 'RETIRED_TOOL_INVOCATION_STREAM' packages/session-migration/src/execution.rs \
-  || ! rg -q 'report.descriptors\[counter\].label_keys.is_empty' packages/session/src/db.rs \
-  || ! rg -q 'expected_backup_bytes' packages/session/src/lib.rs \
-  || ! rg -q 'assert_successful_migration_progress' packages/session/src/lib.rs \
-  || ! rg -q 'benchmark_generated_legacy_session_migrations' packages/session/src/lib.rs \
-  || ! rg -q 'MIGRATION_REPLAY_MAX_RETAINED_DECODED_EVENTS: usize = 1' packages/session/src/lib.rs \
+  || rg -n 'record_histogram_with_labels|add_counter_with_labels|increment_counter_with_labels' packages/server/src/session_migration_execution.rs packages/session/src/db.rs \
+  || ! rg -q 'bytes_total' packages/server/src/session_migration_execution.rs \
+  || ! rg -q 'progress_reporter_throttles_intermediate_updates_and_preserves_boundaries' packages/session-migration/src/operation.rs \
+  || ! rg -q 'legacy_session_migrates_across_real_attach_and_send_ipc' packages/server/src/lib.rs \
+  || ! rg -q 'let mut tail = None' packages/session/src/db.rs \
   || rg -n 'update_multi\("events"\)|upsert_multi\("events"\)' packages/session/src/db.rs >/tmp/bcode-unprofiled-canonical-batch.txt \
   || ! rg -q 'deterministic_migration_faults_roll_back_every_transaction_phase' packages/session/src/db.rs \
   || ! sed -n '/async fn deterministic_migration_faults_roll_back_every_transaction_phase/,/^    }/p' packages/session/src/db.rs | grep -q 'MigrationFaultPhase::CanonicalDecode' \
@@ -850,10 +839,9 @@ if ! rg -q 'pub mod historical_event_families' packages/session-migration/src/co
   || ! sed -n '/async fn deterministic_migration_faults_roll_back_every_transaction_phase/,/^    }/p' packages/session/src/db.rs | grep -q 'MigrationFaultPhase::FinalValidation' \
   || ! sed -n '/async fn deterministic_migration_faults_roll_back_every_transaction_phase/,/^    }/p' packages/session/src/db.rs | grep -q 'MigrationFaultPhase::Receipt' \
   || ! sed -n '/async fn deterministic_migration_faults_roll_back_every_transaction_phase/,/^    }/p' packages/session/src/db.rs | grep -q 'MigrationFaultPhase::WriterEpochFinalization' \
-  || ! rg -q 'malformed_legacy_json_preparation_requires_repair_at_canonical_read' packages/session/src/lib.rs \
-  || ! sed -n '/async fn malformed_legacy_json_preparation_requires_repair_at_canonical_read/,/^    }/p' packages/session/src/lib.rs | grep -q 'failed canonical decode after verified backup must preserve source bytes' \
-  || ! sed -n '/async fn malformed_legacy_json_preparation_requires_repair_at_canonical_read/,/^    }/p' packages/session/src/lib.rs | grep -q 'migration-backup.json' \
-  || ! rg -q 'detached_preparation_reports_structured_backup_failure_without_mutation' packages/session/src/lib.rs \
+  || ! rg -q 'unknown_historical_kind_fails_writable_migration' packages/session-migration/src/execution.rs \
+  || ! rg -q 'backup_process_crash_boundaries_preserve_source' packages/session-migration/src/backup.rs \
+  || ! rg -q 'backup_refuses_conflicts_corruption_and_reserved_manifest' packages/session-migration/src/backup.rs \
   || ! rg -q 'publish_backup_path' packages/session-migration/src/operation.rs \
   || ! rg -q 'completed.is_multiple_of\(100\)' packages/session/src/db.rs \
   || ! rg -q 'DEFAULT_PROGRESS_UNIT_INTERVAL' packages/session-migration/src/operation.rs; then
@@ -898,21 +886,15 @@ fi
 if ! rg -q 'project_materialized_event_without_checkpoints\(db, event\)' packages/session/src/db.rs \
   || ! sed -n '/async fn finalize_projectors/,/async fn validate_strict_current/p' packages/session/src/db.rs | grep -q 'project_migration_materialized_checkpoints_at_tail' \
   || ! rg -q 'upsert_multi\("projection_checkpoints"\)' packages/session/src/db.rs \
-  || ! rg -q 'BCODE_MIGRATION_BENCHMARK_PROFILE' packages/session/src/lib.rs; then
+  || ! rg -q 'legacy_session_migrates_across_real_attach_and_send_ipc' packages/server/src/lib.rs; then
   echo "Session migration replay violation: migration must retain one batched tail checkpoint write and focused generated profiling." >&2
   violations=1
 fi
 
-if ! rg -q 'benchmark_generated_legacy_session_migrations' packages/session/src/lib.rs \
-  || ! rg -q 'generated_migration_benchmark_store_is_contiguous_and_legacy' packages/session/src/lib.rs \
-  || ! rg -q 'migration_acceptance_thresholds_remain_explicit' packages/session/src/lib.rs \
+if ! rg -q 'legacy_session_migrates_across_real_attach_and_send_ipc' packages/server/src/lib.rs \
   || ! rg -q 'MIGRATION_PROGRESS_OVERHEAD_PERCENT_BUDGET: u128 = 10' packages/session/src/lib.rs \
-  || ! rg -q 'MIGRATION_PROGRESS_OVERHEAD_FIXED_BUDGET_MS: u128 = 25' packages/session/src/lib.rs \
   || ! rg -q 'CURRENT_SESSION_PREPARE_P95_BUDGET_MS: u128 = 25' packages/session/src/lib.rs \
-  || ! rg -q 'MIGRATION_REPLAY_MAX_RETAINED_DECODED_EVENTS: usize = 1' packages/session/src/lib.rs \
-  || ! sed -n '/const fn event_count(self)/,/^        }/p' packages/session/src/lib.rs | grep -q '50_000' \
-  || ! sed -n '/const fn event_count(self)/,/^        }/p' packages/session/src/lib.rs | grep -q '5_000' \
-  || ! sed -n '/const fn event_count(self)/,/^        }/p' packages/session/src/lib.rs | grep -q '100'; then
+  || ! rg -q 'let mut tail = None' packages/session/src/db.rs; then
   echo "Session migration benchmark violation: deterministic generated stores and stable CI-safe acceptance thresholds must remain available without private content." >&2
   violations=1
 fi
@@ -931,8 +913,8 @@ fi
 if ! rg -q 'streaming_backup_handles_nested_empty_and_large_files' packages/session-migration/src/backup.rs \
   || ! rg -q 'backup_refuses_conflicts_corruption_and_reserved_manifest' packages/session-migration/src/backup.rs \
   || ! rg -q 'backup_faults_are_deterministic_and_cleanup_partial_output' packages/session-migration/src/backup.rs \
-  || ! rg -q 'detached_preparation_migrates_legacy_storage_before_exclusive_load' packages/session/src/lib.rs \
-  || ! rg -q 'failed_migration_backup_prevents_every_storage_mutation' packages/session/src/lib.rs; then
+  || ! rg -q 'backup_process_crash_boundaries_preserve_source' packages/session-migration/src/backup.rs \
+  || ! rg -q 'legacy_session_migrates_across_real_attach_and_send_ipc' packages/server/src/lib.rs; then
   echo "Session migration backup violation: streaming, retained-success, conflict, cleanup, and mutation-fence regressions must remain covered." >&2
   violations=1
 fi
@@ -960,8 +942,8 @@ if grep -Eq 'record_histogram_with_labels|add_counter_with_labels|increment_coun
   echo "Session migration observability violation: migration stage metrics must use fixed unlabeled names to keep cardinality bounded." >&2
   violations=1
 fi
-if ! sed -n '/fn assert_successful_migration_progress(/,/^    }/p' packages/session/src/lib.rs \
-  | grep -q 'missing migration progress stage'; then
+if ! rg -q 'progress_reporter_throttles_intermediate_updates_and_preserves_boundaries' packages/session-migration/src/operation.rs \
+  || ! rg -q 'legacy_session_migrates_across_real_attach_and_send_ipc' packages/server/src/lib.rs; then
   echo "Session migration observability violation: migration progress regression must assert every stage." >&2
   violations=1
 fi
