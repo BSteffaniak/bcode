@@ -6,9 +6,21 @@
 //! intentionally keeps Turso-specific details at connection boundaries and uses
 //! `switchy` database traits for migrations and repository operations.
 
-use std::{collections::BTreeMap, fs, path::Path, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
 
 use crate::current_schema::{global_migrations, session_migrations};
+use crate::db_connection::{
+    init_turso_local_with_retry, is_database_lock_error, is_database_lock_error_message,
+};
+use crate::db_event_store::insert_event;
+pub use crate::db_path::{
+    global_catalog_db_path, namespaced_catalog_db_path, session_db_path, session_dir_path,
+};
+pub use crate::db_projection::MaterializedProjection;
+use crate::db_projection::ProjectionCheckpointState;
+use crate::db_validation::{
+    validate_canonical_event_identity, validate_projection_checkpoint_snapshot,
+};
 use crate::persisted::{
     CompatibleSessionEvent, PersistedSessionEventError, decode_session_event,
     decode_session_event_compatible, encode_session_event,
@@ -38,8 +50,6 @@ use thiserror::Error;
 
 const GLOBAL_MIGRATIONS_TABLE: &str = "__bcode_global_migrations";
 const SESSION_MIGRATIONS_TABLE: &str = "__bcode_session_migrations";
-const DATABASE_OPEN_RETRY_ATTEMPTS: u32 = 7;
-const DATABASE_OPEN_INITIAL_RETRY_DELAY: Duration = Duration::from_millis(25);
 
 #[cfg(test)]
 fn abort_at_migration_crash_boundary(boundary: &str) {
@@ -69,8 +79,6 @@ fn inject_migration_fault(
     Ok(())
 }
 
-const DATABASE_OPEN_MAX_RETRY_DELAY: Duration = Duration::from_secs(2);
-const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const MIGRATION_EVENT_PAGE_SIZE: usize = 1_000;
 /// Durable storage writer epoch understood by this session database implementation.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -216,99 +224,6 @@ pub enum ModelContextProjectionStatus {
     Stale { checkpoint: u64, expected: u64 },
     /// Projection state uses an unsupported schema.
     Incompatible { actual: u64, expected: u64 },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MaterializedProjection {
-    /// Projected current session state.
-    SessionState,
-    /// User-authored input history.
-    InputHistory,
-    /// Transcript item spans for UI/history windows.
-    Transcript,
-    /// Active and completed tool-call rows.
-    ToolRuns,
-    /// Generic references from finalized plugin artifacts.
-    ArtifactReferences,
-    /// Runtime-work lifecycle rows.
-    RuntimeWork,
-    /// Authoritative current context occupancy.
-    RequestContextOccupancy,
-}
-
-impl MaterializedProjection {
-    const ALL: [Self; 7] = [
-        Self::SessionState,
-        Self::InputHistory,
-        Self::Transcript,
-        Self::ToolRuns,
-        Self::ArtifactReferences,
-        Self::RuntimeWork,
-        Self::RequestContextOccupancy,
-    ];
-
-    /// Return all checkpointed materialized projections.
-    #[must_use]
-    pub const fn all() -> &'static [Self] {
-        &Self::ALL
-    }
-
-    /// Return the schema version stored with this projection's checkpoint.
-    #[must_use]
-    pub const fn schema_version(self) -> u32 {
-        match self {
-            Self::RequestContextOccupancy => CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION,
-            Self::Transcript | Self::ToolRuns => 2,
-            Self::SessionState
-            | Self::InputHistory
-            | Self::ArtifactReferences
-            | Self::RuntimeWork => 1,
-        }
-    }
-
-    /// Return the stable projection checkpoint name.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::SessionState => "session_state",
-            Self::InputHistory => "input_history",
-            Self::Transcript => "transcript",
-            Self::ToolRuns => "tool_runs",
-            Self::ArtifactReferences => "artifact_references",
-            Self::RuntimeWork => "runtime_work",
-            Self::RequestContextOccupancy => "context_occupancy",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ProjectionCheckpointState {
-    version: u64,
-    checkpoint: u64,
-}
-
-/// Return Bcode's legacy global catalog database path under `root`.
-#[must_use]
-pub fn global_catalog_db_path(root: &Path) -> std::path::PathBuf {
-    root.join("catalog.db")
-}
-
-/// Return a build/compatibility-scoped catalog database path under `root`.
-#[must_use]
-pub fn namespaced_catalog_db_path(root: &Path, namespace: &str) -> std::path::PathBuf {
-    root.join("catalogs").join(namespace).join("catalog.db")
-}
-
-/// Return Bcode's canonical per-session directory under `root`.
-#[must_use]
-pub fn session_dir_path(root: &Path, session_id: SessionId) -> std::path::PathBuf {
-    root.join(session_id.to_string())
-}
-
-/// Return Bcode's default per-session database path for `session_id`.
-#[must_use]
-pub fn session_db_path(root: &Path, session_id: SessionId) -> std::path::PathBuf {
-    session_dir_path(root, session_id).join("session.db")
 }
 
 /// Typed tool-run projection row stored in a per-session database.
@@ -1508,7 +1423,7 @@ impl SessionDb {
                         |payload| decode_session_event(payload).map_err(|error| error.to_string()),
                     ) {
                         Ok(normalized) => {
-                            if let Err(error) = validate_migration_event_identity(
+                            if let Err(error) = validate_canonical_event_identity(
                                 &normalized.event,
                                 sequence,
                                 self.session_id,
@@ -2574,49 +2489,6 @@ impl SessionDb {
     }
 }
 
-async fn init_turso_local_with_retry(
-    path: &Path,
-) -> Result<Box<dyn Database>, switchy::database_connection::InitTursoError> {
-    let mut attempt = 0_u32;
-    let mut delay = DATABASE_OPEN_INITIAL_RETRY_DELAY;
-    loop {
-        match switchy::database_connection::builder()
-            .turso()
-            .with_path(path)
-            .with_busy_timeout(DATABASE_BUSY_TIMEOUT)
-            // Turso's multi-process WAL mode is still experimental and has produced stale
-            // WAL-index sidecars after daemon lifecycle churn. Bcode serializes writes with
-            // database transactions and its session access guard instead of relying on that
-            // experimental sidecar format for correctness.
-            .with_multiprocess_wal(false)
-            .build()
-            .await
-        {
-            Ok(db) => return Ok(db),
-            Err(error)
-                if is_database_lock_error(&error) && attempt < DATABASE_OPEN_RETRY_ATTEMPTS =>
-            {
-                attempt = attempt.saturating_add(1);
-                tokio::time::sleep(delay).await;
-                delay = delay.saturating_mul(2).min(DATABASE_OPEN_MAX_RETRY_DELAY);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-fn is_database_lock_error(error: &switchy::database_connection::InitTursoError) -> bool {
-    is_database_lock_error_message(&error.to_string())
-}
-
-fn is_database_lock_error_message(message: &str) -> bool {
-    let message = message.to_ascii_lowercase();
-    message.contains("locking error")
-        || message.contains("failed locking file")
-        || message.contains("database is locked")
-        || message.contains("busy")
-}
-
 async fn run_global_migrations(db: &dyn Database) -> Result<(), MigrationError> {
     let runner = MigrationRunner::new(Box::new(global_migrations()))
         .with_table_name(GLOBAL_MIGRATIONS_TABLE.to_string());
@@ -2756,37 +2628,6 @@ async fn projection_checkpoint_snapshot(
         .collect()
 }
 
-fn validate_projection_checkpoint_snapshot(
-    snapshot: &BTreeMap<String, ProjectionCheckpointState>,
-    expected: u64,
-) -> SessionDbResult<()> {
-    for projection in MaterializedProjection::all() {
-        let Some(state) = snapshot.get(projection.as_str()) else {
-            return Err(SessionDbError::ProjectionStale {
-                projection: projection.as_str(),
-                checkpoint: None,
-                expected,
-            });
-        };
-        let expected_version = u64::from(projection.schema_version());
-        if state.version != expected_version {
-            return Err(SessionDbError::ProjectionIncompatible {
-                projection: projection.as_str(),
-                actual: state.version,
-                expected: expected_version,
-            });
-        }
-        if state.checkpoint != expected {
-            return Err(SessionDbError::ProjectionStale {
-                projection: projection.as_str(),
-                checkpoint: Some(state.checkpoint),
-                expected,
-            });
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 async fn validate_all_projection_checkpoints_at_tail(
     db: &dyn Database,
@@ -2830,25 +2671,6 @@ async fn migrate_session_storage(
 struct MigrationReplayOutcome {
     tail: Option<SessionEvent>,
     evidence: bcode_session_migration::MigrationClassificationEvidence,
-}
-
-fn validate_migration_event_identity(
-    event: &SessionEvent,
-    expected: u64,
-    session_id: SessionId,
-) -> SessionDbResult<()> {
-    if event.sequence != expected {
-        return Err(SessionDbError::InvalidCanonicalSequence {
-            expected,
-            actual: event.sequence,
-        });
-    }
-    if event.session_id != session_id {
-        return Err(SessionDbError::InvalidRow {
-            column: "events.session_id".to_owned(),
-        });
-    }
-    Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2905,7 +2727,7 @@ async fn rebuild_migration_projections(
             if let Some(counter) = normalized.metric_counter {
                 metrics.increment_counter(counter);
             }
-            validate_migration_event_identity(&normalized.event, event_seq, session_id)?;
+            validate_canonical_event_identity(&normalized.event, event_seq, session_id)?;
             let event = normalized.event;
             let current_payload = encode_session_event(&event)?;
             target
@@ -3403,35 +3225,14 @@ async fn validate_storage_writer_contract_for_epoch(
     db: &dyn Database,
     expected_writer_epoch: u32,
 ) -> SessionDbResult<()> {
-    let row = db
-        .select("session_storage_contract")
-        .columns(&["schema_version", "writer_epoch"])
-        .where_eq("contract_id", SESSION_STORAGE_CONTRACT_ID)
-        .execute_first(db)
-        .await?;
-    let Some(row) = row.as_ref() else {
-        return Err(SessionDbError::WriterIncompatible {
-            actual: Some(u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)),
-            expected: u64::from(expected_writer_epoch),
-        });
-    };
-    let schema_version = required_i64(row, "schema_version").map(i64_to_u64)?;
-    if schema_version != u64::from(SESSION_STORAGE_CONTRACT_SCHEMA_VERSION) {
-        return Err(SessionDbError::ProjectionIncompatible {
-            projection: "session_storage_contract",
-            actual: schema_version,
-            expected: u64::from(SESSION_STORAGE_CONTRACT_SCHEMA_VERSION),
-        });
-    }
-    let actual = required_i64(row, "writer_epoch").map(i64_to_u64)?;
-    let expected = u64::from(expected_writer_epoch);
-    if actual != expected {
-        return Err(SessionDbError::WriterIncompatible {
-            actual: Some(actual),
-            expected,
-        });
-    }
-    Ok(())
+    crate::db_contract::validate_writer_contract(
+        db,
+        expected_writer_epoch,
+        SESSION_STORAGE_CONTRACT_SCHEMA_VERSION,
+        LEGACY_SESSION_STORAGE_WRITER_EPOCH,
+        SESSION_STORAGE_CONTRACT_ID,
+    )
+    .await
 }
 
 async fn validate_storage_writer_contract(db: &dyn Database) -> SessionDbResult<()> {
@@ -3639,28 +3440,6 @@ async fn validate_append_postconditions(
         });
     }
     validate_context_occupancy_precondition(db, event).await
-}
-
-async fn insert_event(
-    db: &dyn Database,
-    event: &SessionEvent,
-    activity_timestamp_ms: Option<u64>,
-) -> SessionDbResult<()> {
-    db.insert("events")
-        .value("event_seq", seq_to_value(event.sequence))
-        .value("event_type", event_kind_name(&event.kind))
-        .value(
-            "schema_version",
-            DatabaseValue::Int32(i32::from(event.schema_version)),
-        )
-        .value(
-            "created_at_ms",
-            seq_to_value(activity_timestamp_ms.unwrap_or_else(|| event_created_at_ms(event))),
-        )
-        .value("payload", encode_session_event(event)?)
-        .execute(db)
-        .await?;
-    Ok(())
 }
 
 fn compaction_boundary(event: &SessionEvent) -> SessionDbResult<Option<u64>> {
@@ -4469,7 +4248,7 @@ async fn finalize_tool_transcript_item(
     Ok(())
 }
 
-const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
+pub(crate) const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
     match kind {
         SessionEventKind::SessionCreated { .. } => "session_created",
         SessionEventKind::ClientAttached { .. } => "client_attached",
@@ -4917,11 +4696,11 @@ fn parse_runtime_work_status(value: &str) -> RuntimeWorkStatus {
     }
 }
 
-const fn event_created_at_ms(event: &SessionEvent) -> u64 {
+pub(crate) const fn event_created_at_ms(event: &SessionEvent) -> u64 {
     event.timestamp_ms
 }
 
-fn seq_to_value(sequence: u64) -> DatabaseValue {
+pub(crate) fn seq_to_value(sequence: u64) -> DatabaseValue {
     DatabaseValue::Int64(i64::try_from(sequence).unwrap_or(i64::MAX))
 }
 
@@ -4943,6 +4722,7 @@ mod tests {
     };
     use sha2::Digest;
     use std::collections::BTreeSet;
+    use std::time::Duration;
 
     fn session_storage_files(root: &Path, session_id: SessionId) -> BTreeMap<String, Vec<u8>> {
         let session_dir = root.join(session_id.to_string());

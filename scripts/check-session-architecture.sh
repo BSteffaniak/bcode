@@ -478,7 +478,7 @@ if rg -n 'join\("session-storage"\)|writer-epoch-' packages/session/src --glob '
   violations=1
 fi
 
-if ! rg -q 'session_dir_path\(root, session_id\)\.join\("session\.db"\)' packages/session/src/db.rs; then
+if ! rg -q 'session_dir_path\(root, session_id\)\.join\("session\.db"\)' packages/session/src/db_path.rs; then
   echo "Session path violation: session_db_path must remain root/<session-id>/session.db." >&2
   violations=1
 fi
@@ -518,7 +518,7 @@ if rg -n "handle\.state" packages/session/src/lib.rs >/tmp/bcode-session-actor-v
 fi
 
 if rg -n "std::fs|OpenOptions|fs::File|File::open|File::create" packages/session/src --glob '*.rs' \
-  | rg -v 'packages/session/src/(lib|index|reader|migration|event_migration|ownership|derived|db|lease|repair)\.rs' \
+  | rg -v 'packages/session/src/(lib|index|reader|migration|event_migration|ownership|derived|db|lease|repair|store)\.rs' \
   >/tmp/bcode-session-fs-violations.txt; then
   echo "Session persistence architecture violation: direct filesystem access outside approved store modules." >&2
   cat /tmp/bcode-session-fs-violations.txt >&2
@@ -527,6 +527,30 @@ fi
 
 if ! rg -q "mod actor;" packages/session/src/lib.rs; then
   echo "Session module split violation: actor module must remain split from lib.rs." >&2
+  violations=1
+fi
+
+for session_module in attach attachment catalog context db_connection db_contract db_event_store db_path db_projection db_validation fork manifest mutation ownership runtime_work state store store_executor subscription tools; do
+  if ! rg -q "(pub(\\(crate\\))? )?mod ${session_module};" packages/session/src/lib.rs \
+    || [[ ! -f "packages/session/src/${session_module}.rs" ]]; then
+    echo "Session module split violation: ${session_module} domain module must remain extracted from lib.rs." >&2
+    violations=1
+  fi
+done
+
+if rg -n 'bcode_session_migration|HistoricalStorage|RELEASED_HISTORICAL|writer-epoch-' \
+  packages/session/src/{attach,attachment,catalog,context,fork,manifest,mutation,ownership,runtime_work,state,store,store_executor,tools}.rs \
+  >/tmp/bcode-session-extracted-domain-migration-violations.txt; then
+  echo "Session module split violation: extracted current-runtime domains must not acquire historical migration policy." >&2
+  cat /tmp/bcode-session-extracted-domain-migration-violations.txt >&2
+  violations=1
+fi
+
+if rg -n 'SessionDb::migrate|normalize_canonical_event|recover_accidental_epoch_session_root' \
+  packages/session/src/{attach,context,fork,mutation,runtime_work,subscription,tools}.rs \
+  >/tmp/bcode-session-extracted-domain-mutation-violations.txt; then
+  echo "Session module split violation: normal manager domains must not invoke migration or historical normalization." >&2
+  cat /tmp/bcode-session-extracted-domain-mutation-violations.txt >&2
   violations=1
 fi
 
@@ -543,7 +567,7 @@ fi
 
 normal_session_open_violations="$(
   rg -n '\bSessionDb::open_turso_in_root(_observed)?' packages/session/src/{actor,lib}.rs \
-    | awk -F: '$1 !~ /lib.rs/ || $2 < 3419' \
+    | awk -F: '$1 !~ /lib.rs/ || $2 < 2522' \
     || true
 )"
 if [[ -n "$normal_session_open_violations" ]]; then
