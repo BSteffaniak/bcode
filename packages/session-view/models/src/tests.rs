@@ -291,7 +291,7 @@ fn transcript_patch_appends_and_replaces_prefix_compatible_items() {
     let next = transcript_document(
         4,
         [
-            transcript_item("one", 1, "new"),
+            transcript_item_with_revision("one", 1, 2, "new"),
             transcript_item("two", 2, "append"),
         ],
     );
@@ -301,7 +301,7 @@ fn transcript_patch_appends_and_replaces_prefix_compatible_items() {
         patch.transcript,
         vec![
             TranscriptViewPatchOp::Replace {
-                item: transcript_item("one", 1, "new")
+                item: transcript_item_with_revision("one", 1, 2, "new")
             },
             TranscriptViewPatchOp::Append {
                 item: transcript_item("two", 2, "append")
@@ -311,6 +311,51 @@ fn transcript_patch_appends_and_replaces_prefix_compatible_items() {
 
     base.apply_patch(&patch).expect("patch applies");
     assert_eq!(base, next);
+}
+
+#[test]
+fn transcript_patch_removes_middle_item_without_reset() {
+    let mut base = transcript_document(
+        3,
+        [
+            transcript_item("one", 1, "one"),
+            transcript_item("two", 2, "remove"),
+            transcript_item("three", 3, "three"),
+        ],
+    );
+    let next = transcript_document(
+        4,
+        [
+            transcript_item("one", 1, "one"),
+            transcript_item("three", 3, "three"),
+        ],
+    );
+
+    let patch = SessionViewPatch::transcript_between(3, 4, None, &base, &next);
+    assert_eq!(
+        patch.transcript,
+        vec![TranscriptViewPatchOp::Remove {
+            id: TranscriptViewItemId::new("two")
+        }]
+    );
+    base.apply_patch(&patch).expect("middle removal applies");
+    assert_eq!(base, next);
+}
+
+#[test]
+fn transcript_patch_rejects_non_monotonic_item_replacement() {
+    let mut base = transcript_document(3, [transcript_item("one", 2, "old")]);
+    let next = transcript_document(4, [transcript_item("one", 2, "new")]);
+    let patch = SessionViewPatch::transcript_between(3, 4, None, &base, &next);
+
+    assert_eq!(
+        base.apply_patch(&patch),
+        Err(TranscriptViewPatchError::NonMonotonicItemRevision {
+            id: TranscriptViewItemId::new("one"),
+            current: 2,
+            replacement: 2,
+        })
+    );
 }
 
 #[test]
@@ -476,7 +521,7 @@ fn snapshot_patch_applies_transcript_only_incrementally() {
     next.transcript = transcript_document(
         2,
         [
-            transcript_item("one", 1, "new"),
+            transcript_item_with_revision("one", 1, 2, "new"),
             transcript_item("two", 2, "append"),
         ],
     );
@@ -521,7 +566,7 @@ fn snapshot_patch_keeps_slot_replacement_incremental_with_contribution_update() 
     next.transcript = transcript_document(
         2,
         [
-            transcript_item("tool-slot:call-1:request", 1, "rich"),
+            transcript_item_with_revision("tool-slot:call-1:request", 1, 2, "rich"),
             unchanged,
         ],
     );
@@ -695,11 +740,20 @@ fn transcript_document<const N: usize>(
 }
 
 fn transcript_item(id: &str, sequence: u64, text: &str) -> TranscriptViewItem {
+    transcript_item_with_revision(id, sequence, sequence, text)
+}
+
+fn transcript_item_with_revision(
+    id: &str,
+    sequence: u64,
+    revision: ViewRevision,
+    text: &str,
+) -> TranscriptViewItem {
     TranscriptViewItem {
         id: TranscriptViewItemId::new(id),
         sequence: Some(sequence),
         timestamp_ms: Some(sequence.saturating_mul(10)),
-        revision: sequence,
+        revision,
         streaming: false,
         kind: TranscriptViewItemKind::SystemMessage {
             message: ChatMessageView::plain(text.to_owned()),

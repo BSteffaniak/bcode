@@ -405,8 +405,9 @@ impl SessionViewPatch {
     ///
     /// This helper keeps full-snapshot correctness as the baseline: it emits item-level append,
     /// replace, and remove operations only when the next document preserves the same bounded-window
-    /// metadata and item ordering remains source-prefix compatible. Otherwise it falls back to a
-    /// transcript reset carrying the complete next document.
+    /// metadata, retained item ordering is unchanged, and newly inserted identities append after
+    /// retained items. Otherwise it falls back to a transcript reset carrying the complete next
+    /// document.
     #[must_use]
     pub fn transcript_between(
         base_revision: ViewRevision,
@@ -473,6 +474,15 @@ pub enum TranscriptViewPatchError {
     MissingItem {
         /// Missing item identifier.
         id: TranscriptViewItemId,
+    },
+    /// A replace operation did not advance the existing item revision.
+    NonMonotonicItemRevision {
+        /// Item whose replacement revision was stale or unchanged.
+        id: TranscriptViewItemId,
+        /// Existing accepted item revision.
+        current: ViewRevision,
+        /// Revision carried by the replacement.
+        replacement: ViewRevision,
     },
     /// An append operation attempted to add an item that is already present.
     DuplicateItem {
@@ -590,6 +600,13 @@ impl TranscriptViewDocument {
         else {
             return Err(TranscriptViewPatchError::MissingItem { id: item.id });
         };
+        if item.revision <= existing.revision {
+            return Err(TranscriptViewPatchError::NonMonotonicItemRevision {
+                id: item.id,
+                current: existing.revision,
+                replacement: item.revision,
+            });
+        }
         *existing = item;
         Ok(())
     }
@@ -703,7 +720,7 @@ fn transcript_patch_ops(
     next: &TranscriptViewDocument,
 ) -> Vec<TranscriptViewPatchOp> {
     if !transcript_window_metadata_matches(base, next)
-        || !transcript_items_are_prefix_compatible(base, next)
+        || !transcript_items_are_incrementally_compatible(base, next)
     {
         return vec![TranscriptViewPatchOp::Reset {
             document: next.clone(),
@@ -711,21 +728,31 @@ fn transcript_patch_ops(
     }
 
     let mut operations = Vec::new();
-    let common_len = base.items.len().min(next.items.len());
-    for index in 0..common_len {
-        if base.items[index] != next.items[index] {
-            operations.push(TranscriptViewPatchOp::Replace {
-                item: next.items[index].clone(),
+    let next_ids = next
+        .items
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<BTreeSet<_>>();
+    for item in &base.items {
+        if !next_ids.contains(&item.id) {
+            operations.push(TranscriptViewPatchOp::Remove {
+                id: item.id.clone(),
             });
         }
     }
-    for item in next.items.iter().skip(common_len) {
-        operations.push(TranscriptViewPatchOp::Append { item: item.clone() });
-    }
-    for item in base.items.iter().skip(common_len).rev() {
-        operations.push(TranscriptViewPatchOp::Remove {
-            id: item.id.clone(),
-        });
+    let base_by_id = base
+        .items
+        .iter()
+        .map(|item| (&item.id, item))
+        .collect::<BTreeMap<_, _>>();
+    for item in &next.items {
+        match base_by_id.get(&item.id) {
+            Some(existing) if *existing != item => {
+                operations.push(TranscriptViewPatchOp::Replace { item: item.clone() });
+            }
+            Some(_) => {}
+            None => operations.push(TranscriptViewPatchOp::Append { item: item.clone() }),
+        }
     }
     operations
 }
@@ -739,14 +766,47 @@ fn transcript_window_metadata_matches(
         && base.has_newer_history == next.has_newer_history
 }
 
-fn transcript_items_are_prefix_compatible(
+fn transcript_items_are_incrementally_compatible(
     base: &TranscriptViewDocument,
     next: &TranscriptViewDocument,
 ) -> bool {
-    base.items
+    let base_ids = base
+        .items
         .iter()
-        .zip(&next.items)
-        .all(|(base, next)| base.id == next.id)
+        .map(|item| item.id.clone())
+        .collect::<BTreeSet<_>>();
+    let next_ids = next
+        .items
+        .iter()
+        .map(|item| item.id.clone())
+        .collect::<BTreeSet<_>>();
+    if base_ids.len() != base.items.len() || next_ids.len() != next.items.len() {
+        return false;
+    }
+    let retained_base = base
+        .items
+        .iter()
+        .filter(|item| next_ids.contains(&item.id))
+        .map(|item| &item.id);
+    let retained_next = next
+        .items
+        .iter()
+        .filter(|item| base_ids.contains(&item.id))
+        .map(|item| &item.id);
+    if !retained_base.eq(retained_next) {
+        return false;
+    }
+    let mut saw_new_item = false;
+    for item in &next.items {
+        if base_ids.contains(&item.id) {
+            if saw_new_item {
+                return false;
+            }
+        } else {
+            saw_new_item = true;
+        }
+    }
+    true
 }
 
 /// Renderer-neutral transcript item.
