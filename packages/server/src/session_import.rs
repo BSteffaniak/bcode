@@ -36,6 +36,83 @@ pub fn external_session_id(source_id: &str, external_session_id: &str) -> Sessio
     SessionId(Uuid::from_bytes(bytes))
 }
 
+fn imported_session_event_kind(
+    event: ImportableSessionEventKind,
+    compacted_through_sequence: &mut u64,
+) -> SessionEventKind {
+    match event {
+        ImportableSessionEventKind::UserMessage { text } => SessionEventKind::UserMessage {
+            client_id: ClientId::new(),
+            text,
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
+        },
+        ImportableSessionEventKind::AssistantMessage { text } => {
+            SessionEventKind::AssistantMessage { text }
+        }
+        ImportableSessionEventKind::AssistantReasoningMessage { text } => {
+            SessionEventKind::AssistantReasoningMessage { text }
+        }
+        ImportableSessionEventKind::ToolCallRequested {
+            tool_call_id,
+            tool_name,
+            arguments_json,
+        } => SessionEventKind::ToolCallRequested {
+            tool_call_id,
+            producer_plugin_id: None,
+            tool_name,
+            arguments_json,
+            working_directory: None,
+        },
+        ImportableSessionEventKind::ToolCallFinished {
+            tool_call_id,
+            result,
+            is_error,
+        } => SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord {
+                invocation_id: tool_call_id,
+                model_output: result.clone(),
+                is_error,
+                presentation: None,
+                result: Some(bcode_session_models::ToolInvocationResult::Text { text: result }),
+            },
+        },
+        ImportableSessionEventKind::ModelUsage {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cached_input_tokens,
+            cache_write_input_tokens,
+            reasoning_tokens,
+        } => SessionEventKind::ModelUsage {
+            turn_id: "imported".to_owned(),
+            usage: bcode_session_models::SessionTokenUsage {
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                cached_input_tokens,
+                cache_write_input_tokens,
+                reasoning_tokens,
+            },
+        },
+        ImportableSessionEventKind::ModelChanged { provider, model } => {
+            SessionEventKind::ModelChanged { provider, model }
+        }
+        ImportableSessionEventKind::AgentChanged { agent_id } => {
+            SessionEventKind::AgentChanged { agent_id }
+        }
+        ImportableSessionEventKind::ContextCompacted { summary } => {
+            *compacted_through_sequence = compacted_through_sequence.saturating_add(1);
+            SessionEventKind::ContextCompacted {
+                summary,
+                compacted_through_sequence: *compacted_through_sequence,
+            }
+        }
+        ImportableSessionEventKind::SystemMessage { text } => {
+            SessionEventKind::SystemMessage { text }
+        }
+    }
+}
+
 /// Import an external session by source/external id.
 ///
 /// # Errors
@@ -120,79 +197,7 @@ pub async fn import_external_session(
             .into_iter()
             .scan(0_u64, |compacted_through_sequence, event| {
                 let provenance = import_event_provenance(&event, &importable.summary.locator);
-                let kind = match event.kind {
-                    ImportableSessionEventKind::UserMessage { text } => {
-                        SessionEventKind::UserMessage {
-                            client_id: ClientId::new(),
-                            text,
-                            admission: bcode_session_models::TurnAdmissionMetadata::default(),
-                        }
-                    }
-                    ImportableSessionEventKind::AssistantMessage { text } => {
-                        SessionEventKind::AssistantMessage { text }
-                    }
-                    ImportableSessionEventKind::AssistantReasoningMessage { text } => {
-                        SessionEventKind::AssistantReasoningMessage { text }
-                    }
-                    ImportableSessionEventKind::ToolCallRequested {
-                        tool_call_id,
-                        tool_name,
-                        arguments_json,
-                    } => SessionEventKind::ToolCallRequested {
-                        tool_call_id,
-                        producer_plugin_id: None,
-                        tool_name,
-                        arguments_json,
-                        working_directory: None,
-                    },
-                    ImportableSessionEventKind::ToolCallFinished {
-                        tool_call_id,
-                        result,
-                        is_error,
-                    } => SessionEventKind::ToolInvocationResultRecorded {
-                        record: bcode_session_models::ToolInvocationResultRecord {
-                            invocation_id: tool_call_id,
-                            model_output: result,
-                            is_error,
-                            presentation: None,
-                            result: None,
-                        },
-                    },
-                    ImportableSessionEventKind::ModelUsage {
-                        input_tokens,
-                        output_tokens,
-                        total_tokens,
-                        cached_input_tokens,
-                        cache_write_input_tokens,
-                        reasoning_tokens,
-                    } => SessionEventKind::ModelUsage {
-                        turn_id: "imported".to_owned(),
-                        usage: bcode_session_models::SessionTokenUsage {
-                            input_tokens,
-                            output_tokens,
-                            total_tokens,
-                            cached_input_tokens,
-                            cache_write_input_tokens,
-                            reasoning_tokens,
-                        },
-                    },
-                    ImportableSessionEventKind::ModelChanged { provider, model } => {
-                        SessionEventKind::ModelChanged { provider, model }
-                    }
-                    ImportableSessionEventKind::AgentChanged { agent_id } => {
-                        SessionEventKind::AgentChanged { agent_id }
-                    }
-                    ImportableSessionEventKind::ContextCompacted { summary } => {
-                        *compacted_through_sequence = compacted_through_sequence.saturating_add(1);
-                        SessionEventKind::ContextCompacted {
-                            summary,
-                            compacted_through_sequence: *compacted_through_sequence,
-                        }
-                    }
-                    ImportableSessionEventKind::SystemMessage { text } => {
-                        SessionEventKind::SystemMessage { text }
-                    }
-                };
+                let kind = imported_session_event_kind(event.kind, compacted_through_sequence);
                 Some((kind, provenance))
             })
             .collect();
@@ -381,4 +386,35 @@ fn current_unix_millis() -> u64 {
         .map_or(0, |duration| {
             u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn imported_tool_result_preserves_typed_text_fallback_without_presentation() {
+        let mut compacted_through_sequence = 0;
+        let kind = imported_session_event_kind(
+            ImportableSessionEventKind::ToolCallFinished {
+                tool_call_id: "imported-call".to_owned(),
+                result: "imported tool output".to_owned(),
+                is_error: false,
+            },
+            &mut compacted_through_sequence,
+        );
+
+        let SessionEventKind::ToolInvocationResultRecorded { record } = kind else {
+            panic!("tool completion must import as a canonical result")
+        };
+        assert_eq!(record.invocation_id, "imported-call");
+        assert_eq!(record.model_output, "imported tool output");
+        assert_eq!(record.presentation, None);
+        assert_eq!(
+            record.result,
+            Some(bcode_session_models::ToolInvocationResult::Text {
+                text: "imported tool output".to_owned(),
+            })
+        );
+    }
 }

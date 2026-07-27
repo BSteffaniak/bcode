@@ -7873,6 +7873,52 @@ mod tests {
     }
 
     #[test]
+    fn presentation_free_terminal_result_retains_legacy_model_output_fallback() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "legacy-tool".to_owned(),
+                producer_plugin_id: None,
+                tool_name: "legacy.tool".to_owned(),
+                arguments_json: r#"{"target":"fixture"}"#.to_owned(),
+                working_directory: None,
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "legacy-tool".to_owned(),
+                    model_output: "legacy imported output".to_owned(),
+                    is_error: false,
+                    presentation: None,
+                    result: None,
+                },
+            },
+        ));
+
+        let tool = view
+            .snapshot()
+            .tools
+            .get("legacy-tool")
+            .expect("legacy tool");
+        assert_eq!(tool.status, ToolInvocationViewStatus::Finished);
+        assert_eq!(tool.presentation, None);
+        assert_eq!(tool.result, None);
+        assert_eq!(tool.result_text.as_deref(), Some("legacy imported output"));
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::ToolInvocation { tool }
+                if tool.result_text.as_deref() == Some("legacy imported output")
+                    && tool.presentation.is_none()
+        ));
+    }
+
+    #[test]
     fn durable_results_reconcile_cumulative_assistant_live_state() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();

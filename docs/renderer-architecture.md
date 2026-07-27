@@ -10,9 +10,12 @@ The target boundary is active for tool transcript semantics in both established 
 * `packages/session-view` projects bounded history and renderer-relevant live events and executes daemon-backed semantic actions.
 * `packages/hyperchad` consumes this layer as Bcode's HyperChad application host; selected Cargo features choose the concrete HyperChad backend.
 * `packages/hyperchad/ui` owns portable HyperChad presentation built from canonical HyperChad templates, routes, forms, actions, and renderer APIs.
-* `packages/tui` dual-projects session history/live events into `SessionView` for parity protection and adapts shared transcript items into terminal presentation. Assistant and reasoning streams now consume the shared projection by stable `TranscriptViewItemId`, preserving terminal render identity across incremental replacement and durable finalization even when usage or tool rows are interleaved. The TUI also consumes shared generic user/system/usage items and shared runtime-work, active-skill, plugin-status, model/agent/reasoning-selection, reasoning-visibility, context-occupancy, cumulative-usage, session-metadata, authoritative pending-permission/interaction, and live interaction semantics. Its bounded history-window rebuilds retain authoritative hydrated shared state, while specialized tool/permission/interaction/runtime projections still use established terminal projection paths pending focused migration.
+* `packages/tui` retains a `SessionView` projection and reconciles authoritative shared transcript items by stable `TranscriptViewItemId` and revision into terminal-native rows. Assistant and reasoning streams preserve terminal render identity across incremental replacement and durable finalization even when usage, permission, supplemental, or tool rows are interleaved. Terminal viewport, scroll anchoring, hit testing, wrapping, diff layout, animation, and plugin visual/artifact adapter state remain TUI-owned.
 
-Until TUI migration and projection parity are complete, the shared session view is an extraction target and HyperChad application contract, not yet the canonical state path for every renderer. The implementation progress tracker should be kept aligned with the audited gaps described here.
+The TUI may retain renderer-local interaction and layout state, but shared transcript lifecycle,
+identity, ordering, retention, and fallback semantics come from `SessionView`; it must not create a
+parallel event-derived tool transcript authority. Remaining TUI migration is parity-driven removal
+of proven duplicate adapter/projection helpers, not a different semantic contract.
 
 ## Shared renderer contract
 
@@ -145,7 +148,7 @@ reconnect document, and replayed closed document must converge to the same seman
 ## Legacy contribution-slot compatibility
 
 Persisted `ToolContributionEnvelope` placement (`request`, `progress`, `result`, `supplemental`, or
-`hidden`) remains a decode/replay compatibility fact while producers migrate. Historical events are
+`hidden`) remains a decode/replay compatibility fact for supported historical sessions. Historical events are
 applied chronologically into the current invocation presentation; the latest compatible primary
 update wins, supplemental identities remain independent, and hidden/unplaced payloads stay absent
 from normal transcript UI. New primary presentation APIs must not require plugins to coordinate
@@ -174,6 +177,23 @@ The TUI migration should be incremental:
 * Remove duplicate projection and daemon effects only after relevant parity and UX tests pass.
 
 The goal is not to make every renderer look or behave identically. The goal is for them to consume the same product semantics while retaining native presentation and interaction.
+
+New primary presentation schemas are added at the plugin boundary: define a bounded versioned payload,
+declare the exact schema/version and supported renderer surfaces in the plugin manifest, publish
+invocation-owned updates through the presentation handle, and provide renderer-native adapters only
+where canonical lifecycle/result fallback is insufficient. Each adapter must reject malformed or
+unsupported payloads without exposing opaque data, and manifest inventory/conformance tests must be
+updated with synthetic fixtures.
+
+## Adding another renderer
+
+A new renderer consumes bounded `SessionViewSnapshot` values and `SessionViewPatch` updates by stable
+item identity and revision. It must render canonical tool name, lifecycle, timing, bounded arguments,
+typed result or result text, and safe artifact metadata even when it implements no plugin-specific
+adapter. Presentation schemas are optional enhancement hooks; renderer code must not parse another
+renderer's rows/DOM, replay event logs, infer lifecycle from payloads, or depend on TUI state.
+Renderer-native actions map through `SessionViewAction`/`PresentationContext` equivalents, while
+viewport, layout, interaction mechanics, and resource delivery remain owned by that renderer.
 
 ## Adding another HyperChad backend
 
