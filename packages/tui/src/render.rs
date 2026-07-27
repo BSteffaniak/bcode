@@ -165,13 +165,8 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
         return;
     }
 
-    let resident_item_ids = app
-        .transcript()
-        .iter()
-        .map(|item| item.id().get())
-        .collect::<std::collections::BTreeSet<_>>();
     app.transcript_markdown_cache()
-        .retain_resident(&resident_item_ids);
+        .retain_resident(app.transcript(), app.transcript_projection_revision());
     let theme = TuiTheme::for_app(app);
     render_header(app, layout.header, frame, theme);
     render_composer(app, layout.composer, frame, theme);
@@ -1522,14 +1517,9 @@ pub fn transcript_item_signature(
     _inline_view_config: (),
 ) -> TranscriptLayoutSignature {
     TranscriptLayoutSignature::new(format!(
-        "item:{}:{}:{width}::{}:{}:{:?}:{:?}:{}:{}",
+        "item:{}:{}:{width}:{}",
         item.id().get(),
         item.revision(),
-        item.role(),
-        item.streaming(),
-        item.kind(),
-        item.text_format(),
-        item.text(),
         terminal_elapsed_signature_fragment(item).unwrap_or_default()
     ))
 }
@@ -2214,6 +2204,19 @@ fn transcript_layout_signature_changes_when_only_format_changes() {
         transcript_item_signature(&plain, 30, ()),
         transcript_item_signature(&markdown, 30, ())
     );
+}
+
+#[cfg(test)]
+#[test]
+fn transcript_layout_signature_does_not_copy_message_text() {
+    let short = TranscriptItem::with_format("You", "short".to_owned(), TextFormat::Markdown);
+    let long = TranscriptItem::with_format("You", "x".repeat(256 * 1024), TextFormat::Markdown);
+
+    let short_signature = transcript_item_signature(&short, 80, ());
+    let long_signature = transcript_item_signature(&long, 80, ());
+
+    assert!(short_signature.as_str().len() < 128);
+    assert!(long_signature.as_str().len() < 128);
 }
 
 #[cfg(test)]

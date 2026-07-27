@@ -2195,11 +2195,8 @@ impl WorkflowStore {
         observed_at_ms: u64,
     ) -> Result<ReceiptReconciliationSummary, WorkflowStoreError> {
         validate_id("dispatch_identity", dispatch_identity)?;
-        let requests = receipt_backed_attempts(&self.connection, i64::from(1_000))?;
-        let request = requests
-            .into_iter()
-            .find(|request| request.dispatch_identity == dispatch_identity)
-            .ok_or_else(|| {
+        let request =
+            receipt_backed_attempt(&self.connection, dispatch_identity)?.ok_or_else(|| {
                 WorkflowStoreError::InvalidData(format!(
                     "receipt-backed workflow attempt not found: {dispatch_identity}"
                 ))
@@ -4065,6 +4062,55 @@ fn prepared_read_only_dispatches(
         .collect()
 }
 
+type AttemptReconciliationRow = (String, String, String, u32, String, String, String);
+
+fn attempt_reconciliation_request(
+    row: AttemptReconciliationRow,
+) -> Result<AttemptReconciliationRequest, WorkflowStoreError> {
+    let (run_id, node_id, activation_id, attempt, dispatch_identity, side_effect, receipt_json) =
+        row;
+    Ok(AttemptReconciliationRequest {
+        run_id,
+        node_id,
+        activation_id,
+        attempt,
+        dispatch_identity,
+        side_effect: parse_side_effect(&side_effect)?,
+        receipt: serde_json::from_str(&receipt_json)?,
+    })
+}
+
+fn attempt_reconciliation_row(
+    row: &rusqlite::Row<'_>,
+) -> Result<AttemptReconciliationRow, rusqlite::Error> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+    ))
+}
+
+fn receipt_backed_attempt(
+    connection: &Connection,
+    dispatch_identity: &str,
+) -> Result<Option<AttemptReconciliationRequest>, WorkflowStoreError> {
+    connection
+        .query_row(
+            "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, side_effect, \
+             receipt_json FROM workflow_attempts WHERE dispatch_identity = ?1 \
+             AND status IN ('admitted', 'running', 'cancelling') AND receipt_json IS NOT NULL",
+            [dispatch_identity],
+            attempt_reconciliation_row,
+        )
+        .optional()?
+        .map(attempt_reconciliation_request)
+        .transpose()
+}
+
 fn receipt_backed_attempts(
     connection: &Connection,
     limit: i64,
@@ -4075,37 +4121,8 @@ fn receipt_backed_attempts(
          AND receipt_json IS NOT NULL ORDER BY prepared_at_ms, dispatch_identity LIMIT ?1",
     )?;
     statement
-        .query_map([limit], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, u32>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
-            ))
-        })?
-        .map(|row| {
-            let (
-                run_id,
-                node_id,
-                activation_id,
-                attempt,
-                dispatch_identity,
-                side_effect,
-                receipt_json,
-            ) = row?;
-            Ok(AttemptReconciliationRequest {
-                run_id,
-                node_id,
-                activation_id,
-                attempt,
-                dispatch_identity,
-                side_effect: parse_side_effect(&side_effect)?,
-                receipt: serde_json::from_str(&receipt_json)?,
-            })
-        })
+        .query_map([limit], attempt_reconciliation_row)?
+        .map(|row| attempt_reconciliation_request(row?))
         .collect()
 }
 

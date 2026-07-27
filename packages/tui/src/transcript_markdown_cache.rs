@@ -22,6 +22,7 @@ struct CachedMarkdownProjection {
 #[derive(Debug, Default)]
 pub struct TranscriptMarkdownCache {
     entries: RwLock<BTreeMap<u64, CachedMarkdownProjection>>,
+    retained_revision: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     render_count: std::sync::atomic::AtomicUsize,
 }
@@ -34,6 +35,10 @@ impl Clone for TranscriptMarkdownCache {
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone(),
+            ),
+            retained_revision: std::sync::atomic::AtomicU64::new(
+                self.retained_revision
+                    .load(std::sync::atomic::Ordering::Relaxed),
             ),
             #[cfg(test)]
             render_count: std::sync::atomic::AtomicUsize::new(self.render_count()),
@@ -78,12 +83,27 @@ impl TranscriptMarkdownCache {
         result
     }
 
-    /// Remove projections whose transcript items are no longer resident.
-    pub fn retain_resident(&self, resident_item_ids: &std::collections::BTreeSet<u64>) {
+    /// Remove stale projections once after the transcript document changes.
+    pub fn retain_resident(&self, resident_items: &[TranscriptItem], transcript_revision: u64) {
+        if self
+            .retained_revision
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == transcript_revision
+        {
+            return;
+        }
+        let resident_revisions = resident_items
+            .iter()
+            .map(|item| (item.id().get(), item.revision()))
+            .collect::<BTreeMap<_, _>>();
         self.entries
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .retain(|item_id, _| resident_item_ids.contains(item_id));
+            .retain(|item_id, cached| {
+                resident_revisions.get(item_id) == Some(&cached.item_revision)
+            });
+        self.retained_revision
+            .store(transcript_revision, std::sync::atomic::Ordering::Relaxed);
     }
 
     #[cfg(test)]

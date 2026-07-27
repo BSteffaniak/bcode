@@ -20506,6 +20506,89 @@ async fn register_runtime_work(state: &ServerState, session_id: SessionId, spec:
     }
 }
 
+fn workflow_attempt_observation_from_completion(
+    state: &ServerState,
+    request: &bcode_workflow_store::PreparedActivationDispatch,
+    completion: ModelTurnCompletion,
+) -> Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError> {
+    match completion.outcome {
+        ModelTurnOutcome::Completed => {
+            let output = completion.output.ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "completed workflow agent turn has no structured output".to_string(),
+                )
+            })?;
+            let output: serde_json::Value = serde_json::from_str(&output)?;
+            if let Err(message) =
+                validate_loop_evaluation_evidence(&request.activation.node_id, &output)
+            {
+                return Ok(bcode_workflow_store::AttemptObservation::Failed { message });
+            }
+            Ok(bcode_workflow_store::AttemptObservation::Succeeded {
+                output: bcode_workflow_store::ValidatedOutput {
+                    output_id: format!("{}:output", request.dispatch_identity),
+                    run_id: request.activation.run_id.clone(),
+                    node_id: request.activation.node_id.clone(),
+                    activation_id: request.activation.activation_id.clone(),
+                    schema_id: request.activation.node.output.type_name.clone(),
+                    schema_version: 1,
+                    value: output,
+                    artifact_reference: None,
+                    created_at_ms: current_unix_millis(),
+                },
+            })
+        }
+        ModelTurnOutcome::Cancelled => {
+            let run = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .run_summary(&request.activation.run_id)?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData("workflow run not found".to_string())
+                })?;
+            if run.cancellation_requested_at_ms.is_some() {
+                Ok(bcode_workflow_store::AttemptObservation::Cancelled)
+            } else {
+                Ok(bcode_workflow_store::AttemptObservation::Paused {
+                    reason: bcode_workflow_store::AttemptPauseReason::Steering,
+                    message: completion.message.unwrap_or_else(|| {
+                        "workflow model turn was cancelled for steering; explicit resume is required"
+                            .to_string()
+                    }),
+                })
+            }
+        }
+        ModelTurnOutcome::ProviderUnavailable => {
+            Ok(bcode_workflow_store::AttemptObservation::Paused {
+                reason: bcode_workflow_store::AttemptPauseReason::ProviderUnavailable,
+                message: completion
+                    .message
+                    .unwrap_or_else(|| "model provider unavailable".to_string()),
+            })
+        }
+        ModelTurnOutcome::IdleTimeout => Ok(bcode_workflow_store::AttemptObservation::Paused {
+            reason: bcode_workflow_store::AttemptPauseReason::IdleTimeout,
+            message: completion
+                .message
+                .unwrap_or_else(|| "workflow model turn reached its idle timeout".to_string()),
+        }),
+        ModelTurnOutcome::ToolRoundLimitReached => {
+            Ok(bcode_workflow_store::AttemptObservation::Paused {
+                reason: bcode_workflow_store::AttemptPauseReason::ToolRoundLimitReached,
+                message: completion.message.unwrap_or_else(|| {
+                    "workflow model turn reached its tool-round limit".to_string()
+                }),
+            })
+        }
+        ModelTurnOutcome::Error => Ok(bcode_workflow_store::AttemptObservation::Failed {
+            message: completion
+                .message
+                .unwrap_or_else(|| "workflow model turn ended with an error".to_string()),
+        }),
+    }
+}
+
 struct WorkflowTurnReceiptObserver<'a> {
     state: &'a ServerState,
 }
@@ -21366,6 +21449,7 @@ async fn dispatch_workflow_agent_turn(
     let execution_session_id = target_session_id;
     let dispatch_identity = request.dispatch_identity.clone();
     let request_run_id = request.activation.run_id.clone();
+    let request_for_completion = request.clone();
     let state_for_completion = Arc::clone(state);
     if let Some(completion_receiver) = completion_receiver {
         tokio::spawn(async move {
@@ -21384,40 +21468,41 @@ async fn dispatch_workflow_agent_turn(
                 execution_session_id,
                 WorkId::new(dispatch_identity),
                 status,
-                completion.message,
+                completion.message.clone(),
             )
             .await;
-            let observer = WorkflowTurnReceiptObserver {
-                state: &state_for_completion,
-            };
+            let observation = workflow_attempt_observation_from_completion(
+                &state_for_completion,
+                &request_for_completion,
+                completion,
+            );
             let store_path = state_for_completion
                 .workflow_store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .path()
                 .to_path_buf();
-            match bcode_workflow_store::WorkflowStore::open_at_path(&store_path) {
-                Ok(mut store) => {
-                    let reconciled = store
-                        .reconcile_receipt_backed_attempts_async(
-                            &observer,
-                            1_000,
-                            current_unix_millis(),
-                        )
-                        .await;
+            match (
+                bcode_workflow_store::WorkflowStore::open_at_path(&store_path),
+                observation,
+            ) {
+                (Ok(mut store), Ok(observation)) => {
+                    let reconciled = store.apply_attempt_observation(
+                        &request_for_completion.dispatch_identity,
+                        observation,
+                        current_unix_millis(),
+                    );
                     drop(store);
                     if let Err(error) = reconciled {
-                        tracing::warn!(
-                            "failed to reconcile completed workflow agent turn: {error}"
-                        );
+                        tracing::warn!("failed to persist completed workflow agent turn: {error}");
                     } else if let Err(error) =
                         drive_workflow_run(&state_for_completion, &request_run_id).await
                     {
                         tracing::warn!("failed to continue workflow after completion: {error}");
                     }
                 }
-                Err(error) => {
-                    tracing::warn!("failed to open workflow store for completion: {error}");
+                (Ok(_), Err(error)) | (Err(error), _) => {
+                    tracing::warn!("failed to complete workflow agent turn: {error}");
                 }
             }
         });
