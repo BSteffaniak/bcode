@@ -27,7 +27,9 @@ pub use crate::db_path::{
     global_catalog_db_path, namespaced_catalog_db_path, session_db_path, session_dir_path,
 };
 pub use crate::db_projection::MaterializedProjection;
-use crate::db_projection::{projection_checkpoint_snapshot, update_projection_checkpoint};
+use crate::db_projection::{
+    BASE_MATERIALIZED_PROJECTIONS, projection_checkpoint_snapshot, update_projection_checkpoint,
+};
 use crate::db_projection_row::{
     input_history_entry_from_row, runtime_work_from_row, session_summary_from_catalog_row,
     tool_run_from_row, transcript_item_from_row,
@@ -3541,15 +3543,6 @@ async fn project_turn_receipt(db: &dyn Database, event: &SessionEvent) -> Sessio
         .await?;
     Ok(())
 }
-
-const BASE_MATERIALIZED_PROJECTIONS: [MaterializedProjection; 6] = [
-    MaterializedProjection::SessionState,
-    MaterializedProjection::InputHistory,
-    MaterializedProjection::Transcript,
-    MaterializedProjection::ToolRuns,
-    MaterializedProjection::ArtifactReferences,
-    MaterializedProjection::RuntimeWork,
-];
 
 async fn project_session_compatibility_issue(
     db: &dyn Database,

@@ -117,6 +117,16 @@ pub async fn update_projection_checkpoint(
     Ok(())
 }
 
+/// Current projections finalized together for each canonical event.
+pub const BASE_MATERIALIZED_PROJECTIONS: [MaterializedProjection; 6] = [
+    MaterializedProjection::SessionState,
+    MaterializedProjection::InputHistory,
+    MaterializedProjection::Transcript,
+    MaterializedProjection::ToolRuns,
+    MaterializedProjection::ArtifactReferences,
+    MaterializedProjection::RuntimeWork,
+];
+
 /// One current projection checkpoint row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProjectionCheckpointState {
