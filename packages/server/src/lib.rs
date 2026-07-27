@@ -31688,6 +31688,74 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn every_host_terminal_outcome_persists_latest_retained_presentation() {
+        for (index, is_error, output) in [
+            (0, true, "failed"),
+            (1, true, "cancelled"),
+            (2, true, "timed out"),
+        ] {
+            let sessions = SessionManager::default();
+            let state = test_server_state(sessions);
+            let session = state
+                .sessions
+                .create_session(Some(output.to_owned()), test_working_directory())
+                .await
+                .expect("session");
+            let invocation_id = format!("call-{index}");
+            let update = bcode_tool::ToolPresentationUpdate {
+                invocation_id: invocation_id.clone(),
+                producer_id: "test.plugin".to_owned(),
+                generation: 0,
+                revision: 9,
+                identity: bcode_tool::ToolPresentationIdentity::Primary,
+                retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                schema: "test.presentation".to_owned(),
+                schema_version: 1,
+                artifact: None,
+                payload: serde_json::json!({"outcome": output}),
+            };
+            publish_plugin_tool_presentation_update(
+                &state,
+                session.id,
+                &invocation_id,
+                "test.plugin",
+                update.clone(),
+            )
+            .await
+            .expect("presentation accepted");
+            append_tool_finished_event_inner(
+                &state,
+                session.id,
+                ToolFinishedEventInput {
+                    tool_call_id: invocation_id.clone(),
+                    result: output.to_owned(),
+                    is_error,
+                    content: Vec::new(),
+                    semantic_result: None,
+                },
+            )
+            .await
+            .expect("terminal result");
+
+            let history = state
+                .sessions
+                .session_history(session.id)
+                .await
+                .expect("history");
+            let record = history
+                .iter()
+                .find_map(|event| match &event.kind {
+                    SessionEventKind::ToolInvocationResultRecorded { record } => Some(record),
+                    _ => None,
+                })
+                .expect("terminal record");
+            assert_eq!(record.model_output, output);
+            assert!(record.is_error);
+            assert_eq!(record.presentation.as_ref(), Some(&update));
+        }
+    }
+
+    #[tokio::test]
     async fn retained_presentation_hydrates_attach_and_active_only_is_cleared_on_close() {
         let workspace = tempfile::tempdir().expect("presentation hydration workspace");
         let sessions = SessionManager::persistent(workspace.path().join("sessions"))
