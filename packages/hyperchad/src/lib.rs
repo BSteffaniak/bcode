@@ -486,6 +486,7 @@ async fn hydrate_session_model_status(
 fn view_from_attached_history(attached: &AttachedSessionHistory) -> SessionView {
     let mut view = SessionView::new();
     view.apply_history(&attached.history);
+    apply_projection_window_metadata_to_view(&mut view, attached.projection_window.as_ref());
     let runtime = &attached.runtime_selection;
     view.set_runtime_selection(
         runtime.provider_plugin_id.clone(),
@@ -707,6 +708,18 @@ async fn attach_hyperchad_projection_window_with_request(
     connection
         .attach_session_projection_window_with_input_history(session_id, request)
         .await
+}
+
+fn apply_projection_window_metadata_to_view(
+    view: &mut SessionView,
+    projection_window: Option<&ProjectionWindow>,
+) {
+    view.set_history_window_metadata(
+        projection_window.and_then(|window| window.source_range.map(|range| range.start_sequence)),
+        projection_window.and_then(|window| window.source_range.map(|range| range.end_sequence)),
+        projection_window.is_some_and(|window| window.has_older),
+        projection_window.is_some_and(|window| window.has_newer),
+    );
 }
 
 fn apply_projection_window_metadata(

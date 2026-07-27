@@ -566,6 +566,12 @@ impl SessionView {
         replacement.snapshot.runtime = previous.runtime;
         replacement.snapshot.interactions = previous.interactions;
         replacement.snapshot.session_summary = previous.session_summary;
+        replacement.snapshot.transcript.source_start_sequence =
+            previous.transcript.source_start_sequence;
+        replacement.snapshot.transcript.source_end_sequence =
+            previous.transcript.source_end_sequence;
+        replacement.snapshot.transcript.has_older_history = previous.transcript.has_older_history;
+        replacement.snapshot.transcript.has_newer_history = previous.transcript.has_newer_history;
         replacement.terminal_runtime_work = terminal_runtime_work;
         for (invocation_id, terminal) in terminal_tool_request_drafts {
             replacement
@@ -601,6 +607,20 @@ impl SessionView {
             replacement.apply_contribution_event(0, None, &contribution, placement);
         }
         *self = replacement;
+    }
+
+    /// Set the authoritative bounded-history metadata supplied by the daemon.
+    pub const fn set_history_window_metadata(
+        &mut self,
+        source_start_sequence: Option<u64>,
+        source_end_sequence: Option<u64>,
+        has_older_history: bool,
+        has_newer_history: bool,
+    ) {
+        self.snapshot.transcript.source_start_sequence = source_start_sequence;
+        self.snapshot.transcript.source_end_sequence = source_end_sequence;
+        self.snapshot.transcript.has_older_history = has_older_history;
+        self.snapshot.transcript.has_newer_history = has_newer_history;
     }
 
     /// Apply replayed history events in chronological order.
@@ -6226,6 +6246,7 @@ mod tests {
         );
         view.set_agent_id(Some("build".to_owned()));
         view.set_active_skill_ids(BTreeSet::from(["review".to_owned()]));
+        view.set_history_window_metadata(Some(10), Some(10), true, true);
         view.rebuild_history_window(&[event(
             session_id,
             10,
@@ -6245,6 +6266,10 @@ mod tests {
         );
         assert_eq!(snapshot.runtime.agent_id.as_deref(), Some("build"));
         assert!(snapshot.active_skills.contains("review"));
+        assert_eq!(snapshot.transcript.source_start_sequence, Some(10));
+        assert_eq!(snapshot.transcript.source_end_sequence, Some(10));
+        assert!(snapshot.transcript.has_older_history);
+        assert!(snapshot.transcript.has_newer_history);
         assert!(matches!(
             &snapshot.transcript.items[0].kind,
             TranscriptViewItemKind::AssistantMessage { message } if message.text == "bounded"
