@@ -2191,17 +2191,35 @@ fn shared_tool_presentation_fixtures_render_semantic_content_in_hyperchad() {
                 fixture.name
             );
         }
+        for forbidden in &fixture.forbidden {
+            assert!(
+                !rendered.contains(forbidden),
+                "{} exposed {forbidden:?}: {rendered}",
+                fixture.name
+            );
+        }
         let TranscriptViewItemKind::ToolInvocation { tool } = &fixture.item.kind else {
             unreachable!("shared fixtures are tool invocations");
         };
-        assert!(rendered.contains(match tool.status {
-            ToolInvocationViewStatus::Requested => "requested",
-            ToolInvocationViewStatus::Running => "running",
-            ToolInvocationViewStatus::Waiting => "waiting",
-            ToolInvocationViewStatus::Finished => "finished",
-            ToolInvocationViewStatus::Failed => "failed",
-            ToolInvocationViewStatus::Cancelled => "cancelled",
-        }));
+        let status = if tool.timing.timed_out == Some(true) {
+            "timed out"
+        } else if tool.is_error == Some(true) {
+            "failed"
+        } else {
+            match tool.status {
+                ToolInvocationViewStatus::Requested => "requested",
+                ToolInvocationViewStatus::Running => "running",
+                ToolInvocationViewStatus::Waiting => "waiting",
+                ToolInvocationViewStatus::Finished => "finished",
+                ToolInvocationViewStatus::Failed => "failed",
+                ToolInvocationViewStatus::Cancelled => "cancelled",
+            }
+        };
+        assert!(
+            rendered.contains(status),
+            "{} missing status {status:?}: {rendered}",
+            fixture.name
+        );
     }
 }
 

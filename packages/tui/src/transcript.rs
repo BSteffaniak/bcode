@@ -948,6 +948,7 @@ fn terminal_tool_item_from_shared(tool: &ToolInvocationView) -> TranscriptItem {
         tool.arguments_json.as_deref().unwrap_or("{}"),
         tool.working_directory.clone(),
     );
+    item = apply_shared_tool_timing(item, tool);
     if matches!(
         tool.status,
         ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting

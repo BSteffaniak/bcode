@@ -1,7 +1,10 @@
 [
   {
     "name": "shell",
-    "expected": ["shell.run", "cargo test"],
+    "expected": [
+      "shell.run",
+      "cargo test"
+    ],
     "item": {
       "id": "tool:fixture-shell",
       "revision": 3,
@@ -41,11 +44,15 @@
           }
         }
       }
-    }
+    },
+    "forbidden": []
   },
   {
     "name": "filesystem",
-    "expected": ["filesystem.edit", "/tmp/fixture.rs"],
+    "expected": [
+      "filesystem.edit",
+      "/tmp/fixture.rs"
+    ],
     "item": {
       "id": "tool:fixture-filesystem",
       "revision": 5,
@@ -87,11 +94,15 @@
           }
         }
       }
-    }
+    },
+    "forbidden": []
   },
   {
     "name": "vim-edit",
-    "expected": ["vim_edit.apply", "src/lib.rs"],
+    "expected": [
+      "vim_edit.apply",
+      "src/lib.rs"
+    ],
     "item": {
       "id": "tool:fixture-vim-edit",
       "revision": 7,
@@ -136,6 +147,326 @@
             "timeout_ms": null,
             "timed_out": false,
             "duration_ms": 1000
+          }
+        }
+      }
+    },
+    "forbidden": []
+  },
+  {
+    "name": "requested-no-presentation",
+    "expected": [
+      "example.request",
+      "requested",
+      "fixture-target"
+    ],
+    "forbidden": [],
+    "item": {
+      "id": "tool:fixture-requested",
+      "revision": 3,
+      "sequence": 13,
+      "timestamp_ms": 1700000002500,
+      "streaming": false,
+      "kind": {
+        "type": "tool_invocation",
+        "tool": {
+          "tool_call_id": "fixture-requested",
+          "producer_plugin_id": "example.plugin",
+          "tool_name": "example.request",
+          "arguments_json": "{\"target\":\"fixture-target\"}",
+          "working_directory": "/tmp/project",
+          "status": "requested",
+          "result_text": null,
+          "is_error": null,
+          "result": null,
+          "timing": {
+            "started_at_ms": 1700000000000,
+            "finished_at_ms": 1700000002500,
+            "timeout_ms": null,
+            "timed_out": null,
+            "duration_ms": null
+          },
+          "presentation": null
+        }
+      }
+    }
+  },
+  {
+    "name": "waiting-fallback",
+    "expected": [
+      "example.wait",
+      "waiting",
+      "fixture-target"
+    ],
+    "forbidden": [
+      "opaque-waiting-fallback-secret",
+      "example.unsupported"
+    ],
+    "item": {
+      "id": "tool:fixture-waiting",
+      "revision": 3,
+      "sequence": 13,
+      "timestamp_ms": 1700000002500,
+      "streaming": true,
+      "kind": {
+        "type": "tool_invocation",
+        "tool": {
+          "tool_call_id": "fixture-waiting",
+          "producer_plugin_id": "example.plugin",
+          "tool_name": "example.wait",
+          "arguments_json": "{\"target\":\"fixture-target\"}",
+          "working_directory": "/tmp/project",
+          "status": "waiting",
+          "result_text": null,
+          "is_error": null,
+          "result": null,
+          "timing": {
+            "started_at_ms": 1700000000000,
+            "finished_at_ms": null,
+            "timeout_ms": null,
+            "timed_out": null,
+            "duration_ms": null
+          },
+          "presentation": {
+            "producer_id": "example.plugin",
+            "generation": 0,
+            "revision": 2,
+            "retention": "retain_latest",
+            "schema": "example.unsupported",
+            "schema_version": 1,
+            "payload": {
+              "secret": "opaque-waiting-fallback-secret"
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "failed-text-result",
+    "expected": [
+      "example.fail",
+      "failed",
+      "typed failure"
+    ],
+    "forbidden": [
+      "opaque-failed-text-result-secret",
+      "example.unsupported"
+    ],
+    "item": {
+      "id": "tool:fixture-failed",
+      "revision": 3,
+      "sequence": 13,
+      "timestamp_ms": 1700000002500,
+      "streaming": false,
+      "kind": {
+        "type": "tool_invocation",
+        "tool": {
+          "tool_call_id": "fixture-failed",
+          "producer_plugin_id": "example.plugin",
+          "tool_name": "example.fail",
+          "arguments_json": "{\"target\":\"fixture-target\"}",
+          "working_directory": "/tmp/project",
+          "status": "failed",
+          "result_text": "typed failure",
+          "is_error": true,
+          "result": {
+            "type": "text",
+            "text": "typed failure"
+          },
+          "timing": {
+            "started_at_ms": 1700000000000,
+            "finished_at_ms": 1700000002500,
+            "timeout_ms": null,
+            "timed_out": null,
+            "duration_ms": 2500
+          },
+          "presentation": {
+            "producer_id": "example.plugin",
+            "generation": 0,
+            "revision": 2,
+            "retention": "retain_latest",
+            "schema": "example.unsupported",
+            "schema_version": 1,
+            "payload": {
+              "secret": "opaque-failed-text-result-secret"
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "cancelled-without-result",
+    "expected": [
+      "example.cancel",
+      "cancelled",
+      "fixture-target"
+    ],
+    "forbidden": [
+      "opaque-cancelled-without-result-secret",
+      "example.unsupported"
+    ],
+    "item": {
+      "id": "tool:fixture-cancelled",
+      "revision": 3,
+      "sequence": 13,
+      "timestamp_ms": 1700000002500,
+      "streaming": false,
+      "kind": {
+        "type": "tool_invocation",
+        "tool": {
+          "tool_call_id": "fixture-cancelled",
+          "producer_plugin_id": "example.plugin",
+          "tool_name": "example.cancel",
+          "arguments_json": "{\"target\":\"fixture-target\"}",
+          "working_directory": "/tmp/project",
+          "status": "cancelled",
+          "result_text": null,
+          "is_error": false,
+          "result": null,
+          "timing": {
+            "started_at_ms": 1700000000000,
+            "finished_at_ms": 1700000002500,
+            "timeout_ms": null,
+            "timed_out": null,
+            "duration_ms": 2500
+          },
+          "presentation": {
+            "producer_id": "example.plugin",
+            "generation": 0,
+            "revision": 2,
+            "retention": "retain_latest",
+            "schema": "example.unsupported",
+            "schema_version": 1,
+            "payload": {
+              "secret": "opaque-cancelled-without-result-secret"
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "timed-out-json-result",
+    "expected": [
+      "example.timeout",
+      "timed out",
+      "timeout detail"
+    ],
+    "forbidden": [
+      "opaque-timed-out-json-result-secret",
+      "example.unsupported"
+    ],
+    "item": {
+      "id": "tool:fixture-timeout",
+      "revision": 3,
+      "sequence": 13,
+      "timestamp_ms": 1700000002500,
+      "streaming": false,
+      "kind": {
+        "type": "tool_invocation",
+        "tool": {
+          "tool_call_id": "fixture-timeout",
+          "producer_plugin_id": "example.plugin",
+          "tool_name": "example.timeout",
+          "arguments_json": "{\"target\":\"fixture-target\"}",
+          "working_directory": "/tmp/project",
+          "status": "failed",
+          "result_text": "timeout detail",
+          "is_error": true,
+          "result": {
+            "type": "json",
+            "value": "{\"message\":\"timeout detail\"}"
+          },
+          "timing": {
+            "started_at_ms": 1700000000000,
+            "finished_at_ms": 1700000002500,
+            "timeout_ms": 2000,
+            "timed_out": true,
+            "duration_ms": 2500
+          },
+          "presentation": {
+            "producer_id": "example.plugin",
+            "generation": 0,
+            "revision": 2,
+            "retention": "retain_latest",
+            "schema": "example.unsupported",
+            "schema_version": 1,
+            "payload": {
+              "secret": "opaque-timed-out-json-result-secret"
+            }
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "artifact-result-fallback",
+    "expected": [
+      "example.artifact",
+      "finished",
+      "Fixture artifact"
+    ],
+    "forbidden": [
+      "opaque-artifact-result-fallback-secret",
+      "example.unsupported"
+    ],
+    "item": {
+      "id": "tool:fixture-artifact",
+      "revision": 3,
+      "sequence": 13,
+      "timestamp_ms": 1700000002500,
+      "streaming": false,
+      "kind": {
+        "type": "tool_invocation",
+        "tool": {
+          "tool_call_id": "fixture-artifact",
+          "producer_plugin_id": "example.plugin",
+          "tool_name": "example.artifact",
+          "arguments_json": "{\"target\":\"fixture-target\"}",
+          "working_directory": "/tmp/project",
+          "status": "finished",
+          "result_text": "artifact completed",
+          "is_error": false,
+          "result": {
+            "type": "artifact",
+            "artifact": {
+              "artifact": {
+                "artifact_id": "fixture-artifact-result",
+                "producer_plugin_id": "example.plugin",
+                "schema": "example.artifact",
+                "schema_version": 1,
+                "tool_call_id": "fixture-artifact",
+                "title": "Fixture artifact",
+                "metadata": {
+                  "summary": "artifact completed"
+                },
+                "refs": []
+              },
+              "generic_payload": {
+                "title": "Fixture artifact",
+                "summary": "artifact completed"
+              }
+            }
+          },
+          "timing": {
+            "started_at_ms": 1700000000000,
+            "finished_at_ms": 1700000002500,
+            "timeout_ms": null,
+            "timed_out": null,
+            "duration_ms": 2500
+          },
+          "presentation": {
+            "producer_id": "example.plugin",
+            "generation": 0,
+            "revision": 2,
+            "retention": "retain_latest",
+            "schema": "example.unsupported",
+            "schema_version": 1,
+            "payload": {
+              "secret": "opaque-artifact-result-fallback-secret"
+            }
           }
         }
       }

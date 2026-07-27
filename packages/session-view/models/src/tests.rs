@@ -4,7 +4,7 @@ use proptest::prelude::*;
 #[test]
 fn renderer_tool_presentation_fixtures_round_trip_with_stable_primary_identity() {
     let fixtures = super::renderer_fixtures::renderer_tool_presentation_fixtures();
-    assert_eq!(fixtures.len(), 3);
+    assert_eq!(fixtures.len(), 9);
     for fixture in fixtures {
         let TranscriptViewItemKind::ToolInvocation { tool } = &fixture.item.kind else {
             panic!("{} must be a tool invocation fixture", fixture.name);
@@ -16,7 +16,15 @@ fn renderer_tool_presentation_fixtures_round_trip_with_stable_primary_identity()
             fixture.name
         );
         assert!(!fixture.expected.is_empty(), "{}", fixture.name);
-        assert!(tool.presentation.is_some(), "{}", fixture.name);
+        assert_eq!(
+            tool.presentation.is_some(),
+            fixture.name != "requested-no-presentation",
+            "{}",
+            fixture.name
+        );
+        for forbidden in &fixture.forbidden {
+            assert!(!forbidden.is_empty(), "{}", fixture.name);
+        }
         let encoded = serde_json::to_vec(&fixture.item).expect("encode fixture item");
         let decoded: TranscriptViewItem =
             serde_json::from_slice(&encoded).expect("decode fixture item");

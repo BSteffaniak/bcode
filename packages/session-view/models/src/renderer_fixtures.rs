@@ -9,6 +9,8 @@ use serde::Deserialize;
 pub struct RendererTranscriptFixture {
     pub name: String,
     pub expected: Vec<String>,
+    #[serde(default)]
+    pub forbidden: Vec<String>,
     pub item: super::TranscriptViewItem,
 }
 

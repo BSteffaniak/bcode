@@ -2195,6 +2195,13 @@ fn shared_tool_presentation_fixtures_render_semantic_content_in_tui() {
                 fixture.name
             );
         }
+        for forbidden in &fixture.forbidden {
+            assert!(
+                !rendered.contains(forbidden),
+                "{} exposed {forbidden:?}: {rendered}",
+                fixture.name
+            );
+        }
         let bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool } =
             &fixture.item.kind
         else {
@@ -2471,13 +2478,12 @@ fn push_tool_request_rows(
         muted_style(),
     );
     if !item.text().is_empty() {
-        push_wrapped_styled_text(
+        push_labeled_text_preview(
             rows,
-            vec![Span::styled("  ", muted_style())],
-            "running",
+            "arguments",
+            item.text(),
             width,
-            muted_style(),
-            muted_style(),
+            MAX_INLINE_TOOL_TEXT_ROWS,
         );
     }
     rows.push(Line::default());

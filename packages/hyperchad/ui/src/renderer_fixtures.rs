@@ -6,6 +6,8 @@ use serde::Deserialize;
 pub struct RendererTranscriptFixture {
     pub name: String,
     pub expected: Vec<String>,
+    #[serde(default)]
+    pub forbidden: Vec<String>,
     pub item: bcode_session_view_models::TranscriptViewItem,
 }
 
