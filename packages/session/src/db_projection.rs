@@ -1,5 +1,10 @@
 //! Current materialized-projection identities and checkpoint facts.
 
+use crate::db::SessionDbResult;
+use crate::db_event_store::{event_created_at_ms, seq_to_value};
+use bcode_session_models::SessionEvent;
+use switchy::database::{Database, DatabaseValue};
+
 /// One current checkpointed materialized projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaterializedProjection {
@@ -62,6 +67,25 @@ impl MaterializedProjection {
             Self::RequestContextOccupancy => "context_occupancy",
         }
     }
+}
+
+pub async fn update_projection_checkpoint(
+    db: &dyn Database,
+    projection: MaterializedProjection,
+    event: &SessionEvent,
+) -> SessionDbResult<()> {
+    db.upsert("projection_checkpoints")
+        .unique(&["projection_name"])
+        .value("projection_name", projection.as_str())
+        .value("last_event_seq", seq_to_value(event.sequence))
+        .value(
+            "projection_version",
+            DatabaseValue::Int64(i64::from(projection.schema_version())),
+        )
+        .value("updated_at_ms", seq_to_value(event_created_at_ms(event)))
+        .execute(db)
+        .await?;
+    Ok(())
 }
 
 /// One current projection checkpoint row.

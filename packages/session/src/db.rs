@@ -28,6 +28,7 @@ pub use crate::db_path::{
 };
 pub use crate::db_projection::MaterializedProjection;
 use crate::db_projection::ProjectionCheckpointState;
+use crate::db_projection::update_projection_checkpoint;
 use crate::db_projection_row::{
     input_history_entry_from_row, runtime_work_from_row, session_summary_from_catalog_row,
     tool_run_from_row, transcript_item_from_row,
@@ -4248,25 +4249,6 @@ async fn project_artifact_references(
             .execute(db)
             .await?;
     }
-    Ok(())
-}
-
-async fn update_projection_checkpoint(
-    db: &dyn Database,
-    projection: MaterializedProjection,
-    event: &SessionEvent,
-) -> SessionDbResult<()> {
-    db.upsert("projection_checkpoints")
-        .unique(&["projection_name"])
-        .value("projection_name", projection.as_str())
-        .value("last_event_seq", seq_to_value(event.sequence))
-        .value(
-            "projection_version",
-            DatabaseValue::Int64(i64::from(projection.schema_version())),
-        )
-        .value("updated_at_ms", seq_to_value(event_created_at_ms(event)))
-        .execute(db)
-        .await?;
     Ok(())
 }
 
