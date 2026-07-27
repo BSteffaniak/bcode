@@ -308,6 +308,9 @@ async fn execute_owned_legacy_storage(
         metrics.clone(),
         db_progress,
         Some(operation_id),
+        Arc::new(|row| {
+            bcode_session_migration::normalize_canonical_row(row).map_err(|error| error.to_string())
+        }),
     )
     .await
     .inspect_err(|error| {

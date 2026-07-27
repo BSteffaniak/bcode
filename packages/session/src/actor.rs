@@ -42,7 +42,6 @@ const fn append_rejection_metric(error: &SessionDbError) -> &'static str {
         | SessionDbError::Lease(_)
         | SessionDbError::Serialize(_)
         | SessionDbError::PersistedEvent(_)
-        | SessionDbError::HistoricalMigration(_)
         | SessionDbError::InvalidCompactionMarker { .. }
         | SessionDbError::InvalidRow { .. }
         | SessionDbError::MigrationHistoryIncompatible { .. } => {

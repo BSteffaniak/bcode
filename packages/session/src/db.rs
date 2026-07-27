@@ -47,7 +47,6 @@ use crate::db_validation::{
 };
 use crate::persisted::{PersistedSessionEventError, decode_session_event, encode_session_event};
 use async_trait::async_trait;
-use bcode_session_migration::{CanonicalNormalizationSummary, normalize_canonical_event};
 use bcode_session_migration_target::MigrationTarget as _;
 use sha2::{Digest as _, Sha256};
 
@@ -159,9 +158,6 @@ pub enum SessionDbError {
     /// Canonical event sequences cannot produce a trustworthy incremental projection.
     #[error("invalid canonical event sequence for reindex: expected #{expected}, found #{actual}")]
     InvalidCanonicalSequence { expected: u64, actual: u64 },
-    /// A historical canonical event could not be normalized for writable migration.
-    #[error("historical session migration error: {0}")]
-    HistoricalMigration(#[from] bcode_session_migration::HistoricalSessionEventError),
     /// A materialized projection does not match the canonical event tail.
     #[error(
         "session DB projection is stale: {projection} checkpoint={checkpoint:?} expected={expected}"
@@ -757,6 +753,10 @@ impl SessionDb {
             metrics,
             progress,
             None,
+            Arc::new(|row| {
+                bcode_session_migration::normalize_canonical_row(row)
+                    .map_err(|error| error.to_string())
+            }),
         )
         .await
     }
@@ -766,7 +766,7 @@ impl SessionDb {
     /// # Errors
     ///
     /// Returns an error when opening, migration-target execution, commit, or checkpointing fails.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     pub async fn migrate_turso_in_root_observed_with_operation(
         session_id: SessionId,
         root: &Path,
@@ -775,6 +775,7 @@ impl SessionDb {
         metrics: MetricsRegistry,
         progress: Option<SessionMigrationProgressCallback>,
         operation_id: Option<bcode_session_models::SessionOpenOperationId>,
+        normalizer: bcode_session_migration_target::CanonicalNormalizer,
     ) -> SessionDbResult<Self> {
         Self::migrate_turso_in_root_observed_with_fault(
             session_id,
@@ -784,6 +785,7 @@ impl SessionDb {
             metrics,
             progress,
             operation_id,
+            normalizer,
             MigrationFaultPhase::Disabled,
         )
         .await
@@ -798,6 +800,7 @@ impl SessionDb {
         metrics: MetricsRegistry,
         progress: Option<SessionMigrationProgressCallback>,
         operation_id: Option<bcode_session_models::SessionOpenOperationId>,
+        normalizer: bcode_session_migration_target::CanonicalNormalizer,
         fault: MigrationFaultPhase,
     ) -> SessionDbResult<Self> {
         let path = session_db_path(root, session_id);
@@ -820,9 +823,15 @@ impl SessionDb {
             "session.migration.schema_duration_ms",
             schema_timer.elapsed_ms(),
         );
-        let migration_outcome =
-            migrate_session_storage(&mut target, session_id, &metrics, progress.as_ref(), fault)
-                .await?;
+        let migration_outcome = migrate_session_storage(
+            &mut target,
+            session_id,
+            &metrics,
+            progress.as_ref(),
+            &normalizer,
+            fault,
+        )
+        .await?;
         let receipt = build_target_migration_receipt(
             &*tx,
             session_id,
@@ -2401,6 +2410,7 @@ async fn migrate_session_storage(
     session_id: SessionId,
     metrics: &MetricsRegistry,
     progress: Option<&SessionMigrationProgressCallback>,
+    normalizer: &bcode_session_migration_target::CanonicalNormalizer,
     fault: MigrationFaultPhase,
 ) -> SessionDbResult<MigrationReplayOutcome> {
     let event_total = last_sequence(target.db)
@@ -2414,9 +2424,16 @@ async fn migrate_session_storage(
         "Reading canonical session history",
     );
     metrics.add_counter("session.migration.canonical_events_total", event_total);
-    let replay =
-        rebuild_migration_projections(target, event_total, session_id, metrics, progress, fault)
-            .await?;
+    let replay = rebuild_migration_projections(
+        target,
+        event_total,
+        session_id,
+        metrics,
+        progress,
+        normalizer,
+        fault,
+    )
+    .await?;
     inject_migration_fault(fault, MigrationFaultPhase::FinalValidation)?;
     #[cfg(test)]
     abort_at_migration_crash_boundary("final_validation");
@@ -2436,12 +2453,14 @@ async fn rebuild_migration_projections(
     session_id: SessionId,
     metrics: &MetricsRegistry,
     progress: Option<&SessionMigrationProgressCallback>,
+    normalizer: &bcode_session_migration_target::CanonicalNormalizer,
     fault: MigrationFaultPhase,
 ) -> SessionDbResult<MigrationReplayOutcome> {
     let replay_timer = metrics.timer();
     let mut state = MigrationProjectionState::new();
     let mut source_digest = Sha256::new();
-    let mut normalization_summary = CanonicalNormalizationSummary::default();
+    let mut converted_events = BTreeMap::new();
+    let mut retired_known_events = BTreeMap::new();
     let mut tail = None;
     let mut completed = 0_u64;
     while completed < event_total {
@@ -2470,23 +2489,30 @@ async fn rebuild_migration_projections(
             inject_migration_fault(fault, MigrationFaultPhase::CanonicalDecode)?;
             #[cfg(test)]
             abort_at_migration_crash_boundary("normalization");
-            let normalized = normalize_canonical_event(
-                &payload,
-                bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-                |payload| {
-                    serde_json::from_str::<SessionEvent>(payload).map_err(|error| error.to_string())
-                },
-            )?;
+            let current_row = normalizer(&bcode_session_migration_target::CanonicalRow {
+                sequence: event_seq,
+                event_kind: row.event_kind,
+                schema_version: row.schema_version,
+                payload,
+            })
+            .map_err(|reason| SessionDbError::MigrationHistoryIncompatible { reason })?;
             metrics.record_histogram(
                 "session.migration.canonical_decode_duration_ms",
                 decode_timer.elapsed_ms(),
             );
-            normalization_summary.record(&normalized);
-            if let Some(counter) = normalized.metric_counter {
+            if let Some(source) = current_row.historical_source.as_ref() {
+                let counts = if current_row.retired_known {
+                    &mut retired_known_events
+                } else {
+                    &mut converted_events
+                };
+                *counts.entry(source.clone()).or_insert(0_u64) += 1;
+            }
+            if let Some(counter) = current_row.metric_counter.as_deref() {
                 metrics.increment_counter(counter);
             }
-            validate_canonical_event_identity(&normalized.event, event_seq, session_id)?;
-            let event = normalized.event;
+            validate_canonical_event_identity(&current_row.event, event_seq, session_id)?;
+            let event = current_row.event;
             let current_payload = encode_session_event(&event)?;
             target
                 .replace_canonical_row(bcode_session_migration_target::CanonicalRow {
@@ -2537,7 +2563,6 @@ async fn rebuild_migration_projections(
         replay_timer.elapsed_ms(),
     );
     metrics.add_counter("session.migration.projected_events_total", event_total);
-    let (converted_events, retired_known_events) = normalization_summary.into_counts();
     Ok(MigrationReplayOutcome {
         tail,
         evidence: bcode_session_migration::MigrationClassificationEvidence {
@@ -5512,7 +5537,10 @@ mod tests {
             SessionDb::migrate_turso_in_root(session_id, temp_dir.path(), &maintenance, &write)
                 .await
                 .expect_err("unknown history must fail writable migration");
-        assert!(matches!(error, SessionDbError::HistoricalMigration(_)));
+        assert!(matches!(
+            error,
+            SessionDbError::MigrationHistoryIncompatible { .. }
+        ));
         drop(write);
         drop(maintenance);
 
@@ -8167,6 +8195,10 @@ mod tests {
                     MetricsRegistry::disabled(),
                     None,
                     None,
+                    Arc::new(|row| {
+                bcode_session_migration::normalize_canonical_row(row)
+                    .map_err(|error| error.to_string())
+            }),
                     fault,
                 )
                 .await,

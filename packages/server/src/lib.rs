@@ -6858,8 +6858,7 @@ fn session_migration_failure_outcome(
         | bcode_session::SessionError::Db(
             bcode_session::db::SessionDbError::InvalidCanonicalSequence { .. }
             | bcode_session::db::SessionDbError::InvalidRow { .. }
-            | bcode_session::db::SessionDbError::PersistedEvent(_)
-            | bcode_session::db::SessionDbError::HistoricalMigration(_),
+            | bcode_session::db::SessionDbError::PersistedEvent(_),
         ) => SessionOpenTerminalOutcome::RepairRequired {
             reason: error.to_string(),
         },

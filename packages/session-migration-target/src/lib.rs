@@ -14,6 +14,25 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 
+use std::sync::Arc;
+
+/// Policy-owned canonical normalizer supplied to a current migration target.
+pub type CanonicalNormalizer =
+    Arc<dyn Fn(&CanonicalRow) -> Result<NormalizedCanonicalRow, String> + Send + Sync + 'static>;
+
+/// One canonical row normalized by migration-owned policy for current-target ingestion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedCanonicalRow {
+    /// Strict current event.
+    pub event: SessionEvent,
+    /// Stable migration metric selected by the policy owner, when applicable.
+    pub metric_counter: Option<String>,
+    /// Historical source identity when conversion occurred.
+    pub historical_source: Option<String>,
+    /// Whether the historical source is retained as inert current history.
+    pub retired_known: bool,
+}
+
 /// One durable canonical event row exposed by the current target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalRow {

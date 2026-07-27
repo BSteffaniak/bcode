@@ -144,6 +144,30 @@ pub struct NormalizedCanonicalEvent {
     pub metric_counter: Option<&'static str>,
 }
 
+/// Normalize one source row using migration-owned historical policy.
+///
+/// # Errors
+///
+/// Returns an error when the payload is not a strict current event or a recognized released
+/// historical event.
+pub fn normalize_canonical_row(
+    row: &bcode_session_migration_target::CanonicalRow,
+) -> Result<bcode_session_migration_target::NormalizedCanonicalRow, HistoricalSessionEventError> {
+    let normalized = normalize_canonical_event(
+        &row.payload,
+        bcode_session_migration_target::CURRENT_EVENT_SCHEMA,
+        |payload| serde_json::from_str::<SessionEvent>(payload).map_err(|error| error.to_string()),
+    )?;
+    Ok(bcode_session_migration_target::NormalizedCanonicalRow {
+        event: normalized.event,
+        metric_counter: normalized.metric_counter.map(str::to_owned),
+        historical_source: normalized
+            .historical
+            .map(|metadata| format!("{}:{}", metadata.source_schema, metadata.source_kind)),
+        retired_known: normalized.retired_known,
+    })
+}
+
 /// Normalize one canonical payload into the final current representation.
 ///
 /// `decode_current` must be the strict current persistence decoder. Historical adapters are used
