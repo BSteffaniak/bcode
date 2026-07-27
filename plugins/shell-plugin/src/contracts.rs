@@ -10,8 +10,6 @@ use std::path::PathBuf;
 pub const SHELL_RUN_TOOL_NAME: &str = "shell.run";
 /// Schema for shell execution result artifacts and live recording contributions.
 pub const SHELL_RUN_SCHEMA: &str = "bcode.shell.run";
-/// Schema for durable shell execution summaries.
-pub const SHELL_RUN_SUMMARY_SCHEMA: &str = "bcode.shell.run.summary";
 /// Schema for unsolicited shell invocation controls.
 pub const SHELL_INVOCATION_INPUT_SCHEMA: &str = "bcode.shell.invocation-input";
 /// Current version of all JSON shell invocation schemas above.

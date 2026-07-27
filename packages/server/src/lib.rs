@@ -32814,34 +32814,34 @@ library = "test"
                             && update.artifact.is_some()
                 ))
         );
+        append_tool_finished_event_inner(&state, session_id, result)
+            .await
+            .expect("durable shell result");
 
         let history = state
             .sessions
             .session_history(session_id)
             .await
             .expect("shell contribution history");
-        let contribution = history
+        let record = history
             .iter()
             .find_map(|event| match &event.kind {
-                SessionEventKind::ToolContributionPlaced { envelope }
-                    if envelope.contribution.schema == "bcode.shell.run.summary"
-                        && envelope.placement
-                            == bcode_session_models::ToolContributionPlacement::Result =>
+                SessionEventKind::ToolInvocationResultRecorded { record }
+                    if record.invocation_id == "shell-contribution" =>
                 {
-                    Some(&envelope.contribution)
+                    Some(record)
                 }
                 _ => None,
             })
-            .expect("durable shell contribution");
-        assert_eq!(contribution.invocation_id, "shell-contribution");
-        assert_eq!(contribution.producer_id, "bcode.shell");
-        assert_eq!(contribution.schema, "bcode.shell.run.summary");
-        assert!(
-            contribution
-                .payload
-                .to_string()
-                .contains("server-contribution")
-        );
+            .expect("durable shell result");
+        let presentation = record
+            .presentation
+            .as_ref()
+            .expect("retained shell presentation checkpoint");
+        assert_eq!(presentation.producer_id, "bcode.shell");
+        assert_eq!(presentation.schema, "bcode.shell.run");
+        assert!(presentation.artifact.is_some());
+        assert!(record.model_output.contains("server-contribution"));
         assert!(!history.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::ToolInvocationLifecycle { event }

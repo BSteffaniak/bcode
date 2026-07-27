@@ -96,25 +96,42 @@ impl LiveReasoningActivity {
     }
 }
 
+fn tool_invocation_id(event: &SessionEvent) -> Option<&str> {
+    match &event.kind {
+        SessionEventKind::ToolCallRequested { tool_call_id, .. } => Some(tool_call_id),
+        SessionEventKind::ToolInvocationLifecycle { event } => Some(&event.invocation_id),
+        SessionEventKind::ToolInvocationResultRecorded { record } => Some(&record.invocation_id),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct ToolInvocationAggregate {
+    projection: ToolInvocationProjection,
+    terminal_status: Option<ToolInvocationViewStatus>,
+    request_draft: Option<ToolRequestDraftView>,
+    terminal_request_draft: Option<(u64, u64)>,
+    presentations:
+        BTreeMap<bcode_tool::ToolPresentationIdentity, bcode_tool::ToolPresentationUpdate>,
+    presentation_scope: bcode_tool::ToolPresentationUpdateScope,
+}
+
+impl ToolInvocationAggregate {
+    const fn is_terminal(&self) -> bool {
+        self.terminal_status.is_some()
+    }
+}
+
 /// Renderer-neutral session view projection.
 #[derive(Debug, Clone)]
 pub struct SessionView {
     snapshot: SessionViewSnapshot,
     tool_item_ids: BTreeMap<String, TranscriptViewItemId>,
     interaction_item_ids: BTreeMap<String, TranscriptViewItemId>,
-    tool_invocation_projections: BTreeMap<String, ToolInvocationProjection>,
+    tool_invocations: BTreeMap<String, ToolInvocationAggregate>,
     contribution_sequences: BTreeMap<String, u64>,
     contribution_placements: BTreeMap<String, bcode_session_models::ToolContributionPlacement>,
-    terminal_invocations: BTreeSet<String>,
-    terminal_invocation_statuses: BTreeMap<String, ToolInvocationViewStatus>,
     terminal_runtime_work: BTreeSet<bcode_session_models::WorkId>,
-    tool_request_drafts: BTreeMap<String, ToolRequestDraftView>,
-    terminal_tool_request_drafts: BTreeMap<String, (u64, u64)>,
-    presentation_updates: BTreeMap<
-        (String, bcode_tool::ToolPresentationIdentity),
-        bcode_tool::ToolPresentationUpdate,
-    >,
-    presentation_update_scopes: BTreeMap<String, bcode_tool::ToolPresentationUpdateScope>,
     live_reasoning: BTreeMap<(String, String), LiveReasoningActivity>,
 }
 
@@ -132,18 +149,37 @@ impl SessionView {
             snapshot: SessionViewSnapshot::empty(),
             tool_item_ids: BTreeMap::new(),
             interaction_item_ids: BTreeMap::new(),
-            tool_invocation_projections: BTreeMap::new(),
+            tool_invocations: BTreeMap::new(),
             contribution_sequences: BTreeMap::new(),
             contribution_placements: BTreeMap::new(),
-            terminal_invocations: BTreeSet::new(),
-            terminal_invocation_statuses: BTreeMap::new(),
             terminal_runtime_work: BTreeSet::new(),
-            tool_request_drafts: BTreeMap::new(),
-            terminal_tool_request_drafts: BTreeMap::new(),
-            presentation_updates: BTreeMap::new(),
-            presentation_update_scopes: BTreeMap::new(),
             live_reasoning: BTreeMap::new(),
         }
+    }
+
+    #[cfg(test)]
+    fn tool_request_drafts(&self) -> BTreeMap<String, ToolRequestDraftView> {
+        self.tool_invocations
+            .iter()
+            .filter_map(|(invocation_id, aggregate)| {
+                aggregate
+                    .request_draft
+                    .clone()
+                    .map(|draft| (invocation_id.clone(), draft))
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn terminal_tool_request_drafts(&self) -> BTreeMap<String, (u64, u64)> {
+        self.tool_invocations
+            .iter()
+            .filter_map(|(invocation_id, aggregate)| {
+                aggregate
+                    .terminal_request_draft
+                    .map(|terminal| (invocation_id.clone(), terminal))
+            })
+            .collect()
     }
 
     /// Return the currently accepted presentation update for an invocation identity.
@@ -153,8 +189,9 @@ impl SessionView {
         invocation_id: &str,
         identity: &bcode_tool::ToolPresentationIdentity,
     ) -> Option<&bcode_tool::ToolPresentationUpdate> {
-        self.presentation_updates
-            .get(&(invocation_id.to_owned(), identity.clone()))
+        self.tool_invocations
+            .get(invocation_id)
+            .and_then(|aggregate| aggregate.presentations.get(identity))
     }
 
     /// Return the current snapshot.
@@ -483,11 +520,19 @@ impl SessionView {
         let previous = self.snapshot.clone();
         let terminal_runtime_work = self.terminal_runtime_work.clone();
         let live_tool_request_drafts = self
-            .tool_request_drafts
+            .tool_invocations
             .values()
-            .cloned()
+            .filter_map(|aggregate| aggregate.request_draft.clone())
             .collect::<Vec<_>>();
-        let terminal_tool_request_drafts = self.terminal_tool_request_drafts.clone();
+        let terminal_tool_request_drafts = self
+            .tool_invocations
+            .iter()
+            .filter_map(|(invocation_id, aggregate)| {
+                aggregate
+                    .terminal_request_draft
+                    .map(|terminal| (invocation_id.clone(), terminal))
+            })
+            .collect::<BTreeMap<_, _>>();
         let live_contributions = self
             .snapshot
             .contributions
@@ -517,7 +562,13 @@ impl SessionView {
         replacement.snapshot.interactions = previous.interactions;
         replacement.snapshot.session_summary = previous.session_summary;
         replacement.terminal_runtime_work = terminal_runtime_work;
-        replacement.terminal_tool_request_drafts = terminal_tool_request_drafts;
+        for (invocation_id, terminal) in terminal_tool_request_drafts {
+            replacement
+                .tool_invocations
+                .entry(invocation_id)
+                .or_default()
+                .terminal_request_draft = Some(terminal);
+        }
         replacement.snapshot.revision = self.snapshot.revision.saturating_add(1);
         for draft in live_tool_request_drafts {
             replacement.apply_tool_request_draft(&bcode_session_models::ToolRequestDraftEvent {
@@ -565,7 +616,29 @@ impl SessionView {
             }
             self.snapshot.latest_sequence = Some(event.sequence);
         }
-        apply_tool_invocation_projection_event(&mut self.tool_invocation_projections, event);
+        if let Some(invocation_id) = tool_invocation_id(event) {
+            let aggregate = self
+                .tool_invocations
+                .entry(invocation_id.to_owned())
+                .or_default();
+            let projection = if aggregate.projection.tool_call_id.is_empty() {
+                ToolInvocationProjection {
+                    tool_call_id: invocation_id.to_owned(),
+                    ..ToolInvocationProjection::default()
+                }
+            } else {
+                std::mem::take(&mut aggregate.projection)
+            };
+            let mut projections = BTreeMap::from([(invocation_id.to_owned(), projection)]);
+            apply_tool_invocation_projection_event(&mut projections, event);
+            aggregate.projection =
+                projections
+                    .remove(invocation_id)
+                    .unwrap_or_else(|| ToolInvocationProjection {
+                        tool_call_id: invocation_id.to_owned(),
+                        ..ToolInvocationProjection::default()
+                    });
+        }
 
         match &event.kind {
             SessionEventKind::SessionCreated {
@@ -665,7 +738,11 @@ impl SessionView {
             }
             SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
                 use bcode_session_models::ToolInvocationLifecycleStage;
-                if self.terminal_invocations.contains(&lifecycle.invocation_id) {
+                if self
+                    .tool_invocations
+                    .get(&lifecycle.invocation_id)
+                    .is_some_and(ToolInvocationAggregate::is_terminal)
+                {
                     return;
                 }
                 match lifecycle.stage {
@@ -676,9 +753,9 @@ impl SessionView {
                             .active_invocations
                             .insert(lifecycle.invocation_id.clone(), lifecycle.clone());
                         if self
-                            .tool_invocation_projections
+                            .tool_invocations
                             .get(&lifecycle.invocation_id)
-                            .is_some_and(|projection| projection.tool_name.is_some())
+                            .is_some_and(|aggregate| aggregate.projection.tool_name.is_some())
                         {
                             self.upsert_tool_item(
                                 &lifecycle.invocation_id,
@@ -705,8 +782,10 @@ impl SessionView {
                             | ToolInvocationLifecycleStage::Waiting => unreachable!(),
                         };
                         if !matches!(status, ToolInvocationViewStatus::Finished) {
-                            self.terminal_invocation_statuses
-                                .insert(lifecycle.invocation_id.clone(), status);
+                            self.tool_invocations
+                                .entry(lifecycle.invocation_id.clone())
+                                .or_default()
+                                .terminal_status = Some(status);
                             self.apply_terminal_tool_status(
                                 &lifecycle.invocation_id,
                                 status,
@@ -714,7 +793,11 @@ impl SessionView {
                                 event.sequence,
                                 Some(event.timestamp_ms),
                             );
-                            self.tool_request_drafts.remove(&lifecycle.invocation_id);
+                            if let Some(aggregate) =
+                                self.tool_invocations.get_mut(&lifecycle.invocation_id)
+                            {
+                                aggregate.request_draft = None;
+                            }
                             let result_id = TranscriptViewItemId::tool(&lifecycle.invocation_id);
                             if !matches!(
                                 self.snapshot
@@ -731,9 +814,9 @@ impl SessionView {
                                     .retain(|item| item.id != result_id);
                             }
                         } else if let Some(projection) = self
-                            .tool_invocation_projections
+                            .tool_invocations
                             .get(&lifecycle.invocation_id)
-                            .cloned()
+                            .map(|aggregate| aggregate.projection.clone())
                             .filter(|projection| projection.tool_name.is_some())
                         {
                             let mut tool = tool_invocation_view_from_projection(projection);
@@ -761,37 +844,41 @@ impl SessionView {
                             self.snapshot.transcript.revision =
                                 self.snapshot.transcript.revision.saturating_add(1);
                         }
-                        self.terminal_invocations
-                            .insert(lifecycle.invocation_id.clone());
-                        self.presentation_update_scopes
+                        let aggregate = self
+                            .tool_invocations
                             .entry(lifecycle.invocation_id.clone())
-                            .or_default()
-                            .close();
-                        self.presentation_updates
-                            .retain(|(invocation_id, _), update| {
-                                invocation_id != &lifecycle.invocation_id
-                                    || update.retention
-                                        == bcode_tool::ToolPresentationRetention::RetainLatest
-                            });
+                            .or_default();
+                        aggregate.terminal_status = Some(status);
+                        aggregate.presentation_scope.close();
+                        aggregate.presentations.retain(|_, update| {
+                            update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+                        });
                     }
                 }
                 self.bump_revision();
             }
             SessionEventKind::ToolCallRequested { tool_call_id, .. } => {
                 if self
-                    .tool_request_drafts
+                    .tool_invocations
                     .get(tool_call_id)
+                    .and_then(|aggregate| aggregate.request_draft.as_ref())
                     .is_some_and(|draft| {
                         draft.placement == bcode_session_models::ToolContributionPlacement::Request
                     })
+                    && let Some(aggregate) = self.tool_invocations.get_mut(tool_call_id)
                 {
-                    self.tool_request_drafts.remove(tool_call_id);
+                    aggregate.request_draft = None;
                 }
-                self.terminal_tool_request_drafts.remove(tool_call_id);
+                if let Some(aggregate) = self.tool_invocations.get_mut(tool_call_id) {
+                    aggregate.terminal_request_draft = None;
+                }
                 self.upsert_tool_item(tool_call_id, event.sequence, Some(event.timestamp_ms));
             }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
-                let already_terminal = self.terminal_invocations.contains(&record.invocation_id);
+                let already_terminal = self
+                    .tool_invocations
+                    .get(&record.invocation_id)
+                    .is_some_and(ToolInvocationAggregate::is_terminal);
                 if already_terminal
                     && self
                         .snapshot
@@ -801,21 +888,22 @@ impl SessionView {
                 {
                     return;
                 }
-                self.terminal_invocations
-                    .insert(record.invocation_id.clone());
+                let aggregate = self
+                    .tool_invocations
+                    .entry(record.invocation_id.clone())
+                    .or_default();
+                aggregate.terminal_status.get_or_insert(if record.is_error {
+                    ToolInvocationViewStatus::Failed
+                } else {
+                    ToolInvocationViewStatus::Finished
+                });
+                aggregate.presentation_scope.close();
+                aggregate.presentations.retain(|_, update| {
+                    update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+                });
                 self.snapshot
                     .active_invocations
                     .remove(&record.invocation_id);
-                self.presentation_update_scopes
-                    .entry(record.invocation_id.clone())
-                    .or_default()
-                    .close();
-                self.presentation_updates
-                    .retain(|(invocation_id, _), update| {
-                        invocation_id != &record.invocation_id
-                            || update.retention
-                                == bcode_tool::ToolPresentationRetention::RetainLatest
-                    });
                 self.upsert_tool_item(
                     &record.invocation_id,
                     event.sequence,
@@ -1407,7 +1495,10 @@ impl SessionView {
             }
             SessionLiveEventKind::ToolInvocationProgress { event } => {
                 if event.stage == bcode_session_models::ToolInvocationLifecycleStage::Progress
-                    && !self.terminal_invocations.contains(&event.invocation_id)
+                    && !self
+                        .tool_invocations
+                        .get(&event.invocation_id)
+                        .is_some_and(ToolInvocationAggregate::is_terminal)
                 {
                     self.snapshot
                         .active_invocations
@@ -1437,20 +1528,27 @@ impl SessionView {
 
     #[allow(clippy::too_many_lines)] // One state-machine handler keeps generation/revision/offset transitions atomic.
     fn apply_presentation_update(&mut self, update: &bcode_tool::ToolPresentationUpdate) {
-        if self.terminal_invocations.contains(&update.invocation_id) {
+        if self
+            .tool_invocations
+            .get(&update.invocation_id)
+            .is_some_and(ToolInvocationAggregate::is_terminal)
+        {
             return;
         }
-        let scope = self
-            .presentation_update_scopes
+        let aggregate = self
+            .tool_invocations
             .entry(update.invocation_id.clone())
             .or_default();
-        if scope.accept(update, usize::MAX).is_err() {
+        if aggregate
+            .presentation_scope
+            .accept(update, usize::MAX)
+            .is_err()
+        {
             return;
         }
-        self.presentation_updates.insert(
-            (update.invocation_id.clone(), update.identity.clone()),
-            update.clone(),
-        );
+        aggregate
+            .presentations
+            .insert(update.identity.clone(), update.clone());
         if matches!(
             update.identity,
             bcode_tool::ToolPresentationIdentity::Primary
@@ -1472,9 +1570,9 @@ impl SessionView {
                 return;
             }
             if let Some(projection) = self
-                .tool_invocation_projections
+                .tool_invocations
                 .get(&update.invocation_id)
-                .cloned()
+                .map(|aggregate| aggregate.projection.clone())
                 .filter(|projection| projection.tool_name.is_some())
             {
                 let mut tool = tool_invocation_view_from_projection(projection);
@@ -1510,22 +1608,28 @@ impl SessionView {
         self.bump_revision();
     }
 
+    #[allow(clippy::too_many_lines)] // Draft generation, revision, and UTF-8 offsets form one atomic reducer transition.
     fn apply_tool_request_draft(&mut self, event: &bcode_session_models::ToolRequestDraftEvent) {
         use bcode_session_models::ToolRequestDraftOperation;
 
         let key = event.tool_call_id.clone();
         let previous_placement = self
-            .tool_request_drafts
+            .tool_invocations
             .get(&key)
+            .and_then(|aggregate| aggregate.request_draft.as_ref())
             .map(|draft| draft.placement);
-        let current = self.tool_request_drafts.get(&key).cloned();
+        let current = self
+            .tool_invocations
+            .get(&key)
+            .and_then(|aggregate| aggregate.request_draft.clone());
         let terminal_update = matches!(event.operation, ToolRequestDraftOperation::Remove { .. });
         if self
-            .terminal_tool_request_drafts
+            .tool_invocations
             .get(&key)
+            .and_then(|aggregate| aggregate.terminal_request_draft)
             .is_some_and(|(generation, revision)| {
-                event.generation < *generation
-                    || (event.generation == *generation && event.revision <= *revision)
+                event.generation < generation
+                    || (event.generation == generation && event.revision <= revision)
             })
             || current.as_ref().is_some_and(|current| {
                 event.generation < current.generation
@@ -1541,12 +1645,21 @@ impl SessionView {
             .as_ref()
             .is_some_and(|current| event.generation > current.generation)
         {
-            self.tool_request_drafts.remove(&key);
+            self.tool_invocations
+                .entry(key.clone())
+                .or_default()
+                .request_draft = None;
         }
         if let ToolRequestDraftOperation::Remove { .. } = event.operation {
-            self.tool_request_drafts.remove(&key);
-            self.terminal_tool_request_drafts
-                .insert(key, (event.generation, event.revision.saturating_add(1)));
+            self.tool_invocations
+                .entry(key.clone())
+                .or_default()
+                .request_draft = None;
+            self.tool_invocations
+                .entry(key)
+                .or_default()
+                .terminal_request_draft =
+                Some((event.generation, event.revision.saturating_add(1)));
             self.refresh_tool_presentation_slot(
                 &event.tool_call_id,
                 event.placement,
@@ -1556,7 +1669,10 @@ impl SessionView {
             );
             return;
         }
-        self.terminal_tool_request_drafts.remove(&key);
+        self.tool_invocations
+            .entry(key.clone())
+            .or_default()
+            .terminal_request_draft = None;
         let mut draft = current
             .filter(|current| current.generation == event.generation)
             .unwrap_or_else(|| ToolRequestDraftView {
@@ -1601,7 +1717,7 @@ impl SessionView {
         draft.revision = event.revision;
         draft.argument_bytes = event.argument_bytes;
         draft.truncated = event.truncated;
-        self.tool_request_drafts.insert(key, draft);
+        self.tool_invocations.entry(key).or_default().request_draft = Some(draft);
         if previous_placement.is_some_and(|placement| placement != event.placement) {
             self.refresh_tool_presentation_slot(
                 &event.tool_call_id,
@@ -1739,7 +1855,10 @@ impl SessionView {
                 .map(|(_, contribution)| contribution.clone())
         };
         let tool = self.snapshot.tools.get(invocation_id).cloned();
-        let draft = self.tool_request_drafts.get(invocation_id).cloned();
+        let draft = self
+            .tool_invocations
+            .get(invocation_id)
+            .and_then(|aggregate| aggregate.request_draft.clone());
         let kind = if placement == ToolContributionPlacement::Supplemental {
             latest_contribution(ToolContributionPlacement::Supplemental).map(|contribution| {
                 TranscriptViewItemKind::ToolContribution {
@@ -1820,8 +1939,9 @@ impl SessionView {
         placement: bcode_session_models::ToolContributionPlacement,
     ) {
         if self
-            .terminal_invocations
-            .contains(&contribution.invocation_id)
+            .tool_invocations
+            .get(&contribution.invocation_id)
+            .is_some_and(ToolInvocationAggregate::is_terminal)
             && contribution.persistence
                 == bcode_session_models::ToolContributionPersistence::Transient
         {
@@ -2058,11 +2178,13 @@ impl SessionView {
         &self,
         invocation_id: &str,
     ) -> Option<bcode_session_view_models::ToolPresentationView> {
-        self.presentation_updates
-            .get(&(
-                invocation_id.to_owned(),
-                bcode_tool::ToolPresentationIdentity::Primary,
-            ))
+        self.tool_invocations
+            .get(invocation_id)
+            .and_then(|aggregate| {
+                aggregate
+                    .presentations
+                    .get(&bcode_tool::ToolPresentationIdentity::Primary)
+            })
             .map(Into::into)
     }
 
@@ -2122,12 +2244,14 @@ impl SessionView {
     }
 
     fn upsert_tool_item(&mut self, tool_call_id: &str, sequence: u64, timestamp_ms: Option<u64>) {
-        let Some(projection) = self.tool_invocation_projections.get(tool_call_id).cloned() else {
+        let Some(aggregate) = self.tool_invocations.get(tool_call_id) else {
             return;
         };
+        let projection = aggregate.projection.clone();
+        let terminal_status = aggregate.terminal_status;
         let mut tool = tool_invocation_view_from_projection(projection);
         self.attach_primary_presentation(&mut tool);
-        if let Some(status) = self.terminal_invocation_statuses.get(tool_call_id).copied() {
+        if let Some(status) = terminal_status {
             tool.status = status;
             if matches!(status, ToolInvocationViewStatus::Failed) {
                 tool.is_error = Some(true);
@@ -3342,8 +3466,8 @@ mod tests {
         coalesced.apply_live_event(&draft(3, "latest"));
 
         assert_eq!(
-            full_cadence.tool_request_drafts,
-            coalesced.tool_request_drafts
+            full_cadence.tool_request_drafts(),
+            coalesced.tool_request_drafts()
         );
         let full_item = &full_cadence.snapshot().transcript.items[0];
         let coalesced_item = &coalesced.snapshot().transcript.items[0];
@@ -3374,8 +3498,8 @@ mod tests {
         };
         full_cadence.apply_live_event(&remove);
         coalesced.apply_live_event(&remove);
-        assert!(full_cadence.tool_request_drafts.is_empty());
-        assert!(coalesced.tool_request_drafts.is_empty());
+        assert!(full_cadence.tool_request_drafts().is_empty());
+        assert!(coalesced.tool_request_drafts().is_empty());
         assert!(full_cadence.snapshot().transcript.items.is_empty());
         assert!(coalesced.snapshot().transcript.items.is_empty());
     }
@@ -3600,9 +3724,9 @@ mod tests {
                 text: "post-terminal".to_owned(),
             },
         ));
-        assert!(view.tool_request_drafts.is_empty());
+        assert!(view.tool_request_drafts().is_empty());
         assert_eq!(
-            view.terminal_tool_request_drafts.get("call-write"),
+            view.terminal_tool_request_drafts().get("call-write"),
             Some(&(1, 4))
         );
         assert!(
@@ -3644,12 +3768,12 @@ mod tests {
         let unicode = "λ🙂";
         view.apply_live_event(&draft(1, 0, unicode));
         view.apply_live_event(&draft(2, unicode.len(), "ok"));
-        assert_eq!(view.tool_request_drafts["call-write"].preview, "λ🙂ok");
+        assert_eq!(view.tool_request_drafts()["call-write"].preview, "λ🙂ok");
 
         let character_offset = "λ🙂ok".chars().count();
         assert_ne!(character_offset, "λ🙂ok".len());
         view.apply_live_event(&draft(3, character_offset, "wrong-unit"));
-        assert_eq!(view.tool_request_drafts["call-write"].preview, "λ🙂ok");
+        assert_eq!(view.tool_request_drafts()["call-write"].preview, "λ🙂ok");
     }
 
     #[test]
@@ -3679,11 +3803,11 @@ mod tests {
                     },
                 },
             });
-            assert_eq!(view.tool_request_drafts.len(), 1);
+            assert_eq!(view.tool_request_drafts().len(), 1);
             assert_eq!(view.snapshot().transcript.items.len(), 1);
         }
 
-        assert_eq!(view.tool_request_drafts["call-write"].preview, "10000");
+        assert_eq!(view.tool_request_drafts()["call-write"].preview, "10000");
         assert_eq!(view.snapshot().transcript.items.len(), 1);
     }
 
@@ -3792,10 +3916,8 @@ mod tests {
         view.apply_live_event(&draft(2, 1, "replacement preview"));
         view.apply_live_event(&draft(1, 9, "revived old preview"));
 
-        let projected = view
-            .tool_request_drafts
-            .get("call-write")
-            .expect("current request draft");
+        let drafts = view.tool_request_drafts();
+        let projected = drafts.get("call-write").expect("current request draft");
         assert_eq!(projected.generation, 2);
         assert_eq!(projected.revision, 1);
         assert_eq!(projected.preview, "replacement preview");
@@ -3848,8 +3970,8 @@ mod tests {
         view.apply_live_event(&draft("call-a", 2, 5, " one"));
         view.apply_live_event(&draft("call-b", 2, 5, " two"));
 
-        assert_eq!(view.tool_request_drafts["call-a"].preview, "alpha one");
-        assert_eq!(view.tool_request_drafts["call-b"].preview, "bravo two");
+        assert_eq!(view.tool_request_drafts()["call-a"].preview, "alpha one");
+        assert_eq!(view.tool_request_drafts()["call-b"].preview, "bravo two");
         let snapshot = view.snapshot();
         assert_eq!(
             snapshot
@@ -4003,8 +4125,8 @@ mod tests {
             },
         ));
 
-        assert!(view.tool_request_drafts.is_empty());
-        assert!(view.terminal_tool_request_drafts.is_empty());
+        assert!(view.tool_request_drafts().is_empty());
+        assert!(view.terminal_tool_request_drafts().is_empty());
         assert_eq!(
             view.snapshot()
                 .transcript
@@ -5972,7 +6094,7 @@ mod tests {
             },
         )]);
 
-        assert_eq!(view.tool_request_drafts.len(), 1);
+        assert_eq!(view.tool_request_drafts().len(), 1);
         assert_eq!(view.snapshot().contributions.len(), 1);
         assert_eq!(
             view.snapshot()

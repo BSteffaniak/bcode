@@ -957,6 +957,13 @@ if ! grep -F 'document_invocation_uses_prepared_local_source_path' plugins/docum
   violations=1
 fi
 
+if rg -n 'ToolContributionEnvelope::new\(\s*ToolContributionPlacement::(Request|Progress|Result)|emit_tool_contribution\(\s*[^,]+,\s*ToolContributionPlacement::(Request|Progress|Result)' \
+  plugins --glob '*.rs' >/tmp/bcode-new-primary-placement-producers.txt; then
+  echo "Runtime architecture violation: plugins must publish primary visuals through presentation updates, not legacy placements." >&2
+  cat /tmp/bcode-new-primary-placement-producers.txt >&2
+  violations=1
+fi
+
 if rg -n 'ToolPluginVisualMetadata|ToolVisualPayloadSelector|request_visual:\s*Some' \
   plugins/shell-plugin/src --glob '*.rs' >/tmp/bcode-shell-legacy-request-visuals.txt; then
   echo "Runtime architecture violation: Shell reintroduced legacy request visual production." >&2
@@ -964,9 +971,9 @@ if rg -n 'ToolPluginVisualMetadata|ToolVisualPayloadSelector|request_visual:\s*S
   violations=1
 fi
 
-if ! grep -F 'shell_request_is_generic_contribution_only' plugins/shell-plugin/src/lib.rs >/dev/null ||
-   ! grep -F 'contribution_id: "shell-run-request"' plugins/shell-plugin/src/lib.rs >/dev/null; then
-  echo "Runtime architecture violation: generic Shell request contribution coverage was removed." >&2
+if ! grep -F 'shell_request_uses_primary_presentation_without_definition_ui' plugins/shell-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'PrimaryPresentationPublisher::with_limits_and_cancellation' plugins/shell-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: Shell primary presentation coverage was removed." >&2
   violations=1
 fi
 

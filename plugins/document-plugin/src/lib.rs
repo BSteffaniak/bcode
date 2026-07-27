@@ -10,10 +10,8 @@ use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolContributionEnvelope, ToolContributionEvent, ToolContributionOperation,
-    ToolContributionPersistence, ToolContributionPlacement, ToolDefinition,
-    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult, ToolList,
+    ToolDefinition, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
+    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -259,14 +257,20 @@ impl DocumentPlugin {
         if context.cancellation.is_cancelled() {
             return json_response(&tool_error("document tool cancelled".to_string()));
         }
-        emit_request_contribution(
+        let mut presentation = PrimaryPresentationPublisher::with_limits_and_cancellation(
             context.events,
+            &invocation.tool_call_id,
             DOCUMENT_PLUGIN_ID,
             DOCUMENT_REQUEST_SCHEMA,
-            &invocation.tool_call_id,
+            1,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
+            context.transient_progress_limits,
+            context.cancellation.clone(),
+        );
+        let _ = presentation.replace(&request_visual_payload(
             &invocation.name,
             &invocation.arguments,
-        );
+        ));
         let response = match invocation.name.as_str() {
             "document.extract" => self.invoke_extract(&invocation, context.events),
             "document.status" => invoke_status(&invocation.tool_call_id),
@@ -671,35 +675,13 @@ fn status_tool_definition() -> ToolDefinition {
     }
 }
 
-fn emit_request_contribution(
-    events: ServiceEventEmitter,
-    producer_id: &str,
-    schema: &str,
-    invocation_id: &str,
-    operation: &str,
-    arguments: &serde_json::Value,
-) {
+fn request_visual_payload(operation: &str, arguments: &serde_json::Value) -> serde_json::Value {
     let mut payload = arguments.as_object().cloned().unwrap_or_default();
     payload.insert(
         "operation".to_owned(),
         serde_json::Value::String(operation.to_owned()),
     );
-    let event = ToolContributionEvent {
-        invocation_id: invocation_id.to_owned(),
-        contribution_id: "request".to_owned(),
-        sequence: 1,
-        producer_id: producer_id.to_owned(),
-        schema: schema.to_owned(),
-        schema_version: 1,
-        operation: ToolContributionOperation::Upsert,
-        persistence: ToolContributionPersistence::Durable,
-        artifact: None,
-        payload: serde_json::Value::Object(payload),
-    };
-    let envelope = ToolContributionEnvelope::new(ToolContributionPlacement::Request, event);
-    if let Ok(payload) = serde_json::to_vec(&envelope) {
-        events.emit(&payload);
-    }
+    serde_json::Value::Object(payload)
 }
 
 fn invoke_status(tool_call_id: &str) -> ToolInvocationResponse {

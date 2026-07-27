@@ -15,9 +15,7 @@ use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolContributionEnvelope, ToolContributionEvent, ToolContributionOperation,
-    ToolContributionPersistence, ToolContributionPlacement, ToolDefinition, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult, ToolList,
+    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
 };
 use bcode_worktree_models::{
     WorktreeCreateRequest, WorktreeInfo, WorktreeListRequest, WorktreeRemoveRequest,
@@ -342,14 +340,20 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
     if context.cancellation.is_cancelled() {
         return json_response(&tool_error("worktree tool cancelled".to_string()));
     }
-    emit_tool_contribution(
+    let mut presentation = PrimaryPresentationPublisher::with_limits_and_cancellation(
         context.events,
-        &worktree_request_contribution(
-            &invocation.tool_call_id,
-            &invocation.name,
-            &invocation.arguments,
-        ),
+        &invocation.tool_call_id,
+        WORKTREE_PLUGIN_ID,
+        WORKTREE_REQUEST_SCHEMA,
+        1,
+        bcode_tool::ToolPresentationRetention::RetainLatest,
+        context.transient_progress_limits,
+        context.cancellation.clone(),
     );
+    let _ = presentation.replace(&worktree_request_payload(
+        &invocation.name,
+        &invocation.arguments,
+    ));
     let response = match invocation.name.as_str() {
         "worktree.list" => invoke_list(&invocation, &descriptor),
         "worktree.create" => invoke_create(&invocation, &descriptor),
@@ -450,12 +454,8 @@ fn invoke_remove(
     }
 }
 
-fn worktree_request_contribution(
-    invocation_id: &str,
-    operation: &str,
-    arguments: &serde_json::Value,
-) -> ToolContributionEvent {
-    let payload = arguments.as_object().map_or_else(
+fn worktree_request_payload(operation: &str, arguments: &serde_json::Value) -> serde_json::Value {
+    arguments.as_object().map_or_else(
         || json!({"operation": operation, "arguments": arguments}),
         |arguments| {
             let mut payload = arguments.clone();
@@ -465,26 +465,7 @@ fn worktree_request_contribution(
             );
             serde_json::Value::Object(payload)
         },
-    );
-    ToolContributionEvent {
-        invocation_id: invocation_id.to_owned(),
-        contribution_id: "worktree-request".to_owned(),
-        sequence: 1,
-        producer_id: WORKTREE_PLUGIN_ID.to_owned(),
-        schema: WORKTREE_REQUEST_SCHEMA.to_owned(),
-        schema_version: 1,
-        operation: ToolContributionOperation::Upsert,
-        persistence: ToolContributionPersistence::Durable,
-        artifact: None,
-        payload,
-    }
-}
-
-fn emit_tool_contribution(events: ServiceEventEmitter, event: &ToolContributionEvent) {
-    let envelope = ToolContributionEnvelope::new(ToolContributionPlacement::Request, event.clone());
-    if let Ok(payload) = serde_json::to_vec(&envelope) {
-        events.emit(&payload);
-    }
+    )
 }
 
 fn list_definition() -> ToolDefinition {
@@ -1103,16 +1084,9 @@ mod tests {
     #[test]
     fn worktree_requests_use_durable_generic_contributions_without_legacy_visuals() {
         let arguments = serde_json::json!({"name": "feature", "base_ref": "head"});
-        let contribution = worktree_request_contribution("call-1", "worktree.create", &arguments);
-        assert_eq!(contribution.invocation_id, "call-1");
-        assert_eq!(contribution.producer_id, WORKTREE_PLUGIN_ID);
-        assert_eq!(contribution.schema, WORKTREE_REQUEST_SCHEMA);
-        assert_eq!(
-            contribution.persistence,
-            ToolContributionPersistence::Durable
-        );
-        assert_eq!(contribution.payload["operation"], "worktree.create");
-        assert_eq!(contribution.payload["name"], "feature");
+        let payload = worktree_request_payload("worktree.create", &arguments);
+        assert_eq!(payload["operation"], "worktree.create");
+        assert_eq!(payload["name"], "feature");
     }
 
     fn workspace_context(path: &Path) -> Vec<bcode_tool::ToolHostContextEntry> {
@@ -1226,11 +1200,11 @@ mod tests {
     #[test]
     fn worktree_request_adapter_renders_generic_contribution_payload() {
         let arguments = serde_json::json!({"name": "feature", "base_ref": "head"});
-        let contribution = worktree_request_contribution("call-1", "worktree.create", &arguments);
+        let payload = worktree_request_payload("worktree.create", &arguments);
         let rows = bcode_plugin_sdk::tui::PluginTuiVisualAdapter::rows(
             &WorktreeTuiVisualAdapter,
             WORKTREE_REQUEST_SCHEMA,
-            &contribution.payload,
+            &payload,
             &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
                 80,
                 bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,

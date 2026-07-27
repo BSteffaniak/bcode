@@ -8,9 +8,7 @@ mod git_tui;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolContributionEnvelope, ToolContributionEvent, ToolContributionOperation,
-    ToolContributionPersistence, ToolContributionPlacement, ToolDefinition, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult, ToolList,
+    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -97,7 +95,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
         return json_response(&tool_error("git tool cancelled".to_string()));
     }
     let response = match invocation.name.as_str() {
-        "git.clone" | "github.clone" => invoke_clone(&invocation, context.events),
+        "git.clone" | "github.clone" => invoke_clone(context, &invocation),
         _ => ToolInvocationResponse {
             output: format!("unsupported Git tool: {}", invocation.name),
             is_error: true,
@@ -110,17 +108,24 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
 }
 
 fn invoke_clone(
+    context: &NativeServiceContext,
     invocation: &ToolInvocationRequest,
-    events: ServiceEventEmitter,
 ) -> ToolInvocationResponse {
     let request = match serde_json::from_value::<CloneRequest>(invocation.arguments.clone()) {
         Ok(request) => request,
         Err(error) => return tool_error(error.to_string()),
     };
-    emit_tool_contribution(
-        events,
-        &clone_request_contribution(&invocation.tool_call_id, &request),
+    let mut presentation = PrimaryPresentationPublisher::with_limits_and_cancellation(
+        context.events,
+        &invocation.tool_call_id,
+        GIT_PLUGIN_ID,
+        GIT_CLONE_REQUEST_SCHEMA,
+        1,
+        bcode_tool::ToolPresentationRetention::RetainLatest,
+        context.transient_progress_limits,
+        context.cancellation.clone(),
     );
+    let _ = presentation.replace(&request);
     let descriptor = match serde_json::from_value::<GitPreparationDescriptor>(
         invocation.preparation_descriptor.clone(),
     ) {
@@ -656,31 +661,6 @@ fn github_clone_alias_definition() -> ToolDefinition {
     definition
 }
 
-fn clone_request_contribution(
-    invocation_id: &str,
-    request: &CloneRequest,
-) -> ToolContributionEvent {
-    ToolContributionEvent {
-        invocation_id: invocation_id.to_owned(),
-        contribution_id: "clone-request".to_owned(),
-        sequence: 1,
-        producer_id: GIT_PLUGIN_ID.to_owned(),
-        schema: GIT_CLONE_REQUEST_SCHEMA.to_owned(),
-        schema_version: 1,
-        operation: ToolContributionOperation::Upsert,
-        persistence: ToolContributionPersistence::Durable,
-        artifact: None,
-        payload: serde_json::to_value(request).unwrap_or(serde_json::Value::Null),
-    }
-}
-
-fn emit_tool_contribution(events: ServiceEventEmitter, event: &ToolContributionEvent) {
-    let envelope = ToolContributionEnvelope::new(ToolContributionPlacement::Request, event.clone());
-    if let Ok(payload) = serde_json::to_vec(&envelope) {
-        events.emit(&payload);
-    }
-}
-
 fn json_response<T: Serialize>(value: &T) -> ServiceResponse {
     match ServiceResponse::json(value) {
         Ok(response) => response,
@@ -866,27 +846,14 @@ mod tests {
 
     #[test]
     fn clone_request_uses_durable_generic_contribution_without_legacy_visual() {
-        let contribution = clone_request_contribution(
-            "call-1",
-            &CloneRequest {
-                url: "https://github.com/bmorphism/bcode".to_owned(),
-                git_ref: Some("main".to_owned()),
-                destination: None,
-            },
-        );
-        assert_eq!(contribution.invocation_id, "call-1");
-        assert_eq!(contribution.producer_id, GIT_PLUGIN_ID);
-        assert_eq!(contribution.schema, GIT_CLONE_REQUEST_SCHEMA);
-        assert_eq!(contribution.schema_version, 1);
-        assert_eq!(
-            contribution.persistence,
-            ToolContributionPersistence::Durable
-        );
-        assert_eq!(
-            contribution.payload["url"],
-            "https://github.com/bmorphism/bcode"
-        );
-        assert_eq!(contribution.payload["ref"], "main");
+        let request = CloneRequest {
+            url: "https://github.com/bmorphism/bcode".to_owned(),
+            git_ref: Some("main".to_owned()),
+            destination: None,
+        };
+        let payload = serde_json::to_value(request).expect("clone request payload");
+        assert_eq!(payload["url"], "https://github.com/bmorphism/bcode");
+        assert_eq!(payload["ref"], "main");
     }
 
     fn host_context(

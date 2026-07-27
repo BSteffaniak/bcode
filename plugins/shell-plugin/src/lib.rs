@@ -27,16 +27,15 @@ use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolArtifactRef, ToolContributionArtifact, ToolContributionEvent, ToolContributionOperation,
-    ToolContributionPersistence, ToolContributionPlacement, ToolDefinition,
-    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult, ToolList,
+    ToolArtifactRef, ToolContributionArtifact, ToolDefinition, ToolInvocationLifecycleEvent,
+    ToolInvocationLifecycleStage, ToolInvocationRequest, ToolInvocationResponse,
+    ToolInvocationResult, ToolList,
 };
 use contracts::{
     DEFAULT_SHELL_TIMEOUT_MS, SHELL_INVOCATION_INPUT_SCHEMA, SHELL_RECORDING_CONTENT_TYPE,
-    SHELL_RECORDING_REF_KEY, SHELL_RUN_SCHEMA, SHELL_RUN_SUMMARY_SCHEMA, SHELL_RUN_TOOL_NAME,
-    SHELL_SCHEMA_VERSION, ShellInvocationAction, ShellLiveRecordingPayload, ShellRunArguments,
-    ShellRunResult, TERMINAL_PTY_STREAM_CONTENT_TYPE, TERMINAL_PTY_STREAM_REF_KEY,
+    SHELL_RECORDING_REF_KEY, SHELL_RUN_SCHEMA, SHELL_RUN_TOOL_NAME, SHELL_SCHEMA_VERSION,
+    ShellInvocationAction, ShellLiveRecordingPayload, ShellRunArguments, ShellRunResult,
+    TERMINAL_PTY_STREAM_CONTENT_TYPE, TERMINAL_PTY_STREAM_REF_KEY,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -337,22 +336,6 @@ fn run_shell_tool(
         };
     }
     let arguments_json = serde_json::to_value(&arguments).unwrap_or_else(|_| json!({}));
-    emit_tool_contribution(
-        events,
-        ToolContributionPlacement::Request,
-        &ToolContributionEvent {
-            invocation_id: tool_call_id.to_owned(),
-            contribution_id: "shell-run-request".to_owned(),
-            sequence: 1,
-            producer_id: "bcode.shell".to_owned(),
-            schema: "bcode.tool.request.shell.run".to_owned(),
-            schema_version: SHELL_SCHEMA_VERSION,
-            operation: ToolContributionOperation::Upsert,
-            persistence: ToolContributionPersistence::Durable,
-            artifact: None,
-            payload: arguments_json.clone(),
-        },
-    );
     emit_tool_lifecycle(
         events,
         &ToolInvocationLifecycleEvent {
@@ -363,7 +346,7 @@ fn run_shell_tool(
             metadata: serde_json::Value::Null,
         },
     );
-    let response = run_terminal_shell_command(
+    run_terminal_shell_command(
         events,
         &context.cancellation,
         context.transient_progress_limits,
@@ -374,25 +357,7 @@ fn run_shell_tool(
             session_cwd,
             ..paths
         },
-    );
-    emit_tool_contribution(
-        events,
-        ToolContributionPlacement::Result,
-        &ToolContributionEvent {
-            invocation_id: tool_call_id.to_owned(),
-            contribution_id: "shell-run-summary".to_owned(),
-            sequence: 1,
-            producer_id: "bcode.shell".to_owned(),
-            schema: SHELL_RUN_SUMMARY_SCHEMA.to_owned(),
-            schema_version: SHELL_SCHEMA_VERSION,
-            operation: ToolContributionOperation::Upsert,
-            persistence: ToolContributionPersistence::Durable,
-            artifact: None,
-            payload: serde_json::from_str(&response.output)
-                .unwrap_or_else(|_| json!({"output": response.output.clone()})),
-        },
-    );
-    response
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -1594,17 +1559,6 @@ fn emit_tool_lifecycle(events: ServiceEventEmitter, event: &ToolInvocationLifecy
     }
 }
 
-fn emit_tool_contribution(
-    events: ServiceEventEmitter,
-    placement: ToolContributionPlacement,
-    event: &ToolContributionEvent,
-) {
-    let envelope = bcode_tool::ToolContributionEnvelope::new(placement, event.clone());
-    if let Ok(payload) = serde_json::to_vec(&envelope) {
-        events.emit(&payload);
-    }
-}
-
 #[cfg(test)]
 fn limit_output_bytes(bytes: &[u8], max_bytes: usize) -> LimitedOutput {
     limit_output_bytes_with_original(bytes, bytes.len(), max_bytes, false)
@@ -1920,7 +1874,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_request_is_generic_contribution_only() {
+    fn shell_request_uses_primary_presentation_without_definition_ui() {
         let encoded =
             serde_json::to_value(shell_tool_definition()).expect("tool definition encodes");
         assert!(encoded.get("ui").is_none());
@@ -1985,36 +1939,17 @@ mod tests {
     }
 
     #[test]
-    fn shell_durable_contribution_envelopes_preserve_request_and_result_identity() {
-        let event = ToolContributionEvent {
-            invocation_id: "call-1".to_owned(),
-            contribution_id: "request".to_owned(),
-            sequence: 7,
-            producer_id: "bcode.shell".to_owned(),
-            schema: "test.shell".to_owned(),
-            schema_version: 1,
-            operation: ToolContributionOperation::Upsert,
-            persistence: ToolContributionPersistence::Durable,
-            artifact: None,
-            payload: serde_json::json!({"command": "echo test"}),
+    fn shell_request_payload_serializes_for_primary_presentation() {
+        let arguments = ShellRunArguments {
+            command: "echo test".to_owned(),
+            cwd: None,
+            timeout_ms: None,
+            columns: None,
+            rows: None,
+            format_commands: None,
         };
-        for placement in [
-            ToolContributionPlacement::Request,
-            ToolContributionPlacement::Result,
-        ] {
-            let envelope = bcode_tool::ToolContributionEnvelope::new(placement, event.clone());
-            let encoded = serde_json::to_vec(&envelope).expect("envelope encodes");
-            let decoded: bcode_tool::ToolContributionEnvelope =
-                serde_json::from_slice(&encoded).expect("envelope decodes");
-            assert_eq!(decoded.placement, placement);
-            assert_eq!(decoded.contribution.invocation_id, "call-1");
-            assert_eq!(decoded.contribution.contribution_id, "request");
-            assert_eq!(decoded.contribution.sequence, 7);
-            assert_eq!(
-                decoded.contribution.persistence,
-                ToolContributionPersistence::Durable
-            );
-        }
+        let payload = serde_json::to_value(arguments).expect("arguments encode");
+        assert_eq!(payload["command"], "echo test");
     }
 
     extern "C" fn capture_service_event(

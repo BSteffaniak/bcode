@@ -10,10 +10,9 @@ use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolContributionEnvelope, ToolContributionEvent, ToolContributionOperation,
-    ToolContributionPersistence, ToolContributionPlacement, ToolDefinition,
-    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult, ToolList, ToolResultContent,
+    ToolDefinition, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
+    ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
+    ToolResultContent,
 };
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -232,28 +231,32 @@ impl OcrPlugin {
                 [extract_tool_definition(), status_tool_definition()],
                 ocr_policy_preparation,
             ),
-            OP_INVOKE_TOOL => self.invoke_tool(request, context.events),
+            OP_INVOKE_TOOL => self.invoke_tool(context),
             _ => ServiceResponse::error("unsupported_operation", "unsupported tool operation"),
         }
     }
 
-    fn invoke_tool(
-        &self,
-        request: &ServiceRequest,
-        events: ServiceEventEmitter,
-    ) -> ServiceResponse {
-        let invocation = match request.payload_json::<ToolInvocationRequest>() {
+    fn invoke_tool(&self, context: &NativeServiceContext) -> ServiceResponse {
+        let invocation = match context.request.payload_json::<ToolInvocationRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
-        emit_request_contribution(
-            events,
+        let mut presentation = PrimaryPresentationPublisher::with_limits_and_cancellation(
+            context.events,
             &invocation.tool_call_id,
+            OCR_PLUGIN_ID,
+            OCR_REQUEST_SCHEMA,
+            1,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
+            context.transient_progress_limits,
+            context.cancellation.clone(),
+        );
+        let _ = presentation.replace(&request_visual_payload(
             &invocation.name,
             &invocation.arguments,
-        );
+        ));
         let response = match invocation.name.as_str() {
-            "ocr.extract" => self.invoke_extract(&invocation, events),
+            "ocr.extract" => self.invoke_extract(&invocation, context.events),
             "ocr.status" => invoke_status(&invocation.tool_call_id),
             _ => ToolInvocationResponse {
                 output: format!("unknown OCR tool: {}", invocation.name),
@@ -766,33 +769,13 @@ fn status_tool_definition() -> ToolDefinition {
     }
 }
 
-fn emit_request_contribution(
-    events: ServiceEventEmitter,
-    invocation_id: &str,
-    operation: &str,
-    arguments: &serde_json::Value,
-) {
+fn request_visual_payload(operation: &str, arguments: &serde_json::Value) -> serde_json::Value {
     let mut payload = arguments.as_object().cloned().unwrap_or_default();
     payload.insert(
         "operation".to_owned(),
         serde_json::Value::String(operation.to_owned()),
     );
-    let event = ToolContributionEvent {
-        invocation_id: invocation_id.to_owned(),
-        contribution_id: "request".to_owned(),
-        sequence: 1,
-        producer_id: OCR_PLUGIN_ID.to_owned(),
-        schema: OCR_REQUEST_SCHEMA.to_owned(),
-        schema_version: 1,
-        operation: ToolContributionOperation::Upsert,
-        persistence: ToolContributionPersistence::Durable,
-        artifact: None,
-        payload: serde_json::Value::Object(payload),
-    };
-    let envelope = ToolContributionEnvelope::new(ToolContributionPlacement::Request, event);
-    if let Ok(payload) = serde_json::to_vec(&envelope) {
-        events.emit(&payload);
-    }
+    serde_json::Value::Object(payload)
 }
 
 fn invoke_status(tool_call_id: &str) -> ToolInvocationResponse {
