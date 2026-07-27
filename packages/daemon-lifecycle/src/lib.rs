@@ -780,6 +780,12 @@ pub enum DaemonStartError {
         /// Recent daemon log excerpt.
         recent_log: String,
     },
+    /// Another process held the namespace startup lock beyond the bounded startup window.
+    #[error("timed out waiting for daemon startup coordination lock at {}", lock_path.display())]
+    StartupCoordinationTimeout {
+        /// Namespace-scoped startup lock path.
+        lock_path: PathBuf,
+    },
 }
 
 impl DaemonStartError {
@@ -795,7 +801,7 @@ impl DaemonStartError {
                     || recent_log.contains("Address already in use")
             }
             Self::Io(error) => error.kind() == std::io::ErrorKind::AddrInUse,
-            Self::Lifecycle(_) => false,
+            Self::Lifecycle(_) | Self::StartupCoordinationTimeout { .. } => false,
         }
     }
 }
@@ -884,7 +890,7 @@ where
     let mut startup_attempts = 0;
     loop {
         startup_attempts += 1;
-        let lock = StartupLock::acquire()?;
+        let lock = StartupLock::acquire().await?;
         cleanup_stale_endpoint(&options.endpoint)?;
         if ping_ready(&options.endpoint).await {
             drop(lock);
@@ -944,51 +950,59 @@ pub fn default_daemon_log_path() -> PathBuf {
 
 #[derive(Debug)]
 struct StartupLock {
-    path: PathBuf,
+    file: fs::File,
 }
 
 impl StartupLock {
-    fn acquire() -> Result<Self, DaemonStartError> {
-        let path = bcode_config::default_state_dir()
-            .join("daemons")
-            .join(format!("{}.lock", daemon_namespace()));
+    const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(25);
+    const POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+    async fn acquire() -> Result<Self, DaemonStartError> {
+        Self::acquire_at(
+            bcode_config::default_state_dir()
+                .join("daemons")
+                .join(format!("{}.lock", daemon_namespace())),
+            Self::ACQUIRE_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn acquire_at(path: PathBuf, timeout: Duration) -> Result<Self, DaemonStartError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        for _ in 0..20 {
-            match fs::OpenOptions::new()
+        let started = std::time::Instant::now();
+        loop {
+            let file = fs::OpenOptions::new()
+                .read(true)
                 .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut file) => {
-                    writeln!(file, "pid={}", std::process::id())?;
-                    return Ok(Self { path });
+                .create(true)
+                .truncate(false)
+                .open(&path)?;
+            match file.try_lock() {
+                Ok(()) => {
+                    file.set_len(0)?;
+                    writeln!(&file, "pid={}", std::process::id())?;
+                    file.sync_data()?;
+                    return Ok(Self { file });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    std::thread::sleep(Duration::from_millis(10));
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if started.elapsed() >= timeout {
+                        return Err(DaemonStartError::StartupCoordinationTimeout {
+                            lock_path: path,
+                        });
+                    }
+                    tokio::time::sleep(Self::POLL_INTERVAL).await;
                 }
-                Err(error) => return Err(error.into()),
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
             }
-        }
-        let _ = fs::remove_file(&path);
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut file) => {
-                writeln!(file, "pid={}", std::process::id())?;
-                Ok(Self { path })
-            }
-            Err(error) => Err(error.into()),
         }
     }
 }
 
 impl Drop for StartupLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = self.file.unlock();
     }
 }
 
@@ -1156,6 +1170,55 @@ fn is_bcode_socket_path(path: &Path) -> bool {
 #[cfg(unix)]
 fn unix_socket_has_listener(path: &Path) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+#[cfg(test)]
+mod startup_lock_tests {
+    use super::*;
+
+    fn lock_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "bcode-daemon-startup-lock-{name}-{}-{}",
+            std::process::id(),
+            unix_time_millis().expect("time")
+        ))
+    }
+
+    #[tokio::test]
+    async fn startup_lock_waits_for_owner_instead_of_stealing_lock_file() {
+        let path = lock_path("wait");
+        let first = StartupLock::acquire_at(path.clone(), Duration::from_secs(1))
+            .await
+            .expect("first lock");
+        let waiter_path = path.clone();
+        let waiter = tokio::spawn(async move {
+            StartupLock::acquire_at(waiter_path, Duration::from_secs(1)).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!waiter.is_finished());
+        drop(first);
+        let second = waiter.await.expect("waiter task").expect("second lock");
+        drop(second);
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn startup_lock_times_out_without_removing_active_owner() {
+        let path = lock_path("timeout");
+        let first = StartupLock::acquire_at(path.clone(), Duration::from_secs(1))
+            .await
+            .expect("first lock");
+        let error = StartupLock::acquire_at(path.clone(), Duration::from_millis(50))
+            .await
+            .expect_err("active owner must not be replaced");
+        assert!(matches!(
+            error,
+            DaemonStartError::StartupCoordinationTimeout { lock_path } if lock_path == path
+        ));
+        assert!(path.exists());
+        drop(first);
+        let _ = fs::remove_file(path);
+    }
 }
 
 fn recent_log_excerpt(log_path: &Path) -> String {

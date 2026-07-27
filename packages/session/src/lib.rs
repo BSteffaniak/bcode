@@ -5248,6 +5248,9 @@ mod tests {
                     switchy::database::DatabaseValue::String(
                         "031_session_state_execution_provenance_column".to_owned(),
                     ),
+                    switchy::database::DatabaseValue::String(
+                        "032_terminal_tool_lifecycle_projection".to_owned(),
+                    ),
                 ],
             )
             .execute(db.database())
@@ -6904,7 +6907,7 @@ mod tests {
             attach,
             Err(SessionError::StorageMigrationRequired {
                 actual: 3,
-                expected: 4,
+                expected: 5,
             })
         ));
         assert_eq!(manager.active_session_migration_count().await, 0);
@@ -7721,6 +7724,9 @@ mod tests {
                         ),
                         switchy::database::DatabaseValue::String(
                             "031_session_state_execution_provenance_column".to_owned(),
+                        ),
+                        switchy::database::DatabaseValue::String(
+                            "032_terminal_tool_lifecycle_projection".to_owned(),
                         ),
                     ],
                 )

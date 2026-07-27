@@ -59,7 +59,8 @@ const DATABASE_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
     crate::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH;
 pub(crate) const LEGACY_SESSION_STORAGE_WRITER_EPOCH: u32 = 2;
-const PREVIOUS_SESSION_STORAGE_WRITER_EPOCH: u32 = 3;
+const PREVIOUS_SESSION_STORAGE_WRITER_EPOCH: u32 = 4;
+const OLDER_SESSION_STORAGE_WRITER_EPOCH: u32 = 3;
 const SESSION_COMPATIBILITY_PROJECTION_SCHEMA_VERSION: u32 = 1;
 const SESSION_STORAGE_CONTRACT_ID: i32 = 1;
 const SESSION_STORAGE_CONTRACT_SCHEMA_VERSION: u32 = 1;
@@ -237,10 +238,9 @@ impl MaterializedProjection {
     pub const fn schema_version(self) -> u32 {
         match self {
             Self::RequestContextOccupancy => CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION,
+            Self::Transcript | Self::ToolRuns => 2,
             Self::SessionState
             | Self::InputHistory
-            | Self::Transcript
-            | Self::ToolRuns
             | Self::ArtifactReferences
             | Self::RuntimeWork => 1,
         }
@@ -304,6 +304,12 @@ pub struct ToolRun {
     pub status: String,
     /// Tool name, when known.
     pub tool_name: Option<String>,
+    /// Start timestamp, when known.
+    pub started_at_ms: Option<u64>,
+    /// Completion timestamp, when terminal and known.
+    pub completed_at_ms: Option<u64>,
+    /// Final output size, when recorded.
+    pub output_bytes: Option<u64>,
     /// Whether the completed tool call ended in error.
     pub is_error: Option<bool>,
 }
@@ -1049,6 +1055,9 @@ impl SessionDb {
                 "event_seq_end",
                 "status",
                 "tool_name",
+                "started_at_ms",
+                "completed_at_ms",
+                "output_bytes",
                 "is_error",
             ])
             .where_eq("tool_call_id", tool_call_id.to_owned())
@@ -1072,6 +1081,9 @@ impl SessionDb {
                 "event_seq_end",
                 "status",
                 "tool_name",
+                "started_at_ms",
+                "completed_at_ms",
+                "output_bytes",
                 "is_error",
             ])
             .where_eq("status", status)
@@ -1380,6 +1392,7 @@ impl SessionDb {
         if matches!(
             writer_epoch,
             epoch if epoch == u64::from(LEGACY_SESSION_STORAGE_WRITER_EPOCH)
+                || epoch == u64::from(OLDER_SESSION_STORAGE_WRITER_EPOCH)
                 || epoch == u64::from(PREVIOUS_SESSION_STORAGE_WRITER_EPOCH)
         ) {
             return Ok(SessionStorageCompatibility::KnownLegacy { writer_epoch });
@@ -2813,6 +2826,12 @@ fn add_session_execution_migrations(source: &mut CodeMigrationSource<'static>) {
         "ALTER TABLE session_state ADD COLUMN execution_provenance TEXT",
         "ALTER TABLE session_state DROP COLUMN execution_provenance",
     );
+    add_sql_migration(
+        source,
+        "032_terminal_tool_lifecycle_projection",
+        "UPDATE session_storage_contract SET writer_epoch = writer_epoch WHERE contract_id = 1",
+        "UPDATE session_storage_contract SET writer_epoch = writer_epoch WHERE contract_id = 1",
+    );
 }
 
 fn add_session_base_migrations(source: &mut CodeMigrationSource<'static>) {
@@ -3826,6 +3845,7 @@ async fn project_event(
                 .value("event_seq_start", seq_to_value(event.sequence))
                 .value("status", "running")
                 .value("tool_name", tool_name.clone())
+                .value("started_at_ms", seq_to_value(event_created_at_ms(event)))
                 .execute(db)
                 .await?;
             insert_transcript_item(db, event, "tool", "invocation", "running", None).await?;
@@ -3834,6 +3854,7 @@ async fn project_event(
             db.update("tool_runs")
                 .value("event_seq_end", seq_to_value(event.sequence))
                 .value("status", if record.is_error { "error" } else { "complete" })
+                .value("completed_at_ms", seq_to_value(event_created_at_ms(event)))
                 .value("is_error", bool_to_value(record.is_error))
                 .where_eq("tool_call_id", record.invocation_id.clone())
                 .execute(db)
@@ -3850,19 +3871,47 @@ async fn project_event(
             .await?;
         }
         SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
+            let status = match lifecycle.stage {
+                bcode_session_models::ToolInvocationLifecycleStage::Started
+                | bcode_session_models::ToolInvocationLifecycleStage::Progress
+                | bcode_session_models::ToolInvocationLifecycleStage::Waiting => "running",
+                bcode_session_models::ToolInvocationLifecycleStage::Completed => "complete",
+                bcode_session_models::ToolInvocationLifecycleStage::Cancelled => "cancelled",
+                bcode_session_models::ToolInvocationLifecycleStage::Failed => "error",
+            };
+            if matches!(
+                lifecycle.stage,
+                bcode_session_models::ToolInvocationLifecycleStage::Completed
+                    | bcode_session_models::ToolInvocationLifecycleStage::Cancelled
+                    | bcode_session_models::ToolInvocationLifecycleStage::Failed
+            ) {
+                let is_error = matches!(
+                    lifecycle.stage,
+                    bcode_session_models::ToolInvocationLifecycleStage::Failed
+                        | bcode_session_models::ToolInvocationLifecycleStage::Cancelled
+                );
+                db.update("tool_runs")
+                    .value("event_seq_end", seq_to_value(event.sequence))
+                    .value("status", status)
+                    .value("completed_at_ms", seq_to_value(event_created_at_ms(event)))
+                    .value("is_error", bool_to_value(is_error))
+                    .where_eq("tool_call_id", lifecycle.invocation_id.clone())
+                    .execute(db)
+                    .await?;
+                finalize_tool_transcript_item(
+                    db,
+                    &lifecycle.invocation_id,
+                    event.sequence,
+                    is_error,
+                )
+                .await?;
+            }
             insert_transcript_item(
                 db,
                 event,
                 "runtime",
                 "invocation_lifecycle",
-                match lifecycle.stage {
-                    bcode_session_models::ToolInvocationLifecycleStage::Started
-                    | bcode_session_models::ToolInvocationLifecycleStage::Progress
-                    | bcode_session_models::ToolInvocationLifecycleStage::Waiting => "running",
-                    bcode_session_models::ToolInvocationLifecycleStage::Completed => "complete",
-                    bcode_session_models::ToolInvocationLifecycleStage::Cancelled => "cancelled",
-                    bcode_session_models::ToolInvocationLifecycleStage::Failed => "error",
-                },
+                status,
                 lifecycle.message.clone(),
             )
             .await?;
@@ -4239,6 +4288,9 @@ fn tool_run_from_row(row: &switchy::database::Row) -> SessionDbResult<ToolRun> {
         event_seq_end: optional_i64(row, "event_seq_end").map(i64_to_u64),
         status: required_string(row, "status")?,
         tool_name: optional_string(row, "tool_name"),
+        started_at_ms: optional_i64(row, "started_at_ms").map(i64_to_u64),
+        completed_at_ms: optional_i64(row, "completed_at_ms").map(i64_to_u64),
+        output_bytes: optional_i64(row, "output_bytes").map(i64_to_u64),
         is_error: optional_i64(row, "is_error").map(|value| value != 0),
     })
 }
@@ -4696,6 +4748,7 @@ mod tests {
                     DatabaseValue::String(
                         "031_session_state_execution_provenance_column".to_owned(),
                     ),
+                    DatabaseValue::String("032_terminal_tool_lifecycle_projection".to_owned()),
                 ],
             )
             .execute(db.database())
@@ -4740,14 +4793,14 @@ mod tests {
         let state = snapshot
             .get_mut(MaterializedProjection::ToolRuns.as_str())
             .expect("tool runs checkpoint");
-        state.version = 2;
+        state.version = 3;
         state.checkpoint = 6;
         assert!(matches!(
             validate_projection_checkpoint_snapshot(&snapshot, 7),
             Err(SessionDbError::ProjectionIncompatible {
                 projection: "tool_runs",
-                actual: 2,
-                expected: 1
+                actual: 3,
+                expected: 2
             })
         ));
     }
@@ -5817,6 +5870,209 @@ mod tests {
                 .expect("reopened context"),
             before_context
         );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // The fixture constructs and verifies one complete legacy migration boundary.
+    async fn epoch_four_migration_repairs_terminal_tool_projection() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let tool_call_id = "call-legacy-terminal".to_owned();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: tool_call_id.clone(),
+                producer_plugin_id: Some("bcode.test".to_owned()),
+                tool_name: "test.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ))
+        .await
+        .expect("append tool request");
+        db.append_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: tool_call_id.clone(),
+                    sequence: u64::MAX,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Completed,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        ))
+        .await
+        .expect("append terminal lifecycle");
+        db.database()
+            .update("tool_runs")
+            .value("event_seq_end", DatabaseValue::Null)
+            .value("status", "running")
+            .value("completed_at_ms", DatabaseValue::Null)
+            .value("is_error", DatabaseValue::Null)
+            .where_eq("tool_call_id", tool_call_id.clone())
+            .execute(db.database())
+            .await
+            .expect("restore legacy stale tool projection");
+        db.database()
+            .update("transcript_items")
+            .value("event_seq_end", DatabaseValue::Int64(0))
+            .value("kind", "invocation")
+            .value("status", "running")
+            .where_eq("transcript_seq", DatabaseValue::Int64(0))
+            .execute(db.database())
+            .await
+            .expect("restore legacy stale transcript projection");
+        db.database()
+            .update("projection_checkpoints")
+            .value("projection_version", DatabaseValue::Int64(1))
+            .where_in(
+                "projection_name",
+                vec![
+                    DatabaseValue::String("transcript".to_owned()),
+                    DatabaseValue::String("tool_runs".to_owned()),
+                ],
+            )
+            .execute(db.database())
+            .await
+            .expect("restore legacy projection versions");
+        db.database()
+            .update("session_storage_contract")
+            .value(
+                "writer_epoch",
+                DatabaseValue::Int64(i64::from(PREVIOUS_SESSION_STORAGE_WRITER_EPOCH)),
+            )
+            .where_eq(
+                "contract_id",
+                DatabaseValue::Int32(SESSION_STORAGE_CONTRACT_ID),
+            )
+            .execute(db.database())
+            .await
+            .expect("restore epoch four contract");
+        db.database()
+            .delete(SESSION_MIGRATIONS_TABLE)
+            .where_eq("id", "032_terminal_tool_lifecycle_projection")
+            .execute(db.database())
+            .await
+            .expect("remove epoch five migration");
+        drop(db);
+
+        let maintenance =
+            crate::lease::acquire_session_maintenance_guard(temp_dir.path(), session_id)
+                .expect("maintenance guard");
+        let write = crate::lease::acquire_maintenance_session_write_lock(
+            &maintenance,
+            temp_dir.path(),
+            session_id,
+        )
+        .expect("write guard");
+        let migrated =
+            SessionDb::migrate_turso_in_root(session_id, temp_dir.path(), &maintenance, &write)
+                .await
+                .expect("migrate epoch four session");
+
+        assert_eq!(
+            migrated.storage_writer_epoch().await.expect("writer epoch"),
+            u64::from(CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+        );
+        assert!(
+            migrated
+                .tool_runs_by_status("running")
+                .await
+                .expect("running tools")
+                .is_empty()
+        );
+        let complete = migrated
+            .tool_runs_by_status("complete")
+            .await
+            .expect("complete tools");
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0].tool_call_id, tool_call_id);
+        assert_eq!(complete[0].event_seq_end, Some(1));
+        assert_eq!(complete[0].started_at_ms, Some(1));
+        assert_eq!(complete[0].completed_at_ms, Some(1));
+    }
+
+    #[tokio::test]
+    async fn terminal_tool_lifecycle_closes_running_tool_projection() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        let tool_call_id = "call-terminal".to_owned();
+
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: tool_call_id.clone(),
+                producer_plugin_id: Some("bcode.test".to_owned()),
+                tool_name: "test.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ))
+        .await
+        .expect("append tool request");
+        db.append_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: tool_call_id.clone(),
+                    sequence: u64::MAX,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Completed,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        ))
+        .await
+        .expect("append terminal lifecycle");
+
+        assert!(
+            db.tool_runs_by_status("running")
+                .await
+                .expect("running")
+                .is_empty()
+        );
+        let complete = db
+            .tool_runs_by_status("complete")
+            .await
+            .expect("complete tools");
+        assert_eq!(complete.len(), 1);
+        assert_eq!(complete[0].tool_call_id, tool_call_id);
+        assert_eq!(complete[0].event_seq_end, Some(1));
+        assert_eq!(complete[0].started_at_ms, Some(1));
+        assert_eq!(complete[0].completed_at_ms, Some(1));
+        assert_eq!(complete[0].is_error, Some(false));
+        let timing = db
+            .database()
+            .select("tool_runs")
+            .columns(&["started_at_ms", "completed_at_ms"])
+            .where_eq("tool_call_id", tool_call_id.clone())
+            .execute_first(db.database())
+            .await
+            .expect("tool timing query")
+            .expect("tool timing row");
+        assert_eq!(required_i64(&timing, "started_at_ms").expect("started"), 1);
+        assert_eq!(
+            required_i64(&timing, "completed_at_ms").expect("completed"),
+            1
+        );
+        let transcript = db.latest_transcript_items(16).await.expect("transcript");
+        let invocation = transcript
+            .iter()
+            .find(|item| item.role == "tool" && item.kind == "result")
+            .expect("tool result transcript item");
+        assert_eq!(invocation.status, "complete");
+        assert_eq!(invocation.event_seq_end, 1);
     }
 
     #[tokio::test]
@@ -7062,7 +7318,7 @@ mod tests {
         .expect("append initial event");
         db.database()
             .update("projection_checkpoints")
-            .value("projection_version", DatabaseValue::Int64(2))
+            .value("projection_version", DatabaseValue::Int64(3))
             .where_eq("projection_name", MaterializedProjection::ToolRuns.as_str())
             .execute(db.database())
             .await
@@ -7086,8 +7342,8 @@ mod tests {
             error,
             SessionDbError::ProjectionIncompatible {
                 projection: "tool_runs",
-                actual: 2,
-                expected: 1
+                actual: 3,
+                expected: 2
             }
         ));
         assert_eq!(

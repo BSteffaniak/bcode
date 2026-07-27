@@ -84,7 +84,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 pub const CURRENT_PROTOCOL_VERSION: u16 = 15;
 
 /// Durable session-storage writer epoch expected by this IPC build.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 4;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5;
 
 /// Build-scoped daemon fingerprint generated at compile time.
 pub const BUILD_FINGERPRINT: &str = env!("BCODE_BUILD_FINGERPRINT");

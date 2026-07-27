@@ -148,10 +148,12 @@ owner blocks migration. Unknown, future, dirty, ambiguous, or corrupt storage st
 
 `session_storage_contract` contains a singleton versioned writer epoch. Mutation-capable processes
 advertise their epoch in session leases and validate the durable row before mutation. The current
-contract-aware baseline is epoch `4`. Epoch `3` is recognized legacy storage and migrates under
-exclusive maintenance ownership by rebuilding the required session-compatibility projection. This
-projection records its canonical-tail checkpoint and any opaque event sequence/kind/schema issues;
-a current projection with issues is inspectable but read-only.
+contract-aware baseline is epoch `5`. Epochs `3` and `4` are recognized legacy storage and migrate
+under exclusive maintenance ownership by rebuilding all required projections. That rebuild applies
+terminal tool lifecycle events to the transcript and tool-run projections, so an invocation that
+finished before its result record was persisted no longer remains falsely `running`. The
+session-compatibility projection records its canonical-tail checkpoint and any opaque event
+sequence/kind/schema issues; a current projection with issues is inspectable but read-only.
 
 A known pre-contract migration prefix with no contract table/row is legacy epoch `1`. A missing
 contract after the migration ledger says contract initialization completed is inconsistent and

@@ -175,14 +175,14 @@ if ! rg -q 'create_verified_migration_backup' packages/session/src/lib.rs \
   violations=1
 fi
 
-if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 4' packages/session/src/lease.rs \
-  || ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 4' packages/ipc/src/lib.rs \
+if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5' packages/session/src/lease.rs \
+  || ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5' packages/ipc/src/lib.rs \
   || ! rg -q 'session_event_schema_version' packages/ipc/src/lib.rs \
   || ! rg -q 'session_compatibility_state' packages/session/src/db.rs \
   || ! rg -q 'CompatibilityDegraded' packages/session/src/db.rs \
   || ! rg -q 'epoch_three_opaque_history_migrates_to_bounded_read_only_state' packages/session/src/db.rs \
   || ! rg -q 'migrated_opaque_session_health_is_degraded_and_attach_fails_closed' packages/session/src/lib.rs; then
-  echo "Session compatibility-projection violation: epoch-4 writers must maintain bounded compatibility state and keep opaque sessions read-only." >&2
+  echo "Session compatibility-projection violation: epoch-5 writers must maintain bounded compatibility state and keep opaque sessions read-only." >&2
   violations=1
 fi
 

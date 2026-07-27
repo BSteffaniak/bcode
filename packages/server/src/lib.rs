@@ -423,6 +423,17 @@ enum FinalizedProviderCall<T> {
     Cancelled(Option<T>),
 }
 
+fn completed_result_after_cancellation<T, E>(
+    completed: FinalizedProviderCall<Result<T, E>>,
+) -> Option<T> {
+    match completed {
+        FinalizedProviderCall::Completed(Ok(value))
+        | FinalizedProviderCall::Cancelled(Some(Ok(value))) => Some(value),
+        FinalizedProviderCall::Completed(Err(_))
+        | FinalizedProviderCall::Cancelled(Some(Err(_)) | None) => None,
+    }
+}
+
 async fn finalize_cancelled_provider_call<T>(
     provider_call: &mut ProviderCallFuture<'_, T>,
 ) -> FinalizedProviderCall<T> {
@@ -17488,13 +17499,10 @@ fn execute_model_tool_batch<'a>(
                 Box::pin(execution),
             )
             .await;
-            let batch = match completed {
-                FinalizedProviderCall::Completed(Ok(batch)) => Some(batch),
-                FinalizedProviderCall::Completed(Err(_)) | FinalizedProviderCall::Cancelled(_) => {
-                    let _ = scope.control().begin_cancellation();
-                    None
-                }
-            };
+            let batch = completed_result_after_cancellation(completed);
+            if batch.is_none() {
+                let _ = scope.control().begin_cancellation();
+            }
             let flush = sink.flush().await;
             flush.map(|()| batch)
         };
@@ -17502,9 +17510,6 @@ fn execute_model_tool_batch<'a>(
         let Ok(Some(batch)) = batch else {
             return false;
         };
-        if cancel_state.is_cancelled() {
-            return false;
-        }
 
         for (call, result) in calls.clone().into_iter().zip(batch.results) {
             let input = match result {
@@ -23682,6 +23687,20 @@ mod tests {
     use std::sync::Mutex as TestMutex;
     use switchy::database::DatabaseValue;
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[test]
+    fn completed_tool_batch_survives_cancellation_race() {
+        assert_eq!(
+            completed_result_after_cancellation::<_, ()>(FinalizedProviderCall::Cancelled(Some(
+                Ok("completed batch"),
+            ))),
+            Some("completed batch")
+        );
+        assert_eq!(
+            completed_result_after_cancellation::<&str, ()>(FinalizedProviderCall::Cancelled(None)),
+            None
+        );
+    }
 
     #[derive(Clone, Default)]
     struct CapturedLogWriter(Arc<TestMutex<Vec<u8>>>);
@@ -33325,7 +33344,7 @@ library = "test"
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn canonical_server_batch_cancellation_closes_running_tool_without_result() {
+    async fn canonical_server_batch_cancellation_persists_terminal_result() {
         let workspace = tempfile::tempdir().expect("canonical cancellation workspace");
         let sessions = SessionManager::persistent(workspace.path().join("sessions"))
             .expect("persistent canonical cancellation sessions");
@@ -33395,10 +33414,10 @@ library = "test"
             .session_history(session_id)
             .await
             .expect("canonical cancellation history");
-        assert!(!history.iter().any(|event| matches!(
+        assert!(history.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::ToolInvocationResultRecorded { record }
-                if record.invocation_id == "canonical-cancelled-shell"
+                if record.invocation_id == "canonical-cancelled-shell" && record.is_error
         )));
         let stages = history
             .iter()
