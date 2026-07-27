@@ -2,6 +2,29 @@ use super::*;
 use proptest::prelude::*;
 
 #[test]
+fn renderer_tool_presentation_fixtures_round_trip_with_stable_primary_identity() {
+    let fixtures = super::renderer_fixtures::renderer_tool_presentation_fixtures();
+    assert_eq!(fixtures.len(), 3);
+    for fixture in fixtures {
+        let TranscriptViewItemKind::ToolInvocation { tool } = &fixture.item.kind else {
+            panic!("{} must be a tool invocation fixture", fixture.name);
+        };
+        assert_eq!(
+            fixture.item.id,
+            TranscriptViewItemId::tool(&tool.tool_call_id),
+            "{}",
+            fixture.name
+        );
+        assert!(!fixture.expected.is_empty(), "{}", fixture.name);
+        assert!(tool.presentation.is_some(), "{}", fixture.name);
+        let encoded = serde_json::to_vec(&fixture.item).expect("encode fixture item");
+        let decoded: TranscriptViewItem =
+            serde_json::from_slice(&encoded).expect("decode fixture item");
+        assert_eq!(decoded, fixture.item);
+    }
+}
+
+#[test]
 fn tool_presentation_update_scope_enforces_identity_generation_revision_bounds_and_closure() {
     let update = |generation, revision, identity| ToolPresentationUpdate {
         invocation_id: "call-1".to_owned(),

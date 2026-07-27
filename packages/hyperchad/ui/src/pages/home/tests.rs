@@ -2181,6 +2181,31 @@ fn rich_adapter_state_matrix_covers_empty_truncated_optional_error_and_fallbacks
 }
 
 #[test]
+fn shared_tool_presentation_fixtures_render_semantic_content_in_hyperchad() {
+    for fixture in crate::renderer_fixtures::renderer_tool_presentation_fixtures() {
+        let rendered = container_text_all(&transcript_item(&fixture.item));
+        for expected in &fixture.expected {
+            assert!(
+                rendered.contains(expected),
+                "{} missing {expected:?}: {rendered}",
+                fixture.name
+            );
+        }
+        let TranscriptViewItemKind::ToolInvocation { tool } = &fixture.item.kind else {
+            unreachable!("shared fixtures are tool invocations");
+        };
+        assert!(rendered.contains(match tool.status {
+            ToolInvocationViewStatus::Requested => "requested",
+            ToolInvocationViewStatus::Running => "running",
+            ToolInvocationViewStatus::Waiting => "waiting",
+            ToolInvocationViewStatus::Finished => "finished",
+            ToolInvocationViewStatus::Failed => "failed",
+            ToolInvocationViewStatus::Cancelled => "cancelled",
+        }));
+    }
+}
+
+#[test]
 fn primary_tool_presentation_uses_schema_adapter_and_falls_back_without_raw_payload() {
     let mut tool = tool_fixture(ToolInvocationViewStatus::Running);
     tool.presentation = Some(ToolPresentationView {

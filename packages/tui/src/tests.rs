@@ -3116,7 +3116,7 @@ fn transcript_renders_terminal_shell_output_without_viewport_padding() {
     let output = rendered_text(&buffer);
 
     assert!(output.contains("Shell run"));
-    assert!(output.contains("plugin host unavailable"));
+    assert!(!output.contains("plugin host unavailable"));
     assert!(!output.contains("test.shell-artifact"));
     assert!(!output.contains("artifact_id"));
     assert!(!output.contains("producer_plugin_id"));
@@ -3158,7 +3158,7 @@ fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
     let output = rendered_text(&buffer);
 
     assert!(output.contains("Shell run"));
-    assert!(output.contains("plugin host unavailable"));
+    assert!(!output.contains("plugin host unavailable"));
     assert!(!output.contains("test.shell-artifact"));
     assert!(!output.contains("artifact_id"));
     assert!(!output.contains("producer_plugin_id"));
@@ -6153,7 +6153,7 @@ fn disabled_filesystem_renderer_falls_back_generically_and_reenabled_renderer_re
         "{fallback_rendered}"
     );
     assert!(
-        fallback_rendered.contains("plugin host unavailable"),
+        !fallback_rendered.contains("plugin host unavailable"),
         "{fallback_rendered}"
     );
     assert!(
@@ -6546,7 +6546,7 @@ fn plugin_visual_degrades_without_rendering_raw_payload() {
     let output = format!("{rows:?}");
 
     assert!(output.contains("File change"), "{output}");
-    assert!(output.contains("plugin host unavailable"), "{output}");
+    assert!(!output.contains("plugin host unavailable"), "{output}");
     assert!(!output.contains("old_text"), "{output}");
     assert!(!output.contains("new_text"), "{output}");
     assert!(!output.contains("fn main() {}"), "{output}");

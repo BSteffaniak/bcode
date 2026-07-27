@@ -1678,8 +1678,9 @@ fn push_transcript_item_rows(
                 refs: Vec::new(),
             };
             let visual = CanonicalToolVisual::from_artifact(&artifact);
-            if canonical_plugin_visual_available(&visual, plugin_host) {
-                push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host);
+            if canonical_plugin_visual_available(&visual, plugin_host)
+                && push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host)
+            {
                 rows.push(Line::default());
             } else {
                 push_meta_block(rows, item.text(), width);
@@ -1708,7 +1709,15 @@ fn push_transcript_item_rows(
             if canonical_plugin_visual_available(&visual, plugin_host) {
                 match canonical_plugin_visual_render_mode(plugin_visual, plugin_host) {
                     Some(PluginTuiVisualRenderMode::FullBlock) => {
-                        push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host);
+                        if !push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host)
+                        {
+                            push_tool_invocation_fallback_rows(
+                                rows,
+                                invocation.as_deref(),
+                                item,
+                                width,
+                            );
+                        }
                         rows.push(Line::default());
                     }
                     Some(PluginTuiVisualRenderMode::TranscriptBlock) => {
@@ -1718,7 +1727,7 @@ fn push_transcript_item_rows(
                         if let Some(timeout_ms) = header.timeout_ms {
                             timing.get_or_insert_default().timeout_ms = Some(timeout_ms);
                         }
-                        push_plugin_transcript_block_rows(
+                        if !push_plugin_transcript_block_rows(
                             rows,
                             PluginTranscriptBlockContext {
                                 title: header.title.as_deref().unwrap_or("Tool contribution"),
@@ -1735,7 +1744,14 @@ fn push_transcript_item_rows(
                                 timing,
                             },
                             width,
-                        );
+                        ) {
+                            push_tool_invocation_fallback_rows(
+                                rows,
+                                invocation.as_deref(),
+                                item,
+                                width,
+                            );
+                        }
                     }
                     Some(PluginTuiVisualRenderMode::Inline) | None => {
                         push_tool_block_header(
@@ -1746,7 +1762,15 @@ fn push_transcript_item_rows(
                             false,
                             width,
                         );
-                        push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host);
+                        if !push_canonical_tool_visual_rows(rows, &visual, None, width, plugin_host)
+                        {
+                            push_tool_invocation_fallback_rows(
+                                rows,
+                                invocation.as_deref(),
+                                item,
+                                width,
+                            );
+                        }
                         rows.push(Line::default());
                     }
                 }
@@ -1756,7 +1780,7 @@ fn push_transcript_item_rows(
                     | bcode_session_models::ToolContributionPlacement::Progress
                     | bcode_session_models::ToolContributionPlacement::Result
             ) {
-                push_meta_block(rows, item.text(), width);
+                push_tool_invocation_fallback_rows(rows, invocation.as_deref(), item, width);
             }
         }
         TranscriptItemKind::Generic => {
@@ -2159,11 +2183,80 @@ fn terminal_elapsed_signature_uses_typed_activity_not_streaming_flag() {
 
 #[cfg(test)]
 #[test]
+fn shared_tool_presentation_fixtures_render_semantic_content_in_tui() {
+    for fixture in crate::renderer_fixtures::renderer_tool_presentation_fixtures() {
+        let terminal = super::transcript::terminal_item_from_shared(&fixture.item);
+        let rows = transcript_item_rows(&[terminal], 0, 100, None, TuiDiffViewerConfig::default());
+        let rendered = visible_rows_snapshot(&rows);
+        for expected in &fixture.expected {
+            assert!(
+                rendered.contains(expected),
+                "{} missing {expected:?}: {rendered}",
+                fixture.name
+            );
+        }
+        let bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool } =
+            &fixture.item.kind
+        else {
+            unreachable!("shared fixtures are tool invocations");
+        };
+        assert!(rendered.contains(tool_status_label(tool.status)));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn unsupported_tool_presentation_uses_semantic_fallback_without_opaque_payload() {
+    let secret = "opaque-presentation-secret";
+    let shared = bcode_session_view_models::TranscriptViewItem {
+        id: bcode_session_view_models::TranscriptViewItemId::tool("call-fallback"),
+        revision: 4,
+        sequence: Some(1),
+        timestamp_ms: Some(1),
+        streaming: false,
+        kind: bcode_session_view_models::TranscriptViewItemKind::ToolInvocation {
+            tool: Box::new(bcode_session_view_models::ToolInvocationView {
+                tool_call_id: "call-fallback".to_owned(),
+                producer_plugin_id: Some("example.plugin".to_owned()),
+                tool_name: Some("example.run".to_owned()),
+                arguments_json: Some(r#"{"target":"fixture"}"#.to_owned()),
+                working_directory: None,
+                status: bcode_session_view_models::ToolInvocationViewStatus::Finished,
+                result_text: Some("semantic result".to_owned()),
+                is_error: Some(false),
+                result: None,
+                presentation: Some(bcode_session_view_models::ToolPresentationView {
+                    producer_id: "example.plugin".to_owned(),
+                    generation: 0,
+                    revision: 3,
+                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    schema: "example.unsupported".to_owned(),
+                    schema_version: 1,
+                    artifact: None,
+                    payload: serde_json::json!({"secret": secret}),
+                }),
+                timing: bcode_session_view_models::ToolTimingView::default(),
+            }),
+        },
+    };
+    let terminal = super::transcript::terminal_item_from_shared(&shared);
+    let rows = transcript_item_rows(&[terminal], 0, 80, None, TuiDiffViewerConfig::default());
+    let rendered = visible_rows_snapshot(&rows);
+
+    assert!(rendered.contains("Tool · example.run · finished"));
+    assert!(rendered.contains("semantic result"));
+    assert!(rendered.contains("fixture"));
+    assert!(!rendered.contains(secret));
+    assert!(!rendered.contains("example.unsupported"));
+}
+
+#[cfg(test)]
+#[test]
 fn generic_tool_headers_render_elapsed_and_duration() {
     let now_ms = unix_time_millis(std::time::SystemTime::now());
     let mut request =
         super::transcript::tool_request_item("call-live", None, "example.run", "{}", None);
-    request.streaming = true;
+    request.set_tool_active(true);
     request.set_tool_started_at_ms(Some(now_ms.saturating_sub(2_000)));
     let request_rows =
         transcript_item_rows(&[request], 0, 80, None, TuiDiffViewerConfig::default());
@@ -2453,9 +2546,9 @@ fn push_canonical_tool_visual_rows(
     working_directory: Option<&std::path::Path>,
     width: u16,
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
-) {
+) -> bool {
     let CanonicalToolVisual::Plugin(plugin_visual) = visual;
-    push_canonical_plugin_visual_rows(rows, plugin_visual, working_directory, width, plugin_host);
+    push_canonical_plugin_visual_rows(rows, plugin_visual, working_directory, width, plugin_host)
 }
 
 fn push_canonical_plugin_visual_rows(
@@ -2464,10 +2557,9 @@ fn push_canonical_plugin_visual_rows(
     working_directory: Option<&std::path::Path>,
     width: u16,
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
-) {
+) -> bool {
     let Some(presentation) = plugin_host else {
-        push_plugin_visual_degraded_rows(rows, visual, "plugin host unavailable", width);
-        return;
+        return false;
     };
     let producer = visual.producer_plugin_id.as_deref();
     let Some(route) =
@@ -2475,17 +2567,10 @@ fn push_canonical_plugin_visual_rows(
             .host()
             .visual_adapter(&visual.schema, visual.schema_version, "tui", producer)
     else {
-        push_plugin_visual_degraded_rows(rows, visual, "no TUI visual adapter registered", width);
-        return;
+        return false;
     };
     let Some(registry) = presentation.registry(&route.plugin_id) else {
-        push_plugin_visual_degraded_rows(
-            rows,
-            visual,
-            "TUI visual adapter plugin unavailable",
-            width,
-        );
-        return;
+        return false;
     };
     let visual_started = Instant::now();
     let native_rows = registry.visual_rows(
@@ -2501,14 +2586,9 @@ fn push_canonical_plugin_visual_rows(
     );
     if let Some(native_rows) = native_rows {
         rows.extend(native_rows);
-        return;
+        return true;
     }
-    push_plugin_visual_degraded_rows(
-        rows,
-        visual,
-        "TUI visual adapter could not render payload",
-        width,
-    );
+    false
 }
 
 #[derive(Clone, Copy)]
@@ -2526,7 +2606,17 @@ fn push_plugin_transcript_block_rows(
     rows: &mut Vec<Line>,
     context: PluginTranscriptBlockContext<'_>,
     width: u16,
-) {
+) -> bool {
+    let mut visual_rows = Vec::new();
+    if !push_canonical_plugin_visual_rows(
+        &mut visual_rows,
+        context.visual,
+        context.working_directory,
+        width,
+        context.plugin_host,
+    ) {
+        return false;
+    }
     push_tool_block_header(
         rows,
         context.title,
@@ -2535,14 +2625,9 @@ fn push_plugin_transcript_block_rows(
         context.is_error,
         width,
     );
-    push_canonical_plugin_visual_rows(
-        rows,
-        context.visual,
-        context.working_directory,
-        width,
-        context.plugin_host,
-    );
+    rows.extend(visual_rows);
     rows.push(Line::default());
+    true
 }
 
 fn push_tool_block_header(
@@ -2614,63 +2699,98 @@ fn tool_block_title_with_timing(
     }
 }
 
-fn push_plugin_visual_degraded_rows(
+fn push_tool_invocation_fallback_rows(
     rows: &mut Vec<Line>,
-    visual: &CanonicalPluginVisual,
-    message: &str,
+    invocation: Option<&bcode_session_view_models::ToolInvocationView>,
+    item: &TranscriptItem,
     width: u16,
 ) {
-    let title = visual.title.as_deref().unwrap_or(&visual.schema);
-    push_degraded_tool_visual_rows(rows, title, message, width);
-    if let Some(subtitle) = &visual.subtitle {
-        push_wrapped_styled_text(
+    let Some(invocation) = invocation else {
+        push_meta_block(rows, item.text(), width);
+        return;
+    };
+    let is_error = invocation.is_error == Some(true)
+        || matches!(
+            invocation.status,
+            bcode_session_view_models::ToolInvocationViewStatus::Failed
+        );
+    let title = invocation.tool_name.as_deref().map_or_else(
+        || format!("Tool · {}", tool_status_label(invocation.status)),
+        |name| format!("Tool · {name} · {}", tool_status_label(invocation.status)),
+    );
+    push_tool_block_header(
+        rows,
+        &title,
+        item.tool_timing(),
+        matches!(
+            invocation.status,
+            bcode_session_view_models::ToolInvocationViewStatus::Running
+                | bcode_session_view_models::ToolInvocationViewStatus::Waiting
+        ),
+        is_error,
+        width,
+    );
+    if let Some(arguments) = invocation.arguments_json.as_deref() {
+        push_labeled_text_preview(
             rows,
-            vec![Span::styled("  ", muted_style())],
-            subtitle,
+            "arguments",
+            arguments,
             width,
-            muted_style(),
-            muted_style(),
+            MAX_INLINE_TOOL_TEXT_ROWS,
         );
     }
-    if visual.streaming
-        && let Some(payload) = visual.payload.as_object()
-    {
-        for (key, value) in payload {
-            if matches!(key.as_str(), "argument_bytes" | "truncated") {
-                continue;
+    match invocation.result.as_ref() {
+        Some(bcode_session_view_models::ToolResultView::Text { text }) => {
+            push_labeled_text_preview(rows, "output", text, width, MAX_INLINE_TOOL_TEXT_ROWS);
+        }
+        Some(bcode_session_view_models::ToolResultView::Json { value }) => {
+            push_labeled_text_preview(rows, "result", value, width, MAX_INLINE_TOOL_TEXT_ROWS);
+        }
+        Some(bcode_session_view_models::ToolResultView::Artifact { artifact }) => {
+            let title = artifact
+                .artifact
+                .title
+                .as_deref()
+                .unwrap_or("artifact result");
+            push_labeled_text_preview(rows, "result", title, width, MAX_INLINE_TOOL_TEXT_ROWS);
+            if let Some(result_text) = invocation.result_text.as_deref()
+                && result_text != title
+            {
+                push_labeled_text_preview(
+                    rows,
+                    "output",
+                    result_text,
+                    width,
+                    MAX_INLINE_TOOL_TEXT_ROWS,
+                );
             }
-            let rendered = value
-                .as_str()
-                .map_or_else(|| value.to_string(), ToOwned::to_owned);
-            push_wrapped_styled_text(
-                rows,
-                vec![Span::styled("  ", muted_style())],
-                &format!("{key}: {rendered}"),
-                width,
-                muted_style(),
-                muted_style(),
-            );
+        }
+        None => {
+            if let Some(result_text) = invocation.result_text.as_deref() {
+                push_labeled_text_preview(
+                    rows,
+                    "output",
+                    result_text,
+                    width,
+                    MAX_INLINE_TOOL_TEXT_ROWS,
+                );
+            }
         }
     }
+    rows.push(Line::default());
 }
 
-fn push_degraded_tool_visual_rows(rows: &mut Vec<Line>, title: &str, message: &str, width: u16) {
-    push_wrapped_styled_text(
-        rows,
-        Vec::new(),
-        title,
-        width,
-        Style::new().fg(Color::Yellow),
-        Style::new().fg(Color::Yellow),
-    );
-    push_wrapped_styled_text(
-        rows,
-        vec![Span::styled("  ", muted_style())],
-        message,
-        width,
-        muted_style(),
-        muted_style(),
-    );
+const fn tool_status_label(
+    status: bcode_session_view_models::ToolInvocationViewStatus,
+) -> &'static str {
+    match status {
+        bcode_session_view_models::ToolInvocationViewStatus::Requested => "requested",
+        bcode_session_view_models::ToolInvocationViewStatus::Running => "running",
+        bcode_session_view_models::ToolInvocationViewStatus::Waiting => "waiting",
+        bcode_session_view_models::ToolInvocationViewStatus::Finished => "finished",
+        bcode_session_view_models::ToolInvocationViewStatus::Failed => "failed",
+        bcode_session_view_models::ToolInvocationViewStatus::Cancelled => "cancelled",
+    }
 }
 
 struct ToolResultRenderContext<'a> {
@@ -2695,22 +2815,21 @@ fn push_tool_result_rows(
         if let CanonicalToolVisual::Plugin(plugin_visual) = &visual
             && canonical_plugin_visual_render_mode(plugin_visual, plugin_host)
                 == Some(PluginTuiVisualRenderMode::FullBlock)
-        {
-            push_canonical_tool_visual_rows(
+            && push_canonical_tool_visual_rows(
                 rows,
                 &visual,
                 context.working_directory,
                 width,
                 plugin_host,
-            );
+            )
+        {
             rows.push(Line::default());
             return;
         }
         if let CanonicalToolVisual::Plugin(plugin_visual) = &visual
             && canonical_plugin_visual_render_mode(plugin_visual, plugin_host)
                 == Some(PluginTuiVisualRenderMode::TranscriptBlock)
-        {
-            push_plugin_transcript_block_rows(
+            && push_plugin_transcript_block_rows(
                 rows,
                 PluginTranscriptBlockContext {
                     title: artifact.title.as_deref().unwrap_or("Tool result"),
@@ -2722,7 +2841,8 @@ fn push_tool_result_rows(
                     timing: item.tool_timing(),
                 },
                 width,
-            );
+            )
+        {
             return;
         }
     }
@@ -2741,13 +2861,22 @@ fn push_tool_result_rows(
     );
     if let Some(artifact) = context.artifact {
         let visual = CanonicalToolVisual::from_artifact(artifact);
-        push_canonical_tool_visual_rows(
+        if push_canonical_tool_visual_rows(
             rows,
             &visual,
             context.working_directory,
             width,
             plugin_host,
-        );
+        ) {
+            rows.push(Line::default());
+            return;
+        }
+        let title = artifact.title.as_deref().unwrap_or("artifact result");
+        push_labeled_text_preview(rows, "result", title, width, MAX_INLINE_TOOL_TEXT_ROWS);
+        let result = context.result.trim();
+        if !result.is_empty() && result != title && !result.contains(&artifact.schema) {
+            push_labeled_text_preview(rows, "output", result, width, MAX_INLINE_TOOL_TEXT_ROWS);
+        }
         rows.push(Line::default());
         return;
     }

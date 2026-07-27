@@ -22,6 +22,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 #[cfg(test)]
+mod renderer_fixtures;
+#[cfg(test)]
 mod tests;
 
 /// Monotonic revision for renderer-visible view state.

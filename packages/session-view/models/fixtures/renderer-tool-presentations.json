@@ -1,0 +1,144 @@
+[
+  {
+    "name": "shell",
+    "expected": ["shell.run", "cargo test"],
+    "item": {
+      "id": "tool:fixture-shell",
+      "revision": 3,
+      "sequence": 1,
+      "timestamp_ms": 1700000000000,
+      "streaming": true,
+      "kind": {
+        "type": "tool_invocation",
+        "tool": {
+          "tool_call_id": "fixture-shell",
+          "producer_plugin_id": "bcode.shell",
+          "tool_name": "shell.run",
+          "arguments_json": "{\"command\":\"cargo test\",\"cwd\":\"/tmp/project\"}",
+          "working_directory": "/tmp/project",
+          "status": "running",
+          "result_text": null,
+          "is_error": null,
+          "result": null,
+          "presentation": {
+            "producer_id": "bcode.shell",
+            "generation": 0,
+            "revision": 2,
+            "retention": "retain_latest",
+            "schema": "bcode.tool.request.shell.run",
+            "schema_version": 1,
+            "payload": {
+              "command": "cargo test",
+              "cwd": "/tmp/project"
+            }
+          },
+          "timing": {
+            "started_at_ms": 1700000000000,
+            "finished_at_ms": null,
+            "timeout_ms": 120000,
+            "timed_out": null,
+            "duration_ms": null
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "filesystem",
+    "expected": ["filesystem.edit", "/tmp/fixture.rs"],
+    "item": {
+      "id": "tool:fixture-filesystem",
+      "revision": 5,
+      "sequence": 2,
+      "timestamp_ms": 1700000001000,
+      "streaming": false,
+      "kind": {
+        "type": "tool_invocation",
+        "tool": {
+          "tool_call_id": "fixture-filesystem",
+          "producer_plugin_id": "bcode.filesystem",
+          "tool_name": "filesystem.edit",
+          "arguments_json": "{\"path\":\"/tmp/fixture.rs\",\"old_text\":\"old\",\"new_text\":\"new\"}",
+          "working_directory": "/tmp",
+          "status": "finished",
+          "result_text": "edited /tmp/fixture.rs",
+          "is_error": false,
+          "result": null,
+          "presentation": {
+            "producer_id": "bcode.filesystem",
+            "generation": 0,
+            "revision": 4,
+            "retention": "retain_latest",
+            "schema": "bcode.filesystem.change",
+            "schema_version": 1,
+            "payload": {
+              "path": "/tmp/fixture.rs",
+              "old_text": "old",
+              "new_text": "new",
+              "summary": "edited /tmp/fixture.rs"
+            }
+          },
+          "timing": {
+            "started_at_ms": 1700000000000,
+            "finished_at_ms": 1700000001000,
+            "timeout_ms": null,
+            "timed_out": false,
+            "duration_ms": 1000
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "vim-edit",
+    "expected": ["vim_edit.apply", "src/lib.rs"],
+    "item": {
+      "id": "tool:fixture-vim-edit",
+      "revision": 7,
+      "sequence": 3,
+      "timestamp_ms": 1700000002000,
+      "streaming": false,
+      "kind": {
+        "type": "tool_invocation",
+        "tool": {
+          "tool_call_id": "fixture-vim-edit",
+          "producer_plugin_id": "bcode.vim-edit",
+          "tool_name": "vim_edit.apply",
+          "arguments_json": "{\"path\":\"src/lib.rs\",\"steps\":[{\"insert\":\"fixture\"}]}",
+          "working_directory": "/tmp/project",
+          "status": "finished",
+          "result_text": "updated src/lib.rs",
+          "is_error": false,
+          "result": null,
+          "presentation": {
+            "producer_id": "bcode.vim-edit",
+            "generation": 0,
+            "revision": 6,
+            "retention": "retain_latest",
+            "schema": "bcode.vim-edit.playback",
+            "schema_version": 1,
+            "payload": {
+              "tool_name": "vim_edit.apply",
+              "path": "src/lib.rs",
+              "success": true,
+              "changed": true,
+              "summary": "updated src/lib.rs",
+              "diff": "-old\n+new",
+              "frames": [],
+              "frame_count": 0,
+              "frames_truncated": false,
+              "diff_truncated": false
+            }
+          },
+          "timing": {
+            "started_at_ms": 1700000001000,
+            "finished_at_ms": 1700000002000,
+            "timeout_ms": null,
+            "timed_out": false,
+            "duration_ms": 1000
+          }
+        }
+      }
+    }
+  }
+]

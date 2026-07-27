@@ -60,6 +60,8 @@ pub mod ralph_launcher;
 pub(crate) mod ralph_start_dialog;
 pub(crate) mod ralph_start_dialog_render;
 pub(crate) mod render;
+#[cfg(test)]
+mod renderer_fixtures;
 pub(crate) mod runtime;
 mod runtime_context;
 pub(crate) mod session_flow;

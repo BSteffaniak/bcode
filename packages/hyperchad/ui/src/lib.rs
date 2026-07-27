@@ -6,3 +6,6 @@
 
 pub mod context;
 pub mod pages;
+
+#[cfg(test)]
+mod renderer_fixtures;
