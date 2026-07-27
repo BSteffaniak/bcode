@@ -2389,7 +2389,10 @@ async fn run_with_static_bundled_inner(
             model_retry: config.model.retry,
             auto_compaction: config.model.compaction,
             system_prompt: config.system_prompt,
-            skill_context_bytes: config.skills.max_context_bytes,
+            skill_context_bytes: config
+                .skills
+                .max_context_bytes
+                .map(std::num::NonZeroUsize::get),
             skill_prompt_options: skill_prompt_options_from_config(&config.skills.prompt),
             skill_model_policy: config.skills.model_policy,
             skills,
@@ -16273,15 +16276,23 @@ fn build_coding_system_prompt_parts(
     agent_prompt_suffix: Option<&str>,
     skill_catalog: Option<&str>,
 ) -> (String, String) {
-    let (stable_context, dynamic_context) =
-        build_repository_context_parts(cwd, config.repository_instructions_max_chars);
+    let (stable_context, dynamic_context) = build_repository_context_parts(
+        cwd,
+        config
+            .repository_instructions_max_chars
+            .map(std::num::NonZeroUsize::get),
+    );
     let mut stable = match config.mode {
         bcode_config::SystemPromptMode::Default => DEFAULT_CODING_SYSTEM_PROMPT.to_string(),
         bcode_config::SystemPromptMode::Replace => config.text.clone().unwrap_or_default(),
     };
     if config.sections.repository_invariants
-        && let Some(invariants) =
-            read_repository_invariants(cwd, config.repository_invariants_max_chars)
+        && let Some(invariants) = read_repository_invariants(
+            cwd,
+            config
+                .repository_invariants_max_chars
+                .map(std::num::NonZeroUsize::get),
+        )
     {
         stable.push_str("\n\nRepository invariants:\n\n");
         stable.push_str(
@@ -23408,7 +23419,10 @@ fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegis
     let roots = skill_source_roots_from_config(config);
     let options = SkillRegistryOptions {
         max_skill_file_bytes: config.skills.max_skill_file_bytes,
-        max_context_bytes: config.skills.max_context_bytes,
+        max_context_bytes: config
+            .skills
+            .max_context_bytes
+            .map(std::num::NonZeroUsize::get),
         follow_symlinks: config.skills.follow_symlinks,
         disabled_ids: config.skills.disabled_skill_ids(),
     };
@@ -23473,7 +23487,7 @@ const fn skill_diagnostic_severity_name(severity: SkillDiagnosticSeverity) -> &'
     }
 }
 
-const fn skill_prompt_options_from_config(
+fn skill_prompt_options_from_config(
     config: &bcode_config::SkillPromptConfig,
 ) -> SkillPromptCatalogOptions {
     SkillPromptCatalogOptions {
@@ -23482,8 +23496,10 @@ const fn skill_prompt_options_from_config(
             bcode_config::SkillPromptCatalogMode::NamesOnly => SkillPromptCatalogMode::NamesOnly,
             bcode_config::SkillPromptCatalogMode::Summary => SkillPromptCatalogMode::Summary,
         },
-        max_bytes: config.max_bytes,
-        max_description_chars: config.max_description_chars,
+        max_bytes: config.max_bytes.map(std::num::NonZeroUsize::get),
+        max_description_chars: config
+            .max_description_chars
+            .map(std::num::NonZeroUsize::get),
         include_sources: config.include_sources,
         include_keywords: config.include_keywords,
     }
@@ -31652,8 +31668,8 @@ library = "test"
     fn coding_system_prompt_applies_explicit_repository_limits() {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let config = bcode_config::SystemPromptConfig {
-            repository_instructions_max_chars: Some(200),
-            repository_invariants_max_chars: Some(300),
+            repository_instructions_max_chars: std::num::NonZeroUsize::new(200),
+            repository_invariants_max_chars: std::num::NonZeroUsize::new(300),
             ..bcode_config::SystemPromptConfig::default()
         };
 

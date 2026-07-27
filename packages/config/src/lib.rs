@@ -1097,11 +1097,11 @@ pub struct SystemPromptConfig {
     /// Optional maximum characters loaded from repository agent instructions.
     /// Omitted values load the complete file.
     #[serde(default)]
-    pub repository_instructions_max_chars: Option<usize>,
+    pub repository_instructions_max_chars: Option<std::num::NonZeroUsize>,
     /// Optional maximum characters loaded from a repository invariant catalog.
     /// Omitted values load the complete file.
     #[serde(default)]
-    pub repository_invariants_max_chars: Option<usize>,
+    pub repository_invariants_max_chars: Option<std::num::NonZeroUsize>,
     /// Toggleable built-in system prompt sections.
     #[config_doc(nested)]
     #[serde(default)]
@@ -1189,7 +1189,7 @@ pub struct SkillsConfig {
     /// Optional maximum bytes of skill context included in prompts.
     /// Omitted values include complete skill instructions.
     #[serde(default)]
-    pub max_context_bytes: Option<usize>,
+    pub max_context_bytes: Option<std::num::NonZeroUsize>,
     /// Maximum bytes read from a single skill definition file.
     #[serde(default = "default_skill_file_bytes")]
     pub max_skill_file_bytes: u64,
@@ -1338,11 +1338,11 @@ pub struct SkillPromptConfig {
     /// Optional maximum skill catalog bytes included in prompts.
     /// Omitted values include the complete catalog.
     #[serde(default)]
-    pub max_bytes: Option<usize>,
+    pub max_bytes: Option<std::num::NonZeroUsize>,
     /// Optional maximum skill description characters included in prompts.
     /// Omitted values include complete descriptions.
     #[serde(default)]
-    pub max_description_chars: Option<usize>,
+    pub max_description_chars: Option<std::num::NonZeroUsize>,
     /// Whether skill source paths are included in the prompt catalog.
     #[serde(default = "default_true")]
     pub include_sources: bool,
@@ -6781,8 +6781,8 @@ disabled = ["vim_edit.apply"]
     #[test]
     fn config_to_toml_writes_repository_invariant_prompt_settings() {
         let mut config = BcodeConfig::default();
-        config.system_prompt.repository_instructions_max_chars = Some(6_000);
-        config.system_prompt.repository_invariants_max_chars = Some(8_000);
+        config.system_prompt.repository_instructions_max_chars = std::num::NonZeroUsize::new(6_000);
+        config.system_prompt.repository_invariants_max_chars = std::num::NonZeroUsize::new(8_000);
         config.system_prompt.sections.repository_invariants = false;
 
         let rendered = super::config_to_toml(&config);
@@ -6803,13 +6803,25 @@ disabled = ["vim_edit.apply"]
         let parsed: BcodeConfig = toml::from_str(&rendered).expect("rendered config parses");
         assert_eq!(
             parsed.system_prompt.repository_instructions_max_chars,
-            Some(6_000)
+            std::num::NonZeroUsize::new(6_000)
         );
         assert_eq!(
             parsed.system_prompt.repository_invariants_max_chars,
-            Some(8_000)
+            std::num::NonZeroUsize::new(8_000)
         );
         assert!(!parsed.system_prompt.sections.repository_invariants);
+    }
+
+    #[test]
+    fn zero_optional_prompt_limits_are_rejected() {
+        assert!(
+            toml::from_str::<BcodeConfig>(
+                "[system_prompt]\nrepository_instructions_max_chars = 0\n"
+            )
+            .is_err()
+        );
+        assert!(toml::from_str::<BcodeConfig>("[skills]\nmax_context_bytes = 0\n").is_err());
+        assert!(toml::from_str::<BcodeConfig>("[skills.prompt]\nmax_bytes = 0\n").is_err());
     }
 
     #[test]

@@ -344,7 +344,10 @@ fn build_skill_registry(config: &bcode_config::BcodeConfig) -> Option<SkillRegis
     }
     let options = SkillRegistryOptions {
         max_skill_file_bytes: config.skills.max_skill_file_bytes,
-        max_context_bytes: config.skills.max_context_bytes,
+        max_context_bytes: config
+            .skills
+            .max_context_bytes
+            .map(std::num::NonZeroUsize::get),
         follow_symlinks: config.skills.follow_symlinks,
         disabled_ids: config.skills.disabled_skill_ids(),
     };
