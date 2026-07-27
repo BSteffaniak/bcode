@@ -16266,6 +16266,7 @@ Tool and safety rules:
 const MAX_REPOSITORY_CONTEXT_CHARS: usize = 12_000;
 const MAX_CONTEXT_FILE_CHARS: usize = 6_000;
 const MAX_GIT_STATUS_CHARS: usize = 4_000;
+const REPOSITORY_INVARIANTS_FILE: &str = "INVARIANTS.md";
 
 fn build_coding_system_prompt_parts(
     cwd: &Path,
@@ -16278,6 +16279,16 @@ fn build_coding_system_prompt_parts(
         bcode_config::SystemPromptMode::Default => DEFAULT_CODING_SYSTEM_PROMPT.to_string(),
         bcode_config::SystemPromptMode::Replace => config.text.clone().unwrap_or_default(),
     };
+    if config.sections.repository_invariants
+        && let Some(invariants) =
+            read_repository_invariants(cwd, config.repository_invariants_max_chars)
+    {
+        stable.push_str("\n\nRepository invariants:\n\n");
+        stable.push_str(
+            "The following invariants are mandatory acceptance criteria for changes to this repository. Treat them as conditions that must remain true. If a request conflicts with an invariant, report the conflict rather than silently violating or reinterpreting it. Changing an invariant requires an explicit architectural decision.\n\n",
+        );
+        stable.push_str(&invariants);
+    }
     if config.sections.repository_context {
         stable.push_str("\n\n");
         stable.push_str(&truncate_text(
@@ -16305,6 +16316,36 @@ fn build_coding_system_prompt_parts(
     }
 
     (stable, dynamic)
+}
+
+fn read_repository_invariants(cwd: &Path, max_chars: usize) -> Option<String> {
+    let repo_root = discover_git_root(cwd);
+    let context_root = repo_root.as_deref().unwrap_or(cwd);
+    let path = context_root.join(REPOSITORY_INVARIANTS_FILE);
+    let contents = fs::read_to_string(path).ok()?;
+    let contents = contents.trim();
+    if contents.is_empty() {
+        return None;
+    }
+    Some(truncate_repository_invariants(contents, max_chars))
+}
+
+fn truncate_repository_invariants(contents: &str, max_chars: usize) -> String {
+    let char_count = contents.chars().count();
+    if char_count <= max_chars {
+        return contents.to_string();
+    }
+    let marker = format!(
+        "\n\n[Repository invariants truncated: omitted {} characters. Increase system_prompt.repository_invariants_max_chars to include the complete catalog.]",
+        char_count.saturating_sub(max_chars)
+    );
+    if marker.chars().count() >= max_chars {
+        return marker.chars().take(max_chars).collect();
+    }
+    let content_chars = max_chars.saturating_sub(marker.chars().count());
+    let mut truncated = contents.chars().take(content_chars).collect::<String>();
+    truncated.push_str(&marker);
+    truncated
 }
 
 fn build_repository_context_parts(cwd: &Path) -> (String, String) {
@@ -16365,6 +16406,7 @@ fn run_command(cwd: &Path, program: &str, args: &[&str]) -> Option<String> {
 fn detected_project_files(root: &Path) -> Vec<String> {
     let candidates = [
         "AGENTS.md",
+        REPOSITORY_INVARIANTS_FILE,
         "Cargo.toml",
         "package.json",
         "pyproject.toml",
@@ -31560,10 +31602,55 @@ library = "test"
         );
 
         assert!(stable.contains(DEFAULT_CODING_SYSTEM_PROMPT));
+        assert!(stable.contains("Repository invariants:"));
+        assert!(stable.contains("Shared rendering remains renderer-neutral"));
         assert!(stable.contains("Stable repository context:"));
         assert!(stable.contains("agent suffix"));
         assert!(dynamic.contains("Dynamic repository context:"));
         assert!(!stable.contains("Git status:"));
+    }
+
+    #[test]
+    fn coding_system_prompt_includes_invariants_with_replacement_mode() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut config = bcode_config::SystemPromptConfig {
+            mode: bcode_config::SystemPromptMode::Replace,
+            text: Some("custom base".to_owned()),
+            ..bcode_config::SystemPromptConfig::default()
+        };
+        config.sections.repository_context = false;
+        config.sections.dynamic_repository_context = false;
+        config.sections.agent_suffix = false;
+        config.sections.skill_catalog = false;
+
+        let (stable, dynamic) = build_coding_system_prompt_parts(&cwd, &config, None, None);
+
+        assert!(stable.starts_with("custom base"));
+        assert!(stable.contains("Repository invariants:"));
+        assert!(!stable.contains("Stable repository context:"));
+        assert!(dynamic.is_empty());
+    }
+
+    #[test]
+    fn coding_system_prompt_can_disable_repository_invariants_explicitly() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let mut config = bcode_config::SystemPromptConfig::default();
+        config.sections.repository_invariants = false;
+
+        let (stable, _) = build_coding_system_prompt_parts(&cwd, &config, None, None);
+
+        assert!(!stable.contains("Repository invariants:"));
+        assert!(stable.contains("Stable repository context:"));
+    }
+
+    #[test]
+    fn repository_invariant_truncation_is_visible_and_bounded() {
+        let contents = "invariant ".repeat(100);
+
+        let truncated = truncate_repository_invariants(&contents, 200);
+
+        assert_eq!(truncated.chars().count(), 200);
+        assert!(truncated.contains("Repository invariants truncated"));
     }
 
     #[test]

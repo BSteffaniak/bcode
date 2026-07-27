@@ -158,8 +158,10 @@ The base system prompt can be used as-is or replaced while still keeping selecte
 [system_prompt]
 mode = "default" # default | replace
 text = ""
+repository_invariants_max_chars = 16000
 
 [system_prompt.sections]
+repository_invariants = true
 repository_context = true
 dynamic_repository_context = true
 agent_suffix = true
@@ -171,6 +173,8 @@ Behavior:
 * `mode = "default"` uses Bcode's built-in coding-agent prompt as the base.
 * `mode = "replace"` uses `text` as the base prompt.
 * Enabled sections are appended to either base mode.
+* `system_prompt.sections.repository_invariants = true` loads root `INVARIANTS.md` into a dedicated stable prompt section independently of ordinary repository context. Replacement mode does not disable it.
+* `system_prompt.repository_invariants_max_chars` sets its independent character budget. Truncation is explicitly marked in model context.
 * `system_prompt.sections.skill_catalog = false` disables catalog injection even if `[skills.prompt]` is enabled.
 * `skills.enabled = false` disables skill discovery and therefore disables the skill catalog.
 * `skills.prompt.catalog = "off"` disables only the prompt catalog while keeping skills available elsewhere.

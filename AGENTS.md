@@ -2,6 +2,19 @@
 
 This file defines required project conventions and validation expectations for coding agents working in this repository.
 
+## Architectural Invariants
+
+All changes must preserve the conditions in [`INVARIANTS.md`](INVARIANTS.md).
+
+Before modifying a covered area:
+
+- Identify and read the applicable invariant sections.
+- Treat those invariants as acceptance criteria, not suggestions.
+- Stop and report a conflict rather than silently violating or reinterpreting an invariant.
+- If a requested change intentionally alters an invariant, update the invariant and affected architecture documentation, tests, and mechanical guards in the same change after obtaining explicit approval.
+- Use the repository-local `add-invariant` skill when deciding whether a proposed rule belongs in `INVARIANTS.md`, `AGENTS.md`, architecture documentation, or nowhere.
+- Use the repository-local `audit-invariants` skill for comprehensive conflict, duplication, classification, and coverage reviews.
+
 ## Product Architecture Direction
 
 Bcode is a Rust-native, TUI-first, plugin-driven coding agent with a local client/server architecture.

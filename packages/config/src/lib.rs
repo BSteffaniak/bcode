@@ -1094,6 +1094,9 @@ pub struct SystemPromptConfig {
     /// Replacement system prompt text when replacement mode is active.
     #[serde(default)]
     pub text: Option<String>,
+    /// Maximum characters loaded from a repository invariant catalog.
+    #[serde(default = "default_repository_invariants_max_chars")]
+    pub repository_invariants_max_chars: usize,
     /// Toggleable built-in system prompt sections.
     #[config_doc(nested)]
     #[serde(default)]
@@ -1105,9 +1108,14 @@ impl Default for SystemPromptConfig {
         Self {
             mode: SystemPromptMode::Default,
             text: None,
+            repository_invariants_max_chars: default_repository_invariants_max_chars(),
             sections: SystemPromptSectionsConfig::default(),
         }
     }
+}
+
+const fn default_repository_invariants_max_chars() -> usize {
+    16_000
 }
 
 /// Base system prompt mode.
@@ -1124,6 +1132,9 @@ pub enum SystemPromptMode {
 #[allow(clippy::struct_excessive_bools)]
 #[config_doc(section = "sections")]
 pub struct SystemPromptSectionsConfig {
+    /// Include repository invariants independently of ordinary repository context.
+    #[serde(default = "default_true")]
+    pub repository_invariants: bool,
     /// Include static repository context.
     #[serde(default = "default_true")]
     pub repository_context: bool,
@@ -1141,6 +1152,7 @@ pub struct SystemPromptSectionsConfig {
 impl Default for SystemPromptSectionsConfig {
     fn default() -> Self {
         Self {
+            repository_invariants: true,
             repository_context: true,
             dynamic_repository_context: true,
             agent_suffix: true,
@@ -4825,9 +4837,20 @@ fn write_system_prompt_toml(output: &mut String, system_prompt: &SystemPromptCon
     if let Some(text) = &system_prompt.text {
         writeln!(output, "text = {}", toml_string(text)).expect("write to string");
     }
+    if system_prompt.repository_invariants_max_chars != default_repository_invariants_max_chars() {
+        writeln!(
+            output,
+            "repository_invariants_max_chars = {}",
+            system_prompt.repository_invariants_max_chars
+        )
+        .expect("write to string");
+    }
     output.push('\n');
     if system_prompt.sections != SystemPromptSectionsConfig::default() {
         output.push_str("[system_prompt.sections]\n");
+        if !system_prompt.sections.repository_invariants {
+            output.push_str("repository_invariants = false\n");
+        }
         if !system_prompt.sections.repository_context {
             output.push_str("repository_context = false\n");
         }
@@ -6766,6 +6789,28 @@ disabled = ["vim_edit.apply"]
             rendered.contains("disabled = [\"vim_edit.apply\"]"),
             "{rendered}"
         );
+    }
+
+    #[test]
+    fn config_to_toml_writes_repository_invariant_prompt_settings() {
+        let mut config = BcodeConfig::default();
+        config.system_prompt.repository_invariants_max_chars = 8_000;
+        config.system_prompt.sections.repository_invariants = false;
+
+        let rendered = super::config_to_toml(&config);
+
+        assert!(
+            rendered.contains("repository_invariants_max_chars = 8000"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("repository_invariants = false"),
+            "{rendered}"
+        );
+
+        let parsed: BcodeConfig = toml::from_str(&rendered).expect("rendered config parses");
+        assert_eq!(parsed.system_prompt.repository_invariants_max_chars, 8_000);
+        assert!(!parsed.system_prompt.sections.repository_invariants);
     }
 
     #[test]
