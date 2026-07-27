@@ -2271,7 +2271,12 @@ impl WorkflowStore {
         let requests = receipt_backed_attempts(&self.connection, limit)?;
         let mut observations = Vec::with_capacity(requests.len());
         for request in requests {
-            let observation = observer.observe_async(&request).await?;
+            let observation = if cancellation_requested_for_run(&self.connection, &request.run_id)?
+            {
+                AttemptObservation::Cancelled
+            } else {
+                observer.observe_async(&request).await?
+            };
             observations.push((request, observation));
         }
         let transaction = self.connection.transaction()?;
@@ -4128,10 +4133,10 @@ fn receipt_backed_attempts(
 }
 
 fn cancellation_requested_for_run(
-    transaction: &Transaction<'_>,
+    connection: &Connection,
     run_id: &str,
 ) -> Result<bool, WorkflowStoreError> {
-    transaction
+    connection
         .query_row(
             "SELECT cancellation_requested_at_ms IS NOT NULL FROM workflow_runs WHERE run_id = ?1",
             [run_id],
@@ -6226,6 +6231,49 @@ mod tests {
             store
                 .retry_failed_node("run-1", "review", &activation_id(), 1, 23)
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_async_reconciliation_does_not_query_owner() {
+        struct Observer;
+        impl AsyncAttemptStatusObserver for Observer {
+            fn observe_async<'a>(
+                &'a self,
+                _request: &'a AttemptReconciliationRequest,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<AttemptObservation, WorkflowStoreError>> + Send + 'a,
+                >,
+            > {
+                Box::pin(async {
+                    Err(WorkflowStoreError::InvalidData(
+                        "owner must not be queried after cancellation".to_string(),
+                    ))
+                })
+            }
+        }
+
+        let (_temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        store.request_cancellation("run-1", 20).expect("intent");
+        store
+            .mark_cancellation_signalled(&identity, 21)
+            .expect("signal");
+
+        let summary = store
+            .reconcile_receipt_backed_attempts_async(&Observer, 10, 22)
+            .await
+            .expect("cancel without owner");
+
+        assert_eq!(summary.cancelled, [identity]);
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Cancelled
         );
     }
 
