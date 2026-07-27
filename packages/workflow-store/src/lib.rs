@@ -1156,12 +1156,18 @@ impl WorkflowStore {
                     "workflow entry node is missing: {node_id}"
                 ))
             })?;
+            let entry_input = run.input.clone().unwrap_or(serde_json::Value::Null);
+            validate_json_schema(
+                &format!("workflow entry input for node {node_id}"),
+                &node.input.schema,
+                &entry_input,
+            )?;
             let activation = NewActivation {
                 run_id: run.run_id.clone(),
                 node_id: node_id.clone(),
                 activation_id: activation_identity(&run.run_id, node_id, 0),
                 dependency_generation: 0,
-                input: run.input.clone(),
+                input: Some(entry_input),
                 created_at_ms: run.created_at_ms,
             };
             validate_activation(&activation)?;
@@ -2864,6 +2870,11 @@ impl WorkflowStore {
                     input: Some(input.clone()),
                     created_at_ms: settled_at_ms,
                 };
+                validate_json_schema(
+                    &format!("workflow repeat input for node {}", node.id),
+                    &node.input.schema,
+                    input,
+                )?;
                 insert_activation_with_status(
                     &transaction,
                     &next,
@@ -3792,38 +3803,45 @@ fn activation_input(
     target: &bcode_workflow::NodeDefinition,
     generation: u64,
 ) -> Result<serde_json::Value, WorkflowStoreError> {
-    if target.kind == bcode_workflow::NodeKind::Repeat {
+    let input = if target.kind == bcode_workflow::NodeKind::Repeat {
         let mut input = output.value.clone();
         let iteration = input.get("iteration").and_then(serde_json::Value::as_u64);
         if let Some(iteration) = iteration {
             input["iteration"] = serde_json::json!(iteration.saturating_add(1));
         }
-        return Ok(input);
-    }
-    if target.kind != bcode_workflow::NodeKind::Parallel {
-        return Ok(output.value.clone());
-    }
-    let left_exits = configured_node_ids(&target.configuration, "left_exits")?;
-    let right_exits = configured_node_ids(&target.configuration, "right_exits")?;
-    let branch_value = |exits: &[String]| {
-        exits
-            .iter()
-            .find_map(|node_id| {
-                definition.node(node_id).and_then(|_| {
-                    activation_output_value(transaction, &output.run_id, node_id, generation).ok()
+        input
+    } else if target.kind == bcode_workflow::NodeKind::Parallel {
+        let left_exits = configured_node_ids(&target.configuration, "left_exits")?;
+        let right_exits = configured_node_ids(&target.configuration, "right_exits")?;
+        let branch_value = |exits: &[String]| {
+            exits
+                .iter()
+                .find_map(|node_id| {
+                    definition.node(node_id).and_then(|_| {
+                        activation_output_value(transaction, &output.run_id, node_id, generation)
+                            .ok()
+                    })
                 })
-            })
-            .ok_or_else(|| {
-                WorkflowStoreError::InvalidData(format!(
-                    "parallel join {} has no completed branch output",
-                    target.id
-                ))
-            })
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(format!(
+                        "parallel join {} has no completed branch output",
+                        target.id
+                    ))
+                })
+        };
+        serde_json::Value::Array(vec![
+            branch_value(&left_exits)?,
+            branch_value(&right_exits)?,
+        ])
+    } else {
+        output.value.clone()
     };
-    Ok(serde_json::Value::Array(vec![
-        branch_value(&left_exits)?,
-        branch_value(&right_exits)?,
-    ]))
+    validate_json_schema(
+        &format!("workflow activation input for node {}", target.id),
+        &target.input.schema,
+        &input,
+    )?;
+    Ok(input)
 }
 
 #[allow(clippy::too_many_lines)]
@@ -4674,6 +4692,31 @@ fn insert_activation_with_status(
     activation: &NewActivation,
     status: &str,
 ) -> Result<(), WorkflowStoreError> {
+    let input = activation.input.as_ref().ok_or_else(|| {
+        WorkflowStoreError::InvalidData(format!(
+            "workflow activation input is required: {}/{}/{}",
+            activation.run_id, activation.node_id, activation.activation_id
+        ))
+    })?;
+    let definition_json: String = transaction.query_row(
+        "SELECT definition.definition_json FROM workflow_runs run \
+         JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+           AND definition.version = run.definition_version WHERE run.run_id = ?1",
+        [&activation.run_id],
+        |row| row.get(0),
+    )?;
+    let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+    let node = definition.node(&activation.node_id).ok_or_else(|| {
+        WorkflowStoreError::InvalidData(format!(
+            "workflow activation references missing node: {}",
+            activation.node_id
+        ))
+    })?;
+    validate_json_schema(
+        &format!("workflow activation input for node {}", activation.node_id),
+        &node.input.schema,
+        input,
+    )?;
     transaction.execute(
         "INSERT INTO workflow_activations \
          (run_id, node_id, activation_id, dependency_generation, input_json, status, created_at_ms) \
@@ -5533,14 +5576,17 @@ mod tests {
     fn parallel_join_definition() -> WorkflowDefinition {
         let left = Step::task("left", |value: u32, _context| async move { Ok(value + 1) });
         let right = Step::task("right", |value: u32, _context| async move { Ok(value + 2) });
-        WorkflowBuilder::new(
+        let workflow = WorkflowBuilder::new(
             "parallel",
             bcode_workflow::parallel_named("join", left, right),
         )
         .build()
-        .expect("workflow")
-        .definition()
-        .clone()
+        .expect("workflow");
+        assert_eq!(
+            workflow.definition().nodes["join"].input,
+            bcode_workflow::ValueSchema::of::<(u32, u32)>()
+        );
+        workflow.definition().clone()
     }
 
     fn conditional_definition() -> WorkflowDefinition {
@@ -5682,7 +5728,7 @@ mod tests {
             node_id: "review".to_string(),
             activation_id: activation_id(),
             dependency_generation: 0,
-            input: None,
+            input: Some(serde_json::json!(1)),
             created_at_ms: 11,
         }
     }
@@ -7455,7 +7501,6 @@ mod tests {
             let mut store = initialized_store_at(temp.path());
             store
                 .create_activation(&NewActivation {
-                    node_id: "security-review".to_string(),
                     activation_id: "activation-2".to_string(),
                     created_at_ms: 12,
                     ..new_activation()
@@ -7484,7 +7529,6 @@ mod tests {
                 .expect("first receipt");
             store
                 .prepare_attempt(&PreparedAttempt {
-                    node_id: "security-review".to_string(),
                     activation_id: "activation-2".to_string(),
                     prepared_at_ms: 15,
                     ..first
@@ -7645,6 +7689,234 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn branch_target_input_validation_rolls_back_selected_activation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let mut definition = conditional_definition();
+        definition
+            .nodes
+            .get_mut("selected")
+            .expect("selected")
+            .input
+            .schema = serde_json::json!({"type": "string"});
+        store
+            .persist_definition("invalid-branch", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.run_id = "invalid-branch-run".to_string();
+        run.definition_id = "invalid-branch".to_string();
+        store.create_run(&run).expect("run");
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "inspect-output".to_string(),
+                run_id: run.run_id.clone(),
+                node_id: "inspect".to_string(),
+                activation_id: activation_identity(&run.run_id, "inspect", 0),
+                schema_id: definition.nodes["inspect"].output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::json!(1),
+                artifact_reference: None,
+                created_at_ms: 2,
+            })
+            .expect("inspect output");
+        let branch = store
+            .pending_activations(10)
+            .expect("branch")
+            .into_iter()
+            .find(|activation| activation.node_id == "choose")
+            .expect("branch activation");
+        let error = store
+            .settle_pending_control_nodes(&run.run_id, 10, 3)
+            .expect_err("selected target mismatch");
+        assert!(error.to_string().contains("workflow activation input"));
+        assert!(
+            store
+                .pending_activations(10)
+                .expect("pending")
+                .iter()
+                .any(|activation| activation.activation_id == branch.activation_id)
+        );
+        assert!(
+            store
+                .pending_activations(10)
+                .expect("pending")
+                .iter()
+                .all(|activation| activation.node_id != "selected")
+        );
+    }
+
+    #[test]
+    fn repeat_back_input_validation_rolls_back_generation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let mut definition = repeat_definition();
+        definition.nodes.get_mut("body").expect("body").input.schema = serde_json::json!({
+            "type": "object",
+            "required": ["condition_met", "iteration"],
+            "properties": {
+                "condition_met": {"type": "boolean"},
+                "iteration": {"const": 1}
+            }
+        });
+        store
+            .persist_definition("invalid-repeat", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.run_id = "invalid-repeat-run".to_string();
+        run.definition_id = "invalid-repeat".to_string();
+        run.input = Some(serde_json::json!({"condition_met": false, "iteration": 1}));
+        store.create_run(&run).expect("run");
+        let body = store
+            .pending_activations(10)
+            .expect("body")
+            .pop()
+            .expect("body");
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "body-output".to_string(),
+                run_id: run.run_id.clone(),
+                node_id: "body".to_string(),
+                activation_id: body.activation_id,
+                schema_id: definition.nodes["body"].output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::json!({"condition_met": false, "iteration": 1}),
+                artifact_reference: None,
+                created_at_ms: 2,
+            })
+            .expect("body output");
+        let repeat = store
+            .pending_activations(10)
+            .expect("repeat")
+            .into_iter()
+            .find(|activation| activation.node_id == "repeat-control")
+            .expect("repeat activation");
+        let error = store
+            .settle_pending_control_nodes(&run.run_id, 10, 3)
+            .expect_err("repeat target mismatch");
+        assert!(error.to_string().contains("workflow repeat input"));
+        assert!(
+            store
+                .pending_activations(10)
+                .expect("pending")
+                .iter()
+                .any(|activation| activation.activation_id == repeat.activation_id)
+        );
+        assert_eq!(
+            store
+                .pending_activations(10)
+                .expect("pending")
+                .iter()
+                .filter(|activation| activation.node_id == "body")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn run_creation_validates_each_entry_schema_and_rolls_back_atomically() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let mut definition = definition("entry-validation");
+        definition.input.schema = serde_json::json!({});
+        definition
+            .nodes
+            .get_mut("review")
+            .expect("entry")
+            .input
+            .schema = serde_json::json!({"type": "string"});
+        store
+            .persist_definition("entry-validation", 1, &definition)
+            .expect("definition");
+        let error = store
+            .create_run(&NewWorkflowRun {
+                run_id: "entry-validation-run".to_string(),
+                definition_id: "entry-validation".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                binding: None,
+                input: Some(serde_json::json!(1)),
+                created_at_ms: 1,
+                limits: WorkflowRunLimits::default(),
+            })
+            .expect_err("entry schema mismatch");
+        assert!(error.to_string().contains("workflow entry input"));
+        assert!(
+            store
+                .run_summary("entry-validation-run")
+                .expect("summary")
+                .is_none()
+        );
+        assert!(
+            store
+                .pending_activations(10)
+                .expect("activations")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn invalid_successor_input_rolls_back_output_and_activation_atomically() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let mut definition = sequential_definition();
+        definition
+            .nodes
+            .get_mut("second")
+            .expect("second")
+            .input
+            .schema = serde_json::json!({"type": "string"});
+        store
+            .persist_definition("invalid-successor", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.run_id = "invalid-successor-run".to_string();
+        run.definition_id = "invalid-successor".to_string();
+        store.create_run(&run).expect("run");
+        let error = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "invalid-successor-output".to_string(),
+                run_id: run.run_id.clone(),
+                node_id: "first".to_string(),
+                activation_id: activation_identity(&run.run_id, "first", 0),
+                schema_id: definition.nodes["first"].output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 2,
+            })
+            .expect_err("target input mismatch");
+        assert!(error.to_string().contains("workflow activation input"));
+        assert_eq!(
+            store
+                .pending_activations(10)
+                .expect("pending")
+                .into_iter()
+                .map(|activation| activation.node_id)
+                .collect::<Vec<_>>(),
+            ["first"]
+        );
+        assert!(
+            store
+                .output_summaries(&run.run_id, 10)
+                .expect("outputs")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn create_activation_validates_target_schema() {
+        let (_temp, mut store) = initialized_store();
+        let error = store
+            .create_activation(&NewActivation {
+                input: Some(serde_json::json!("wrong")),
+                ..new_activation()
+            })
+            .expect_err("invalid activation input");
+        assert!(error.to_string().contains("workflow activation input"));
     }
 
     #[test]

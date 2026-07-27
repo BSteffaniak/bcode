@@ -977,6 +977,14 @@ impl ArtifactReference {
     }
 }
 
+/// Stable durable transform contract version.
+pub const WORKFLOW_TRANSFORM_VERSION: u32 = 1;
+
+const MAX_TRANSFORM_DEPTH: usize = 16;
+const MAX_TRANSFORM_OPERATIONS: usize = 256;
+const MAX_TRANSFORM_FIELDS: usize = 256;
+const MAX_TRANSFORM_VALUE_BYTES: usize = 1_048_576;
+
 /// Stable plugin workflow-block service interface.
 pub const WORKFLOW_BLOCK_INTERFACE_ID: &str = "bcode.workflow-block/v1";
 
@@ -1799,6 +1807,308 @@ pub fn field<T>(path: impl Into<String>) -> Field<T> {
     }
 }
 
+/// Conflict behavior for deterministic object merge transforms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TransformMergeConflict {
+    /// Reject duplicate object fields.
+    Reject,
+    /// Keep the value from the first object containing the field.
+    KeepFirst,
+    /// Keep the value from the last object containing the field.
+    KeepLast,
+}
+
+/// One named durable transform input.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkflowTransformInput<'a> {
+    /// Stable source name referenced by [`WorkflowTransformExpression::Input`].
+    pub name: &'a str,
+    /// Source value.
+    pub value: &'a serde_json::Value,
+}
+
+/// Finite declarative workflow transform expression.
+///
+/// The contract contains no script evaluation, recursion, filesystem access, or network access.
+/// References are resolved only from the explicitly supplied named inputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum WorkflowTransformExpression {
+    /// Select a complete named input or one dotted object path below it.
+    Input {
+        /// Stable input source name.
+        source: String,
+        /// Dotted object path; empty selects the complete source value.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        path: String,
+    },
+    /// Embed one bounded JSON constant.
+    Constant { value: serde_json::Value },
+    /// Construct an object from explicit deterministic field expressions.
+    Object { fields: BTreeMap<String, Self> },
+    /// Construct an array in declaration order.
+    Array { items: Vec<Self> },
+    /// Merge object expressions using an explicit conflict policy.
+    Merge {
+        objects: Vec<Self>,
+        conflict: TransformMergeConflict,
+    },
+    /// Select an optional value and evaluate a deterministic default when absent or null.
+    Default {
+        value: Box<Self>,
+        default: Box<Self>,
+    },
+}
+
+/// One versioned bounded transform producing a declared schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowTransform {
+    /// Transform contract version.
+    pub version: u32,
+    /// Declarative expression root.
+    pub expression: WorkflowTransformExpression,
+    /// Exact schema of the produced value.
+    pub output: ValueSchema,
+}
+
+impl WorkflowTransform {
+    /// Validate and evaluate this transform from explicit named inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, unknown or ambiguous sources, missing fields,
+    /// excessive size/depth/operations, merge conflicts, non-object merges, invalid output
+    /// schemas, or output schema mismatch.
+    pub fn evaluate(
+        &self,
+        inputs: &[WorkflowTransformInput<'_>],
+    ) -> Result<serde_json::Value, WorkflowError> {
+        self.validate()?;
+        let mut named = BTreeMap::new();
+        for input in inputs {
+            if input.name.trim().is_empty() || named.insert(input.name, input.value).is_some() {
+                return Err(WorkflowError::Build {
+                    path: "transform.inputs".to_string(),
+                    message: "transform input names must be non-empty and unique".to_string(),
+                });
+            }
+        }
+        let mut operations = 0_usize;
+        let value = evaluate_transform_expression(&self.expression, &named, 0, &mut operations)?;
+        ensure_transform_value_bound("transform.output", &value)?;
+        let validator = jsonschema::validator_for(&self.output.schema).map_err(|error| {
+            WorkflowError::Build {
+                path: "transform.output".to_string(),
+                message: format!("invalid transform output schema: {error}"),
+            }
+        })?;
+        if let Err(error) = validator.validate(&value) {
+            return Err(WorkflowError::Build {
+                path: "transform.output".to_string(),
+                message: format!("transform output does not match its declared schema: {error}"),
+            });
+        }
+        Ok(value)
+    }
+
+    /// Validate the transform contract without evaluating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, invalid output schemas, or expression bounds.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_TRANSFORM_VERSION {
+            return Err(WorkflowError::Build {
+                path: "transform.version".to_string(),
+                message: format!(
+                    "unsupported workflow transform version {}; expected {}",
+                    self.version, WORKFLOW_TRANSFORM_VERSION
+                ),
+            });
+        }
+        jsonschema::validator_for(&self.output.schema).map_err(|error| WorkflowError::Build {
+            path: "transform.output".to_string(),
+            message: format!("invalid transform output schema: {error}"),
+        })?;
+        let mut operations = 0_usize;
+        validate_transform_expression(&self.expression, 0, &mut operations)
+    }
+}
+
+fn validate_transform_expression(
+    expression: &WorkflowTransformExpression,
+    depth: usize,
+    operations: &mut usize,
+) -> Result<(), WorkflowError> {
+    check_transform_budget(depth, operations)?;
+    match expression {
+        WorkflowTransformExpression::Input { source, path } => {
+            if source.trim().is_empty() || source.len() > 256 || path.len() > 512 {
+                return Err(WorkflowError::Build {
+                    path: "transform.input".to_string(),
+                    message: "transform input source/path exceeds bounds".to_string(),
+                });
+            }
+        }
+        WorkflowTransformExpression::Constant { value } => {
+            ensure_transform_value_bound("transform.constant", value)?;
+        }
+        WorkflowTransformExpression::Object { fields } => {
+            if fields.len() > MAX_TRANSFORM_FIELDS
+                || fields
+                    .keys()
+                    .any(|field| field.is_empty() || field.len() > 256)
+            {
+                return Err(WorkflowError::Build {
+                    path: "transform.object".to_string(),
+                    message: format!("transform object fields exceed {MAX_TRANSFORM_FIELDS}"),
+                });
+            }
+            for value in fields.values() {
+                validate_transform_expression(value, depth + 1, operations)?;
+            }
+        }
+        WorkflowTransformExpression::Array { items }
+        | WorkflowTransformExpression::Merge { objects: items, .. } => {
+            if items.len() > MAX_TRANSFORM_FIELDS {
+                return Err(WorkflowError::Build {
+                    path: "transform.array".to_string(),
+                    message: format!("transform items exceed {MAX_TRANSFORM_FIELDS}"),
+                });
+            }
+            for value in items {
+                validate_transform_expression(value, depth + 1, operations)?;
+            }
+        }
+        WorkflowTransformExpression::Default { value, default } => {
+            validate_transform_expression(value, depth + 1, operations)?;
+            validate_transform_expression(default, depth + 1, operations)?;
+        }
+    }
+    Ok(())
+}
+
+fn check_transform_budget(depth: usize, operations: &mut usize) -> Result<(), WorkflowError> {
+    if depth > MAX_TRANSFORM_DEPTH {
+        return Err(WorkflowError::Build {
+            path: "transform".to_string(),
+            message: format!("transform depth exceeds {MAX_TRANSFORM_DEPTH}"),
+        });
+    }
+    *operations = operations
+        .checked_add(1)
+        .ok_or_else(|| WorkflowError::Build {
+            path: "transform".to_string(),
+            message: "transform operation count overflow".to_string(),
+        })?;
+    if *operations > MAX_TRANSFORM_OPERATIONS {
+        return Err(WorkflowError::Build {
+            path: "transform".to_string(),
+            message: format!("transform operations exceed {MAX_TRANSFORM_OPERATIONS}"),
+        });
+    }
+    Ok(())
+}
+
+fn evaluate_transform_expression(
+    expression: &WorkflowTransformExpression,
+    inputs: &BTreeMap<&str, &serde_json::Value>,
+    depth: usize,
+    operations: &mut usize,
+) -> Result<serde_json::Value, WorkflowError> {
+    check_transform_budget(depth, operations)?;
+    match expression {
+        WorkflowTransformExpression::Input { source, path } => {
+            let source = inputs
+                .get(source.as_str())
+                .ok_or_else(|| WorkflowError::Build {
+                    path: source.clone(),
+                    message: "transform references an unknown named input".to_string(),
+                })?;
+            path.split('.')
+                .filter(|part| !part.is_empty())
+                .try_fold(*source, |current, part| current.get(part))
+                .cloned()
+                .ok_or_else(|| WorkflowError::Build {
+                    path: path.clone(),
+                    message: "transform input field was not present".to_string(),
+                })
+        }
+        WorkflowTransformExpression::Constant { value } => Ok(value.clone()),
+        WorkflowTransformExpression::Object { fields } => fields
+            .iter()
+            .map(|(field, expression)| {
+                evaluate_transform_expression(expression, inputs, depth + 1, operations)
+                    .map(|value| (field.clone(), value))
+            })
+            .collect::<Result<serde_json::Map<_, _>, _>>()
+            .map(serde_json::Value::Object),
+        WorkflowTransformExpression::Array { items } => items
+            .iter()
+            .map(|item| evaluate_transform_expression(item, inputs, depth + 1, operations))
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array),
+        WorkflowTransformExpression::Merge { objects, conflict } => {
+            let mut merged = serde_json::Map::new();
+            for expression in objects {
+                let value =
+                    evaluate_transform_expression(expression, inputs, depth + 1, operations)?;
+                let object = value.as_object().ok_or_else(|| WorkflowError::Build {
+                    path: "transform.merge".to_string(),
+                    message: "transform merge inputs must be objects".to_string(),
+                })?;
+                for (field, value) in object {
+                    match (merged.contains_key(field), conflict) {
+                        (true, TransformMergeConflict::Reject) => {
+                            return Err(WorkflowError::Build {
+                                path: field.clone(),
+                                message: "transform merge field conflict".to_string(),
+                            });
+                        }
+                        (true, TransformMergeConflict::KeepFirst) => {}
+                        _ => {
+                            merged.insert(field.clone(), value.clone());
+                        }
+                    }
+                }
+            }
+            Ok(serde_json::Value::Object(merged))
+        }
+        WorkflowTransformExpression::Default { value, default } => {
+            match evaluate_transform_expression(value, inputs, depth + 1, operations) {
+                Ok(serde_json::Value::Null) => {
+                    evaluate_transform_expression(default, inputs, depth + 1, operations)
+                }
+                Ok(value) => Ok(value),
+                Err(WorkflowError::Build { message, .. })
+                    if message == "transform input field was not present" =>
+                {
+                    evaluate_transform_expression(default, inputs, depth + 1, operations)
+                }
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
+fn ensure_transform_value_bound(
+    path: &str,
+    value: &serde_json::Value,
+) -> Result<(), WorkflowError> {
+    let bytes = serde_json::to_vec(value).map_err(|error| WorkflowError::Build {
+        path: path.to_string(),
+        message: error.to_string(),
+    })?;
+    if bytes.len() > MAX_TRANSFORM_VALUE_BYTES {
+        return Err(WorkflowError::Build {
+            path: path.to_string(),
+            message: format!("transform value exceeds {MAX_TRANSFORM_VALUE_BYTES} bytes"),
+        });
+    }
+    Ok(())
+}
+
 /// Serializable, host-neutral compiled workflow definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowDefinition {
@@ -1887,6 +2197,16 @@ impl WorkflowDefinition {
                 }
             }
             if node.kind == NodeKind::Parallel {
+                if node.input != node.output {
+                    diagnostics.push(WorkflowCapabilityDiagnostic {
+                        code: "invalid_parallel_join_schema".to_string(),
+                        node_id: Some(node.id.clone()),
+                        message: format!(
+                            "parallel node '{}' must declare its deterministic join tuple as both input and output",
+                            node.id
+                        ),
+                    });
+                }
                 match serde_json::from_value::<ParallelFailurePolicy>(
                     node.configuration
                         .get("failure_policy")
@@ -1917,6 +2237,7 @@ impl WorkflowDefinition {
             }
         }
         for edge in &self.edges {
+            validate_production_edge_schema(self, edge, &mut diagnostics);
             if capabilities.edge_support(edge.kind.capability_kind())
                 != WorkflowCapabilitySupport::Supported
             {
@@ -2926,7 +3247,7 @@ where
         id: join_id.clone(),
         name: "parallel join".to_string(),
         kind: NodeKind::Parallel,
-        input: ValueSchema::of::<I>(),
+        input: ValueSchema::of::<(A, B)>(),
         output: ValueSchema::of::<(A, B)>(),
         resources: Vec::new(),
         configuration: serde_json::json!({
@@ -3572,6 +3893,39 @@ fn validate_compiled_definition(definition: &WorkflowDefinition) -> Result<(), W
     ensure_acyclic(&definition.name, &definition.nodes, &definition.edges)
 }
 
+fn validate_production_edge_schema(
+    definition: &WorkflowDefinition,
+    edge: &EdgeDefinition,
+    diagnostics: &mut Vec<WorkflowCapabilityDiagnostic>,
+) {
+    let Some(source) = definition.node(&edge.from) else {
+        return;
+    };
+    let Some(target) = definition.node(&edge.to) else {
+        return;
+    };
+    let compatible = match edge.kind {
+        EdgeKind::Direct | EdgeKind::Conditional { .. } => {
+            if target.kind == NodeKind::Parallel {
+                return;
+            }
+            source.output == target.input
+        }
+        EdgeKind::Back { .. } => source.output == target.input,
+        EdgeKind::Retry { .. } => false,
+    };
+    if !compatible && !matches!(edge.kind, EdgeKind::Retry { .. }) {
+        diagnostics.push(WorkflowCapabilityDiagnostic {
+            code: "incompatible_edge_schema".to_string(),
+            node_id: Some(edge.from.clone()),
+            message: format!(
+                "edge '{} -> {}' requires an explicit typed transform: source output '{}' does not exactly match target input '{}'",
+                edge.from, edge.to, source.output.type_name, target.input.type_name
+            ),
+        });
+    }
+}
+
 fn validate_production_agent_node(
     node: &NodeDefinition,
     capabilities: &WorkflowProductionCapabilities,
@@ -3923,6 +4277,278 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn declarative_transforms_cover_projection_construction_merge_defaults_and_bounds() {
+        let state = serde_json::json!({
+            "git": {"expected_head": "abc", "paths": ["src/lib.rs"]},
+            "message": null
+        });
+        let generated = serde_json::json!({"message": "Implement workflow transforms"});
+        let transform = WorkflowTransform {
+            version: WORKFLOW_TRANSFORM_VERSION,
+            expression: WorkflowTransformExpression::Object {
+                fields: BTreeMap::from([
+                    (
+                        "expected_head".to_string(),
+                        WorkflowTransformExpression::Input {
+                            source: "state".to_string(),
+                            path: "git.expected_head".to_string(),
+                        },
+                    ),
+                    (
+                        "message".to_string(),
+                        WorkflowTransformExpression::Default {
+                            value: Box::new(WorkflowTransformExpression::Input {
+                                source: "state".to_string(),
+                                path: "message".to_string(),
+                            }),
+                            default: Box::new(WorkflowTransformExpression::Input {
+                                source: "generated".to_string(),
+                                path: "message".to_string(),
+                            }),
+                        },
+                    ),
+                    (
+                        "paths".to_string(),
+                        WorkflowTransformExpression::Input {
+                            source: "state".to_string(),
+                            path: "git.paths".to_string(),
+                        },
+                    ),
+                    (
+                        "repo_path".to_string(),
+                        WorkflowTransformExpression::Constant {
+                            value: serde_json::json!("."),
+                        },
+                    ),
+                ]),
+            },
+            output: ValueSchema {
+                type_name: "bcode.git.commit-request/v1".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "required": ["repo_path", "expected_head", "message", "paths"],
+                    "properties": {
+                        "repo_path": {"type": "string"},
+                        "expected_head": {"type": "string"},
+                        "message": {"type": "string"},
+                        "paths": {"type": "array", "items": {"type": "string"}}
+                    }
+                }),
+            },
+        };
+        assert_eq!(
+            transform
+                .evaluate(&[
+                    WorkflowTransformInput {
+                        name: "state",
+                        value: &state,
+                    },
+                    WorkflowTransformInput {
+                        name: "generated",
+                        value: &generated,
+                    },
+                ])
+                .expect("transform"),
+            serde_json::json!({
+                "repo_path": ".",
+                "expected_head": "abc",
+                "message": "Implement workflow transforms",
+                "paths": ["src/lib.rs"]
+            })
+        );
+
+        let merge = WorkflowTransform {
+            version: WORKFLOW_TRANSFORM_VERSION,
+            expression: WorkflowTransformExpression::Merge {
+                objects: vec![
+                    WorkflowTransformExpression::Constant {
+                        value: serde_json::json!({"a": 1, "same": "first"}),
+                    },
+                    WorkflowTransformExpression::Constant {
+                        value: serde_json::json!({"b": 2, "same": "last"}),
+                    },
+                ],
+                conflict: TransformMergeConflict::KeepLast,
+            },
+            output: ValueSchema {
+                type_name: "object".to_string(),
+                schema: serde_json::json!({"type": "object"}),
+            },
+        };
+        assert_eq!(
+            merge.evaluate(&[]).expect("merge"),
+            serde_json::json!({"a": 1, "b": 2, "same": "last"})
+        );
+        let array = WorkflowTransform {
+            version: WORKFLOW_TRANSFORM_VERSION,
+            expression: WorkflowTransformExpression::Array {
+                items: vec![
+                    WorkflowTransformExpression::Constant {
+                        value: serde_json::json!(1),
+                    },
+                    WorkflowTransformExpression::Constant {
+                        value: serde_json::json!(2),
+                    },
+                ],
+            },
+            output: ValueSchema {
+                type_name: "array".to_string(),
+                schema: serde_json::json!({"type": "array", "items": {"type": "integer"}}),
+            },
+        };
+        assert_eq!(
+            array.evaluate(&[]).expect("array"),
+            serde_json::json!([1, 2])
+        );
+
+        let merge_objects = match &merge.expression {
+            WorkflowTransformExpression::Merge { objects, .. } => objects.clone(),
+            _ => unreachable!(),
+        };
+        let keep_first = WorkflowTransform {
+            version: WORKFLOW_TRANSFORM_VERSION,
+            expression: WorkflowTransformExpression::Merge {
+                objects: merge_objects.clone(),
+                conflict: TransformMergeConflict::KeepFirst,
+            },
+            output: merge.output.clone(),
+        };
+        assert_eq!(
+            keep_first.evaluate(&[]).expect("keep first")["same"],
+            "first"
+        );
+        let reject = WorkflowTransform {
+            version: WORKFLOW_TRANSFORM_VERSION,
+            expression: WorkflowTransformExpression::Merge {
+                objects: merge_objects,
+                conflict: TransformMergeConflict::Reject,
+            },
+            output: merge.output,
+        };
+        assert!(reject.evaluate(&[]).is_err());
+    }
+
+    #[test]
+    fn declarative_transform_rejects_unknown_sources_versions_depth_and_output_mismatch() {
+        let output = ValueSchema::of::<u32>();
+        let unknown = WorkflowTransform {
+            version: WORKFLOW_TRANSFORM_VERSION,
+            expression: WorkflowTransformExpression::Input {
+                source: "missing".to_string(),
+                path: String::new(),
+            },
+            output: output.clone(),
+        };
+        assert!(unknown.evaluate(&[]).is_err());
+        let duplicate = serde_json::json!(1);
+        assert!(
+            unknown
+                .evaluate(&[
+                    WorkflowTransformInput {
+                        name: "same",
+                        value: &duplicate,
+                    },
+                    WorkflowTransformInput {
+                        name: "same",
+                        value: &duplicate,
+                    },
+                ])
+                .is_err()
+        );
+        let unsupported = WorkflowTransform {
+            version: 2,
+            expression: unknown.expression.clone(),
+            output: unknown.output,
+        };
+        assert!(unsupported.validate().is_err());
+        assert!(
+            WorkflowTransform {
+                version: WORKFLOW_TRANSFORM_VERSION,
+                expression: WorkflowTransformExpression::Constant {
+                    value: serde_json::json!("wrong")
+                },
+                output,
+            }
+            .evaluate(&[])
+            .is_err()
+        );
+
+        let mut expression = WorkflowTransformExpression::Constant {
+            value: serde_json::Value::Null,
+        };
+        for _ in 0..=MAX_TRANSFORM_DEPTH {
+            expression = WorkflowTransformExpression::Array {
+                items: vec![expression],
+            };
+        }
+        assert!(
+            WorkflowTransform {
+                version: WORKFLOW_TRANSFORM_VERSION,
+                expression,
+                output: ValueSchema {
+                    type_name: "array".to_string(),
+                    schema: serde_json::json!({"type": "array"}),
+                },
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn production_admission_rejects_incompatible_direct_edge_schemas() {
+        let number = ValueSchema::of::<u32>();
+        let text = ValueSchema::of::<String>();
+        let definition = WorkflowDefinition {
+            schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "incompatible-edge".to_string(),
+            input: number.clone(),
+            output: text.clone(),
+            nodes: BTreeMap::from([
+                (
+                    "source".to_string(),
+                    NodeDefinition {
+                        id: "source".to_string(),
+                        name: "source".to_string(),
+                        kind: NodeKind::Input,
+                        input: number.clone(),
+                        output: number,
+                        resources: Vec::new(),
+                        configuration: serde_json::json!({"gate_version": 1}),
+                    },
+                ),
+                (
+                    "target".to_string(),
+                    NodeDefinition {
+                        id: "target".to_string(),
+                        name: "target".to_string(),
+                        kind: NodeKind::Input,
+                        input: text.clone(),
+                        output: text,
+                        resources: Vec::new(),
+                        configuration: serde_json::json!({"gate_version": 1}),
+                    },
+                ),
+            ]),
+            entries: vec!["source".to_string()],
+            exits: vec!["target".to_string()],
+            edges: vec![EdgeDefinition {
+                from: "source".to_string(),
+                to: "target".to_string(),
+                kind: EdgeKind::Direct,
+            }],
+        };
+        let admission = definition
+            .production_admission(&WorkflowProductionCapabilities::current())
+            .expect("structurally valid definition");
+        assert!(admission.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "incompatible_edge_schema"
+                && diagnostic.node_id.as_deref() == Some("source")
+        }));
+    }
+
+    #[test]
     fn production_admission_rejects_unsupported_agent_and_parallel_options() {
         let schema = ValueSchema::of::<u32>();
         let definition = WorkflowDefinition {
@@ -3980,6 +4606,10 @@ mod tests {
         }));
         assert!(admission.diagnostics.iter().any(|item| {
             item.code == "unsupported_agent_prompt_mode" && item.node_id.as_deref() == Some("agent")
+        }));
+        assert!(admission.diagnostics.iter().any(|item| {
+            item.code == "invalid_parallel_join_schema"
+                && item.node_id.as_deref() == Some("parallel")
         }));
         assert!(admission.diagnostics.iter().any(|item| {
             item.code == "unsupported_parallel_policy"

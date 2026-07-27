@@ -63,7 +63,14 @@ slice requires these identities and relationships:
 Stable dispatch identity is derived from `(run_id, node_id, activation_id, attempt)` and persisted
 with prepared intent before an external operation is invoked.
 
-## Transaction boundaries
+## Target-input validation
+
+Once durable support is enabled, activation input is validated against the exact target node schema
+at every insertion boundary. This includes run entry materialization, direct and conditional
+successors, parallel join values, repeat back-edges, public activation insertion, and waiting-gate
+successors. Validation occurs in the same transaction as output completion and successor
+materialization, so a mismatch leaves the source activation/output and target activation unchanged.
+
 
 Canonical state transitions and required projections commit atomically. In particular:
 

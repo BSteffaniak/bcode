@@ -36807,10 +36807,49 @@ library = "test"
             exits: vec!["agent".to_string()],
             edges: Vec::new(),
         };
+        let incompatible_edge = bcode_workflow::WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "incompatible-edge".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([
+                (
+                    "source".to_string(),
+                    node(
+                        "source",
+                        bcode_workflow::NodeKind::Input,
+                        serde_json::json!({"gate_version": 1}),
+                    ),
+                ),
+                (
+                    "target".to_string(),
+                    bcode_workflow::NodeDefinition {
+                        id: "target".to_string(),
+                        name: "target".to_string(),
+                        kind: bcode_workflow::NodeKind::Input,
+                        input: bcode_workflow::ValueSchema {
+                            type_name: "string".to_string(),
+                            schema: serde_json::json!({"type": "string"}),
+                        },
+                        output: schema.clone(),
+                        resources: Vec::new(),
+                        configuration: serde_json::json!({"gate_version": 1}),
+                    },
+                ),
+            ]),
+            entries: vec!["source".to_string()],
+            exits: vec!["target".to_string()],
+            edges: vec![bcode_workflow::EdgeDefinition {
+                from: "source".to_string(),
+                to: "target".to_string(),
+                kind: bcode_workflow::EdgeKind::Direct,
+            }],
+        };
         for (definition_id, definition) in [
             ("retry-edge", retry_edge),
             ("fail-fast", fail_fast),
             ("invalid-agent", invalid_agent),
+            ("incompatible-edge", incompatible_edge),
         ] {
             let temp = tempfile::tempdir().expect("temp");
             let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(temp.path())
