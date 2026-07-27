@@ -9,6 +9,9 @@
 use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
 
 use crate::current_schema::{global_migrations, session_migrations};
+use crate::db_artifact::{
+    finalized_artifact_reference_from_row, generic_artifact_reference_metadata,
+};
 use crate::db_connection::{
     init_turso_local_with_retry, is_database_lock_error, is_database_lock_error_message,
 };
@@ -25,10 +28,19 @@ pub use crate::db_path::{
 };
 pub use crate::db_projection::MaterializedProjection;
 use crate::db_projection::ProjectionCheckpointState;
+use crate::db_projection_row::{
+    input_history_entry_from_row, runtime_work_from_row, session_summary_from_catalog_row,
+    tool_run_from_row, transcript_item_from_row,
+};
 use crate::db_row::{
     i64_to_u64, optional_i64, optional_string, required_i64, required_non_negative_u64,
     required_string,
 };
+use crate::db_runtime_work::{runtime_work_kind_name, runtime_work_status_name};
+
+const fn bool_to_value(value: bool) -> DatabaseValue {
+    DatabaseValue::Int32(if value { 1 } else { 0 })
+}
 use crate::db_validation::{
     compaction_boundary, validate_canonical_event_identity, validate_projection_checkpoint_snapshot,
 };
@@ -46,8 +58,7 @@ use bcode_session_models::{
     ExecutionSessionProvenance, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent,
     SessionEventCompatibilityIssue, SessionEventKind, SessionHistoryCursor,
     SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionId,
-    SessionInputHistoryEntry, SessionSummary, SessionTitleSource, SessionVisibility,
-    ToolInvocationResult, WorkId,
+    SessionInputHistoryEntry, SessionSummary, SessionVisibility, ToolInvocationResult, WorkId,
 };
 use switchy::{
     database::{
@@ -4210,24 +4221,6 @@ async fn finalize_tool_transcript_item(
     Ok(())
 }
 
-fn generic_artifact_reference_metadata(
-    reference: &bcode_session_models::ToolArtifactRef,
-) -> (Option<String>, Option<bool>, Option<String>) {
-    let metadata = reference.metadata.as_ref();
-    let availability = metadata
-        .and_then(|metadata| metadata.get("availability"))
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned);
-    let complete = metadata
-        .and_then(|metadata| metadata.get("complete"))
-        .and_then(serde_json::Value::as_bool);
-    let checksum_sha256 = metadata
-        .and_then(|metadata| metadata.get("checksum_sha256"))
-        .and_then(serde_json::Value::as_str)
-        .map(ToOwned::to_owned);
-    (availability, complete, checksum_sha256)
-}
-
 async fn project_artifact_references(
     db: &dyn Database,
     finalized_event_seq: u64,
@@ -4258,29 +4251,6 @@ async fn project_artifact_references(
     Ok(())
 }
 
-fn finalized_artifact_reference_from_row(
-    row: &switchy::database::Row,
-) -> SessionDbResult<FinalizedArtifactReference> {
-    Ok(FinalizedArtifactReference {
-        artifact_id: required_string(row, "artifact_id")?,
-        reference_key: required_string(row, "reference_key")?,
-        producer_plugin_id: required_string(row, "producer_plugin_id")?,
-        schema: required_string(row, "schema")?,
-        schema_version: u32::try_from(required_i64(row, "schema_version")?).map_err(|_| {
-            SessionDbError::InvalidRow {
-                column: "schema_version".to_owned(),
-            }
-        })?,
-        storage_uri: optional_string(row, "storage_uri"),
-        content_type: optional_string(row, "content_type"),
-        byte_len: optional_i64(row, "byte_len").map(i64_to_u64),
-        availability: optional_string(row, "availability"),
-        complete: optional_i64(row, "complete").map(|value| value != 0),
-        checksum_sha256: optional_string(row, "checksum_sha256"),
-        finalized_event_seq: required_i64(row, "finalized_event_seq").map(i64_to_u64)?,
-    })
-}
-
 async fn update_projection_checkpoint(
     db: &dyn Database,
     projection: MaterializedProjection,
@@ -4298,85 +4268,6 @@ async fn update_projection_checkpoint(
         .execute(db)
         .await?;
     Ok(())
-}
-
-fn runtime_work_from_row(row: &switchy::database::Row) -> SessionDbResult<RuntimeWorkProjection> {
-    Ok(RuntimeWorkProjection {
-        work_id: WorkId::new(required_string(row, "work_id")?),
-        event_seq_start: required_i64(row, "event_seq_start").map(i64_to_u64)?,
-        event_seq_end: optional_i64(row, "event_seq_end").map(i64_to_u64),
-        kind: parse_runtime_work_kind(&required_string(row, "kind")?),
-        label: required_string(row, "label")?,
-        status: parse_runtime_work_status(&required_string(row, "status")?),
-        parent_work_id: optional_string(row, "parent_work_id").map(WorkId::new),
-        started_at_ms: optional_i64(row, "started_at_ms").map(i64_to_u64),
-        finished_at_ms: optional_i64(row, "finished_at_ms").map(i64_to_u64),
-        message: optional_string(row, "message"),
-        cancellable: optional_i64(row, "cancellable").is_some_and(|value| value != 0),
-    })
-}
-
-fn tool_run_from_row(row: &switchy::database::Row) -> SessionDbResult<ToolRun> {
-    Ok(ToolRun {
-        tool_call_id: required_string(row, "tool_call_id")?,
-        event_seq_start: required_i64(row, "event_seq_start").map(i64_to_u64)?,
-        event_seq_end: optional_i64(row, "event_seq_end").map(i64_to_u64),
-        status: required_string(row, "status")?,
-        tool_name: optional_string(row, "tool_name"),
-        started_at_ms: optional_i64(row, "started_at_ms").map(i64_to_u64),
-        completed_at_ms: optional_i64(row, "completed_at_ms").map(i64_to_u64),
-        output_bytes: optional_i64(row, "output_bytes").map(i64_to_u64),
-        is_error: optional_i64(row, "is_error").map(|value| value != 0),
-    })
-}
-
-fn session_summary_from_catalog_row(
-    row: &switchy::database::Row,
-) -> SessionDbResult<SessionSummary> {
-    let session_id =
-        required_string(row, "session_id")?
-            .parse()
-            .map_err(|_| SessionDbError::InvalidRow {
-                column: "session_id".to_string(),
-            })?;
-    let working_directory = std::path::PathBuf::from(required_string(row, "working_directory")?);
-    let name = optional_string(row, "title");
-    Ok(SessionSummary {
-        id: session_id,
-        name: name.clone(),
-        explicit_name: name,
-        derived_title: None,
-        title_source: SessionTitleSource::Explicit,
-        client_count: 0,
-        created_at_ms: required_i64(row, "created_at_ms").map(i64_to_u64)?,
-        updated_at_ms: required_i64(row, "updated_at_ms").map(i64_to_u64)?,
-        working_directory,
-        import: None,
-        fork: None,
-        execution: None,
-    })
-}
-
-fn transcript_item_from_row(row: &switchy::database::Row) -> SessionDbResult<TranscriptItem> {
-    Ok(TranscriptItem {
-        transcript_seq: required_i64(row, "transcript_seq").map(i64_to_u64)?,
-        event_seq_start: required_i64(row, "event_seq_start").map(i64_to_u64)?,
-        event_seq_end: required_i64(row, "event_seq_end").map(i64_to_u64)?,
-        role: required_string(row, "role")?,
-        kind: required_string(row, "kind")?,
-        status: required_string(row, "status")?,
-        content: optional_string(row, "content"),
-    })
-}
-
-fn input_history_entry_from_row(
-    row: &switchy::database::Row,
-) -> SessionDbResult<SessionInputHistoryEntry> {
-    Ok(SessionInputHistoryEntry {
-        sequence: required_i64(row, "event_seq").map(i64_to_u64)?,
-        timestamp_ms: optional_i64(row, "created_at_ms").map_or(0, i64_to_u64),
-        text: required_string(row, "text")?,
-    })
 }
 
 fn canonical_model_context_from_events(
@@ -4429,61 +4320,6 @@ fn canonical_model_context_from_events(
     context.push(marker);
     context.extend(retained);
     context
-}
-
-const fn runtime_work_kind_name(kind: RuntimeWorkKind) -> &'static str {
-    match kind {
-        RuntimeWorkKind::Tool => "tool",
-        RuntimeWorkKind::PluginInvocation => "plugin_invocation",
-        RuntimeWorkKind::ModelTurn => "model_turn",
-        RuntimeWorkKind::EventDelivery => "event_delivery",
-        RuntimeWorkKind::Workflow => "workflow",
-        RuntimeWorkKind::WorkflowNode => "workflow_node",
-    }
-}
-
-fn parse_runtime_work_kind(value: &str) -> RuntimeWorkKind {
-    match value {
-        "plugin_invocation" => RuntimeWorkKind::PluginInvocation,
-        "model_turn" => RuntimeWorkKind::ModelTurn,
-        "event_delivery" => RuntimeWorkKind::EventDelivery,
-        "workflow" => RuntimeWorkKind::Workflow,
-        "workflow_node" => RuntimeWorkKind::WorkflowNode,
-        _ => RuntimeWorkKind::Tool,
-    }
-}
-
-const fn runtime_work_status_name(status: RuntimeWorkStatus) -> &'static str {
-    match status {
-        RuntimeWorkStatus::Queued => "queued",
-        RuntimeWorkStatus::Running => "running",
-        RuntimeWorkStatus::Cancelling => "cancelling",
-        RuntimeWorkStatus::Completed => "completed",
-        RuntimeWorkStatus::Failed => "failed",
-        RuntimeWorkStatus::TimedOut => "timed_out",
-        RuntimeWorkStatus::Cancelled => "cancelled",
-    }
-}
-
-fn parse_runtime_work_status(value: &str) -> RuntimeWorkStatus {
-    match value {
-        "queued" => RuntimeWorkStatus::Queued,
-        "cancelling" => RuntimeWorkStatus::Cancelling,
-        "completed" => RuntimeWorkStatus::Completed,
-        "failed" => RuntimeWorkStatus::Failed,
-        "timed_out" => RuntimeWorkStatus::TimedOut,
-        "cancelled" => RuntimeWorkStatus::Cancelled,
-        _ => RuntimeWorkStatus::Running,
-    }
-}
-
-#[allow(dead_code)]
-fn usize_to_value(value: usize) -> DatabaseValue {
-    DatabaseValue::Int64(i64::try_from(value).unwrap_or(i64::MAX))
-}
-
-const fn bool_to_value(value: bool) -> DatabaseValue {
-    DatabaseValue::Int32(if value { 1 } else { 0 })
 }
 
 #[cfg(test)]
