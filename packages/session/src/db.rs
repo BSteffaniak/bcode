@@ -16,8 +16,8 @@ use crate::db_connection::{
     init_turso_local_with_retry, is_database_lock_error, is_database_lock_error_message,
 };
 use crate::db_context::{
-    ContextHistoryRole, context_history_role, is_model_context_event_type,
-    model_context_event_kind_name,
+    ContextHistoryRole, canonical_model_context_from_events, context_history_role,
+    is_model_context_event_type, model_context_event_kind_name,
 };
 use crate::db_event_store::{
     compatible_event_from_row, event_created_at_ms, event_kind_name, insert_event, last_sequence,
@@ -4268,58 +4268,6 @@ async fn update_projection_checkpoint(
         .execute(db)
         .await?;
     Ok(())
-}
-
-fn canonical_model_context_from_events(
-    events: impl IntoIterator<Item = SessionEvent>,
-) -> Vec<SessionEvent> {
-    let events = events.into_iter().collect::<Vec<_>>();
-    let Some(marker) = events
-        .iter()
-        .filter(|event| {
-            matches!(
-                event.kind,
-                SessionEventKind::ContextCompacted { .. }
-                    | SessionEventKind::ProviderContextCompacted { .. }
-            )
-        })
-        .max_by_key(|event| event.sequence)
-        .cloned()
-    else {
-        return events
-            .into_iter()
-            .filter(|event| is_model_context_event_type(model_context_event_kind_name(&event.kind)))
-            .collect();
-    };
-    let boundary = match &marker.kind {
-        SessionEventKind::ContextCompacted {
-            compacted_through_sequence,
-            ..
-        }
-        | SessionEventKind::ProviderContextCompacted {
-            compacted_through_sequence,
-            ..
-        } => *compacted_through_sequence,
-        _ => unreachable!("marker selection accepts only compaction events"),
-    };
-    let mut retained = events
-        .into_iter()
-        .filter(|event| {
-            event.sequence > boundary
-                && event.sequence != marker.sequence
-                && is_model_context_event_type(model_context_event_kind_name(&event.kind))
-                && !matches!(
-                    event.kind,
-                    SessionEventKind::ContextCompacted { .. }
-                        | SessionEventKind::ProviderContextCompacted { .. }
-                )
-        })
-        .collect::<Vec<_>>();
-    retained.sort_by_key(|event| event.sequence);
-    let mut context = Vec::with_capacity(retained.len().saturating_add(1));
-    context.push(marker);
-    context.extend(retained);
-    context
 }
 
 #[cfg(test)]
