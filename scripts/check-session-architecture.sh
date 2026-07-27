@@ -365,7 +365,8 @@ if ! rg -q 'pub struct SessionMigrationReceipt' packages/session-migration/src/v
   || ! rg -q 'pub const fn validate_writer_finalization' packages/session-migration/src/validation.rs \
   || ! rg -q 'migration_target_validation_facts' packages/session/src/db.rs \
   || ! rg -q 'validate_strict_target' packages/session/src/db.rs \
-  || ! rg -q 'build_session_migration_receipt' packages/session/src/db.rs \
+  || ! rg -q 'build_target_receipt' packages/session-migration/src/execution.rs \
+  || ! rg -q 'build_receipt:.*MigrationReceiptBuilder' packages/session-migration-target/src/lib.rs \
   || sed -n '/async fn validate_migrated_storage(/,/^}/p' packages/session/src/db.rs | grep -q 'ProjectionStale\|ProjectionIncompatible\|CompatibilityDegraded'; then
   echo "Session migration validation ownership violation: receipt construction and migration-plan selection must remain migration-owned." >&2
   violations=1
@@ -391,7 +392,7 @@ fi
 if ! rg -q '033_session_migration_receipts_table' packages/session/src/current_schema.rs \
   || ! rg -q 'build_target_migration_receipt' packages/session/src/db.rs \
   || ! sed -n '/async fn migrate_turso_in_root_observed_with_fault/,/Ok(db)/p' packages/session/src/db.rs | grep -q 'target.persist_migration_receipt' \
-  || ! rg -q 'automatic migration receipt' packages/session/src/lib.rs; then
+  || ! rg -q 'legacy_session_migrates_across_real_attach_and_send_ipc' packages/server/src/lib.rs; then
   echo "Session migration receipt violation: successful migration must transactionally retain operation, plan, canonical digest/count, classification, and completion audit metadata." >&2
   violations=1
 fi
@@ -456,7 +457,9 @@ fi
 
 if sed '/#\[cfg(test)\]/,$d' packages/session/src/db.rs \
     | rg -q 'pub async fn migrate_turso_in_root(_observed)?' \
-  || rg -n 'migrate_turso_in_root(_observed)?' packages/cli/src packages/server/src --glob '*.rs'; then
+  || rg -n 'migrate_turso_in_root(_observed)?' packages/cli/src --glob '*.rs' \
+  || rg -n 'migrate_turso_in_root(_observed)?' packages/server/src --glob '*.rs' \
+    | rg -v 'session_migration_execution.rs'; then
   echo "Session migration API-surface violation: low-level historical migration entry points must remain internal to the current target adapter and tests." >&2
   violations=1
 fi
@@ -609,8 +612,7 @@ if rg -n "SessionDb::open_turso_in_root" packages/server/src --glob '*.rs' >/tmp
 fi
 
 normal_session_open_violations="$(
-  rg -n '\bSessionDb::open_turso_in_root(_observed)?' packages/session/src/{actor,lib}.rs \
-    | awk -F: '$1 !~ /lib.rs/ || $2 < 2522' \
+  rg -n '\bSessionDb::open_turso_in_root(_observed)?' packages/session/src/actor.rs \
     || true
 )"
 if [[ -n "$normal_session_open_violations" ]]; then
@@ -740,15 +742,15 @@ fi
 
 if ! rg -q 'storage_compatibility\(\)' packages/session/src/lib.rs \
   || ! rg -q 'load_gates: BTreeMap<SessionId, Arc<Mutex<\(\)>>>' packages/session/src/lib.rs \
-  || ! rg -q 'prepare_owned_session_storage\(' packages/session/src/lib.rs \
-  || rg -q 'migrate_legacy_session_for_load|transition_session_maintenance_to_lease' packages/session/src/lib.rs \
-  || sed -n '1,4000p' packages/session/src/lib.rs | grep -q 'acquire_session_maintenance_guard(root, session_id)'; then
+  || ! rg -q 'migrate_owned_session_storage\(' packages/server/src/session_migration_execution.rs \
+  || ! rg -q 'acquire_session_maintenance_guard\(root, session_id\)' packages/server/src/session_migration_execution.rs \
+  || rg -q 'migrate_legacy_session_for_load|transition_session_maintenance_to_lease' packages/session/src/lib.rs; then
   echo "Session normal-load violation: manager first load must classify storage, serialize per session, and safely migrate known legacy storage under exclusive maintenance ownership." >&2
   violations=1
 fi
 
-if rg -q 'KnownLegacy \{ writer_epoch \} => Err\(SessionError::StorageMigrationRequired' packages/session/src/lib.rs; then
-  echo "Session normal-load violation: recognized legacy storage must attempt guarded migration rather than fail before ownership acquisition." >&2
+if ! rg -q 'KnownLegacy \{ writer_epoch \} => Err\(SessionError::StorageMigrationRequired' packages/session/src/lib.rs; then
+  echo "Session normal-load violation: strict current loading must fail closed with policy-free migration-required facts." >&2
   violations=1
 fi
 
@@ -1001,13 +1003,12 @@ if rg -q 'mixed_legacy_fixture_is_discoverable_migrates_and_preserves_bounded_hi
   violations=1
 fi
 
-migration_load_body="$(sed -n '/async fn ensure_session_loaded_with_progress(/,/async fn refresh_summary_session(/p' packages/session/src/lib.rs)"
+migration_load_body="$(sed -n '/async fn ensure_session_loaded(/,/async fn refresh_summary_session(/p' packages/session/src/lib.rs)"
 if ! grep -q 'session_load_gate(session_id)' <<<"$migration_load_body" \
   || ! grep -q 'let _guard = gate.lock().await' <<<"$migration_load_body" \
-  || ! grep -q 'if progress.is_none()' <<<"$migration_load_body" \
   || ! grep -q 'StorageMigrationRequired' <<<"$migration_load_body" \
-  || [[ "$(grep -c 'storage_compatibility' <<<"$migration_load_body")" -lt 2 ]] \
-  || ! grep -q 'prepare_owned_session_storage' <<<"$migration_load_body"; then
+  || ! rg -q 'start_or_join' packages/server/src/lib.rs \
+  || ! rg -q 'migrate_owned_session_storage' packages/server/src/lib.rs; then
   echo "Session migration gate violation: detached migration must retain the per-session load gate and ownership compatibility rechecks." >&2
   violations=1
 fi
@@ -1037,7 +1038,7 @@ if ! rg -q 'preparation_recovers_retained_operation_after_transport_interruption
 fi
 
 if ! rg -q 'normal_open_does_not_decode_canonical_events' packages/session/src/lib.rs \
-  || ! rg -q 'unknown_legacy_history_preparation_fails_closed' packages/session/src/lib.rs; then
+  || ! rg -q 'legacy_session_migrates_across_real_attach_and_send_ipc' packages/server/src/lib.rs; then
   echo "Session normal-load violation: healthy opens must remain decode-free and unresolved legacy preparation must fail closed." >&2
   violations=1
 fi

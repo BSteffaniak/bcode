@@ -203,7 +203,7 @@ pub async fn migrate_owned_session_storage(
     let ownership_timer = metrics.timer();
     let maintenance = lease::acquire_session_maintenance_guard(root, session_id)?;
     metrics.record_histogram(
-        "session.manager.storage_migration.ownership_wait_duration_ms",
+        "session.migration.ownership_duration_ms",
         ownership_timer.elapsed_ms(),
     );
     let write = lease::acquire_maintenance_session_write_lock(&maintenance, root, session_id)?;
