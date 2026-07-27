@@ -1660,7 +1660,7 @@ impl SessionView {
                 .or_default()
                 .terminal_request_draft =
                 Some((event.generation, event.revision.saturating_add(1)));
-            self.refresh_tool_presentation_slot(
+            self.refresh_legacy_contribution_projection(
                 &event.tool_call_id,
                 event.placement,
                 None,
@@ -1719,7 +1719,7 @@ impl SessionView {
         draft.truncated = event.truncated;
         self.tool_invocations.entry(key).or_default().request_draft = Some(draft);
         if previous_placement.is_some_and(|placement| placement != event.placement) {
-            self.refresh_tool_presentation_slot(
+            self.refresh_legacy_contribution_projection(
                 &event.tool_call_id,
                 previous_placement.expect("checked draft placement"),
                 None,
@@ -1727,7 +1727,13 @@ impl SessionView {
                 None,
             );
         }
-        self.refresh_tool_presentation_slot(&event.tool_call_id, event.placement, None, 0, None);
+        self.refresh_legacy_contribution_projection(
+            &event.tool_call_id,
+            event.placement,
+            None,
+            0,
+            None,
+        );
     }
 
     fn refresh_reasoning_items(&mut self) {
@@ -1818,7 +1824,7 @@ impl SessionView {
     }
 
     #[allow(clippy::too_many_lines)] // Compatibility inputs collapse into one canonical primary item here.
-    fn refresh_tool_presentation_slot(
+    fn refresh_legacy_contribution_projection(
         &mut self,
         invocation_id: &str,
         placement: bcode_session_models::ToolContributionPlacement,
@@ -1978,10 +1984,10 @@ impl SessionView {
                 self.snapshot.contributions.remove(&key);
                 self.contribution_placements.remove(&key);
                 if let Some(previous_item_id) = previous_item_id.as_ref() {
-                    self.remove_owned_contribution_slot_item(previous_item_id, &key);
+                    self.remove_owned_legacy_contribution_item(previous_item_id, &key);
                 }
                 if previous_item_id.as_ref() != Some(&item_id) {
-                    self.remove_owned_contribution_slot_item(&item_id, &key);
+                    self.remove_owned_legacy_contribution_item(&item_id, &key);
                 }
             }
             bcode_session_models::ToolContributionOperation::Upsert
@@ -1993,10 +1999,10 @@ impl SessionView {
                 if let Some(previous_item_id) = previous_item_id.as_ref()
                     && previous_item_id != &item_id
                 {
-                    self.remove_contribution_slot_item(previous_item_id);
+                    self.remove_legacy_contribution_item(previous_item_id);
                 }
                 if placement == bcode_session_models::ToolContributionPlacement::Hidden {
-                    self.remove_contribution_slot_item(&item_id);
+                    self.remove_legacy_contribution_item(&item_id);
                 } else if placement == bcode_session_models::ToolContributionPlacement::Result
                     && self
                         .snapshot
@@ -2004,9 +2010,9 @@ impl SessionView {
                         .get(&contribution.invocation_id)
                         .is_some_and(|tool| is_terminal_tool_status(tool.status))
                 {
-                    self.remove_owned_contribution_slot_item(&item_id, &key);
+                    self.remove_owned_legacy_contribution_item(&item_id, &key);
                 } else {
-                    self.upsert_contribution_slot_item(
+                    self.upsert_legacy_contribution_item(
                         item_id,
                         &key,
                         event_sequence,
@@ -2022,7 +2028,11 @@ impl SessionView {
         self.bump_revision();
     }
 
-    fn remove_owned_contribution_slot_item(&mut self, id: &TranscriptViewItemId, owner_key: &str) {
+    fn remove_owned_legacy_contribution_item(
+        &mut self,
+        id: &TranscriptViewItemId,
+        owner_key: &str,
+    ) {
         let Some(index) = self.snapshot.transcript.items.iter().position(|item| {
             item.id == *id
                 && matches!(
@@ -2042,7 +2052,7 @@ impl SessionView {
         self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
     }
 
-    fn remove_contribution_slot_item(&mut self, id: &TranscriptViewItemId) {
+    fn remove_legacy_contribution_item(&mut self, id: &TranscriptViewItemId) {
         let Some(index) = self
             .snapshot
             .transcript
@@ -2056,7 +2066,7 @@ impl SessionView {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn upsert_contribution_slot_item(
+    fn upsert_legacy_contribution_item(
         &mut self,
         id: TranscriptViewItemId,
         owner_key: &str,
@@ -2243,6 +2253,42 @@ impl SessionView {
         self.sync_contribution_invocation_context(tool_call_id);
     }
 
+    fn refresh_canonical_tool_item(
+        &mut self,
+        tool_call_id: &str,
+        sequence: u64,
+        timestamp_ms: Option<u64>,
+        tool: &ToolInvocationView,
+    ) {
+        let id = TranscriptViewItemId::tool(tool_call_id);
+        let kind = self
+            .tool_invocations
+            .get(tool_call_id)
+            .and_then(|aggregate| aggregate.request_draft.clone())
+            .filter(|draft| {
+                draft.placement == bcode_session_models::ToolContributionPlacement::Result
+                    && tool.result.is_none()
+                    && tool.result_text.is_none()
+            })
+            .map_or_else(
+                || TranscriptViewItemKind::ToolInvocation {
+                    tool: Box::new(tool.clone()),
+                },
+                |draft| TranscriptViewItemKind::ToolRequestDraft { draft },
+            );
+        self.upsert_item(
+            id.clone(),
+            sequence,
+            timestamp_ms,
+            matches!(
+                tool.status,
+                ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+            ),
+            kind,
+        );
+        self.tool_item_ids.insert(tool_call_id.to_owned(), id);
+    }
+
     fn upsert_tool_item(&mut self, tool_call_id: &str, sequence: u64, timestamp_ms: Option<u64>) {
         let Some(aggregate) = self.tool_invocations.get(tool_call_id) else {
             return;
@@ -2280,37 +2326,7 @@ impl SessionView {
             self.upsert_terminal_tool_item(tool_call_id, sequence, timestamp_ms, tool);
             return;
         }
-        self.tool_item_ids
-            .insert(tool_call_id.to_owned(), canonical_id.clone());
-        if self
-            .snapshot
-            .transcript
-            .items
-            .iter()
-            .any(|item| item.id == canonical_id)
-        {
-            self.refresh_tool_presentation_slot(
-                tool_call_id,
-                bcode_session_models::ToolContributionPlacement::Request,
-                None,
-                sequence,
-                timestamp_ms,
-            );
-        } else {
-            let id = self.push_item(
-                canonical_id,
-                sequence,
-                timestamp_ms,
-                matches!(
-                    tool.status,
-                    ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
-                ),
-                TranscriptViewItemKind::ToolInvocation {
-                    tool: Box::new(tool),
-                },
-            );
-            self.tool_item_ids.insert(tool_call_id.to_owned(), id);
-        }
+        self.refresh_canonical_tool_item(tool_call_id, sequence, timestamp_ms, &tool);
         self.sync_contribution_invocation_context(tool_call_id);
     }
 
@@ -2700,6 +2716,11 @@ fn presentation_update_contribution(
 }
 
 /// Decode-only adapter from historical placement events into canonical invocation identities.
+///
+/// This module may be removed only when the supported session-history contract no longer includes
+/// schemas that encoded `ToolContributionPlacement`. Until then it must remain decode-only: new
+/// producers are rejected by `scripts/check-loop-runtime-architecture.sh`, and canonical update
+/// APIs must not call into this adapter.
 mod legacy_contribution_projection {
     use super::TranscriptViewItemId;
 
