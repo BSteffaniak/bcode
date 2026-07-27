@@ -1388,7 +1388,7 @@ impl TuiEffect {
                     &client,
                     SessionViewAction::CancelTurn {
                         session_id,
-                        clear_queue: false,
+                        clear_queue: true,
                     },
                 )
                 .await

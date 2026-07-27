@@ -402,6 +402,8 @@ struct MessageQueueStatus {
     disposition: bcode_ipc::MessageAcceptanceDisposition,
 }
 
+const PROVIDER_CANCELLATION_GRACE: Duration = Duration::from_secs(2);
+
 type ProviderCallFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 enum ProviderCallWait<T> {
@@ -411,7 +413,14 @@ enum ProviderCallWait<T> {
 
 enum FinalizedProviderCall<T> {
     Completed(T),
-    Cancelled(T),
+    Cancelled(Option<T>),
+}
+
+async fn finalize_cancelled_provider_call<T>(
+    provider_call: &mut ProviderCallFuture<'_, T>,
+) -> FinalizedProviderCall<T> {
+    let result = tokio::time::timeout(PROVIDER_CANCELLATION_GRACE, provider_call).await;
+    FinalizedProviderCall::Cancelled(result.ok())
 }
 
 async fn finalize_provider_call_after_cancellation<'a, T>(
@@ -423,7 +432,7 @@ where
 {
     tokio::select! {
         result = &mut provider_call => FinalizedProviderCall::Completed(result),
-        () = cancel_state.cancelled() => FinalizedProviderCall::Cancelled(provider_call.await),
+        () = cancel_state.cancelled() => finalize_cancelled_provider_call(&mut provider_call).await,
     }
 }
 
@@ -2463,12 +2472,16 @@ async fn recover_abandoned_session_runtime_work(
     state: &ServerState,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
+    let active_runtime_ids = state.runtime_work.active_ids_for_session(session_id).await;
     let active = state.sessions.active_runtime_work(session_id).await?;
     let work_ids = active
         .iter()
         .map(|work| work.work_id.clone())
         .collect::<std::collections::BTreeSet<_>>();
     for work in active {
+        if active_runtime_ids.contains(&work.work_id) {
+            continue;
+        }
         let message = if work
             .parent_work_id
             .as_ref()
@@ -8011,6 +8024,12 @@ async fn process_cancel_turn_command(
         let cleared = drain_followup_commands(followup_commands);
         if cleared > 0 {
             queued_followups.fetch_sub(cleared, Ordering::AcqRel);
+            append_system_event(
+                state,
+                session_id,
+                format!("Cancelled the active turn and cleared {cleared} queued follow-up(s)."),
+            )
+            .await;
         }
     }
     let cancelled = current_turn.is_some();
@@ -8078,12 +8097,12 @@ where
                 }
                 if cancel_state.is_cancelled() {
                     let _ = scope.control().begin_cancellation();
-                    return FinalizedProviderCall::Cancelled(batch.await);
+                    return finalize_cancelled_provider_call(&mut batch).await;
                 }
             }
             () = cancel_state.cancelled() => {
                 let _ = scope.control().begin_cancellation();
-                return FinalizedProviderCall::Cancelled(batch.await);
+                return finalize_cancelled_provider_call(&mut batch).await;
             }
         }
     }
@@ -8114,7 +8133,7 @@ where
                     .await;
                 }
                 if cancel_state.is_cancelled() {
-                    return FinalizedProviderCall::Cancelled(provider_call.await);
+                    return finalize_cancelled_provider_call(&mut provider_call).await;
                 }
             }
             steering_command = context.steering_commands.recv() => {
@@ -8129,11 +8148,11 @@ where
                     .await;
                 }
                 if cancel_state.is_cancelled() {
-                    return FinalizedProviderCall::Cancelled(provider_call.await);
+                    return finalize_cancelled_provider_call(&mut provider_call).await;
                 }
             }
             () = cancel_state.cancelled() => {
-                return FinalizedProviderCall::Cancelled(provider_call.await);
+                return finalize_cancelled_provider_call(&mut provider_call).await;
             }
         }
     }
@@ -20344,10 +20363,13 @@ async fn append_tool_finished_event_inner(
     } = input;
     let runtime_work_id = WorkId::new(format!("tool_{tool_call_id}"));
     let runtime_status = runtime_work_status_from_tool_result(&result, is_error);
-    state
+    let owned_runtime_work = state
         .runtime_work
         .finish(session_id, &runtime_work_id)
         .await;
+    if !owned_runtime_work {
+        tracing::debug!(%session_id, work_id = %runtime_work_id, "tool runtime work already reached a terminal state");
+    }
     let content_note = tool_result_content_model_note(&tool_call_id, &content);
     let model_output = format!("{result}{content_note}");
     let generic_event = state
@@ -20365,16 +20387,17 @@ async fn append_tool_finished_event_inner(
     transition_finalized_active_artifacts(state, session_id, semantic_result.as_ref());
     publish_session_event(state, &generic_event).await;
     retire_tool_request_draft_after_result(state, session_id, &tool_call_id).await;
-    if let Ok(runtime_event) = state
-        .sessions
-        .append_runtime_work_finished(
-            session_id,
-            runtime_work_id,
-            runtime_status,
-            Some(current_unix_millis()),
-            None,
-        )
-        .await
+    if owned_runtime_work
+        && let Ok(runtime_event) = state
+            .sessions
+            .append_runtime_work_finished(
+                session_id,
+                runtime_work_id,
+                runtime_status,
+                Some(current_unix_millis()),
+                None,
+            )
+            .await
     {
         publish_session_event(state, &runtime_event).await;
     }
@@ -20461,7 +20484,7 @@ async fn register_runtime_work(state: &ServerState, session_id: SessionId, spec:
         .append_runtime_work_started(
             session_id,
             SessionEventKind::RuntimeWorkStarted {
-                work_id,
+                work_id: work_id.clone(),
                 kind,
                 label,
                 tool_call_id,
@@ -20476,7 +20499,10 @@ async fn register_runtime_work(state: &ServerState, session_id: SessionId, spec:
         .await
     {
         Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => tracing::warn!("failed to append runtime work start: {error}"),
+        Err(error) => {
+            state.runtime_work.finish(session_id, &work_id).await;
+            tracing::warn!("failed to append runtime work start: {error}");
+        }
     }
 }
 
@@ -21700,7 +21726,10 @@ async fn finish_registered_runtime_work(
     status: RuntimeWorkStatus,
     message: Option<String>,
 ) {
-    state.runtime_work.finish(session_id, &work_id).await;
+    if !state.runtime_work.finish(session_id, &work_id).await {
+        tracing::debug!(%session_id, work_id = %work_id, "runtime work already reached a terminal state");
+        return;
+    }
     append_runtime_work_finished_event(state, session_id, work_id, status, message).await;
     state.release_session_resources_if_idle(session_id).await;
 }

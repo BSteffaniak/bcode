@@ -173,7 +173,7 @@ async fn request_turn_cancellation(client: &BcodeClient, chat: &mut ActiveChat) 
         client,
         SessionViewAction::CancelTurn {
             session_id,
-            clear_queue: false,
+            clear_queue: true,
         },
     )
     .await

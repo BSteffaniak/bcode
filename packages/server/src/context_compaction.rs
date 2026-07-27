@@ -1029,7 +1029,7 @@ pub async fn collect_compaction_summary_once(
                 result.map_err(CompactionError::Provider)?.provider_turn_id
             }
             FinalizedProviderCall::Cancelled(result) => {
-                if let Ok(response) = result {
+                if let Some(Ok(response)) = result {
                     finish_provider_turn(
                         state,
                         selection.provider_plugin_id.clone(),
@@ -1056,7 +1056,7 @@ pub async fn collect_compaction_summary_once(
                 result.map_err(CompactionError::Provider)?.provider_turn_id
             }
             FinalizedProviderCall::Cancelled(result) => {
-                if let Ok(response) = result {
+                if let Some(Ok(response)) = result {
                     finish_provider_turn(
                         state,
                         selection.provider_plugin_id.clone(),
@@ -1886,6 +1886,25 @@ mod cancellation_tests {
     }
 
     #[tokio::test]
+    async fn cancellation_stops_waiting_after_cleanup_grace() {
+        let cancel_state = TurnCancelState::default();
+        cancel_state.cancel().await;
+
+        let started = Instant::now();
+        let outcome = finalize_provider_call_after_cancellation(
+            &cancel_state,
+            Box::pin(async {
+                std::future::pending::<()>().await;
+                "unreachable"
+            }),
+        )
+        .await;
+
+        assert!(matches!(outcome, FinalizedProviderCall::Cancelled(None)));
+        assert!(started.elapsed() < PROVIDER_CANCELLATION_GRACE + Duration::from_secs(1));
+    }
+
+    #[tokio::test]
     async fn cancellation_waits_for_started_provider_call_to_be_finalizable() {
         let cancel_state = TurnCancelState::default();
         cancel_state.cancel().await;
@@ -1901,7 +1920,7 @@ mod cancellation_tests {
 
         assert!(matches!(
             outcome,
-            FinalizedProviderCall::Cancelled("provider-turn-id")
+            FinalizedProviderCall::Cancelled(Some("provider-turn-id"))
         ));
     }
 }

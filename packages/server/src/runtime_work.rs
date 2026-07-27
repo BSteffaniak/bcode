@@ -301,12 +301,28 @@ impl RuntimeWorkManager {
         cancelled_work_ids
     }
 
-    /// Finish work and remove it from the active registry.
-    pub async fn finish(&self, session_id: SessionId, work_id: &WorkId) {
+    /// Return active work identifiers for a session.
+    pub async fn active_ids_for_session(
+        &self,
+        session_id: SessionId,
+    ) -> std::collections::BTreeSet<WorkId> {
         self.active
             .lock()
             .await
-            .remove(&(session_id, work_id.clone()));
+            .keys()
+            .filter_map(|(active_session_id, work_id)| {
+                (*active_session_id == session_id).then_some(work_id.clone())
+            })
+            .collect()
+    }
+
+    /// Remove active work and return whether this manager owned it.
+    pub async fn finish(&self, session_id: SessionId, work_id: &WorkId) -> bool {
+        self.active
+            .lock()
+            .await
+            .remove(&(session_id, work_id.clone()))
+            .is_some()
     }
 
     /// Return active work snapshots for a session.
@@ -347,6 +363,34 @@ const fn runtime_work_kind_label(kind: RuntimeWorkKind) -> &'static str {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn active_ids_are_removed_exactly_once_on_finish() {
+        let manager = RuntimeWorkManager::default();
+        let session_id = SessionId::new();
+        let work_id = WorkId::new("model-turn");
+        manager
+            .start(
+                session_id,
+                RuntimeWorkSpec::new(
+                    work_id.clone(),
+                    RuntimeWorkKind::ModelTurn,
+                    "model turn".to_owned(),
+                    CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+                ),
+            )
+            .await;
+
+        assert!(
+            manager
+                .active_ids_for_session(session_id)
+                .await
+                .contains(&work_id)
+        );
+        assert!(manager.finish(session_id, &work_id).await);
+        assert!(!manager.finish(session_id, &work_id).await);
+        assert!(manager.active_ids_for_session(session_id).await.is_empty());
+    }
 
     async fn wait_for_count(count: &AtomicUsize, expected: usize) {
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
