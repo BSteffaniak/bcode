@@ -540,6 +540,46 @@ fn transcript_patch_resets_when_window_metadata_changes() {
 }
 
 #[test]
+fn dropped_and_reordered_patch_streams_reject_and_recover_via_snapshot() {
+    let base = transcript_document(1, [transcript_item("one", 1, "one")]);
+    let middle = transcript_document(
+        2,
+        [
+            transcript_item_with_revision("one", 1, 2, "middle"),
+            transcript_item("two", 2, "two"),
+        ],
+    );
+    let next = transcript_document(
+        3,
+        [
+            transcript_item_with_revision("one", 1, 3, "next"),
+            transcript_item("two", 2, "two"),
+        ],
+    );
+    let first = SessionViewPatch::transcript_between(1, 2, None, &base, &middle);
+    let second = SessionViewPatch::transcript_between(2, 3, None, &middle, &next);
+
+    let mut dropped = base.clone();
+    assert!(matches!(
+        dropped.apply_patch(&second),
+        Err(TranscriptViewPatchError::RevisionMismatch { .. })
+    ));
+    dropped = next.clone();
+    assert_eq!(dropped, next);
+
+    let mut reordered = base;
+    assert!(matches!(
+        reordered.apply_patch(&second),
+        Err(TranscriptViewPatchError::RevisionMismatch { .. })
+    ));
+    reordered.apply_patch(&first).expect("first patch applies");
+    reordered
+        .apply_patch(&second)
+        .expect("second patch applies");
+    assert_eq!(reordered, next);
+}
+
+#[test]
 fn transcript_patch_rejects_wrong_base_revision() {
     let mut base = transcript_document(3, [transcript_item("one", 1, "old")]);
     let next = transcript_document(5, [transcript_item("one", 1, "new")]);

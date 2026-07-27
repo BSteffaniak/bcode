@@ -237,6 +237,7 @@ pub struct BmuxApp {
     composer: TextInputState,
     input_history: InputHistory,
     transcript: TranscriptDocument,
+    authoritative_transcript: bcode_session_view_models::TranscriptViewDocument,
     session_view: bcode_session_view::SessionView,
     transcript_window: TranscriptResidentWindow,
     latest_history_sequence: Option<u64>,
@@ -443,6 +444,7 @@ impl BmuxApp {
             composer: TextInputState::new(TextEditBuffer::new()),
             input_history: InputHistory::from_entries(input_history),
             transcript: TranscriptDocument::default(),
+            authoritative_transcript: bcode_session_view_models::TranscriptViewDocument::default(),
             session_view: bcode_session_view::SessionView::new(),
             transcript_window: TranscriptResidentWindow::default(),
             latest_history_sequence: None,
@@ -2587,15 +2589,11 @@ impl BmuxApp {
                 self.viewport.preserve_for_append();
                 self.sync_shared_message_items();
             }
-            SessionLiveEventKind::ToolContributionPlaced { envelope } => {
-                self.apply_live_contribution(&envelope.contribution, envelope.placement);
-            }
-            SessionLiveEventKind::ToolPresentationUpdated { .. }
-            | SessionLiveEventKind::RequestContextOccupancyChanged { .. } => {
-                // SessionView owns update validation/state; primary item adaptation migrates next.
-            }
-            SessionLiveEventKind::ToolRequestDraft { event: draft } => {
-                self.sync_shared_tool_items(&draft.tool_call_id);
+            SessionLiveEventKind::ToolContributionPlaced { .. }
+            | SessionLiveEventKind::ToolPresentationUpdated { .. }
+            | SessionLiveEventKind::RequestContextOccupancyChanged { .. }
+            | SessionLiveEventKind::ToolRequestDraft { .. } => {
+                // SessionView owns semantic replacement/removal; reconciliation runs below.
             }
             SessionLiveEventKind::ToolInvocationProgress { .. } => {
                 self.apply_shared_runtime_work_activity();
@@ -2605,57 +2603,6 @@ impl BmuxApp {
             }
         }
         self.sync_authoritative_transcript_items();
-    }
-
-    fn apply_live_contribution(
-        &mut self,
-        contribution: &bcode_session_models::ToolContributionEvent,
-        placement: bcode_session_models::ToolContributionPlacement,
-    ) {
-        let item_id = if placement == bcode_session_models::ToolContributionPlacement::Supplemental
-        {
-            bcode_session_view_models::TranscriptViewItemId::tool_supplemental(
-                &contribution.invocation_id,
-                &contribution.contribution_id,
-            )
-        } else {
-            bcode_session_view_models::TranscriptViewItemId::tool(&contribution.invocation_id)
-        };
-        if placement == bcode_session_models::ToolContributionPlacement::Supplemental
-            && contribution.artifact.as_ref().is_some_and(|artifact| {
-                let Some(presentation) = self.plugin_presentation() else {
-                    return false;
-                };
-                self.session_view
-                    .snapshot()
-                    .contributions
-                    .values()
-                    .any(|existing| {
-                        existing.invocation_id == contribution.invocation_id
-                            && existing.contribution_id != contribution.contribution_id
-                            && presentation.accepts_artifact_reference(
-                                &existing.producer_id,
-                                &existing.schema,
-                                existing.schema_version,
-                                &artifact.reference_key,
-                                artifact.content_type.as_deref(),
-                            )
-                    })
-            })
-        {
-            self.transcript.remove_shared_item(&item_id);
-            return;
-        }
-        self.sync_shared_tool_items(&contribution.invocation_id);
-    }
-
-    fn apply_durable_contribution(
-        &mut self,
-        _event_sequence: u64,
-        contribution: &bcode_session_models::ToolContributionEvent,
-        _placement: bcode_session_models::ToolContributionPlacement,
-    ) {
-        self.sync_shared_tool_items(&contribution.invocation_id);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2858,19 +2805,6 @@ impl BmuxApp {
             SessionEventKind::TraceEvent { trace } if application.live_activity() => {
                 self.apply_trace_event(trace);
             }
-            SessionEventKind::ToolContribution {
-                event: contribution,
-            } => self.apply_durable_contribution(
-                event.sequence,
-                contribution,
-                bcode_session_models::ToolContributionPlacement::Hidden,
-            ),
-            SessionEventKind::ToolContributionPlaced { envelope } => self
-                .apply_durable_contribution(
-                    event.sequence,
-                    &envelope.contribution,
-                    envelope.placement,
-                ),
             SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
                 self.sync_shared_tool_items(&lifecycle.invocation_id);
                 if lifecycle.stage == bcode_session_models::ToolInvocationLifecycleStage::Started
@@ -3270,10 +3204,13 @@ impl BmuxApp {
     }
 
     fn sync_authoritative_transcript_items(&mut self) {
+        self.authoritative_transcript = self.session_view.snapshot().transcript.clone();
+        self.reconcile_authoritative_transcript_items();
+    }
+
+    fn reconcile_authoritative_transcript_items(&mut self) {
         let shared_items = self
-            .session_view
-            .snapshot()
-            .transcript
+            .authoritative_transcript
             .items
             .iter()
             .map(terminal_item_from_shared)
@@ -3289,6 +3226,20 @@ impl BmuxApp {
         for item in shared_items {
             self.transcript.upsert_shared_item(item);
         }
+    }
+
+    #[cfg(test)]
+    fn apply_authoritative_transcript_patch(
+        &mut self,
+        patch: &bcode_session_view_models::SessionViewPatch,
+        recovery: &bcode_session_view_models::TranscriptViewDocument,
+    ) -> bool {
+        let applied = self.authoritative_transcript.apply_patch(patch).is_ok();
+        if !applied {
+            self.authoritative_transcript.clone_from(recovery);
+        }
+        self.reconcile_authoritative_transcript_items();
+        applied
     }
 
     fn sync_shared_message_items(&mut self) {
@@ -4938,6 +4889,77 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn authoritative_patch_revision_mismatch_recovers_from_snapshot() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let mut recovery = bcode_session_view_models::TranscriptViewDocument {
+            revision: 4,
+            ..Default::default()
+        };
+        recovery
+            .items
+            .push(bcode_session_view_models::TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new("event:1"),
+                revision: 0,
+                sequence: Some(1),
+                timestamp_ms: Some(1),
+                streaming: false,
+                kind: bcode_session_view_models::TranscriptViewItemKind::SystemMessage {
+                    message: bcode_session_view_models::ChatMessageView::plain("recovered"),
+                },
+            });
+        let patch = bcode_session_view_models::SessionViewPatch::empty(3, 4);
+
+        assert!(!app.apply_authoritative_transcript_patch(&patch, &recovery));
+        assert_eq!(app.authoritative_transcript, recovery);
+        assert_eq!(app.transcript().len(), 1);
+        assert_eq!(app.transcript()[0].text(), "recovered");
+    }
+
+    #[test]
+    fn authoritative_patch_applies_incrementally_by_stable_identity() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let mut base = bcode_session_view_models::TranscriptViewDocument {
+            revision: 1,
+            ..Default::default()
+        };
+        base.items
+            .push(bcode_session_view_models::TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new("event:1"),
+                revision: 0,
+                sequence: Some(1),
+                timestamp_ms: Some(1),
+                streaming: false,
+                kind: bcode_session_view_models::TranscriptViewItemKind::SystemMessage {
+                    message: bcode_session_view_models::ChatMessageView::plain("before"),
+                },
+            });
+        app.authoritative_transcript.clone_from(&base);
+        app.reconcile_authoritative_transcript_items();
+        let mut next = base.clone();
+        next.revision = 2;
+        next.items[0].revision = 1;
+        next.items[0].kind = bcode_session_view_models::TranscriptViewItemKind::SystemMessage {
+            message: bcode_session_view_models::ChatMessageView::plain("after"),
+        };
+        next.source_start_sequence = Some(1);
+        next.source_end_sequence = Some(1);
+        let patch = bcode_session_view_models::SessionViewPatch::transcript_between(
+            1,
+            2,
+            Some(session_id),
+            &base,
+            &next,
+        );
+
+        assert!(app.apply_authoritative_transcript_patch(&patch, &next));
+        assert_eq!(app.authoritative_transcript, next);
+        assert_eq!(app.transcript().len(), 1);
+        assert_eq!(app.transcript()[0].text(), "after");
     }
 
     #[test]

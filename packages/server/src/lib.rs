@@ -185,6 +185,10 @@ pub enum ServerError {
     ModelTurnCompletionClosed(#[from] oneshot::error::RecvError),
 }
 
+type ActivePresentationUpdateKey = (SessionId, String, bcode_tool::ToolPresentationIdentity);
+type ActivePresentationUpdates =
+    Arc<StdMutex<BTreeMap<ActivePresentationUpdateKey, bcode_tool::ToolPresentationUpdate>>>;
+
 #[derive(Debug)]
 pub struct ServerState {
     pub sessions: SessionManager,
@@ -233,6 +237,7 @@ pub struct ServerState {
     active_contributions: Arc<StdMutex<ActiveContributionRegistry>>,
     presentation_update_scopes:
         Arc<StdMutex<BTreeMap<(SessionId, String), bcode_tool::ToolPresentationUpdateScope>>>,
+    active_presentation_updates: ActivePresentationUpdates,
     active_tool_request_drafts: Arc<StdMutex<ActiveToolRequestDraftRegistry>>,
     next_permission_id: Mutex<u64>,
     next_permission_batch_id: Mutex<u64>,
@@ -1347,6 +1352,7 @@ impl ServerState {
             active_artifacts: Arc::default(),
             active_contributions: Arc::default(),
             presentation_update_scopes: Arc::default(),
+            active_presentation_updates: Arc::default(),
             active_tool_request_drafts: Arc::default(),
             next_permission_id: Mutex::new(1),
             next_permission_batch_id: Mutex::new(1),
@@ -18751,6 +18757,9 @@ fn clear_all_live_state(state: &ServerState) {
         registry.terminal_revisions.clear();
         registry.session_bytes.clear();
     }
+    if let Ok(mut updates) = state.active_presentation_updates.lock() {
+        updates.clear();
+    }
     if let Ok(mut artifacts) = state.active_artifacts.lock() {
         artifacts.clear();
     }
@@ -18784,6 +18793,9 @@ fn clear_session_live_state(state: &ServerState, session_id: SessionId) {
             .terminal_revisions
             .retain(|key, _| key.session() != session_id);
         registry.session_bytes.remove(&session_id);
+    }
+    if let Ok(mut updates) = state.active_presentation_updates.lock() {
+        updates.retain(|(current_session_id, _, _), _| *current_session_id != session_id);
     }
     if let Ok(mut artifacts) = state.active_artifacts.lock() {
         artifacts.retain(|key, _| key.session_id != session_id);
@@ -18868,6 +18880,16 @@ async fn publish_plugin_tool_presentation_update(
 ) -> Result<(), String> {
     accept_tool_presentation_update(state, session_id, invocation_id, producer_id, &update)
         .map_err(|error| format!("presentation update rejected: {error:?}"))?;
+    if let Ok(mut updates) = state.active_presentation_updates.lock() {
+        updates.insert(
+            (
+                session_id,
+                invocation_id.to_owned(),
+                update.identity.clone(),
+            ),
+            update.clone(),
+        );
+    }
     let _ = state
         .sessions
         .publish_live_event(
@@ -18901,6 +18923,27 @@ fn accept_tool_presentation_update(
         .accept(update, MAX_ACTIVE_CONTRIBUTION_BYTES)
 }
 
+fn active_presentation_snapshot_events(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Vec<bcode_session_models::SessionLiveEvent> {
+    state.active_presentation_updates.lock().map_or_else(
+        |_| Vec::new(),
+        |updates| {
+            updates
+                .iter()
+                .filter(|((current_session_id, _, _), _)| *current_session_id == session_id)
+                .map(|(_, update)| bcode_session_models::SessionLiveEvent {
+                    session_id,
+                    kind: SessionLiveEventKind::ToolPresentationUpdated {
+                        update: update.clone(),
+                    },
+                })
+                .collect()
+        },
+    )
+}
+
 fn close_tool_presentation_update_scope(
     state: &ServerState,
     session_id: SessionId,
@@ -18911,6 +18954,13 @@ fn close_tool_presentation_update_scope(
             .entry((session_id, invocation_id.to_owned()))
             .or_default()
             .close();
+    }
+    if let Ok(mut updates) = state.active_presentation_updates.lock() {
+        updates.retain(|(current_session_id, current_invocation_id, _), update| {
+            *current_session_id != session_id
+                || current_invocation_id != invocation_id
+                || update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+        });
     }
 }
 
@@ -22835,6 +22885,9 @@ async fn send_active_runtime_snapshots(
         sink.send(Event::SessionLive(event)).await?;
     }
     for event in active_contribution_snapshot_events(state, session_id).unwrap_or_default() {
+        sink.send(Event::SessionLive(event)).await?;
+    }
+    for event in active_presentation_snapshot_events(state, session_id) {
         sink.send(Event::SessionLive(event)).await?;
     }
     for event in active_tool_request_draft_snapshot_events(state, session_id) {
@@ -31499,6 +31552,69 @@ library = "test"
             artifact_read_error_code("artifact references projection is stale"),
             "artifact_read_failed"
         );
+    }
+
+    #[tokio::test]
+    async fn retained_presentation_hydrates_attach_and_active_only_is_cleared_on_close() {
+        let workspace = tempfile::tempdir().expect("presentation hydration workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("presentation hydration session manager");
+        let state = test_server_state(sessions);
+        let session_id = SessionId::new();
+        let update = |retention| bcode_tool::ToolPresentationUpdate {
+            invocation_id: "call-1".to_owned(),
+            producer_id: "test.plugin".to_owned(),
+            generation: 0,
+            revision: 1,
+            identity: bcode_tool::ToolPresentationIdentity::Primary,
+            retention,
+            schema: "test.presentation".to_owned(),
+            schema_version: 1,
+            artifact: None,
+            payload: serde_json::json!({"value": 1}),
+        };
+
+        publish_plugin_tool_presentation_update(
+            &state,
+            session_id,
+            "call-1",
+            "test.plugin",
+            update(bcode_tool::ToolPresentationRetention::RetainLatest),
+        )
+        .await
+        .expect("retained update accepted");
+        let snapshots = active_presentation_snapshot_events(&state, session_id);
+        assert_eq!(snapshots.len(), 1);
+        assert!(matches!(
+            &snapshots[0].kind,
+            SessionLiveEventKind::ToolPresentationUpdated { update }
+                if update.generation == 0 && update.revision == 1
+        ));
+        close_tool_presentation_update_scope(&state, session_id, "call-1");
+        assert_eq!(
+            active_presentation_snapshot_events(&state, session_id).len(),
+            1
+        );
+
+        let second_session = SessionId::new();
+        publish_plugin_tool_presentation_update(
+            &state,
+            second_session,
+            "call-2",
+            "test.plugin",
+            bcode_tool::ToolPresentationUpdate {
+                invocation_id: "call-2".to_owned(),
+                ..update(bcode_tool::ToolPresentationRetention::ActiveOnly)
+            },
+        )
+        .await
+        .expect("active-only update accepted");
+        assert_eq!(
+            active_presentation_snapshot_events(&state, second_session).len(),
+            1
+        );
+        close_tool_presentation_update_scope(&state, second_session, "call-2");
+        assert!(active_presentation_snapshot_events(&state, second_session).is_empty());
     }
 
     #[test]

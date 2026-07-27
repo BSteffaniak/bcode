@@ -103,11 +103,6 @@ impl TranscriptDocument {
         }
     }
 
-    /// Remove an item with the given stable shared-view identity.
-    pub fn remove_shared_item(&mut self, id: &bcode_session_view_models::TranscriptViewItemId) {
-        self.retain(|item| item.source_view_item_id() != Some(id));
-    }
-
     /// Replace all transcript items and bump the collection revision.
     pub fn replace(&mut self, items: Vec<TranscriptItem>) {
         self.items = items;

@@ -1485,6 +1485,27 @@ impl SessionView {
                 self.upsert_tool_item(&update.invocation_id, 0, None);
                 return;
             }
+        } else if let bcode_tool::ToolPresentationIdentity::Supplemental { item_id } =
+            &update.identity
+        {
+            let id = TranscriptViewItemId::tool_supplemental(&update.invocation_id, item_id);
+            self.upsert_item(
+                id,
+                0,
+                None,
+                true,
+                TranscriptViewItemKind::ToolContribution {
+                    invocation: self
+                        .snapshot
+                        .tools
+                        .get(&update.invocation_id)
+                        .cloned()
+                        .map(Box::new),
+                    contribution: presentation_update_contribution(update),
+                    placement: bcode_session_models::ToolContributionPlacement::Supplemental,
+                },
+            );
+            return;
         }
         self.bump_revision();
     }
@@ -2521,6 +2542,34 @@ impl SessionView {
         self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
         self.bump_revision();
         true
+    }
+}
+
+fn presentation_update_contribution(
+    update: &bcode_tool::ToolPresentationUpdate,
+) -> bcode_session_models::ToolContributionEvent {
+    let contribution_id = match &update.identity {
+        bcode_tool::ToolPresentationIdentity::Primary => "primary".to_owned(),
+        bcode_tool::ToolPresentationIdentity::Supplemental { item_id } => item_id.clone(),
+    };
+    bcode_session_models::ToolContributionEvent {
+        invocation_id: update.invocation_id.clone(),
+        contribution_id,
+        sequence: update.revision,
+        producer_id: update.producer_id.clone(),
+        schema: update.schema.clone(),
+        schema_version: update.schema_version,
+        operation: bcode_session_models::ToolContributionOperation::Upsert,
+        persistence: match update.retention {
+            bcode_tool::ToolPresentationRetention::RetainLatest => {
+                bcode_session_models::ToolContributionPersistence::Durable
+            }
+            bcode_tool::ToolPresentationRetention::ActiveOnly => {
+                bcode_session_models::ToolContributionPersistence::Transient
+            }
+        },
+        artifact: update.artifact.clone(),
+        payload: update.payload.clone(),
     }
 }
 
@@ -5647,6 +5696,63 @@ mod tests {
     }
 
     #[test]
+    fn parallel_tools_keep_request_order_when_finishing_out_of_order() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        for (sequence, invocation_id) in [(1, "call-a"), (2, "call-b")] {
+            view.apply_event(&event(
+                session_id,
+                sequence,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: invocation_id.to_owned(),
+                    producer_plugin_id: Some("test.plugin".to_owned()),
+                    tool_name: "test.tool".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                },
+            ));
+        }
+        for (sequence, invocation_id) in [(3, "call-b"), (4, "call-a")] {
+            view.apply_event(&event(
+                session_id,
+                sequence,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: invocation_id.to_owned(),
+                        model_output: format!("finished {invocation_id}"),
+                        is_error: false,
+                        result: Some(ToolInvocationResult::Text {
+                            text: format!("finished {invocation_id}"),
+                        }),
+                    },
+                },
+            ));
+        }
+
+        let ids = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                TranscriptViewItemId::tool("call-a"),
+                TranscriptViewItemId::tool("call-b")
+            ]
+        );
+        assert!(view.snapshot().transcript.items.iter().all(|item| {
+            matches!(
+                &item.kind,
+                TranscriptViewItemKind::ToolInvocation { tool }
+                    if tool.status == ToolInvocationViewStatus::Finished
+            )
+        }));
+    }
+
+    #[test]
     fn source_derived_item_ids_survive_bounded_window_shifts() {
         let session_id = SessionId::new();
         let events = vec![
@@ -6572,6 +6678,60 @@ mod tests {
                     Some(ToolResultView::Artifact { ref artifact, .. })
                         if artifact.artifact.schema == "test.change"
                 )
+        ));
+    }
+
+    #[test]
+    fn explicit_supplemental_presentation_materializes_without_changing_primary_identity() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("test.plugin".to_owned()),
+                tool_name: "test.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolPresentationUpdated {
+                update: bcode_tool::ToolPresentationUpdate {
+                    invocation_id: "call-1".to_owned(),
+                    producer_id: "test.plugin".to_owned(),
+                    generation: 0,
+                    revision: 1,
+                    identity: bcode_tool::ToolPresentationIdentity::Supplemental {
+                        item_id: "details".to_owned(),
+                    },
+                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    schema: "test.details".to_owned(),
+                    schema_version: 1,
+                    artifact: None,
+                    payload: serde_json::json!({"details": true}),
+                },
+            },
+        });
+
+        assert_eq!(view.snapshot().transcript.items.len(), 2);
+        assert_eq!(
+            view.snapshot().transcript.items[0].id,
+            TranscriptViewItemId::tool("call-1")
+        );
+        assert_eq!(
+            view.snapshot().transcript.items[1].id,
+            TranscriptViewItemId::tool_supplemental("call-1", "details")
+        );
+        assert!(matches!(
+            &view.snapshot().transcript.items[1].kind,
+            TranscriptViewItemKind::ToolContribution {
+                contribution,
+                placement: bcode_session_models::ToolContributionPlacement::Supplemental,
+                ..
+            } if contribution.schema == "test.details"
         ));
     }
 
