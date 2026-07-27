@@ -533,6 +533,11 @@ impl SessionView {
                     .map(|terminal| (invocation_id.clone(), terminal))
             })
             .collect::<BTreeMap<_, _>>();
+        let live_presentations = self
+            .tool_invocations
+            .values()
+            .flat_map(|aggregate| aggregate.presentations.values().cloned())
+            .collect::<Vec<_>>();
         let live_contributions = self
             .snapshot
             .contributions
@@ -588,6 +593,9 @@ impl SessionView {
                 argument_bytes: draft.argument_bytes,
                 truncated: draft.truncated,
             });
+        }
+        for update in live_presentations {
+            replacement.apply_presentation_update(&update);
         }
         for (contribution, placement) in live_contributions {
             replacement.apply_contribution_event(0, None, &contribution, placement);
@@ -6151,6 +6159,23 @@ mod tests {
                 ),
             },
         });
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolPresentationUpdated {
+                update: bcode_tool::ToolPresentationUpdate {
+                    invocation_id: "call-presentation".to_owned(),
+                    producer_id: "test.plugin".to_owned(),
+                    generation: 0,
+                    revision: 4,
+                    identity: bcode_tool::ToolPresentationIdentity::Primary,
+                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    schema: "test.presentation".to_owned(),
+                    schema_version: 1,
+                    artifact: None,
+                    payload: serde_json::json!({"status": "current"}),
+                },
+            },
+        });
 
         view.rebuild_history_window(&[event(
             session_id,
@@ -6162,6 +6187,14 @@ mod tests {
 
         assert_eq!(view.tool_request_drafts().len(), 1);
         assert_eq!(view.snapshot().contributions.len(), 1);
+        assert_eq!(
+            view.presentation_update(
+                "call-presentation",
+                &bcode_tool::ToolPresentationIdentity::Primary,
+            )
+            .map(|update| (update.revision, update.payload.clone())),
+            Some((4, serde_json::json!({"status": "current"})))
+        );
         assert_eq!(
             view.snapshot()
                 .transcript
