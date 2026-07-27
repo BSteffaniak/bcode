@@ -17,7 +17,8 @@ use crate::db_context::{
     model_context_event_kind_name,
 };
 use crate::db_event_store::{
-    compatible_event_from_row, insert_event, last_sequence, strict_events,
+    compatible_event_from_row, event_created_at_ms, event_kind_name, insert_event, last_sequence,
+    seq_to_value, strict_events,
 };
 pub use crate::db_path::{
     global_catalog_db_path, namespaced_catalog_db_path, session_db_path, session_dir_path,
@@ -4209,59 +4210,6 @@ async fn finalize_tool_transcript_item(
     Ok(())
 }
 
-pub(crate) const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
-    match kind {
-        SessionEventKind::SessionCreated { .. } => "session_created",
-        SessionEventKind::ClientAttached { .. } => "client_attached",
-        SessionEventKind::ClientDetached { .. } => "client_detached",
-        SessionEventKind::UserMessage { .. } => "user_message",
-        SessionEventKind::AssistantDelta { .. } => "assistant_delta",
-        SessionEventKind::AssistantMessage { .. } => "assistant_message",
-        SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
-        SessionEventKind::PermissionRequested { .. } => "permission_requested",
-        SessionEventKind::PermissionResolved { .. } => "permission_resolved",
-        SessionEventKind::ModelChanged { .. } => "model_changed",
-        SessionEventKind::ReasoningChanged { .. } => "reasoning_changed",
-        SessionEventKind::SystemMessage { .. } => "system_message",
-        SessionEventKind::AgentChanged { .. } => "agent_changed",
-        SessionEventKind::ModelTurnStarted { .. } => "model_turn_started",
-        SessionEventKind::ModelTurnFinished { .. } => "model_turn_finished",
-        SessionEventKind::ModelUsage { .. } => "model_usage",
-        SessionEventKind::ContextCompacted { .. } => "context_compacted",
-        SessionEventKind::ProviderContextCompacted { .. } => "provider_context_compacted",
-        SessionEventKind::RequestContextObserved { .. } => "request_context_observed",
-        SessionEventKind::SessionRenamed { .. } => "session_renamed",
-        SessionEventKind::TraceEvent { .. } => "trace_event",
-        SessionEventKind::SkillInvoked { .. } => "skill_invoked",
-        SessionEventKind::SkillSuggested { .. } => "skill_suggested",
-        SessionEventKind::SkillActivated { .. } => "skill_activated",
-        SessionEventKind::SkillDeactivated { .. } => "skill_deactivated",
-        SessionEventKind::SkillContextLoaded { .. } => "skill_context_loaded",
-        SessionEventKind::SkillInvocationFailed { .. } => "skill_invocation_failed",
-        SessionEventKind::AssistantReasoningDelta { .. } => "assistant_reasoning_delta",
-        SessionEventKind::AssistantReasoningMessage { .. } => "assistant_reasoning_message",
-        SessionEventKind::RuntimeWorkStarted { .. } => "runtime_work_started",
-        SessionEventKind::RuntimeWorkFinished { .. } => "runtime_work_finished",
-        SessionEventKind::RuntimeWorkProgress { .. } => "runtime_work_progress",
-        SessionEventKind::RuntimeWorkCancelRequested { .. } => "runtime_work_cancel_requested",
-        SessionEventKind::ModelTurnCancelRequested { .. } => "model_turn_cancel_requested",
-        SessionEventKind::ToolInvocationLifecycle { .. } => "tool_invocation_lifecycle",
-        SessionEventKind::ToolInvocationResultRecorded { .. } => "tool_invocation_result_recorded",
-        SessionEventKind::ToolContribution { .. } => "tool_contribution",
-        SessionEventKind::ToolContributionPlaced { .. } => "tool_contribution_placed",
-        SessionEventKind::ToolExchangeRequested { .. } => "tool_exchange_requested",
-        SessionEventKind::ToolExchangeResolved { .. } => "tool_exchange_resolved",
-        SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
-        SessionEventKind::SessionImported { .. } => "session_imported",
-        SessionEventKind::SessionForked { .. } => "session_forked",
-        SessionEventKind::ExecutionSessionCreated { .. } => "execution_session_created",
-        SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
-        SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
-        SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
-        SessionEventKind::OpaqueEvent { .. } => "opaque_event",
-    }
-}
-
 fn generic_artifact_reference_metadata(
     reference: &bcode_session_models::ToolArtifactRef,
 ) -> (Option<String>, Option<bool>, Option<String>) {
@@ -4527,14 +4475,6 @@ fn parse_runtime_work_status(value: &str) -> RuntimeWorkStatus {
         "cancelled" => RuntimeWorkStatus::Cancelled,
         _ => RuntimeWorkStatus::Running,
     }
-}
-
-pub(crate) const fn event_created_at_ms(event: &SessionEvent) -> u64 {
-    event.timestamp_ms
-}
-
-pub(crate) fn seq_to_value(sequence: u64) -> DatabaseValue {
-    DatabaseValue::Int64(i64::try_from(sequence).unwrap_or(i64::MAX))
 }
 
 #[allow(dead_code)]

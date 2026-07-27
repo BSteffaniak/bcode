@@ -592,8 +592,8 @@ if ! grep -q 'finalized_artifact_reference' <<<"$artifact_read_body"; then
   violations=1
 fi
 
-if ! rg -q 'SessionEventKind::ModelTurnStarted.*=> "model_turn_started"' packages/session/src/db.rs \
-  || ! rg -q 'SessionEventKind::ModelTurnFinished.*=> "model_turn_finished"' packages/session/src/db.rs; then
+if ! rg -q 'SessionEventKind::ModelTurnStarted.*=> "model_turn_started"' packages/session/src/db_context.rs \
+  || ! rg -q 'SessionEventKind::ModelTurnFinished.*=> "model_turn_finished"' packages/session/src/db_context.rs; then
   echo "Session model-context projection violation: model-turn lifecycle boundaries must remain structural context events." >&2
   violations=1
 fi
