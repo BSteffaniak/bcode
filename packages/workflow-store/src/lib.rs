@@ -2957,6 +2957,7 @@ impl WorkflowStore {
                 run_id: run_id.to_string(),
             });
         }
+        finalize_run_cancellation_if_settled(&transaction, run_id, requested_at_ms)?;
         transaction.commit()?;
         Ok(changed == 1)
     }
@@ -4192,6 +4193,13 @@ fn apply_attempt_observation(
         }
         AttemptObservation::Cancelled => {
             transition_attempt(transaction, request, "cancelled", Some(reconciled_at_ms))?;
+            transaction.execute(
+                "UPDATE workflow_activations SET status = 'cancelled' \
+                 WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 \
+                   AND status = 'running' AND output_id IS NULL",
+                (&request.run_id, &request.node_id, &request.activation_id),
+            )?;
+            finalize_run_cancellation_if_settled(transaction, &request.run_id, reconciled_at_ms)?;
             summary.cancelled.push(request.dispatch_identity.clone());
         }
         AttemptObservation::Unknown => {
@@ -4756,6 +4764,38 @@ fn repair_required_attempt(
                 "repair-required workflow attempt not found: {dispatch_identity}"
             ))
         })
+}
+
+fn finalize_run_cancellation_if_settled(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    cancelled_at_ms: u64,
+) -> Result<bool, WorkflowStoreError> {
+    let active_attempts: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM workflow_attempts WHERE run_id = ?1 \
+         AND status IN ('prepared', 'admitted', 'running', 'cancelling'))",
+        [run_id],
+        |row| row.get(0),
+    )?;
+    if active_attempts {
+        return Ok(false);
+    }
+    let changed = transaction.execute(
+        "UPDATE workflow_runs SET status = 'cancelled', updated_at_ms = ?2 \
+         WHERE run_id = ?1 AND status IN ('running', 'paused') \
+           AND cancellation_requested_at_ms IS NOT NULL",
+        (run_id, cancelled_at_ms),
+    )?;
+    if changed == 1 {
+        transaction.execute(
+            "UPDATE workflow_activations SET status = 'cancelled' \
+             WHERE run_id = ?1 AND status IN ('pending', 'running', 'waiting_input', \
+             'waiting_approval') AND output_id IS NULL",
+            [run_id],
+        )?;
+        append_event(transaction, run_id, "run_cancelled", "{}", cancelled_at_ms)?;
+    }
+    Ok(changed == 1)
 }
 
 fn transition_run_control_state(
@@ -5547,7 +5587,7 @@ mod tests {
 
         let conflict = NewWorkflowRun {
             run_id: "run-2".to_string(),
-            created_at_ms: 11,
+            created_at_ms: 15,
             ..run.clone()
         };
         let error = store.create_run(&conflict).expect_err("single active");
@@ -5556,13 +5596,14 @@ mod tests {
         assert!(store.pause_run(&run.run_id, 12).expect("pause"));
         assert!(store.resume_run(&run.run_id, 13).expect("resume"));
         assert!(store.request_cancellation(&run.run_id, 14).expect("cancel"));
-        store
-            .connection
-            .execute(
-                "UPDATE workflow_runs SET status = 'cancelled', updated_at_ms = 9 WHERE run_id = ?1",
-                [&run.run_id],
-            )
-            .expect("terminalize test run");
+        assert_eq!(
+            store
+                .run_summary(&run.run_id)
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Cancelled
+        );
         store
             .create_run(&conflict)
             .expect("replacement after terminal");
@@ -6353,12 +6394,70 @@ mod tests {
                 prepared_at_ms: 22,
             })
             .expect_err("cancelled run rejects admission");
-        assert!(error.to_string().contains("cancellation"));
+        assert!(error.to_string().contains("cancelled"));
+        assert_eq!(summary.status, RunStatus::Cancelled);
         assert_eq!(
             store
                 .active_attempts_for_cancellation("run-1", 10)
                 .expect("active children"),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn repeated_cancellation_finalizes_legacy_settled_run() {
+        let (_temp, mut store) = initialized_store();
+        store
+            .connection
+            .execute(
+                "UPDATE workflow_runs SET cancellation_requested_at_ms = 20 \
+                 WHERE run_id = 'run-1'",
+                [],
+            )
+            .expect("legacy cancellation intent");
+
+        assert!(
+            !store
+                .request_cancellation("run-1", 21)
+                .expect("finalize existing intent")
+        );
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn cancelled_attempt_finalizes_run_after_owner_settles() {
+        let (_temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::ReadOnly);
+        store.request_cancellation("run-1", 20).expect("intent");
+        assert!(
+            store
+                .mark_cancellation_signalled(&identity, 21)
+                .expect("signal")
+        );
+
+        let summary = store
+            .apply_attempt_observation(&identity, AttemptObservation::Cancelled, 22)
+            .expect("cancelled observation");
+
+        assert_eq!(summary.cancelled, [identity]);
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Cancelled
+        );
+        assert_eq!(
+            store.attempt_history("run-1", None, 10).expect("attempts")[0].status,
+            "cancelled"
         );
     }
 

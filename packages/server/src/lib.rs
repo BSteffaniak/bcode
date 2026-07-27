@@ -36454,7 +36454,7 @@ library = "test"
                 outcome: ModelTurnOutcome::Cancelled,
                 cancellation_requested: true,
                 expected_status: "cancelled",
-                expected_run_status: bcode_workflow_store::RunStatus::Running,
+                expected_run_status: bcode_workflow_store::RunStatus::Cancelled,
                 expected_pause_reason: None,
             },
             Scenario {
@@ -38457,12 +38457,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         .await
         .expect("stop");
         assert!(changed);
-        assert!(
-            stopped
-                .expect("stopped")
-                .cancellation_requested_at_ms
-                .is_some()
-        );
+        let stopped = stopped.expect("stopped");
+        assert!(stopped.cancellation_requested_at_ms.is_some());
+        assert_eq!(stopped.status, bcode_workflow_store::RunStatus::Cancelled);
     }
 
     #[tokio::test]
