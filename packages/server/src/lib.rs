@@ -34873,6 +34873,26 @@ library = "test"
             ),
         )
         .await;
+        publish_plugin_tool_presentation_update(
+            &state,
+            session_id,
+            "call-reconnect",
+            "bcode.filesystem",
+            bcode_tool::ToolPresentationUpdate {
+                invocation_id: "call-reconnect".to_owned(),
+                producer_id: "bcode.filesystem".to_owned(),
+                generation: 0,
+                revision: 3,
+                identity: bcode_tool::ToolPresentationIdentity::Primary,
+                retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                schema: "bcode.filesystem.request".to_owned(),
+                schema_version: 1,
+                artifact: None,
+                payload: serde_json::json!({"status": "current presentation"}),
+            },
+        )
+        .await
+        .expect("active presentation update");
         append_tool_invocation_lifecycle_event(
             &state,
             session_id,
@@ -34941,14 +34961,38 @@ library = "test"
             .expect("reattach");
         let mut replacement = bcode_session_view::SessionView::new();
         replacement.apply_history(&reattached.history);
-        let reconnect_live = tokio::time::timeout(Duration::from_secs(2), reconnected.recv_event())
-            .await
-            .expect("reconnect checkpoint timeout")
-            .expect("reconnect checkpoint");
-        let bcode_ipc::Event::SessionLive(reconnect_live) = reconnect_live else {
-            panic!("expected current live checkpoint after reconnect");
-        };
-        replacement.apply_live_event(&reconnect_live);
+        let mut saw_presentation = false;
+        let mut saw_draft = false;
+        for _ in 0..4 {
+            let reconnect_live =
+                tokio::time::timeout(Duration::from_secs(2), reconnected.recv_event())
+                    .await
+                    .expect("reconnect checkpoint timeout")
+                    .expect("reconnect checkpoint");
+            let bcode_ipc::Event::SessionLive(reconnect_live) = reconnect_live else {
+                continue;
+            };
+            match &reconnect_live.kind {
+                SessionLiveEventKind::ToolPresentationUpdated { update }
+                    if update.invocation_id == "call-reconnect" =>
+                {
+                    saw_presentation = update.revision == 3
+                        && update.payload == serde_json::json!({"status": "current presentation"});
+                }
+                SessionLiveEventKind::ToolRequestDraft { event }
+                    if event.tool_call_id == "call-reconnect" =>
+                {
+                    saw_draft = true;
+                }
+                _ => {}
+            }
+            replacement.apply_live_event(&reconnect_live);
+            if saw_presentation && saw_draft {
+                break;
+            }
+        }
+        assert!(saw_presentation);
+        assert!(saw_draft);
         assert!(
             replacement
                 .snapshot()
