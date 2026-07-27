@@ -13,10 +13,10 @@ mod vim_edit_playback_tui;
 use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
-    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID,
+    ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
     ToolContributionEnvelope, ToolContributionEvent, ToolContributionOperation,
     ToolContributionPersistence, ToolContributionPlacement, ToolDefinition, ToolInvocationRequest,
-    ToolInvocationResponse, ToolList,
+    ToolInvocationResponse, ToolInvocationResult, ToolList,
 };
 use bcode_vim_edit::{
     VimEditFrame, VimEditMode, VimEditMultiFileEntry, VimEditMultiFileRequest,
@@ -715,8 +715,8 @@ fn vim_edit_success_response(
         final_context: &result.final_context,
         events: &result.events,
     };
-    let response = json_tool_response(&output, false);
     let playback = vim_edit_playback_payload(tool_name, path, result, mode, original_arguments);
+    let response = playback_tool_response(&output, tool_call_id, &playback);
     emit_playback_contribution(events, tool_call_id, &playback);
     response
 }
@@ -793,7 +793,7 @@ fn vim_edit_multi_file_success_response(
         "frame_count": frame_count,
         "frames_truncated": frames_truncated,
     });
-    let response = json_tool_response(&output, false);
+    let response = playback_tool_response(&output, tool_call_id, &output);
     emit_playback_contribution(events, tool_call_id, &output);
     response
 }
@@ -1112,6 +1112,40 @@ fn json_response<T: serde::Serialize>(value: &T) -> ServiceResponse {
 
 fn tool_json_error(error: &serde_json::Error) -> ToolInvocationResponse {
     vim_edit_error_response(None, format!("invalid vim edit request: {error}"))
+}
+
+fn playback_tool_response<T: serde::Serialize>(
+    value: &T,
+    tool_call_id: &str,
+    playback: &serde_json::Value,
+) -> ToolInvocationResponse {
+    match serde_json::to_string_pretty(value) {
+        Ok(output) => ToolInvocationResponse {
+            output,
+            is_error: false,
+            content: Vec::new(),
+            full_output: None,
+            result: Some(ToolInvocationResult::Artifact {
+                artifact: Box::new(ToolArtifact {
+                    artifact_id: format!("{tool_call_id}-vim-edit-playback"),
+                    producer_plugin_id: VIM_EDIT_PLUGIN_ID.to_owned(),
+                    schema: VIM_EDIT_PLAYBACK_SCHEMA.to_owned(),
+                    schema_version: 1,
+                    tool_call_id: Some(tool_call_id.to_owned()),
+                    title: Some("Vim edit".to_owned()),
+                    metadata: playback.clone(),
+                    refs: Vec::new(),
+                }),
+            }),
+        },
+        Err(error) => ToolInvocationResponse {
+            output: error.to_string(),
+            is_error: true,
+            content: Vec::new(),
+            full_output: None,
+            result: None,
+        },
+    }
 }
 
 fn json_tool_response<T: serde::Serialize>(value: &T, is_error: bool) -> ToolInvocationResponse {
@@ -1519,7 +1553,13 @@ mod tests {
             &json!({ "path": "src/lib.rs", "steps": [] }),
             &emitter,
         );
-        assert!(response.result.is_none());
+        let artifact = match response.result.as_ref() {
+            Some(ToolInvocationResult::Artifact { artifact }) => artifact,
+            result => panic!("expected canonical playback artifact, got {result:?}"),
+        };
+        assert_eq!(artifact.schema, VIM_EDIT_PLAYBACK_SCHEMA);
+        assert_eq!(artifact.producer_plugin_id, VIM_EDIT_PLUGIN_ID);
+        assert_eq!(artifact.metadata["path"], "src/lib.rs");
         let playback = events
             .iter()
             .find(|event| event.contribution.contribution_id == "playback")

@@ -2640,22 +2640,16 @@ impl BmuxApp {
             self.transcript.remove_shared_item(&item_id);
             return;
         }
-        self.sync_shared_tool_presentation_slot(&item_id);
+        self.sync_shared_tool_items(&contribution.invocation_id);
     }
 
     fn apply_durable_contribution(
         &mut self,
         _event_sequence: u64,
         contribution: &bcode_session_models::ToolContributionEvent,
-        placement: bcode_session_models::ToolContributionPlacement,
+        _placement: bcode_session_models::ToolContributionPlacement,
     ) {
-        let item_id = bcode_session_view_models::TranscriptViewItemId::tool_presentation_slot(
-            &contribution.invocation_id,
-            placement,
-            (placement == bcode_session_models::ToolContributionPlacement::Supplemental)
-                .then_some(contribution.contribution_id.as_str()),
-        );
-        self.sync_shared_tool_presentation_slot(&item_id);
+        self.sync_shared_tool_items(&contribution.invocation_id);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2727,7 +2721,7 @@ impl BmuxApp {
                 );
             }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
-                self.sync_shared_tool_contributions(&record.invocation_id);
+                self.sync_shared_tool_items(&record.invocation_id);
                 if application.live_activity() {
                     self.set_activity(ActivityState::PreparingFollowUpRequest);
                 }
@@ -2872,7 +2866,7 @@ impl BmuxApp {
                     envelope.placement,
                 ),
             SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
-                self.sync_shared_tool_contributions(&lifecycle.invocation_id);
+                self.sync_shared_tool_items(&lifecycle.invocation_id);
                 if lifecycle.stage == bcode_session_models::ToolInvocationLifecycleStage::Started
                     && let Some(context) = self
                         .tool_call_contexts
@@ -3110,20 +3104,22 @@ impl BmuxApp {
         self.transcript
             .iter()
             .filter_map(move |item| {
-                let timing = item.tool_timing()?;
-                if !item.streaming() || timing.started_at_ms.is_none() {
+                let invocation_id = item.visual_invocation_id()?;
+                let tool = self.session_view.snapshot().tools.get(invocation_id)?;
+                if !matches!(
+                    tool.status,
+                    bcode_session_view_models::ToolInvocationViewStatus::Running
+                ) {
                     return None;
                 }
+                let timing = item.tool_timing()?;
                 let at = super::temporal::next_elapsed_invalidation_capped(
                     timing.started_at_ms?,
-                    timing.finished_at_ms,
+                    None,
                     now,
                     now_system,
                     TOOL_ELAPSED_INVALIDATION_MAX_INTERVAL,
                 )?;
-                let invocation_id = item
-                    .visual_invocation_id()
-                    .map_or_else(|| item.id().get().to_string(), str::to_owned);
                 Some(InvalidationRequest::new(
                     InvalidationKey::new(format!(
                         "{TOOL_ELAPSED_INVALIDATION_PREFIX}:{invocation_id}"
@@ -3378,24 +3374,26 @@ impl BmuxApp {
             .find(|item| item.role == role && item.streaming)
     }
 
-    fn sync_shared_tool_contributions(&mut self, invocation_id: &str) {
+    fn sync_shared_tool_items(&mut self, invocation_id: &str) {
         let items = self
             .session_view
             .snapshot()
             .transcript
             .items
             .iter()
-            .filter(|item| {
-                matches!(
-                    &item.kind,
-                    bcode_session_view_models::TranscriptViewItemKind::ToolContribution {
-                        contribution,
-                        ..
-                    } if contribution.invocation_id == invocation_id
-                )
-            })
             .map(terminal_item_from_shared)
+            .filter(|item| item.visual_invocation_id() == Some(invocation_id))
             .collect::<Vec<_>>();
+        let source_ids = items
+            .iter()
+            .filter_map(|item| item.source_view_item_id().cloned())
+            .collect::<BTreeSet<_>>();
+        self.transcript.retain(|item| {
+            item.visual_invocation_id() != Some(invocation_id)
+                || item
+                    .source_view_item_id()
+                    .is_some_and(|id| source_ids.contains(id))
+        });
         for item in items {
             self.transcript.upsert_shared_item(item);
         }
@@ -4938,6 +4936,93 @@ mod tests {
             BTreeSet::from(["call-item".to_owned()])
         );
         assert!(app.drain_elapsed_dirty_visuals().is_empty());
+    }
+
+    #[test]
+    fn tool_elapsed_invalidation_requires_authoritative_running_status() {
+        let session_id = bcode_session_models::SessionId::new();
+        let event = |sequence, timestamp_ms, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms,
+            session_id,
+            provenance: None,
+            kind,
+        };
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        app.absorb_session_event(&event(
+            1,
+            1_000,
+            bcode_session_models::SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("test.plugin".to_owned()),
+                tool_name: "test.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        app.absorb_session_event(&event(
+            2,
+            2_000,
+            bcode_session_models::SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "call-1".to_owned(),
+                    sequence: 1,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        ));
+        app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::ToolContributionPlaced {
+                envelope: bcode_session_models::ToolContributionEnvelope::new(
+                    bcode_session_models::ToolContributionPlacement::Progress,
+                    bcode_session_models::ToolContributionEvent {
+                        invocation_id: "call-1".to_owned(),
+                        contribution_id: "progress".to_owned(),
+                        sequence: 1,
+                        producer_id: "test.plugin".to_owned(),
+                        schema: "test.progress".to_owned(),
+                        schema_version: 1,
+                        operation: bcode_session_models::ToolContributionOperation::Upsert,
+                        persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                        artifact: None,
+                        payload: serde_json::json!({"progress": true}),
+                    },
+                ),
+            },
+        });
+
+        let now = Instant::now();
+        let now_system = std::time::UNIX_EPOCH + Duration::from_secs(3);
+        assert!(
+            app.tool_elapsed_invalidation_requests(now, now_system)
+                .any(|request| {
+                    tool_elapsed_invalidation_invocation_id(&request.key) == Some("call-1")
+                })
+        );
+
+        app.absorb_session_event(&event(
+            3,
+            2_500,
+            bcode_session_models::SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "call-1".to_owned(),
+                    sequence: 2,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Completed,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        ));
+
+        assert!(
+            app.tool_elapsed_invalidation_requests(now, now_system)
+                .next()
+                .is_none()
+        );
     }
 
     #[test]

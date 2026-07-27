@@ -720,16 +720,17 @@ impl SessionView {
                                     .items
                                     .retain(|item| item.id != result_id);
                             }
-                        } else if self
+                        } else if let Some(projection) = self
                             .tool_invocation_projections
                             .get(&lifecycle.invocation_id)
-                            .is_some_and(|projection| projection.tool_name.is_some())
+                            .cloned()
+                            .filter(|projection| projection.tool_name.is_some())
                         {
-                            self.upsert_tool_item(
-                                &lifecycle.invocation_id,
-                                event.sequence,
-                                Some(event.timestamp_ms),
-                            );
+                            let tool = tool_invocation_view_from_projection(projection);
+                            self.snapshot
+                                .tools
+                                .insert(lifecycle.invocation_id.clone(), tool);
+                            self.sync_contribution_invocation_context(&lifecycle.invocation_id);
                         }
                         self.snapshot
                             .active_invocations
@@ -1944,6 +1945,8 @@ impl SessionView {
             .insert(tool_call_id.to_owned(), tool.clone());
         if let Some(id) = self.tool_item_ids.get(tool_call_id).cloned() {
             self.update_existing_tool_item(id, tool_call_id, sequence, timestamp_ms, tool);
+        } else {
+            self.upsert_terminal_tool_item(tool_call_id, sequence, timestamp_ms, tool);
         }
         self.sync_contribution_invocation_context(tool_call_id);
     }
@@ -1967,9 +1970,14 @@ impl SessionView {
             return;
         }
         match self.tool_item_ids.entry(tool_call_id.to_owned()) {
-            Entry::Occupied(entry) => {
-                let id = entry.get().clone();
-                self.update_existing_tool_item(id, tool_call_id, sequence, timestamp_ms, tool);
+            Entry::Occupied(_) => {
+                self.refresh_tool_presentation_slot(
+                    tool_call_id,
+                    bcode_session_models::ToolContributionPlacement::Request,
+                    None,
+                    sequence,
+                    timestamp_ms,
+                );
             }
             Entry::Vacant(_) => {
                 let id = TranscriptViewItemId::tool_presentation_slot(

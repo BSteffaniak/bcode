@@ -1028,6 +1028,8 @@ impl From<bcode_session_models::ToolInvocationProjectionStatus> for ToolInvocati
             bcode_session_models::ToolInvocationProjectionStatus::Requested => Self::Requested,
             bcode_session_models::ToolInvocationProjectionStatus::Running => Self::Running,
             bcode_session_models::ToolInvocationProjectionStatus::Finished => Self::Finished,
+            bcode_session_models::ToolInvocationProjectionStatus::Cancelled => Self::Cancelled,
+            bcode_session_models::ToolInvocationProjectionStatus::Failed => Self::Failed,
         }
     }
 }

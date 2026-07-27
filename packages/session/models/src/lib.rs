@@ -67,8 +67,12 @@ pub enum ToolInvocationProjectionStatus {
     Requested,
     /// Canonical invocation lifecycle reported the tool as running.
     Running,
-    /// Final result was observed.
+    /// The invocation completed successfully or produced a final result.
     Finished,
+    /// The owning invocation or turn was cancelled.
+    Cancelled,
+    /// The invocation lifecycle completed with an error.
+    Failed,
 }
 
 /// Build renderer-neutral tool invocation projections from chronological session events.
@@ -133,9 +137,17 @@ pub fn apply_tool_invocation_projection_event(
                     projection.status = ToolInvocationProjectionStatus::Running;
                     projection.started_at_ms.get_or_insert(event.timestamp_ms);
                 }
-                ToolInvocationLifecycleStage::Completed
-                | ToolInvocationLifecycleStage::Cancelled
-                | ToolInvocationLifecycleStage::Failed => {
+                ToolInvocationLifecycleStage::Completed => {
+                    projection.status = ToolInvocationProjectionStatus::Finished;
+                    projection.finished_at_ms = Some(event.timestamp_ms);
+                }
+                ToolInvocationLifecycleStage::Cancelled => {
+                    projection.status = ToolInvocationProjectionStatus::Cancelled;
+                    projection.finished_at_ms = Some(event.timestamp_ms);
+                }
+                ToolInvocationLifecycleStage::Failed => {
+                    projection.status = ToolInvocationProjectionStatus::Failed;
+                    projection.is_error = Some(true);
                     projection.finished_at_ms = Some(event.timestamp_ms);
                 }
             }
