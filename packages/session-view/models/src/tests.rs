@@ -47,6 +47,9 @@ fn tool_presentation_update_scope_enforces_identity_generation_revision_bounds_a
         payload: serde_json::json!({"revision": revision}),
     };
     let mut scope = ToolPresentationUpdateScope::default();
+    let supplemental = ToolPresentationIdentity::Supplemental {
+        item_id: "details".to_owned(),
+    };
     scope
         .accept(&update(0, 1, ToolPresentationIdentity::Primary), 4_096)
         .expect("first primary update");
@@ -55,17 +58,16 @@ fn tool_presentation_update_scope_enforces_identity_generation_revision_bounds_a
         Err(ToolPresentationUpdateError::StaleRevision)
     );
     scope
-        .accept(
-            &update(
-                0,
-                1,
-                ToolPresentationIdentity::Supplemental {
-                    item_id: "details".to_owned(),
-                },
-            ),
-            4_096,
-        )
+        .accept(&update(0, 1, supplemental.clone()), 4_096)
         .expect("supplemental has independent revision");
+    scope
+        .accept(&update(0, 2, supplemental.clone()), 4_096)
+        .expect("supplemental revisions advance independently");
+    assert_eq!(scope.highest_revision(&supplemental), Some(2));
+    assert_eq!(
+        scope.highest_revision(&ToolPresentationIdentity::Primary),
+        Some(1)
+    );
     scope
         .accept(&update(1, 1, ToolPresentationIdentity::Primary), 4_096)
         .expect("next generation resets revisions");

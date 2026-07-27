@@ -31871,6 +31871,25 @@ library = "test"
             accept_tool_presentation_update(&state, session_id, "call-1", "other.plugin", &update,),
             Err(bcode_tool::ToolPresentationUpdateError::ProducerMismatch)
         );
+        let oversized = bcode_tool::ToolPresentationUpdate {
+            payload: serde_json::json!({
+                "value": "x".repeat(MAX_ACTIVE_CONTRIBUTION_BYTES)
+            }),
+            ..update.clone()
+        };
+        assert!(matches!(
+            accept_tool_presentation_update(
+                &state,
+                session_id,
+                "call-1",
+                "test.plugin",
+                &oversized,
+            ),
+            Err(bcode_tool::ToolPresentationUpdateError::TooLarge {
+                maximum: MAX_ACTIVE_CONTRIBUTION_BYTES,
+                ..
+            })
+        ));
         accept_tool_presentation_update(&state, session_id, "call-1", "test.plugin", &update)
             .expect("first update accepted");
         assert_eq!(

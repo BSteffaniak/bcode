@@ -6998,6 +6998,119 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One fixture keeps schema replacement and interleaved ordering in one transition sequence.
+    fn presentation_schema_changes_and_interleaved_items_preserve_primary_identity_and_order() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("test.plugin".to_owned()),
+                tool_name: "test.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        let primary_id = TranscriptViewItemId::tool("call-1");
+        let update = |revision, schema: &str| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolPresentationUpdated {
+                update: bcode_tool::ToolPresentationUpdate {
+                    invocation_id: "call-1".to_owned(),
+                    producer_id: "test.plugin".to_owned(),
+                    generation: 0,
+                    revision,
+                    identity: bcode_tool::ToolPresentationIdentity::Primary,
+                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    schema: schema.to_owned(),
+                    schema_version: 1,
+                    artifact: None,
+                    payload: serde_json::json!({"revision": revision}),
+                },
+            },
+        };
+        view.apply_live_event(&update(1, "test.request"));
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ModelUsage {
+                turn_id: "turn-1".to_owned(),
+                usage: bcode_session_models::SessionTokenUsage::default(),
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            3,
+            SessionEventKind::PermissionRequested {
+                permission_id: "permission-1".to_owned(),
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("test.plugin".to_owned()),
+                tool_name: "test.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                batch: None,
+                policy_source: None,
+                policy_reason: Some("approval required".to_owned()),
+            },
+        ));
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolPresentationUpdated {
+                update: bcode_tool::ToolPresentationUpdate {
+                    invocation_id: "call-1".to_owned(),
+                    producer_id: "test.plugin".to_owned(),
+                    generation: 0,
+                    revision: 1,
+                    identity: bcode_tool::ToolPresentationIdentity::Supplemental {
+                        item_id: "details".to_owned(),
+                    },
+                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    schema: "test.details".to_owned(),
+                    schema_version: 1,
+                    artifact: None,
+                    payload: serde_json::json!({"details": true}),
+                },
+            },
+        });
+        let before = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+
+        view.apply_live_event(&update(2, "test.result"));
+
+        let after = &view.snapshot().transcript.items;
+        assert_eq!(
+            after.iter().map(|item| item.id.clone()).collect::<Vec<_>>(),
+            before
+        );
+        assert_eq!(after.iter().filter(|item| item.id == primary_id).count(), 1);
+        assert!(matches!(
+            &after[0].kind,
+            TranscriptViewItemKind::ToolInvocation { tool }
+                if tool.presentation.as_ref().is_some_and(|presentation|
+                    presentation.schema == "test.result" && presentation.revision == 2)
+        ));
+        assert!(
+            after
+                .iter()
+                .any(|item| item.id == TranscriptViewItemId::event(2))
+        );
+        assert!(
+            after
+                .iter()
+                .any(|item| item.id == TranscriptViewItemId::permission("permission-1"))
+        );
+        assert!(after.iter().any(|item| {
+            item.id == TranscriptViewItemId::tool_supplemental("call-1", "details")
+        }));
+    }
+
+    #[test]
     fn presentation_updates_are_monotonic_and_terminal_closure_is_absorbing() {
         let session_id = SessionId::new();
         let update = |revision, retention| bcode_tool::ToolPresentationUpdate {
