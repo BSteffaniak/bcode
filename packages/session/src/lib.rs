@@ -103,6 +103,15 @@ fn ensure_durable_session_event_kind(
         }
         return Err(SessionError::LiveEventPersistenceRejected { event_kind });
     }
+    if let SessionEventKind::ToolInvocationResultRecorded { record } = kind
+        && record.presentation.as_ref().is_some_and(|presentation| {
+            presentation.retention == bcode_session_models::ToolPresentationRetention::ActiveOnly
+        })
+    {
+        return Err(SessionError::EventSerialization(
+            "active-only presentation update cannot be persisted".to_owned(),
+        ));
+    }
     if matches!(
         kind,
         SessionEventKind::ToolContribution { .. } | SessionEventKind::ToolContributionPlaced { .. }
@@ -9942,6 +9951,55 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn active_only_presentation_is_rejected_before_durable_append() {
+        let manager = SessionManager::default();
+        let session = manager
+            .create_session(
+                Some("active-only presentation".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let result = manager
+            .append_tool_invocation_result(
+                session.id,
+                bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call".to_owned(),
+                    model_output: "done".to_owned(),
+                    is_error: false,
+                    presentation: Some(bcode_session_models::ToolPresentationUpdate {
+                        invocation_id: "call".to_owned(),
+                        producer_id: "producer".to_owned(),
+                        generation: 0,
+                        revision: 1,
+                        identity: bcode_session_models::ToolPresentationIdentity::Primary,
+                        retention: bcode_session_models::ToolPresentationRetention::ActiveOnly,
+                        schema: "example.active-only".to_owned(),
+                        schema_version: 1,
+                        artifact: None,
+                        payload: serde_json::json!({"must_not_persist": true}),
+                    }),
+                    result: None,
+                },
+            )
+            .await;
+        assert!(
+            matches!(result, Err(SessionError::EventSerialization(message)) if message.contains("active-only"))
+        );
+        assert!(
+            !manager
+                .session_history(session.id)
+                .await
+                .expect("history")
+                .iter()
+                .any(|event| matches!(
+                    event.kind,
+                    SessionEventKind::ToolInvocationResultRecorded { .. }
+                ))
+        );
     }
 
     #[tokio::test]

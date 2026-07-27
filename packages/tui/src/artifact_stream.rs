@@ -44,6 +44,17 @@ pub struct ActiveArtifactFetchCompletion {
     result: Result<bcode_client::SessionArtifactRange, ClientError>,
 }
 
+fn active_artifact_request_range(next_offset: u64, committed_bytes: u64) -> Option<(u32, u64)> {
+    let remaining = committed_bytes.checked_sub(next_offset)?;
+    if remaining == 0 {
+        return None;
+    }
+    let length = u32::try_from(remaining)
+        .unwrap_or(u32::MAX)
+        .min(ACTIVE_ARTIFACT_FETCH_BYTES);
+    Some((length, next_offset.saturating_add(u64::from(length))))
+}
+
 fn active_artifact_completion_is_current(
     completion_session_id: SessionId,
     current_session_id: Option<SessionId>,
@@ -294,12 +305,12 @@ impl ArtifactStreamCoordinator {
             return;
         }
         let requested_offset = state.next_offset;
-        let remaining = target.committed_bytes.saturating_sub(requested_offset);
-        let length = u32::try_from(remaining)
-            .unwrap_or(u32::MAX)
-            .min(ACTIVE_ARTIFACT_FETCH_BYTES);
+        let Some((length, requested_end)) =
+            active_artifact_request_range(requested_offset, target.committed_bytes)
+        else {
+            return;
+        };
         let target_revision = target.revision;
-        let requested_end = requested_offset.saturating_add(u64::from(length));
         state.fetching = true;
         self.stats.fetches_started = self.stats.fetches_started.saturating_add(1);
         state.retry_at = None;
@@ -651,6 +662,57 @@ mod tests {
                 .artifact_fetches
                 .keys()
                 .all(|key| key.3 == "accepted")
+        );
+    }
+
+    #[test]
+    fn artifact_fetch_ranges_are_chunk_bounded_and_advance_from_committed_offset() {
+        let committed_bytes = u64::from(ACTIVE_ARTIFACT_FETCH_BYTES) * 3;
+        assert_eq!(
+            active_artifact_request_range(17, committed_bytes),
+            Some((
+                ACTIVE_ARTIFACT_FETCH_BYTES,
+                17 + u64::from(ACTIVE_ARTIFACT_FETCH_BYTES)
+            ))
+        );
+        assert_eq!(
+            active_artifact_request_range(committed_bytes - 9, committed_bytes),
+            Some((9, committed_bytes))
+        );
+        assert_eq!(
+            active_artifact_request_range(committed_bytes, committed_bytes),
+            None
+        );
+        assert_eq!(
+            active_artifact_request_range(committed_bytes + 1, committed_bytes),
+            None
+        );
+    }
+
+    #[test]
+    fn resetting_a_resident_session_discards_all_artifact_fetch_state() {
+        let session_id = SessionId::new();
+        let other_session_id = SessionId::new();
+        let mut coordinator = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
+        for (owner, name) in [(session_id, "old"), (other_session_id, "retained")] {
+            coordinator.artifact_fetches.insert(
+                (
+                    owner,
+                    name.to_owned(),
+                    "artifact".to_owned(),
+                    "reference".to_owned(),
+                ),
+                ActiveArtifactFetchState::default(),
+            );
+        }
+
+        coordinator.reset_session(session_id);
+        assert_eq!(coordinator.artifact_fetches.len(), 1);
+        assert!(
+            coordinator
+                .artifact_fetches
+                .keys()
+                .all(|key| key.0 == other_session_id)
         );
     }
 

@@ -833,6 +833,30 @@ fn snapshot_patch_resets_when_non_transcript_state_changes() {
 }
 
 #[test]
+fn repeated_large_item_replacement_is_constant_cardinality_and_patch_bounded() {
+    let large_payload = "x".repeat(256 * 1024);
+    let mut current = SessionViewSnapshot::empty();
+    current.revision = 1;
+    current.transcript = transcript_document(1, [transcript_item("shell-call", 1, &large_payload)]);
+
+    for revision in 2..=128 {
+        let mut next = current.clone();
+        next.revision = revision;
+        next.transcript.revision = revision;
+        next.transcript.items[0].revision = revision;
+        next.transcript.items[0].kind = TranscriptViewItemKind::SystemMessage {
+            message: ChatMessageView::plain(format!("artifact revision {revision}")),
+        };
+        let patch = SessionViewPatch::between_snapshots(&current, &next);
+        assert!(patch.reset.is_none());
+        assert_eq!(patch.transcript.len(), 1);
+        current.apply_patch(&patch).expect("replacement applies");
+        assert_eq!(current.transcript.items.len(), 1);
+        assert_eq!(current, next);
+    }
+}
+
+#[test]
 fn patch_size_measurements_cover_incremental_and_reset_workloads() {
     let mut base = SessionViewSnapshot::empty();
     base.revision = 100;
@@ -889,6 +913,52 @@ fn patch_size_measurements_cover_incremental_and_reset_workloads() {
 }
 
 proptest! {
+    #[test]
+    fn bounded_window_prepend_eviction_and_reset_converge(
+        base_len in 1_usize..24,
+        prepend_len in 0_usize..12,
+        evict_front in 0_usize..24,
+        reset in any::<bool>(),
+    ) {
+        let base_items = (0..base_len)
+            .map(|index| transcript_item(
+                &format!("base-{index}"),
+                u64::try_from(index.saturating_add(100)).expect("bounded sequence"),
+                "base",
+            ))
+            .collect::<Vec<_>>();
+        let base = transcript_document_from_vec(10, base_items);
+        let evict_front = evict_front.min(base_len);
+        let mut next_items = (0..prepend_len)
+            .map(|index| transcript_item(
+                &format!("older-{index}"),
+                u64::try_from(index.saturating_add(1)).expect("bounded sequence"),
+                "older",
+            ))
+            .collect::<Vec<_>>();
+        next_items.extend(base.items.iter().skip(evict_front).cloned());
+        let mut next = transcript_document_from_vec(11, next_items);
+        next.has_older_history = evict_front > 0;
+        next.has_newer_history = false;
+        if reset {
+            let mut base_snapshot = SessionViewSnapshot::empty();
+            base_snapshot.revision = 10;
+            base_snapshot.transcript = base;
+            let mut next_snapshot = base_snapshot.clone();
+            next_snapshot.revision = 11;
+            next_snapshot.transcript = next.clone();
+            let patch = SessionViewPatch::between_snapshots(&base_snapshot, &next_snapshot);
+            let mut applied = base_snapshot;
+            applied.apply_patch(&patch).expect("bounded window reset applies");
+            prop_assert_eq!(applied.transcript, next);
+        } else {
+            let patch = SessionViewPatch::transcript_between(10, 11, None, &base, &next);
+            let mut applied = base;
+            applied.apply_patch(&patch).expect("bounded window patch applies");
+            prop_assert_eq!(applied, next);
+        }
+    }
+
     #[test]
     fn transcript_patch_matches_fresh_materialization_for_compatible_documents(
         base_len in 0_usize..24,

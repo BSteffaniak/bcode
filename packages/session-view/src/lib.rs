@@ -892,6 +892,22 @@ impl SessionView {
                     .tool_invocations
                     .entry(record.invocation_id.clone())
                     .or_default();
+                if let Some(presentation) = record.presentation.as_ref()
+                    && presentation.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+                {
+                    let replace = aggregate
+                        .presentations
+                        .get(&presentation.identity)
+                        .is_none_or(|current| {
+                            (presentation.generation, presentation.revision)
+                                > (current.generation, current.revision)
+                        });
+                    if replace {
+                        aggregate
+                            .presentations
+                            .insert(presentation.identity.clone(), presentation.clone());
+                    }
+                }
                 aggregate.terminal_status.get_or_insert(if record.is_error {
                     ToolInvocationViewStatus::Failed
                 } else {
@@ -7035,6 +7051,81 @@ mod tests {
             view.presentation_update("call-1", &bcode_tool::ToolPresentationIdentity::Primary)
                 .map(|update| update.revision),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn terminal_checkpoint_wins_reconnect_races_without_mixed_live_state() {
+        let session_id = SessionId::new();
+        let update = |revision| bcode_tool::ToolPresentationUpdate {
+            invocation_id: "call-race".to_owned(),
+            producer_id: "test.plugin".to_owned(),
+            generation: 0,
+            revision,
+            identity: bcode_tool::ToolPresentationIdentity::Primary,
+            retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+            schema: "test.presentation".to_owned(),
+            schema_version: 1,
+            artifact: None,
+            payload: serde_json::json!({"revision": revision}),
+        };
+        let live = |revision| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolPresentationUpdated {
+                update: update(revision),
+            },
+        };
+        let terminal = event(
+            session_id,
+            1,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-race".to_owned(),
+                    model_output: "done".to_owned(),
+                    is_error: false,
+                    presentation: Some(update(2)),
+                    result: Some(ToolInvocationResult::Text {
+                        text: "done".to_owned(),
+                    }),
+                },
+            },
+        );
+
+        let mut active_then_terminal = SessionView::new();
+        active_then_terminal.apply_live_event(&live(1));
+        active_then_terminal.apply_event(&terminal);
+        active_then_terminal.apply_live_event(&live(3));
+
+        let mut terminal_then_stale_checkpoint = SessionView::new();
+        terminal_then_stale_checkpoint.apply_event(&terminal);
+        terminal_then_stale_checkpoint.apply_live_event(&live(1));
+
+        for view in [&active_then_terminal, &terminal_then_stale_checkpoint] {
+            let tool = view
+                .snapshot()
+                .tools
+                .get("call-race")
+                .expect("terminal tool");
+            assert_eq!(tool.status, ToolInvocationViewStatus::Finished);
+            assert_eq!(
+                tool.presentation
+                    .as_ref()
+                    .map(|presentation| presentation.revision),
+                Some(2)
+            );
+            assert_eq!(
+                view.snapshot()
+                    .transcript
+                    .items
+                    .iter()
+                    .filter(|item| item.id == TranscriptViewItemId::tool("call-race"))
+                    .count(),
+                1
+            );
+        }
+        assert_eq!(
+            active_then_terminal.snapshot().tools,
+            terminal_then_stale_checkpoint.snapshot().tools
         );
     }
 

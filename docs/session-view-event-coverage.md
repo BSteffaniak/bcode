@@ -86,13 +86,27 @@ Required migration invariants:
 | `AssistantReasoningDelta` | Cumulatively updates reasoning item and thinking state without overriding renderer-selected visibility. | Upserts terminal reasoning presentation by shared `TranscriptViewItemId` while preserving split-stream boundaries and anchoring. | **Complete** for semantic content, visibility, and canonical projection consumption. |
 | `ToolRequestDraft` | Applies generation/revision-dominant UTF-8-byte append, bounded checkpoint, placement migration, and remove operations to the plugin-declared semantic tool slot. Canonical result, failure, and cancellation sources remain authoritative over stale or terminal draft updates. | Consumes the shared draft item and routes its producer/schema/version through native visual adapters; request drafts bypass the TUI's lossy generic superseding key. Server fan-out publishes latest state on a transport-owned 16 ms cadence without byte thresholds, and attach/reconnect supplies the active bounded checkpoint alongside durable permission/execution state. | **Complete** for live draft projection, reconnect recovery, and final-result replacement semantics; terminal layout and bounded row rendering remain renderer-owned. |
 
-The former `ToolArgumentPreview` and `ToolOutputDelta` channels were removed. During migration,
-plugin-owned transient contributions and durable request visuals still carry updates through
-compatibility placement. New primary presentation behavior uses invocation-scoped current-item
-replacement and retains only the latest eligible value at closure.
+The former `ToolArgumentPreview` and `ToolOutputDelta` channels were removed. New producers publish
+invocation-scoped primary presentation replacements; historical placement events are accepted only
+through the explicitly decode-only compatibility adapter. Closure retains only the latest eligible
+presentation value.
 
 | `RequestContextOccupancyChanged` | Replaces authoritative current occupancy while rejecting stale epoch/sequence updates. | Footer context accounting consumes shared occupancy. | **Complete**. |
 | `ProviderStreamProgress` | Projects turn-correlated human-readable progress and retry timing. | Live provider-stream activity consumes the shared projected detail/timing; trace-only diagnostics remain terminal-local. | **Complete** for semantic progress; animation/timers remain renderer-owned. |
+
+| `ToolExchangeRequested` | Records the pending renderer-neutral interaction request through interaction hydration; it does not create a competing tool transcript item. | Interaction controls consume the shared interaction state. | **Complete**; exchange lifecycle is separate from presentation updates. |
+| `ToolExchangeResolved` | Replaces the correlated interaction with its terminal resolution without changing tool ownership. | Resolved interaction history consumes shared state. | **Complete**. |
+| `ToolInvocationLifecycle` | Updates host-owned running/waiting/terminal status and timing on the invocation aggregate; terminal state closes presentation acceptance. | Both renderers consume the same typed lifecycle. | **Complete**. |
+| `ExecutionSessionCreated` | Intentionally does not create transcript content; execution provenance remains session/runtime metadata. | No transcript item. | **Intentional no-op**. |
+| `AssistantReasoningActivity` | Inserts or replaces one stable complete reasoning activity. | Shared reasoning item is rendered according to visibility policy. | **Complete**. |
+
+## Live `SessionLiveEventKind` coverage
+
+| Event | `SessionView` behavior | Shared status / next action |
+|---|---|---|
+| `AssistantReasoningActivity` | Incrementally replaces one stable reasoning activity until completion. | **Complete**. |
+| `ToolPresentationUpdated` | Applies generation/revision checks to the invocation aggregate and replaces the primary item or explicit supplemental item. | **Complete**. |
+| `ToolInvocationProgress` | Updates host-owned active invocation progress only while the invocation remains open. | **Complete**. |
 
 ## Migration order derived from the matrix
 

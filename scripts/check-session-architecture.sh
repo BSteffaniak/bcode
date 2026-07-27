@@ -9,6 +9,12 @@ if rg -n 'publish_transient_event|PublishTransient' packages/session/src --glob 
   violations=1
 fi
 
+if ! grep -F 'transient_payload_markers_never_enter_durable_or_observability_sinks' packages/server/src/lib.rs >/dev/null \
+  || ! grep -F 'active-only presentation update cannot be persisted' packages/session/src/lib.rs >/dev/null; then
+  echo "Session architecture violation: active-only presentation persistence guard or sink coverage was removed." >&2
+  violations=1
+fi
+
 if rg -n 'SessionEventKind::ToolRequestDraft|ToolRequestDraftEvent' packages/session/src --glob '*.rs' \
   >/tmp/bcode-session-durable-request-draft.txt; then
   echo "Session architecture violation: request drafts must remain SessionLiveEvent-only and absent from durable session implementation." >&2
@@ -20,6 +26,24 @@ if ! grep -F 'ToolContributionPersistence::Transient' packages/session/src/lib.r
   || ! grep -F 'ToolContributionPlacement::Progress' packages/session/src/lib.rs >/dev/null \
   || ! grep -F 'historical_progress_contribution_decodes_for_compatibility' packages/session/src/persisted.rs >/dev/null; then
   echo "Session architecture violation: transient/progress durable rejection or historical decode compatibility coverage was removed." >&2
+  violations=1
+fi
+
+if ! python3 - <<'PY'
+import re
+from pathlib import Path
+source = Path('packages/session/models/src/lib.rs').read_text()
+documentation = Path('docs/session-view-event-coverage.md').read_text()
+for enum_name in ('SessionEventKind', 'SessionLiveEventKind'):
+    start = source.index(f'pub enum {enum_name}')
+    end = source.index('\n}', start)
+    variants = re.findall(r'^    ([A-Z][A-Za-z0-9_]*)', source[start:end], re.MULTILINE)
+    missing = [variant for variant in variants if f'`{variant}`' not in documentation]
+    if missing:
+        raise SystemExit(f'{enum_name} variants missing from coverage matrix: {missing}')
+PY
+then
+  echo "Session architecture violation: durable/live SessionView event coverage documentation is incomplete." >&2
   violations=1
 fi
 

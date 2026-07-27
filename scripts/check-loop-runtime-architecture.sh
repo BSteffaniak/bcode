@@ -1174,6 +1174,21 @@ if ! grep -F 'ShellRecordingFrame::Output' plugins/shell-plugin/src/recording.rs
   violations=1
 fi
 
+if ! grep -F 'if terminal {' packages/server/src/lib.rs >/dev/null \
+  || ! grep -F 'close_tool_presentation_update_scope(state, session_id, &invocation_id);' packages/server/src/lib.rs >/dev/null \
+  || ! grep -F 'append_tool_invocation_terminal_event(' packages/server/src/lib.rs >/dev/null \
+  || ! grep -F 'close_tool_presentation_update_scope(state, session_id, invocation_id);' packages/server/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: terminal invocation paths must close presentation update scopes." >&2
+  violations=1
+fi
+
+if rg -n 'tool_name\.(as_deref|as_str)\(\)\s*==|match\s+[^\n]*tool_name|tool\.tool_name\s*==' \
+  packages/tui/src packages/hyperchad/ui/src --glob '*.rs' >/tmp/bcode-renderer-tool-lifecycle-branch.txt; then
+  echo "Runtime architecture violation: generic renderers must not infer lifecycle or placement from tool names." >&2
+  cat /tmp/bcode-renderer-tool-lifecycle-branch.txt >&2
+  violations=1
+fi
+
 if ! grep -F 'fn select_visual_adapter' packages/plugin/src/lib.rs >/dev/null ||
    ! grep -F 'adapter.supports(schema, schema_version, surface)' packages/plugin/src/lib.rs >/dev/null ||
    ! grep -F 'adapter.priority' packages/plugin/src/lib.rs >/dev/null ||

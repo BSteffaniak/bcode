@@ -216,30 +216,6 @@ pub struct PluginToolPresentationDeclaration {
     pub request_draft_schema: String,
     /// Version of `request_draft_schema`.
     pub request_draft_schema_version: u32,
-    /// Semantic transcript slot updated by the live draft.
-    pub request_draft_placement: PluginToolPresentationPlacement,
-}
-
-/// Legal semantic placement for a streamed tool request draft.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PluginToolPresentationPlacement {
-    /// Primary request presentation for the invocation.
-    Request,
-    /// Current progress presentation for the invocation.
-    Progress,
-    /// Primary result preview for the invocation.
-    Result,
-}
-
-impl From<PluginToolPresentationPlacement> for bcode_tool::ToolContributionPlacement {
-    fn from(value: PluginToolPresentationPlacement) -> Self {
-        match value {
-            PluginToolPresentationPlacement::Request => Self::Request,
-            PluginToolPresentationPlacement::Progress => Self::Progress,
-            PluginToolPresentationPlacement::Result => Self::Result,
-        }
-    }
 }
 
 fn validate_tool_presentation_declarations<'a>(
@@ -4698,10 +4674,6 @@ library = "libexample_plugin.dylib"
             "bcode.filesystem.request-draft.write"
         );
         assert_eq!(write.request_draft_schema_version, 1);
-        assert_eq!(
-            write.request_draft_placement,
-            PluginToolPresentationPlacement::Result
-        );
     }
 
     #[test]
@@ -4712,7 +4684,6 @@ library = "libexample_plugin.dylib"
             tool_name: "filesystem.write".to_owned(),
             request_draft_schema: String::new(),
             request_draft_schema_version: 1,
-            request_draft_placement: PluginToolPresentationPlacement::Result,
         }];
 
         let error = validate_tool_presentation_declarations([&manifest])
@@ -4732,7 +4703,6 @@ library = "libexample_plugin.dylib"
             tool_name: "filesystem.write".to_owned(),
             request_draft_schema: "bcode.filesystem.request-draft.write".to_owned(),
             request_draft_schema_version: 1,
-            request_draft_placement: PluginToolPresentationPlacement::Result,
         }];
 
         let error = validate_tool_presentation_declarations([&manifest])
@@ -4763,7 +4733,6 @@ library = "libexample_plugin.dylib"
             tool_name: "duplicate.tool".to_owned(),
             request_draft_schema: "test.draft".to_owned(),
             request_draft_schema_version: 1,
-            request_draft_placement: PluginToolPresentationPlacement::Result,
         }];
         let mut second = first.clone();
         second.id = "bcode.second".to_owned();
@@ -4784,7 +4753,6 @@ library = "libexample_plugin.dylib"
             tool_name: "expected.tool".to_owned(),
             request_draft_schema: "test.draft".to_owned(),
             request_draft_schema_version: 1,
-            request_draft_placement: PluginToolPresentationPlacement::Result,
         }];
         let loaded = LoadedPlugin {
             config: ResolvedPluginConfig::default(),

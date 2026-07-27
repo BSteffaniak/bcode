@@ -90,9 +90,9 @@ Contiguous updates use UTF-8 byte offsets. A gap, lag, reconnect, or truncation 
 replacement checkpoint. After truncation, producers continue with checkpoints so offsets remain
 trustworthy. Omitted bytes are not retained merely for presentation.
 
-During migration, `request_draft_placement` remains accepted in manifests and maps old slot behavior
-into the invocation's current primary presentation. It is compatibility metadata, not the target
-identity model.
+The declared draft schema always updates the invocation's current primary presentation. Placement
+is intentionally not configurable: request/progress/result slot selection was removed with the
+legacy primary-slot architecture.
 
 ## Artifact-backed updates
 

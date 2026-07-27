@@ -13846,7 +13846,7 @@ async fn handle_provider_turn_event(
                             Some(plugin_id.to_owned()),
                             presentation.request_draft_schema.clone(),
                             presentation.request_draft_schema_version,
-                            presentation.request_draft_placement.into(),
+                            bcode_session_models::ToolContributionPlacement::Request,
                         )
                     });
             let (producer_plugin_id, schema, schema_version, placement) =
