@@ -9,8 +9,10 @@
 use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
 
 use crate::current_schema::{global_migrations, session_migrations};
-use crate::db_artifact::{
-    finalized_artifact_reference_from_row, generic_artifact_reference_metadata,
+use crate::db_artifact::{finalized_artifact_reference_from_row, project_artifact_references};
+use crate::db_compatibility::{
+    clear_session_compatibility_issues, project_session_compatibility,
+    project_session_compatibility_state,
 };
 use crate::db_connection::{
     init_turso_local_with_retry, is_database_lock_error, is_database_lock_error_message,
@@ -1664,7 +1666,14 @@ impl SessionDb {
         project_model_context_event(&*tx, event).await?;
         project_context_occupancy_event(&*tx, event).await?;
         project_turn_receipt(&*tx, event).await?;
-        project_session_compatibility(&*tx, event, None).await?;
+        project_session_compatibility(
+            &*tx,
+            event,
+            None,
+            1,
+            SESSION_COMPATIBILITY_PROJECTION_SCHEMA_VERSION,
+        )
+        .await?;
         validate_append_postconditions(&*tx, event).await?;
         tx.commit().await?;
         Ok(())
@@ -2948,7 +2957,7 @@ async fn project_migration_event(
         timer.elapsed_ms(),
     );
     let timer = metrics.timer();
-    project_session_compatibility_issue(db, None).await?;
+    clear_session_compatibility_issues(db).await?;
     metrics.record_histogram(
         "session.migration.projector.compatibility_duration_ms",
         timer.elapsed_ms(),
@@ -3083,7 +3092,13 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
                 finalize_migration_model_context(self.db, tail).await?;
                 finalize_migration_context_occupancy(self.db, tail, &self.projection_state).await?;
                 project_migration_materialized_checkpoints_at_tail(self.db, tail).await?;
-                project_session_compatibility_state(self.db, tail).await
+                project_session_compatibility_state(
+                    self.db,
+                    tail,
+                    1,
+                    SESSION_COMPATIBILITY_PROJECTION_SCHEMA_VERSION,
+                )
+                .await
             }
             _ => Err(SessionDbError::MigrationHistoryIncompatible {
                 reason: "migration target canonical tail does not match projector ingestion"
@@ -3544,65 +3559,6 @@ async fn project_turn_receipt(db: &dyn Database, event: &SessionEvent) -> Sessio
     Ok(())
 }
 
-async fn project_session_compatibility_issue(
-    db: &dyn Database,
-    issue: Option<&SessionEventCompatibilityIssue>,
-) -> SessionDbResult<()> {
-    if let Some(issue) = issue {
-        db.upsert("session_compatibility_issues")
-            .unique(&["event_seq"])
-            .value("event_seq", seq_to_value(issue.sequence))
-            .value("event_kind", issue.event_kind.clone())
-            .value(
-                "event_schema_version",
-                DatabaseValue::Int32(i32::from(issue.schema_version)),
-            )
-            .value(
-                "compatibility",
-                match issue.compatibility {
-                    bcode_session_models::SessionEventCompatibilityKind::UnknownEventKind => {
-                        "unknown_event_kind"
-                    }
-                    bcode_session_models::SessionEventCompatibilityKind::FutureSchema => {
-                        "future_schema"
-                    }
-                },
-            )
-            .value("remediation", issue.remediation.clone())
-            .execute(db)
-            .await?;
-    }
-    Ok(())
-}
-
-async fn project_session_compatibility_state(
-    db: &dyn Database,
-    event: &SessionEvent,
-) -> SessionDbResult<()> {
-    db.upsert("session_compatibility_state")
-        .unique(&["projection_id"])
-        .value("projection_id", DatabaseValue::Int32(1))
-        .value(
-            "schema_version",
-            DatabaseValue::Int32(
-                i32::try_from(SESSION_COMPATIBILITY_PROJECTION_SCHEMA_VERSION).unwrap_or(i32::MAX),
-            ),
-        )
-        .value("last_event_seq", seq_to_value(event.sequence))
-        .execute(db)
-        .await?;
-    Ok(())
-}
-
-async fn project_session_compatibility(
-    db: &dyn Database,
-    event: &SessionEvent,
-    issue: Option<&SessionEventCompatibilityIssue>,
-) -> SessionDbResult<()> {
-    project_session_compatibility_issue(db, issue).await?;
-    project_session_compatibility_state(db, event).await
-}
-
 async fn project_materialized_event_without_checkpoints(
     db: &dyn Database,
     event: &SessionEvent,
@@ -4054,36 +4010,6 @@ async fn finalize_tool_transcript_item(
         .where_eq("transcript_seq", seq_to_value(event_seq_start))
         .execute(db)
         .await?;
-    Ok(())
-}
-
-async fn project_artifact_references(
-    db: &dyn Database,
-    finalized_event_seq: u64,
-    artifact: &bcode_session_models::ToolArtifact,
-) -> SessionDbResult<()> {
-    for reference in &artifact.refs {
-        let (availability, complete, checksum_sha256) =
-            generic_artifact_reference_metadata(reference);
-        db.upsert("artifact_references")
-            .value("artifact_id", artifact.artifact_id.clone())
-            .value("reference_key", reference.key.clone())
-            .value("producer_plugin_id", artifact.producer_plugin_id.clone())
-            .value("schema", artifact.schema.clone())
-            .value(
-                "schema_version",
-                DatabaseValue::Int64(i64::from(artifact.schema_version)),
-            )
-            .value("storage_uri", reference.storage_uri.clone())
-            .value("content_type", reference.content_type.clone())
-            .value("byte_len", reference.byte_len.map(seq_to_value))
-            .value("availability", availability)
-            .value("complete", complete.map(bool_to_value))
-            .value("checksum_sha256", checksum_sha256)
-            .value("finalized_event_seq", seq_to_value(finalized_event_seq))
-            .execute(db)
-            .await?;
-    }
     Ok(())
 }
 

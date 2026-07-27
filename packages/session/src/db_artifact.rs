@@ -1,8 +1,43 @@
 //! Generic finalized-artifact projection value helpers.
 
 use crate::db::{FinalizedArtifactReference, SessionDbError, SessionDbResult};
+use crate::db_event_store::seq_to_value;
 use crate::db_row::{i64_to_u64, optional_i64, optional_string, required_i64, required_string};
-use bcode_session_models::ToolArtifactRef;
+use bcode_session_models::{ToolArtifact, ToolArtifactRef};
+use switchy::database::{Database, DatabaseValue};
+
+pub async fn project_artifact_references(
+    db: &dyn Database,
+    finalized_event_seq: u64,
+    artifact: &ToolArtifact,
+) -> SessionDbResult<()> {
+    for reference in &artifact.refs {
+        let (availability, complete, checksum_sha256) =
+            generic_artifact_reference_metadata(reference);
+        db.upsert("artifact_references")
+            .value("artifact_id", artifact.artifact_id.clone())
+            .value("reference_key", reference.key.clone())
+            .value("producer_plugin_id", artifact.producer_plugin_id.clone())
+            .value("schema", artifact.schema.clone())
+            .value(
+                "schema_version",
+                DatabaseValue::Int64(i64::from(artifact.schema_version)),
+            )
+            .value("storage_uri", reference.storage_uri.clone())
+            .value("content_type", reference.content_type.clone())
+            .value("byte_len", reference.byte_len.map(seq_to_value))
+            .value("availability", availability)
+            .value(
+                "complete",
+                complete.map(|value| DatabaseValue::Int32(i32::from(value))),
+            )
+            .value("checksum_sha256", checksum_sha256)
+            .value("finalized_event_seq", seq_to_value(finalized_event_seq))
+            .execute(db)
+            .await?;
+    }
+    Ok(())
+}
 
 #[must_use]
 pub fn generic_artifact_reference_metadata(

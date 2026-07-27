@@ -22,6 +22,7 @@ mod context;
 mod current_schema;
 pub mod db;
 pub(crate) mod db_artifact;
+pub(crate) mod db_compatibility;
 pub(crate) mod db_connection;
 pub(crate) mod db_context;
 pub(crate) mod db_contract;

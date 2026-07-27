@@ -530,7 +530,7 @@ if ! rg -q "mod actor;" packages/session/src/lib.rs; then
   violations=1
 fi
 
-for session_module in attach attachment catalog context db_artifact db_connection db_context db_contract db_event_store db_path db_projection db_projection_row db_row db_runtime_work db_validation fork manifest mutation ownership runtime_work state store store_executor subscription tools; do
+for session_module in attach attachment catalog context db_artifact db_compatibility db_connection db_context db_contract db_event_store db_path db_projection db_projection_row db_row db_runtime_work db_validation fork manifest mutation ownership runtime_work state store store_executor subscription tools; do
   if ! rg -q "(pub(\\(crate\\))? )?mod ${session_module};" packages/session/src/lib.rs \
     || [[ ! -f "packages/session/src/${session_module}.rs" ]]; then
     echo "Session module split violation: ${session_module} domain module must remain extracted from lib.rs." >&2
