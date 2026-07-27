@@ -44,7 +44,8 @@ const fn bool_to_value(value: bool) -> DatabaseValue {
 }
 use crate::db_validation::{
     compaction_boundary, validate_append_identity, validate_canonical_event_identity,
-    validate_model_context_precondition, validate_projection_checkpoint_snapshot,
+    validate_context_occupancy_precondition, validate_model_context_precondition,
+    validate_projection_checkpoint_snapshot,
 };
 use crate::persisted::{
     CompatibleSessionEvent, PersistedSessionEventError, decode_session_event, encode_session_event,
@@ -3247,38 +3248,6 @@ async fn validate_storage_writer_contract(db: &dyn Database) -> SessionDbResult<
     validate_storage_writer_contract_for_epoch(db, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await
 }
 
-async fn validate_context_occupancy_precondition(
-    db: &dyn Database,
-    event: &SessionEvent,
-) -> SessionDbResult<()> {
-    let row = db
-        .select("context_occupancy_projection")
-        .columns(&["schema_version"])
-        .where_eq("projection_id", CONTEXT_OCCUPANCY_PROJECTION_ID)
-        .execute_first(db)
-        .await?;
-    let Some(row) = row.as_ref() else {
-        if event.sequence == 0 {
-            return Ok(());
-        }
-        return Err(SessionDbError::ProjectionStale {
-            projection: MaterializedProjection::RequestContextOccupancy.as_str(),
-            checkpoint: None,
-            expected: event.sequence.saturating_sub(1),
-        });
-    };
-    let actual = required_i64(row, "schema_version").map(i64_to_u64)?;
-    let expected = u64::from(CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION);
-    if actual != expected {
-        return Err(SessionDbError::ProjectionIncompatible {
-            projection: MaterializedProjection::RequestContextOccupancy.as_str(),
-            actual,
-            expected,
-        });
-    }
-    Ok(())
-}
-
 async fn validate_session_compatibility_precondition(
     db: &dyn Database,
     canonical_tail: Option<u64>,
@@ -3343,7 +3312,13 @@ async fn validate_append_preconditions_without_writer(
         MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION,
     )
     .await?;
-    validate_context_occupancy_precondition(db, event).await?;
+    validate_context_occupancy_precondition(
+        db,
+        event,
+        CONTEXT_OCCUPANCY_PROJECTION_ID,
+        CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION,
+    )
+    .await?;
     validate_session_compatibility_precondition(db, canonical_tail).await?;
     if let Some(expected) = canonical_tail {
         let snapshot = projection_checkpoint_snapshot(db).await?;
@@ -3390,7 +3365,13 @@ async fn validate_append_postconditions(
             expected: event.sequence,
         });
     }
-    validate_context_occupancy_precondition(db, event).await
+    validate_context_occupancy_precondition(
+        db,
+        event,
+        CONTEXT_OCCUPANCY_PROJECTION_ID,
+        CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION,
+    )
+    .await
 }
 
 async fn project_migration_model_context_event(

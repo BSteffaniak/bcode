@@ -7,6 +7,40 @@ use bcode_session_models::{SessionEvent, SessionId};
 use std::collections::BTreeMap;
 use switchy::database::{Database, query::FilterableQuery};
 
+pub async fn validate_context_occupancy_precondition(
+    db: &dyn Database,
+    event: &SessionEvent,
+    projection_id: i32,
+    schema_version: u32,
+) -> SessionDbResult<()> {
+    let row = db
+        .select("context_occupancy_projection")
+        .columns(&["schema_version"])
+        .where_eq("projection_id", projection_id)
+        .execute_first(db)
+        .await?;
+    let Some(row) = row.as_ref() else {
+        if event.sequence == 0 {
+            return Ok(());
+        }
+        return Err(SessionDbError::ProjectionStale {
+            projection: MaterializedProjection::RequestContextOccupancy.as_str(),
+            checkpoint: None,
+            expected: event.sequence.saturating_sub(1),
+        });
+    };
+    let actual = required_i64(row, "schema_version").map(i64_to_u64)?;
+    let expected = u64::from(schema_version);
+    if actual != expected {
+        return Err(SessionDbError::ProjectionIncompatible {
+            projection: MaterializedProjection::RequestContextOccupancy.as_str(),
+            actual,
+            expected,
+        });
+    }
+    Ok(())
+}
+
 pub async fn validate_model_context_precondition(
     db: &dyn Database,
     event: &SessionEvent,
