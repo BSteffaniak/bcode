@@ -36764,6 +36764,7 @@ library = "test"
                 from: "first".to_string(),
                 to: "second".to_string(),
                 kind: bcode_workflow::EdgeKind::Retry { max_attempts: 2 },
+                transform: None,
             }],
         };
         let fail_fast = bcode_workflow::WorkflowDefinition {
@@ -36843,6 +36844,7 @@ library = "test"
                 from: "source".to_string(),
                 to: "target".to_string(),
                 kind: bcode_workflow::EdgeKind::Direct,
+                transform: None,
             }],
         };
         for (definition_id, definition) in [
@@ -37195,11 +37197,13 @@ library = "test"
                     from: "left".to_string(),
                     to: "join".to_string(),
                     kind: bcode_workflow::EdgeKind::Direct,
+                    transform: None,
                 },
                 bcode_workflow::EdgeDefinition {
                     from: "right".to_string(),
                     to: "join".to_string(),
                     kind: bcode_workflow::EdgeKind::Direct,
+                    transform: None,
                 },
             ],
         };
@@ -37803,6 +37807,7 @@ library = "test"
                         from: "loop.implementation".to_string(),
                         to: "loop.repeat".to_string(),
                         kind: bcode_workflow::EdgeKind::Direct,
+                        transform: None,
                     },
                     bcode_workflow::EdgeDefinition {
                         from: "loop.repeat".to_string(),
@@ -37814,6 +37819,7 @@ library = "test"
                             },
                             max_iterations: 2,
                         },
+                        transform: None,
                     },
                 ],
             };
@@ -39223,6 +39229,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 from: "shared.implementation".to_string(),
                 to: "shared.evaluation".to_string(),
                 kind: bcode_workflow::EdgeKind::Direct,
+                transform: None,
             }],
         };
         let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
@@ -39407,11 +39414,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     from: "loop.implementation".to_string(),
                     to: "loop.evaluation".to_string(),
                     kind: bcode_workflow::EdgeKind::Direct,
+                    transform: None,
                 },
                 bcode_workflow::EdgeDefinition {
                     from: "loop.evaluation".to_string(),
                     to: "loop.repeat".to_string(),
                     kind: bcode_workflow::EdgeKind::Direct,
+                    transform: None,
                 },
                 bcode_workflow::EdgeDefinition {
                     from: "loop.repeat".to_string(),
@@ -39420,6 +39429,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         predicate,
                         max_iterations: 3,
                     },
+                    transform: None,
                 },
             ],
         };
@@ -39593,6 +39603,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     from: "seed".to_string(),
                     to: "repeat".to_string(),
                     kind: bcode_workflow::EdgeKind::Direct,
+                    transform: None,
                 },
                 bcode_workflow::EdgeDefinition {
                     from: "repeat".to_string(),
@@ -39604,6 +39615,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                             .clone(),
                         max_iterations: 2,
                     },
+                    transform: None,
                 },
             ],
         };

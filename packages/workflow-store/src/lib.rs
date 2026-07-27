@@ -2858,6 +2858,32 @@ impl WorkflowStore {
                         edge.to
                     ))
                 })?;
+                let transformed_input = if let Some(transform) = &edge.transform {
+                    let run_input_json: Option<String> = transaction.query_row(
+                        "SELECT input_json FROM workflow_runs WHERE run_id = ?1",
+                        [&activation.run_id],
+                        |row| row.get(0),
+                    )?;
+                    let run_input = run_input_json
+                        .as_deref()
+                        .map(serde_json::from_str)
+                        .transpose()?
+                        .unwrap_or(serde_json::Value::Null);
+                    transform
+                        .evaluate(&[
+                            bcode_workflow::WorkflowTransformInput {
+                                name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                                value: input,
+                            },
+                            bcode_workflow::WorkflowTransformInput {
+                                name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_STATE,
+                                value: &run_input,
+                            },
+                        ])
+                        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+                } else {
+                    input.clone()
+                };
                 let next = NewActivation {
                     run_id: activation.run_id.clone(),
                     node_id: edge.to.clone(),
@@ -2867,13 +2893,13 @@ impl WorkflowStore {
                         next_generation,
                     ),
                     dependency_generation: next_generation,
-                    input: Some(input.clone()),
+                    input: Some(transformed_input.clone()),
                     created_at_ms: settled_at_ms,
                 };
                 validate_json_schema(
                     &format!("workflow repeat input for node {}", node.id),
                     &node.input.schema,
-                    input,
+                    &transformed_input,
                 )?;
                 insert_activation_with_status(
                     &transaction,
@@ -3796,6 +3822,32 @@ fn activation_output_value(
     Ok(serde_json::from_str(&value_json)?)
 }
 
+fn parallel_join_members(
+    transaction: &Transaction<'_>,
+    definition: &WorkflowDefinition,
+    run_id: &str,
+    target: &bcode_workflow::NodeDefinition,
+    generation: u64,
+) -> Result<(serde_json::Value, serde_json::Value), WorkflowStoreError> {
+    let member = |field: &str| {
+        let exits = configured_node_ids(&target.configuration, field)?;
+        exits
+            .iter()
+            .find_map(|node_id| {
+                definition.node(node_id).and_then(|_| {
+                    activation_output_value(transaction, run_id, node_id, generation).ok()
+                })
+            })
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "parallel join {} has no completed {field} member output",
+                    target.id
+                ))
+            })
+    };
+    Ok((member("left_exits")?, member("right_exits")?))
+}
+
 fn activation_input(
     transaction: &Transaction<'_>,
     definition: &WorkflowDefinition,
@@ -3803,36 +3855,56 @@ fn activation_input(
     target: &bcode_workflow::NodeDefinition,
     generation: u64,
 ) -> Result<serde_json::Value, WorkflowStoreError> {
-    let input = if target.kind == bcode_workflow::NodeKind::Repeat {
-        let mut input = output.value.clone();
-        let iteration = input.get("iteration").and_then(serde_json::Value::as_u64);
-        if let Some(iteration) = iteration {
-            input["iteration"] = serde_json::json!(iteration.saturating_add(1));
+    let edge_transform = definition
+        .edges
+        .iter()
+        .find(|edge| edge.from == output.node_id && edge.to == target.id)
+        .and_then(|edge| edge.transform.as_ref());
+    let input = if let Some(transform) = edge_transform {
+        let run_input_json: Option<String> = transaction.query_row(
+            "SELECT input_json FROM workflow_runs WHERE run_id = ?1",
+            [&output.run_id],
+            |row| row.get(0),
+        )?;
+        let run_input = run_input_json
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?
+            .unwrap_or(serde_json::Value::Null);
+        let join_members = (target.kind == bcode_workflow::NodeKind::Parallel)
+            .then(|| {
+                parallel_join_members(transaction, definition, &output.run_id, target, generation)
+            })
+            .transpose()?;
+        let mut inputs = vec![
+            bcode_workflow::WorkflowTransformInput {
+                name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                value: &output.value,
+            },
+            bcode_workflow::WorkflowTransformInput {
+                name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_STATE,
+                value: &run_input,
+            },
+        ];
+        if let Some((left, right)) = &join_members {
+            inputs.extend([
+                bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_JOIN_LEFT,
+                    value: left,
+                },
+                bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_JOIN_RIGHT,
+                    value: right,
+                },
+            ]);
         }
-        input
+        transform
+            .evaluate(&inputs)
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
     } else if target.kind == bcode_workflow::NodeKind::Parallel {
-        let left_exits = configured_node_ids(&target.configuration, "left_exits")?;
-        let right_exits = configured_node_ids(&target.configuration, "right_exits")?;
-        let branch_value = |exits: &[String]| {
-            exits
-                .iter()
-                .find_map(|node_id| {
-                    definition.node(node_id).and_then(|_| {
-                        activation_output_value(transaction, &output.run_id, node_id, generation)
-                            .ok()
-                    })
-                })
-                .ok_or_else(|| {
-                    WorkflowStoreError::InvalidData(format!(
-                        "parallel join {} has no completed branch output",
-                        target.id
-                    ))
-                })
-        };
-        serde_json::Value::Array(vec![
-            branch_value(&left_exits)?,
-            branch_value(&right_exits)?,
-        ])
+        let (left, right) =
+            parallel_join_members(transaction, definition, &output.run_id, target, generation)?;
+        serde_json::Value::Array(vec![left, right])
     } else {
         output.value.clone()
     };
@@ -3873,6 +3945,18 @@ fn materialize_direct_successors(
         })
         .map(|edge| edge.to.clone())
         .collect::<Vec<_>>();
+    for target in &targets {
+        if definition
+            .node(target)
+            .is_some_and(|node| node.kind == bcode_workflow::NodeKind::Parallel)
+        {
+            bcode_workflow::validate_parallel_join_configuration(
+                &definition,
+                definition.node(target).expect("checked"),
+            )
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        }
+    }
     if let Some(branch) = definition
         .node(&output.node_id)
         .filter(|node| node.kind == bcode_workflow::NodeKind::Branch)
@@ -5589,6 +5673,34 @@ mod tests {
         workflow.definition().clone()
     }
 
+    fn parallel_join_transform_definition() -> WorkflowDefinition {
+        let mut definition = parallel_join_definition();
+        let tuple_schema = bcode_workflow::ValueSchema::of::<(u32, u32)>();
+        for edge in &mut definition.edges {
+            if edge.to == "join" {
+                edge.transform = Some(bcode_workflow::WorkflowTransform {
+                    version: bcode_workflow::WORKFLOW_TRANSFORM_VERSION,
+                    expression: bcode_workflow::WorkflowTransformExpression::Array {
+                        items: vec![
+                            bcode_workflow::WorkflowTransformExpression::Input {
+                                source: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_JOIN_LEFT
+                                    .to_string(),
+                                path: String::new(),
+                            },
+                            bcode_workflow::WorkflowTransformExpression::Input {
+                                source: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_JOIN_RIGHT
+                                    .to_string(),
+                                path: String::new(),
+                            },
+                        ],
+                    },
+                    output: tuple_schema.clone(),
+                });
+            }
+        }
+        definition
+    }
+
     fn conditional_definition() -> WorkflowDefinition {
         let inspect = Step::task("inspect", |value: u32, _context| async move { Ok(value) });
         let selected = Step::task("selected", |value: u32, _context| async move { Ok(value) });
@@ -6971,6 +7083,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn durable_input_gate_waits_validates_and_activates_successor() {
         let (_temp, mut store) = initialized_store();
         let schema = bcode_workflow::ValueSchema {
@@ -7014,6 +7127,7 @@ mod tests {
                 from: "input".to_string(),
                 to: "next".to_string(),
                 kind: bcode_workflow::EdgeKind::Direct,
+                transform: None,
             }],
         };
         store
@@ -7119,6 +7233,7 @@ mod tests {
                 from: "approve".to_string(),
                 to: "mutate".to_string(),
                 kind: bcode_workflow::EdgeKind::Direct,
+                transform: None,
             }],
         };
         store
@@ -7761,6 +7876,16 @@ mod tests {
                 "iteration": {"const": 1}
             }
         });
+        let back_edge = definition
+            .edges
+            .iter_mut()
+            .find(|edge| matches!(edge.kind, bcode_workflow::EdgeKind::Back { .. }))
+            .expect("back edge");
+        back_edge
+            .transform
+            .as_mut()
+            .expect("repeat transform")
+            .output = definition.nodes["body"].input.clone();
         store
             .persist_definition("invalid-repeat", 1, &definition)
             .expect("definition");
@@ -7796,7 +7921,7 @@ mod tests {
         let error = store
             .settle_pending_control_nodes(&run.run_id, 10, 3)
             .expect_err("repeat target mismatch");
-        assert!(error.to_string().contains("workflow repeat input"));
+        assert!(error.to_string().contains("transform output"));
         assert!(
             store
                 .pending_activations(10)
@@ -8018,6 +8143,105 @@ mod tests {
             )
             .expect("join count");
         assert_eq!(join_count, 1);
+    }
+
+    #[test]
+    fn transformed_parallel_join_is_deterministic_across_store_restart() {
+        let temp = tempfile::tempdir().expect("temp");
+        let definition = parallel_join_transform_definition();
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("parallel-transform", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.run_id = "parallel-transform-run".to_string();
+        run.definition_id = "parallel-transform".to_string();
+        store.create_run(&run).expect("run");
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "right-output".to_string(),
+                run_id: run.run_id.clone(),
+                node_id: "right".to_string(),
+                activation_id: activation_identity(&run.run_id, "right", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(20),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect("first member");
+        drop(store);
+
+        let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let result = reopened
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "left-output".to_string(),
+                run_id: run.run_id.clone(),
+                node_id: "left".to_string(),
+                activation_id: activation_identity(&run.run_id, "left", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(10),
+                artifact_reference: None,
+                created_at_ms: 21,
+            })
+            .expect("second member");
+        assert_eq!(result.activated.len(), 1);
+        assert_eq!(result.activated[0].node_id, "join");
+        assert_eq!(result.activated[0].input, Some(serde_json::json!([10, 20])));
+    }
+
+    #[test]
+    fn parallel_join_rejects_ambiguous_member_configuration_atomically() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut definition = parallel_join_definition();
+        definition
+            .nodes
+            .get_mut("join")
+            .expect("join")
+            .configuration["right_exits"] = serde_json::json!(["left"]);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("ambiguous-parallel", 1, &definition)
+            .expect("definition");
+        let mut run = new_run();
+        run.run_id = "ambiguous-parallel-run".to_string();
+        run.definition_id = "ambiguous-parallel".to_string();
+        store.create_run(&run).expect("run");
+        let output_count = |store: &WorkflowStore| {
+            store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_outputs WHERE run_id = 'ambiguous-parallel-run'",
+                    [],
+                    |row| row.get::<_, u64>(0),
+                )
+                .expect("output count")
+        };
+        let error = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "left-output".to_string(),
+                run_id: run.run_id.clone(),
+                node_id: "left".to_string(),
+                activation_id: activation_identity(&run.run_id, "left", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(10),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect_err("ambiguous members");
+        assert!(error.to_string().contains("exactly one side"));
+        assert_eq!(output_count(&store), 0);
+        assert_eq!(
+            store
+                .pending_activations(10)
+                .expect("pending")
+                .iter()
+                .filter(|activation| activation.node_id == "join")
+                .count(),
+            0
+        );
     }
 
     #[test]

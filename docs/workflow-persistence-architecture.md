@@ -72,6 +72,12 @@ successors. Validation occurs in the same transaction as output completion and s
 materialization, so a mismatch leaves the source activation/output and target activation unchanged.
 
 
+Canonical parallel joins declare non-empty, disjoint `left_exits` and `right_exits` sets whose
+members have direct edges to the join. Durable materialization always serializes the tuple as
+`[left, right]`, independent of branch completion order. A join-edge transform can address those
+same persisted values through the stable `join.left` and `join.right` source names. Other transforms
+can address the selecting node output as `current` and immutable run input as `state`.
+
 Canonical state transitions and required projections commit atomically. In particular:
 
 1. Persist prepared external-operation intent before dispatch.

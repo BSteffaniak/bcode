@@ -980,6 +980,15 @@ impl ArtifactReference {
 /// Stable durable transform contract version.
 pub const WORKFLOW_TRANSFORM_VERSION: u32 = 1;
 
+/// Durable transform source containing the output that selected the successor edge.
+pub const WORKFLOW_TRANSFORM_SOURCE_CURRENT: &str = "current";
+/// Durable transform source containing the immutable workflow run input.
+pub const WORKFLOW_TRANSFORM_SOURCE_STATE: &str = "state";
+/// Durable transform source containing the left member of a completed parallel join.
+pub const WORKFLOW_TRANSFORM_SOURCE_JOIN_LEFT: &str = "join.left";
+/// Durable transform source containing the right member of a completed parallel join.
+pub const WORKFLOW_TRANSFORM_SOURCE_JOIN_RIGHT: &str = "join.right";
+
 const MAX_TRANSFORM_DEPTH: usize = 16;
 const MAX_TRANSFORM_OPERATIONS: usize = 256;
 const MAX_TRANSFORM_FIELDS: usize = 256;
@@ -1572,7 +1581,7 @@ impl WorkflowProductionCapabilities {
             capability_version: WORKFLOW_PRODUCTION_CAPABILITY_VERSION,
             definition_schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
             predicate_version: WORKFLOW_PREDICATE_VERSION,
-            transform_version: None,
+            transform_version: Some(WORKFLOW_TRANSFORM_VERSION),
             automatic_retry_policy_version: None,
             agent_configuration_version: 1,
             workflow_block_interface_version: WORKFLOW_BLOCK_INTERFACE_VERSION,
@@ -1581,7 +1590,7 @@ impl WorkflowProductionCapabilities {
             parallel_join_policies: BTreeSet::from([ParallelFailurePolicy::WaitAll]),
             automatic_retry: WorkflowCapabilitySupport::Unsupported,
             fan_out: WorkflowCapabilitySupport::Unsupported,
-            transforms: WorkflowCapabilitySupport::Unsupported,
+            transforms: WorkflowCapabilitySupport::Supported,
             artifact_references: WorkflowCapabilitySupport::Supported,
             agent_execution_targets: BTreeSet::from([
                 AgentExecutionTarget::FreshIsolated,
@@ -1647,6 +1656,9 @@ pub struct EdgeDefinition {
     /// Control-flow behavior for this edge.
     #[serde(default)]
     pub kind: EdgeKind,
+    /// Optional bounded declarative mapping evaluated before target activation insertion.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<WorkflowTransform>,
 }
 
 /// Serializable workflow edge behavior category used by production capability admission.
@@ -1823,6 +1835,10 @@ pub enum TransformMergeConflict {
 #[derive(Debug, Clone, Copy)]
 pub struct WorkflowTransformInput<'a> {
     /// Stable source name referenced by [`WorkflowTransformExpression::Input`].
+    ///
+    /// Durable hosts expose [`WORKFLOW_TRANSFORM_SOURCE_CURRENT`],
+    /// [`WORKFLOW_TRANSFORM_SOURCE_STATE`], and, for a completed parallel join,
+    /// [`WORKFLOW_TRANSFORM_SOURCE_JOIN_LEFT`] and [`WORKFLOW_TRANSFORM_SOURCE_JOIN_RIGHT`].
     pub name: &'a str,
     /// Source value.
     pub value: &'a serde_json::Value,
@@ -1854,6 +1870,8 @@ pub enum WorkflowTransformExpression {
         objects: Vec<Self>,
         conflict: TransformMergeConflict,
     },
+    /// Add a signed integer delta to one integer expression.
+    Increment { value: Box<Self>, by: i64 },
     /// Select an optional value and evaluate a deterministic default when absent or null.
     Default {
         value: Box<Self>,
@@ -1981,6 +1999,9 @@ fn validate_transform_expression(
                 validate_transform_expression(value, depth + 1, operations)?;
             }
         }
+        WorkflowTransformExpression::Increment { value, .. } => {
+            validate_transform_expression(value, depth + 1, operations)?;
+        }
         WorkflowTransformExpression::Default { value, default } => {
             validate_transform_expression(value, depth + 1, operations)?;
             validate_transform_expression(default, depth + 1, operations)?;
@@ -2075,6 +2096,20 @@ fn evaluate_transform_expression(
             }
             Ok(serde_json::Value::Object(merged))
         }
+        WorkflowTransformExpression::Increment { value, by } => {
+            let value = evaluate_transform_expression(value, inputs, depth + 1, operations)?;
+            let value = value.as_i64().ok_or_else(|| WorkflowError::Build {
+                path: "transform.increment".to_string(),
+                message: "transform increment input must be a signed integer".to_string(),
+            })?;
+            value
+                .checked_add(*by)
+                .map(serde_json::Value::from)
+                .ok_or_else(|| WorkflowError::Build {
+                    path: "transform.increment".to_string(),
+                    message: "transform increment overflow".to_string(),
+                })
+        }
         WorkflowTransformExpression::Default { value, default } => {
             match evaluate_transform_expression(value, inputs, depth + 1, operations) {
                 Ok(serde_json::Value::Null) => {
@@ -2096,6 +2131,7 @@ fn ensure_transform_value_bound(
     path: &str,
     value: &serde_json::Value,
 ) -> Result<(), WorkflowError> {
+    validate_transform_json_depth(path, value, 0)?;
     let bytes = serde_json::to_vec(value).map_err(|error| WorkflowError::Build {
         path: path.to_string(),
         message: error.to_string(),
@@ -2105,6 +2141,33 @@ fn ensure_transform_value_bound(
             path: path.to_string(),
             message: format!("transform value exceeds {MAX_TRANSFORM_VALUE_BYTES} bytes"),
         });
+    }
+    Ok(())
+}
+
+fn validate_transform_json_depth(
+    path: &str,
+    value: &serde_json::Value,
+    depth: usize,
+) -> Result<(), WorkflowError> {
+    if depth > MAX_TRANSFORM_DEPTH {
+        return Err(WorkflowError::Build {
+            path: path.to_string(),
+            message: format!("transform JSON depth exceeds {MAX_TRANSFORM_DEPTH}"),
+        });
+    }
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                validate_transform_json_depth(path, item, depth + 1)?;
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            for item in fields.values() {
+                validate_transform_json_depth(path, item, depth + 1)?;
+            }
+        }
+        _ => {}
     }
     Ok(())
 }
@@ -2207,6 +2270,13 @@ impl WorkflowDefinition {
                         ),
                     });
                 }
+                if let Err(error) = validate_parallel_join_configuration(self, node) {
+                    diagnostics.push(WorkflowCapabilityDiagnostic {
+                        code: "invalid_parallel_join_configuration".to_string(),
+                        node_id: Some(node.id.clone()),
+                        message: error.to_string(),
+                    });
+                }
                 match serde_json::from_value::<ParallelFailurePolicy>(
                     node.configuration
                         .get("failure_policy")
@@ -2237,6 +2307,47 @@ impl WorkflowDefinition {
             }
         }
         for edge in &self.edges {
+            if let Some(transform) = &edge.transform {
+                if capabilities.transforms != WorkflowCapabilitySupport::Supported {
+                    diagnostics.push(WorkflowCapabilityDiagnostic {
+                        code: "unsupported_transform".to_string(),
+                        node_id: Some(edge.from.clone()),
+                        message: format!(
+                            "edge '{} -> {}' uses transforms but the production host does not support them",
+                            edge.from, edge.to
+                        ),
+                    });
+                }
+                if capabilities.transform_version != Some(transform.version) {
+                    diagnostics.push(WorkflowCapabilityDiagnostic {
+                        code: "unsupported_transform_version".to_string(),
+                        node_id: Some(edge.from.clone()),
+                        message: format!(
+                            "edge '{} -> {}' uses unsupported transform version {}",
+                            edge.from, edge.to, transform.version
+                        ),
+                    });
+                }
+                if let Err(error) = transform.validate() {
+                    diagnostics.push(WorkflowCapabilityDiagnostic {
+                        code: "invalid_transform".to_string(),
+                        node_id: Some(edge.from.clone()),
+                        message: error.to_string(),
+                    });
+                }
+                if let Some(target) = self.node(&edge.to)
+                    && transform.output != target.input
+                {
+                    diagnostics.push(WorkflowCapabilityDiagnostic {
+                        code: "transform_target_schema_mismatch".to_string(),
+                        node_id: Some(edge.from.clone()),
+                        message: format!(
+                            "edge '{} -> {}' transform output '{}' does not exactly match target input '{}'",
+                            edge.from, edge.to, transform.output.type_name, target.input.type_name
+                        ),
+                    });
+                }
+            }
             validate_production_edge_schema(self, edge, &mut diagnostics);
             if capabilities.edge_support(edge.kind.capability_kind())
                 != WorkflowCapabilitySupport::Supported
@@ -2323,6 +2434,7 @@ impl DefinitionFragment {
                     from: from.clone(),
                     to: to.clone(),
                     kind: EdgeKind::Direct,
+                    transform: None,
                 });
             }
         }
@@ -2678,6 +2790,7 @@ where
     /// The output type is also the next iteration's input, and `max_iterations` includes the
     /// initial execution. A zero iteration limit is rejected when the workflow is built.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn repeat_while(
         self,
         name: impl Into<String>,
@@ -2705,6 +2818,7 @@ where
             configuration: serde_json::json!({
                 "predicate": expression,
                 "max_iterations": max_iterations,
+                "iteration_state": "explicit_back_edge_transform",
             }),
         });
         for exit in &body_exits {
@@ -2712,8 +2826,35 @@ where
                 from: exit.clone(),
                 to: repeat_id.clone(),
                 kind: EdgeKind::Direct,
+                transform: None,
             });
         }
+        let iteration_transform =
+            (ValueSchema::of::<O>() == ValueSchema::of::<I>()).then(|| WorkflowTransform {
+                version: WORKFLOW_TRANSFORM_VERSION,
+                expression: WorkflowTransformExpression::Merge {
+                    objects: vec![
+                        WorkflowTransformExpression::Input {
+                            source: "current".to_string(),
+                            path: String::new(),
+                        },
+                        WorkflowTransformExpression::Object {
+                            fields: BTreeMap::from([(
+                                "iteration".to_string(),
+                                WorkflowTransformExpression::Increment {
+                                    value: Box::new(WorkflowTransformExpression::Input {
+                                        source: "current".to_string(),
+                                        path: "iteration".to_string(),
+                                    }),
+                                    by: 1,
+                                },
+                            )]),
+                        },
+                    ],
+                    conflict: TransformMergeConflict::KeepLast,
+                },
+                output: ValueSchema::of::<I>(),
+            });
         for entry in &body_entries {
             fragment.edges.push(EdgeDefinition {
                 from: repeat_id.clone(),
@@ -2722,6 +2863,7 @@ where
                     predicate: expression.clone(),
                     max_iterations,
                 },
+                transform: iteration_transform.clone(),
             });
         }
         fragment.exits = vec![repeat_id.clone()];
@@ -2837,6 +2979,7 @@ where
                 from: exit.clone(),
                 to: branch_id.clone(),
                 kind: EdgeKind::Direct,
+                transform: None,
             });
         }
         for entry in &when_true.fragment.entries {
@@ -2847,6 +2990,7 @@ where
                     predicate: expression.clone(),
                     expected: true,
                 },
+                transform: None,
             });
         }
         for entry in &when_false.fragment.entries {
@@ -2857,6 +3001,7 @@ where
                     predicate: expression.clone(),
                     expected: false,
                 },
+                transform: None,
             });
         }
         fragment.nodes.push(NodeDefinition {
@@ -2943,6 +3088,7 @@ where
                 from: exit.clone(),
                 to: retry_id.clone(),
                 kind: EdgeKind::Direct,
+                transform: None,
             });
         }
         for entry in &body_entries {
@@ -2950,6 +3096,7 @@ where
                 from: retry_id.clone(),
                 to: entry.clone(),
                 kind: EdgeKind::Retry { max_attempts },
+                transform: None,
             });
         }
         fragment.nodes.push(NodeDefinition {
@@ -3088,6 +3235,7 @@ where
             from: exit.clone(),
             to: fan_out_id.clone(),
             kind: EdgeKind::Direct,
+            transform: None,
         });
     }
     body.nodes.push(NodeDefinition {
@@ -3267,6 +3415,7 @@ where
             from: exit.clone(),
             to: join_id.clone(),
             kind: EdgeKind::Direct,
+            transform: None,
         });
     }
     let mut entries = left_fragment.entries;
@@ -3778,6 +3927,18 @@ where
                 ),
             });
         }
+        if let Some(transform) = &edge.transform {
+            transform.validate()?;
+            if transform.output != nodes[&edge.to].input {
+                return Err(WorkflowError::Build {
+                    path: edge.from.clone(),
+                    message: format!(
+                        "edge transform output does not match target input for '{} -> {}'",
+                        edge.from, edge.to
+                    ),
+                });
+            }
+        }
         if matches!(
             &edge.kind,
             EdgeKind::Back {
@@ -3871,6 +4032,18 @@ fn validate_compiled_definition(definition: &WorkflowDefinition) -> Result<(), W
                 ),
             });
         }
+        if let Some(transform) = &edge.transform {
+            transform.validate()?;
+            if transform.output != definition.nodes[&edge.to].input {
+                return Err(WorkflowError::Build {
+                    path: edge.from.clone(),
+                    message: format!(
+                        "edge transform output does not match target input for '{} -> {}'",
+                        edge.from, edge.to
+                    ),
+                });
+            }
+        }
         if matches!(
             edge.kind,
             EdgeKind::Back {
@@ -3904,6 +4077,9 @@ fn validate_production_edge_schema(
     let Some(target) = definition.node(&edge.to) else {
         return;
     };
+    if edge.transform.is_some() {
+        return;
+    }
     let compatible = match edge.kind {
         EdgeKind::Direct | EdgeKind::Conditional { .. } => {
             if target.kind == NodeKind::Parallel {
@@ -4012,6 +4188,70 @@ fn validate_predicate_expression(expression: &PredicateExpression) -> Result<(),
                     message: "predicate value exceeds 65536 bytes".to_string(),
                 });
             }
+        }
+    }
+    Ok(())
+}
+
+/// Validate one parallel node's canonical left/right join membership declaration.
+///
+/// # Errors
+///
+/// Returns an error when member lists are missing, empty, duplicated, overlapping, reference
+/// unknown nodes, or do not correspond to direct member-to-join edges.
+pub fn validate_parallel_join_configuration(
+    definition: &WorkflowDefinition,
+    node: &NodeDefinition,
+) -> Result<(), WorkflowError> {
+    let invalid = |message: String| WorkflowError::Build {
+        path: node.id.clone(),
+        message,
+    };
+    let configured = |field: &str| -> Result<Vec<&str>, WorkflowError> {
+        let values = node
+            .configuration
+            .get(field)
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "parallel join must declare '{field}' as a non-empty array"
+                ))
+            })?;
+        if values.is_empty() {
+            return Err(invalid(format!(
+                "parallel join '{field}' must not be empty"
+            )));
+        }
+        values
+            .iter()
+            .map(|value| {
+                value.as_str().ok_or_else(|| {
+                    invalid(format!("parallel join '{field}' must contain node IDs"))
+                })
+            })
+            .collect()
+    };
+    let left = configured("left_exits")?;
+    let right = configured("right_exits")?;
+    let left_set = left.iter().copied().collect::<BTreeSet<_>>();
+    let right_set = right.iter().copied().collect::<BTreeSet<_>>();
+    if left_set.len() != left.len()
+        || right_set.len() != right.len()
+        || !left_set.is_disjoint(&right_set)
+    {
+        return Err(invalid(
+            "parallel join members must be unique and belong to exactly one side".to_string(),
+        ));
+    }
+    for member in left.into_iter().chain(right) {
+        if !definition.nodes.contains_key(member)
+            || !definition.edges.iter().any(|edge| {
+                edge.from == member && edge.to == node.id && matches!(edge.kind, EdgeKind::Direct)
+            })
+        {
+            return Err(invalid(format!(
+                "parallel join member '{member}' must exist and have a direct edge to the join"
+            )));
         }
     }
     Ok(())
@@ -4177,7 +4417,7 @@ mod tests {
         assert_eq!(capabilities.fan_out, WorkflowCapabilitySupport::Unsupported);
         assert_eq!(
             capabilities.transforms,
-            WorkflowCapabilitySupport::Unsupported
+            WorkflowCapabilitySupport::Supported
         );
         assert_eq!(
             capabilities.artifact_references,
@@ -4260,6 +4500,7 @@ mod tests {
                 from: "first".to_string(),
                 to: "second".to_string(),
                 kind: EdgeKind::Retry { max_attempts: 2 },
+                transform: None,
             }],
         };
         let admission = definition
@@ -4430,6 +4671,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn declarative_transform_rejects_unknown_sources_versions_depth_and_output_mismatch() {
         let output = ValueSchema::of::<u32>();
         let unknown = WorkflowTransform {
@@ -4471,6 +4713,107 @@ mod tests {
                 output,
             }
             .evaluate(&[])
+            .is_err()
+        );
+
+        let oversized_constant = WorkflowTransform {
+            version: WORKFLOW_TRANSFORM_VERSION,
+            expression: WorkflowTransformExpression::Constant {
+                value: serde_json::json!("x".repeat(MAX_TRANSFORM_VALUE_BYTES)),
+            },
+            output: ValueSchema::of::<String>(),
+        };
+        assert!(oversized_constant.validate().is_err());
+
+        let too_many_fields = WorkflowTransform {
+            version: WORKFLOW_TRANSFORM_VERSION,
+            expression: WorkflowTransformExpression::Object {
+                fields: (0..=MAX_TRANSFORM_FIELDS)
+                    .map(|index| {
+                        (
+                            format!("field-{index}"),
+                            WorkflowTransformExpression::Constant {
+                                value: serde_json::Value::Null,
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+            output: ValueSchema {
+                type_name: "object".to_string(),
+                schema: serde_json::json!({"type": "object"}),
+            },
+        };
+        assert!(too_many_fields.validate().is_err());
+
+        let too_many_items = WorkflowTransform {
+            version: WORKFLOW_TRANSFORM_VERSION,
+            expression: WorkflowTransformExpression::Array {
+                items: (0..=MAX_TRANSFORM_FIELDS)
+                    .map(|_| WorkflowTransformExpression::Constant {
+                        value: serde_json::Value::Null,
+                    })
+                    .collect(),
+            },
+            output: ValueSchema {
+                type_name: "array".to_string(),
+                schema: serde_json::json!({"type": "array"}),
+            },
+        };
+        assert!(too_many_items.validate().is_err());
+
+        let too_many_operations = WorkflowTransform {
+            version: WORKFLOW_TRANSFORM_VERSION,
+            expression: WorkflowTransformExpression::Object {
+                fields: (0..MAX_TRANSFORM_FIELDS)
+                    .map(|index| {
+                        (
+                            format!("field-{index}"),
+                            WorkflowTransformExpression::Default {
+                                value: Box::new(WorkflowTransformExpression::Constant {
+                                    value: serde_json::Value::Null,
+                                }),
+                                default: Box::new(WorkflowTransformExpression::Constant {
+                                    value: serde_json::Value::Null,
+                                }),
+                            },
+                        )
+                    })
+                    .collect(),
+            },
+            output: ValueSchema {
+                type_name: "object".to_string(),
+                schema: serde_json::json!({"type": "object"}),
+            },
+        };
+        assert!(too_many_operations.validate().is_err());
+
+        let overflow = WorkflowTransform {
+            version: WORKFLOW_TRANSFORM_VERSION,
+            expression: WorkflowTransformExpression::Increment {
+                value: Box::new(WorkflowTransformExpression::Constant {
+                    value: serde_json::json!(i64::MAX),
+                }),
+                by: 1,
+            },
+            output: ValueSchema::of::<i64>(),
+        };
+        assert!(overflow.evaluate(&[]).is_err());
+
+        let mut nested_json = serde_json::Value::Null;
+        for _ in 0..=MAX_TRANSFORM_DEPTH {
+            nested_json = serde_json::Value::Array(vec![nested_json]);
+        }
+        assert!(
+            WorkflowTransform {
+                version: WORKFLOW_TRANSFORM_VERSION,
+                expression: WorkflowTransformExpression::Constant { value: nested_json },
+                output: ValueSchema {
+                    type_name: "array".to_string(),
+                    schema: serde_json::json!({"type": "array"}),
+                },
+            }
+            .validate()
             .is_err()
         );
 
@@ -4537,6 +4880,7 @@ mod tests {
                 from: "source".to_string(),
                 to: "target".to_string(),
                 kind: EdgeKind::Direct,
+                transform: None,
             }],
         };
         let admission = definition
@@ -4545,6 +4889,29 @@ mod tests {
         assert!(admission.diagnostics.iter().any(|diagnostic| {
             diagnostic.code == "incompatible_edge_schema"
                 && diagnostic.node_id.as_deref() == Some("source")
+        }));
+    }
+
+    #[test]
+    fn production_admission_rejects_ambiguous_parallel_join_members() {
+        let left = Step::task("left", |value: u32, _context| async move { Ok(value) });
+        let right = Step::task("right", |value: u32, _context| async move { Ok(value) });
+        let mut definition = WorkflowBuilder::new("parallel", parallel_named("join", left, right))
+            .build()
+            .expect("workflow")
+            .definition()
+            .clone();
+        definition
+            .nodes
+            .get_mut("join")
+            .expect("join")
+            .configuration["right_exits"] = serde_json::json!(["left"]);
+        let admission = definition
+            .production_admission(&WorkflowProductionCapabilities::current())
+            .expect("admission");
+        assert!(admission.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "invalid_parallel_join_configuration"
+                && diagnostic.node_id.as_deref() == Some("join")
         }));
     }
 
@@ -4595,6 +4962,7 @@ mod tests {
                 from: "agent".to_string(),
                 to: "parallel".to_string(),
                 kind: EdgeKind::Direct,
+                transform: None,
             }],
         };
         let admission = definition
