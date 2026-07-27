@@ -7445,6 +7445,15 @@ fn session_live_event_description(event: &SessionLiveEvent) -> String {
         SessionLiveEventKind::ProviderStreamProgress { turn_id, event } => {
             format!("live provider progress ({turn_id}): {event:?}")
         }
+        SessionLiveEventKind::ToolPresentationUpdated { update } => format!(
+            "live tool presentation call={} identity={:?} generation={} revision={} schema={}@{}",
+            update.invocation_id,
+            update.identity,
+            update.generation,
+            update.revision,
+            update.schema,
+            update.schema_version
+        ),
         SessionLiveEventKind::ToolRequestDraft { event } => format!(
             "live tool request draft ({}) call={} generation={} revision={} bytes={} truncated={}",
             event.turn_id,

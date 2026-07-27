@@ -1526,7 +1526,7 @@ pub fn transcript_item_signature(
 
 pub fn terminal_elapsed_signature_fragment(item: &TranscriptItem) -> Option<String> {
     let timing = item.tool_timing()?;
-    if !item.streaming() {
+    if !item.tool_is_active() {
         return None;
     }
     let now_ms = unix_time_millis(std::time::SystemTime::now());
@@ -1582,6 +1582,7 @@ fn push_transcript_item_rows(
             tool_name,
             working_directory: _,
             timing: _,
+            active: _,
         } => {
             let context = ToolRequestRenderContext {
                 tool_call_id,
@@ -2140,6 +2141,24 @@ fn tui_help_markdown_renders_at_normal_and_constrained_widths() {
 
 #[cfg(test)]
 #[test]
+fn terminal_elapsed_signature_uses_typed_activity_not_streaming_flag() {
+    let mut terminal = super::transcript::tool_result_item(
+        "call-final",
+        Some("example.run"),
+        Some("{}"),
+        "done",
+        false,
+    );
+    terminal.streaming = true;
+    terminal.set_tool_started_at_ms(Some(1_000));
+    terminal.set_tool_duration_ms(Some(2_500));
+
+    assert!(!terminal.tool_is_active());
+    assert_eq!(terminal_elapsed_signature_fragment(&terminal), None);
+}
+
+#[cfg(test)]
+#[test]
 fn generic_tool_headers_render_elapsed_and_duration() {
     let now_ms = unix_time_millis(std::time::SystemTime::now());
     let mut request =
@@ -2346,7 +2365,7 @@ fn push_tool_request_rows(
         rows,
         &format!("Tool · {}", context.tool_name),
         item.tool_timing(),
-        item.streaming(),
+        item.tool_is_active(),
         false,
         width,
     );

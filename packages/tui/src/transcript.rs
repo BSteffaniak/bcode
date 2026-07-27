@@ -44,6 +44,8 @@ pub enum TranscriptItemKind {
         tool_name: String,
         /// Working directory captured for this invocation.
         working_directory: Option<std::path::PathBuf>,
+        /// Whether host-owned lifecycle state is active or waiting.
+        active: bool,
         /// Generic timing metadata for the tool invocation.
         timing: ToolTiming,
     },
@@ -335,6 +337,22 @@ impl TranscriptItem {
         self.bump_revision();
     }
 
+    /// Return whether this item represents an active tool invocation.
+    #[must_use]
+    pub const fn tool_is_active(&self) -> bool {
+        match &self.kind {
+            TranscriptItemKind::ToolContribution {
+                invocation: Some(invocation),
+                ..
+            } => matches!(
+                invocation.status,
+                ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+            ),
+            TranscriptItemKind::ToolRequest { active, .. } => *active,
+            _ => false,
+        }
+    }
+
     /// Return generic tool timing metadata, when this item represents a tool invocation.
     #[must_use]
     pub const fn tool_timing(&self) -> Option<ToolTiming> {
@@ -346,6 +364,14 @@ impl TranscriptItem {
                 ..
             } => Some(tool_timing_from_view(invocation)),
             _ => None,
+        }
+    }
+
+    /// Set host-owned active/waiting lifecycle state on a tool request item.
+    pub const fn set_tool_active(&mut self, is_active: bool) {
+        if let TranscriptItemKind::ToolRequest { active, .. } = &mut self.kind {
+            *active = is_active;
+            self.bump_revision();
         }
     }
 
@@ -471,6 +497,7 @@ pub fn tool_request_item(
             producer_plugin_id: producer_plugin_id.map(ToOwned::to_owned),
             tool_name: tool_name.to_owned(),
             working_directory,
+            active: false,
             timing: ToolTiming::default(),
         },
     )
@@ -845,6 +872,42 @@ fn terminal_tool_request_item_from_shared(tool: &ToolInvocationView) -> Transcri
 }
 
 fn terminal_tool_item_from_shared(tool: &ToolInvocationView) -> TranscriptItem {
+    if let Some(presentation) = &tool.presentation {
+        let contribution = bcode_session_models::ToolContributionEvent {
+            invocation_id: tool.tool_call_id.clone(),
+            contribution_id: "primary".to_owned(),
+            sequence: presentation.revision,
+            producer_id: presentation.producer_id.clone(),
+            schema: presentation.schema.clone(),
+            schema_version: presentation.schema_version,
+            operation: bcode_session_models::ToolContributionOperation::Upsert,
+            persistence: match presentation.retention {
+                bcode_tool::ToolPresentationRetention::RetainLatest => {
+                    bcode_session_models::ToolContributionPersistence::Durable
+                }
+                bcode_tool::ToolPresentationRetention::ActiveOnly => {
+                    bcode_session_models::ToolContributionPersistence::Transient
+                }
+            },
+            artifact: presentation.artifact.clone(),
+            payload: presentation.payload.clone(),
+        };
+        return TranscriptItem::with_kind(
+            "Tool presentation",
+            tool.tool_name
+                .clone()
+                .unwrap_or_else(|| "tool presentation".to_owned()),
+            matches!(
+                tool.status,
+                ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+            ),
+            TranscriptItemKind::ToolContribution {
+                contribution: Box::new(contribution),
+                placement: bcode_session_models::ToolContributionPlacement::Result,
+                invocation: Some(Box::new(tool.clone())),
+            },
+        );
+    }
     if let Some(ToolResultView::Artifact { artifact }) = &tool.result {
         return apply_shared_tool_timing(
             artifact_tool_result_item(
@@ -876,7 +939,10 @@ fn terminal_tool_item_from_shared(tool: &ToolInvocationView) -> TranscriptItem {
         tool.arguments_json.as_deref().unwrap_or("{}"),
         tool.working_directory.clone(),
     );
-    if matches!(tool.status, ToolInvocationViewStatus::Running) {
+    if matches!(
+        tool.status,
+        ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+    ) {
         item.streaming = true;
     }
     item
@@ -906,6 +972,10 @@ const fn apply_shared_tool_timing(
     mut item: TranscriptItem,
     tool: &ToolInvocationView,
 ) -> TranscriptItem {
+    item.set_tool_active(matches!(
+        tool.status,
+        ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+    ));
     item.set_tool_started_at_ms(tool.timing.started_at_ms);
     item.set_tool_finished_at_ms(tool.timing.finished_at_ms);
     item.set_tool_timeout_ms(tool.timing.timeout_ms);

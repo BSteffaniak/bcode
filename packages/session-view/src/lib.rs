@@ -22,7 +22,7 @@ use bcode_session_view_models::{
     ToolRequestDraftView, ToolResultView, ToolTimingView, TranscriptViewItem, TranscriptViewItemId,
     TranscriptViewItemKind,
 };
-use std::collections::{BTreeMap, BTreeSet, btree_map::Entry};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, Default)]
 struct LiveReasoningActivity {
@@ -105,13 +105,16 @@ pub struct SessionView {
     tool_invocation_projections: BTreeMap<String, ToolInvocationProjection>,
     contribution_sequences: BTreeMap<String, u64>,
     contribution_placements: BTreeMap<String, bcode_session_models::ToolContributionPlacement>,
-    contribution_slot_items: BTreeMap<TranscriptViewItemId, usize>,
-    contribution_slot_owners: BTreeMap<TranscriptViewItemId, String>,
     terminal_invocations: BTreeSet<String>,
     terminal_invocation_statuses: BTreeMap<String, ToolInvocationViewStatus>,
     terminal_runtime_work: BTreeSet<bcode_session_models::WorkId>,
     tool_request_drafts: BTreeMap<String, ToolRequestDraftView>,
     terminal_tool_request_drafts: BTreeMap<String, (u64, u64)>,
+    presentation_updates: BTreeMap<
+        (String, bcode_tool::ToolPresentationIdentity),
+        bcode_tool::ToolPresentationUpdate,
+    >,
+    presentation_update_scopes: BTreeMap<String, bcode_tool::ToolPresentationUpdateScope>,
     live_reasoning: BTreeMap<(String, String), LiveReasoningActivity>,
 }
 
@@ -132,15 +135,26 @@ impl SessionView {
             tool_invocation_projections: BTreeMap::new(),
             contribution_sequences: BTreeMap::new(),
             contribution_placements: BTreeMap::new(),
-            contribution_slot_items: BTreeMap::new(),
-            contribution_slot_owners: BTreeMap::new(),
             terminal_invocations: BTreeSet::new(),
             terminal_invocation_statuses: BTreeMap::new(),
             terminal_runtime_work: BTreeSet::new(),
             tool_request_drafts: BTreeMap::new(),
             terminal_tool_request_drafts: BTreeMap::new(),
+            presentation_updates: BTreeMap::new(),
+            presentation_update_scopes: BTreeMap::new(),
             live_reasoning: BTreeMap::new(),
         }
+    }
+
+    /// Return the currently accepted presentation update for an invocation identity.
+    #[must_use]
+    pub fn presentation_update(
+        &self,
+        invocation_id: &str,
+        identity: &bcode_tool::ToolPresentationIdentity,
+    ) -> Option<&bcode_tool::ToolPresentationUpdate> {
+        self.presentation_updates
+            .get(&(invocation_id.to_owned(), identity.clone()))
     }
 
     /// Return the current snapshot.
@@ -701,11 +715,7 @@ impl SessionView {
                                 Some(event.timestamp_ms),
                             );
                             self.tool_request_drafts.remove(&lifecycle.invocation_id);
-                            let result_id = TranscriptViewItemId::tool_presentation_slot(
-                                &lifecycle.invocation_id,
-                                bcode_session_models::ToolContributionPlacement::Result,
-                                None,
-                            );
+                            let result_id = TranscriptViewItemId::tool(&lifecycle.invocation_id);
                             if !matches!(
                                 self.snapshot
                                     .transcript
@@ -726,7 +736,8 @@ impl SessionView {
                             .cloned()
                             .filter(|projection| projection.tool_name.is_some())
                         {
-                            let tool = tool_invocation_view_from_projection(projection);
+                            let mut tool = tool_invocation_view_from_projection(projection);
+                            self.attach_primary_presentation(&mut tool);
                             self.snapshot
                                 .tools
                                 .insert(lifecycle.invocation_id.clone(), tool);
@@ -752,32 +763,59 @@ impl SessionView {
                         }
                         self.terminal_invocations
                             .insert(lifecycle.invocation_id.clone());
+                        self.presentation_update_scopes
+                            .entry(lifecycle.invocation_id.clone())
+                            .or_default()
+                            .close();
+                        self.presentation_updates
+                            .retain(|(invocation_id, _), update| {
+                                invocation_id != &lifecycle.invocation_id
+                                    || update.retention
+                                        == bcode_tool::ToolPresentationRetention::RetainLatest
+                            });
                     }
                 }
                 self.bump_revision();
             }
             SessionEventKind::ToolCallRequested { tool_call_id, .. } => {
-                if self.tool_request_drafts.remove(tool_call_id).is_some()
-                    || self
-                        .terminal_tool_request_drafts
-                        .remove(tool_call_id)
-                        .is_some()
+                if self
+                    .tool_request_drafts
+                    .get(tool_call_id)
+                    .is_some_and(|draft| {
+                        draft.placement == bcode_session_models::ToolContributionPlacement::Request
+                    })
                 {
-                    let id = TranscriptViewItemId::tool_presentation_slot(
-                        tool_call_id,
-                        bcode_session_models::ToolContributionPlacement::Request,
-                        None,
-                    );
-                    let item_count = self.snapshot.transcript.items.len();
-                    self.snapshot.transcript.items.retain(|item| item.id != id);
-                    if self.snapshot.transcript.items.len() != item_count {
-                        self.snapshot.transcript.revision =
-                            self.snapshot.transcript.revision.saturating_add(1);
-                    }
+                    self.tool_request_drafts.remove(tool_call_id);
                 }
+                self.terminal_tool_request_drafts.remove(tool_call_id);
                 self.upsert_tool_item(tool_call_id, event.sequence, Some(event.timestamp_ms));
             }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
+                let already_terminal = self.terminal_invocations.contains(&record.invocation_id);
+                if already_terminal
+                    && self
+                        .snapshot
+                        .tools
+                        .get(&record.invocation_id)
+                        .is_some_and(|tool| tool.result.is_some() || tool.result_text.is_some())
+                {
+                    return;
+                }
+                self.terminal_invocations
+                    .insert(record.invocation_id.clone());
+                self.snapshot
+                    .active_invocations
+                    .remove(&record.invocation_id);
+                self.presentation_update_scopes
+                    .entry(record.invocation_id.clone())
+                    .or_default()
+                    .close();
+                self.presentation_updates
+                    .retain(|(invocation_id, _), update| {
+                        invocation_id != &record.invocation_id
+                            || update.retention
+                                == bcode_tool::ToolPresentationRetention::RetainLatest
+                    });
                 self.upsert_tool_item(
                     &record.invocation_id,
                     event.sequence,
@@ -1361,6 +1399,9 @@ impl SessionView {
             SessionLiveEventKind::ToolContributionPlaced { envelope } => {
                 self.apply_contribution_event(0, None, &envelope.contribution, envelope.placement);
             }
+            SessionLiveEventKind::ToolPresentationUpdated { update } => {
+                self.apply_presentation_update(update);
+            }
             SessionLiveEventKind::ToolRequestDraft { event } => {
                 self.apply_tool_request_draft(event);
             }
@@ -1395,6 +1436,59 @@ impl SessionView {
     }
 
     #[allow(clippy::too_many_lines)] // One state-machine handler keeps generation/revision/offset transitions atomic.
+    fn apply_presentation_update(&mut self, update: &bcode_tool::ToolPresentationUpdate) {
+        if self.terminal_invocations.contains(&update.invocation_id) {
+            return;
+        }
+        let scope = self
+            .presentation_update_scopes
+            .entry(update.invocation_id.clone())
+            .or_default();
+        if scope.accept(update, usize::MAX).is_err() {
+            return;
+        }
+        self.presentation_updates.insert(
+            (update.invocation_id.clone(), update.identity.clone()),
+            update.clone(),
+        );
+        if matches!(
+            update.identity,
+            bcode_tool::ToolPresentationIdentity::Primary
+        ) {
+            let presentation = self.current_primary_presentation(&update.invocation_id);
+            if let Some(tool) = self.snapshot.tools.get_mut(&update.invocation_id) {
+                tool.presentation.clone_from(&presentation);
+            }
+            if let Some(id) = self.tool_item_ids.get(&update.invocation_id).cloned()
+                && let Some(index) = self
+                    .snapshot
+                    .transcript
+                    .items
+                    .iter()
+                    .position(|item| item.id == id)
+                && let Some(tool) = self.snapshot.tools.get(&update.invocation_id).cloned()
+            {
+                self.replace_tool_item(index, tool, &update.invocation_id, 0, None);
+                return;
+            }
+            if let Some(projection) = self
+                .tool_invocation_projections
+                .get(&update.invocation_id)
+                .cloned()
+                .filter(|projection| projection.tool_name.is_some())
+            {
+                let mut tool = tool_invocation_view_from_projection(projection);
+                tool.presentation = presentation;
+                self.snapshot
+                    .tools
+                    .insert(update.invocation_id.clone(), tool);
+                self.upsert_tool_item(&update.invocation_id, 0, None);
+                return;
+            }
+        }
+        self.bump_revision();
+    }
+
     fn apply_tool_request_draft(&mut self, event: &bcode_session_models::ToolRequestDraftEvent) {
         use bcode_session_models::ToolRequestDraftOperation;
 
@@ -1586,7 +1680,7 @@ impl SessionView {
         }
     }
 
-    #[allow(clippy::too_many_lines)] // Source precedence remains explicit and centralized for one semantic slot.
+    #[allow(clippy::too_many_lines)] // Compatibility inputs collapse into one canonical primary item here.
     fn refresh_tool_presentation_slot(
         &mut self,
         invocation_id: &str,
@@ -1600,79 +1694,69 @@ impl SessionView {
         if placement == ToolContributionPlacement::Hidden {
             return;
         }
-        let id =
-            TranscriptViewItemId::tool_presentation_slot(invocation_id, placement, supplemental_id);
-        let contribution = self
-            .snapshot
-            .contributions
-            .iter()
-            .filter(|(key, contribution)| {
-                contribution.invocation_id == invocation_id
-                    && self.contribution_placements.get(*key) == Some(&placement)
-                    && (placement != ToolContributionPlacement::Supplemental
-                        || supplemental_id == Some(contribution.contribution_id.as_str()))
-            })
-            .max_by(|(left_key, left), (right_key, right)| {
-                (left.sequence, left_key.as_str()).cmp(&(right.sequence, right_key.as_str()))
-            })
-            .map(|(_, contribution)| contribution.clone());
-        let draft = self.tool_request_drafts.get(invocation_id).cloned();
+        let id = if placement == ToolContributionPlacement::Supplemental {
+            TranscriptViewItemId::tool_supplemental(
+                invocation_id,
+                supplemental_id.expect("supplemental contributions require stable identity"),
+            )
+        } else {
+            TranscriptViewItemId::tool(invocation_id)
+        };
+        let latest_contribution = |candidate_placement| {
+            self.snapshot
+                .contributions
+                .iter()
+                .filter(|(key, contribution)| {
+                    contribution.invocation_id == invocation_id
+                        && self.contribution_placements.get(*key) == Some(&candidate_placement)
+                        && (candidate_placement != ToolContributionPlacement::Supplemental
+                            || supplemental_id == Some(contribution.contribution_id.as_str()))
+                })
+                .max_by(|(left_key, left), (right_key, right)| {
+                    (left.sequence, left_key.as_str()).cmp(&(right.sequence, right_key.as_str()))
+                })
+                .map(|(_, contribution)| contribution.clone())
+        };
         let tool = self.snapshot.tools.get(invocation_id).cloned();
-        let kind = match placement {
-            ToolContributionPlacement::Request => contribution
-                .map(|contribution| TranscriptViewItemKind::ToolContribution {
+        let draft = self.tool_request_drafts.get(invocation_id).cloned();
+        let kind = if placement == ToolContributionPlacement::Supplemental {
+            latest_contribution(ToolContributionPlacement::Supplemental).map(|contribution| {
+                TranscriptViewItemKind::ToolContribution {
                     invocation: tool.clone().map(Box::new),
                     contribution,
-                    placement,
-                })
-                .or_else(|| {
-                    draft
-                        .filter(|draft| draft.placement == placement)
-                        .map(|draft| TranscriptViewItemKind::ToolRequestDraft { draft })
-                })
-                .or_else(|| {
-                    tool.clone().map(|tool| {
-                        if is_terminal_tool_status(tool.status) {
-                            TranscriptViewItemKind::ToolRequest {
-                                tool: Box::new(tool),
-                            }
-                        } else {
-                            TranscriptViewItemKind::ToolInvocation {
-                                tool: Box::new(tool),
-                            }
-                        }
-                    })
-                }),
-            ToolContributionPlacement::Result => tool
-                .filter(|tool| is_terminal_tool_status(tool.status))
-                .map(|tool| TranscriptViewItemKind::ToolInvocation {
-                    tool: Box::new(tool),
-                })
-                .or_else(|| {
-                    contribution.map(|contribution| TranscriptViewItemKind::ToolContribution {
-                        invocation: self
-                            .snapshot
-                            .tools
-                            .get(invocation_id)
-                            .cloned()
-                            .map(Box::new),
+                    placement: ToolContributionPlacement::Supplemental,
+                }
+            })
+        } else {
+            let contribution = [
+                ToolContributionPlacement::Result,
+                ToolContributionPlacement::Progress,
+                ToolContributionPlacement::Request,
+            ]
+            .into_iter()
+            .find_map(|candidate_placement| {
+                latest_contribution(candidate_placement).map(|contribution| {
+                    TranscriptViewItemKind::ToolContribution {
+                        invocation: tool.clone().map(Box::new),
                         contribution,
-                        placement,
+                        placement: candidate_placement,
+                    }
+                })
+            });
+            contribution
+                .or_else(|| {
+                    tool.clone()
+                        .filter(|tool| is_terminal_tool_status(tool.status))
+                        .map(|tool| TranscriptViewItemKind::ToolInvocation {
+                            tool: Box::new(tool),
+                        })
+                })
+                .or_else(|| draft.map(|draft| TranscriptViewItemKind::ToolRequestDraft { draft }))
+                .or_else(|| {
+                    tool.map(|tool| TranscriptViewItemKind::ToolInvocation {
+                        tool: Box::new(tool),
                     })
                 })
-                .or_else(|| {
-                    draft
-                        .filter(|draft| draft.placement == placement)
-                        .map(|draft| TranscriptViewItemKind::ToolRequestDraft { draft })
-                }),
-            ToolContributionPlacement::Progress | ToolContributionPlacement::Supplemental => {
-                contribution.map(|contribution| TranscriptViewItemKind::ToolContribution {
-                    invocation: tool.map(Box::new),
-                    contribution,
-                    placement,
-                })
-            }
-            ToolContributionPlacement::Hidden => None,
         };
         let Some(kind) = kind else {
             let item_count = self.snapshot.transcript.items.len();
@@ -1690,11 +1774,17 @@ impl SessionView {
                 contribution.persistence
                     == bcode_session_models::ToolContributionPersistence::Transient
                     || self.snapshot.tools.get(invocation_id).is_some_and(|tool| {
-                        matches!(tool.status, ToolInvocationViewStatus::Running)
+                        matches!(
+                            tool.status,
+                            ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+                        )
                     })
             }
             TranscriptViewItemKind::ToolInvocation { tool } => {
-                matches!(tool.status, ToolInvocationViewStatus::Running)
+                matches!(
+                    tool.status,
+                    ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+                )
             }
             _ => false,
         };
@@ -1730,9 +1820,18 @@ impl SessionView {
         self.contribution_sequences
             .insert(key.clone(), contribution.sequence);
         let previous_placement = self.contribution_placements.get(&key).copied();
-        let previous_item_id =
-            previous_placement.map(|previous| contribution_item_id(contribution, previous));
-        let item_id = contribution_item_id(contribution, placement);
+        let previous_item_id = previous_placement.map(|previous| {
+            legacy_contribution_projection::item_id(
+                &contribution.invocation_id,
+                &contribution.contribution_id,
+                previous,
+            )
+        });
+        let item_id = legacy_contribution_projection::item_id(
+            &contribution.invocation_id,
+            &contribution.contribution_id,
+            placement,
+        );
         match contribution.operation {
             bcode_session_models::ToolContributionOperation::Remove => {
                 self.snapshot.contributions.remove(&key);
@@ -1768,7 +1867,7 @@ impl SessionView {
                 } else {
                     self.upsert_contribution_slot_item(
                         item_id,
-                        key,
+                        &key,
                         event_sequence,
                         timestamp_ms,
                         contribution.persistence
@@ -1783,34 +1882,43 @@ impl SessionView {
     }
 
     fn remove_owned_contribution_slot_item(&mut self, id: &TranscriptViewItemId, owner_key: &str) {
-        if self
-            .contribution_slot_owners
-            .get(id)
-            .is_some_and(|owner| owner == owner_key)
-        {
-            self.remove_contribution_slot_item(id);
-        }
+        let Some(index) = self.snapshot.transcript.items.iter().position(|item| {
+            item.id == *id
+                && matches!(
+                    &item.kind,
+                    TranscriptViewItemKind::ToolContribution { contribution, .. }
+                        if format!("{}:{}", contribution.invocation_id, contribution.contribution_id)
+                            == owner_key
+                )
+        }) else {
+            return;
+        };
+        self.remove_transcript_item_at(index);
+    }
+
+    fn remove_transcript_item_at(&mut self, index: usize) {
+        self.snapshot.transcript.items.remove(index);
+        self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
     }
 
     fn remove_contribution_slot_item(&mut self, id: &TranscriptViewItemId) {
-        let Some(index) = self.contribution_slot_items.remove(id) else {
+        let Some(index) = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|item| item.id == *id)
+        else {
             return;
         };
-        self.contribution_slot_owners.remove(id);
-        self.snapshot.transcript.items.remove(index);
-        for slot_index in self.contribution_slot_items.values_mut() {
-            if *slot_index > index {
-                *slot_index = slot_index.saturating_sub(1);
-            }
-        }
-        self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        self.remove_transcript_item_at(index);
     }
 
     #[allow(clippy::too_many_arguments)]
     fn upsert_contribution_slot_item(
         &mut self,
         id: TranscriptViewItemId,
-        owner_key: String,
+        owner_key: &str,
         sequence: u64,
         timestamp_ms: Option<u64>,
         streaming: bool,
@@ -1824,17 +1932,28 @@ impl SessionView {
             .cloned()
             .map(Box::new);
         let streaming = invocation.as_ref().is_some_and(|invocation| {
-            matches!(invocation.status, ToolInvocationViewStatus::Running)
+            matches!(
+                invocation.status,
+                ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+            )
         }) || streaming;
-        if let Some(index) = self.contribution_slot_items.get(&id).copied()
-            && let Some(item) = self.snapshot.transcript.items.get_mut(index)
+        if let Some(item) = self
+            .snapshot
+            .transcript
+            .items
+            .iter_mut()
+            .find(|item| item.id == id)
         {
-            if let Some(previous_owner) = self
-                .contribution_slot_owners
-                .insert(id.clone(), owner_key.clone())
-                && previous_owner != owner_key
+            if let TranscriptViewItemKind::ToolContribution {
+                contribution: previous,
+                ..
+            } = &item.kind
             {
-                self.contribution_placements.remove(&previous_owner);
+                let previous_owner =
+                    format!("{}:{}", previous.invocation_id, previous.contribution_id);
+                if previous_owner != owner_key {
+                    self.contribution_placements.remove(&previous_owner);
+                }
             }
             item.kind = TranscriptViewItemKind::ToolContribution {
                 contribution,
@@ -1849,9 +1968,6 @@ impl SessionView {
             self.bump_revision();
             return;
         }
-        let index = self.snapshot.transcript.items.len();
-        self.contribution_slot_items.insert(id.clone(), index);
-        self.contribution_slot_owners.insert(id.clone(), owner_key);
         self.push_item(
             id,
             sequence,
@@ -1917,6 +2033,22 @@ impl SessionView {
         self.push_item(id, sequence, timestamp_ms, streaming, kind);
     }
 
+    fn current_primary_presentation(
+        &self,
+        invocation_id: &str,
+    ) -> Option<bcode_session_view_models::ToolPresentationView> {
+        self.presentation_updates
+            .get(&(
+                invocation_id.to_owned(),
+                bcode_tool::ToolPresentationIdentity::Primary,
+            ))
+            .map(Into::into)
+    }
+
+    fn attach_primary_presentation(&self, tool: &mut ToolInvocationView) {
+        tool.presentation = self.current_primary_presentation(&tool.tool_call_id);
+    }
+
     fn apply_terminal_tool_status(
         &mut self,
         tool_call_id: &str,
@@ -1943,8 +2075,23 @@ impl SessionView {
         self.snapshot
             .tools
             .insert(tool_call_id.to_owned(), tool.clone());
-        if let Some(id) = self.tool_item_ids.get(tool_call_id).cloned() {
-            self.update_existing_tool_item(id, tool_call_id, sequence, timestamp_ms, tool);
+        let canonical_id = TranscriptViewItemId::tool(tool_call_id);
+        self.tool_item_ids
+            .insert(tool_call_id.to_owned(), canonical_id.clone());
+        if self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .any(|item| item.id == canonical_id)
+        {
+            self.update_existing_tool_item(
+                &canonical_id,
+                tool_call_id,
+                sequence,
+                timestamp_ms,
+                tool,
+            );
         } else {
             self.upsert_terminal_tool_item(tool_call_id, sequence, timestamp_ms, tool);
         }
@@ -1956,58 +2103,66 @@ impl SessionView {
             return;
         };
         let mut tool = tool_invocation_view_from_projection(projection);
+        self.attach_primary_presentation(&mut tool);
         if let Some(status) = self.terminal_invocation_statuses.get(tool_call_id).copied() {
             tool.status = status;
             if matches!(status, ToolInvocationViewStatus::Failed) {
                 tool.is_error = Some(true);
             }
         }
+        let already_terminal = self
+            .snapshot
+            .tools
+            .get(tool_call_id)
+            .is_some_and(|tool| is_terminal_tool_status(tool.status));
         self.snapshot
             .tools
             .insert(tool_call_id.to_owned(), tool.clone());
+        let canonical_id = TranscriptViewItemId::tool(tool_call_id);
         if is_terminal_tool_status(tool.status) {
+            if already_terminal
+                && !self
+                    .snapshot
+                    .transcript
+                    .items
+                    .iter()
+                    .any(|item| item.id == canonical_id)
+            {
+                return;
+            }
             self.upsert_terminal_tool_item(tool_call_id, sequence, timestamp_ms, tool);
             return;
         }
-        match self.tool_item_ids.entry(tool_call_id.to_owned()) {
-            Entry::Occupied(_) => {
-                self.refresh_tool_presentation_slot(
-                    tool_call_id,
-                    bcode_session_models::ToolContributionPlacement::Request,
-                    None,
-                    sequence,
-                    timestamp_ms,
-                );
-            }
-            Entry::Vacant(_) => {
-                let id = TranscriptViewItemId::tool_presentation_slot(
-                    tool_call_id,
-                    bcode_session_models::ToolContributionPlacement::Request,
-                    None,
-                );
-                let id = self.push_item(
-                    id,
-                    sequence,
-                    timestamp_ms,
-                    matches!(tool.status, ToolInvocationViewStatus::Running),
-                    TranscriptViewItemKind::ToolInvocation {
-                        tool: Box::new(tool),
-                    },
-                );
-                if id
-                    == TranscriptViewItemId::tool_presentation_slot(
-                        tool_call_id,
-                        bcode_session_models::ToolContributionPlacement::Request,
-                        None,
-                    )
-                {
-                    self.contribution_slot_items.insert(
-                        id.clone(),
-                        self.snapshot.transcript.items.len().saturating_sub(1),
-                    );
-                }
-                self.tool_item_ids.insert(tool_call_id.to_owned(), id);
-            }
+        self.tool_item_ids
+            .insert(tool_call_id.to_owned(), canonical_id.clone());
+        if self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .any(|item| item.id == canonical_id)
+        {
+            self.refresh_tool_presentation_slot(
+                tool_call_id,
+                bcode_session_models::ToolContributionPlacement::Request,
+                None,
+                sequence,
+                timestamp_ms,
+            );
+        } else {
+            let id = self.push_item(
+                canonical_id,
+                sequence,
+                timestamp_ms,
+                matches!(
+                    tool.status,
+                    ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+                ),
+                TranscriptViewItemKind::ToolInvocation {
+                    tool: Box::new(tool),
+                },
+            );
+            self.tool_item_ids.insert(tool_call_id.to_owned(), id);
         }
         self.sync_contribution_invocation_context(tool_call_id);
     }
@@ -2019,33 +2174,7 @@ impl SessionView {
         timestamp_ms: Option<u64>,
         tool: ToolInvocationView,
     ) {
-        let request_tool = tool.clone();
-        if let Some(request_id) = self.tool_item_ids.remove(tool_call_id)
-            && let Some(index) = self
-                .snapshot
-                .transcript
-                .items
-                .iter()
-                .position(|item| item.id == request_id)
-            && matches!(
-                self.snapshot.transcript.items[index].kind,
-                TranscriptViewItemKind::ToolInvocation { .. }
-            )
-        {
-            self.snapshot.transcript.items[index].kind = TranscriptViewItemKind::ToolRequest {
-                tool: Box::new(request_tool),
-            };
-            self.snapshot.transcript.items[index].streaming = false;
-            self.snapshot.transcript.items[index].revision = self.snapshot.transcript.items[index]
-                .revision
-                .saturating_add(1);
-            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
-        }
-        let result_id = TranscriptViewItemId::tool_presentation_slot(
-            tool_call_id,
-            bcode_session_models::ToolContributionPlacement::Result,
-            None,
-        );
+        let result_id = TranscriptViewItemId::tool(tool_call_id);
         if let Some(index) = self
             .snapshot
             .transcript
@@ -2053,10 +2182,29 @@ impl SessionView {
             .iter()
             .position(|item| item.id == result_id)
         {
-            self.replace_tool_item(index, tool, tool_call_id, sequence, timestamp_ms);
+            if let TranscriptViewItemKind::ToolContribution { invocation, .. } =
+                &mut self.snapshot.transcript.items[index].kind
+            {
+                *invocation = Some(Box::new(tool));
+                self.snapshot.transcript.items[index].streaming = false;
+                self.snapshot.transcript.items[index].revision = self.snapshot.transcript.items
+                    [index]
+                    .revision
+                    .saturating_add(1);
+                self.snapshot.transcript.revision =
+                    self.snapshot.transcript.revision.saturating_add(1);
+                self.bump_revision();
+            } else {
+                self.replace_tool_item(index, tool, tool_call_id, sequence, timestamp_ms);
+            }
+            return;
+        }
+        if let Some(id) = self.tool_item_ids.get(tool_call_id).cloned() {
+            self.update_existing_tool_item(&id, tool_call_id, sequence, timestamp_ms, tool);
         } else {
-            self.push_item(
-                result_id,
+            let id = TranscriptViewItemId::tool(tool_call_id);
+            let id = self.push_item(
+                id,
                 sequence,
                 timestamp_ms,
                 false,
@@ -2064,6 +2212,7 @@ impl SessionView {
                     tool: Box::new(tool),
                 },
             );
+            self.tool_item_ids.insert(tool_call_id.to_owned(), id);
         }
         self.sync_contribution_invocation_context(tool_call_id);
     }
@@ -2071,7 +2220,10 @@ impl SessionView {
     fn sync_contribution_invocation_context(&mut self, tool_call_id: &str) {
         let invocation = self.snapshot.tools.get(tool_call_id).cloned().map(Box::new);
         let streaming = invocation.as_ref().is_some_and(|invocation| {
-            matches!(invocation.status, ToolInvocationViewStatus::Running)
+            matches!(
+                invocation.status,
+                ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+            )
         });
         let mut changed = false;
         for item in &mut self.snapshot.transcript.items {
@@ -2101,7 +2253,7 @@ impl SessionView {
 
     fn update_existing_tool_item(
         &mut self,
-        id: TranscriptViewItemId,
+        id: &TranscriptViewItemId,
         tool_call_id: &str,
         sequence: u64,
         timestamp_ms: Option<u64>,
@@ -2112,7 +2264,7 @@ impl SessionView {
             .transcript
             .items
             .iter()
-            .position(|item| item.id == id)
+            .position(|item| &item.id == id)
         else {
             return;
         };
@@ -2122,68 +2274,28 @@ impl SessionView {
                 TranscriptViewItemKind::ToolContribution { .. }
             )
         {
-            self.contribution_slot_items.remove(&id);
-            self.contribution_slot_owners.remove(&id);
-            self.replace_tool_item(index, tool, tool_call_id, sequence, timestamp_ms);
+            if let TranscriptViewItemKind::ToolContribution {
+                invocation,
+                contribution: _,
+                placement: _,
+            } = &mut self.snapshot.transcript.items[index].kind
+            {
+                *invocation = Some(Box::new(tool));
+            }
+            self.snapshot.transcript.items[index].sequence = (sequence != 0)
+                .then_some(sequence)
+                .or(self.snapshot.transcript.items[index].sequence);
+            self.snapshot.transcript.items[index].timestamp_ms =
+                timestamp_ms.or(self.snapshot.transcript.items[index].timestamp_ms);
+            self.snapshot.transcript.items[index].streaming = false;
+            self.snapshot.transcript.items[index].revision = self.snapshot.transcript.items[index]
+                .revision
+                .saturating_add(1);
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
             return;
         }
-        let existing_tool = match &self.snapshot.transcript.items[index].kind {
-            TranscriptViewItemKind::ToolInvocation { tool } => Some((**tool).clone()),
-            TranscriptViewItemKind::ToolRequest { .. }
-            | TranscriptViewItemKind::ToolRequestDraft { .. }
-            | TranscriptViewItemKind::AssistantMessage { .. }
-            | TranscriptViewItemKind::ReasoningMessage { .. }
-            | TranscriptViewItemKind::ReasoningActivity { .. }
-            | TranscriptViewItemKind::UserMessage { .. }
-            | TranscriptViewItemKind::SystemMessage { .. }
-            | TranscriptViewItemKind::Permission { .. }
-            | TranscriptViewItemKind::RuntimeWork { .. }
-            | TranscriptViewItemKind::Usage { .. }
-            | TranscriptViewItemKind::Compaction { .. }
-            | TranscriptViewItemKind::Skill { .. }
-            | TranscriptViewItemKind::Interaction { .. }
-            | TranscriptViewItemKind::ToolContribution { .. } => None,
-        };
-        if should_split_terminal_tool_item(existing_tool.as_ref(), &tool) {
-            self.split_terminal_tool_item(
-                index,
-                id,
-                tool_call_id,
-                (sequence, timestamp_ms),
-                existing_tool.expect("split requires existing tool"),
-                tool,
-            );
-        } else {
-            self.replace_tool_item(index, tool, tool_call_id, sequence, timestamp_ms);
-        }
-    }
-
-    fn split_terminal_tool_item(
-        &mut self,
-        index: usize,
-        id: TranscriptViewItemId,
-        tool_call_id: &str,
-        event_metadata: (u64, Option<u64>),
-        existing_tool: ToolInvocationView,
-        tool: ToolInvocationView,
-    ) {
-        let item = &mut self.snapshot.transcript.items[index];
-        item.id = TranscriptViewItemId::tool_request(tool_call_id);
-        item.kind = TranscriptViewItemKind::ToolRequest {
-            tool: Box::new(existing_tool),
-        };
-        item.streaming = false;
-        item.revision = item.revision.saturating_add(1);
-        self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
-        self.push_item(
-            id,
-            event_metadata.0,
-            event_metadata.1,
-            false,
-            TranscriptViewItemKind::ToolInvocation {
-                tool: Box::new(tool),
-            },
-        );
+        self.replace_tool_item(index, tool, tool_call_id, sequence, timestamp_ms);
     }
 
     fn replace_tool_item(
@@ -2202,7 +2314,7 @@ impl SessionView {
         item.timestamp_ms = timestamp_ms.or(item.timestamp_ms);
         item.streaming = matches!(
             self.snapshot.tools[tool_call_id].status,
-            ToolInvocationViewStatus::Running
+            ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
         );
         item.revision = item.revision.saturating_add(1);
         self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
@@ -2412,16 +2524,29 @@ impl SessionView {
     }
 }
 
-fn contribution_item_id(
-    contribution: &bcode_session_models::ToolContributionEvent,
-    placement: bcode_session_models::ToolContributionPlacement,
-) -> TranscriptViewItemId {
-    TranscriptViewItemId::tool_presentation_slot(
-        &contribution.invocation_id,
-        placement,
-        (placement == bcode_session_models::ToolContributionPlacement::Supplemental)
-            .then_some(contribution.contribution_id.as_str()),
-    )
+/// Decode-only adapter from historical placement events into canonical invocation identities.
+mod legacy_contribution_projection {
+    use super::TranscriptViewItemId;
+
+    pub fn item_id(
+        invocation_id: &str,
+        contribution_id: &str,
+        placement: bcode_session_models::ToolContributionPlacement,
+    ) -> TranscriptViewItemId {
+        match placement {
+            bcode_session_models::ToolContributionPlacement::Supplemental => {
+                TranscriptViewItemId::tool_supplemental(invocation_id, contribution_id)
+            }
+            bcode_session_models::ToolContributionPlacement::Hidden => TranscriptViewItemId::new(
+                format!("legacy-hidden:{invocation_id}:{contribution_id}"),
+            ),
+            bcode_session_models::ToolContributionPlacement::Request
+            | bcode_session_models::ToolContributionPlacement::Progress
+            | bcode_session_models::ToolContributionPlacement::Result => {
+                TranscriptViewItemId::tool(invocation_id)
+            }
+        }
+    }
 }
 
 fn working_directory_changed_message(
@@ -2507,7 +2632,9 @@ fn tool_invocation_view_from_projection(
         finished_at_ms: projection.finished_at_ms,
         timeout_ms: projection_timeout_ms(projection.raw_result.as_ref()),
         timed_out: projection_timed_out(projection.raw_result.as_ref()),
-        duration_ms: projection_duration_ms(projection.raw_result.as_ref()),
+        duration_ms: projection
+            .duration_ms
+            .or_else(|| projection_duration_ms(projection.raw_result.as_ref())),
     };
     ToolInvocationView {
         tool_call_id: projection.tool_call_id,
@@ -2519,6 +2646,7 @@ fn tool_invocation_view_from_projection(
         result_text: projection.result_text,
         is_error: projection.is_error,
         result: projection.raw_result.map(ToolResultView::from),
+        presentation: None,
         timing,
     }
 }
@@ -2554,14 +2682,6 @@ fn projection_duration_ms(
     projection_result_metadata(result)?
         .get("duration_ms")
         .and_then(serde_json::Value::as_u64)
-}
-
-fn should_split_terminal_tool_item(
-    existing_tool: Option<&ToolInvocationView>,
-    next_tool: &ToolInvocationView,
-) -> bool {
-    is_terminal_tool_status(next_tool.status)
-        && existing_tool.is_some_and(|tool| !is_terminal_tool_status(tool.status))
 }
 
 const fn is_terminal_tool_status(status: ToolInvocationViewStatus) -> bool {
@@ -3287,7 +3407,7 @@ mod tests {
     }
 
     #[test]
-    fn draft_placement_change_removes_previous_slot_and_preserves_current_slot() {
+    fn draft_placement_change_replaces_the_same_primary_item() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
         let draft = |revision, placement| SessionLiveEvent {
@@ -3331,13 +3451,15 @@ mod tests {
             bcode_session_models::ToolContributionPlacement::Result,
             None,
         );
-        assert!(
-            !view
-                .snapshot()
+        assert_eq!(request_id, result_id);
+        assert_eq!(
+            view.snapshot()
                 .transcript
                 .items
                 .iter()
-                .any(|item| item.id == request_id)
+                .filter(|item| item.id == request_id)
+                .count(),
+            1
         );
         assert!(matches!(
             view.snapshot()
@@ -3767,37 +3889,27 @@ mod tests {
             events, original,
             "projection must not rewrite historical events"
         );
-        let request_id = TranscriptViewItemId::tool_presentation_slot(
-            "call-edit",
-            bcode_session_models::ToolContributionPlacement::Request,
-            None,
-        );
-        assert!(matches!(
+        assert_eq!(
             snapshot
                 .transcript
                 .items
                 .iter()
-                .find(|item| item.id == request_id)
-                .map(|item| &item.kind),
-            Some(TranscriptViewItemKind::ToolContribution { contribution, .. })
-                if contribution.schema == "bcode.filesystem.change"
-                    && contribution.payload["old_text"] == "before\n"
-                    && contribution.payload["new_text"] == "after\n"
-        ));
-        let result_id = TranscriptViewItemId::tool_presentation_slot(
-            "call-edit",
-            bcode_session_models::ToolContributionPlacement::Result,
-            None,
+                .filter(|item| {
+                    matches!(
+                        &item.kind,
+                        TranscriptViewItemKind::ToolContribution {
+                            contribution,
+                            invocation: Some(invocation),
+                            ..
+                        } if contribution.schema == "bcode.filesystem.change"
+                            && contribution.payload["old_text"] == "before\n"
+                            && contribution.payload["new_text"] == "after\n"
+                            && invocation.status == ToolInvocationViewStatus::Finished
+                    )
+                })
+                .count(),
+            1
         );
-        assert!(matches!(
-            snapshot
-                .transcript
-                .items
-                .iter()
-                .find(|item| item.id == result_id)
-                .map(|item| &item.kind),
-            Some(TranscriptViewItemKind::ToolInvocation { .. })
-        ));
     }
 
     #[test]
@@ -4350,17 +4462,18 @@ mod tests {
             },
         ));
 
-        let result_id = TranscriptViewItemId::tool_presentation_slot(
-            "call-1",
-            bcode_session_models::ToolContributionPlacement::Result,
-            None,
-        );
         let result_items = view
             .snapshot()
             .transcript
             .items
             .iter()
-            .filter(|item| item.id == result_id)
+            .filter(|item| {
+                matches!(
+                    &item.kind,
+                    TranscriptViewItemKind::ToolInvocation { tool }
+                        if tool.tool_call_id == "call-1"
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(result_items.len(), 1);
         assert!(matches!(
@@ -5584,7 +5697,7 @@ mod tests {
 
         assert_eq!(full_ids, shifted_ids);
         assert_eq!(full_ids[0].get(), "event:2");
-        assert_eq!(full_ids[1].get(), "tool-slot:tool-1:request");
+        assert_eq!(full_ids[1].get(), "tool:tool-1");
     }
 
     #[test]
@@ -6378,10 +6491,7 @@ mod tests {
             },
         ));
         let compact = view.snapshot().transcript.items[0].clone();
-        assert_eq!(
-            compact.id,
-            TranscriptViewItemId::new("tool-slot:call-1:request")
-        );
+        assert_eq!(compact.id, TranscriptViewItemId::tool("call-1"));
         assert!(matches!(
             compact.kind,
             TranscriptViewItemKind::ToolInvocation { .. }
@@ -6447,19 +6557,21 @@ mod tests {
         ));
 
         let items = &view.snapshot().transcript.items;
-        assert_eq!(items.len(), 2);
+        assert_eq!(items.len(), 1);
         assert_eq!(items[0].id, compact.id);
-        assert_eq!(
-            items[1].id,
-            TranscriptViewItemId::tool_presentation_slot(
-                "call-1",
-                bcode_session_models::ToolContributionPlacement::Result,
-                None,
-            )
-        );
         assert!(matches!(
-            items[1].kind,
-            TranscriptViewItemKind::ToolInvocation { .. }
+            &items[0].kind,
+            TranscriptViewItemKind::ToolContribution {
+                invocation: Some(tool),
+                contribution,
+                ..
+            } if tool.status == ToolInvocationViewStatus::Finished
+                && contribution.schema == "test.request"
+                && matches!(
+                    tool.result,
+                    Some(ToolResultView::Artifact { ref artifact, .. })
+                        if artifact.artifact.schema == "test.change"
+                )
         ));
     }
 
@@ -6507,7 +6619,181 @@ mod tests {
     }
 
     #[test]
-    fn placed_slots_replace_by_placement_and_supplementals_coexist() {
+    fn primary_presentation_replaces_existing_tool_item_without_changing_identity() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("test.plugin".to_owned()),
+                tool_name: "test.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        let id = view.snapshot().transcript.items[0].id.clone();
+        let revision = view.snapshot().transcript.items[0].revision;
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolPresentationUpdated {
+                update: bcode_tool::ToolPresentationUpdate {
+                    invocation_id: "call-1".to_owned(),
+                    producer_id: "test.plugin".to_owned(),
+                    generation: 0,
+                    revision: 1,
+                    identity: bcode_tool::ToolPresentationIdentity::Primary,
+                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    schema: "test.presentation".to_owned(),
+                    schema_version: 1,
+                    artifact: None,
+                    payload: serde_json::json!({"current": true}),
+                },
+            },
+        });
+
+        assert_eq!(view.snapshot().transcript.items.len(), 1);
+        let item = &view.snapshot().transcript.items[0];
+        assert_eq!(item.id, id);
+        assert!(item.revision > revision);
+        assert!(matches!(
+            &item.kind,
+            TranscriptViewItemKind::ToolInvocation { tool }
+                if tool.presentation.as_ref().is_some_and(|presentation|
+                    presentation.payload == serde_json::json!({"current": true}))
+        ));
+    }
+
+    #[test]
+    fn presentation_updates_are_monotonic_and_terminal_closure_is_absorbing() {
+        let session_id = SessionId::new();
+        let update = |revision, retention| bcode_tool::ToolPresentationUpdate {
+            invocation_id: "call-1".to_owned(),
+            producer_id: "test.plugin".to_owned(),
+            generation: 0,
+            revision,
+            identity: bcode_tool::ToolPresentationIdentity::Primary,
+            retention,
+            schema: "test.presentation".to_owned(),
+            schema_version: 1,
+            artifact: None,
+            payload: serde_json::json!({"revision": revision}),
+        };
+        let live = |update| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolPresentationUpdated { update },
+        };
+        let mut view = SessionView::new();
+        view.apply_live_event(&live(update(
+            1,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
+        )));
+        view.apply_live_event(&live(update(
+            1,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
+        )));
+        assert_eq!(
+            view.presentation_update("call-1", &bcode_tool::ToolPresentationIdentity::Primary)
+                .map(|update| update.revision),
+            Some(1)
+        );
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "call-1".to_owned(),
+                    sequence: 1,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Completed,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        ));
+        view.apply_live_event(&live(update(
+            2,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
+        )));
+        assert_eq!(
+            view.presentation_update("call-1", &bcode_tool::ToolPresentationIdentity::Primary)
+                .map(|update| update.revision),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn active_only_presentation_is_removed_at_terminal_closure() {
+        let session_id = SessionId::new();
+        let update = bcode_tool::ToolPresentationUpdate {
+            invocation_id: "call-1".to_owned(),
+            producer_id: "test.plugin".to_owned(),
+            generation: 0,
+            revision: 1,
+            identity: bcode_tool::ToolPresentationIdentity::Primary,
+            retention: bcode_tool::ToolPresentationRetention::ActiveOnly,
+            schema: "test.presentation".to_owned(),
+            schema_version: 1,
+            artifact: None,
+            payload: serde_json::Value::Null,
+        };
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("test.plugin".to_owned()),
+                tool_name: "test.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolPresentationUpdated { update },
+        });
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "call-1".to_owned(),
+                    sequence: 1,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Failed,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        ));
+        assert!(
+            view.presentation_update("call-1", &bcode_tool::ToolPresentationIdentity::Primary)
+                .is_none()
+        );
+        let primary_id = TranscriptViewItemId::tool("call-1");
+        assert_eq!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .filter(|item| item.id == primary_id)
+                .count(),
+            1
+        );
+        assert!(matches!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .find(|item| item.id == primary_id)
+                .map(|item| &item.kind),
+            Some(TranscriptViewItemKind::ToolInvocation { tool })
+                if tool.status == ToolInvocationViewStatus::Failed
+        ));
+    }
+
+    #[test]
+    fn primary_contributions_replace_one_item_and_supplementals_coexist() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
         let contribution = |id: &str, sequence, placement| {
@@ -6583,31 +6869,30 @@ mod tests {
         view.apply_event(&remove_replaced_request);
 
         let items = &view.snapshot().transcript.items;
-        assert_eq!(items.len(), 4);
-        let request_id = TranscriptViewItemId::new("tool-slot:call-1:request");
+        assert_eq!(items.len(), 3);
+        let request_id = TranscriptViewItemId::tool("call-1");
         let request_revision = items
             .iter()
             .find(|item| item.id == request_id)
             .expect("request slot")
             .revision;
-        assert_eq!(request_revision, 1);
+        assert_eq!(request_revision, 2);
         assert_eq!(items.iter().filter(|item| item.id == request_id).count(), 1);
         assert!(matches!(
             &items[0].kind,
-            TranscriptViewItemKind::ToolContribution { contribution, .. }
-                if contribution.contribution_id == "request-two"
+            TranscriptViewItemKind::ToolContribution {
+                contribution,
+                placement: bcode_session_models::ToolContributionPlacement::Progress,
+                ..
+            } if contribution.contribution_id == "progress"
         ));
         assert_eq!(
             items[1].id,
-            TranscriptViewItemId::new("tool-slot:call-1:progress")
+            TranscriptViewItemId::tool_supplemental("call-1", "supplemental-one")
         );
         assert_eq!(
             items[2].id,
-            TranscriptViewItemId::new("tool-slot:call-1:supplemental:supplemental-one")
-        );
-        assert_eq!(
-            items[3].id,
-            TranscriptViewItemId::new("tool-slot:call-1:supplemental:supplemental-two")
+            TranscriptViewItemId::tool_supplemental("call-1", "supplemental-two")
         );
     }
 
@@ -6784,6 +7069,73 @@ mod tests {
             TranscriptViewItemKind::AssistantMessage { message }
                 if message.text == "hello world again"
         ));
+    }
+
+    #[test]
+    fn result_terminal_rejects_late_lifecycle_and_presentation_revival() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("test.plugin".to_owned()),
+                tool_name: "test.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-1".to_owned(),
+                    model_output: "done".to_owned(),
+                    is_error: false,
+                    result: None,
+                },
+            },
+        ));
+        let terminal = view.snapshot().tools["call-1"].clone();
+        view.apply_event(&event(
+            session_id,
+            3,
+            SessionEventKind::ToolInvocationLifecycle {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "call-1".to_owned(),
+                    sequence: 3,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Progress,
+                    message: Some("late".to_owned()),
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        ));
+        view.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolPresentationUpdated {
+                update: bcode_tool::ToolPresentationUpdate {
+                    invocation_id: "call-1".to_owned(),
+                    producer_id: "test.plugin".to_owned(),
+                    generation: 0,
+                    revision: 1,
+                    identity: bcode_tool::ToolPresentationIdentity::Primary,
+                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    schema: "test.presentation".to_owned(),
+                    schema_version: 1,
+                    artifact: None,
+                    payload: serde_json::json!({"late": true}),
+                },
+            },
+        });
+
+        assert_eq!(view.snapshot().tools["call-1"], terminal);
+        assert!(view.snapshot().active_invocations.is_empty());
+        assert!(
+            view.presentation_update("call-1", &bcode_tool::ToolPresentationIdentity::Primary)
+                .is_none()
+        );
     }
 
     #[test]

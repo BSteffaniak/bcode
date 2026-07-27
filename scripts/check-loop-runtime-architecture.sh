@@ -975,8 +975,9 @@ if rg -n 'ToolPluginVisualMetadata|ToolVisualPayloadSelector|request_visual:\s*S
 fi
 
 if ! grep -F 'vim_edit_requests_remove_legacy_visuals_and_map_contribution_schemas' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
-   ! grep -F 'contribution_id: "request"' plugins/vim-edit-plugin/src/lib.rs >/dev/null; then
-  echo "Runtime architecture violation: generic Vim-edit request contribution coverage was removed." >&2
+   ! grep -F 'vim_edit_request_payload' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'PrimaryPresentationPublisher' plugins/vim-edit-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: typed Vim-edit request presentation coverage was removed." >&2
   violations=1
 fi
 
@@ -994,18 +995,16 @@ if rg -n 'ToolContributionPersistence::Transient' plugins --glob '*.rs' \
   violations=1
 fi
 
-if ! rg -n 'TransientProgressPublisher::(new|with_limits|with_limits_and_cancellation)' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
-   ! grep -F '"vim-live"' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
-   ! grep -F 'VIM_EDIT_LIVE_SCHEMA' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
-   ! grep -F 'ToolContributionPersistence::Transient' packages/plugin-sdk/src/lib.rs >/dev/null; then
-  echo "Runtime architecture violation: shared transient Vim-edit progress contributions were removed." >&2
+if ! grep -F 'PrimaryPresentationPublisher' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'replace_if_ready' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'VIM_EDIT_LIVE_SCHEMA' plugins/vim-edit-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: typed Vim-edit primary progress updates were removed." >&2
   violations=1
 fi
 
-if ! grep -F 'emit_playback_contribution' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
-   ! grep -F 'contribution_id: "playback"' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
-   ! grep -F 'persistence: ToolContributionPersistence::Durable' plugins/vim-edit-plugin/src/lib.rs >/dev/null; then
-  echo "Runtime architecture violation: durable Vim-edit playback contributions were removed." >&2
+if ! grep -F 'replace_as(VIM_EDIT_PLAYBACK_SCHEMA' plugins/vim-edit-plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'ToolPresentationRetention::RetainLatest' plugins/vim-edit-plugin/src/lib.rs >/dev/null; then
+  echo "Runtime architecture violation: retained Vim-edit playback presentation updates were removed." >&2
   violations=1
 fi
 

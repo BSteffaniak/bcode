@@ -16,6 +16,8 @@ pub use bcode_tool_models::{
     ToolContributionOperation, ToolContributionPersistence, ToolContributionPlacement,
     ToolExchangeRequest, ToolExchangeResolution, ToolExchangeResolutionEvent,
     ToolExchangeResponsePolicy, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
+    ToolPresentationIdentity, ToolPresentationRetention, ToolPresentationScopeState,
+    ToolPresentationUpdate, ToolPresentationUpdateError, ToolPresentationUpdateScope,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -57,6 +59,8 @@ pub struct ToolInvocationProjection {
     pub started_at_ms: Option<u64>,
     /// Tool finish time as UNIX epoch milliseconds, when known.
     pub finished_at_ms: Option<u64>,
+    /// Authoritative terminal duration in milliseconds, when known.
+    pub duration_ms: Option<u64>,
 }
 
 /// Renderer-neutral tool invocation lifecycle status.
@@ -67,6 +71,8 @@ pub enum ToolInvocationProjectionStatus {
     Requested,
     /// Canonical invocation lifecycle reported the tool as running.
     Running,
+    /// The invocation is active but waiting for external input or a resource.
+    Waiting,
     /// The invocation completed successfully or produced a final result.
     Finished,
     /// The owning invocation or turn was cancelled.
@@ -128,40 +134,112 @@ pub fn apply_tool_invocation_projection_event(
         }
         SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
             let projection = tool_invocation_projection_mut(projections, &lifecycle.invocation_id);
+            if is_terminal_projection_status(projection.status) {
+                return;
+            }
             match lifecycle.stage {
                 ToolInvocationLifecycleStage::Started => {
                     projection.status = ToolInvocationProjectionStatus::Running;
                     projection.started_at_ms = Some(event.timestamp_ms);
                 }
-                ToolInvocationLifecycleStage::Progress | ToolInvocationLifecycleStage::Waiting => {
+                ToolInvocationLifecycleStage::Progress => {
                     projection.status = ToolInvocationProjectionStatus::Running;
+                    projection.started_at_ms.get_or_insert(event.timestamp_ms);
+                }
+                ToolInvocationLifecycleStage::Waiting => {
+                    projection.status = ToolInvocationProjectionStatus::Waiting;
                     projection.started_at_ms.get_or_insert(event.timestamp_ms);
                 }
                 ToolInvocationLifecycleStage::Completed => {
                     projection.status = ToolInvocationProjectionStatus::Finished;
-                    projection.finished_at_ms = Some(event.timestamp_ms);
+                    apply_projection_terminal_timing(projection, lifecycle, event.timestamp_ms);
                 }
                 ToolInvocationLifecycleStage::Cancelled => {
                     projection.status = ToolInvocationProjectionStatus::Cancelled;
-                    projection.finished_at_ms = Some(event.timestamp_ms);
+                    apply_projection_terminal_timing(projection, lifecycle, event.timestamp_ms);
                 }
                 ToolInvocationLifecycleStage::Failed => {
                     projection.status = ToolInvocationProjectionStatus::Failed;
                     projection.is_error = Some(true);
-                    projection.finished_at_ms = Some(event.timestamp_ms);
+                    apply_projection_terminal_timing(projection, lifecycle, event.timestamp_ms);
                 }
             }
         }
         SessionEventKind::ToolInvocationResultRecorded { record } => {
             let projection = tool_invocation_projection_mut(projections, &record.invocation_id);
+            if is_terminal_projection_status(projection.status) {
+                if projection.result_text.is_none() {
+                    projection.result_text = Some(record.model_output.clone());
+                    projection.is_error.get_or_insert(record.is_error);
+                    if projection.raw_result.is_none() {
+                        projection.raw_result.clone_from(&record.result);
+                    }
+                    if projection.duration_ms.is_none() {
+                        projection.duration_ms = record
+                            .result
+                            .as_ref()
+                            .and_then(tool_result_duration_ms)
+                            .or_else(|| {
+                                projection_wall_duration_ms(projection, event.timestamp_ms)
+                            });
+                    }
+                }
+                return;
+            }
             projection.status = ToolInvocationProjectionStatus::Finished;
             projection.result_text = Some(record.model_output.clone());
             projection.is_error = Some(record.is_error);
             projection.raw_result.clone_from(&record.result);
             projection.finished_at_ms = Some(event.timestamp_ms);
+            projection.duration_ms = record
+                .result
+                .as_ref()
+                .and_then(tool_result_duration_ms)
+                .or_else(|| projection_wall_duration_ms(projection, event.timestamp_ms));
         }
         _ => {}
     }
+}
+
+const fn is_terminal_projection_status(status: ToolInvocationProjectionStatus) -> bool {
+    matches!(
+        status,
+        ToolInvocationProjectionStatus::Finished
+            | ToolInvocationProjectionStatus::Cancelled
+            | ToolInvocationProjectionStatus::Failed
+    )
+}
+
+fn apply_projection_terminal_timing(
+    projection: &mut ToolInvocationProjection,
+    lifecycle: &ToolInvocationLifecycleEvent,
+    timestamp_ms: u64,
+) {
+    projection.finished_at_ms = Some(timestamp_ms);
+    projection.duration_ms = lifecycle
+        .metadata
+        .get("duration_ms")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| projection_wall_duration_ms(projection, timestamp_ms));
+}
+
+fn projection_wall_duration_ms(
+    projection: &ToolInvocationProjection,
+    finished_at_ms: u64,
+) -> Option<u64> {
+    projection
+        .started_at_ms
+        .map(|started_at_ms| finished_at_ms.saturating_sub(started_at_ms))
+}
+
+fn tool_result_duration_ms(result: &ToolInvocationResult) -> Option<u64> {
+    let ToolInvocationResult::Artifact { artifact } = result else {
+        return None;
+    };
+    artifact
+        .metadata
+        .get("duration_ms")
+        .and_then(serde_json::Value::as_u64)
 }
 
 fn tool_invocation_projection_mut<'a>(
@@ -1438,6 +1516,8 @@ pub enum SessionLiveEventKind {
     },
     /// Renderer contribution with explicit placement published only to attached clients.
     ToolContributionPlaced { envelope: ToolContributionEnvelope },
+    /// Invocation-owned current presentation replacement published only to attached clients.
+    ToolPresentationUpdated { update: ToolPresentationUpdate },
     /// Authoritative current context occupancy after a durable projection update.
     RequestContextOccupancyChanged {
         /// Current occupancy, or `None` when a model/compaction boundary cleared it.
@@ -2832,6 +2912,136 @@ mod tests {
             tokens,
             algorithm_version,
         }
+    }
+
+    #[test]
+    fn terminal_projection_is_absorbing_for_late_lifecycle_and_result_events() {
+        let session_id = SessionId::new();
+        let lifecycle = |sequence, stage| SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence.saturating_mul(100),
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::ToolInvocationLifecycle {
+                event: ToolInvocationLifecycleEvent {
+                    invocation_id: "call-1".to_owned(),
+                    sequence,
+                    stage,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        };
+        let mut projections = BTreeMap::new();
+        apply_tool_invocation_projection_event(
+            &mut projections,
+            &lifecycle(1, ToolInvocationLifecycleStage::Started),
+        );
+        apply_tool_invocation_projection_event(
+            &mut projections,
+            &lifecycle(2, ToolInvocationLifecycleStage::Cancelled),
+        );
+        apply_tool_invocation_projection_event(
+            &mut projections,
+            &lifecycle(3, ToolInvocationLifecycleStage::Progress),
+        );
+        apply_tool_invocation_projection_event(
+            &mut projections,
+            &SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 4,
+                timestamp_ms: 400,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ToolInvocationResultRecorded {
+                    record: ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "late".to_owned(),
+                        is_error: false,
+                        result: Some(ToolInvocationResult::Text {
+                            text: "late".to_owned(),
+                        }),
+                    },
+                },
+            },
+        );
+
+        let projection = &projections["call-1"];
+        assert_eq!(projection.status, ToolInvocationProjectionStatus::Cancelled);
+        assert_eq!(projection.finished_at_ms, Some(200));
+        assert_eq!(projection.result_text.as_deref(), Some("late"));
+    }
+
+    #[test]
+    fn terminal_lifecycle_prefers_authoritative_duration_metadata() {
+        let session_id = SessionId::new();
+        let event = |sequence, timestamp_ms, stage, metadata| SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms,
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::ToolInvocationLifecycle {
+                event: ToolInvocationLifecycleEvent {
+                    invocation_id: "call-1".to_owned(),
+                    sequence,
+                    stage,
+                    message: None,
+                    metadata,
+                },
+            },
+        };
+        let projections = build_tool_invocation_projections(&[
+            event(
+                1,
+                1_000,
+                ToolInvocationLifecycleStage::Started,
+                serde_json::Value::Null,
+            ),
+            event(
+                2,
+                9_000,
+                ToolInvocationLifecycleStage::Completed,
+                serde_json::json!({"duration_ms": 2500}),
+            ),
+        ]);
+
+        assert_eq!(projections[0].finished_at_ms, Some(9_000));
+        assert_eq!(projections[0].duration_ms, Some(2_500));
+    }
+
+    #[test]
+    fn tool_invocation_projection_preserves_waiting_state() {
+        let session_id = SessionId::new();
+        let event = |sequence, stage| SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence.saturating_mul(100),
+            session_id,
+            provenance: None,
+            kind: SessionEventKind::ToolInvocationLifecycle {
+                event: ToolInvocationLifecycleEvent {
+                    invocation_id: "call-1".to_owned(),
+                    sequence,
+                    stage,
+                    message: None,
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        };
+        let projections = build_tool_invocation_projections(&[
+            event(1, ToolInvocationLifecycleStage::Started),
+            event(2, ToolInvocationLifecycleStage::Waiting),
+        ]);
+
+        assert_eq!(projections.len(), 1);
+        assert_eq!(
+            projections[0].status,
+            ToolInvocationProjectionStatus::Waiting
+        );
+        assert_eq!(projections[0].started_at_ms, Some(100));
+        assert_eq!(projections[0].finished_at_ms, None);
     }
 
     #[test]

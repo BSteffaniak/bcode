@@ -8,8 +8,9 @@
 //! interpretation, terminal emulation, and shell-result rendering. Host, session, server, and
 //! generic TUI-extension code must treat shell recordings as opaque tool artifacts and must not
 //! branch on shell schema IDs, recording reference keys, MIME types, ANSI, PTY, resize, grid, or
-//! scrollback semantics. Live presentation uses generic transient shell contributions carrying
-//! recording artifact revisions; durable replay uses shell-owned artifact references.
+//! scrollback semantics. Live presentation uses invocation-owned primary replacement updates
+//! carrying bounded recording artifact revisions; durable replay uses shell-owned artifact
+//! references.
 
 mod contracts;
 pub mod recording;
@@ -1537,14 +1538,14 @@ fn shell_recording_commit_observer(
 ) -> recording::ShellRecordingCommitObserver {
     let tool_call_id = tool_call_id.to_owned();
     let publication_state = Arc::new(std::sync::atomic::AtomicU8::new(0));
-    let progress = Arc::new(StdMutex::new(
-        TransientProgressPublisher::with_limits_and_cancellation(
+    let presentation = Arc::new(StdMutex::new(
+        PrimaryPresentationPublisher::with_limits_and_cancellation(
             events,
             &tool_call_id,
-            "shell-recording",
             "bcode.shell",
             SHELL_RUN_SCHEMA,
             SHELL_SCHEMA_VERSION,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
             limits,
             cancellation,
         ),
@@ -1561,7 +1562,7 @@ fn shell_recording_commit_observer(
             finalized: commit.finalized,
             availability: None,
         };
-        let mut progress = progress
+        let mut presentation = presentation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let publish_immediately = if commit.finalized {
@@ -1576,10 +1577,10 @@ fn shell_recording_commit_observer(
             false
         };
         if publish_immediately {
-            let _ = progress
-                .upsert_with_artifact(&ShellLiveRecordingPayload { mode: "terminal" }, artifact);
+            let _ = presentation
+                .replace_with_artifact(&ShellLiveRecordingPayload { mode: "terminal" }, artifact);
         } else {
-            let _ = progress.upsert_with_artifact_if_ready(
+            let _ = presentation.replace_with_artifact_if_ready(
                 &ShellLiveRecordingPayload { mode: "terminal" },
                 artifact,
             );
@@ -1984,7 +1985,7 @@ mod tests {
     }
 
     #[test]
-    fn shell_contribution_envelopes_preserve_placement_identity_and_sequence() {
+    fn shell_durable_contribution_envelopes_preserve_request_and_result_identity() {
         let event = ToolContributionEvent {
             invocation_id: "call-1".to_owned(),
             contribution_id: "request".to_owned(),
@@ -1999,7 +2000,6 @@ mod tests {
         };
         for placement in [
             ToolContributionPlacement::Request,
-            ToolContributionPlacement::Progress,
             ToolContributionPlacement::Result,
         ] {
             let envelope = bcode_tool::ToolContributionEnvelope::new(placement, event.clone());
@@ -2063,9 +2063,9 @@ mod tests {
             .expect("events")
             .iter()
             .filter_map(|payload| {
-                serde_json::from_slice::<bcode_tool::ToolContributionEnvelope>(payload).ok()
+                serde_json::from_slice::<bcode_tool::ToolPresentationUpdate>(payload).ok()
             })
-            .filter_map(|envelope| envelope.contribution.artifact)
+            .filter_map(|update| update.artifact)
             .map(|artifact| artifact.revision)
             .collect::<Vec<_>>();
         assert_eq!(
@@ -2586,9 +2586,9 @@ mod tests {
             .expect("events")
             .iter()
             .filter_map(|payload| {
-                serde_json::from_slice::<bcode_tool::ToolContributionEnvelope>(payload).ok()
+                serde_json::from_slice::<bcode_tool::ToolPresentationUpdate>(payload).ok()
             })
-            .filter_map(|envelope| envelope.contribution.artifact)
+            .filter_map(|update| update.artifact)
             .map(|artifact| {
                 (
                     artifact.committed_bytes,
@@ -3127,10 +3127,13 @@ mod tests {
         let mut ipc_bytes = 0_usize;
         for event in events {
             ipc_bytes = ipc_bytes.saturating_add(event.payload.len());
-            let envelope: bcode_tool::ToolContributionEnvelope =
-                serde_json::from_slice(&event.payload).expect("artifact contribution envelope");
-            assert_eq!(envelope.placement, ToolContributionPlacement::Progress);
-            let artifact = envelope.contribution.artifact.expect("artifact revision");
+            let update: bcode_tool::ToolPresentationUpdate =
+                serde_json::from_slice(&event.payload).expect("artifact presentation update");
+            assert_eq!(
+                update.identity,
+                bcode_tool::ToolPresentationIdentity::Primary
+            );
+            let artifact = update.artifact.expect("artifact revision");
             let delta = artifact.committed_bytes.saturating_sub(previous_bytes);
             previous_bytes = artifact.committed_bytes;
             if !artifact.finalized {
@@ -3399,10 +3402,10 @@ mod tests {
         let recorded_events = recorded_events.lock().expect("recorded lock");
         assert!(!recorded_events.is_empty());
         assert!(recorded_events.iter().all(|payload| {
-            serde_json::from_slice::<bcode_tool::ToolContributionEnvelope>(payload).is_ok_and(
-                |envelope| {
-                    envelope.placement == ToolContributionPlacement::Progress
-                        && envelope.contribution.artifact.is_some()
+            serde_json::from_slice::<bcode_tool::ToolPresentationUpdate>(payload).is_ok_and(
+                |update| {
+                    update.identity == bcode_tool::ToolPresentationIdentity::Primary
+                        && update.artifact.is_some()
                 },
             )
         }));

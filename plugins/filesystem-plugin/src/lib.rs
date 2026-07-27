@@ -13,10 +13,9 @@ use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ImageMetadata, ImageRefContent, ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS,
-    TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolContributionEvent, ToolContributionOperation,
-    ToolContributionPersistence, ToolContributionPlacement, ToolDefinition,
-    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult, ToolList, ToolResultContent,
+    TOOL_SERVICE_INTERFACE_ID, ToolArtifact, ToolDefinition, ToolInvocationLifecycleEvent,
+    ToolInvocationLifecycleStage, ToolInvocationRequest, ToolInvocationResponse,
+    ToolInvocationResult, ToolList, ToolResultContent,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -747,12 +746,8 @@ fn artifact_grep_tool_definition() -> ToolDefinition {
     }
 }
 
-fn filesystem_request_contribution(
-    invocation_id: &str,
-    operation: &str,
-    arguments: &serde_json::Value,
-) -> ToolContributionEvent {
-    let payload = arguments.as_object().map_or_else(
+fn filesystem_request_payload(operation: &str, arguments: &serde_json::Value) -> serde_json::Value {
+    arguments.as_object().map_or_else(
         || json!({"operation": operation, "arguments": arguments}),
         |arguments| {
             let mut payload = arguments.clone();
@@ -762,29 +757,25 @@ fn filesystem_request_contribution(
             );
             serde_json::Value::Object(payload)
         },
-    );
-    ToolContributionEvent {
-        invocation_id: invocation_id.to_owned(),
-        contribution_id: "filesystem-request".to_owned(),
-        sequence: 1,
-        producer_id: FILESYSTEM_PLUGIN_ID.to_owned(),
-        schema: FILESYSTEM_REQUEST_SCHEMA.to_owned(),
-        schema_version: 1,
-        operation: ToolContributionOperation::Upsert,
-        persistence: ToolContributionPersistence::Durable,
-        artifact: None,
-        payload,
-    }
+    )
 }
 
-fn emit_tool_contribution(
-    events: ServiceEventEmitter,
-    placement: ToolContributionPlacement,
-    event: &ToolContributionEvent,
+fn publish_filesystem_result_presentation(
+    presentation: &mut PrimaryPresentationPublisher,
+    response: &ToolInvocationResponse,
 ) {
-    let envelope = bcode_tool::ToolContributionEnvelope::new(placement, event.clone());
-    if let Ok(payload) = serde_json::to_vec(&envelope) {
-        events.emit(&payload);
+    if let Some(ToolInvocationResult::Artifact { artifact }) = &response.result {
+        let _ = presentation.replace_as(
+            artifact.schema.clone(),
+            artifact.schema_version,
+            &artifact.metadata,
+        );
+    } else {
+        let payload = json!({
+            "output": response.output,
+            "is_error": response.is_error,
+        });
+        let _ = presentation.replace_as("bcode.filesystem.result", 1, &payload);
     }
 }
 
@@ -812,11 +803,10 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             )));
         }
     };
-    emit_tool_contribution(
-        context.events,
-        ToolContributionPlacement::Request,
-        &filesystem_request_contribution(&request.tool_call_id, &request.name, &request.arguments),
-    );
+    let request_payload = filesystem_request_payload(&request.name, &request.arguments);
+    let mut presentation =
+        context.primary_presentation(&request.tool_call_id, FILESYSTEM_REQUEST_SCHEMA, 1);
+    let _ = presentation.replace(&request_payload);
     let mut arguments = request.arguments;
     if let Err(error) = apply_filesystem_preparation(&mut arguments, &descriptor) {
         return json_response(&tool_error(error));
@@ -860,6 +850,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             result: None,
         },
     };
+    publish_filesystem_result_presentation(&mut presentation, &response);
     json_response(&response)
 }
 
@@ -2548,25 +2539,95 @@ bcode_plugin_sdk::export_plugin!(FilesystemPlugin, include_str!("../bcode-plugin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::c_void;
+    use std::sync::Mutex;
+
+    extern "C" fn capture_presentation_update(
+        payload: *const u8,
+        payload_len: usize,
+        user_data: *mut c_void,
+    ) {
+        // SAFETY: this test keeps the collector alive and the emitter invokes synchronously.
+        let updates = unsafe { &*(user_data.cast::<Mutex<Vec<Vec<u8>>>>()) };
+        // SAFETY: the emitter supplies a valid payload pointer and length for the callback.
+        let payload = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+        updates
+            .lock()
+            .expect("update collector")
+            .push(payload.to_vec());
+    }
+
+    #[test]
+    fn filesystem_primary_presentation_replaces_request_with_file_change() {
+        let updates = Mutex::new(Vec::<Vec<u8>>::new());
+        let events = ServiceEventEmitter::new(
+            Some(capture_presentation_update),
+            std::ptr::from_ref(&updates).cast_mut().cast(),
+        );
+        let mut presentation = PrimaryPresentationPublisher::with_limits_and_cancellation(
+            events,
+            "call-1",
+            FILESYSTEM_PLUGIN_ID,
+            FILESYSTEM_REQUEST_SCHEMA,
+            1,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
+            bcode_plugin_sdk::TransientProgressLimits::default(),
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        );
+        presentation
+            .replace(&filesystem_request_payload(
+                "filesystem.write",
+                &json!({"path": "new.rs", "contents": "fn main() {}"}),
+            ))
+            .expect("request presentation");
+        let response = ToolInvocationResponse {
+            output: "wrote 12 bytes".to_owned(),
+            is_error: false,
+            content: Vec::new(),
+            full_output: None,
+            result: Some(file_change_artifact(
+                "call-1",
+                "filesystem.write",
+                "wrote 12 bytes",
+                Some(Path::new("new.rs")),
+                "",
+                "fn main() {}",
+                Some(1),
+            )),
+        };
+        publish_filesystem_result_presentation(&mut presentation, &response);
+
+        let updates = updates
+            .lock()
+            .expect("update collector")
+            .iter()
+            .map(|payload| {
+                serde_json::from_slice::<bcode_tool::ToolPresentationUpdate>(payload)
+                    .expect("typed presentation update")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(updates.len(), 2);
+        assert_eq!(updates[0].revision, 1);
+        assert_eq!(updates[0].schema, FILESYSTEM_REQUEST_SCHEMA);
+        assert_eq!(updates[1].revision, 2);
+        assert_eq!(updates[1].schema, "bcode.filesystem.change");
+        assert_eq!(updates[1].payload["new_text"], "fn main() {}");
+        assert!(updates.iter().all(|update| {
+            update.identity == bcode_tool::ToolPresentationIdentity::Primary
+                && update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+        }));
+    }
 
     #[test]
     fn filesystem_requests_use_durable_generic_contributions_without_legacy_visuals() {
         let arguments = serde_json::json!({"path": "src/lib.rs", "offset": 2});
-        let contribution = filesystem_request_contribution("call-1", "filesystem.read", &arguments);
-        assert_eq!(contribution.invocation_id, "call-1");
-        assert_eq!(contribution.producer_id, FILESYSTEM_PLUGIN_ID);
-        assert_eq!(contribution.schema, FILESYSTEM_REQUEST_SCHEMA);
-        assert_eq!(
-            contribution.persistence,
-            ToolContributionPersistence::Durable
-        );
-        assert_eq!(contribution.payload["operation"], "filesystem.read");
-        assert_eq!(contribution.payload["path"], "src/lib.rs");
+        let payload = filesystem_request_payload("filesystem.read", &arguments);
+        assert_eq!(payload["operation"], "filesystem.read");
+        assert_eq!(payload["path"], "src/lib.rs");
         let write_arguments = serde_json::json!({"path": "new.rs", "contents": "fn main() {}"});
-        let write = filesystem_request_contribution("call-2", "filesystem.write", &write_arguments);
-        assert_eq!(write.schema, FILESYSTEM_REQUEST_SCHEMA);
-        assert_eq!(write.payload["operation"], "filesystem.write");
-        assert_eq!(write.payload["contents"], "fn main() {}");
+        let write = filesystem_request_payload("filesystem.write", &write_arguments);
+        assert_eq!(write["operation"], "filesystem.write");
+        assert_eq!(write["contents"], "fn main() {}");
     }
 
     #[test]

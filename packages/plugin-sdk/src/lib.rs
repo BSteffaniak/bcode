@@ -320,6 +320,276 @@ impl Default for TransientProgressLimits {
     }
 }
 
+/// Failure returned while publishing an invocation-owned presentation update.
+#[derive(Debug)]
+pub enum PresentationUpdateError {
+    /// The host did not provide an incremental event callback.
+    Unavailable,
+    /// The invocation was cancelled before publication.
+    Cancelled,
+    /// No later monotonic revision can be represented.
+    RevisionExhausted,
+    /// Typed payload or update serialization failed.
+    Encode(serde_json::Error),
+    /// The encoded update exceeded the host-advertised bound.
+    TooLarge { actual: usize, maximum: usize },
+}
+
+impl std::fmt::Display for PresentationUpdateError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => formatter.write_str("presentation updates are unavailable"),
+            Self::Cancelled => formatter.write_str("presentation update was cancelled"),
+            Self::RevisionExhausted => formatter.write_str("presentation revision exhausted"),
+            Self::Encode(error) => {
+                write!(formatter, "presentation update encoding failed: {error}")
+            }
+            Self::TooLarge { actual, maximum } => write!(
+                formatter,
+                "encoded presentation update contains {actual} bytes but maximum is {maximum}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PresentationUpdateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Encode(error) => Some(error),
+            Self::Unavailable
+            | Self::Cancelled
+            | Self::RevisionExhausted
+            | Self::TooLarge { .. } => None,
+        }
+    }
+}
+
+impl From<serde_json::Error> for PresentationUpdateError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::Encode(error)
+    }
+}
+
+/// Small replace-oriented publisher for one invocation-owned primary presentation.
+///
+/// Every successful call emits one monotonic replacement. Invocation lifecycle closure is owned
+/// by the host; plugin code does not remove or promote this presentation at completion.
+#[derive(Debug, Clone)]
+pub struct PrimaryPresentationPublisher {
+    events: ServiceEventEmitter,
+    invocation_id: String,
+    producer_id: String,
+    generation: u64,
+    revision: u64,
+    schema: String,
+    schema_version: u32,
+    retention: bcode_tool::ToolPresentationRetention,
+    limits: TransientProgressLimits,
+    cancellation: ServiceCancellation,
+    last_emitted_at: Option<Instant>,
+}
+
+impl PrimaryPresentationPublisher {
+    /// Create a primary presentation publisher using host limits and cancellation.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)] // Identity, schema, and host policy are explicit.
+    pub fn with_limits_and_cancellation(
+        events: ServiceEventEmitter,
+        invocation_id: impl Into<String>,
+        producer_id: impl Into<String>,
+        schema: impl Into<String>,
+        schema_version: u32,
+        retention: bcode_tool::ToolPresentationRetention,
+        limits: TransientProgressLimits,
+        cancellation: ServiceCancellation,
+    ) -> Self {
+        Self {
+            events,
+            invocation_id: invocation_id.into(),
+            producer_id: producer_id.into(),
+            generation: 0,
+            revision: 0,
+            schema: schema.into(),
+            schema_version,
+            retention,
+            limits,
+            cancellation,
+            last_emitted_at: None,
+        }
+    }
+
+    /// Return whether the producer cadence permits another replacement now.
+    #[must_use]
+    pub fn is_ready(&self) -> bool {
+        self.events.is_available()
+            && !self.cancellation.is_cancelled()
+            && self.last_emitted_at.is_none_or(|emitted_at| {
+                emitted_at.elapsed() >= Duration::from_millis(self.limits.min_interval_ms)
+            })
+    }
+
+    /// Replace the current primary payload while changing its producer-owned visual schema.
+    ///
+    /// This keeps primary identity and revision continuity while allowing one invocation to move
+    /// from a compact request visual to a richer result visual.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when updates are unavailable, cancelled, oversized, exhausted, or cannot
+    /// be encoded.
+    pub fn replace_as<T: Serialize + ?Sized>(
+        &mut self,
+        schema: impl Into<String>,
+        schema_version: u32,
+        payload: &T,
+    ) -> Result<u64, PresentationUpdateError> {
+        self.replace_value_as(
+            serde_json::to_value(payload)?,
+            None,
+            schema.into(),
+            schema_version,
+        )
+    }
+
+    /// Replace the current primary payload and return its revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when updates are unavailable, cancelled, oversized, exhausted, or cannot
+    /// be encoded.
+    pub fn replace<T: Serialize + ?Sized>(
+        &mut self,
+        payload: &T,
+    ) -> Result<u64, PresentationUpdateError> {
+        self.replace_value(serde_json::to_value(payload)?, None)
+    }
+
+    /// Replace the current primary payload with an artifact revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when updates are unavailable, cancelled, oversized, exhausted, or cannot
+    /// be encoded.
+    pub fn replace_with_artifact<T: Serialize + ?Sized>(
+        &mut self,
+        payload: &T,
+        artifact: bcode_tool::ToolContributionArtifact,
+    ) -> Result<u64, PresentationUpdateError> {
+        self.replace_value(serde_json::to_value(payload)?, Some(artifact))
+    }
+
+    /// Replace the current primary payload only when the cadence permits it.
+    ///
+    /// Returns `Ok(None)` without serializing when an update is intentionally coalesced.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when updates are unavailable, cancelled, oversized, exhausted, or cannot
+    /// be encoded.
+    pub fn replace_if_ready<T: Serialize + ?Sized>(
+        &mut self,
+        payload: &T,
+    ) -> Result<Option<u64>, PresentationUpdateError> {
+        if !self.is_ready() {
+            if self.cancellation.is_cancelled() {
+                return Err(PresentationUpdateError::Cancelled);
+            }
+            if !self.events.is_available() {
+                return Err(PresentationUpdateError::Unavailable);
+            }
+            return Ok(None);
+        }
+        self.replace(payload).map(Some)
+    }
+
+    /// Replace the current primary payload and artifact only when cadence permits it.
+    ///
+    /// Finalized artifacts bypass cadence so the last complete checkpoint is emitted before the
+    /// invocation returns. Returns `Ok(None)` without serializing other coalesced updates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when updates are unavailable, cancelled, oversized, exhausted, or cannot
+    /// be encoded.
+    pub fn replace_with_artifact_if_ready<T: Serialize + ?Sized>(
+        &mut self,
+        payload: &T,
+        artifact: bcode_tool::ToolContributionArtifact,
+    ) -> Result<Option<u64>, PresentationUpdateError> {
+        if artifact.finalized {
+            return self.replace_with_artifact(payload, artifact).map(Some);
+        }
+        if !self.is_ready() {
+            if self.cancellation.is_cancelled() {
+                return Err(PresentationUpdateError::Cancelled);
+            }
+            if !self.events.is_available() {
+                return Err(PresentationUpdateError::Unavailable);
+            }
+            return Ok(None);
+        }
+        self.replace_with_artifact(payload, artifact).map(Some)
+    }
+
+    /// Return the last successfully emitted revision.
+    #[must_use]
+    pub const fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    fn replace_value(
+        &mut self,
+        payload: serde_json::Value,
+        artifact: Option<bcode_tool::ToolContributionArtifact>,
+    ) -> Result<u64, PresentationUpdateError> {
+        self.replace_value_as(payload, artifact, self.schema.clone(), self.schema_version)
+    }
+
+    fn replace_value_as(
+        &mut self,
+        payload: serde_json::Value,
+        artifact: Option<bcode_tool::ToolContributionArtifact>,
+        schema: String,
+        schema_version: u32,
+    ) -> Result<u64, PresentationUpdateError> {
+        if self.cancellation.is_cancelled() {
+            return Err(PresentationUpdateError::Cancelled);
+        }
+        if !self.events.is_available() {
+            return Err(PresentationUpdateError::Unavailable);
+        }
+        let revision = self
+            .revision
+            .checked_add(1)
+            .ok_or(PresentationUpdateError::RevisionExhausted)?;
+        let update = bcode_tool::ToolPresentationUpdate {
+            invocation_id: self.invocation_id.clone(),
+            producer_id: self.producer_id.clone(),
+            generation: self.generation,
+            revision,
+            identity: bcode_tool::ToolPresentationIdentity::Primary,
+            retention: self.retention,
+            schema: schema.clone(),
+            schema_version,
+            artifact,
+            payload,
+        };
+        let encoded = serde_json::to_vec(&update)?;
+        if encoded.len() > self.limits.max_encoded_bytes {
+            return Err(PresentationUpdateError::TooLarge {
+                actual: encoded.len(),
+                maximum: self.limits.max_encoded_bytes,
+            });
+        }
+        self.events.emit(&encoded);
+        self.schema = schema;
+        self.schema_version = schema_version;
+        self.revision = revision;
+        self.last_emitted_at = Some(Instant::now());
+        Ok(revision)
+    }
+}
+
 /// Failure returned while publishing transient plugin progress.
 #[derive(Debug)]
 pub enum TransientProgressError {
@@ -1080,6 +1350,43 @@ impl NativeServiceContext {
         T: Default + DeserializeOwned,
     {
         self.config.typed_or_default()
+    }
+
+    /// Create a scoped primary presentation publisher using host-advertised limits.
+    #[must_use]
+    pub fn primary_presentation(
+        &self,
+        invocation_id: impl Into<String>,
+        schema: impl Into<String>,
+        schema_version: u32,
+    ) -> PrimaryPresentationPublisher {
+        self.primary_presentation_with_retention(
+            invocation_id,
+            schema,
+            schema_version,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
+        )
+    }
+
+    /// Create a scoped primary presentation publisher with an explicit retention policy.
+    #[must_use]
+    pub fn primary_presentation_with_retention(
+        &self,
+        invocation_id: impl Into<String>,
+        schema: impl Into<String>,
+        schema_version: u32,
+        retention: bcode_tool::ToolPresentationRetention,
+    ) -> PrimaryPresentationPublisher {
+        PrimaryPresentationPublisher::with_limits_and_cancellation(
+            self.events,
+            invocation_id,
+            self.plugin_id.clone(),
+            schema,
+            schema_version,
+            retention,
+            self.transient_progress_limits,
+            self.cancellation.clone(),
+        )
     }
 
     /// Create a scoped transient progress publisher using host-advertised limits.
@@ -2072,24 +2379,26 @@ pub mod prelude {
         DEFAULT_TRANSIENT_PROGRESS_MIN_INTERVAL_MS, EVENT_STATUS_DECODE_FAILED,
         EVENT_STATUS_INVALID_ARGUMENT, EVENT_STATUS_OK, EVENT_STATUS_PLUGIN_UNAVAILABLE,
         EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, NativeEventContext, NativeServiceContext,
-        PluginError, PluginEvent, RustPlugin, SERVICE_STATUS_BUFFER_TOO_SMALL,
-        SERVICE_STATUS_DECODE_FAILED, SERVICE_STATUS_ENCODE_FAILED,
-        SERVICE_STATUS_INVALID_ARGUMENT, SERVICE_STATUS_OK, SERVICE_STATUS_PLUGIN_UNAVAILABLE,
-        ServiceBridge, ServiceBridgeCallback, ServiceBridgeError, ServiceBridgeRequest,
-        ServiceBridgeResponse, ServiceError, ServiceEventCallback, ServiceEventEmitter,
-        ServiceRequest, ServiceResponse, StaticPluginVtable, StreamingServiceFn,
-        TransientProgressError, TransientProgressLimits, TransientProgressPublisher,
-        export_concurrent_plugin, export_plugin, prepare_tool_from_definitions,
-        prepare_tool_service_response, static_concurrent_plugin_vtable, static_plugin_vtable,
+        PluginError, PluginEvent, PresentationUpdateError, PrimaryPresentationPublisher,
+        RustPlugin, SERVICE_STATUS_BUFFER_TOO_SMALL, SERVICE_STATUS_DECODE_FAILED,
+        SERVICE_STATUS_ENCODE_FAILED, SERVICE_STATUS_INVALID_ARGUMENT, SERVICE_STATUS_OK,
+        SERVICE_STATUS_PLUGIN_UNAVAILABLE, ServiceBridge, ServiceBridgeCallback,
+        ServiceBridgeError, ServiceBridgeRequest, ServiceBridgeResponse, ServiceError,
+        ServiceEventCallback, ServiceEventEmitter, ServiceRequest, ServiceResponse,
+        StaticPluginVtable, StreamingServiceFn, TransientProgressError, TransientProgressLimits,
+        TransientProgressPublisher, export_concurrent_plugin, export_plugin,
+        prepare_tool_from_definitions, prepare_tool_service_response,
+        static_concurrent_plugin_vtable, static_plugin_vtable,
     };
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        SERVICE_BRIDGE_STATUS_OK, ServiceBridge, ServiceBridgeRequest, ServiceBridgeResponse,
-        ServiceCancellation, ServiceEventEmitter, ServiceRequest, ServiceResponse,
-        TransientProgressError, TransientProgressLimits, TransientProgressPublisher,
+        PresentationUpdateError, PrimaryPresentationPublisher, SERVICE_BRIDGE_STATUS_OK,
+        ServiceBridge, ServiceBridgeRequest, ServiceBridgeResponse, ServiceCancellation,
+        ServiceEventEmitter, ServiceRequest, ServiceResponse, TransientProgressError,
+        TransientProgressLimits, TransientProgressPublisher,
     };
     use serde::{Deserialize, Serialize};
     use std::ffi::c_void;
@@ -2111,6 +2420,151 @@ mod tests {
             .lock()
             .expect("event collector")
             .push(payload.to_vec());
+    }
+
+    #[test]
+    fn primary_presentation_publisher_replaces_without_terminal_cleanup() {
+        let events: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+        let emitter = ServiceEventEmitter::new(
+            Some(collect_progress_event),
+            std::ptr::from_ref(&events).cast_mut().cast(),
+        );
+        let mut presentation = PrimaryPresentationPublisher::with_limits_and_cancellation(
+            emitter,
+            "call-1",
+            "example.plugin",
+            "example.presentation",
+            1,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
+            TransientProgressLimits {
+                max_encoded_bytes: 1024,
+                min_interval_ms: 0,
+            },
+            ServiceCancellation::default(),
+        );
+
+        assert_eq!(
+            presentation
+                .replace(&serde_json::json!({"step": 1}))
+                .expect("first replacement"),
+            1
+        );
+        assert_eq!(
+            presentation
+                .replace(&serde_json::json!({"step": 2}))
+                .expect("second replacement"),
+            2
+        );
+        assert_eq!(
+            presentation
+                .replace_with_artifact_if_ready(
+                    &serde_json::json!({"step": 3}),
+                    bcode_tool::ToolContributionArtifact {
+                        artifact_id: "artifact-1".to_owned(),
+                        reference_key: "bytes".to_owned(),
+                        content_type: None,
+                        storage_uri: "file:///tmp/artifact".to_owned(),
+                        committed_bytes: 3,
+                        revision: 3,
+                        finalized: true,
+                        availability: Some("complete".to_owned()),
+                    },
+                )
+                .expect("finalized replacement"),
+            Some(3)
+        );
+
+        let decoded = events
+            .lock()
+            .expect("event collector")
+            .iter()
+            .map(|payload| {
+                serde_json::from_slice::<bcode_tool::ToolPresentationUpdate>(payload)
+                    .expect("presentation update")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decoded.len(), 3);
+        assert!(decoded.iter().all(|update| {
+            update.invocation_id == "call-1"
+                && update.producer_id == "example.plugin"
+                && update.identity == bcode_tool::ToolPresentationIdentity::Primary
+                && update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+        }));
+        assert_eq!(decoded[0].revision, 1);
+        assert_eq!(decoded[1].revision, 2);
+        assert_eq!(decoded[1].payload, serde_json::json!({"step": 2}));
+        assert_eq!(decoded[2].revision, 3);
+        assert!(
+            decoded[2]
+                .artifact
+                .as_ref()
+                .is_some_and(|artifact| artifact.finalized)
+        );
+        assert_eq!(
+            presentation
+                .replace_as(
+                    "example.presentation.final",
+                    2,
+                    &serde_json::json!({"step": 4}),
+                )
+                .expect("schema replacement"),
+            4
+        );
+        let final_update = events
+            .lock()
+            .expect("event collector")
+            .last()
+            .map(|payload| {
+                serde_json::from_slice::<bcode_tool::ToolPresentationUpdate>(payload)
+                    .expect("schema presentation update")
+            })
+            .expect("final presentation update");
+        assert_eq!(final_update.schema, "example.presentation.final");
+        assert_eq!(final_update.schema_version, 2);
+    }
+
+    #[test]
+    fn primary_presentation_publisher_enforces_limits_and_cancellation() {
+        let events: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+        let emitter = ServiceEventEmitter::new(
+            Some(collect_progress_event),
+            std::ptr::from_ref(&events).cast_mut().cast(),
+        );
+        let mut oversized = PrimaryPresentationPublisher::with_limits_and_cancellation(
+            emitter,
+            "call-1",
+            "example.plugin",
+            "example.presentation",
+            1,
+            bcode_tool::ToolPresentationRetention::ActiveOnly,
+            TransientProgressLimits {
+                max_encoded_bytes: 1,
+                min_interval_ms: 0,
+            },
+            ServiceCancellation::default(),
+        );
+        assert!(matches!(
+            oversized.replace(&serde_json::json!({"value": "large"})),
+            Err(PresentationUpdateError::TooLarge { maximum: 1, .. })
+        ));
+        assert_eq!(oversized.revision(), 0);
+
+        let cancellation = ServiceCancellation::default();
+        let mut cancelled = PrimaryPresentationPublisher::with_limits_and_cancellation(
+            emitter,
+            "call-2",
+            "example.plugin",
+            "example.presentation",
+            1,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
+            TransientProgressLimits::default(),
+            cancellation.clone(),
+        );
+        cancellation.cancel();
+        assert!(matches!(
+            cancelled.replace(&serde_json::json!({"step": 1})),
+            Err(PresentationUpdateError::Cancelled)
+        ));
     }
 
     #[test]

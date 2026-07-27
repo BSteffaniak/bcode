@@ -5,6 +5,7 @@
 //! Serializable leaf-model types for neutral tool runtime contracts.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 /// Generic lifecycle stage for a tool invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +35,171 @@ pub enum ToolContributionOperation {
     Append,
     /// Remove the identified contribution.
     Remove,
+}
+
+/// Retention policy for an invocation-owned presentation update.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPresentationRetention {
+    /// Keep one bounded current value and checkpoint the latest accepted value at closure.
+    #[default]
+    RetainLatest,
+    /// Keep the value only while the invocation update scope remains open.
+    ActiveOnly,
+}
+
+/// Semantic identity of an invocation-owned presentation item.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolPresentationIdentity {
+    /// Primary presentation for the invocation.
+    Primary,
+    /// Independently meaningful supporting presentation.
+    Supplemental { item_id: String },
+}
+
+/// Renderer-neutral current presentation update for one tool invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPresentationUpdate {
+    /// Invocation that owns this update.
+    pub invocation_id: String,
+    /// Plugin, direct tool, or adapter that owns the payload schema.
+    pub producer_id: String,
+    /// Invocation-local update generation.
+    pub generation: u64,
+    /// Monotonic revision within the generation and presentation identity.
+    pub revision: u64,
+    /// Primary or independently keyed supplemental identity.
+    pub identity: ToolPresentationIdentity,
+    /// Retention policy independent from whether the invocation is currently active.
+    pub retention: ToolPresentationRetention,
+    /// Producer-owned payload schema.
+    pub schema: String,
+    /// Version of `schema` used by `payload`.
+    pub schema_version: u32,
+    /// Optional bounded artifact revision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<ToolContributionArtifact>,
+    /// Opaque producer-owned visual payload.
+    pub payload: serde_json::Value,
+}
+
+/// State of an invocation presentation update scope.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolPresentationScopeState {
+    /// Updates may be accepted subject to identity, generation, revision, and host limits.
+    #[default]
+    Open,
+    /// Terminal closure is absorbing and rejects every later update.
+    Closed,
+}
+
+/// Error accepting an invocation presentation update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolPresentationUpdateError {
+    MissingInvocationId,
+    MissingProducerId,
+    MissingSupplementalId,
+    MissingSchema,
+    InvocationMismatch,
+    ProducerMismatch,
+    Unavailable,
+    Closed,
+    StaleGeneration,
+    FutureGeneration,
+    StaleRevision,
+    TooLarge { actual: usize, maximum: usize },
+    Encode(String),
+}
+
+/// Authoritative acceptance state for one invocation-owned presentation identity.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolPresentationUpdateScope {
+    state: ToolPresentationScopeState,
+    generation: u64,
+    highest_revisions: BTreeMap<ToolPresentationIdentity, u64>,
+}
+
+impl ToolPresentationUpdateScope {
+    #[must_use]
+    pub const fn state(&self) -> ToolPresentationScopeState {
+        self.state
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    #[must_use]
+    pub fn highest_revision(&self, identity: &ToolPresentationIdentity) -> Option<u64> {
+        self.highest_revisions.get(identity).copied()
+    }
+
+    /// Accept a bounded update and advance authoritative revision state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid identity/schema, closed scope, stale or skipped generation,
+    /// stale revision, serialization failure, or encoded payload larger than `max_encoded_bytes`.
+    pub fn accept(
+        &mut self,
+        update: &ToolPresentationUpdate,
+        max_encoded_bytes: usize,
+    ) -> Result<(), ToolPresentationUpdateError> {
+        if self.state == ToolPresentationScopeState::Closed {
+            return Err(ToolPresentationUpdateError::Closed);
+        }
+        if update.invocation_id.trim().is_empty() {
+            return Err(ToolPresentationUpdateError::MissingInvocationId);
+        }
+        if update.producer_id.trim().is_empty() {
+            return Err(ToolPresentationUpdateError::MissingProducerId);
+        }
+        if update.schema.trim().is_empty() {
+            return Err(ToolPresentationUpdateError::MissingSchema);
+        }
+        if matches!(
+            &update.identity,
+            ToolPresentationIdentity::Supplemental { item_id } if item_id.trim().is_empty()
+        ) {
+            return Err(ToolPresentationUpdateError::MissingSupplementalId);
+        }
+        if update.generation < self.generation {
+            return Err(ToolPresentationUpdateError::StaleGeneration);
+        }
+        if update.generation > self.generation.saturating_add(1) {
+            return Err(ToolPresentationUpdateError::FutureGeneration);
+        }
+        if update.generation > self.generation {
+            self.generation = update.generation;
+            self.highest_revisions.clear();
+        }
+        if self
+            .highest_revisions
+            .get(&update.identity)
+            .is_some_and(|revision| update.revision <= *revision)
+        {
+            return Err(ToolPresentationUpdateError::StaleRevision);
+        }
+        let encoded = serde_json::to_vec(update)
+            .map_err(|error| ToolPresentationUpdateError::Encode(error.to_string()))?;
+        if encoded.len() > max_encoded_bytes {
+            return Err(ToolPresentationUpdateError::TooLarge {
+                actual: encoded.len(),
+                maximum: max_encoded_bytes,
+            });
+        }
+        self.highest_revisions
+            .insert(update.identity.clone(), update.revision);
+        Ok(())
+    }
+
+    /// Close the scope. Repeated closure is idempotent.
+    pub const fn close(&mut self) {
+        self.state = ToolPresentationScopeState::Closed;
+    }
 }
 
 /// Renderer-neutral placement for one tool contribution.
@@ -257,6 +423,41 @@ pub struct ToolInvocationLifecycleEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presentation_scope_close_retains_highest_accepted_revision() {
+        let mut scope = ToolPresentationUpdateScope::default();
+        let update = ToolPresentationUpdate {
+            invocation_id: "call-1".to_owned(),
+            producer_id: "example.plugin".to_owned(),
+            generation: 0,
+            revision: 7,
+            identity: ToolPresentationIdentity::Primary,
+            retention: ToolPresentationRetention::RetainLatest,
+            schema: "example.presentation".to_owned(),
+            schema_version: 1,
+            artifact: None,
+            payload: serde_json::json!({"value": 1}),
+        };
+        scope.accept(&update, 1024).expect("accepted update");
+        scope.close();
+
+        assert_eq!(scope.state(), ToolPresentationScopeState::Closed);
+        assert_eq!(
+            scope.highest_revision(&ToolPresentationIdentity::Primary),
+            Some(7)
+        );
+        assert_eq!(
+            scope.accept(
+                &ToolPresentationUpdate {
+                    revision: 8,
+                    ..update
+                },
+                1024
+            ),
+            Err(ToolPresentationUpdateError::Closed)
+        );
+    }
 
     #[test]
     fn contribution_envelope_round_trips_all_placements() {

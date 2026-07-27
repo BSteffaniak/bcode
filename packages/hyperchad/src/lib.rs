@@ -2120,18 +2120,14 @@ mod tests {
         assert!(removal.reset.is_none());
         assert!(matches!(
             removal.transcript.as_slice(),
-            [bcode_session_view_models::TranscriptViewPatchOp::Remove { id }]
+            [bcode_session_view_models::TranscriptViewPatchOp::Remove { id, .. }]
                 if id == &item_id
         ));
     }
 
     #[test]
-    fn scoped_snapshot_patch_replaces_stable_result_slot() {
-        let item_id = bcode_session_view_models::TranscriptViewItemId::tool_presentation_slot(
-            "call-1",
-            bcode_session_models::ToolContributionPlacement::Result,
-            None,
-        );
+    fn scoped_snapshot_patch_replaces_stable_primary_tool_item() {
+        let item_id = bcode_session_view_models::TranscriptViewItemId::tool("call-1");
         let draft = bcode_session_view_models::TranscriptViewItem {
             id: item_id.clone(),
             revision: 1,

@@ -37,6 +37,7 @@ fn lifecycle_status(tool: &ToolInvocationView) -> (&'static str, &'static str) {
         match tool.status {
             ToolInvocationViewStatus::Requested => ("requested", color::MUTED),
             ToolInvocationViewStatus::Running => ("running", color::SUCCESS),
+            ToolInvocationViewStatus::Waiting => ("waiting", color::WARNING),
             ToolInvocationViewStatus::Finished => ("finished", color::INFO),
             ToolInvocationViewStatus::Cancelled => ("cancelled", color::WARNING),
             ToolInvocationViewStatus::Failed => ("failed", color::ERROR),

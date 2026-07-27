@@ -2587,16 +2587,13 @@ impl BmuxApp {
             SessionLiveEventKind::ToolContributionPlaced { envelope } => {
                 self.apply_live_contribution(&envelope.contribution, envelope.placement);
             }
-            SessionLiveEventKind::ToolRequestDraft { event: draft } => {
-                let item_id =
-                    bcode_session_view_models::TranscriptViewItemId::tool_presentation_slot(
-                        &draft.tool_call_id,
-                        draft.placement,
-                        None,
-                    );
-                self.sync_shared_tool_presentation_slot(&item_id);
+            SessionLiveEventKind::ToolPresentationUpdated { .. }
+            | SessionLiveEventKind::RequestContextOccupancyChanged { .. } => {
+                // SessionView owns update validation/state; primary item adaptation migrates next.
             }
-            SessionLiveEventKind::RequestContextOccupancyChanged { .. } => {}
+            SessionLiveEventKind::ToolRequestDraft { event: draft } => {
+                self.sync_shared_tool_items(&draft.tool_call_id);
+            }
             SessionLiveEventKind::ToolInvocationProgress { .. } => {
                 self.apply_shared_runtime_work_activity();
             }
@@ -2611,32 +2608,37 @@ impl BmuxApp {
         contribution: &bcode_session_models::ToolContributionEvent,
         placement: bcode_session_models::ToolContributionPlacement,
     ) {
-        let item_id = bcode_session_view_models::TranscriptViewItemId::tool_presentation_slot(
-            &contribution.invocation_id,
-            placement,
-            (placement == bcode_session_models::ToolContributionPlacement::Supplemental)
-                .then_some(contribution.contribution_id.as_str()),
-        );
-        if contribution.artifact.as_ref().is_some_and(|artifact| {
-            let Some(presentation) = self.plugin_presentation() else {
-                return false;
-            };
-            self.session_view
-                .snapshot()
-                .contributions
-                .values()
-                .any(|existing| {
-                    existing.invocation_id == contribution.invocation_id
-                        && existing.contribution_id != contribution.contribution_id
-                        && presentation.accepts_artifact_reference(
-                            &existing.producer_id,
-                            &existing.schema,
-                            existing.schema_version,
-                            &artifact.reference_key,
-                            artifact.content_type.as_deref(),
-                        )
-                })
-        }) {
+        let item_id = if placement == bcode_session_models::ToolContributionPlacement::Supplemental
+        {
+            bcode_session_view_models::TranscriptViewItemId::tool_supplemental(
+                &contribution.invocation_id,
+                &contribution.contribution_id,
+            )
+        } else {
+            bcode_session_view_models::TranscriptViewItemId::tool(&contribution.invocation_id)
+        };
+        if placement == bcode_session_models::ToolContributionPlacement::Supplemental
+            && contribution.artifact.as_ref().is_some_and(|artifact| {
+                let Some(presentation) = self.plugin_presentation() else {
+                    return false;
+                };
+                self.session_view
+                    .snapshot()
+                    .contributions
+                    .values()
+                    .any(|existing| {
+                        existing.invocation_id == contribution.invocation_id
+                            && existing.contribution_id != contribution.contribution_id
+                            && presentation.accepts_artifact_reference(
+                                &existing.producer_id,
+                                &existing.schema,
+                                existing.schema_version,
+                                &artifact.reference_key,
+                                artifact.content_type.as_deref(),
+                            )
+                    })
+            })
+        {
             self.transcript.remove_shared_item(&item_id);
             return;
         }
@@ -3104,14 +3106,10 @@ impl BmuxApp {
         self.transcript
             .iter()
             .filter_map(move |item| {
-                let invocation_id = item.visual_invocation_id()?;
-                let tool = self.session_view.snapshot().tools.get(invocation_id)?;
-                if !matches!(
-                    tool.status,
-                    bcode_session_view_models::ToolInvocationViewStatus::Running
-                ) {
+                if !item.tool_is_active() {
                     return None;
                 }
+                let invocation_id = item.visual_invocation_id()?;
                 let timing = item.tool_timing()?;
                 let at = super::temporal::next_elapsed_invalidation_capped(
                     timing.started_at_ms?,
@@ -3236,25 +3234,6 @@ impl BmuxApp {
             return;
         }
         self.push_required_shared_terminal_item(sequence, "user message");
-    }
-
-    fn sync_shared_tool_presentation_slot(
-        &mut self,
-        item_id: &bcode_session_view_models::TranscriptViewItemId,
-    ) {
-        let item = self
-            .session_view
-            .snapshot()
-            .transcript
-            .items
-            .iter()
-            .find(|item| &item.id == item_id)
-            .map(terminal_item_from_shared);
-        if let Some(item) = item {
-            self.transcript.upsert_shared_item(item);
-        } else {
-            self.transcript.remove_shared_item(item_id);
-        }
     }
 
     fn push_required_shared_terminal_item(&mut self, sequence: u64, event_kind: &str) {
@@ -3399,65 +3378,6 @@ impl BmuxApp {
         }
     }
 
-    fn shared_tool_request_item(
-        &self,
-        sequence: u64,
-        tool_call_id: &str,
-    ) -> Option<TranscriptItem> {
-        self.session_view
-            .snapshot()
-            .transcript
-            .items
-            .iter()
-            .rev()
-            .find(|item| {
-                item.sequence == Some(sequence)
-                    && matches!(
-                        &item.kind,
-                        bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool }
-                            if tool.tool_call_id == tool_call_id
-                                && matches!(
-                                    tool.status,
-                                    bcode_session_view_models::ToolInvocationViewStatus::Requested
-                                        | bcode_session_view_models::ToolInvocationViewStatus::Running
-                                )
-                    )
-            })
-            .map(terminal_item_from_shared)
-            .filter(|item| {
-                matches!(
-                    item.kind(),
-                    TranscriptItemKind::ToolRequest {
-                        tool_call_id: item_tool_call_id,
-                        ..
-                    } if item_tool_call_id == tool_call_id
-                )
-            })
-    }
-
-    fn shared_tool_result_item(&self, tool_call_id: &str) -> Option<TranscriptItem> {
-        self.session_view
-            .snapshot()
-            .transcript
-            .items
-            .iter()
-            .rev()
-            .find(|item| {
-                matches!(
-                    &item.kind,
-                    bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool }
-                        if tool.tool_call_id == tool_call_id
-                            && matches!(
-                                tool.status,
-                                bcode_session_view_models::ToolInvocationViewStatus::Finished
-                                    | bcode_session_view_models::ToolInvocationViewStatus::Cancelled
-                                    | bcode_session_view_models::ToolInvocationViewStatus::Failed
-                            )
-                )
-            })
-            .map(terminal_item_from_shared)
-    }
-
     fn shared_runtime_work_item(
         &self,
         work_id: &str,
@@ -3554,7 +3474,7 @@ impl BmuxApp {
 
     fn push_tool_request(
         &mut self,
-        event_metadata: (u64, u64),
+        _event_metadata: (u64, u64),
         tool_call_id: &str,
         tool_name: &str,
         arguments_json: &str,
@@ -3568,29 +3488,7 @@ impl BmuxApp {
         );
         self.tool_call_contexts
             .insert(tool_call_id.to_owned(), projected_context.clone());
-        let item = self
-            .shared_tool_request_item(event_metadata.0, tool_call_id)
-            .unwrap_or_else(|| {
-                panic!(
-                    "shared session view must project tool request {tool_call_id} at sequence {}",
-                    event_metadata.0
-                )
-            });
-        let replaced = self.transcript.mutate_rev_find(
-            |existing| {
-                matches!(
-                    existing.kind(),
-                    TranscriptItemKind::ToolRequest {
-                        tool_call_id: item_tool_call_id,
-                        ..
-                    } if item_tool_call_id == tool_call_id
-                )
-            },
-            |existing| *existing = item.clone(),
-        );
-        if replaced.is_none() {
-            self.transcript.push(item);
-        }
+        self.sync_shared_tool_items(tool_call_id);
         self.set_activity(ActivityState::RunningTool {
             name: projected_context.tool_name,
         });
@@ -3744,16 +3642,7 @@ impl BmuxApp {
         _semantic_result: Option<&ToolInvocationResult>,
         application: SessionEventApplication,
     ) {
-        let item = self
-            .shared_tool_result_item(tool_call_id)
-            .unwrap_or_else(|| {
-                panic!("shared session view must project final tool result for {tool_call_id}")
-            });
-        let item_id = item
-            .source_view_item_id()
-            .expect("shared tool result must carry stable identity")
-            .clone();
-        self.sync_shared_tool_presentation_slot(&item_id);
+        self.sync_shared_tool_items(tool_call_id);
         self.update_tool_result_status(tool_call_id, is_error, application);
         self.finish_tool_request_streaming(tool_call_id);
     }

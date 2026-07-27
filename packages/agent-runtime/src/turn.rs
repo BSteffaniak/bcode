@@ -300,6 +300,8 @@ pub enum ScopedTurnEvent {
     InvocationLifecycle(ToolInvocationLifecycleEvent),
     /// Opaque schema-versioned renderer contribution.
     Contribution(ToolContributionEvent),
+    /// Current invocation-owned presentation replacement.
+    PresentationUpdate(bcode_tool::ToolPresentationUpdate),
 }
 
 /// Non-blocking destination for accepted turn events.
@@ -1195,6 +1197,14 @@ impl InvocationScope {
     pub(crate) fn emit_cancellation_lifecycle(&self, event: ToolInvocationLifecycleEvent) -> bool {
         event.invocation_id == self.invocation_id.as_ref()
             && self.turn.emit_cancellation_lifecycle(event)
+    }
+
+    /// Emit a presentation update only when it belongs to this active invocation.
+    #[must_use]
+    pub fn emit_presentation_update(&self, update: bcode_tool::ToolPresentationUpdate) -> bool {
+        self.accepts_work()
+            && update.invocation_id == self.invocation_id.as_ref()
+            && self.turn.emit(ScopedTurnEvent::PresentationUpdate(update))
     }
 
     /// Emit a contribution only when it belongs to this active invocation.

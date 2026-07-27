@@ -13,6 +13,10 @@ use bcode_session_models::{
     SessionForkResult, SessionId, SessionSummary, SessionTokenUsage, ToolArtifact,
     ToolInvocationResult, WorkId,
 };
+pub use bcode_session_models::{
+    ToolPresentationIdentity, ToolPresentationRetention, ToolPresentationScopeState,
+    ToolPresentationUpdate, ToolPresentationUpdateError, ToolPresentationUpdateScope,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -65,7 +69,19 @@ impl TranscriptViewItemId {
         Self(format!("tool-request:{tool_call_id}"))
     }
 
-    /// Create an identifier for a semantic presentation slot owned by a tool invocation.
+    /// Create an identifier for a supplemental tool presentation.
+    #[must_use]
+    pub fn tool_supplemental(tool_call_id: &str, supplemental_id: &str) -> Self {
+        Self(format!(
+            "tool:{tool_call_id}:supplemental:{supplemental_id}"
+        ))
+    }
+
+    /// Create an identifier for a legacy semantic presentation slot owned by a tool invocation.
+    ///
+    /// This decode-compatibility constructor must not be used by new producers. Historical
+    /// request/progress/result placements map to the invocation primary identity, while explicit
+    /// supplemental placements retain their independent stable identity.
     ///
     /// # Panics
     ///
@@ -76,17 +92,21 @@ impl TranscriptViewItemId {
         placement: bcode_session_models::ToolContributionPlacement,
         supplemental_id: Option<&str>,
     ) -> Self {
-        let slot = match placement {
-            bcode_session_models::ToolContributionPlacement::Request => "request".to_owned(),
-            bcode_session_models::ToolContributionPlacement::Progress => "progress".to_owned(),
-            bcode_session_models::ToolContributionPlacement::Result => "result".to_owned(),
-            bcode_session_models::ToolContributionPlacement::Supplemental => format!(
-                "supplemental:{}",
-                supplemental_id.expect("supplemental presentation slots require stable identity")
-            ),
-            bcode_session_models::ToolContributionPlacement::Hidden => "hidden".to_owned(),
-        };
-        Self(format!("tool-slot:{tool_call_id}:{slot}"))
+        match placement {
+            bcode_session_models::ToolContributionPlacement::Request
+            | bcode_session_models::ToolContributionPlacement::Progress
+            | bcode_session_models::ToolContributionPlacement::Result => Self::tool(tool_call_id),
+            bcode_session_models::ToolContributionPlacement::Supplemental => {
+                Self::tool_supplemental(
+                    tool_call_id,
+                    supplemental_id
+                        .expect("supplemental presentation slots require stable identity"),
+                )
+            }
+            bcode_session_models::ToolContributionPlacement::Hidden => {
+                Self(format!("tool:{tool_call_id}:hidden"))
+            }
+        }
     }
 
     /// Create an identifier for a permission request.
@@ -373,7 +393,7 @@ pub struct SessionViewPatch {
 
 impl SessionViewPatch {
     /// Current patch schema version.
-    pub const SCHEMA_VERSION: u16 = 12;
+    pub const SCHEMA_VERSION: u16 = 13;
 
     /// Create an empty patch between two revisions.
     #[must_use]
@@ -499,8 +519,11 @@ pub enum TranscriptViewPatchOp {
     Append { item: TranscriptViewItem },
     /// Replace an existing transcript item by id.
     Replace { item: TranscriptViewItem },
-    /// Remove a transcript item by id.
-    Remove { id: TranscriptViewItemId },
+    /// Remove a transcript item by id using a monotonic tombstone revision.
+    Remove {
+        id: TranscriptViewItemId,
+        revision: ViewRevision,
+    },
     /// Replace the entire bounded transcript window.
     Reset { document: TranscriptViewDocument },
 }
@@ -564,7 +587,7 @@ impl TranscriptViewDocument {
         match operation {
             TranscriptViewPatchOp::Append { item } => self.append_patch_item(item.clone()),
             TranscriptViewPatchOp::Replace { item } => self.replace_patch_item(item.clone()),
-            TranscriptViewPatchOp::Remove { id } => self.remove_patch_item(id),
+            TranscriptViewPatchOp::Remove { id, revision } => self.remove_patch_item(id, *revision),
             TranscriptViewPatchOp::Reset { document } => {
                 if document.revision != target_revision {
                     return Err(TranscriptViewPatchError::ResetRevisionMismatch {
@@ -614,10 +637,19 @@ impl TranscriptViewDocument {
     fn remove_patch_item(
         &mut self,
         id: &TranscriptViewItemId,
+        revision: ViewRevision,
     ) -> Result<(), TranscriptViewPatchError> {
         let Some(index) = self.items.iter().position(|item| item.id == *id) else {
             return Err(TranscriptViewPatchError::MissingItem { id: id.clone() });
         };
+        let current = self.items[index].revision;
+        if revision <= current {
+            return Err(TranscriptViewPatchError::NonMonotonicItemRevision {
+                id: id.clone(),
+                current,
+                replacement: revision,
+            });
+        }
         self.items.remove(index);
         Ok(())
     }
@@ -737,6 +769,7 @@ fn transcript_patch_ops(
         if !next_ids.contains(&item.id) {
             operations.push(TranscriptViewPatchOp::Remove {
                 id: item.id.clone(),
+                revision: item.revision.saturating_add(1),
             });
         }
     }
@@ -1040,6 +1073,35 @@ pub struct ToolRequestDraftView {
     pub truncated: bool,
 }
 
+/// Renderer-neutral current plugin presentation attached to a tool invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPresentationView {
+    pub producer_id: String,
+    pub generation: u64,
+    pub revision: u64,
+    pub retention: ToolPresentationRetention,
+    pub schema: String,
+    pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<bcode_session_models::ToolContributionArtifact>,
+    pub payload: serde_json::Value,
+}
+
+impl From<&ToolPresentationUpdate> for ToolPresentationView {
+    fn from(update: &ToolPresentationUpdate) -> Self {
+        Self {
+            producer_id: update.producer_id.clone(),
+            generation: update.generation,
+            revision: update.revision,
+            retention: update.retention,
+            schema: update.schema.clone(),
+            schema_version: update.schema_version,
+            artifact: update.artifact.clone(),
+            payload: update.payload.clone(),
+        }
+    }
+}
+
 /// Renderer-neutral tool invocation view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolInvocationView {
@@ -1061,6 +1123,9 @@ pub struct ToolInvocationView {
     pub is_error: Option<bool>,
     /// Semantic result, when supplied by the tool.
     pub result: Option<ToolResultView>,
+    /// Current plugin-owned visual presentation, when supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<ToolPresentationView>,
     /// Tool timing metadata.
     pub timing: ToolTimingView,
 }
@@ -1074,6 +1139,8 @@ pub enum ToolInvocationViewStatus {
     Requested,
     /// Canonical invocation lifecycle reported the tool as running.
     Running,
+    /// The invocation is active but waiting for external input or a resource.
+    Waiting,
     /// Final result was observed or lifecycle completed successfully.
     Finished,
     /// The owning invocation or turn was cancelled.
@@ -1087,6 +1154,7 @@ impl From<bcode_session_models::ToolInvocationProjectionStatus> for ToolInvocati
         match value {
             bcode_session_models::ToolInvocationProjectionStatus::Requested => Self::Requested,
             bcode_session_models::ToolInvocationProjectionStatus::Running => Self::Running,
+            bcode_session_models::ToolInvocationProjectionStatus::Waiting => Self::Waiting,
             bcode_session_models::ToolInvocationProjectionStatus::Finished => Self::Finished,
             bcode_session_models::ToolInvocationProjectionStatus::Cancelled => Self::Cancelled,
             bcode_session_models::ToolInvocationProjectionStatus::Failed => Self::Failed,

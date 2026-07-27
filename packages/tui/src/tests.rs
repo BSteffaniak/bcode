@@ -2873,10 +2873,10 @@ fn transcript_renders_compact_tool_blocks_without_raw_arguments() {
     render::render(&mut app, &mut frame);
     let output = rendered_text(&buffer);
 
-    assert!(output.contains("Tool · shell.run"));
-    assert!(output.contains("call call_ABCD"));
-    assert!(output.contains(full_call_id));
-    assert!(output.contains("running"));
+    assert!(!output.contains("Tool · shell.run"));
+    assert!(!output.contains("call call_ABCD"));
+    assert!(!output.contains(full_call_id));
+    assert!(!output.contains("running"));
     assert!(!output.contains("\"command\""), "{output}");
     assert!(!output.contains("\"cwd\""), "{output}");
     assert!(output.contains("Tool result · shell.run · ok"));
@@ -4029,16 +4029,20 @@ fn file_change_artifact_history_renders_generic_tool_result_without_request() {
 }
 
 #[test]
-fn file_change_artifact_history_uses_request_preview_when_present() {
+fn file_change_artifact_history_replaces_request_with_generic_tool_result() {
     let session_id = SessionId::new();
     let events = file_change_semantic_result_events(session_id, true);
 
     let transcript = transcript_items_from_events_with_reasoning(&events, true);
 
-    assert!(transcript.iter().any(|item| matches!(
+    assert!(!transcript.iter().any(|item| matches!(
         item.kind(),
         TranscriptItemKind::ToolRequest { tool_call_id, .. } if tool_call_id == "call-file"
     )));
+    assert!(transcript.iter().any(|item| {
+        item.visual_invocation_id() == Some("call-file")
+            && matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
+    }));
     assert!(!transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolResult { .. })
             && item.text().contains("duplicate write result")
@@ -4193,7 +4197,7 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
 }
 
 #[test]
-fn live_shell_result_preserves_request_block() {
+fn live_shell_result_replaces_request_block() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
     let events = vec![
@@ -4242,7 +4246,7 @@ fn live_shell_result_preserves_request_block() {
     }
     let transcript = app.transcript();
 
-    assert!(transcript.iter().any(|item| {
+    assert!(!transcript.iter().any(|item| {
         matches!(item.kind(), TranscriptItemKind::ToolRequest { .. })
             && item.text().contains("echo hello")
     }));
@@ -5394,7 +5398,7 @@ async fn live_shell_recording_chunk_renders_once_through_canonical_request_contr
     let rendered = render_app_text(&mut app);
     assert!(rendered.contains("live red"), "{rendered}");
     assert_eq!(rendered.matches("live red").count(), 1, "{rendered}");
-    assert!(rendered.contains("printf red"), "{rendered}");
+    assert!(!rendered.contains("printf red"), "{rendered}");
 }
 
 #[test]
@@ -5834,11 +5838,7 @@ fn filesystem_write_request_renders_from_contribution() {
 
     let rendered = render_app_text(&mut app);
 
-    let request_id = bcode_session_view_models::TranscriptViewItemId::tool_presentation_slot(
-        "call-write",
-        bcode_session_models::ToolContributionPlacement::Request,
-        None,
-    );
+    let request_id = bcode_session_view_models::TranscriptViewItemId::tool("call-write");
     let shared_request_count = app
         .session_view_snapshot()
         .transcript

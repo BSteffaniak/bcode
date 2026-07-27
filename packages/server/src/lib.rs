@@ -231,6 +231,8 @@ pub struct ServerState {
     active_plugin_invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
     active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
     active_contributions: Arc<StdMutex<ActiveContributionRegistry>>,
+    presentation_update_scopes:
+        Arc<StdMutex<BTreeMap<(SessionId, String), bcode_tool::ToolPresentationUpdateScope>>>,
     active_tool_request_drafts: Arc<StdMutex<ActiveToolRequestDraftRegistry>>,
     next_permission_id: Mutex<u64>,
     next_permission_batch_id: Mutex<u64>,
@@ -1344,6 +1346,7 @@ impl ServerState {
             active_plugin_invocations: Arc::default(),
             active_artifacts: Arc::default(),
             active_contributions: Arc::default(),
+            presentation_update_scopes: Arc::default(),
             active_tool_request_drafts: Arc::default(),
             next_permission_id: Mutex::new(1),
             next_permission_batch_id: Mutex::new(1),
@@ -17352,6 +17355,7 @@ async fn persist_scoped_turn_event(
                 .map_err(|error| error.to_string())?;
             publish_session_event(state, &appended).await;
             if terminal {
+                close_tool_presentation_update_scope(state, session_id, &invocation_id);
                 clear_active_contributions(state, session_id, &invocation_id).await;
             }
             Ok(())
@@ -17361,6 +17365,18 @@ async fn persist_scoped_turn_event(
             let producer_id = event.producer_id.clone();
             append_tool_contribution_event(state, session_id, &invocation_id, &producer_id, event)
                 .await
+        }
+        ScopedTurnEvent::PresentationUpdate(update) => {
+            let invocation_id = update.invocation_id.clone();
+            let producer_id = update.producer_id.clone();
+            publish_plugin_tool_presentation_update(
+                state,
+                session_id,
+                &invocation_id,
+                &producer_id,
+                update,
+            )
+            .await
         }
     }
 }
@@ -18344,6 +18360,29 @@ async fn invoke_plugin_tool_transport(
                                     )
                                     .await;
                                 }
+                            } else if let Ok(update) = serde_json::from_slice::<
+                                bcode_tool::ToolPresentationUpdate,
+                            >(&payload)
+                            {
+                                if route_canonical_events_to_scope {
+                                    if let Some(scope) = invocation_scope
+                                        && !scope.emit_presentation_update(update)
+                                    {
+                                        return Err(
+                                            "session invocation sink rejected presentation update"
+                                                .to_owned(),
+                                        );
+                                    }
+                                } else {
+                                    publish_plugin_tool_presentation_update(
+                                        state,
+                                        session_id,
+                                        &call.id,
+                                        plugin_id,
+                                        update,
+                                    )
+                                    .await?;
+                                }
                             } else if let Ok(envelope) = serde_json::from_slice::<
                                 bcode_session_models::ToolContributionEnvelope,
                             >(&payload)
@@ -18406,6 +18445,21 @@ async fn invoke_plugin_tool_transport(
                 }
             } else {
                 append_plugin_tool_lifecycle_event(state, session_id, &call.id, lifecycle).await;
+            }
+        } else if let Ok(update) =
+            serde_json::from_slice::<bcode_tool::ToolPresentationUpdate>(&payload)
+        {
+            if route_canonical_events_to_scope {
+                if let Some(scope) = invocation_scope
+                    && !scope.emit_presentation_update(update)
+                {
+                    return Err("session invocation sink rejected presentation update".to_owned());
+                }
+            } else {
+                publish_plugin_tool_presentation_update(
+                    state, session_id, &call.id, plugin_id, update,
+                )
+                .await?;
             }
         } else if let Ok(envelope) =
             serde_json::from_slice::<bcode_session_models::ToolContributionEnvelope>(&payload)
@@ -18805,6 +18859,61 @@ async fn clear_active_contributions(
         refresh_active_live_state_metrics(state);
     }
 }
+async fn publish_plugin_tool_presentation_update(
+    state: &ServerState,
+    session_id: SessionId,
+    invocation_id: &str,
+    producer_id: &str,
+    update: bcode_tool::ToolPresentationUpdate,
+) -> Result<(), String> {
+    accept_tool_presentation_update(state, session_id, invocation_id, producer_id, &update)
+        .map_err(|error| format!("presentation update rejected: {error:?}"))?;
+    let _ = state
+        .sessions
+        .publish_live_event(
+            session_id,
+            SessionLiveEventKind::ToolPresentationUpdated { update },
+        )
+        .await;
+    Ok(())
+}
+
+fn accept_tool_presentation_update(
+    state: &ServerState,
+    session_id: SessionId,
+    invocation_id: &str,
+    producer_id: &str,
+    update: &bcode_tool::ToolPresentationUpdate,
+) -> Result<(), bcode_tool::ToolPresentationUpdateError> {
+    if update.invocation_id != invocation_id {
+        return Err(bcode_tool::ToolPresentationUpdateError::InvocationMismatch);
+    }
+    if update.producer_id != producer_id {
+        return Err(bcode_tool::ToolPresentationUpdateError::ProducerMismatch);
+    }
+    let mut scopes = state
+        .presentation_update_scopes
+        .lock()
+        .map_err(|_| bcode_tool::ToolPresentationUpdateError::Unavailable)?;
+    scopes
+        .entry((session_id, invocation_id.to_owned()))
+        .or_default()
+        .accept(update, MAX_ACTIVE_CONTRIBUTION_BYTES)
+}
+
+fn close_tool_presentation_update_scope(
+    state: &ServerState,
+    session_id: SessionId,
+    invocation_id: &str,
+) {
+    if let Ok(mut scopes) = state.presentation_update_scopes.lock() {
+        scopes
+            .entry((session_id, invocation_id.to_owned()))
+            .or_default()
+            .close();
+    }
+}
+
 async fn append_tool_contribution_envelope(
     state: &ServerState,
     session_id: SessionId,
@@ -20161,6 +20270,7 @@ async fn append_tool_invocation_terminal_event(
         },
     )
     .await;
+    close_tool_presentation_update_scope(state, session_id, invocation_id);
     clear_active_contributions(state, session_id, invocation_id).await;
     clear_unfinalized_active_artifacts(state, session_id, invocation_id);
 }
@@ -31388,6 +31498,84 @@ library = "test"
         assert_eq!(
             artifact_read_error_code("artifact references projection is stale"),
             "artifact_read_failed"
+        );
+    }
+
+    #[test]
+    fn presentation_update_registry_enforces_owner_bounds_and_absorbing_closure() {
+        let workspace = tempfile::tempdir().expect("presentation registry workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("presentation registry session manager");
+        let state = test_server_state(sessions);
+        let session_id = SessionId::new();
+        let update = bcode_tool::ToolPresentationUpdate {
+            invocation_id: "call-1".to_owned(),
+            producer_id: "test.plugin".to_owned(),
+            generation: 0,
+            revision: 1,
+            identity: bcode_tool::ToolPresentationIdentity::Primary,
+            retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+            schema: "test.presentation".to_owned(),
+            schema_version: 1,
+            artifact: None,
+            payload: serde_json::json!({"value": 1}),
+        };
+
+        assert_eq!(
+            accept_tool_presentation_update(
+                &state,
+                session_id,
+                "other-call",
+                "test.plugin",
+                &update,
+            ),
+            Err(bcode_tool::ToolPresentationUpdateError::InvocationMismatch)
+        );
+        assert_eq!(
+            accept_tool_presentation_update(&state, session_id, "call-1", "other.plugin", &update,),
+            Err(bcode_tool::ToolPresentationUpdateError::ProducerMismatch)
+        );
+        accept_tool_presentation_update(&state, session_id, "call-1", "test.plugin", &update)
+            .expect("first update accepted");
+        assert_eq!(
+            accept_tool_presentation_update(&state, session_id, "call-1", "test.plugin", &update,),
+            Err(bcode_tool::ToolPresentationUpdateError::StaleRevision)
+        );
+        assert_eq!(
+            state
+                .presentation_update_scopes
+                .lock()
+                .expect("presentation scopes")
+                .get(&(session_id, "call-1".to_owned()))
+                .and_then(|scope| {
+                    scope.highest_revision(&bcode_tool::ToolPresentationIdentity::Primary)
+                }),
+            Some(1)
+        );
+        close_tool_presentation_update_scope(&state, session_id, "call-1");
+        assert_eq!(
+            state
+                .presentation_update_scopes
+                .lock()
+                .expect("presentation scopes")
+                .get(&(session_id, "call-1".to_owned()))
+                .and_then(|scope| {
+                    scope.highest_revision(&bcode_tool::ToolPresentationIdentity::Primary)
+                }),
+            Some(1)
+        );
+        assert_eq!(
+            accept_tool_presentation_update(
+                &state,
+                session_id,
+                "call-1",
+                "test.plugin",
+                &bcode_tool::ToolPresentationUpdate {
+                    revision: 2,
+                    ..update
+                },
+            ),
+            Err(bcode_tool::ToolPresentationUpdateError::Closed)
         );
     }
 

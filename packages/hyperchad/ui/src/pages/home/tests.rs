@@ -325,6 +325,7 @@ fn tool_fixture(status: ToolInvocationViewStatus) -> ToolInvocationView {
         result_text: terminal.then(|| "fixture result".to_owned()),
         is_error: Some(status == ToolInvocationViewStatus::Failed),
         result: None,
+        presentation: None,
         timing: ToolTimingView {
             started_at_ms: Some(1_000),
             finished_at_ms: terminal.then_some(2_250),
@@ -340,13 +341,17 @@ fn every_tool_transcript_kind_and_lifecycle_state_renders() {
     for status in [
         ToolInvocationViewStatus::Requested,
         ToolInvocationViewStatus::Running,
+        ToolInvocationViewStatus::Waiting,
         ToolInvocationViewStatus::Finished,
         ToolInvocationViewStatus::Failed,
         ToolInvocationViewStatus::Cancelled,
     ] {
         let lifecycle = transcript_fixture_item(
             &format!("fixture-tool-lifecycle-{status:?}"),
-            status == ToolInvocationViewStatus::Running,
+            matches!(
+                status,
+                ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+            ),
             TranscriptViewItemKind::ToolInvocation {
                 tool: Box::new(tool_fixture(status)),
             },
@@ -356,6 +361,7 @@ fn every_tool_transcript_kind_and_lifecycle_state_renders() {
         assert!(rendered.contains(match status {
             ToolInvocationViewStatus::Requested => "requested",
             ToolInvocationViewStatus::Running => "running",
+            ToolInvocationViewStatus::Waiting => "waiting",
             ToolInvocationViewStatus::Finished => "finished",
             ToolInvocationViewStatus::Failed => "failed",
             ToolInvocationViewStatus::Cancelled => "cancelled",
@@ -2148,13 +2154,17 @@ fn rich_adapter_state_matrix_covers_empty_truncated_optional_error_and_fallbacks
     for status in [
         ToolInvocationViewStatus::Requested,
         ToolInvocationViewStatus::Running,
+        ToolInvocationViewStatus::Waiting,
         ToolInvocationViewStatus::Finished,
         ToolInvocationViewStatus::Failed,
         ToolInvocationViewStatus::Cancelled,
     ] {
         let rendered = container_text_all(&transcript_item(&transcript_fixture_item(
             &format!("state-matrix-{status:?}"),
-            status == ToolInvocationViewStatus::Running,
+            matches!(
+                status,
+                ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+            ),
             TranscriptViewItemKind::ToolInvocation {
                 tool: Box::new(tool_fixture(status)),
             },
@@ -2162,6 +2172,7 @@ fn rich_adapter_state_matrix_covers_empty_truncated_optional_error_and_fallbacks
         assert!(rendered.contains(match status {
             ToolInvocationViewStatus::Requested => "requested",
             ToolInvocationViewStatus::Running => "running",
+            ToolInvocationViewStatus::Waiting => "waiting",
             ToolInvocationViewStatus::Finished => "finished",
             ToolInvocationViewStatus::Failed => "failed",
             ToolInvocationViewStatus::Cancelled => "cancelled",

@@ -14,9 +14,7 @@ use bcode_plugin_sdk::path::display;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
-    ToolContributionEnvelope, ToolContributionEvent, ToolContributionOperation,
-    ToolContributionPersistence, ToolContributionPlacement, ToolDefinition, ToolInvocationRequest,
-    ToolInvocationResponse, ToolInvocationResult, ToolList,
+    ToolDefinition, ToolInvocationRequest, ToolInvocationResponse, ToolInvocationResult, ToolList,
 };
 use bcode_vim_edit::{
     VimEditFrame, VimEditMode, VimEditMultiFileEntry, VimEditMultiFileRequest,
@@ -329,19 +327,36 @@ struct VimProgressContext {
     cancellation: bcode_plugin_sdk::ServiceCancellation,
 }
 
+impl VimProgressContext {
+    fn primary_presentation(
+        &self,
+        invocation_id: &str,
+        schema: &str,
+    ) -> PrimaryPresentationPublisher {
+        PrimaryPresentationPublisher::with_limits_and_cancellation(
+            self.events,
+            invocation_id,
+            VIM_EDIT_PLUGIN_ID,
+            schema,
+            1,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
+            self.limits,
+            self.cancellation.clone(),
+        )
+    }
+}
+
 fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
     let request = match context.request.payload_json::<ToolInvocationRequest>() {
         Ok(request) => request,
         Err(error) => return invalid_request(&error),
     };
-    let response = invoke_tool_request_with_events(
-        request,
-        VimProgressContext {
-            events: context.events,
-            limits: context.transient_progress_limits,
-            cancellation: context.cancellation.clone(),
-        },
-    );
+    let progress = VimProgressContext {
+        events: context.events,
+        limits: context.transient_progress_limits,
+        cancellation: context.cancellation.clone(),
+    };
+    let response = invoke_tool_request_with_events(request, &progress);
     json_response(&response)
 }
 
@@ -365,19 +380,17 @@ fn invoke_tool_request(mut request: ToolInvocationRequest) -> ToolInvocationResp
         Ok(prepared) => prepared.descriptor,
         Err(error) => return vim_edit_error_response(None, error),
     };
-    invoke_tool_request_with_events(
-        request,
-        VimProgressContext {
-            events: ServiceEventEmitter::default(),
-            limits: bcode_plugin_sdk::TransientProgressLimits::default(),
-            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
-        },
-    )
+    let progress = VimProgressContext {
+        events: ServiceEventEmitter::default(),
+        limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+        cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
+    };
+    invoke_tool_request_with_events(request, &progress)
 }
 
 fn invoke_tool_request_with_events(
     request: ToolInvocationRequest,
-    progress: VimProgressContext,
+    progress: &VimProgressContext,
 ) -> ToolInvocationResponse {
     let descriptor = match serde_json::from_value::<VimEditPreparationDescriptor>(
         request.preparation_descriptor.clone(),
@@ -391,12 +404,10 @@ fn invoke_tool_request_with_events(
         }
     };
 
-    emit_request_contribution(
-        progress.events,
-        &request.tool_call_id,
-        &request.name,
-        &request.arguments,
-    );
+    let request_schema = vim_edit_request_schema(&request.name).unwrap_or(VIM_EDIT_LIVE_SCHEMA);
+    let request_payload = vim_edit_request_payload(&request.name, &request.arguments);
+    let mut presentation = progress.primary_presentation(&request.tool_call_id, request_schema);
+    let _ = presentation.replace(&request_payload);
     let mut arguments = request.arguments;
     if let Err(error) = apply_vim_edit_preparation(&mut arguments, &descriptor) {
         return vim_edit_error_response(None, error);
@@ -409,7 +420,7 @@ fn invoke_tool_request_with_events(
             &request.tool_call_id,
             "vim_edit.preview",
             None,
-            progress,
+            presentation,
         ),
         "vim_edit.apply" => tool_vim_edit_with_nvim_executable(
             arguments,
@@ -418,7 +429,7 @@ fn invoke_tool_request_with_events(
             &request.tool_call_id,
             "vim_edit.apply",
             None,
-            progress,
+            presentation,
         ),
         _ => ToolInvocationResponse {
             output: "unknown vim edit tool".to_string(),
@@ -446,11 +457,16 @@ fn tool_vim_edit_with_nvim_executable_for_test(
         tool_call_id,
         tool_name,
         nvim_executable,
-        VimProgressContext {
-            events: ServiceEventEmitter::default(),
-            limits: bcode_plugin_sdk::TransientProgressLimits::default(),
-            cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
-        },
+        PrimaryPresentationPublisher::with_limits_and_cancellation(
+            ServiceEventEmitter::default(),
+            tool_call_id,
+            VIM_EDIT_PLUGIN_ID,
+            vim_edit_request_schema(tool_name).unwrap_or(VIM_EDIT_LIVE_SCHEMA),
+            1,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
+            bcode_plugin_sdk::TransientProgressLimits::default(),
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        ),
     )
 }
 
@@ -461,7 +477,7 @@ fn tool_vim_edit_with_nvim_executable(
     tool_call_id: &str,
     tool_name: &str,
     nvim_executable: Option<PathBuf>,
-    progress: VimProgressContext,
+    presentation: PrimaryPresentationPublisher,
 ) -> ToolInvocationResponse {
     let request = match serde_json::from_value::<VimEditToolRequest>(arguments.clone()) {
         Ok(request) => request,
@@ -487,7 +503,7 @@ fn tool_vim_edit_with_nvim_executable(
                 nvim_executable,
                 original_arguments: arguments,
             },
-            progress,
+            presentation,
         ),
         VimEditToolRequest::Multi {
             files,
@@ -505,7 +521,7 @@ fn tool_vim_edit_with_nvim_executable(
                 nvim_executable,
                 original_arguments: arguments,
             },
-            progress,
+            presentation,
         ),
     }
 }
@@ -525,7 +541,7 @@ struct SingleVimEditToolRun<'a> {
 
 fn run_single_vim_edit_tool(
     run: SingleVimEditToolRun<'_>,
-    progress_context: VimProgressContext,
+    presentation: PrimaryPresentationPublisher,
 ) -> ToolInvocationResponse {
     let path = resolve_path(run.cwd, &run.path);
     let display_path = display(&path, run.cwd.unwrap_or_else(|| Path::new("."))).to_string();
@@ -538,17 +554,8 @@ fn run_single_vim_edit_tool(
         timeout: Duration::from_millis(run.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS)),
         observation_granularity: VimEditObservationGranularity::Key,
     };
-    let events = progress_context.events;
-    let mut progress = TransientProgressPublisher::with_limits_and_cancellation(
-        events,
-        run.tool_call_id,
-        "vim-live",
-        VIM_EDIT_PLUGIN_ID,
-        VIM_EDIT_LIVE_SCHEMA,
-        1,
-        progress_context.limits,
-        progress_context.cancellation,
-    );
+
+    let mut progress = presentation;
     emit_vim_live_phase(
         &mut progress,
         run.tool_name,
@@ -563,21 +570,24 @@ fn run_single_vim_edit_tool(
         run_vim_edit_observed(edit_request, Some(&mut observer))
     };
     match run_result {
-        Ok(result) => {
-            let _ = progress.finish();
-            vim_edit_success_response(
-                &display_path,
-                &result,
-                run.tool_call_id,
-                run.tool_name,
-                run.mode,
-                &run.original_arguments,
-                &events,
-            )
-        }
+        Ok(result) => vim_edit_success_response(
+            &display_path,
+            &result,
+            run.tool_call_id,
+            run.tool_name,
+            run.mode,
+            &run.original_arguments,
+            &mut progress,
+        ),
         Err(error) => {
             let error = error.to_string();
-            let _ = progress.finish();
+            emit_vim_live_phase(
+                &mut progress,
+                run.tool_name,
+                "failed",
+                Some(&display_path),
+                Some(&error),
+            );
             vim_edit_error_response(Some(&display_path), error)
         }
     }
@@ -597,7 +607,7 @@ struct MultiFileVimEditToolRun<'a> {
 
 fn run_multi_file_vim_edit_tool(
     run: MultiFileVimEditToolRun<'_>,
-    progress_context: VimProgressContext,
+    presentation: PrimaryPresentationPublisher,
 ) -> ToolInvocationResponse {
     let entries = run
         .files
@@ -607,17 +617,8 @@ fn run_multi_file_vim_edit_tool(
             steps: file.steps.into_iter().map(Into::into).collect(),
         })
         .collect::<Vec<_>>();
-    let events = progress_context.events;
-    let mut progress = TransientProgressPublisher::with_limits_and_cancellation(
-        events,
-        run.tool_call_id,
-        "vim-live",
-        VIM_EDIT_PLUGIN_ID,
-        VIM_EDIT_LIVE_SCHEMA,
-        1,
-        progress_context.limits,
-        progress_context.cancellation,
-    );
+
+    let mut progress = presentation;
     emit_vim_live_phase(&mut progress, run.tool_name, "started", None, None);
     let request = VimEditMultiFileRequest {
         files: entries,
@@ -634,47 +635,48 @@ fn run_multi_file_vim_edit_tool(
         run_vim_multi_file_edit_observed(&request, Some(&mut observer))
     };
     match run_result {
-        Ok(result) => {
-            let _ = progress.finish();
-            vim_edit_multi_file_success_response(
-                &result,
-                run.tool_call_id,
-                run.tool_name,
-                run.mode,
-                &run.original_arguments,
-                &events,
-            )
-        }
+        Ok(result) => vim_edit_multi_file_success_response(
+            &result,
+            run.tool_call_id,
+            run.tool_name,
+            run.mode,
+            &run.original_arguments,
+            &mut progress,
+        ),
         Err(error) => {
             let error = error.to_string();
-            let _ = progress.finish();
+            emit_vim_live_phase(&mut progress, run.tool_name, "failed", None, Some(&error));
             vim_edit_error_response(None, error)
         }
     }
 }
 
 fn emit_vim_live_phase(
-    progress: &mut TransientProgressPublisher,
+    progress: &mut PrimaryPresentationPublisher,
     tool_name: &str,
     phase: &str,
     path: Option<&str>,
     error: Option<&str>,
 ) {
-    let _ = progress.upsert(&json!({
-        "tool_name": tool_name,
-        "phase": phase,
-        "path": path,
-        "error": error,
-    }));
+    let _ = progress.replace_as(
+        VIM_EDIT_LIVE_SCHEMA,
+        1,
+        &json!({
+            "tool_name": tool_name,
+            "phase": phase,
+            "path": path,
+            "error": error,
+        }),
+    );
 }
 
 fn emit_vim_live_frame(
-    progress: &mut TransientProgressPublisher,
+    progress: &mut PrimaryPresentationPublisher,
     tool_name: &str,
     phase: &str,
     frame: &VimEditFrame,
 ) {
-    let _ = progress.upsert_if_ready(&json!({
+    let _ = progress.replace_if_ready(&json!({
         "tool_name": tool_name,
         "phase": phase,
         "path": frame.path.display().to_string(),
@@ -703,7 +705,7 @@ fn vim_edit_success_response(
     tool_name: &str,
     mode: VimEditMode,
     original_arguments: &serde_json::Value,
-    events: &ServiceEventEmitter,
+    presentation: &mut PrimaryPresentationPublisher,
 ) -> ToolInvocationResponse {
     let output = VimEditToolOutput {
         success: true,
@@ -717,7 +719,7 @@ fn vim_edit_success_response(
     };
     let playback = vim_edit_playback_payload(tool_name, path, result, mode, original_arguments);
     let response = playback_tool_response(&output, tool_call_id, &playback);
-    emit_playback_contribution(events, tool_call_id, &playback);
+    let _ = presentation.replace_as(VIM_EDIT_PLAYBACK_SCHEMA, 1, &playback);
     response
 }
 
@@ -769,7 +771,7 @@ fn vim_edit_multi_file_success_response(
     tool_name: &str,
     mode: VimEditMode,
     original_arguments: &serde_json::Value,
-    events: &ServiceEventEmitter,
+    presentation: &mut PrimaryPresentationPublisher,
 ) -> ToolInvocationResponse {
     let diff = truncated_text(&result.diff, MAX_DIFF_BYTES);
     let frames = multi_file_playback_frames(result);
@@ -794,7 +796,7 @@ fn vim_edit_multi_file_success_response(
         "frames_truncated": frames_truncated,
     });
     let response = playback_tool_response(&output, tool_call_id, &output);
-    emit_playback_contribution(events, tool_call_id, &output);
+    let _ = presentation.replace_as(VIM_EDIT_PLAYBACK_SCHEMA, 1, &output);
     response
 }
 
@@ -945,59 +947,13 @@ fn vim_edit_request_schema(operation: &str) -> Option<&'static str> {
     }
 }
 
-fn emit_request_contribution(
-    events: ServiceEventEmitter,
-    invocation_id: &str,
-    operation: &str,
-    arguments: &serde_json::Value,
-) {
-    let Some(schema) = vim_edit_request_schema(operation) else {
-        return;
-    };
+fn vim_edit_request_payload(operation: &str, arguments: &serde_json::Value) -> serde_json::Value {
     let mut payload = arguments.as_object().cloned().unwrap_or_default();
     payload.insert(
         "operation".to_owned(),
         serde_json::Value::String(operation.to_owned()),
     );
-    let event = ToolContributionEvent {
-        invocation_id: invocation_id.to_owned(),
-        contribution_id: "request".to_owned(),
-        sequence: 1,
-        producer_id: VIM_EDIT_PLUGIN_ID.to_owned(),
-        schema: schema.to_owned(),
-        schema_version: 1,
-        operation: ToolContributionOperation::Upsert,
-        persistence: ToolContributionPersistence::Durable,
-        artifact: None,
-        payload: serde_json::Value::Object(payload),
-    };
-    let envelope = ToolContributionEnvelope::new(ToolContributionPlacement::Request, event);
-    if let Ok(payload) = serde_json::to_vec(&envelope) {
-        events.emit(&payload);
-    }
-}
-
-fn emit_playback_contribution(
-    events: &ServiceEventEmitter,
-    invocation_id: &str,
-    payload: &serde_json::Value,
-) {
-    let event = ToolContributionEvent {
-        invocation_id: invocation_id.to_owned(),
-        contribution_id: "playback".to_owned(),
-        sequence: 1,
-        producer_id: VIM_EDIT_PLUGIN_ID.to_owned(),
-        schema: VIM_EDIT_PLAYBACK_SCHEMA.to_owned(),
-        schema_version: 1,
-        operation: ToolContributionOperation::Upsert,
-        persistence: ToolContributionPersistence::Durable,
-        artifact: None,
-        payload: payload.clone(),
-    };
-    let envelope = ToolContributionEnvelope::new(ToolContributionPlacement::Result, event);
-    if let Ok(payload) = serde_json::to_vec(&envelope) {
-        events.emit(&payload);
-    }
+    serde_json::Value::Object(payload)
 }
 
 fn vim_edit_step_schema() -> serde_json::Value {
@@ -1205,9 +1161,29 @@ mod tests {
     use std::ffi::c_void;
 
     extern "C" fn collect_event(payload: *const u8, len: usize, user_data: *mut c_void) {
-        let events = unsafe { &mut *(user_data.cast::<Vec<ToolContributionEnvelope>>()) };
+        let events = unsafe { &mut *(user_data.cast::<Vec<bcode_tool::ToolPresentationUpdate>>()) };
         let payload = unsafe { std::slice::from_raw_parts(payload, len) };
-        events.push(serde_json::from_slice(payload).expect("contribution event"));
+        events.push(serde_json::from_slice(payload).expect("presentation update"));
+    }
+
+    fn test_presentation(
+        emitter: ServiceEventEmitter,
+        invocation_id: &str,
+        tool_name: &str,
+    ) -> PrimaryPresentationPublisher {
+        PrimaryPresentationPublisher::with_limits_and_cancellation(
+            emitter,
+            invocation_id,
+            VIM_EDIT_PLUGIN_ID,
+            vim_edit_request_schema(tool_name).unwrap_or(VIM_EDIT_LIVE_SCHEMA),
+            1,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
+            bcode_plugin_sdk::TransientProgressLimits {
+                max_encoded_bytes: 256 * 1024,
+                min_interval_ms: 0,
+            },
+            bcode_plugin_sdk::ServiceCancellation::default(),
+        )
     }
 
     #[test]
@@ -1445,7 +1421,7 @@ mod tests {
         }
         let file = tempfile::NamedTempFile::new().expect("temp file");
         std::fs::write(file.path(), "foo bar").expect("write temp file");
-        let mut events = Vec::<ToolContributionEnvelope>::new();
+        let mut events = Vec::<bcode_tool::ToolPresentationUpdate>::new();
         let emitter = ServiceEventEmitter::new(
             Some(collect_event),
             std::ptr::addr_of_mut!(events).cast::<c_void>(),
@@ -1457,34 +1433,22 @@ mod tests {
             "call-live",
             "vim_edit.preview",
             None,
-            VimProgressContext {
-                events: emitter,
-                limits: bcode_plugin_sdk::TransientProgressLimits {
-                    max_encoded_bytes: 256 * 1024,
-                    min_interval_ms: 0,
-                },
-                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
-            },
+            test_presentation(emitter, "call-live", "vim_edit.preview"),
         );
         assert!(!response.is_error, "{}", response.output);
         let live_events = events
             .iter()
-            .filter(|event| event.contribution.schema == VIM_EDIT_LIVE_SCHEMA)
+            .filter(|event| event.schema == VIM_EDIT_LIVE_SCHEMA)
             .collect::<Vec<_>>();
-        assert!(live_events.len() >= 3, "{events:#?}");
-        assert_eq!(live_events[0].contribution.contribution_id, "vim-live");
-        assert_eq!(live_events[0].contribution.payload["phase"], "started");
+        assert!(live_events.len() >= 2, "{events:#?}");
+        assert_eq!(live_events[0].payload["phase"], "started");
         assert!(live_events.iter().any(|event| {
-            event.contribution.payload["phase"] == "running"
-                && event.contribution.payload.get("context").is_some()
+            event.payload["phase"] == "running" && event.payload.get("context").is_some()
         }));
-        assert_eq!(
-            live_events.last().map(|event| event.contribution.operation),
-            Some(ToolContributionOperation::Remove)
-        );
         assert!(events.iter().any(|event| {
-            event.contribution.schema == VIM_EDIT_PLAYBACK_SCHEMA
-                && event.contribution.persistence == ToolContributionPersistence::Durable
+            event.schema == VIM_EDIT_PLAYBACK_SCHEMA
+                && event.identity == bcode_tool::ToolPresentationIdentity::Primary
+                && event.retention == bcode_tool::ToolPresentationRetention::RetainLatest
         }));
     }
 
@@ -1492,7 +1456,7 @@ mod tests {
     fn live_event_stream_emits_error_for_missing_nvim() {
         let file = tempfile::NamedTempFile::new().expect("temp file");
         std::fs::write(file.path(), "foo").expect("write temp file");
-        let mut events = Vec::<ToolContributionEnvelope>::new();
+        let mut events = Vec::<bcode_tool::ToolPresentationUpdate>::new();
         let emitter = ServiceEventEmitter::new(
             Some(collect_event),
             std::ptr::addr_of_mut!(events).cast::<c_void>(),
@@ -1504,25 +1468,16 @@ mod tests {
             "call-error",
             "vim_edit.preview",
             Some(PathBuf::from("definitely-missing-bcode-plugin-nvim")),
-            VimProgressContext {
-                events: emitter,
-                limits: bcode_plugin_sdk::TransientProgressLimits {
-                    max_encoded_bytes: 256 * 1024,
-                    min_interval_ms: 0,
-                },
-                cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
-            },
+            test_presentation(emitter, "call-error", "vim_edit.preview"),
         );
         assert!(response.is_error);
         assert_eq!(
-            events
-                .first()
-                .map(|event| &event.contribution.payload["phase"]),
+            events.first().map(|event| &event.payload["phase"]),
             Some(&json!("started"))
         );
         assert_eq!(
-            events.last().map(|event| event.contribution.operation),
-            Some(ToolContributionOperation::Remove)
+            events.last().map(|event| &event.payload["phase"]),
+            Some(&json!("failed"))
         );
     }
 
@@ -1539,11 +1494,12 @@ mod tests {
             },
             events: Vec::new(),
         };
-        let mut events = Vec::<ToolContributionEnvelope>::new();
+        let mut events = Vec::<bcode_tool::ToolPresentationUpdate>::new();
         let emitter = ServiceEventEmitter::new(
             Some(collect_event),
             std::ptr::addr_of_mut!(events).cast::<c_void>(),
         );
+        let mut presentation = test_presentation(emitter, "call-1", "vim_edit.preview");
         let response = vim_edit_success_response(
             "src/lib.rs",
             &result,
@@ -1551,7 +1507,7 @@ mod tests {
             "vim_edit.preview",
             VimEditMode::Preview,
             &json!({ "path": "src/lib.rs", "steps": [] }),
-            &emitter,
+            &mut presentation,
         );
         let artifact = match response.result.as_ref() {
             Some(ToolInvocationResult::Artifact { artifact }) => artifact,
@@ -1562,30 +1518,27 @@ mod tests {
         assert_eq!(artifact.metadata["path"], "src/lib.rs");
         let playback = events
             .iter()
-            .find(|event| event.contribution.contribution_id == "playback")
-            .expect("durable playback contribution");
-        assert_eq!(playback.contribution.schema, VIM_EDIT_PLAYBACK_SCHEMA);
-        assert_eq!(playback.contribution.producer_id, VIM_EDIT_PLUGIN_ID);
+            .find(|event| event.schema == VIM_EDIT_PLAYBACK_SCHEMA)
+            .expect("playback presentation update");
+        assert_eq!(playback.producer_id, VIM_EDIT_PLUGIN_ID);
         assert_eq!(
-            playback.contribution.persistence,
-            ToolContributionPersistence::Durable
+            playback.identity,
+            bcode_tool::ToolPresentationIdentity::Primary
         );
         assert_eq!(
-            playback.contribution.payload["tool_name"],
-            "vim_edit.preview"
+            playback.retention,
+            bcode_tool::ToolPresentationRetention::RetainLatest
         );
-        assert_eq!(playback.contribution.payload["path"], "src/lib.rs");
-        assert_eq!(
-            playback.contribution.payload["summary"],
-            "vim edit changed file"
-        );
-        assert_eq!(playback.contribution.payload["success"], true);
-        assert!(playback.contribution.payload.get("events").is_some());
-        assert!(playback.contribution.payload.get("frames").is_some());
-        assert_eq!(playback.contribution.payload["frame_count"], 0);
-        assert_eq!(playback.contribution.payload["frames_truncated"], false);
-        assert_eq!(playback.contribution.payload["diff_truncated"], false);
-        assert!(playback.contribution.payload.get("final_context").is_some());
+        assert_eq!(playback.payload["tool_name"], "vim_edit.preview");
+        assert_eq!(playback.payload["path"], "src/lib.rs");
+        assert_eq!(playback.payload["summary"], "vim edit changed file");
+        assert_eq!(playback.payload["success"], true);
+        assert!(playback.payload.get("events").is_some());
+        assert!(playback.payload.get("frames").is_some());
+        assert_eq!(playback.payload["frame_count"], 0);
+        assert_eq!(playback.payload["frames_truncated"], false);
+        assert_eq!(playback.payload["diff_truncated"], false);
+        assert!(playback.payload.get("final_context").is_some());
     }
 
     #[test]

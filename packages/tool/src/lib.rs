@@ -12,7 +12,9 @@ pub use bcode_tool_models::{
     ToolContributionOperation, ToolContributionPersistence, ToolContributionPlacement,
     ToolExchangeRequest, ToolExchangeResolution, ToolExchangeResolutionEvent,
     ToolExchangeResponsePolicy, ToolInvocationInput, ToolInvocationInputResolution,
-    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
+    ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage, ToolPresentationIdentity,
+    ToolPresentationRetention, ToolPresentationScopeState, ToolPresentationUpdate,
+    ToolPresentationUpdateError, ToolPresentationUpdateScope,
 };
 pub use contracts::{
     PreparedToolInvocation, TOOL_ARTIFACT_CONTEXT_SCHEMA, TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION,

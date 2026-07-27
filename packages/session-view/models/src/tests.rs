@@ -2,15 +2,130 @@ use super::*;
 use proptest::prelude::*;
 
 #[test]
-fn tool_presentation_slot_ids_are_stable_and_supplementals_are_independent() {
+fn tool_presentation_update_scope_enforces_identity_generation_revision_bounds_and_closure() {
+    let update = |generation, revision, identity| ToolPresentationUpdate {
+        invocation_id: "call-1".to_owned(),
+        producer_id: "test.plugin".to_owned(),
+        generation,
+        revision,
+        identity,
+        retention: ToolPresentationRetention::RetainLatest,
+        schema: "test.presentation".to_owned(),
+        schema_version: 1,
+        artifact: None,
+        payload: serde_json::json!({"revision": revision}),
+    };
+    let mut scope = ToolPresentationUpdateScope::default();
+    scope
+        .accept(&update(0, 1, ToolPresentationIdentity::Primary), 4_096)
+        .expect("first primary update");
     assert_eq!(
-        TranscriptViewItemId::tool_presentation_slot(
-            "call-1",
-            bcode_session_models::ToolContributionPlacement::Request,
-            None,
-        ),
-        TranscriptViewItemId::new("tool-slot:call-1:request")
+        scope.accept(&update(0, 1, ToolPresentationIdentity::Primary), 4_096),
+        Err(ToolPresentationUpdateError::StaleRevision)
     );
+    scope
+        .accept(
+            &update(
+                0,
+                1,
+                ToolPresentationIdentity::Supplemental {
+                    item_id: "details".to_owned(),
+                },
+            ),
+            4_096,
+        )
+        .expect("supplemental has independent revision");
+    scope
+        .accept(&update(1, 1, ToolPresentationIdentity::Primary), 4_096)
+        .expect("next generation resets revisions");
+    assert_eq!(scope.generation(), 1);
+    assert_eq!(
+        scope.accept(&update(0, 2, ToolPresentationIdentity::Primary), 4_096),
+        Err(ToolPresentationUpdateError::StaleGeneration)
+    );
+    assert_eq!(
+        scope.accept(&update(3, 1, ToolPresentationIdentity::Primary), 4_096),
+        Err(ToolPresentationUpdateError::FutureGeneration)
+    );
+    assert!(matches!(
+        scope.accept(&update(1, 2, ToolPresentationIdentity::Primary), 1),
+        Err(ToolPresentationUpdateError::TooLarge { maximum: 1, .. })
+    ));
+    scope.close();
+    scope.close();
+    assert_eq!(scope.state(), ToolPresentationScopeState::Closed);
+    assert_eq!(
+        scope.accept(&update(1, 2, ToolPresentationIdentity::Primary), 4_096),
+        Err(ToolPresentationUpdateError::Closed)
+    );
+}
+
+#[test]
+fn tool_presentation_update_scope_rejects_invalid_public_identity_fields() {
+    let valid = ToolPresentationUpdate {
+        invocation_id: "call-1".to_owned(),
+        producer_id: "test.plugin".to_owned(),
+        generation: 0,
+        revision: 1,
+        identity: ToolPresentationIdentity::Primary,
+        retention: ToolPresentationRetention::ActiveOnly,
+        schema: "test.presentation".to_owned(),
+        schema_version: 1,
+        artifact: None,
+        payload: serde_json::Value::Null,
+    };
+    for (update, error) in [
+        (
+            ToolPresentationUpdate {
+                invocation_id: String::new(),
+                ..valid.clone()
+            },
+            ToolPresentationUpdateError::MissingInvocationId,
+        ),
+        (
+            ToolPresentationUpdate {
+                producer_id: String::new(),
+                ..valid.clone()
+            },
+            ToolPresentationUpdateError::MissingProducerId,
+        ),
+        (
+            ToolPresentationUpdate {
+                schema: String::new(),
+                ..valid.clone()
+            },
+            ToolPresentationUpdateError::MissingSchema,
+        ),
+        (
+            ToolPresentationUpdate {
+                identity: ToolPresentationIdentity::Supplemental {
+                    item_id: String::new(),
+                },
+                ..valid
+            },
+            ToolPresentationUpdateError::MissingSupplementalId,
+        ),
+    ] {
+        assert_eq!(
+            ToolPresentationUpdateScope::default().accept(&update, 4_096),
+            Err(error)
+        );
+    }
+}
+
+#[test]
+fn tool_presentation_slot_ids_collapse_primary_and_keep_supplementals_independent() {
+    let primary = TranscriptViewItemId::tool("call-1");
+    for placement in [
+        bcode_session_models::ToolContributionPlacement::Request,
+        bcode_session_models::ToolContributionPlacement::Progress,
+        bcode_session_models::ToolContributionPlacement::Result,
+    ] {
+        assert_eq!(
+            TranscriptViewItemId::tool_presentation_slot("call-1", placement, None),
+            primary
+        );
+    }
     assert_ne!(
         TranscriptViewItemId::tool_presentation_slot(
             "call-1",
@@ -336,7 +451,8 @@ fn transcript_patch_removes_middle_item_without_reset() {
     assert_eq!(
         patch.transcript,
         vec![TranscriptViewPatchOp::Remove {
-            id: TranscriptViewItemId::new("two")
+            id: TranscriptViewItemId::new("two"),
+            revision: 3,
         }]
     );
     base.apply_patch(&patch).expect("middle removal applies");
@@ -348,6 +464,27 @@ fn transcript_patch_rejects_non_monotonic_item_replacement() {
     let mut base = transcript_document(3, [transcript_item("one", 2, "old")]);
     let next = transcript_document(4, [transcript_item("one", 2, "new")]);
     let patch = SessionViewPatch::transcript_between(3, 4, None, &base, &next);
+
+    assert_eq!(
+        base.apply_patch(&patch),
+        Err(TranscriptViewPatchError::NonMonotonicItemRevision {
+            id: TranscriptViewItemId::new("one"),
+            current: 2,
+            replacement: 2,
+        })
+    );
+}
+
+#[test]
+fn transcript_patch_rejects_non_monotonic_item_removal() {
+    let mut base = transcript_document(3, [transcript_item("one", 2, "old")]);
+    let patch = SessionViewPatch {
+        transcript: vec![TranscriptViewPatchOp::Remove {
+            id: TranscriptViewItemId::new("one"),
+            revision: 2,
+        }],
+        ..SessionViewPatch::empty(3, 4)
+    };
 
     assert_eq!(
         base.apply_patch(&patch),
@@ -374,7 +511,8 @@ fn transcript_patch_removes_tail_items() {
     assert_eq!(
         patch.transcript,
         vec![TranscriptViewPatchOp::Remove {
-            id: TranscriptViewItemId::new("two")
+            id: TranscriptViewItemId::new("two"),
+            revision: 3,
         }]
     );
 
@@ -500,6 +638,7 @@ fn transcript_patch_rejects_missing_and_duplicate_items() {
     let missing = SessionViewPatch {
         transcript: vec![TranscriptViewPatchOp::Remove {
             id: TranscriptViewItemId::new("missing"),
+            revision: 2,
         }],
         ..SessionViewPatch::empty(1, 2)
     };
@@ -536,7 +675,7 @@ fn snapshot_patch_applies_transcript_only_incrementally() {
 }
 
 #[test]
-fn snapshot_patch_keeps_slot_replacement_incremental_with_contribution_update() {
+fn snapshot_patch_keeps_primary_replacement_incremental_with_contribution_update() {
     let contribution = |sequence, label: &str| bcode_session_models::ToolContributionEvent {
         invocation_id: "call-1".to_owned(),
         contribution_id: "request".to_owned(),
@@ -555,7 +694,7 @@ fn snapshot_patch_keeps_slot_replacement_incremental_with_contribution_update() 
     base.transcript = transcript_document(
         1,
         [
-            transcript_item("tool-slot:call-1:request", 1, "compact"),
+            transcript_item("tool:call-1", 1, "compact"),
             unchanged.clone(),
         ],
     );
@@ -567,7 +706,7 @@ fn snapshot_patch_keeps_slot_replacement_incremental_with_contribution_update() 
     next.transcript = transcript_document(
         2,
         [
-            transcript_item_with_revision("tool-slot:call-1:request", 1, 2, "rich"),
+            transcript_item_with_revision("tool:call-1", 1, 2, "rich"),
             unchanged,
         ],
     );
@@ -579,7 +718,7 @@ fn snapshot_patch_keeps_slot_replacement_incremental_with_contribution_update() 
     assert!(matches!(
         patch.transcript.as_slice(),
         [TranscriptViewPatchOp::Replace { item }]
-            if item.id == TranscriptViewItemId::new("tool-slot:call-1:request")
+            if item.id == TranscriptViewItemId::tool("call-1")
     ));
     assert_eq!(patch.contributions.len(), 1);
     assert_eq!(
@@ -607,7 +746,7 @@ fn snapshot_patch_removes_transient_contribution_incrementally() {
         payload: serde_json::json!({"frame": 1}),
     };
     let key = "call-1:progress".to_owned();
-    let mut item = transcript_item("tool-slot:call-1:progress", 1, "progress");
+    let mut item = transcript_item("tool:call-1", 1, "progress");
     item.sequence = None;
     let mut base = SessionViewSnapshot::empty();
     base.revision = 1;
@@ -625,8 +764,8 @@ fn snapshot_patch_removes_transient_contribution_incrementally() {
     assert_eq!(patch.removed_contributions, [key]);
     assert!(matches!(
         patch.transcript.as_slice(),
-        [TranscriptViewPatchOp::Remove { id }]
-            if id == &TranscriptViewItemId::new("tool-slot:call-1:progress")
+        [TranscriptViewPatchOp::Remove { id, .. }]
+            if id == &TranscriptViewItemId::tool("call-1")
     ));
 
     base.apply_patch(&patch)

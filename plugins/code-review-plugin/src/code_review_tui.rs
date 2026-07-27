@@ -4199,6 +4199,7 @@ impl ReviewAgentSessionStreamState {
                 self.status = "thinking…".to_string();
             }
             SessionLiveEventKind::ToolContributionPlaced { .. }
+            | SessionLiveEventKind::ToolPresentationUpdated { .. }
             | SessionLiveEventKind::ToolInvocationProgress { .. } => {
                 self.phase = ReviewAgentThreadPhase::Running;
                 self.status = "running tool…".to_string();
