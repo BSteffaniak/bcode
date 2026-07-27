@@ -3,16 +3,10 @@
 use bcode_session_models::SessionId;
 use std::path::{Path, PathBuf};
 
-/// Return Bcode's legacy global catalog database path under `root`.
+/// Return Bcode's canonical global catalog database path under `root`.
 #[must_use]
 pub fn global_catalog_db_path(root: &Path) -> PathBuf {
     root.join("catalog.db")
-}
-
-/// Return a build/compatibility-scoped catalog database path under `root`.
-#[must_use]
-pub fn namespaced_catalog_db_path(root: &Path, namespace: &str) -> PathBuf {
-    root.join("catalogs").join(namespace).join("catalog.db")
 }
 
 /// Return Bcode's canonical per-session directory under `root`.
@@ -40,9 +34,5 @@ mod tests {
             root.join(session_id.to_string()).join("session.db")
         );
         assert_eq!(global_catalog_db_path(root), root.join("catalog.db"));
-        assert_eq!(
-            namespaced_catalog_db_path(root, "build"),
-            root.join("catalogs").join("build").join("catalog.db")
-        );
     }
 }

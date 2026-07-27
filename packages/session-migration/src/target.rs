@@ -36,10 +36,6 @@ pub fn validate_strict_target(
         model_context_schema_version: validation.model_context_schema_version,
         expected_model_context_schema_version: validation.expected_model_context_schema_version,
         model_context_checkpoint: validation.model_context_checkpoint,
-        compatibility_schema_version: validation.compatibility_schema_version,
-        expected_compatibility_schema_version: validation.expected_compatibility_schema_version,
-        compatibility_checkpoint: validation.compatibility_checkpoint,
-        compatibility_resolved: validation.compatibility_resolved,
     })
 }
 
@@ -141,10 +137,6 @@ mod tests {
                 model_context_schema_version: Some(2),
                 expected_model_context_schema_version: 2,
                 model_context_checkpoint: Some(7),
-                compatibility_schema_version: Some(1),
-                expected_compatibility_schema_version: 1,
-                compatibility_checkpoint: Some(7),
-                compatibility_resolved: true,
             })
         }
 

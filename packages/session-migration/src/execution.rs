@@ -683,7 +683,7 @@ mod tests {
             assert_eq!(metadata.source_kind, event_kind);
             assert!(matches!(
                 event.kind,
-                SessionEventKind::OpaqueEvent { ref event_type, ref payload }
+                SessionEventKind::InertHistory { ref event_type, ref payload }
                     if event_type == event_kind && payload["preserved"] == true
             ));
         }
@@ -699,7 +699,7 @@ mod tests {
             panic!("expected retired known event");
         };
         assert_eq!(metadata.source_kind, "tool_invocation_stream");
-        let SessionEventKind::OpaqueEvent {
+        let SessionEventKind::InertHistory {
             event_type,
             payload,
         } = event.kind
@@ -755,7 +755,7 @@ mod tests {
                     && metadata.source_kind == "tool_invocation_stream"
                     && matches!(
                         &event.kind,
-                        SessionEventKind::OpaqueEvent { event_type, payload }
+                        SessionEventKind::InertHistory { event_type, payload }
                             if event_type == "tool_invocation_stream"
                                 && payload["event"]["status"]["tool_call_id"] == "call-1"
                                 && payload["event"]["status"]["sequence"] == 1
@@ -1023,7 +1023,7 @@ mod tests {
                     && metadata.source_kind == "context_usage_observed"
                     && matches!(
                         &event.kind,
-                        SessionEventKind::OpaqueEvent { event_type, payload }
+                        SessionEventKind::InertHistory { event_type, payload }
                             if event_type == "context_usage_observed"
                                 && payload["snapshot"]["input_tokens"] == 123
                     )

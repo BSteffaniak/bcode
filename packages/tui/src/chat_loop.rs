@@ -2167,7 +2167,7 @@ fn absorb_bcode_event(
                     event.kind,
                     SessionEventKind::RalphLifecycle { .. }
                         | SessionEventKind::PluginStatusNote { .. }
-                        | SessionEventKind::OpaqueEvent { .. }
+                        | SessionEventKind::InertHistory { .. }
                 ) {
                     loop_state.replace_effect(TuiEffect::LoadPluginStatus {
                         session_id: event.session_id,

@@ -1577,7 +1577,7 @@ pub const RELEASED_EVENT_VARIANTS: &[ReleasedEventVariantDescriptor] = &[
     },
     ReleasedEventVariantDescriptor {
         kind: "opaque_event",
-        treatment: ReleasedEventTreatment::CurrentEquivalent,
+        treatment: ReleasedEventTreatment::RetiredKnown,
     },
     ReleasedEventVariantDescriptor {
         kind: "permission_requested",
@@ -2336,6 +2336,7 @@ mod tests {
                 "legacy_tool_invocation_presentation",
                 "legacy_turn_finished",
                 "legacy_turn_started",
+                "opaque_event",
                 "plugin_automation_turn_finished",
                 "plugin_automation_turn_started",
                 "tool_invocation_presentation",

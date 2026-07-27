@@ -32,9 +32,6 @@ const fn append_rejection_metric(error: &SessionDbError) -> &'static str {
         | SessionDbError::InvalidCanonicalSequence { .. } => {
             "session.actor.append_event.rejected.canonical_sequence_total"
         }
-        SessionDbError::CompatibilityDegraded { .. } => {
-            "session.actor.append_event.rejected.compatibility_degraded_total"
-        }
         SessionDbError::TransientContribution { .. } => {
             "session.actor.append_event.rejected.transient_contribution_total"
         }
@@ -925,28 +922,11 @@ impl SessionActor {
                 .increment_counter("session.manifest.write_error_total");
             eprintln!("failed to write session manifest: {error}");
         }
-        let catalog = match store
-            .lease_owner()
-            .build_fingerprint
-            .as_deref()
-            .map(crate::safe_catalog_namespace)
-        {
-            Some(namespace) => {
-                crate::db::GlobalSessionDb::open_turso_in_root_namespace_observed(
-                    &store.root_path(),
-                    &namespace,
-                    store.metrics(),
-                )
-                .await
-            }
-            None => {
-                crate::db::GlobalSessionDb::open_turso_in_root_observed(
-                    &store.root_path(),
-                    store.metrics(),
-                )
-                .await
-            }
-        };
+        let catalog = crate::db::GlobalSessionDb::open_turso_in_root_observed(
+            &store.root_path(),
+            store.metrics(),
+        )
+        .await;
         match catalog {
             Ok(catalog) => {
                 if let Err(error) = catalog

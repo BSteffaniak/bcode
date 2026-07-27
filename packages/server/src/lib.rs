@@ -14,6 +14,7 @@ pub(crate) mod context_compaction;
 mod model_ignores;
 mod runtime_work;
 mod session_migration_adapter;
+mod session_migration_execution;
 
 use context_accounting::{
     LOCAL_CONTEXT_ESTIMATOR_VERSION, estimated_model_messages_tokens, local_request_estimate,
@@ -1326,7 +1327,6 @@ impl ServerState {
     ) -> Self {
         let (shutdown, _) = broadcast::channel(1);
         let session_migrations = bcode_session_migration::SessionMigrationService::default();
-        let sessions = sessions.with_migration_operations(session_migrations.operations());
         Self {
             sessions,
             session_migrations,
@@ -6821,6 +6821,73 @@ async fn handle_session_history(
 
 const MAX_SESSION_OPEN_PROGRESS_WAIT: Duration = Duration::from_secs(5);
 
+fn migrating_session_open_snapshot(
+    session_id: SessionId,
+    writer_epoch: u32,
+) -> bcode_session_models::SessionOpenOperationSnapshot {
+    bcode_session_models::SessionOpenOperationSnapshot {
+        operation_id: bcode_session_models::SessionOpenOperationId::new(),
+        revision: 0,
+        session_id,
+        source_writer_epoch: Some(u64::from(writer_epoch)),
+        target_writer_epoch: u64::from(bcode_session::db::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
+        progress: bcode_session_models::SessionMigrationProgress {
+            stage: bcode_session_models::SessionMigrationStage::WaitingForOwnership,
+            completed_units: None,
+            total_units: None,
+            unit: None,
+            message: "Waiting for exclusive session ownership".to_owned(),
+        },
+        outcome: None,
+        backup_path: None,
+    }
+}
+
+fn session_migration_failure_outcome(
+    error: &bcode_session::SessionError,
+) -> bcode_session_models::SessionOpenTerminalOutcome {
+    use bcode_session_models::{SessionOpenFailureKind, SessionOpenTerminalOutcome};
+    match error {
+        bcode_session::SessionError::Db(
+            bcode_session::db::SessionDbError::WriterIncompatible { actual, expected },
+        ) => SessionOpenTerminalOutcome::WriterIncompatible {
+            actual: *actual,
+            expected: *expected,
+        },
+        bcode_session::SessionError::ProjectionStale { .. }
+        | bcode_session::SessionError::Db(
+            bcode_session::db::SessionDbError::InvalidCanonicalSequence { .. }
+            | bcode_session::db::SessionDbError::InvalidRow { .. }
+            | bcode_session::db::SessionDbError::PersistedEvent(_)
+            | bcode_session::db::SessionDbError::HistoricalMigration(_),
+        ) => SessionOpenTerminalOutcome::RepairRequired {
+            reason: error.to_string(),
+        },
+        bcode_session::SessionError::NotFound(_) => SessionOpenTerminalOutcome::Failed {
+            kind: SessionOpenFailureKind::NotFound,
+            message: error.to_string(),
+            backup_path: None,
+        },
+        bcode_session::SessionError::MigrationBackup { .. } => SessionOpenTerminalOutcome::Failed {
+            kind: SessionOpenFailureKind::BackupFailed,
+            message: error.to_string(),
+            backup_path: None,
+        },
+        bcode_session::SessionError::Lease(
+            bcode_session::lease::SessionLeaseError::OwnedByOtherDaemon { .. },
+        ) => SessionOpenTerminalOutcome::Failed {
+            kind: SessionOpenFailureKind::OwnedByOtherDaemon,
+            message: error.to_string(),
+            backup_path: None,
+        },
+        _ => SessionOpenTerminalOutcome::Failed {
+            kind: SessionOpenFailureKind::MigrationFailed,
+            message: error.to_string(),
+            backup_path: None,
+        },
+    }
+}
+
 async fn handle_prepare_session_open(
     request_id: u64,
     state: &Arc<ServerState>,
@@ -6836,16 +6903,53 @@ async fn handle_prepare_session_open(
         } => u32::try_from(source).ok(),
         _ => None,
     };
-    if let Some(source_writer_epoch) = source_writer_epoch
-        && let Err(error) = state.session_migrations.plan(source_writer_epoch)
-    {
+    if let Some(source_writer_epoch) = source_writer_epoch {
+        if let Err(error) = state.session_migrations.plan(source_writer_epoch) {
+            return send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    "session_writer_incompatible",
+                    error.to_string(),
+                )),
+            )
+            .await;
+        }
+        let initial = migrating_session_open_snapshot(session_id, source_writer_epoch);
+        let sessions = state.sessions.clone();
+        let operation = state
+            .session_migrations
+            .operations()
+            .start_or_join(initial, move |operation| async move {
+                let reporter =
+                    bcode_session_migration::SessionMigrationProgressReporter::new(operation);
+                let result = async {
+                    let root = sessions
+                        .session_store_root()
+                        .ok_or(bcode_session::SessionError::NotFound(session_id))?;
+                    session_migration_execution::migrate_owned_session_storage(
+                        session_id,
+                        &root,
+                        u64::from(source_writer_epoch),
+                        &reporter,
+                        &bcode_metrics::MetricsRegistry::disabled(),
+                    )
+                    .await?;
+                    sessions.load_current_session(session_id).await
+                }
+                .await;
+                match result {
+                    Ok(()) => bcode_session_models::SessionOpenTerminalOutcome::Ready,
+                    Err(error) => session_migration_failure_outcome(&error),
+                }
+            })
+            .await;
         return send_response(
             writer,
             request_id,
-            Response::Err(ErrorResponse::new(
-                "session_writer_incompatible",
-                error.to_string(),
-            )),
+            Response::Ok(ResponsePayload::SessionOpenPrepared {
+                snapshot: operation.snapshot(),
+            }),
         )
         .await;
     }
@@ -7020,14 +7124,6 @@ fn session_db_error_response(error: &bcode_session::db::SessionDbError) -> Error
                 "session history contains unsupported persisted event kind {kind}; upgrade Bcode and restart the daemon, then reopen the session"
             ),
         ),
-        bcode_session::db::SessionDbError::CompatibilityDegraded { issue_count } => {
-            ErrorResponse::new(
-                "session_degraded_read_only",
-                format!(
-                    "session contains {issue_count} opaque compatibility event(s); bounded history remains available, but attach and writes are disabled; run `bcode session diagnose <session-id>` and use a compatible Bcode build"
-                ),
-            )
-        }
         bcode_session::db::SessionDbError::WriterIncompatible { .. } => {
             ErrorResponse::new("session_writer_incompatible", error.to_string())
         }
@@ -22822,7 +22918,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
-        SessionEventKind::OpaqueEvent { .. } => "opaque_event",
+        SessionEventKind::InertHistory { .. } => "inert_history",
     }
 }
 
@@ -34164,7 +34260,7 @@ library = "test"
             current.outcome,
             Some(bcode_session_models::SessionOpenTerminalOutcome::Ready)
         );
-        assert_eq!(state.sessions.active_session_migration_count().await, 0);
+        assert_eq!(state.session_migrations.active_count().await, 0);
         connection
             .attach_session_recent(session_id, 16)
             .await

@@ -4463,7 +4463,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         | SessionEventKind::AssistantReasoningMessage { .. }
         | SessionEventKind::AssistantReasoningActivity { .. }
         | SessionEventKind::ModelTurnFinished { .. }
-        | SessionEventKind::OpaqueEvent { .. } => true,
+        | SessionEventKind::InertHistory { .. } => true,
         SessionEventKind::SkillSuggested { reason, .. } => reason.is_some(),
         SessionEventKind::SessionCreated { .. }
         | SessionEventKind::ClientAttached { .. }

@@ -2380,8 +2380,8 @@ pub enum SessionEventKind {
         #[serde(default)]
         metadata: BTreeMap<String, serde_json::Value>,
     },
-    /// Opaque historical event retained for replay/export compatibility only.
-    OpaqueEvent {
+    /// Semantically inert current history retained faithfully by migration.
+    InertHistory {
         event_type: String,
         payload: serde_json::Value,
     },

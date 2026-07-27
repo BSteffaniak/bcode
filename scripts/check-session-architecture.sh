@@ -24,8 +24,8 @@ fi
 
 if ! grep -F 'ToolContributionPersistence::Transient' packages/session/src/lib.rs >/dev/null \
   || ! grep -F 'ToolContributionPlacement::Progress' packages/session/src/lib.rs >/dev/null \
-  || ! grep -F 'historical_progress_contribution_decodes_for_compatibility' packages/session/src/persisted.rs >/dev/null; then
-  echo "Session architecture violation: transient/progress durable rejection or historical decode compatibility coverage was removed." >&2
+  || ! grep -F 'transient_contribution_is_rejected_before_durable_append' packages/session/src/lib.rs >/dev/null; then
+  echo "Session architecture violation: transient/progress contributions must remain rejected before current durable append." >&2
   violations=1
 fi
 
@@ -139,10 +139,29 @@ then
   violations=1
 fi
 
-if ! rg -q 'decode_opaque_session_event' packages/session/src/persisted.rs \
-  || ! rg -q 'degraded_decode_preserves_unknown_and_future_events_as_opaque_history' packages/session/src/persisted.rs \
-  || ! rg -q 'bounded_metadata_envelope_check_rejects_untrustworthy_records' packages/session/src/persisted.rs; then
-  echo "Session compatibility violation: generic trustworthy opaque-envelope handling must remain covered." >&2
+if ! sed -n '/fn reject_unsupported_future_shape/,/fn is_unknown_variant_error/p' packages/session/src/persisted.rs \
+  | grep -q 'schema_version != CURRENT_SESSION_EVENT_SCHEMA_VERSION' \
+  || ! sed -n '/fn decode_for_migration/,/#\[cfg(test)\]/p' packages/session-migration/src/execution.rs \
+    | grep -q 'HistoricalEnvelope' \
+  || ! rg -q 'serde_json::from_str::<SessionEvent>' packages/session/src/db.rs; then
+  echo "Session architecture violation: current persistence must accept only the exact current schema while released structural decoding remains migration-only." >&2
+  violations=1
+fi
+
+if rg -n 'OpaqueEvent|opaque_event' packages/session/src packages/session/models/src --glob '*.rs' \
+  >/tmp/bcode-current-opaque-event.txt \
+  || ! rg -q 'InertHistory' packages/session/models/src/lib.rs \
+  || ! awk '/kind: "opaque_event"/{found=1} found && /treatment: ReleasedEventTreatment::RetiredKnown/{exit 0} END{exit !found}' \
+    packages/session-migration/src/inventory.rs; then
+  echo "Session architecture violation: released opaque events must migrate to explicit inert current history and remain absent from current session naming." >&2
+  cat /tmp/bcode-current-opaque-event.txt >&2 2>/dev/null || true
+  violations=1
+fi
+
+if rg -n 'decode_session_event_compatible|CompatibleSessionEvent|decode_opaque_session_event|has_trustworthy_session_event_envelope' \
+  packages/session/src --glob '*.rs' >/tmp/bcode-session-opaque-read-policy.txt; then
+  echo "Session architecture violation: current session reads must decode strictly without opaque compatibility fallback." >&2
+  cat /tmp/bcode-session-opaque-read-policy.txt >&2
   violations=1
 fi
 
@@ -180,10 +199,10 @@ if ! rg -q 'failed_explicit_migration_preserves_projection_and_writer_contract' 
   violations=1
 fi
 
-if ! rg -q 'create_verified_migration_backup' packages/session/src/migration_execution.rs \
+if ! rg -q 'create_verified_migration_backup' packages/server/src/session_migration_execution.rs \
   || ! rg -q 'build_migration_backup_request' packages/session-migration/src/backup.rs \
-  || ! rg -q 'build_migration_backup_request' packages/session/src/migration_execution.rs \
-  || sed -n '/async fn create_verified_migration_backup(/,/^}/p' packages/session/src/migration_execution.rs | grep -q 'plan_writer_epoch_migration' \
+  || ! rg -q 'build_migration_backup_request' packages/server/src/session_migration_execution.rs \
+  || sed -n '/async fn create_verified_migration_backup(/,/^}/p' packages/server/src/session_migration_execution.rs | grep -q 'plan_writer_epoch_migration' \
   || ! rg -q 'failed_migration_backup_prevents_every_storage_mutation' packages/session/src/lib.rs \
   || ! rg -q 'migration-backup.json' packages/session/src/lib.rs; then
   echo "Session migration-backup violation: automatic legacy migration must create and verify a retained backup before changing storage." >&2
@@ -300,14 +319,16 @@ if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5' packages/session/mode
   || ! rg -q 'bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH' packages/session/src/lease.rs \
   || ! rg -q 'bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH' packages/ipc/src/lib.rs \
   || ! rg -q 'session_event_schema_version' packages/ipc/src/lib.rs \
-  || ! rg -q 'session_compatibility_state' packages/session/src/db.rs \
-  || ! rg -q 'CompatibilityDegraded' packages/session/src/db.rs \
+  || awk '/#\[cfg\(test\)\]/{exit} {print}' packages/session/src/db.rs \
+    | rg -n 'session_compatibility_state|session_compatibility_issues|CompatibilityDegraded' \
+    >/tmp/bcode-current-compatibility-projection.txt \
+  || awk '/#\[cfg\(test\)\]/{exit} {print}' packages/session/src/lib.rs \
+    | rg -n 'session_compatibility_state|session_compatibility_issues|CompatibilityDegraded' \
+    >>/tmp/bcode-current-compatibility-projection.txt \
   || ! rg -q 'epoch_three_unknown_history_fails_writable_migration_atomically' packages/session/src/db.rs \
-  || ! rg -q 'schema_28_incident_distribution_migrates_without_unresolved_issues' packages/session/src/db.rs \
   || ! rg -q 'schema_28_historical_events_normalize_to_current_writable_storage' packages/session/src/db.rs \
-  || ! rg -q 'broken_epoch_four_compatibility_state_is_rebuilt_to_writable_epoch_five' packages/session/src/db.rs \
   || ! rg -q 'unknown_legacy_history_preparation_fails_closed' packages/session/src/lib.rs; then
-  echo "Session compatibility-projection violation: epoch-5 migration must normalize known history, reject unresolved history atomically, and retain bounded compatibility reporting." >&2
+  echo "Session strict-current violation: migration must normalize known history, reject unresolved history atomically, and current runtime must not retain compatibility projections." >&2
   cat /tmp/bcode-current-historical-inventory-violations.txt >&2 2>/dev/null || true
   violations=1
 fi
@@ -383,18 +404,18 @@ if ! rg -q 'pub async fn canonical_event_inventory' packages/session/src/db.rs \
   violations=1
 fi
 
-if rg -n 'decode_session_event_degraded' packages/session/src \
-  >/tmp/bcode-lossy-session-read-violations.txt \
-  || ! rg -q 'pub fn has_trustworthy_session_event_envelope' packages/session/src/persisted.rs; then
-  echo "Session history violation: DB-backed canonical/indexed reads must not silently discard undecodable rows." >&2
+if rg -n 'decode_session_event_degraded|decode_session_event_compatible|CompatibleSessionEvent|has_trustworthy_session_event_envelope' \
+  packages/session/src >/tmp/bcode-lossy-session-read-violations.txt; then
+  echo "Session history violation: current canonical/indexed reads must use strict decoding only." >&2
   cat /tmp/bcode-lossy-session-read-violations.txt >&2
   violations=1
 fi
 
-if ! rg -q 'pub enum CompatibleSessionEvent' packages/session/src/persisted.rs \
-  || ! rg -q 'pub compatibility_issues: Vec<SessionEventCompatibilityIssue>' packages/session/models/src/lib.rs \
-  || ! rg -q 'filter_map\(\|event\| event.issue\(\).cloned\(\)\)' packages/session/src/db.rs; then
-  echo "Session compatibility-reporting violation: bounded history must distinguish known and opaque events and return structured compatibility issues." >&2
+if ! rg -q 'pub compatibility_issues: Vec<SessionEventCompatibilityIssue>' packages/session/models/src/lib.rs \
+  || ! sed -n '/pub async fn history_page(/,/^    }/p' packages/session/src/db.rs \
+    | grep -q 'let compatibility_issues = Vec::new' \
+  || ! rg -q 'normal_history_reads_reject_future_events_without_mutation' packages/session/src/db.rs; then
+  echo "Session strict-history violation: current bounded history must fail closed for non-current events and report no opaque compatibility issues." >&2
   violations=1
 fi
 
@@ -530,7 +551,7 @@ if ! rg -q "mod actor;" packages/session/src/lib.rs; then
   violations=1
 fi
 
-for session_module in attach attachment catalog context db_artifact db_compatibility db_connection db_context db_contract db_event_store db_path db_projection db_projection_row db_row db_runtime_work db_validation fork manifest mutation ownership runtime_work state store store_executor subscription tools; do
+for session_module in attach attachment catalog context db_artifact db_connection db_context db_contract db_event_store db_path db_projection db_projection_row db_row db_runtime_work db_validation fork manifest mutation ownership runtime_work state store store_executor subscription tools; do
   if ! rg -q "(pub(\\(crate\\))? )?mod ${session_module};" packages/session/src/lib.rs \
     || [[ ! -f "packages/session/src/${session_module}.rs" ]]; then
     echo "Session module split violation: ${session_module} domain module must remain extracted from lib.rs." >&2
@@ -744,9 +765,9 @@ if ! rg -q 'pub mod historical_event_families' packages/session-migration/src/co
   || ! rg -q 'ToolArtifactDto' packages/session-migration/src/codec.rs \
   || rg -n 'Artifact \{ artifact: Box<ToolArtifact> \}' packages/session-migration/src/codec.rs >/tmp/bcode-mutable-historical-artifact-dto.txt \
   || ! rg -q 'normalize_canonical_event' packages/session/src/db.rs \
-  || ! rg -q 'decode_session_event_compatible' packages/session/src/persisted.rs \
+  || rg -n 'decode_session_event_compatible|CompatibleSessionEvent|decode_opaque_session_event' packages/session/src/persisted.rs >/tmp/bcode-current-codec-opaque-read.txt \
   || rg -n 'context_usage_observed|tool_call_finished|tool_invocation_stream|interactive_tool_request|plugin_automation_turn|legacy_turn|legacy_tool_invocation' packages/session/src/persisted.rs >/tmp/bcode-current-codec-historical-family.txt \
-  || ! rg -q 'normal_history_reads_preserve_future_events_without_mutation' packages/session/src/db.rs \
+  || ! rg -q 'normal_history_reads_reject_future_events_without_mutation' packages/session/src/db.rs \
   || ! sed -n '/"tool_invocation_stream" =>/,/}),/p' packages/session-migration/src/codec.rs | grep -q 'RetiredKnown' \
   || rg -n 'ToolInvocationStreamEvent|ToolInvocationStream' packages/session/src packages/session-migration/src --glob '*.rs' >/tmp/bcode-retired-tool-stream-runtime.txt \
   || ! rg -q 'released_epoch_four_writer_rejects_corrected_epoch_five_store' packages/session/src/db.rs \
@@ -831,21 +852,21 @@ if ! rg -q 'daemon_instance_id: Some\(format!\("process-' packages/session/src/l
   || ! rg -q 'allows_reentrant_registrations_from_one_daemon_instance' packages/session/src/lease.rs \
   || ! rg -q 'maintenance_refuses_any_live_session_owner' packages/session/src/lease.rs \
   || ! rg -q 'maintenance_to_lease_transition_prevents_incompatible_handoff_race' packages/session/src/lease.rs \
-  || ! sed -n '/pub async fn prepare_owned_session_storage(/,/^}/p' packages/session/src/migration_execution.rs | grep -q 'acquire_maintenance_session_write_lock' \
-  || ! sed -n '/pub async fn prepare_owned_session_storage(/,/^}/p' packages/session/src/migration_execution.rs | grep -q 'transition_session_maintenance_to_lease' \
-  || ! sed -n '/pub async fn prepare_owned_session_storage(/,/^}/p' packages/session/src/migration_execution.rs | grep -q 'validate_write_readiness' \
-  || ! rg -q 'execute_owned_legacy_storage' packages/session/src/migration_execution.rs \
+  || ! sed -n '/pub async fn migrate_owned_session_storage(/,/^}/p' packages/server/src/session_migration_execution.rs | grep -q 'acquire_maintenance_session_write_lock' \
+  || ! sed -n '/pub async fn migrate_owned_session_storage(/,/^}/p' packages/server/src/session_migration_execution.rs | grep -q 'drop(maintenance)' \
+  || ! sed -n '/pub async fn migrate_owned_session_storage(/,/^}/p' packages/server/src/session_migration_execution.rs | grep -q 'validate_write_readiness' \
+  || ! rg -q 'execute_owned_legacy_storage' packages/server/src/session_migration_execution.rs \
   || ! rg -q 'progress_reporter_throttles_intermediate_updates_and_preserves_boundaries' packages/session-migration/src/operation.rs \
   || rg -n 'struct MigrationProgressReporter|MIGRATION_PROGRESS_BYTE_INTERVAL' packages/session/src --glob '*.rs' \
     >/tmp/bcode-current-migration-progress-policy-violations.txt \
   || rg -n 'fn migrate_owned_legacy_storage|fn create_verified_migration_backup|struct MigrationProgressReporter' packages/session/src/lib.rs \
   || ! rg -q 'session_migrations: bcode_session_migration::SessionMigrationService' packages/server/src/lib.rs \
-  || ! rg -q 'with_migration_operations\(session_migrations.operations\(\)\)' packages/server/src/lib.rs \
+  || ! rg -q 'session_migrations' packages/server/src/lib.rs \
+  || ! rg -q '\.operations\(\)' packages/server/src/lib.rs \
+  || ! rg -q '\.start_or_join\(' packages/server/src/lib.rs \
   || ! rg -q 'session_migrations\.active_count\(\)' packages/server/src/lib.rs \
   || ! rg -q 'pub async fn prepare_session_open' packages/session/src/lib.rs \
-  || ! rg -q 'migration_operations: bcode_session_migration::SessionMigrationOperations' packages/session/src/lib.rs \
-  || ! rg -q 'concurrent_preparation_joins_one_detached_legacy_migration' packages/session/src/lib.rs \
-  || ! rg -q 'current_session_preparation_is_immediately_ready_without_operation' packages/session/src/lib.rs \
+  || rg -n 'migration_operations: bcode_session_migration::SessionMigrationOperations|with_migration_operations' packages/session/src/lib.rs \
   || ! rg -q 'concurrent_starts_join_one_running_operation' packages/session-migration/src/operation.rs \
   || ! rg -q 'pruning_is_bounded_and_never_removes_running_operations' packages/session-migration/src/operation.rs \
   || test -e packages/session/src/migration_operation.rs; then
@@ -895,7 +916,7 @@ if ! rg -q 'streaming_backup_handles_nested_empty_and_large_files' packages/sess
   violations=1
 fi
 
-migration_metric_sources="$(cat packages/session/src/migration_execution.rs; sed -n '/pub(crate) async fn migrate_turso_in_root_observed(/,/pub async fn open_turso_in_root/p; /async fn migrate_session_storage(/,/^}/p; /async fn rebuild_migration_projections(/,/^}/p; /async fn validate_migrated_storage(/,/^}/p; /async fn project_migration_event(/,/^}/p' packages/session/src/db.rs)"
+migration_metric_sources="$(cat packages/server/src/session_migration_execution.rs; sed -n '/pub(crate) async fn migrate_turso_in_root_observed(/,/pub async fn open_turso_in_root/p; /async fn migrate_session_storage(/,/^}/p; /async fn rebuild_migration_projections(/,/^}/p; /async fn validate_migrated_storage(/,/^}/p; /async fn project_migration_event(/,/^}/p' packages/session/src/db.rs)"
 for metric in \
   session.migration.ownership_duration_ms \
   session.migration.backup.plan_duration_ms \
@@ -969,11 +990,11 @@ if ! grep -q 'session_load_gate(session_id)' <<<"$migration_load_body" \
   violations=1
 fi
 
-migration_capability_body="$(sed -n '/pub async fn prepare_owned_session_storage(/,/^}/p' packages/session/src/migration_execution.rs)"
-if ! rg -q "maintenance: &'a lease::SessionMaintenanceGuard" packages/session/src/migration_execution.rs \
-  || ! rg -q "write: &'a lease::SessionWriteGuard" packages/session/src/migration_execution.rs \
+migration_capability_body="$(sed -n '/pub async fn migrate_owned_session_storage(/,/^}/p' packages/server/src/session_migration_execution.rs)"
+if ! rg -q "maintenance: &'a lease::SessionMaintenanceGuard" packages/server/src/session_migration_execution.rs \
+  || ! rg -q "write: &'a lease::SessionWriteGuard" packages/server/src/session_migration_execution.rs \
   || ! grep -q 'validate_write_readiness().await' <<<"$migration_capability_body" \
-  || ! grep -q 'transition_session_maintenance_to_lease' <<<"$migration_capability_body"; then
+  || ! grep -q 'drop(maintenance)' <<<"$migration_capability_body"; then
   echo "Session migration capability violation: maintenance and write guards must remain borrowed through migration and write-readiness validation before lease transition." >&2
   violations=1
 fi

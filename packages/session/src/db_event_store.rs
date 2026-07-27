@@ -1,10 +1,7 @@
 //! Current canonical event-row reads and writes.
 
 use crate::db::{SessionDbError, SessionDbResult};
-use crate::persisted::{
-    CompatibleSessionEvent, decode_session_event, decode_session_event_compatible,
-    encode_session_event,
-};
+use crate::persisted::{decode_session_event, encode_session_event};
 use bcode_session_models::{SessionEvent, SessionEventKind, SessionId};
 use switchy::database::{Database, DatabaseValue, query::SortDirection};
 
@@ -57,7 +54,7 @@ pub const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
-        SessionEventKind::OpaqueEvent { .. } => "opaque_event",
+        SessionEventKind::InertHistory { .. } => "inert_history",
     }
 }
 
@@ -103,14 +100,13 @@ pub async fn strict_events(db: &dyn Database) -> SessionDbResult<Vec<SessionEven
         .collect()
 }
 
-pub fn compatible_event_from_row(
+pub fn strict_event_from_row(
     row: &switchy::database::Row,
     session_id: SessionId,
-) -> SessionDbResult<CompatibleSessionEvent> {
+) -> SessionDbResult<SessionEvent> {
     let event_seq = required_non_negative_u64(row, "event_seq")?;
     let payload = required_string(row, "payload")?;
-    let decoded = decode_session_event_compatible(&payload)?;
-    let event = decoded.event();
+    let event = decode_session_event(&payload)?;
     if event.sequence != event_seq {
         return Err(SessionDbError::InvalidCanonicalSequence {
             expected: event_seq,
@@ -122,7 +118,7 @@ pub fn compatible_event_from_row(
             column: "events.session_id".to_owned(),
         });
     }
-    Ok(decoded)
+    Ok(event)
 }
 
 pub async fn last_sequence(db: &dyn Database) -> SessionDbResult<Option<u64>> {

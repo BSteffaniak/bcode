@@ -230,21 +230,22 @@ fn add_session_runtime_migrations(source: &mut CodeMigrationSource<'static>) {
         "INSERT OR IGNORE INTO session_storage_contract (contract_id, schema_version, writer_epoch, updated_by_build) VALUES (1, 1, 1, NULL)",
         "DELETE FROM session_storage_contract WHERE contract_id = 1",
     );
-    add_session_compatibility_migrations(source);
+    add_session_compatibility_ledger_markers(source);
 }
 
-fn add_session_compatibility_migrations(source: &mut CodeMigrationSource<'static>) {
+fn add_session_compatibility_ledger_markers(source: &mut CodeMigrationSource<'static>) {
+    // Preserve released ledger identities without materializing superseded compatibility tables.
     add_sql_migration(
         source,
         "028_session_compatibility_state",
-        "CREATE TABLE IF NOT EXISTS session_compatibility_state (\n    projection_id INTEGER PRIMARY KEY NOT NULL,\n    schema_version INTEGER NOT NULL,\n    last_event_seq INTEGER NOT NULL\n)",
-        "DROP TABLE IF EXISTS session_compatibility_state",
+        "UPDATE session_storage_contract SET contract_id = contract_id WHERE 0",
+        "UPDATE session_storage_contract SET contract_id = contract_id WHERE 0",
     );
     add_sql_migration(
         source,
         "029_session_compatibility_issues",
-        "CREATE TABLE IF NOT EXISTS session_compatibility_issues (\n    event_seq INTEGER PRIMARY KEY NOT NULL,\n    event_kind TEXT NOT NULL,\n    event_schema_version INTEGER NOT NULL,\n    compatibility TEXT NOT NULL,\n    remediation TEXT NOT NULL,\n    FOREIGN KEY(event_seq) REFERENCES events(event_seq)\n)",
-        "DROP TABLE IF EXISTS session_compatibility_issues",
+        "UPDATE session_storage_contract SET contract_id = contract_id WHERE 0",
+        "UPDATE session_storage_contract SET contract_id = contract_id WHERE 0",
     );
 }
 

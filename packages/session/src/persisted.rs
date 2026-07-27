@@ -3,13 +3,11 @@
 //! These persistence DTOs intentionally live in the session package instead of IPC because the
 //! durable JSON and non-self-describing wire formats have different requirements. Historical
 //! conversion and retired-event policy live exclusively in `bcode_session_migration`; this module
-//! decodes current-equivalent shapes and provides generic opaque-envelope reads for unknown/future
-//! user-facing history.
+//! strictly accepts only the current durable event schema.
 
 use bcode_session_models::{
     CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ModelTurnOutcome, ProviderContextSnapshot,
-    RequestContextObservation, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent,
-    SessionEventCompatibilityIssue, SessionEventCompatibilityKind, SessionEventKind,
+    RequestContextObservation, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
     SessionEventProvenance, SessionForkKind, SessionId, SessionTokenUsage, SessionTraceEvent,
     TurnAdmissionMetadata, WorkId, current_unix_timestamp_ms,
 };
@@ -49,7 +47,7 @@ fn reject_unsupported_future_shape(
         .and_then(serde_json::Value::as_u64)
     {
         let schema_version = u16::try_from(schema_version).unwrap_or(u16::MAX);
-        if schema_version > CURRENT_SESSION_EVENT_SCHEMA_VERSION {
+        if schema_version != CURRENT_SESSION_EVENT_SCHEMA_VERSION {
             return Err(PersistedSessionEventError::UnsupportedSchemaVersion {
                 actual: schema_version,
                 current: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -80,168 +78,6 @@ fn first_persisted_event_kind_name(kind: &serde_json::Value) -> String {
         .unwrap_or_else(|| "<invalid>".to_string())
 }
 
-/// Result of compatibility decoding one persisted canonical event.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CompatibleSessionEvent {
-    /// Event semantics are understood by the current persistence layer.
-    Known(SessionEvent),
-    /// The stable envelope is trustworthy, but event semantics are unsupported.
-    Opaque {
-        /// Inert history representation retaining the canonical sequence and payload.
-        event: SessionEvent,
-        /// Structured reason this event is opaque.
-        issue: SessionEventCompatibilityIssue,
-    },
-}
-
-impl CompatibleSessionEvent {
-    /// Return the replayable event representation.
-    #[must_use]
-    pub const fn event(&self) -> &SessionEvent {
-        match self {
-            Self::Known(event) | Self::Opaque { event, .. } => event,
-        }
-    }
-
-    /// Consume the outcome and return its replayable event representation.
-    #[must_use]
-    pub fn into_event(self) -> SessionEvent {
-        match self {
-            Self::Known(event) | Self::Opaque { event, .. } => event,
-        }
-    }
-
-    /// Return the compatibility issue when this event is opaque.
-    #[must_use]
-    pub const fn issue(&self) -> Option<&SessionEventCompatibilityIssue> {
-        match self {
-            Self::Known(_) => None,
-            Self::Opaque { issue, .. } => Some(issue),
-        }
-    }
-}
-
-/// Decode a persisted session event for normal user-facing reads.
-///
-/// Unknown event kinds and future-schema events with trustworthy envelopes are
-/// returned explicitly as [`CompatibleSessionEvent::Opaque`]. Structurally
-/// malformed records return an error. This must not be used by repair, doctor,
-/// reindex, or migration code, which requires strict semantic compatibility as
-/// well as envelope validity.
-///
-/// # Errors
-///
-/// Returns an error when the persisted envelope is malformed or cannot be
-/// trusted.
-pub fn decode_session_event_compatible(
-    payload: &str,
-) -> Result<CompatibleSessionEvent, PersistedSessionEventError> {
-    match decode_session_event(payload) {
-        Ok(event) => Ok(CompatibleSessionEvent::Known(event)),
-        Err(PersistedSessionEventError::UnsupportedSchemaVersion { actual, .. }) => {
-            decode_opaque_session_event(payload).map(|(event, event_kind)| {
-                CompatibleSessionEvent::Opaque {
-                    issue: compatibility_issue(
-                        &event,
-                        event_kind,
-                        SessionEventCompatibilityKind::FutureSchema,
-                        format!(
-                            "open this session with a Bcode build supporting event schema {actual}"
-                        ),
-                    ),
-                    event,
-                }
-            })
-        }
-        Err(PersistedSessionEventError::UnsupportedEventKind { kind }) => {
-            decode_opaque_session_event(payload).map(|(event, event_kind)| {
-                CompatibleSessionEvent::Opaque {
-                    issue: compatibility_issue(
-                        &event,
-                        event_kind,
-                        SessionEventCompatibilityKind::UnknownEventKind,
-                        format!(
-                            "open this session with a Bcode build supporting event kind {kind}"
-                        ),
-                    ),
-                    event,
-                }
-            })
-        }
-        Err(error) => Err(error),
-    }
-}
-
-const fn compatibility_issue(
-    event: &SessionEvent,
-    event_kind: String,
-    compatibility: SessionEventCompatibilityKind,
-    remediation: String,
-) -> SessionEventCompatibilityIssue {
-    SessionEventCompatibilityIssue {
-        sequence: event.sequence,
-        event_kind,
-        schema_version: event.schema_version,
-        compatibility,
-        remediation,
-    }
-}
-
-/// Return whether one persisted event has a trustworthy stable envelope for bounded metadata
-/// discovery.
-///
-/// This intentionally exposes no historical semantic decoding. Unknown and future events are
-/// represented opaquely by `decode_session_event_compatible`; structurally damaged rows return
-/// `false` so catalog discovery can continue without hiding the session directory.
-#[must_use]
-pub fn has_trustworthy_session_event_envelope(payload: &str) -> bool {
-    decode_session_event_compatible(payload).is_ok()
-}
-
-fn decode_opaque_session_event(
-    payload: &str,
-) -> Result<(SessionEvent, String), PersistedSessionEventError> {
-    let persisted = serde_json::from_str::<OpaquePersistedSessionEvent>(payload)?;
-    let Some(kind) = persisted.kind.as_object() else {
-        return Err(PersistedSessionEventError::InvalidOpaqueEvent {
-            reason: "kind is not an object".to_owned(),
-        });
-    };
-    if kind.len() != 1 {
-        return Err(PersistedSessionEventError::InvalidOpaqueEvent {
-            reason: "kind must contain exactly one event variant".to_owned(),
-        });
-    }
-    let (event_type, payload) = kind.iter().next().expect("kind length was validated");
-    let event_type = event_type.clone();
-    Ok((
-        SessionEvent {
-            schema_version: persisted.schema_version,
-            sequence: persisted.sequence,
-            timestamp_ms: persisted.timestamp_ms,
-            session_id: persisted.session_id,
-            provenance: persisted.provenance,
-            kind: SessionEventKind::OpaqueEvent {
-                event_type: event_type.clone(),
-                payload: payload.clone(),
-            },
-        },
-        event_type,
-    ))
-}
-
-#[derive(Debug, Deserialize)]
-struct OpaquePersistedSessionEvent {
-    schema_version: u16,
-    sequence: u64,
-    #[serde(default = "current_unix_timestamp_ms")]
-    timestamp_ms: u64,
-    session_id: SessionId,
-    #[serde(default)]
-    provenance: Option<SessionEventProvenance>,
-    kind: serde_json::Value,
-}
-
 /// Errors returned when decoding persisted session events.
 #[derive(Debug, Error)]
 pub enum PersistedSessionEventError {
@@ -256,9 +92,6 @@ pub enum PersistedSessionEventError {
     /// Persisted event uses an unknown future event kind not supported by this build.
     #[error("unsupported persisted session event kind {kind}")]
     UnsupportedEventKind { kind: String },
-    /// A semantically opaque event did not contain a trustworthy persisted envelope.
-    #[error("invalid opaque persisted session event: {reason}")]
-    InvalidOpaqueEvent { reason: String },
 }
 
 /// Persisted session event DTO.
@@ -289,7 +122,7 @@ impl From<&SessionEvent> for PersistedSessionEvent {
 
 impl PersistedSessionEvent {
     fn into_domain(self) -> Result<SessionEvent, PersistedSessionEventError> {
-        if self.schema_version > CURRENT_SESSION_EVENT_SCHEMA_VERSION {
+        if self.schema_version != CURRENT_SESSION_EVENT_SCHEMA_VERSION {
             return Err(PersistedSessionEventError::UnsupportedSchemaVersion {
                 actual: self.schema_version,
                 current: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -550,7 +383,7 @@ enum PersistedSessionEventKind {
         #[serde(default)]
         metadata: BTreeMap<String, serde_json::Value>,
     },
-    OpaqueEvent {
+    InertHistory {
         event_type: String,
         payload: serde_json::Value,
     },
@@ -929,10 +762,10 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 text: text.clone(),
                 metadata: metadata.clone(),
             },
-            SessionEventKind::OpaqueEvent {
+            SessionEventKind::InertHistory {
                 event_type,
                 payload,
-            } => Self::OpaqueEvent {
+            } => Self::InertHistory {
                 event_type: event_type.clone(),
                 payload: payload.clone(),
             },
@@ -1247,10 +1080,10 @@ impl PersistedSessionEventKind {
                 text,
                 metadata,
             },
-            Self::OpaqueEvent {
+            Self::InertHistory {
                 event_type,
                 payload,
-            } => SessionEventKind::OpaqueEvent {
+            } => SessionEventKind::InertHistory {
                 event_type,
                 payload,
             },
@@ -1330,38 +1163,6 @@ mod tests {
     }
 
     #[test]
-    fn historical_progress_contribution_decodes_for_compatibility() {
-        let historical = SessionEvent {
-            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: 8,
-            timestamp_ms: 10,
-            session_id: SessionId::new(),
-            provenance: None,
-            kind: SessionEventKind::ToolContributionPlaced {
-                envelope: bcode_session_models::ToolContributionEnvelope::new(
-                    bcode_session_models::ToolContributionPlacement::Progress,
-                    bcode_session_models::ToolContributionEvent {
-                        invocation_id: "call-1".to_owned(),
-                        contribution_id: "screen".to_owned(),
-                        sequence: 1,
-                        producer_id: "legacy.plugin".to_owned(),
-                        schema: "legacy.progress".to_owned(),
-                        schema_version: 1,
-                        operation: bcode_session_models::ToolContributionOperation::Upsert,
-                        persistence: bcode_session_models::ToolContributionPersistence::Durable,
-                        artifact: None,
-                        payload: serde_json::json!({"frame": "historical"}),
-                    },
-                ),
-            },
-        };
-        let persisted = PersistedSessionEvent::from(&historical);
-        let fixture = serde_json::to_string(&persisted).expect("historical fixture");
-        let decoded = decode_session_event(&fixture).expect("historical progress decode");
-        assert_eq!(decoded, historical);
-    }
-
-    #[test]
     fn user_message_turn_origin_round_trips_through_persistence() {
         let event = SessionEvent {
             schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
@@ -1386,51 +1187,6 @@ mod tests {
         let encoded = encode_session_event(&event).expect("event should encode");
         let decoded = decode_session_event(&encoded).expect("event should decode");
         assert_eq!(decoded, event);
-    }
-
-    #[test]
-    fn degraded_decode_preserves_unknown_and_future_events_as_opaque_history() {
-        let opaque_cases = [
-            (
-                include_str!("../fixtures/migrations/unknown-future-event-kind-v39.json"),
-                SessionEventCompatibilityKind::UnknownEventKind,
-                "future_event_kind",
-            ),
-            (
-                include_str!("../fixtures/migrations/future-schema-v41.json"),
-                SessionEventCompatibilityKind::FutureSchema,
-                "assistant_message",
-            ),
-        ];
-        for (payload, expected_compatibility, expected_kind) in opaque_cases {
-            assert!(decode_session_event(payload).is_err());
-            let CompatibleSessionEvent::Opaque { event, issue } =
-                decode_session_event_compatible(payload).expect("trustworthy envelope")
-            else {
-                panic!("fixture should decode opaquely");
-            };
-            assert_eq!(event.sequence, 0);
-            assert_eq!(issue.event_kind, expected_kind);
-            assert_eq!(issue.compatibility, expected_compatibility);
-        }
-
-        let malformed = include_str!("../fixtures/migrations/malformed-json-v39.json");
-        assert!(matches!(
-            decode_session_event_compatible(malformed),
-            Err(PersistedSessionEventError::Json(_))
-        ));
-    }
-
-    #[test]
-    fn bounded_metadata_envelope_check_rejects_untrustworthy_records() {
-        for payload in [
-            r#"{"schema_version":39,"sequence":1,"session_id":"not-a-session-id","kind":{"future":{}}}"#,
-            r#"{"schema_version":39,"sequence":1,"session_id":"00000000-0000-0000-0000-000000000001","kind":{}}"#,
-            r#"{"schema_version":39,"sequence":1,"session_id":"00000000-0000-0000-0000-000000000001","kind":{"one":{},"two":{}}}"#,
-            "not json",
-        ] {
-            assert!(!has_trustworthy_session_event_envelope(payload));
-        }
     }
 
     #[test]

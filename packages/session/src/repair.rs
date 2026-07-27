@@ -24,8 +24,6 @@ pub struct RepairOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepairTarget {
-    /// The removed historical writer-epoch storage root.
-    LegacyStorage,
     /// A per-session database.
     Session { session_id: SessionId },
     /// The global session catalog database.
@@ -89,25 +87,6 @@ impl RepairReport {
             final_error: None,
             actions: Vec::new(),
             notes: Vec::new(),
-        }
-    }
-
-    /// Create a report for migration-owned historical storage diagnosis.
-    #[must_use]
-    pub const fn historical_storage(
-        root: PathBuf,
-        status: RepairStatus,
-        notes: Vec<String>,
-    ) -> Self {
-        Self {
-            target: RepairTarget::LegacyStorage,
-            db_path: root,
-            status,
-            backup_path: None,
-            initial_error: None,
-            final_error: None,
-            actions: Vec::new(),
-            notes,
         }
     }
 }

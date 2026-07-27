@@ -4,20 +4,120 @@
 //! by `bcode_session_migration`. This adapter supplies the current database and lease capabilities
 //! needed to execute one already-owned migration.
 
-use crate::{SessionError, db, lease};
 use bcode_metrics::{MetricsRegistry, MetricsTimer};
-use bcode_session_models::{SessionId, SessionMigrationStage, SessionOpenOperationId};
+use bcode_session::{SessionError, db, lease};
+use bcode_session_models::{
+    SessionEvent, SessionId, SessionMigrationStage, SessionOpenOperationId,
+};
+use sha2::{Digest as _, Sha256};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub use bcode_session_migration::SessionMigrationProgressReporter as MigrationExecutionProgress;
+use bcode_session_migration::SessionMigrationProgressReporter as MigrationExecutionProgress;
+
+async fn migration_source_evidence(
+    db: &db::SessionDb,
+) -> Result<bcode_session_migration::MigrationSourceEvidence<SessionError>, SessionError> {
+    let mut digest = Sha256::new();
+    let mut summary = bcode_session_migration::CanonicalNormalizationSummary::default();
+    let mut classification_error = None;
+    let mut cursor = 0_u64;
+    let mut event_count = 0_u64;
+    let mut classified_event_count = 0_u64;
+    let mut event_tail = None;
+    loop {
+        let page = db
+            .canonical_rows_page(cursor, 256)
+            .await
+            .map_err(SessionError::from)?;
+        if page.is_empty() {
+            break;
+        }
+        for row in page {
+            if classification_error.is_none() && row.sequence != event_count {
+                classification_error = Some(SessionError::Db(
+                    db::SessionDbError::InvalidCanonicalSequence {
+                        expected: event_count,
+                        actual: row.sequence,
+                    },
+                ));
+            }
+            digest.update(
+                u64::try_from(row.payload.len())
+                    .unwrap_or(u64::MAX)
+                    .to_le_bytes(),
+            );
+            digest.update(row.payload.as_bytes());
+            if classification_error.is_none() {
+                match bcode_session_migration::normalize_canonical_event(
+                    &row.payload,
+                    bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    |payload| {
+                        serde_json::from_str::<SessionEvent>(payload)
+                            .map_err(|error| error.to_string())
+                    },
+                ) {
+                    Ok(normalized)
+                        if normalized.event.sequence == row.sequence
+                            && normalized.event.session_id == db.session_id() =>
+                    {
+                        summary.record(&normalized);
+                        classified_event_count = classified_event_count.saturating_add(1);
+                    }
+                    Ok(_) => {
+                        classification_error = Some(SessionError::Db(
+                            db::SessionDbError::InvalidCanonicalSequence {
+                                expected: row.sequence,
+                                actual: normalized_sequence(&row.payload).unwrap_or(u64::MAX),
+                            },
+                        ));
+                    }
+                    Err(error) => {
+                        classification_error = Some(SessionError::Db(
+                            db::SessionDbError::MigrationHistoryIncompatible {
+                                reason: error.to_string(),
+                            },
+                        ));
+                    }
+                }
+            }
+            event_count = event_count.saturating_add(1);
+            event_tail = Some(row.sequence);
+            let Some(next) = row.sequence.checked_add(1) else {
+                break;
+            };
+            cursor = next;
+        }
+        if event_tail == Some(u64::MAX) {
+            break;
+        }
+    }
+    let (converted_events, retired_known_events) = summary.into_counts();
+    Ok(bcode_session_migration::MigrationSourceEvidence {
+        canonical: bcode_session_migration::MigrationBackupCanonicalEvidence {
+            classified_event_count,
+            event_count,
+            event_tail,
+            payload_digest_sha256: format!("{:x}", digest.finalize()),
+        },
+        converted_events,
+        retired_known_events,
+        classification_error,
+    })
+}
+
+fn normalized_sequence(payload: &str) -> Option<u64> {
+    serde_json::from_str::<SessionEvent>(payload)
+        .ok()
+        .map(|event| event.sequence)
+}
 
 async fn create_verified_migration_backup(
     root: &Path,
     session_id: SessionId,
     writer_epoch: u64,
     operation_id: SessionOpenOperationId,
-    source_evidence: db::MigrationSourceEvidence,
+    source_evidence: bcode_session_migration::MigrationSourceEvidence<SessionError>,
     metrics: &MetricsRegistry,
     progress: Option<&MigrationExecutionProgress>,
 ) -> Result<PathBuf, SessionError> {
@@ -72,7 +172,7 @@ fn duration_millis(duration: std::time::Duration) -> u64 {
 }
 
 /// Current capabilities and operation context for one exclusively owned migration.
-pub struct OwnedLegacyMigration<'a> {
+struct OwnedLegacyMigration<'a> {
     pub(crate) session_id: SessionId,
     pub(crate) root: &'a Path,
     pub(crate) writer_epoch: u64,
@@ -82,73 +182,39 @@ pub struct OwnedLegacyMigration<'a> {
     pub(crate) progress: Option<MigrationExecutionProgress>,
 }
 
-/// Result of acquiring exclusive ownership and preparing current writable storage.
-pub enum PreparedSessionLease {
-    /// Current writable storage was acquired.
-    Acquired(Box<lease::SessionLeaseGuard>),
-    /// Storage changed while ownership was being acquired; the caller should reclassify and retry.
-    Retry,
-}
-
-/// Acquire exclusive ownership, execute migration when still required, and adopt a runtime lease.
+/// Acquire exclusive maintenance ownership and migrate storage when it remains legacy.
 ///
 /// # Errors
 ///
-/// Returns an error when ownership is held elsewhere, migration fails, lease handoff fails, or the
-/// resulting current store does not pass strict write readiness.
-pub async fn prepare_owned_session_storage(
+/// Returns an error when ownership, backup, migration, or strict validation fails.
+pub async fn migrate_owned_session_storage(
     session_id: SessionId,
     root: &Path,
-    lease_owner: &lease::SessionLeaseOwnerContext,
     writer_epoch: u64,
-    attempt: u8,
-    progress: Option<&MigrationExecutionProgress>,
+    progress: &MigrationExecutionProgress,
     metrics: &MetricsRegistry,
-) -> Result<PreparedSessionLease, SessionError> {
-    use db::SessionStorageCompatibility::{Current, KnownLegacy};
-
+) -> Result<(), SessionError> {
     let started = metrics.timer();
     metrics.increment_counter("session.manager.storage_migration.attempted_total");
-    tracing::info!(
-        target: "bcode_session::migration",
-        %session_id,
-        writer_epoch,
-        target_writer_epoch = db::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
-        "attempting automatic legacy session migration"
+    progress.stage(
+        SessionMigrationStage::WaitingForOwnership,
+        "Waiting for exclusive session ownership",
     );
     let ownership_timer = metrics.timer();
-    if let Some(progress) = progress {
-        progress.stage(
-            SessionMigrationStage::WaitingForOwnership,
-            "Waiting for exclusive session ownership",
-        );
-    }
-    let maintenance = match lease::acquire_session_maintenance_guard(root, session_id) {
-        Ok(maintenance) => maintenance,
-        Err(error @ lease::SessionLeaseError::OwnedByOtherDaemon { .. }) => {
-            metrics.increment_counter("session.manager.storage_migration.blocked_owner_total");
-            let rechecked = db::SessionDb::open_existing_turso_in_root(session_id, root)
-                .await?
-                .storage_compatibility()
-                .await?;
-            if matches!(rechecked, Current { .. }) && attempt < 2 {
-                metrics.increment_counter("session.manager.storage_migration.race_retry_total");
-                return Ok(PreparedSessionLease::Retry);
-            }
-            return Err(error.into());
-        }
-        Err(error) => return Err(error.into()),
-    };
+    let maintenance = lease::acquire_session_maintenance_guard(root, session_id)?;
     metrics.record_histogram(
-        "session.migration.ownership_duration_ms",
+        "session.manager.storage_migration.ownership_wait_duration_ms",
         ownership_timer.elapsed_ms(),
     );
     let write = lease::acquire_maintenance_session_write_lock(&maintenance, root, session_id)?;
-    let rechecked = db::SessionDb::open_existing_turso_in_root(session_id, root)
+    let compatibility = db::SessionDb::open_existing_turso_in_root(session_id, root)
         .await?
         .storage_compatibility()
         .await?;
-    if matches!(rechecked, KnownLegacy { .. }) {
+    if matches!(
+        compatibility,
+        db::SessionStorageCompatibility::KnownLegacy { .. }
+    ) {
         execute_owned_legacy_storage(
             OwnedLegacyMigration {
                 session_id,
@@ -157,18 +223,17 @@ pub async fn prepare_owned_session_storage(
                 maintenance: &maintenance,
                 write: &write,
                 started: &started,
-                progress: progress.cloned(),
+                progress: Some(progress.clone()),
             },
             metrics,
         )
         .await?;
     }
     drop(write);
-    let runtime_lease =
-        lease::transition_session_maintenance_to_lease(maintenance, root, session_id, lease_owner)?;
+    drop(maintenance);
     let current = db::SessionDb::open_existing_turso_in_root(session_id, root).await?;
     current.validate_write_readiness().await?;
-    Ok(PreparedSessionLease::Acquired(Box::new(runtime_lease)))
+    Ok(())
 }
 
 /// Execute one exclusively owned historical migration through the current target API.
@@ -178,7 +243,7 @@ pub async fn prepare_owned_session_storage(
 /// Returns an error if source evidence cannot be read, a verified backup cannot be retained,
 /// canonical normalization or target projection fails, or strict write readiness is not reached.
 #[allow(clippy::too_many_lines)]
-pub async fn execute_owned_legacy_storage(
+async fn execute_owned_legacy_storage(
     migration: OwnedLegacyMigration<'_>,
     metrics: &MetricsRegistry,
 ) -> Result<(), SessionError> {
@@ -196,7 +261,7 @@ pub async fn execute_owned_legacy_storage(
         MigrationExecutionProgress::operation_id,
     );
     let source = db::SessionDb::open_existing_turso_in_root(session_id, root).await?;
-    let mut source_evidence = source.migration_source_evidence().await?;
+    let mut source_evidence = migration_source_evidence(&source).await?;
     drop(source);
     let classification_error = source_evidence.classification_error.take();
     let backup_path = create_verified_migration_backup(
@@ -223,7 +288,7 @@ pub async fn execute_owned_legacy_storage(
                 "Canonical source history requires repair",
             );
         }
-        return Err(error.into());
+        return Err(error);
     }
     tracing::info!(
         target: "bcode_session::migration",

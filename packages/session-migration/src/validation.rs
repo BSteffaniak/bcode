@@ -29,14 +29,6 @@ pub struct MigrationTargetValidation {
     pub expected_model_context_schema_version: u64,
     /// Model-context checkpoint, when initialized.
     pub model_context_checkpoint: Option<u64>,
-    /// Compatibility projection schema, when initialized.
-    pub compatibility_schema_version: Option<u64>,
-    /// Current compatibility projection schema required by the target API.
-    pub expected_compatibility_schema_version: u64,
-    /// Compatibility projection checkpoint, when initialized.
-    pub compatibility_checkpoint: Option<u64>,
-    /// Whether current compatibility validation found no unresolved history.
-    pub compatibility_resolved: bool,
 }
 
 /// Failure to validate a rebuilt current-format migration target.
@@ -86,9 +78,6 @@ pub enum MigrationTargetValidationError {
         /// Required current schema version.
         expected: u64,
     },
-    /// Current compatibility validation found unresolved canonical history.
-    #[error("migration target retains unresolved compatibility state")]
-    CompatibilityUnresolved,
 }
 
 /// Validate projection and compatibility facts produced by the current migration-target API.
@@ -130,26 +119,6 @@ pub fn validate_migration_target(
                 expected: target.canonical_tail,
             });
         }
-    }
-    if target.canonical_tail.is_some() {
-        if target.compatibility_schema_version != Some(target.expected_compatibility_schema_version)
-        {
-            return Err(MigrationTargetValidationError::ProjectionIncompatible {
-                projection: "session_compatibility".to_owned(),
-                actual: target.compatibility_schema_version,
-                expected: target.expected_compatibility_schema_version,
-            });
-        }
-        if target.compatibility_checkpoint != target.canonical_tail {
-            return Err(MigrationTargetValidationError::ProjectionStale {
-                projection: "session_compatibility".to_owned(),
-                checkpoint: target.compatibility_checkpoint,
-                expected: target.canonical_tail,
-            });
-        }
-    }
-    if !target.compatibility_resolved {
-        return Err(MigrationTargetValidationError::CompatibilityUnresolved);
     }
     Ok(())
 }
@@ -812,10 +781,6 @@ mod tests {
             model_context_schema_version: Some(2),
             expected_model_context_schema_version: 2,
             model_context_checkpoint: Some(9),
-            compatibility_schema_version: Some(1),
-            expected_compatibility_schema_version: 1,
-            compatibility_checkpoint: Some(9),
-            compatibility_resolved: true,
         };
         assert!(validate_migration_target(&valid).is_ok());
 
@@ -825,32 +790,22 @@ mod tests {
             validate_migration_target(&stale),
             Err(MigrationTargetValidationError::ProjectionStale { .. })
         ));
-        let mut incompatible = valid.clone();
+        let mut incompatible = valid;
         incompatible.model_context_schema_version = Some(1);
         assert!(matches!(
             validate_migration_target(&incompatible),
             Err(MigrationTargetValidationError::ModelContextIncompatible { .. })
         ));
-        let mut unresolved = valid;
-        unresolved.compatibility_resolved = false;
-        assert_eq!(
-            validate_migration_target(&unresolved),
-            Err(MigrationTargetValidationError::CompatibilityUnresolved)
-        );
     }
 
     #[test]
-    fn empty_target_requires_resolved_compatibility_without_projection_rows() {
+    fn empty_target_requires_no_projection_rows() {
         let target = MigrationTargetValidation {
             canonical_tail: None,
             projections: Vec::new(),
             model_context_schema_version: None,
             expected_model_context_schema_version: 2,
             model_context_checkpoint: None,
-            compatibility_schema_version: None,
-            expected_compatibility_schema_version: 1,
-            compatibility_checkpoint: None,
-            compatibility_resolved: true,
         };
         assert!(validate_migration_target(&target).is_ok());
     }

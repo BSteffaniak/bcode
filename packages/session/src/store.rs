@@ -4,7 +4,6 @@ use crate::{
     CURRENT_SESSION_FORMAT_EPOCH, SessionFormatMarker, SessionManifest, SessionState,
     SessionTitleSource, canonical_session_id_from_dir, db,
     lease::{self, SessionLeaseOwnerContext},
-    safe_catalog_namespace,
 };
 use bcode_metrics::MetricsRegistry;
 use bcode_session_models::{SessionId, SessionSummary};
@@ -75,10 +74,6 @@ impl SessionStore {
         };
         summaries.extend(self.load_session_manifests()?);
         summaries.extend(self.discover_canonical_session_summaries()?);
-        match self.load_legacy_catalog_summaries() {
-            Ok(legacy) => summaries.extend(legacy),
-            Err(error) => eprintln!("ignoring unreadable legacy session catalog: {error}"),
-        }
         summaries.sort_by(|left, right| {
             left.id
                 .cmp(&right.id)
@@ -107,10 +102,6 @@ impl SessionStore {
     pub(crate) fn backfill_catalog(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
         let mut summaries = self.load_session_manifests()?;
         summaries.extend(self.discover_canonical_session_summaries()?);
-        match self.load_legacy_catalog_summaries() {
-            Ok(legacy) => summaries.extend(legacy),
-            Err(error) => eprintln!("ignoring unreadable legacy session catalog: {error}"),
-        }
         summaries.sort_by(|left, right| {
             left.id
                 .cmp(&right.id)
@@ -253,41 +244,11 @@ impl SessionStore {
         Ok(Some(manifest.summary))
     }
 
-    fn load_legacy_catalog_summaries(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
-        if self.catalog_namespace().is_none() || !db::global_catalog_db_path(&self.root).exists() {
-            return Ok(Vec::new());
-        }
-        Self::load_catalog_summaries_at_path(db::global_catalog_db_path(&self.root))
-    }
-
-    fn load_catalog_summaries_at_path(
-        path: PathBuf,
-    ) -> Result<Vec<SessionSummary>, SessionStoreError> {
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-            runtime.block_on(async move {
-                let catalog = db::GlobalSessionDb::open_turso_without_catalog_lock(&path)
-                    .await
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-                catalog
-                    .list_sessions()
-                    .await
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))
-            })
-        })
-        .join()
-        .map_err(|_| SessionStoreError::CatalogLoad("catalog loader panicked".to_string()))?
-    }
-
     fn write_global_catalog_summaries(
         &self,
         summaries: &[SessionSummary],
     ) -> Result<(), SessionStoreError> {
         let root = self.root.clone();
-        let namespace = self.catalog_namespace();
         let summaries = summaries.to_vec();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -295,13 +256,9 @@ impl SessionStore {
                 .build()
                 .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
             runtime.block_on(async move {
-                let catalog = match namespace.as_deref() {
-                    Some(namespace) => {
-                        db::GlobalSessionDb::open_turso_in_root_namespace(&root, namespace).await
-                    }
-                    None => db::GlobalSessionDb::open_turso_in_root(&root).await,
-                }
-                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+                let catalog = db::GlobalSessionDb::open_turso_in_root(&root)
+                    .await
+                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
                 for summary in summaries {
                     catalog
                         .upsert_session(&summary, &db::session_db_path(&root, summary.id))
@@ -347,36 +304,21 @@ impl SessionStore {
         db::session_dir_path(&self.root, session_id).join("manifest.json")
     }
 
-    fn catalog_namespace(&self) -> Option<String> {
-        self.lease_owner
-            .build_fingerprint
-            .as_deref()
-            .map(safe_catalog_namespace)
-    }
-
     fn catalog_db_path(&self) -> PathBuf {
-        self.catalog_namespace().map_or_else(
-            || db::global_catalog_db_path(&self.root),
-            |namespace| db::namespaced_catalog_db_path(&self.root, &namespace),
-        )
+        db::global_catalog_db_path(&self.root)
     }
 
     fn load_global_catalog_summaries(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
         let root = self.root.clone();
-        let namespace = self.catalog_namespace();
         std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
             runtime.block_on(async move {
-                let catalog = match namespace.as_deref() {
-                    Some(namespace) => {
-                        db::GlobalSessionDb::open_turso_in_root_namespace(&root, namespace).await
-                    }
-                    None => db::GlobalSessionDb::open_turso_in_root(&root).await,
-                }
-                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
+                let catalog = db::GlobalSessionDb::open_turso_in_root(&root)
+                    .await
+                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
                 catalog
                     .list_sessions()
                     .await

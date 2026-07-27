@@ -2,7 +2,7 @@
 
 use crate::db::{MaterializedProjection, SessionDbError, SessionDbResult};
 use crate::db_projection::ProjectionCheckpointState;
-use crate::db_row::{i64_to_u64, required_i64, required_non_negative_u64};
+use crate::db_row::{i64_to_u64, required_i64};
 use bcode_session_models::{SessionEvent, SessionId};
 use std::collections::BTreeMap;
 use switchy::database::{Database, query::FilterableQuery};
@@ -49,59 +49,6 @@ pub async fn validate_model_context_postcondition(
         return Err(SessionDbError::ModelContextProjectionStale {
             checkpoint,
             expected: event.sequence,
-        });
-    }
-    Ok(())
-}
-
-pub async fn validate_session_compatibility_precondition(
-    db: &dyn Database,
-    canonical_tail: Option<u64>,
-    projection_id: i32,
-    schema_version: u32,
-) -> SessionDbResult<()> {
-    let row = db
-        .select("session_compatibility_state")
-        .columns(&["schema_version", "last_event_seq"])
-        .where_eq("projection_id", projection_id)
-        .execute_first(db)
-        .await?;
-    let Some(row) = row.as_ref() else {
-        if canonical_tail.is_none() {
-            return Ok(());
-        }
-        return Err(SessionDbError::ProjectionStale {
-            projection: "session_compatibility",
-            checkpoint: None,
-            expected: canonical_tail.unwrap_or_default(),
-        });
-    };
-    let actual = required_non_negative_u64(row, "schema_version")?;
-    let expected = u64::from(schema_version);
-    if actual != expected {
-        return Err(SessionDbError::ProjectionIncompatible {
-            projection: "session_compatibility",
-            actual,
-            expected,
-        });
-    }
-    let checkpoint = required_non_negative_u64(row, "last_event_seq")?;
-    if Some(checkpoint) != canonical_tail {
-        return Err(SessionDbError::ProjectionStale {
-            projection: "session_compatibility",
-            checkpoint: Some(checkpoint),
-            expected: canonical_tail.unwrap_or_default(),
-        });
-    }
-    let issue_count = db
-        .select("session_compatibility_issues")
-        .columns(&["event_seq"])
-        .execute(db)
-        .await?
-        .len();
-    if issue_count > 0 {
-        return Err(SessionDbError::CompatibilityDegraded {
-            issue_count: u64::try_from(issue_count).unwrap_or(u64::MAX),
         });
     }
     Ok(())

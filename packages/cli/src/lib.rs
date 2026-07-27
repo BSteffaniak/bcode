@@ -7038,7 +7038,7 @@ async fn run_session_repair_command(options: SessionRepairCliOptions) -> Result<
     let mut reports = Vec::new();
     match options.target {
         SessionRepairCliTarget::Scan => {
-            reports.push(doctor_historical_storage(root.parent().unwrap_or(&root))?);
+            print_historical_storage_diagnosis(root.parent().unwrap_or(&root))?;
             reports.push(repair_catalog_report(&root, dry_run).await?);
             for session_id in discover_session_ids(&root)? {
                 reports.push(repair_session_report(&root, session_id, dry_run).await?);
@@ -7071,28 +7071,16 @@ async fn run_session_repair_command(options: SessionRepairCliOptions) -> Result<
     Ok(())
 }
 
-fn doctor_historical_storage(
-    state_dir: &Path,
-) -> Result<bcode_session::repair::RepairReport, CliError> {
+fn print_historical_storage_diagnosis(state_dir: &Path) -> Result<(), CliError> {
     let diagnosis = session_migration_adapter::diagnose_historical_session_storage(state_dir)?;
-    Ok(bcode_session::repair::RepairReport::historical_storage(
-        diagnosis.root,
-        match diagnosis.status {
-            bcode_session_migration::HistoricalStorageDiagnosisStatus::Ok => {
-                bcode_session::repair::RepairStatus::Ok
-            }
-            bcode_session_migration::HistoricalStorageDiagnosisStatus::WouldRecover => {
-                bcode_session::repair::RepairStatus::WouldRepair
-            }
-            bcode_session_migration::HistoricalStorageDiagnosisStatus::BlockedByOwner => {
-                bcode_session::repair::RepairStatus::RefusedOwnedElsewhere
-            }
-            bcode_session_migration::HistoricalStorageDiagnosisStatus::ManualRequired => {
-                bcode_session::repair::RepairStatus::ManualRequired
-            }
-        },
-        diagnosis.notes,
-    ))
+    println!("target: historical storage");
+    println!("path: {}", display_from_current_dir(&diagnosis.root));
+    println!("status: {:?}", diagnosis.status);
+    for note in diagnosis.notes {
+        println!("note: {note}");
+    }
+    println!();
+    Ok(())
 }
 
 async fn repair_session_report(
@@ -7173,7 +7161,6 @@ fn print_repair_report(report: &bcode_session::repair::RepairReport) {
 
 fn repair_target_label(target: &bcode_session::repair::RepairTarget) -> String {
     match target {
-        bcode_session::repair::RepairTarget::LegacyStorage => "legacy storage".to_owned(),
         bcode_session::repair::RepairTarget::Session { session_id } => {
             format!("session {session_id}")
         }
@@ -7406,7 +7393,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantReasoningActivity { .. } => "assistant_reasoning_activity",
         SessionEventKind::RalphLifecycle { .. } => "ralph_lifecycle",
         SessionEventKind::PluginStatusNote { .. } => "plugin_status_note",
-        SessionEventKind::OpaqueEvent { .. } => "opaque_event",
+        SessionEventKind::InertHistory { .. } => "inert_history",
     }
 }
 
@@ -8073,7 +8060,7 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         SessionEventKind::PluginStatusNote {
             plugin_id, text, ..
         } => println!("#{} plugin status {plugin_id}: {text}", event.sequence),
-        SessionEventKind::OpaqueEvent { event_type, .. } => {
+        SessionEventKind::InertHistory { event_type, .. } => {
             println!("#{} legacy event: {event_type}", event.sequence);
         }
         SessionEventKind::TraceEvent { .. } => {}

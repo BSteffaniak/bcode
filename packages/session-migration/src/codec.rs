@@ -35,7 +35,7 @@ impl HistoricalEnvelope {
     pub fn decode_retired_known(&self) -> Result<HistoricalDecode, HistoricalSessionEventError> {
         let (event_kind, payload) = source_kind(self)?;
         Ok(HistoricalDecode::RetiredKnown {
-            event: self.materialize(SessionEventKind::OpaqueEvent {
+            event: self.materialize(SessionEventKind::InertHistory {
                 event_type: event_kind.to_owned(),
                 payload: payload.clone(),
             }),
@@ -476,7 +476,7 @@ pub mod historical_event_families {
             ContextUsageConversion::Active(observation) => *observation,
             ContextUsageConversion::Inert => {
                 return Ok(HistoricalDecode::RetiredKnown {
-                    event: envelope.materialize(SessionEventKind::OpaqueEvent {
+                    event: envelope.materialize(SessionEventKind::InertHistory {
                         event_type: event_kind.to_owned(),
                         payload: event_payload.clone(),
                     }),
@@ -502,7 +502,7 @@ pub mod historical_event_families {
             "tool_call_finished" => decode_tool_call_finished(envelope),
             "context_usage_observed" => decode_context_usage_observed(envelope),
             "tool_invocation_stream" => Ok(HistoricalDecode::RetiredKnown {
-                event: envelope.materialize(SessionEventKind::OpaqueEvent {
+                event: envelope.materialize(SessionEventKind::InertHistory {
                     event_type: event_kind.to_owned(),
                     payload: event_payload.clone(),
                 }),

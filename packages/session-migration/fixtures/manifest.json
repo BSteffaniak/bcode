@@ -185,17 +185,22 @@
       "event_schemas": [
         21,
         29,
-        32
+        32,
+        39
       ],
       "migratable_store": false,
       "historical_payloads": false,
-      "expected_event_count": 11,
+      "expected_event_count": 12,
       "expected_classifications": {
         "converted": 0,
-        "retired_known": 10,
+        "retired_known": 11,
         "current_passthrough": 1
       },
       "covered_schema_event_pairs": [
+        {
+          "event_schema": 39,
+          "event_kind": "opaque_event"
+        },
         {
           "event_schema": 25,
           "event_kind": "interactive_tool_request_created"
@@ -545,6 +550,7 @@
         "legacy_tool_invocation_presentation",
         "legacy_turn_finished",
         "legacy_turn_started",
+        "opaque_event",
         "plugin_automation_turn_finished",
         "plugin_automation_turn_started",
         "session_created",
@@ -1032,11 +1038,11 @@
       ],
       "migratable_store": false,
       "historical_payloads": false,
-      "expected_event_count": 47,
+      "expected_event_count": 46,
       "expected_classifications": {
         "converted": 0,
         "retired_known": 0,
-        "current_passthrough": 47
+        "current_passthrough": 46
       },
       "covered_schema_event_pairs": [
         {
@@ -2718,10 +2724,6 @@
         {
           "event_schema": 39,
           "event_kind": "model_usage"
-        },
-        {
-          "event_schema": 39,
-          "event_kind": "opaque_event"
         },
         {
           "event_schema": 2,
@@ -5416,7 +5418,6 @@
         "model_turn_finished",
         "model_turn_started",
         "model_usage",
-        "opaque_event",
         "permission_requested",
         "permission_resolved",
         "plugin_status_note",

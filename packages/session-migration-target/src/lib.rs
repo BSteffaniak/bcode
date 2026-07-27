@@ -53,14 +53,6 @@ pub struct StrictValidation {
     pub expected_model_context_schema_version: u64,
     /// Model-context checkpoint, when initialized.
     pub model_context_checkpoint: Option<u64>,
-    /// Compatibility projection schema, when initialized.
-    pub compatibility_schema_version: Option<u64>,
-    /// Current compatibility projection schema.
-    pub expected_compatibility_schema_version: u64,
-    /// Compatibility checkpoint, when initialized.
-    pub compatibility_checkpoint: Option<u64>,
-    /// Whether all canonical semantics are resolved for current writes.
-    pub compatibility_resolved: bool,
 }
 
 /// Migration-owned audit receipt data accepted by the current target.
@@ -280,11 +272,7 @@ mod tests {
             model_context_schema_version: Some(2),
             expected_model_context_schema_version: 2,
             model_context_checkpoint: Some(7),
-            compatibility_schema_version: Some(1),
-            expected_compatibility_schema_version: 1,
-            compatibility_checkpoint: Some(7),
-            compatibility_resolved: true,
         };
-        assert!(validation.compatibility_resolved);
+        assert_eq!(validation.canonical_tail, Some(7));
     }
 }
