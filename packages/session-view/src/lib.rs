@@ -2067,7 +2067,9 @@ impl SessionView {
     }
 
     fn attach_primary_presentation(&self, tool: &mut ToolInvocationView) {
-        tool.presentation = self.current_primary_presentation(&tool.tool_call_id);
+        if let Some(presentation) = self.current_primary_presentation(&tool.tool_call_id) {
+            tool.presentation = Some(presentation);
+        }
     }
 
     fn apply_terminal_tool_status(
@@ -2695,7 +2697,7 @@ fn tool_invocation_view_from_projection(
         result_text: projection.result_text,
         is_error: projection.is_error,
         result: projection.raw_result.map(ToolResultView::from),
-        presentation: None,
+        presentation: projection.presentation.as_ref().map(Into::into),
         timing,
     }
 }
@@ -3161,6 +3163,7 @@ mod tests {
                         invocation_id: "call".to_owned(),
                         model_output: "done".to_owned(),
                         is_error: false,
+                        presentation: None,
                         result: Some(ToolInvocationResult::Json {
                             value: r#"{"opaque_result":true}"#.to_owned(),
                         }),
@@ -3925,6 +3928,7 @@ mod tests {
                         invocation_id: "call-edit".to_owned(),
                         model_output: "edited src/lib.rs".to_owned(),
                         is_error: false,
+                        presentation: None,
                         result: None,
                     },
                 },
@@ -4069,6 +4073,7 @@ mod tests {
                     invocation_id: "call-1".to_owned(),
                     model_output: "written".to_owned(),
                     is_error: false,
+                    presentation: None,
                     result: Some(ToolInvocationResult::Text {
                         text: "written".to_owned(),
                     }),
@@ -4244,6 +4249,7 @@ mod tests {
                     invocation_id: "call-1".to_owned(),
                     model_output: "written".to_owned(),
                     is_error: false,
+                    presentation: None,
                     result: Some(ToolInvocationResult::Text {
                         text: "written".to_owned(),
                     }),
@@ -4345,6 +4351,7 @@ mod tests {
                     invocation_id: "call-1".to_owned(),
                     model_output: "written".to_owned(),
                     is_error: false,
+                    presentation: None,
                     result: Some(ToolInvocationResult::Text {
                         text: "written".to_owned(),
                     }),
@@ -4440,6 +4447,7 @@ mod tests {
                     invocation_id: "call-1".to_owned(),
                     model_output: "written".to_owned(),
                     is_error: false,
+                    presentation: None,
                     result: Some(ToolInvocationResult::Text {
                         text: "written".to_owned(),
                     }),
@@ -4483,6 +4491,7 @@ mod tests {
                     invocation_id: "call-1".to_owned(),
                     model_output: "canonical".to_owned(),
                     is_error: false,
+                    presentation: None,
                     result: Some(ToolInvocationResult::Text {
                         text: "canonical".to_owned(),
                     }),
@@ -4554,6 +4563,7 @@ mod tests {
                     invocation_id: "call-1".to_owned(),
                     model_output: "done".to_owned(),
                     is_error: false,
+                    presentation: None,
                     result: Some(ToolInvocationResult::Text {
                         text: "semantic".to_owned(),
                     }),
@@ -4955,6 +4965,7 @@ mod tests {
                         invocation_id: "call-1".to_owned(),
                         model_output: "failed".to_owned(),
                         is_error: true,
+                        presentation: None,
                         result: typed_result.then(|| ToolInvocationResult::Text {
                             text: "typed failure".to_owned(),
                         }),
@@ -5721,6 +5732,7 @@ mod tests {
                         invocation_id: invocation_id.to_owned(),
                         model_output: format!("finished {invocation_id}"),
                         is_error: false,
+                        presentation: None,
                         result: Some(ToolInvocationResult::Text {
                             text: format!("finished {invocation_id}"),
                         }),
@@ -6646,6 +6658,7 @@ mod tests {
                     invocation_id: "call-1".to_owned(),
                     model_output: "applied 1 replacement".to_owned(),
                     is_error: false,
+                    presentation: None,
                     result: Some(ToolInvocationResult::Artifact {
                         artifact: Box::new(bcode_session_models::ToolArtifact {
                             artifact_id: "call-1-filesystem-change".to_owned(),
@@ -7254,6 +7267,7 @@ mod tests {
                     invocation_id: "call-1".to_owned(),
                     model_output: "done".to_owned(),
                     is_error: false,
+                    presentation: None,
                     result: None,
                 },
             },
@@ -7342,6 +7356,7 @@ mod tests {
                     invocation_id: "tool-1".to_owned(),
                     model_output: "durable output".to_owned(),
                     is_error: false,
+                    presentation: None,
                     result: Some(ToolInvocationResult::Text {
                         text: "durable output".to_owned(),
                     }),

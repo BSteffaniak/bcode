@@ -154,6 +154,7 @@ pub async fn import_external_session(
                             invocation_id: tool_call_id,
                             model_output: result,
                             is_error,
+                            presentation: None,
                             result: None,
                         },
                     },

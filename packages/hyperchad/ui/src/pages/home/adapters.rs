@@ -1267,6 +1267,27 @@ pub(super) fn render_worktree_remove_result(artifact: &ToolArtifactView) -> Opti
     })
 }
 
+pub(super) fn render_tool_presentation(
+    presentation: &bcode_session_view_models::ToolPresentationView,
+    invocation_id: &str,
+) -> Option<Containers> {
+    let visual = bcode_session_models::ToolContributionEvent {
+        invocation_id: invocation_id.to_owned(),
+        contribution_id: "primary".to_owned(),
+        sequence: presentation.revision,
+        producer_id: presentation.producer_id.clone(),
+        schema: presentation.schema.clone(),
+        schema_version: presentation.schema_version,
+        operation: bcode_session_models::ToolContributionOperation::Upsert,
+        persistence: bcode_session_models::ToolContributionPersistence::Transient,
+        artifact: presentation.artifact.clone(),
+        payload: presentation.payload.clone(),
+    };
+    VISUAL_ADAPTERS
+        .get(&(presentation.schema.as_str(), presentation.schema_version))
+        .and_then(|adapter| adapter(&visual))
+}
+
 pub(super) fn render_tool_contribution(
     contribution: &bcode_session_models::ToolContributionEvent,
     placement: bcode_session_models::ToolContributionPlacement,

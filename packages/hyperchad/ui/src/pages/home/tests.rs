@@ -18,7 +18,7 @@ use bcode_session_view_models::{
     ChatMessageView, CompactionView, CompactionViewStatus, InteractionViewSummary,
     PermissionBatchView, PermissionView, RuntimeWorkView, SessionViewSnapshot, SkillView,
     SkillViewStatus, TextFormat, ToolArtifactView, ToolInvocationView, ToolInvocationViewStatus,
-    ToolResultView, ToolTimingView, TranscriptViewItem, TranscriptViewItemId,
+    ToolPresentationView, ToolResultView, ToolTimingView, TranscriptViewItem, TranscriptViewItemId,
     TranscriptViewItemKind,
 };
 
@@ -2178,6 +2178,52 @@ fn rich_adapter_state_matrix_covers_empty_truncated_optional_error_and_fallbacks
             ToolInvocationViewStatus::Cancelled => "cancelled",
         }));
     }
+}
+
+#[test]
+fn primary_tool_presentation_uses_schema_adapter_and_falls_back_without_raw_payload() {
+    let mut tool = tool_fixture(ToolInvocationViewStatus::Running);
+    tool.presentation = Some(ToolPresentationView {
+        producer_id: "bcode.shell".to_owned(),
+        generation: 0,
+        revision: 2,
+        retention: bcode_session_view_models::ToolPresentationRetention::RetainLatest,
+        schema: "bcode.tool.request.shell.run".to_owned(),
+        schema_version: 1,
+        artifact: None,
+        payload: serde_json::json!({"command": "cargo test", "cwd": "/tmp/project"}),
+    });
+    let item = transcript_fixture_item(
+        "primary-presentation",
+        true,
+        TranscriptViewItemKind::ToolInvocation {
+            tool: Box::new(tool.clone()),
+        },
+    );
+    let rendered = container_text_all(&transcript_item(&item));
+    assert!(rendered.contains("cargo test"));
+    assert!(!rendered.contains("developer arguments"));
+
+    tool.presentation = Some(ToolPresentationView {
+        producer_id: "example.plugin".to_owned(),
+        generation: 0,
+        revision: 3,
+        retention: bcode_session_view_models::ToolPresentationRetention::RetainLatest,
+        schema: "example.unsupported".to_owned(),
+        schema_version: 1,
+        artifact: None,
+        payload: serde_json::json!({"secret": "must-not-render"}),
+    });
+    let item = transcript_fixture_item(
+        "unsupported-primary-presentation",
+        true,
+        TranscriptViewItemKind::ToolInvocation {
+            tool: Box::new(tool),
+        },
+    );
+    let rendered = container_text_all(&transcript_item(&item));
+    assert!(rendered.contains("developer arguments"));
+    assert!(!rendered.contains("must-not-render"));
 }
 
 #[test]

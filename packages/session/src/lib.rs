@@ -5425,6 +5425,7 @@ mod tests {
                         invocation_id: "call-1".to_owned(),
                         model_output: "bounded result".to_owned(),
                         is_error: false,
+                        presentation: None,
                         result: Some(ToolInvocationResult::Artifact {
                             artifact: Box::new(bcode_session_models::ToolArtifact {
                                 artifact_id: "artifact-1".to_owned(),
@@ -5509,6 +5510,7 @@ mod tests {
                         invocation_id: "call".to_owned(),
                         model_output: "done".to_owned(),
                         is_error: false,
+                        presentation: None,
                         result: Some(ToolInvocationResult::Artifact {
                             artifact: Box::new(artifact),
                         }),
@@ -5879,6 +5881,7 @@ mod tests {
                             invocation_id: "call-1".to_string(),
                             model_output: "model fallback".to_string(),
                             is_error: false,
+                            presentation: None,
                             result: Some(ToolInvocationResult::Artifact {
                                 artifact: Box::new(bcode_session_models::ToolArtifact {
                                     artifact_id: "call-1-shell-run".to_string(),
@@ -5921,6 +5924,7 @@ mod tests {
             &event.kind,
             SessionEventKind::ToolInvocationResultRecorded {
                 record: bcode_session_models::ToolInvocationResultRecord {
+                    presentation: None,
                     result: Some(ToolInvocationResult::Artifact { artifact }),
                     ..
                 },
@@ -6169,6 +6173,7 @@ mod tests {
                         invocation_id: "tool-1".to_string(),
                         model_output: "ok".to_string(),
                         is_error: false,
+                        presentation: None,
                         result: None,
                     },
                 },
@@ -10556,6 +10561,7 @@ mod tests {
                         invocation_id: "call".to_owned(),
                         model_output: "done".to_owned(),
                         is_error: false,
+                        presentation: None,
                         result: None,
                     },
                 },

@@ -1316,6 +1316,7 @@ mod tests {
                     invocation_id: "call-1".to_owned(),
                     model_output: "done".to_owned(),
                     is_error: false,
+                    presentation: None,
                     result: Some(ToolInvocationResult::Json {
                         value: r#"{"ok":true}"#.to_owned(),
                     }),

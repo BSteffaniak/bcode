@@ -609,6 +609,7 @@ mod tests {
                 invocation_id: "call".to_owned(),
                 model_output: String::new(),
                 is_error: false,
+                presentation: None,
                 result: Some(bcode_session_models::ToolInvocationResult::Artifact {
                     artifact: Box::new(bcode_session_models::ToolArtifact {
                         artifact_id: "artifact".to_owned(),

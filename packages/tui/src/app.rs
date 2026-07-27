@@ -6317,6 +6317,7 @@ mod tests {
                     invocation_id: "tool-shared".to_owned(),
                     model_output: "shared result".to_owned(),
                     is_error: false,
+                    presentation: None,
                     result: Some(ToolInvocationResult::Text {
                         text: "shared result".to_owned(),
                     }),
@@ -6400,6 +6401,7 @@ mod tests {
                     invocation_id: "tool-shared".to_owned(),
                     model_output: "shared failure".to_owned(),
                     is_error: true,
+                    presentation: None,
                     result: Some(ToolInvocationResult::Text {
                         text: "shared failure".to_owned(),
                     }),
@@ -6448,6 +6450,7 @@ mod tests {
                     invocation_id: "tool-shared".to_owned(),
                     model_output: "shared result".to_owned(),
                     is_error: false,
+                    presentation: None,
                     result: Some(ToolInvocationResult::Text {
                         text: "shared result".to_owned(),
                     }),

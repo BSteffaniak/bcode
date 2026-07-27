@@ -8,7 +8,7 @@ use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_view_models::{ToolInvocationView, ToolInvocationViewStatus, ToolResultView};
 use hyperchad::template::{Containers, container};
 
-use super::adapters::{ARTIFACT_ADAPTERS, json_panel};
+use super::adapters::{ARTIFACT_ADAPTERS, json_panel, render_tool_presentation};
 use super::components::{StatusTone, code_output, disclosure, tool_card};
 
 const MAX_INLINE_ARGUMENT_CHARS: usize = 8_000;
@@ -100,24 +100,32 @@ pub(super) fn render_tool_lifecycle_with_context(
         .working_directory
         .as_ref()
         .map(|directory| display_from_current_dir(directory).to_string());
+    let presentation_content = tool
+        .presentation
+        .as_ref()
+        .and_then(|presentation| render_tool_presentation(presentation, &tool.tool_call_id));
     let content = container! {
-        @if let Some((arguments, truncated)) = arguments {
-            (disclosure("developer arguments", &container! {
-                (code_output(&arguments, StatusTone::Neutral))
-                @if truncated {
-                    div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "Arguments truncated for display." }
-                }
-            }))
-        }
-        @if let Some(result) = &tool.result {
-            div margin-top=((space::SM)) { (render_tool_result_with_context(result, session_id, presentation)) }
-        } @else if let Some((result_text, truncated)) = result_text {
-            (disclosure("result", &container! {
-                (code_output(&result_text, if tool.is_error == Some(true) { StatusTone::Error } else { StatusTone::Neutral }))
-                @if truncated {
-                    div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "Result truncated for display." }
-                }
-            }))
+        @if let Some(presentation_content) = presentation_content {
+            (presentation_content)
+        } @else {
+            @if let Some((arguments, truncated)) = arguments {
+                (disclosure("developer arguments", &container! {
+                    (code_output(&arguments, StatusTone::Neutral))
+                    @if truncated {
+                        div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "Arguments truncated for display." }
+                    }
+                }))
+            }
+            @if let Some(result) = &tool.result {
+                div margin-top=((space::SM)) { (render_tool_result_with_context(result, session_id, presentation)) }
+            } @else if let Some((result_text, truncated)) = result_text {
+                (disclosure("result", &container! {
+                    (code_output(&result_text, if tool.is_error == Some(true) { StatusTone::Error } else { StatusTone::Neutral }))
+                    @if truncated {
+                        div color=(color::WARNING) font-size=((typeface::DETAIL)) margin-top=((space::S6)) { "Result truncated for display." }
+                    }
+                }))
+            }
         }
     };
     tool_card(

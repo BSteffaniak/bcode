@@ -55,6 +55,8 @@ pub struct ToolInvocationProjection {
     pub is_error: Option<bool>,
     /// Raw semantic result returned by the tool.
     pub raw_result: Option<ToolInvocationResult>,
+    /// Latest retained plugin-owned presentation at the terminal boundary.
+    pub presentation: Option<bcode_tool_models::ToolPresentationUpdate>,
     /// Tool start time as UNIX epoch milliseconds, when known.
     pub started_at_ms: Option<u64>,
     /// Tool finish time as UNIX epoch milliseconds, when known.
@@ -174,6 +176,7 @@ pub fn apply_tool_invocation_projection_event(
                     if projection.raw_result.is_none() {
                         projection.raw_result.clone_from(&record.result);
                     }
+                    projection.presentation.clone_from(&record.presentation);
                     if projection.duration_ms.is_none() {
                         projection.duration_ms = record
                             .result
@@ -190,6 +193,7 @@ pub fn apply_tool_invocation_projection_event(
             projection.result_text = Some(record.model_output.clone());
             projection.is_error = Some(record.is_error);
             projection.raw_result.clone_from(&record.result);
+            projection.presentation.clone_from(&record.presentation);
             projection.finished_at_ms = Some(event.timestamp_ms);
             projection.duration_ms = record
                 .result
@@ -1784,6 +1788,9 @@ pub struct ToolInvocationResultRecord {
     pub model_output: String,
     /// Whether the invocation reported an error.
     pub is_error: bool,
+    /// Latest retained plugin-owned presentation checkpoint at the terminal boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<bcode_tool_models::ToolPresentationUpdate>,
     /// Optional typed semantic result supplied by the tool owner.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<ToolInvocationResult>,
@@ -2959,6 +2966,7 @@ mod tests {
                         invocation_id: "call-1".to_owned(),
                         model_output: "late".to_owned(),
                         is_error: false,
+                        presentation: None,
                         result: Some(ToolInvocationResult::Text {
                             text: "late".to_owned(),
                         }),

@@ -3084,6 +3084,7 @@ mod tests {
                     invocation_id: "call-1".to_string(),
                     model_output: "z".repeat(MAX_FRAME_PAYLOAD_SIZE + 100_000),
                     is_error: false,
+                    presentation: None,
                     result: None,
                 },
             },
@@ -3135,6 +3136,7 @@ mod tests {
                     invocation_id: "call-1".to_string(),
                     model_output: "done".to_string(),
                     is_error: false,
+                    presentation: None,
                     result: Some(ToolInvocationResult::Text {
                         text: "done".to_string(),
                     }),
@@ -3404,6 +3406,7 @@ mod tests {
                     invocation_id: "call-1".to_string(),
                     model_output: "tool result".to_string(),
                     is_error: false,
+                    presentation: None,
                     result: Some(semantic_result),
                 },
             },

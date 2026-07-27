@@ -2060,7 +2060,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn scoped_snapshot_patch_replaces_and_removes_stable_progress_slot() {
+    fn scoped_snapshot_patch_replaces_and_removes_legacy_progress_supplemental() {
         let session_id = bcode_session_models::SessionId::new();
         let progress_event =
             |sequence, operation, frame: &str| bcode_session_models::SessionLiveEvent {

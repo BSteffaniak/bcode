@@ -2860,6 +2860,7 @@ fn transcript_renders_compact_tool_blocks_without_raw_arguments() {
                     invocation_id: full_call_id.to_owned(),
                     model_output: "ok".to_owned(),
                     is_error: false,
+                    presentation: None,
                     result: None,
                 },
             },
@@ -2981,6 +2982,7 @@ fn live_file_edit_card_shows_permission_and_applied_phases() {
                 invocation_id: "call_edit".to_owned(),
                 model_output: "edited src/lib.rs".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: None,
             },
         },
@@ -3090,6 +3092,7 @@ fn transcript_renders_terminal_shell_output_without_viewport_padding() {
                 invocation_id: "call_terminal".to_owned(),
                 model_output: String::new(),
                 is_error: false,
+                presentation: None,
                 result: Some(shell_result_artifact(&ShellRunResult::Terminal {
                     exit_code: Some(0),
                     timed_out: false,
@@ -3131,6 +3134,7 @@ fn transcript_renders_truncated_terminal_shell_output_as_terminal() {
                 invocation_id: "call_terminal".to_owned(),
                 model_output: String::new(),
                 is_error: false,
+                presentation: None,
                 result: Some(shell_result_artifact(&ShellRunResult::Terminal {
                     exit_code: Some(0),
                     timed_out: false,
@@ -3865,6 +3869,7 @@ fn assistant_response_after_tool_loop_transitions_to_message_top() {
                 invocation_id: "tool-1".to_owned(),
                 model_output: "done".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: None,
             },
         },
@@ -4095,6 +4100,7 @@ fn file_change_semantic_result_events(
                 invocation_id: "call-file".to_owned(),
                 model_output: "wrote 2 bytes".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: Some(file_change_artifact(&FileChangeResult {
                     tool_name: "example.write".to_owned(),
                     summary: "wrote 2 bytes".to_owned(),
@@ -4129,6 +4135,7 @@ fn canonical_lifecycle_without_output_renders_final_result() {
                     invocation_id: "call-empty".to_owned(),
                     model_output: "final result".to_owned(),
                     is_error: false,
+                    presentation: None,
                     result: None,
                 },
             },
@@ -4163,6 +4170,7 @@ fn semantic_terminal_result_without_live_delta_renders_terminal_history() {
                     invocation_id: "call-no-live".to_owned(),
                     model_output: String::new(),
                     is_error: false,
+                    presentation: None,
                     result: Some(shell_result_artifact(&ShellRunResult::Terminal {
                         exit_code: Some(0),
                         timed_out: false,
@@ -4224,6 +4232,7 @@ fn live_shell_result_replaces_request_block() {
                     invocation_id: "call-live-shell".to_owned(),
                     model_output: String::new(),
                     is_error: false,
+                    presentation: None,
                     result: Some(shell_result_artifact(&ShellRunResult::Captured {
                         exit_code: Some(0),
                         timed_out: false,
@@ -4267,6 +4276,7 @@ fn semantic_terminal_result_without_stream_renders_generic_artifact() {
                 invocation_id: "call-terminal".to_owned(),
                 model_output: String::new(),
                 is_error: false,
+                presentation: None,
                 result: Some(shell_result_artifact(&ShellRunResult::Terminal {
                     exit_code: Some(0),
                     timed_out: false,
@@ -4304,6 +4314,7 @@ fn semantic_captured_shell_result_renders_generic_artifact() {
                 invocation_id: "call-captured".to_owned(),
                 model_output: "legacy output should not be used".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: Some(shell_result_artifact(&ShellRunResult::Captured {
                     exit_code: Some(0),
                     timed_out: false,
@@ -4366,6 +4377,7 @@ fn legacy_terminal_result_renders_plain_tool_result() {
                     })
                     .to_string(),
                     is_error: false,
+                    presentation: None,
                     result: None,
                 },
             },
@@ -4397,6 +4409,7 @@ fn semantic_text_result_renders_generic_tool_result() {
                 invocation_id: "call-text".to_owned(),
                 model_output: "model fallback text".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: Some(ToolInvocationResult::Text {
                     text: "semantic text".to_owned(),
                 }),
@@ -4616,6 +4629,7 @@ fn transcript_resident_window_prunes_old_tool_state_after_trim() {
                     invocation_id: tool_call_id,
                     model_output: "ok".to_owned(),
                     is_error: false,
+                    presentation: None,
                     result: None,
                 },
             },
@@ -4829,6 +4843,7 @@ fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
                 invocation_id: "call-write".to_owned(),
                 model_output: "wrote 5 bytes".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(bcode_session_models::ToolArtifact {
                         artifact_id: "call-write-filesystem-change".to_owned(),
@@ -5414,6 +5429,7 @@ fn live_question_artifact_renders_outcome_from_raw_metadata() {
                 invocation_id: "call-question".to_owned(),
                 model_output: "question answered".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(question_outcome_artifact()),
                 }),
@@ -5440,6 +5456,7 @@ fn replayed_question_artifact_renders_outcome_from_raw_metadata() {
                 invocation_id: "call-question".to_owned(),
                 model_output: "question answered".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(question_outcome_artifact()),
                 }),
@@ -5470,6 +5487,7 @@ fn live_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
                 invocation_id: "call-shell".to_owned(),
                 model_output: "shell completed".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(shell_run_artifact()),
                 }),
@@ -5496,6 +5514,7 @@ fn replayed_shell_artifact_renders_terminal_output_from_raw_run_metadata() {
                 invocation_id: "call-shell".to_owned(),
                 model_output: "shell completed".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(shell_run_artifact()),
                 }),
@@ -5543,6 +5562,7 @@ fn replayed_legacy_shell_artifact_does_not_read_files_during_render() {
                 invocation_id: "call-shell".to_owned(),
                 model_output: "shell completed".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(artifact),
                 }),
@@ -5583,6 +5603,7 @@ fn canonical_generic_result_record_renders_filesystem_source_viewer() {
                 invocation_id: "call-read".to_owned(),
                 model_output: "model-visible fallback".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(ToolArtifact {
                         artifact_id: "call-read-filesystem-read".to_owned(),
@@ -5971,6 +5992,7 @@ fn same_raw_filesystem_events_render_same_live_and_replayed_tool_ui() {
                     invocation_id: "call-file".to_owned(),
                     model_output: "edited file".to_owned(),
                     is_error: false,
+                    presentation: None,
                     result: Some(ToolInvocationResult::Artifact {
                         artifact: Box::new(filesystem_change_artifact()),
                     }),
@@ -6027,6 +6049,7 @@ fn live_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
                 invocation_id: "call-file".to_owned(),
                 model_output: "edited file".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(filesystem_change_artifact()),
                 }),
@@ -6055,6 +6078,7 @@ fn final_filesystem_artifact_renders_without_stream_fallback() {
                 invocation_id: "call-file".to_owned(),
                 model_output: "edited file".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(filesystem_change_artifact()),
                 }),
@@ -6082,6 +6106,7 @@ fn replayed_filesystem_artifact_renders_rich_diff_from_raw_change_metadata() {
                 invocation_id: "call-file".to_owned(),
                 model_output: "edited file".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(filesystem_change_artifact()),
                 }),
@@ -6111,6 +6136,7 @@ fn disabled_filesystem_renderer_falls_back_generically_and_reenabled_renderer_re
                 invocation_id: "call-file".to_owned(),
                 model_output: "edited file".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(filesystem_change_artifact()),
                 }),
@@ -6177,6 +6203,7 @@ fn legacy_serialized_artifact_result_does_not_render_raw_json() {
                 invocation_id: "call-file".to_owned(),
                 model_output: serde_json::to_string(&artifact).expect("artifact should serialize"),
                 is_error: false,
+                presentation: None,
                 result: None,
             },
         },
@@ -6225,6 +6252,7 @@ fn legacy_serialized_semantic_artifact_result_does_not_render_raw_json() {
                 model_output: serde_json::to_string(&result)
                     .expect("semantic result should serialize"),
                 is_error: false,
+                presentation: None,
                 result: None,
             },
         },
@@ -6255,6 +6283,7 @@ fn generic_artifact_fallback_projection_is_repeatable_and_non_mutating() {
                 invocation_id: "call-artifact".to_owned(),
                 model_output: "fallback".to_owned(),
                 is_error: false,
+                presentation: None,
                 result: Some(ToolInvocationResult::Artifact {
                     artifact: Box::new(bcode_session_models::ToolArtifact {
                         artifact_id: "artifact-1".to_owned(),

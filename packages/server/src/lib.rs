@@ -18878,6 +18878,38 @@ async fn publish_plugin_tool_presentation_update(
     producer_id: &str,
     update: bcode_tool::ToolPresentationUpdate,
 ) -> Result<(), String> {
+    if update.artifact.is_some() {
+        let artifact_envelope = bcode_session_models::ToolContributionEnvelope::new(
+            bcode_session_models::ToolContributionPlacement::Hidden,
+            bcode_session_models::ToolContributionEvent {
+                invocation_id: update.invocation_id.clone(),
+                contribution_id: match &update.identity {
+                    bcode_tool::ToolPresentationIdentity::Primary => {
+                        "primary-presentation".to_owned()
+                    }
+                    bcode_tool::ToolPresentationIdentity::Supplemental { item_id } => {
+                        format!("supplemental-presentation:{item_id}")
+                    }
+                },
+                sequence: update.revision,
+                producer_id: update.producer_id.clone(),
+                schema: update.schema.clone(),
+                schema_version: update.schema_version,
+                operation: bcode_session_models::ToolContributionOperation::Upsert,
+                persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                artifact: update.artifact.clone(),
+                payload: update.payload.clone(),
+            },
+        );
+        match update_active_artifact(state, session_id, &artifact_envelope) {
+            Ok(()) => {}
+            Err(error)
+                if error == "active artifact revision and committed length must increase"
+                    || error == "active artifact is already finalized"
+                    || error == "active artifact invocation is not registered" => {}
+            Err(error) => return Err(error),
+        }
+    }
     accept_tool_presentation_update(state, session_id, invocation_id, producer_id, &update)
         .map_err(|error| format!("presentation update rejected: {error:?}"))?;
     if let Ok(mut updates) = state.active_presentation_updates.lock() {
@@ -20532,6 +20564,22 @@ async fn append_tool_finished_event_inner(
     }
     let content_note = tool_result_content_model_note(&tool_call_id, &content);
     let model_output = format!("{result}{content_note}");
+    let presentation = state
+        .active_presentation_updates
+        .lock()
+        .ok()
+        .and_then(|updates| {
+            updates
+                .get(&(
+                    session_id,
+                    tool_call_id.clone(),
+                    bcode_tool::ToolPresentationIdentity::Primary,
+                ))
+                .filter(|update| {
+                    update.retention == bcode_tool::ToolPresentationRetention::RetainLatest
+                })
+                .cloned()
+        });
     let generic_event = state
         .sessions
         .append_tool_invocation_result(
@@ -20540,6 +20588,7 @@ async fn append_tool_finished_event_inner(
                 invocation_id: tool_call_id.clone(),
                 model_output: model_output.clone(),
                 is_error,
+                presentation,
                 result: semantic_result.clone(),
             },
         )
@@ -25497,6 +25546,7 @@ library = "test"
                         invocation_id: tool_call_id.to_owned(),
                         model_output: result,
                         is_error: false,
+                        presentation: None,
                         result: None,
                     },
                 },
@@ -27363,6 +27413,7 @@ library = "test"
                         invocation_id: "call-1".to_owned(),
                         model_output: "wrote src/lib.rs".to_owned(),
                         is_error: false,
+                        presentation: None,
                         result: None,
                     },
                 )
@@ -28823,6 +28874,7 @@ library = "test"
                         invocation_id: "call-1".to_string(),
                         model_output: "ok".to_string(),
                         is_error: false,
+                        presentation: None,
                         result: None,
                     },
                 },
@@ -28852,6 +28904,7 @@ library = "test"
                     invocation_id: "call-1".to_string(),
                     model_output: "orphaned output".to_string(),
                     is_error: false,
+                    presentation: None,
                     result: None,
                 },
             },
@@ -29001,6 +29054,7 @@ library = "test"
                         invocation_id: call.into(),
                         model_output: "ok".into(),
                         is_error: false,
+                        presentation: None,
                         result: None,
                     },
                 },
@@ -29568,6 +29622,7 @@ library = "test"
                         invocation_id: "call-1".to_string(),
                         model_output: "done".to_string(),
                         is_error: false,
+                        presentation: None,
                         result: None,
                     },
                 },
@@ -29831,6 +29886,7 @@ library = "test"
                                 "y".repeat(2_000)
                             ),
                             is_error: false,
+                            presentation: None,
                             result: None,
                         },
                     },
@@ -31316,6 +31372,7 @@ library = "test"
                         invocation_id: "call-1".to_owned(),
                         model_output: "safe-result".to_owned(),
                         is_error: false,
+                        presentation: None,
                         result: None,
                     },
                 },
@@ -31551,6 +31608,82 @@ library = "test"
         assert_eq!(
             artifact_read_error_code("artifact references projection is stale"),
             "artifact_read_failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_result_persists_retained_presentation_atomically() {
+        let workspace = tempfile::tempdir().expect("terminal presentation workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("terminal presentation session manager");
+        let state = test_server_state(sessions);
+        let session = state
+            .sessions
+            .create_session(
+                Some("terminal presentation".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("session");
+        let update = bcode_tool::ToolPresentationUpdate {
+            invocation_id: "call-1".to_owned(),
+            producer_id: "test.plugin".to_owned(),
+            generation: 0,
+            revision: 7,
+            identity: bcode_tool::ToolPresentationIdentity::Primary,
+            retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+            schema: "test.presentation".to_owned(),
+            schema_version: 1,
+            artifact: None,
+            payload: serde_json::json!({"terminal": true}),
+        };
+        publish_plugin_tool_presentation_update(
+            &state,
+            session.id,
+            "call-1",
+            "test.plugin",
+            update.clone(),
+        )
+        .await
+        .expect("presentation accepted");
+
+        append_tool_finished_event(
+            &state,
+            session.id,
+            ToolFinishedEventInput {
+                tool_call_id: "call-1".to_owned(),
+                result: "done".to_owned(),
+                is_error: false,
+                content: Vec::new(),
+                semantic_result: Some(ToolInvocationResult::Text {
+                    text: "done".to_owned(),
+                }),
+            },
+        )
+        .await;
+
+        let attachment = state
+            .sessions
+            .attach_session(session.id, bcode_session_models::ClientId::new())
+            .await
+            .expect("attach");
+        let record = attachment
+            .history
+            .iter()
+            .find_map(|event| match &event.kind {
+                SessionEventKind::ToolInvocationResultRecorded { record } => Some(record),
+                _ => None,
+            })
+            .expect("terminal record");
+        assert_eq!(record.presentation.as_ref(), Some(&update));
+        let snapshot = bcode_session_view::build_session_view_snapshot(&attachment.history);
+        assert_eq!(
+            snapshot
+                .tools
+                .get("call-1")
+                .and_then(|tool| tool.presentation.as_ref())
+                .map(|presentation| presentation.revision),
+            Some(7)
         );
     }
 
@@ -32659,33 +32792,26 @@ library = "test"
         .await
         .expect("shell contribution result");
         assert!(!result.is_error, "{:?}", result.content);
-        let mut saw_recording_contribution = false;
+        let mut saw_recording_presentation = false;
         while let Ok(live) = attachment.live_events.try_recv() {
-            match live.kind {
-                SessionLiveEventKind::ToolContributionPlaced { envelope }
-                    if envelope.contribution.contribution_id == "shell-recording" =>
-                {
-                    assert_eq!(
-                        envelope.placement,
-                        bcode_session_models::ToolContributionPlacement::Progress
-                    );
-                    saw_recording_contribution |= envelope.contribution.artifact.is_some();
-                }
-                _ => {}
+            if let SessionLiveEventKind::ToolPresentationUpdated { update } = live.kind
+                && update.invocation_id == "shell-contribution"
+                && update.producer_id == "bcode.shell"
+                && update.artifact.is_some()
+            {
+                saw_recording_presentation = true;
             }
         }
-        assert!(saw_recording_contribution);
+        assert!(saw_recording_presentation);
         assert!(
-            active_artifact_snapshot_events(&state, session_id)
-                .expect("shell reattach artifact snapshot")
+            active_presentation_snapshot_events(&state, session_id)
                 .iter()
                 .any(|snapshot| matches!(
                     &snapshot.kind,
-                    SessionLiveEventKind::ToolContributionPlaced { envelope }
-                        if envelope.contribution.contribution_id == "shell-recording"
-                            && envelope.contribution.artifact.is_some()
-                            && envelope.placement
-                                == bcode_session_models::ToolContributionPlacement::Progress
+                    SessionLiveEventKind::ToolPresentationUpdated { update }
+                        if update.invocation_id == "shell-contribution"
+                            && update.producer_id == "bcode.shell"
+                            && update.artifact.is_some()
                 ))
         );
 
@@ -32776,21 +32902,23 @@ library = "test"
         assert!(!result.is_error, "{}", result.result);
         assert_eq!(std::fs::read_to_string(&file).expect("read source"), "foo");
         assert!(state.pending_tool_exchanges.lock().await.is_empty());
-        let mut saw_live_contribution = false;
+        let mut saw_live_presentation = false;
         while let Ok(live) = attachment.live_events.try_recv() {
             if matches!(
                 live.kind,
-                SessionLiveEventKind::ToolContributionPlaced { envelope }
-                    if envelope.contribution.invocation_id == "vim-preview"
-                        && envelope.contribution.schema == "bcode.vim-edit.live"
-                        && envelope.contribution.sequence >= 1
-                        && envelope.placement
-                            == bcode_session_models::ToolContributionPlacement::Progress
+                SessionLiveEventKind::ToolPresentationUpdated { update }
+                    if update.invocation_id == "vim-preview"
+                        && update.producer_id == "bcode.vim-edit"
+                        && update.schema == "bcode.vim-edit.playback"
+                        && update.revision >= 1
             ) {
-                saw_live_contribution = true;
+                saw_live_presentation = true;
             }
         }
-        assert!(saw_live_contribution);
+        assert!(saw_live_presentation);
+        append_tool_finished_event_inner(&state, session_id, result)
+            .await
+            .expect("durable Vim preview result");
         let history = state
             .sessions
             .session_history(session_id)
@@ -32798,14 +32926,13 @@ library = "test"
             .expect("Vim preview history");
         assert!(history.iter().any(|entry| matches!(
             &entry.kind,
-            SessionEventKind::ToolContributionPlaced { envelope }
-                if envelope.contribution.invocation_id == "vim-preview"
-                    && envelope.contribution.contribution_id == "playback"
-                    && envelope.contribution.schema == "bcode.vim-edit.playback"
-                    && envelope.contribution.persistence
-                        == bcode_session_models::ToolContributionPersistence::Durable
-                    && envelope.placement
-                        == bcode_session_models::ToolContributionPlacement::Result
+            SessionEventKind::ToolInvocationResultRecorded { record }
+                if record.invocation_id == "vim-preview"
+                    && record.presentation.as_ref().is_some_and(|presentation|
+                        presentation.producer_id == "bcode.vim-edit"
+                            && presentation.schema == "bcode.vim-edit.playback"
+                            && presentation.retention
+                                == bcode_tool::ToolPresentationRetention::RetainLatest)
         )));
     }
 
@@ -35104,19 +35231,15 @@ library = "test"
                 else {
                     continue;
                 };
-                let bcode_session_models::SessionLiveEventKind::ToolContributionPlaced {
-                    envelope,
-                } = event.kind
+                let bcode_session_models::SessionLiveEventKind::ToolPresentationUpdated { update } =
+                    event.kind
                 else {
                     continue;
                 };
-                let Some(artifact) = envelope.contribution.artifact else {
+                let Some(artifact) = update.artifact else {
                     continue;
                 };
-                if envelope.placement
-                    != bcode_session_models::ToolContributionPlacement::Progress
-                    || artifact.finalized
-                {
+                if update.producer_id != "bcode.shell" || artifact.finalized {
                     continue;
                 }
                 let range = client
@@ -43123,6 +43246,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         invocation_id: "call-recording".to_owned(),
                         model_output: "bounded useful result".to_owned(),
                         is_error: false,
+                        presentation: None,
                         result: Some(ToolInvocationResult::Artifact {
                             artifact: Box::new(bcode_session_models::ToolArtifact {
                                 artifact_id: secret.to_owned(),
@@ -43182,6 +43306,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         invocation_id: "call-1".to_string(),
                         model_output: output,
                         is_error: false,
+                        presentation: None,
                         result: None,
                     },
                 },
@@ -43220,6 +43345,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         invocation_id: "call-1".to_owned(),
                         model_output: "generic result".to_owned(),
                         is_error: false,
+                        presentation: None,
                         result: None,
                     },
                 },
@@ -43232,6 +43358,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         invocation_id: "call-1".to_owned(),
                         model_output: "legacy duplicate".to_owned(),
                         is_error: false,
+                        presentation: None,
                         result: None,
                     },
                 },
@@ -43407,6 +43534,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         invocation_id: "call-tail".to_string(),
                         model_output: "workspace".to_string(),
                         is_error: false,
+                        presentation: None,
                         result: None,
                     },
                 },
