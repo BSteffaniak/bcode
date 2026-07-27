@@ -196,6 +196,76 @@ pub enum StorageCompatibilityError {
     Classification(String),
 }
 
+/// Classify raw facts against the exact current target contract.
+///
+/// This performs no released-format interpretation: an exact current ledger and contract are
+/// current, a clean known prefix is non-current, and unknown, dirty, or inconsistent facts fail.
+///
+/// # Errors
+///
+/// Returns an error for dirty/unknown ledgers, inconsistent contracts, or future writer epochs.
+pub fn classify_storage_facts(
+    facts: &StorageCompatibilityFacts,
+) -> Result<StorageCompatibility, StorageCompatibilityError> {
+    let mut completed = Vec::with_capacity(facts.migration_rows.len());
+    for row in &facts.migration_rows {
+        if row.status != "completed" {
+            return Err(StorageCompatibilityError::IncompleteLedger);
+        }
+        completed.push(row.id.as_str());
+    }
+    if completed.len() > facts.current_migration_ids.len()
+        || !completed
+            .iter()
+            .zip(&facts.current_migration_ids)
+            .all(|(actual, expected)| *actual == expected)
+    {
+        return Err(StorageCompatibilityError::Classification(
+            "source migration ledger is not a known current-schema prefix".to_owned(),
+        ));
+    }
+    let expected_writer = u64::from(CURRENT_WRITER_EPOCH);
+    if facts.contract_table_exists {
+        let schema = facts.contract_schema_version.ok_or_else(|| {
+            StorageCompatibilityError::Classification(
+                "storage contract table has no contract row".to_owned(),
+            )
+        })?;
+        let writer = facts.writer_epoch.ok_or_else(|| {
+            StorageCompatibilityError::Classification(
+                "storage contract row has no writer epoch".to_owned(),
+            )
+        })?;
+        if schema != facts.expected_contract_schema_version {
+            return Err(StorageCompatibilityError::Classification(format!(
+                "unsupported storage contract schema {schema}"
+            )));
+        }
+        if writer > expected_writer {
+            return Err(StorageCompatibilityError::WriterEpoch {
+                actual: writer,
+                expected: expected_writer,
+            });
+        }
+        if completed.len() == facts.current_migration_ids.len() && writer == expected_writer {
+            return Ok(StorageCompatibility::Current {
+                writer_epoch: writer,
+            });
+        }
+        return Ok(StorageCompatibility::MigrationRequired {
+            writer_epoch: writer,
+        });
+    }
+    if facts.writer_epoch.is_some() || facts.contract_schema_version.is_some() {
+        return Err(StorageCompatibilityError::Classification(
+            "storage contract facts are inconsistent".to_owned(),
+        ));
+    }
+    Ok(StorageCompatibility::MigrationRequired {
+        writer_epoch: u64::from(facts.legacy_writer_epoch),
+    })
+}
+
 /// Complete current migration-target capabilities required by historical migration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CurrentMigrationTargetCapability {

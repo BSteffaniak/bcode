@@ -836,13 +836,11 @@ impl SessionDb {
         #[cfg(test)]
         abort_at_migration_crash_boundary("before_epoch_update");
         inject_migration_fault(fault, MigrationFaultPhase::WriterEpochFinalization)?;
-        bcode_session_migration::validate_writer_finalization(
-            CURRENT_SESSION_STORAGE_WRITER_EPOCH,
-            true,
-        )
-        .map_err(|error| SessionDbError::MigrationHistoryIncompatible {
-            reason: error.to_string(),
-        })?;
+        if CURRENT_SESSION_STORAGE_WRITER_EPOCH == 0 {
+            return Err(SessionDbError::MigrationHistoryIncompatible {
+                reason: "current writer epoch must be non-zero".to_owned(),
+            });
+        }
         target.finalize_writer_contract().await?;
         #[cfg(test)]
         abort_at_migration_crash_boundary("after_epoch_update_before_commit");
@@ -1448,7 +1446,7 @@ impl SessionDb {
     ///
     /// Returns an error for damaged, unknown, or unsupported storage facts.
     pub async fn storage_compatibility(&self) -> SessionDbResult<SessionStorageCompatibility> {
-        match bcode_session_migration::classify_target_storage(
+        match bcode_session_migration_target::classify_storage_facts(
             &self.storage_compatibility_facts().await?,
         ) {
             Ok(bcode_session_migration_target::StorageCompatibility::Current { writer_epoch }) => {
@@ -2553,9 +2551,9 @@ async fn rebuild_migration_projections(
 async fn migration_target_validation_facts(
     db: &dyn Database,
     canonical_tail: Option<u64>,
-) -> SessionDbResult<bcode_session_migration::MigrationTargetValidation> {
+) -> SessionDbResult<bcode_session_migration_target::StrictValidation> {
     if canonical_tail.is_none() {
-        return Ok(bcode_session_migration::MigrationTargetValidation {
+        return Ok(bcode_session_migration_target::StrictValidation {
             canonical_tail,
             projections: Vec::new(),
             model_context_schema_version: None,
@@ -2571,7 +2569,7 @@ async fn migration_target_validation_facts(
         .iter()
         .map(|projection| {
             let state = snapshot.get(projection.as_str());
-            bcode_session_migration::MigrationProjectionValidation {
+            bcode_session_migration_target::ProjectionValidation {
                 projection: projection.as_str().to_owned(),
                 actual_schema_version: state.map(|state| state.version),
                 expected_schema_version: u64::from(projection.schema_version()),
@@ -2593,13 +2591,47 @@ async fn migration_target_validation_facts(
         .as_ref()
         .map(|row| required_non_negative_u64(row, "last_event_seq"))
         .transpose()?;
-    Ok(bcode_session_migration::MigrationTargetValidation {
+    Ok(bcode_session_migration_target::StrictValidation {
         canonical_tail,
         projections,
         model_context_schema_version,
         expected_model_context_schema_version: u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION),
         model_context_checkpoint,
     })
+}
+
+fn validate_strict_target_facts(
+    facts: &bcode_session_migration_target::StrictValidation,
+) -> SessionDbResult<()> {
+    if facts.canonical_tail.is_none() {
+        return Ok(());
+    }
+    for projection in &facts.projections {
+        if projection.actual_schema_version != Some(projection.expected_schema_version) {
+            return Err(SessionDbError::MigrationHistoryIncompatible {
+                reason: format!(
+                    "projection {} has incompatible schema",
+                    projection.projection
+                ),
+            });
+        }
+        if projection.checkpoint != facts.canonical_tail {
+            return Err(SessionDbError::MigrationHistoryIncompatible {
+                reason: format!("projection {} is stale", projection.projection),
+            });
+        }
+    }
+    if facts.model_context_schema_version != Some(facts.expected_model_context_schema_version) {
+        return Err(SessionDbError::MigrationHistoryIncompatible {
+            reason: "model-context projection has incompatible schema".to_owned(),
+        });
+    }
+    if facts.model_context_checkpoint != facts.canonical_tail {
+        return Err(SessionDbError::MigrationHistoryIncompatible {
+            reason: "model-context projection is stale".to_owned(),
+        });
+    }
+    Ok(())
 }
 
 async fn validate_migrated_storage(
@@ -2617,11 +2649,7 @@ async fn validate_migrated_storage(
     let canonical_tail = tail.map(|event| event.sequence);
     target.finalize_projectors(canonical_tail).await?;
     let validation = target.validate_strict_current().await?;
-    bcode_session_migration::validate_strict_target(&validation).map_err(|error| {
-        SessionDbError::MigrationHistoryIncompatible {
-            reason: error.to_string(),
-        }
-    })?;
+    validate_strict_target_facts(&validation)?;
     metrics.record_histogram(
         "session.migration.validation_duration_ms",
         validation_timer.elapsed_ms(),
@@ -2629,16 +2657,44 @@ async fn validate_migrated_storage(
     Ok(())
 }
 
+struct CurrentAuthoritativeProjectionState {
+    context_epoch: u64,
+    context_occupancy: Option<bcode_session_models::RequestContextOccupancy>,
+}
+
+impl CurrentAuthoritativeProjectionState {
+    fn ingest(&mut self, event: &SessionEvent) {
+        use bcode_session_models::{RequestContextOccupancy, SessionEventKind};
+        match &event.kind {
+            SessionEventKind::ModelChanged { .. }
+            | SessionEventKind::ContextCompacted { .. }
+            | SessionEventKind::ProviderContextCompacted { .. } => {
+                self.context_epoch = event.sequence;
+                self.context_occupancy = None;
+            }
+            SessionEventKind::RequestContextObserved { observation } => {
+                self.context_occupancy = RequestContextOccupancy::reconcile(
+                    self.context_occupancy.as_ref(),
+                    self.context_epoch,
+                    event.sequence,
+                    observation.clone(),
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
 struct MigrationProjectionState {
     model_context_checkpoint: Option<u64>,
-    authoritative: bcode_session_migration::AuthoritativeMigrationState,
+    authoritative: CurrentAuthoritativeProjectionState,
 }
 
 impl MigrationProjectionState {
     const fn new() -> Self {
         Self {
             model_context_checkpoint: None,
-            authoritative: bcode_session_migration::AuthoritativeMigrationState {
+            authoritative: CurrentAuthoritativeProjectionState {
                 context_epoch: 0,
                 context_occupancy: None,
             },
@@ -2818,24 +2874,7 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
     ) -> Result<bcode_session_migration_target::StrictValidation, Self::Error> {
         let canonical_tail = last_sequence(self.db).await?;
         let facts = migration_target_validation_facts(self.db, canonical_tail).await?;
-        Ok(bcode_session_migration_target::StrictValidation {
-            canonical_tail: facts.canonical_tail,
-            projections: facts
-                .projections
-                .into_iter()
-                .map(
-                    |projection| bcode_session_migration_target::ProjectionValidation {
-                        projection: projection.projection,
-                        actual_schema_version: projection.actual_schema_version,
-                        expected_schema_version: projection.expected_schema_version,
-                        checkpoint: projection.checkpoint,
-                    },
-                )
-                .collect(),
-            model_context_schema_version: facts.model_context_schema_version,
-            expected_model_context_schema_version: facts.expected_model_context_schema_version,
-            model_context_checkpoint: facts.model_context_checkpoint,
-        })
+        Ok(facts)
     }
 
     async fn persist_migration_receipt(
