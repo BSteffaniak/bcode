@@ -55,6 +55,27 @@ pub fn validate_projection_checkpoint_snapshot(
     Ok(())
 }
 
+pub fn compaction_boundary(event: &SessionEvent) -> SessionDbResult<Option<u64>> {
+    let boundary = match &event.kind {
+        bcode_session_models::SessionEventKind::ContextCompacted {
+            compacted_through_sequence,
+            ..
+        }
+        | bcode_session_models::SessionEventKind::ProviderContextCompacted {
+            compacted_through_sequence,
+            ..
+        } => *compacted_through_sequence,
+        _ => return Ok(None),
+    };
+    if boundary > event.sequence {
+        return Err(SessionDbError::InvalidCompactionMarker {
+            sequence: event.sequence,
+            message: format!("compacted boundary #{boundary} is later than its marker"),
+        });
+    }
+    Ok(Some(boundary))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

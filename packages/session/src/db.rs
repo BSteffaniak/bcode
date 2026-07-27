@@ -12,18 +12,19 @@ use crate::current_schema::{global_migrations, session_migrations};
 use crate::db_connection::{
     init_turso_local_with_retry, is_database_lock_error, is_database_lock_error_message,
 };
-use crate::db_event_store::insert_event;
+use crate::db_event_store::{
+    compatible_event_from_row, insert_event, last_sequence, strict_events,
+};
 pub use crate::db_path::{
     global_catalog_db_path, namespaced_catalog_db_path, session_db_path, session_dir_path,
 };
 pub use crate::db_projection::MaterializedProjection;
 use crate::db_projection::ProjectionCheckpointState;
 use crate::db_validation::{
-    validate_canonical_event_identity, validate_projection_checkpoint_snapshot,
+    compaction_boundary, validate_canonical_event_identity, validate_projection_checkpoint_snapshot,
 };
 use crate::persisted::{
-    CompatibleSessionEvent, PersistedSessionEventError, decode_session_event,
-    decode_session_event_compatible, encode_session_event,
+    CompatibleSessionEvent, PersistedSessionEventError, decode_session_event, encode_session_event,
 };
 use async_trait::async_trait;
 use bcode_session_migration::{CanonicalNormalizationSummary, normalize_canonical_event};
@@ -1933,7 +1934,7 @@ impl SessionDb {
     ///
     /// Returns an error if the query or event deserialization fails.
     pub async fn all_events_strict(&self) -> SessionDbResult<Vec<SessionEvent>> {
-        strict_events_from_database(&**self.db).await
+        strict_events(&**self.db).await
     }
 
     /// Return a bounded history page from canonical DB events.
@@ -2647,7 +2648,7 @@ async fn migrate_session_storage(
     progress: Option<&SessionMigrationProgressCallback>,
     fault: MigrationFaultPhase,
 ) -> SessionDbResult<MigrationReplayOutcome> {
-    let event_total = last_event_sequence_from_database(target.db)
+    let event_total = last_sequence(target.db)
         .await?
         .map_or(0, |tail| tail.saturating_add(1));
     report_migration_progress(
@@ -3096,7 +3097,7 @@ impl bcode_session_migration_target::MigrationTarget for SessionMigrationTarget<
     async fn validate_strict_current(
         &mut self,
     ) -> Result<bcode_session_migration_target::StrictValidation, Self::Error> {
-        let canonical_tail = last_event_sequence_from_database(self.db).await?;
+        let canonical_tail = last_sequence(self.db).await?;
         let facts = migration_target_validation_facts(self.db, canonical_tail).await?;
         Ok(bcode_session_migration_target::StrictValidation {
             canonical_tail: facts.canonical_tail,
@@ -3184,23 +3185,8 @@ fn report_migration_progress(
     }
 }
 
-async fn strict_events_from_database(db: &dyn Database) -> SessionDbResult<Vec<SessionEvent>> {
-    let rows = db
-        .select("events")
-        .columns(&["payload"])
-        .sort("event_seq", SortDirection::Asc)
-        .execute(db)
-        .await?;
-    rows.into_iter()
-        .map(|row| {
-            let payload = required_string(&row, "payload")?;
-            Ok(decode_session_event(&payload)?)
-        })
-        .collect()
-}
-
 async fn rebuild_model_context_projection(db: &dyn Database) -> SessionDbResult<usize> {
-    let events = strict_events_from_database(db).await?;
+    let events = strict_events(db).await?;
     for (index, event) in events.iter().enumerate() {
         let expected = u64::try_from(index).unwrap_or(u64::MAX);
         if event.sequence != expected {
@@ -3237,18 +3223,6 @@ async fn validate_storage_writer_contract_for_epoch(
 
 async fn validate_storage_writer_contract(db: &dyn Database) -> SessionDbResult<()> {
     validate_storage_writer_contract_for_epoch(db, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await
-}
-
-async fn last_event_sequence_from_database(db: &dyn Database) -> SessionDbResult<Option<u64>> {
-    let row = db
-        .query_raw("SELECT MAX(event_seq) AS event_seq FROM events")
-        .await?
-        .into_iter()
-        .next();
-    row.as_ref()
-        .and_then(|row| optional_i64(row, "event_seq"))
-        .map(i64_to_u64)
-        .map_or(Ok(None), |value| Ok(Some(value)))
 }
 
 async fn validate_model_context_precondition(
@@ -3383,7 +3357,7 @@ async fn validate_append_preconditions_without_writer(
             contribution_id: event.contribution_id.clone(),
         });
     }
-    let canonical_tail = last_event_sequence_from_database(db).await?;
+    let canonical_tail = last_sequence(db).await?;
     let expected_sequence = canonical_tail.map_or(0, |tail| tail.saturating_add(1));
     if event.sequence != expected_sequence {
         return Err(SessionDbError::InvalidCanonicalAppendSequence {
@@ -3405,7 +3379,7 @@ async fn validate_append_postconditions(
     db: &dyn Database,
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
-    let canonical_tail = last_event_sequence_from_database(db).await?;
+    let canonical_tail = last_sequence(db).await?;
     if canonical_tail != Some(event.sequence) {
         return Err(SessionDbError::InvalidCanonicalAppendSequence {
             expected: event.sequence,
@@ -3440,27 +3414,6 @@ async fn validate_append_postconditions(
         });
     }
     validate_context_occupancy_precondition(db, event).await
-}
-
-fn compaction_boundary(event: &SessionEvent) -> SessionDbResult<Option<u64>> {
-    let boundary = match &event.kind {
-        SessionEventKind::ContextCompacted {
-            compacted_through_sequence,
-            ..
-        }
-        | SessionEventKind::ProviderContextCompacted {
-            compacted_through_sequence,
-            ..
-        } => *compacted_through_sequence,
-        _ => return Ok(None),
-    };
-    if boundary > event.sequence {
-        return Err(SessionDbError::InvalidCompactionMarker {
-            sequence: event.sequence,
-            message: format!("compacted boundary #{boundary} is later than its marker"),
-        });
-    }
-    Ok(Some(boundary))
 }
 
 async fn project_migration_model_context_event(
@@ -4606,28 +4559,6 @@ fn required_i64(row: &switchy::database::Row, column: &str) -> SessionDbResult<i
         })
 }
 
-fn compatible_event_from_row(
-    row: &switchy::database::Row,
-    session_id: SessionId,
-) -> SessionDbResult<CompatibleSessionEvent> {
-    let event_seq = required_non_negative_u64(row, "event_seq")?;
-    let payload = required_string(row, "payload")?;
-    let decoded = decode_session_event_compatible(&payload)?;
-    let event = decoded.event();
-    if event.sequence != event_seq {
-        return Err(SessionDbError::InvalidCanonicalSequence {
-            expected: event_seq,
-            actual: event.sequence,
-        });
-    }
-    if event.session_id != session_id {
-        return Err(SessionDbError::InvalidRow {
-            column: "events.session_id".to_owned(),
-        });
-    }
-    Ok(decoded)
-}
-
 fn required_non_negative_u64(row: &switchy::database::Row, column: &str) -> SessionDbResult<u64> {
     let value = required_i64(row, column)?;
     if value.is_negative() {
@@ -4716,6 +4647,7 @@ const fn bool_to_value(value: bool) -> DatabaseValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persisted::decode_session_event_compatible;
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, RequestContextObservation,
         RequestContextTokenCount,
