@@ -53,6 +53,22 @@ if actual != expected:
             print(f"  manifests: {actual.get(plugin_id)}", file=sys.stderr)
     raise SystemExit(1)
 
+import re
+
+publisher = re.compile(
+    r"ToolContributionEnvelope::new\(\s*ToolContributionPlacement::(?:Request|Progress|Result)"
+    r"|emit_tool_contribution\(\s*[^,]+,\s*ToolContributionPlacement::(?:Request|Progress|Result)",
+    re.MULTILINE,
+)
+for plugin_path in sorted(Path("plugins").glob("*-plugin")):
+    for source_path in plugin_path.rglob("*.rs"):
+        source = source_path.read_text()
+        if publisher.search(source):
+            raise SystemExit(
+                f"{source_path}: production plugins must publish invocation-owned presentations; "
+                "primary ToolContribution placement is historical compatibility only"
+            )
+
 print(
     "plugin presentation manifest inventory passed "
     f"({sum(len(value[0]) for value in actual.values())} visual adapters, "

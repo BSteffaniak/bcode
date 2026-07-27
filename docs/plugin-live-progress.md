@@ -134,10 +134,14 @@ host metadata or outcome fallback.
 
 ## Compatibility
 
-Historical `ToolContributionEnvelope` placement remains decodable. Chronological compatibility
-projection maps the latest compatible request/progress/result contribution to the invocation's
-current primary item, preserves explicit supplementals independently, and keeps hidden/unplaced
-payloads invisible. New primary producers must not rely on this placement model.
+Historical `ToolContributionEnvelope` placement remains decodable for the supported history contract.
+It is not scheduled for time-based removal: removal requires an explicit supported-history migration
+or version cutoff, fixtures proving older sessions are intentionally no longer supported, and
+coordinated updates to persisted decoding, compatibility projection, architecture documentation,
+and mechanical guards. Chronological compatibility projection maps the latest compatible
+request/progress/result contribution to the invocation's current primary item, preserves explicit
+supplementals independently, and keeps hidden/unplaced payloads invisible. New primary producers
+must not rely on this placement model.
 
 ## Troubleshooting
 

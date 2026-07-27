@@ -51,3 +51,4 @@ Audit rules:
 * Read-only filesystem results may use canonical typed results as the durable semantic source; a native request presentation does not require duplicate durable output.
 * Unknown dynamic-plugin schemas intentionally use canonical fallback until that renderer has an optional native adapter. Raw opaque payloads are not fallback content.
 * `ToolContributionPlaced` and placement-based projection remain historical/supplemental compatibility only.
+* Legacy placement decode has no date-based removal target. Removal requires an explicit supported-history migration or version cutoff plus coordinated persisted-decoder, projection, fixture, documentation, and guard updates.

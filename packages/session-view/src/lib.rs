@@ -7130,6 +7130,33 @@ mod tests {
         view.apply_event(&event(
             session_id,
             3,
+            SessionEventKind::AssistantMessage {
+                text: "assistant interleave".to_owned(),
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            4,
+            SessionEventKind::AssistantReasoningActivity {
+                turn_id: "turn-1".to_owned(),
+                activity: bcode_session_models::ReasoningActivity {
+                    activity_id: "reasoning-interleave".to_owned(),
+                    order: 0,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    parts: vec![bcode_session_models::ReasoningPart {
+                        part_id: "summary-0".to_owned(),
+                        kind: bcode_session_models::ReasoningContentKind::Summary,
+                        role: bcode_session_models::ReasoningContentRole::Milestone,
+                        order: 0,
+                        text: "reasoning interleave".to_owned(),
+                    }],
+                    opaque: false,
+                },
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            5,
             SessionEventKind::PermissionRequested {
                 permission_id: "permission-1".to_owned(),
                 tool_call_id: "call-1".to_owned(),
@@ -7187,6 +7214,18 @@ mod tests {
                 .iter()
                 .any(|item| item.id == TranscriptViewItemId::event(2))
         );
+        assert!(
+            after
+                .iter()
+                .any(|item| item.id == TranscriptViewItemId::event(3))
+        );
+        assert!(after.iter().any(|item| {
+            matches!(
+                &item.kind,
+                TranscriptViewItemKind::ReasoningActivity { activity }
+                    if activity.activity_id == "reasoning-interleave"
+            )
+        }));
         assert!(
             after
                 .iter()
@@ -7474,7 +7513,8 @@ mod tests {
     }
 
     #[test]
-    fn primary_contributions_replace_one_item_and_supplementals_coexist() {
+    #[allow(clippy::too_many_lines)] // One historical stream proves primary replacement, supplemental identity, and hidden-state behavior together.
+    fn historical_placement_events_project_chronologically_with_supplementals_and_hidden_state() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
         let contribution = |id: &str, sequence, placement| {
@@ -7517,25 +7557,30 @@ mod tests {
             bcode_session_models::ToolContributionPlacement::Progress,
         ));
         view.apply_event(&contribution(
-            "supplemental-one",
+            "hidden",
             4,
+            bcode_session_models::ToolContributionPlacement::Hidden,
+        ));
+        view.apply_event(&contribution(
+            "supplemental-one",
+            5,
             bcode_session_models::ToolContributionPlacement::Supplemental,
         ));
         view.apply_event(&contribution(
             "supplemental-two",
-            5,
+            6,
             bcode_session_models::ToolContributionPlacement::Supplemental,
         ));
         let remove_replaced_request = event(
             session_id,
-            6,
+            7,
             SessionEventKind::ToolContributionPlaced {
                 envelope: bcode_session_models::ToolContributionEnvelope::new(
                     bcode_session_models::ToolContributionPlacement::Request,
                     bcode_session_models::ToolContributionEvent {
                         invocation_id: "call-1".to_owned(),
                         contribution_id: "request-one".to_owned(),
-                        sequence: 6,
+                        sequence: 7,
                         producer_id: "test.plugin".to_owned(),
                         schema: "test.visual".to_owned(),
                         schema_version: 1,
@@ -7559,6 +7604,13 @@ mod tests {
             .revision;
         assert_eq!(request_revision, 2);
         assert_eq!(items.iter().filter(|item| item.id == request_id).count(), 1);
+        assert!(!items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                TranscriptViewItemKind::ToolContribution { contribution, .. }
+                    if contribution.contribution_id == "hidden"
+            )
+        }));
         assert!(matches!(
             &items[0].kind,
             TranscriptViewItemKind::ToolContribution {
