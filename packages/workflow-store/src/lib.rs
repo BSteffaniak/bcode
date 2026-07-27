@@ -1765,6 +1765,98 @@ impl WorkflowStore {
             .map_err(WorkflowStoreError::from)
     }
 
+    /// Acquire all declared resources for one activation before dispatch admission.
+    ///
+    /// Acquisitions use deterministic claim order and stable lease identities. Any conflict rolls
+    /// back the complete set, so parallel branches never partially hold resources.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed claims, incompatible active leases, or database failure.
+    fn acquire_activation_resources(
+        &mut self,
+        activation: &PendingActivation,
+        acquired_at_ms: u64,
+    ) -> Result<(), WorkflowStoreError> {
+        let mut claims = activation.node.resources.clone();
+        claims.sort_by(|left, right| left.resource.cmp(&right.resource));
+        let transaction = self.connection.transaction()?;
+        for claim in claims {
+            let mode = match claim.access {
+                bcode_workflow::ResourceAccess::Read => ResourceLeaseMode::Read,
+                bcode_workflow::ResourceAccess::Write => ResourceLeaseMode::Write,
+            };
+            let lease = WorkflowResourceLease {
+                lease_id: format!(
+                    "{}:{}:{}",
+                    activation.activation_id,
+                    claim.resource,
+                    mode.as_str()
+                ),
+                run_id: activation.run_id.clone(),
+                node_id: activation.node_id.clone(),
+                activation_id: activation.activation_id.clone(),
+                resource_key: claim.resource,
+                mode,
+                acquired_at_ms,
+                expires_at_ms: None,
+            };
+            let existing = resource_lease(&transaction, &lease.lease_id)?;
+            if let Some((existing, released_at_ms)) = existing {
+                if existing == lease && released_at_ms.is_none() {
+                    continue;
+                }
+                return Err(WorkflowStoreError::InvalidData(format!(
+                    "workflow resource lease identity conflict: {}",
+                    lease.lease_id
+                )));
+            }
+            let conflict: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_resource_leases \
+                 WHERE run_id = ?1 AND resource_key = ?2 AND released_at_ms IS NULL \
+                 AND (expires_at_ms IS NULL OR expires_at_ms > ?3) \
+                 AND (?4 = 'write' OR mode = 'write'))",
+                (
+                    &lease.run_id,
+                    &lease.resource_key,
+                    lease.acquired_at_ms,
+                    lease.mode.as_str(),
+                ),
+                |row| row.get(0),
+            )?;
+            if conflict {
+                return Err(WorkflowStoreError::InvalidData(format!(
+                    "workflow resource is already leased incompatibly: {}",
+                    lease.resource_key
+                )));
+            }
+            transaction.execute(
+                "INSERT INTO workflow_resource_leases \
+                 (lease_id, run_id, node_id, activation_id, resource_key, mode, acquired_at_ms, expires_at_ms) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (
+                    &lease.lease_id,
+                    &lease.run_id,
+                    &lease.node_id,
+                    &lease.activation_id,
+                    &lease.resource_key,
+                    lease.mode.as_str(),
+                    lease.acquired_at_ms,
+                    lease.expires_at_ms,
+                ),
+            )?;
+            append_event(
+                &transaction,
+                &lease.run_id,
+                "resource_lease_acquired",
+                &serde_json::to_string(&lease)?,
+                acquired_at_ms,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Admit and dispatch a bounded snapshot of pending executable activations.
     ///
     /// For each activation, owner planning happens before mutation, then activation reservation and
@@ -1818,6 +1910,13 @@ impl WorkflowStore {
                 summary.unsupported.push(activation.activation_id);
                 continue;
             };
+            if let Err(error) = self.acquire_activation_resources(&activation, dispatched_at_ms) {
+                if error.to_string().contains("already leased incompatibly") {
+                    summary.raced.push(activation.activation_id);
+                    continue;
+                }
+                return Err(error);
+            }
             let Some(prepared) = self.prepare_pending_activation(
                 &activation.run_id,
                 &activation.node_id,
@@ -3878,6 +3977,13 @@ where
         output.created_at_ms,
     )?;
     let (activated, completed_is_exit) = materialize_direct_successors(transaction, output, fault)?;
+    let parallel_failure = settle_wait_all_parallel_failure(
+        transaction,
+        &output.run_id,
+        &output.node_id,
+        output.created_at_ms,
+    )?
+    .unwrap_or(false);
     fault.after_boundary(WorkflowOutputBoundary::SuccessorsMaterialized, output)?;
     let active_count: u64 = transaction.query_row(
         "SELECT COUNT(*) FROM workflow_activations WHERE run_id = ?1 \
@@ -3885,7 +3991,9 @@ where
         [&output.run_id],
         |row| row.get(0),
     )?;
-    let run_status = if active_count == 0 && completed_is_exit {
+    let run_status = if parallel_failure {
+        RunStatus::Failed
+    } else if active_count == 0 && completed_is_exit {
         transaction.execute(
             "UPDATE workflow_runs SET status = 'completed', updated_at_ms = ?2 \
              WHERE run_id = ?1 AND status = 'running'",
@@ -4426,6 +4534,108 @@ fn cancellation_requested_for_run(
         .map_err(WorkflowStoreError::from)
 }
 
+fn settle_wait_all_parallel_failure(
+    transaction: &Transaction<'_>,
+    run_id: &str,
+    member_node_id: &str,
+    settled_at_ms: u64,
+) -> Result<Option<bool>, WorkflowStoreError> {
+    let (definition_json, generation): (String, u64) = transaction.query_row(
+        "SELECT definition.definition_json, activation.dependency_generation \
+         FROM workflow_runs run \
+         JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+           AND definition.version = run.definition_version \
+         JOIN workflow_activations activation ON activation.run_id = run.run_id \
+           AND activation.node_id = ?2 \
+         WHERE run.run_id = ?1",
+        (run_id, member_node_id),
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+    for join in definition
+        .nodes
+        .values()
+        .filter(|node| node.kind == bcode_workflow::NodeKind::Parallel)
+    {
+        let left = configured_node_ids(&join.configuration, "left_exits")?;
+        let right = configured_node_ids(&join.configuration, "right_exits")?;
+        let members = left.into_iter().chain(right).collect::<Vec<_>>();
+        if !members.iter().any(|member| member == member_node_id) {
+            continue;
+        }
+        let policy: bcode_workflow::ParallelFailurePolicy = serde_json::from_value(
+            join.configuration
+                .get("failure_policy")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!("wait_all")),
+        )?;
+        if policy != bcode_workflow::ParallelFailurePolicy::WaitAll {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "unsupported durable parallel failure policy for {}: {policy:?}",
+                join.id
+            )));
+        }
+        let mut outcomes = Vec::with_capacity(members.len());
+        let mut all_terminal = true;
+        let mut has_failure = false;
+        for member in members {
+            let status: Option<String> = transaction
+                .query_row(
+                    "SELECT status FROM workflow_activations WHERE run_id = ?1 AND node_id = ?2 \
+                     AND dependency_generation = ?3",
+                    (run_id, &member, generation),
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let terminal = status.as_deref().is_some_and(|status| {
+                matches!(status, "completed" | "skipped" | "failed" | "cancelled")
+            });
+            all_terminal &= terminal;
+            has_failure |= status
+                .as_deref()
+                .is_some_and(|status| matches!(status, "failed" | "cancelled"));
+            outcomes.push(serde_json::json!({"node_id": member, "status": status}));
+        }
+        if all_terminal && has_failure {
+            let value = serde_json::json!({
+                "policy": policy,
+                "generation": generation,
+                "members": outcomes,
+                "outcome": "failed",
+            });
+            transaction.execute(
+                "INSERT INTO workflow_decisions \
+                 (decision_id, run_id, node_id, decision_type, value_json, created_at_ms) \
+                 VALUES (?1, ?2, ?3, 'parallel_wait_all', ?4, ?5) \
+                 ON CONFLICT(decision_id) DO NOTHING",
+                (
+                    format!("{run_id}:{}:{generation}:parallel-wait-all", join.id),
+                    run_id,
+                    &join.id,
+                    serde_json::to_string(&value)?,
+                    settled_at_ms,
+                ),
+            )?;
+            transaction.execute(
+                "UPDATE workflow_runs SET status = 'failed', updated_at_ms = ?2 \
+                 WHERE run_id = ?1 AND status = 'running'",
+                (run_id, settled_at_ms),
+            )?;
+            append_event(
+                transaction,
+                run_id,
+                "parallel_join_failed",
+                &serde_json::json!({"join_node_id": join.id, "decision": value}).to_string(),
+                settled_at_ms,
+            )?;
+            return Ok(Some(true));
+        }
+        return Ok(Some(false));
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_lines)]
 fn apply_attempt_observation(
     transaction: &Transaction<'_>,
     request: &AttemptReconciliationRequest,
@@ -4465,11 +4675,19 @@ fn apply_attempt_observation(
                     request.dispatch_identity
                 )));
             }
-            transaction.execute(
-                "UPDATE workflow_runs SET status = 'failed', updated_at_ms = ?2 \
-                 WHERE run_id = ?1 AND status = 'running'",
-                (&request.run_id, reconciled_at_ms),
+            let parallel_state = settle_wait_all_parallel_failure(
+                transaction,
+                &request.run_id,
+                &request.node_id,
+                reconciled_at_ms,
             )?;
+            if parallel_state.is_none() {
+                transaction.execute(
+                    "UPDATE workflow_runs SET status = 'failed', updated_at_ms = ?2 \
+                     WHERE run_id = ?1 AND status = 'running'",
+                    (&request.run_id, reconciled_at_ms),
+                )?;
+            }
             append_event(
                 transaction,
                 &request.run_id,
@@ -8431,6 +8649,78 @@ mod tests {
         assert_eq!(completed, 1);
     }
 
+    #[tokio::test]
+    async fn dispatch_admission_enforces_declared_resources_and_run_concurrency() {
+        struct Owner;
+        impl ActivationDispatchOwner for Owner {
+            fn plan(
+                &self,
+                _activation: &PendingActivation,
+            ) -> Result<Option<ActivationDispatchPlan>, WorkflowStoreError> {
+                Ok(Some(ActivationDispatchPlan {
+                    side_effect: DispatchSideEffect::ReadOnly,
+                    intent: serde_json::json!({"operation": "read"}),
+                }))
+            }
+
+            fn dispatch<'a>(
+                &'a self,
+                _request: &'a PreparedActivationDispatch,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<serde_json::Value, WorkflowStoreError>> + Send + 'a>,
+            > {
+                Box::pin(async { Ok(serde_json::json!({"accepted": true})) })
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp");
+        let mut definition = parallel_join_definition();
+        definition.nodes.get_mut("left").expect("left").resources =
+            vec![bcode_workflow::ResourceClaim::write("repository")];
+        definition.nodes.get_mut("right").expect("right").resources =
+            vec![bcode_workflow::ResourceClaim::write("repository")];
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("parallel-resource", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "parallel-resource-run".to_string(),
+                definition_id: "parallel-resource".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                binding: None,
+                input: Some(serde_json::json!(1)),
+                created_at_ms: 1,
+                limits: WorkflowRunLimits {
+                    concurrency_cap: 2,
+                    ..WorkflowRunLimits::default()
+                },
+            })
+            .expect("run");
+        let summary = store
+            .dispatch_pending_activations(&Owner, 10, 2)
+            .await
+            .expect("dispatch");
+        assert_eq!(summary.admitted.len(), 1);
+        assert_eq!(summary.raced.len(), 1);
+        assert_eq!(
+            store
+                .resource_leases_for_run("parallel-resource-run", 10)
+                .expect("leases")
+                .len(),
+            1
+        );
+        assert_eq!(
+            store
+                .attempt_history("parallel-resource-run", None, 10)
+                .expect("attempts")
+                .len(),
+            1
+        );
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn decisions_grants_leases_and_checkpoints_are_durable_and_fail_closed() {
@@ -8963,6 +9253,104 @@ mod tests {
             )
             .expect("join count");
         assert_eq!(join_count, 1);
+    }
+
+    #[test]
+    fn wait_all_parallel_failure_persists_only_after_all_members_settle() {
+        struct FailedObserver;
+        impl AttemptStatusObserver for FailedObserver {
+            fn observe(
+                &self,
+                _request: &AttemptReconciliationRequest,
+            ) -> Result<AttemptObservation, WorkflowStoreError> {
+                Ok(AttemptObservation::Failed {
+                    message: "branch failed".to_string(),
+                })
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp");
+        let definition = parallel_join_definition();
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("parallel-failure", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "parallel-failure-run".to_string(),
+                definition_id: "parallel-failure".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                binding: None,
+                input: Some(serde_json::json!(1)),
+                created_at_ms: 1,
+                limits: WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let left = store
+            .prepare_pending_activation(
+                "parallel-failure-run",
+                "left",
+                &activation_identity("parallel-failure-run", "left", 0),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"branch": "left"}),
+                2,
+            )
+            .expect("prepare")
+            .expect("left");
+        store
+            .persist_dispatch_receipt(&DispatchReceipt {
+                run_id: "parallel-failure-run".to_string(),
+                node_id: "left".to_string(),
+                activation_id: left.activation.activation_id,
+                attempt: left.attempt,
+                dispatch_identity: left.dispatch_identity,
+                receipt: serde_json::json!({"accepted": true}),
+                admitted_at_ms: 3,
+            })
+            .expect("receipt");
+        store
+            .reconcile_receipt_backed_attempts(&FailedObserver, 10, 4)
+            .expect("left failure");
+        assert_eq!(
+            store
+                .run_summary("parallel-failure-run")
+                .expect("run")
+                .expect("run")
+                .status,
+            RunStatus::Running
+        );
+        drop(store);
+
+        let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        reopened
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "right-output".to_string(),
+                run_id: "parallel-failure-run".to_string(),
+                node_id: "right".to_string(),
+                activation_id: activation_identity("parallel-failure-run", "right", 0),
+                schema_id: definition.nodes["right"].output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 5,
+            })
+            .expect("right output");
+        let decision = reopened
+            .decision("parallel-failure-run:join:0:parallel-wait-all")
+            .expect("decision")
+            .expect("settlement");
+        assert_eq!(decision.value["policy"], "wait_all");
+        assert_eq!(decision.value["outcome"], "failed");
+        assert_eq!(
+            reopened
+                .run_summary("parallel-failure-run")
+                .expect("run")
+                .expect("run")
+                .status,
+            RunStatus::Failed
+        );
     }
 
     #[test]

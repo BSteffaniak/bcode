@@ -4053,6 +4053,30 @@ mod tests {
     use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn shell_manifest_declares_valid_workflow_block_contract() {
+        let manifest: PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/shell-plugin/bcode-plugin.toml"
+        ))
+        .expect("shell manifest");
+        let service = manifest
+            .services
+            .iter()
+            .find(|service| service.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
+            .expect("workflow block service");
+        assert_eq!(service.workflow_blocks.len(), 1);
+        let block = &service.workflow_blocks[0];
+        block.validate().expect("valid workflow block");
+        assert_eq!(block.block_id, "shell.command-plan");
+        assert_eq!(block.plugin_id, manifest.id);
+        assert_eq!(block.effect, bcode_workflow::WorkflowBlockEffect::Mutating);
+        assert!(block.authorization.explicit_grant_required);
+        assert_eq!(
+            block.reconciliation,
+            bcode_workflow::WorkflowBlockReconciliation::RepairRequired
+        );
+    }
+
+    #[test]
     fn code_review_manifest_declares_valid_workflow_block_contract() {
         let manifest: PluginManifest = toml::from_str(include_str!(
             "../../../plugins/code-review-plugin/bcode-plugin.toml"

@@ -30,6 +30,83 @@ pub const SHELL_RECORDING_MEDIA_TYPE: &str = "application/x-bcode-shell-recordin
 /// Current authoritative shell recording content type.
 pub const SHELL_RECORDING_CONTENT_TYPE: &str = "application/x-bcode-shell-recording; version=3";
 
+/// Current typed command-plan workflow block contract version.
+pub const SHELL_COMMAND_PLAN_VERSION: u32 = 1;
+
+/// One argv-mode command. No implicit shell-string parsing is performed.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellWorkflowCommand {
+    pub argv: Vec<String>,
+    pub timeout_ms: u64,
+    pub continue_on_nonzero: bool,
+}
+
+/// Explicit environment policy for a workflow command plan.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellWorkflowEnvironment {
+    pub inherit: bool,
+    pub set: std::collections::BTreeMap<String, String>,
+}
+
+/// Bounded output retention policy.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellWorkflowOutputPolicy {
+    pub preview_bytes: u32,
+    pub artifact_spill: bool,
+}
+
+/// Typed procedural workflow command plan.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellWorkflowCommandPlan {
+    pub version: u32,
+    pub cwd: PathBuf,
+    pub commands: Vec<ShellWorkflowCommand>,
+    pub environment: ShellWorkflowEnvironment,
+    pub output: ShellWorkflowOutputPolicy,
+}
+
+/// Stable terminal state for one command in a workflow plan.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellWorkflowCommandStatus {
+    Exited,
+    SpawnFailed,
+    TimedOut,
+    Cancelled,
+}
+
+/// Typed result for one command, preserving declaration order by index.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellWorkflowCommandResult {
+    pub index: u32,
+    pub status: ShellWorkflowCommandStatus,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub duration_ms: u64,
+    pub stdout_preview: String,
+    pub stderr_preview: String,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+/// Typed final command-plan result.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShellWorkflowCommandPlanResult {
+    pub version: u32,
+    pub passed: bool,
+    pub commands: Vec<ShellWorkflowCommandResult>,
+    pub artifacts: Vec<bcode_workflow::ArtifactReference>,
+}
+
 /// Input payload for one shell execution invocation.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ShellRunArguments {
@@ -116,6 +193,67 @@ const fn default_format_commands() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_command_plan_contract_is_versioned_bounded_and_argv_explicit() {
+        let plan = ShellWorkflowCommandPlan {
+            version: SHELL_COMMAND_PLAN_VERSION,
+            cwd: PathBuf::from("workspace"),
+            commands: vec![ShellWorkflowCommand {
+                argv: vec!["cargo".to_string(), "test".to_string()],
+                timeout_ms: 30_000,
+                continue_on_nonzero: false,
+            }],
+            environment: ShellWorkflowEnvironment {
+                inherit: false,
+                set: std::collections::BTreeMap::from([("CI".to_string(), "true".to_string())]),
+            },
+            output: ShellWorkflowOutputPolicy {
+                preview_bytes: 4096,
+                artifact_spill: true,
+            },
+        };
+        let payload = serde_json::to_value(&plan).expect("encode");
+        assert_eq!(payload["version"], 1);
+        assert_eq!(
+            payload["commands"][0]["argv"],
+            serde_json::json!(["cargo", "test"])
+        );
+        assert_eq!(
+            serde_json::from_value::<ShellWorkflowCommandPlan>(payload).expect("decode"),
+            plan
+        );
+    }
+
+    #[test]
+    fn workflow_command_plan_result_carries_terminal_detail_and_artifacts() {
+        let result = ShellWorkflowCommandPlanResult {
+            version: SHELL_COMMAND_PLAN_VERSION,
+            passed: false,
+            commands: vec![ShellWorkflowCommandResult {
+                index: 0,
+                status: ShellWorkflowCommandStatus::Exited,
+                exit_code: Some(1),
+                signal: None,
+                duration_ms: 12,
+                stdout_preview: String::new(),
+                stderr_preview: "failed".to_string(),
+                stdout_truncated: false,
+                stderr_truncated: true,
+            }],
+            artifacts: vec![bcode_workflow::ArtifactReference::new(
+                "stderr-1",
+                "bcode.shell.stderr",
+                1,
+                "text/plain",
+                "shell/stderr-1.txt",
+            )],
+        };
+        let payload = serde_json::to_value(&result).expect("encode");
+        assert_eq!(payload["passed"], false);
+        assert_eq!(payload["commands"][0]["status"], "exited");
+        assert_eq!(payload["artifacts"][0]["artifact_id"], "stderr-1");
+    }
 
     #[test]
     fn shell_control_schema_round_trips_resize() {

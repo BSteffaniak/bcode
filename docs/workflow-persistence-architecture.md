@@ -109,11 +109,22 @@ selected successor activation. A failure after that insertion rolls back the dec
 markers, output, and activation together, allowing restart to recompute the same decision from the
 persisted definition and source input.
 
+Before attempt reservation, dispatch admission acquires every node-declared resource claim in
+canonical resource-key order using stable activation-derived lease identities. Reader/writer
+conflicts roll back the entire acquisition transaction, so parallel siblings never partially hold a
+claim. Attempt reservation then enforces the persisted run concurrency cap before external dispatch.
+
 Canonical fan-out results use version 1 `{ index, value }` members in strict contiguous ascending
 input-index order. This shape is independent of completion order and rejects sparse or reordered
 members. The in-process SDK implementation enforces bounded concurrency and preserves this ordering,
 but production `FanOut` remains rejected until durable item admission, resource/cancellation state,
 and restart-safe partial completion are implemented.
+
+For supported wait-all joins, a failed member does not terminate the run while another member is
+non-terminal. Once all declared members are terminal, the store persists one generation-scoped
+ordered member-outcome decision and fails the run if any member failed or was cancelled. This
+settlement is restart-safe because it derives entirely from persisted activations. Fail-fast remains
+rejected until sibling cancellation intent and terminal outcomes are durably recorded.
 
 Canonical parallel joins declare non-empty, disjoint `left_exits` and `right_exits` sets whose
 members have direct edges to the join. Durable materialization always serializes the tuple as

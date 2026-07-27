@@ -35,7 +35,7 @@ use contracts::{
     DEFAULT_SHELL_TIMEOUT_MS, SHELL_INVOCATION_INPUT_SCHEMA, SHELL_RECORDING_CONTENT_TYPE,
     SHELL_RECORDING_REF_KEY, SHELL_RUN_SCHEMA, SHELL_RUN_TOOL_NAME, SHELL_SCHEMA_VERSION,
     ShellInvocationAction, ShellLiveRecordingPayload, ShellRunArguments, ShellRunResult,
-    TERMINAL_PTY_STREAM_CONTENT_TYPE, TERMINAL_PTY_STREAM_REF_KEY,
+    ShellWorkflowCommandPlan, TERMINAL_PTY_STREAM_CONTENT_TYPE, TERMINAL_PTY_STREAM_REF_KEY,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -68,6 +68,9 @@ impl RustPlugin for ShellPlugin {
 }
 
 fn invoke_shell_service(context: &NativeServiceContext) -> ServiceResponse {
+    if context.request.interface_id == bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID {
+        return invoke_workflow_block_contract(context);
+    }
     if context.request.interface_id != TOOL_SERVICE_INTERFACE_ID {
         return ServiceResponse::error(
             "unsupported_interface",
@@ -252,6 +255,52 @@ fn shell_tool_definition() -> ToolDefinition {
                     }
                 }),
             }
+}
+
+fn invoke_workflow_block_contract(context: &NativeServiceContext) -> ServiceResponse {
+    if context.request.operation != "shell.command-plan" {
+        return ServiceResponse::error(
+            "unsupported_operation",
+            "unsupported shell workflow block operation",
+        );
+    }
+    if context.cancellation.is_cancelled() {
+        return ServiceResponse::error("cancelled", "shell command plan cancelled");
+    }
+    let plan = match context.request.payload_json::<ShellWorkflowCommandPlan>() {
+        Ok(plan) => plan,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    if plan.version != contracts::SHELL_COMMAND_PLAN_VERSION
+        || plan.commands.is_empty()
+        || plan.commands.len() > 64
+        || plan.cwd.is_absolute()
+        || plan.cwd.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+        || plan.commands.iter().any(|command| {
+            command.argv.is_empty()
+                || command.argv.len() > 256
+                || command.timeout_ms == 0
+                || command.timeout_ms > 300_000
+        })
+        || plan.environment.set.len() > 128
+        || plan.output.preview_bytes > 65_536
+    {
+        return ServiceResponse::error(
+            "invalid_request",
+            "shell command plan exceeds version, path, command, timeout, environment, or output bounds",
+        );
+    }
+    ServiceResponse::error(
+        "not_implemented",
+        "shell command-plan execution is not enabled until durable receipt/output handling is complete",
+    )
 }
 
 fn list_tools(request: &ServiceRequest) -> ServiceResponse {
