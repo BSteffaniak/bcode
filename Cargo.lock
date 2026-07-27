@@ -2371,6 +2371,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_session_models",
  "bcode_tool",
+ "proptest",
  "serde",
  "serde_json",
 ]

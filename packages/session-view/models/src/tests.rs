@@ -1,4 +1,5 @@
 use super::*;
+use proptest::prelude::*;
 
 #[test]
 fn tool_presentation_slot_ids_are_stable_and_supplementals_are_independent() {
@@ -708,6 +709,54 @@ fn patch_size_measurements_cover_incremental_and_reset_workloads() {
     );
 }
 
+proptest! {
+    #[test]
+    fn transcript_patch_matches_fresh_materialization_for_compatible_documents(
+        base_len in 0_usize..24,
+        removed in proptest::collection::btree_set(0_usize..24, 0..24),
+        replaced in proptest::collection::btree_set(0_usize..24, 0..24),
+        appended_len in 0_usize..12,
+    ) {
+        let base_items = (0..base_len)
+            .map(|index| transcript_item(
+                &format!("item-{index}"),
+                u64::try_from(index.saturating_add(1)).expect("bounded sequence"),
+                "base",
+            ))
+            .collect::<Vec<_>>();
+        let base = transcript_document_from_vec(1, base_items);
+        let mut next_items = base
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !removed.contains(index))
+            .map(|(index, item)| {
+                let mut item = item.clone();
+                if replaced.contains(&index) {
+                    item.revision = item.revision.saturating_add(1);
+                    item.kind = TranscriptViewItemKind::SystemMessage {
+                        message: ChatMessageView::plain("replaced"),
+                    };
+                }
+                item
+            })
+            .collect::<Vec<_>>();
+        next_items.extend((0..appended_len).map(|index| {
+            let sequence = base_len.saturating_add(index).saturating_add(1);
+            transcript_item(
+                &format!("appended-{index}"),
+                u64::try_from(sequence).expect("bounded sequence"),
+                "appended",
+            )
+        }));
+        let next = transcript_document_from_vec(2, next_items);
+        let patch = SessionViewPatch::transcript_between(1, 2, None, &base, &next);
+        let mut applied = base;
+        applied.apply_patch(&patch).expect("generated compatible patch applies");
+        prop_assert_eq!(applied, next);
+    }
+}
+
 fn assert_serialized_patch_smaller(
     workload: &str,
     patch: &SessionViewPatch,
@@ -730,6 +779,22 @@ fn transcript_document<const N: usize>(
     let mut document = TranscriptViewDocument {
         revision,
         items: items.into(),
+        source_start_sequence: None,
+        source_end_sequence: None,
+        has_older_history: false,
+        has_newer_history: false,
+    };
+    document.refresh_source_bounds();
+    document
+}
+
+fn transcript_document_from_vec(
+    revision: ViewRevision,
+    items: Vec<TranscriptViewItem>,
+) -> TranscriptViewDocument {
+    let mut document = TranscriptViewDocument {
+        revision,
+        items,
         source_start_sequence: None,
         source_end_sequence: None,
         has_older_history: false,

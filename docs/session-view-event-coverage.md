@@ -9,6 +9,24 @@ Status meanings:
 * **Missing**: renderer-relevant semantics exist in the TUI or host flow but are absent from the shared projection.
 * **Intentional no-op**: the event has no renderer-semantic state to share at present.
 
+## Updateable tool transcript migration
+
+The coverage statuses below describe the currently implemented event projection. The target
+composition is one stable primary transcript item per invocation, updated by monotonic revision and
+closed without a separate final presentation object. Existing request/progress/result placement rows
+remain compatibility coverage until all producers and renderers migrate; they are not the target
+extension contract.
+
+Required migration invariants:
+
+* request metadata, current plugin visual, lifecycle/timing, and canonical model result converge in
+  one invocation-owned primary item;
+* completion preserves the latest retained presentation and rejects later updates;
+* active-only request/progress state is absent from durable replay;
+* TUI and HyperChad consume revision-checked shared patches/snapshots rather than independently
+  resolving source precedence;
+* final live, reconnect, and durable replay projection agree for closed invocations.
+
 ## Durable `SessionEventKind` coverage
 
 | Event | `SessionView` behavior | Established TUI behavior | Shared status / next action |
@@ -68,7 +86,10 @@ Status meanings:
 | `AssistantReasoningDelta` | Cumulatively updates reasoning item and thinking state without overriding renderer-selected visibility. | Upserts terminal reasoning presentation by shared `TranscriptViewItemId` while preserving split-stream boundaries and anchoring. | **Complete** for semantic content, visibility, and canonical projection consumption. |
 | `ToolRequestDraft` | Applies generation/revision-dominant UTF-8-byte append, bounded checkpoint, placement migration, and remove operations to the plugin-declared semantic tool slot. Canonical result, failure, and cancellation sources remain authoritative over stale or terminal draft updates. | Consumes the shared draft item and routes its producer/schema/version through native visual adapters; request drafts bypass the TUI's lossy generic superseding key. Server fan-out publishes latest state on a transport-owned 16 ms cadence without byte thresholds, and attach/reconnect supplies the active bounded checkpoint alongside durable permission/execution state. | **Complete** for live draft projection, reconnect recovery, and final-result replacement semantics; terminal layout and bounded row rendering remain renderer-owned. |
 
-The former `ToolArgumentPreview` and `ToolOutputDelta` channels were removed. Plugin-owned transient contributions and durable request visuals now carry tool visual updates without host-projected partial-argument or output events.
+The former `ToolArgumentPreview` and `ToolOutputDelta` channels were removed. During migration,
+plugin-owned transient contributions and durable request visuals still carry updates through
+compatibility placement. New primary presentation behavior uses invocation-scoped current-item
+replacement and retains only the latest eligible value at closure.
 
 | `RequestContextOccupancyChanged` | Replaces authoritative current occupancy while rejecting stale epoch/sequence updates. | Footer context accounting consumes shared occupancy. | **Complete**. |
 | `ProviderStreamProgress` | Projects turn-correlated human-readable progress and retry timing. | Live provider-stream activity consumes the shared projected detail/timing; trace-only diagnostics remain terminal-local. | **Complete** for semantic progress; animation/timers remain renderer-owned. |

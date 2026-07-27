@@ -89,59 +89,73 @@ attach/resync active checkpoint ────────────────
                          -> TUI or HyperChad native presentation
 ```
 
-Request drafts are keyed by turn, tool call, and generation for transport ordering, while their
-visible identity is the plugin-declared semantic placement slot. Contiguous append batches use UTF-8
-byte offsets; a gap or lag requires a bounded replacement checkpoint. The server publishes latest
-state on a transport-owned 16 ms cadence with no byte threshold; the filesystem adapter bounds even
-a 256 KiB single-line preview to at most 25 rows, 16 KiB total rendered text, and 8 KiB per row. A
-request-targeted draft is retired when the complete durable request takes authority. A result-targeted draft instead remains
-the result-slot preview through permission and execution. Publishing the authoritative
-`ToolInvocationResultRecorded` replaces that same result slot before the server retires the live
-draft, so renderers never observe an intentional blank handoff frame.
+## Updateable transcript document
 
-Slot source precedence is renderer-neutral:
+`SessionView` owns the authoritative renderer-neutral transcript document. Every visible item has a
+stable `TranscriptViewItemId`, a monotonic item revision, and a fixed insertion position. Semantic
+changes replace the item with the same identity; they do not remove and append a second item merely
+because content was produced incrementally or an operation completed.
 
-* Request: durable rich request contribution, request-targeted live draft, compact canonical
-  `ToolCallRequested`, then absent.
-* Result: canonical typed/textual result or artifact, terminal failure/cancellation fallback,
-  durable result contribution, result-targeted live draft, then absent.
+`SessionViewPatch` carries the required base document revision and resulting revision. A renderer
+applies append, replace, and remove operations only when its current revision equals the patch base.
+Replacements must advance the item revision and preserve position. Retained-item reordering,
+bounded-window metadata changes, duplicate identities, or non-append insertion fall back to a
+bounded authoritative reset. Renderers that miss a patch must resynchronize from that reset/snapshot
+rather than retaining partially synchronized semantic state.
 
-Once a canonical final result owns the result slot, stale drafts, lower-authority contributions, and
-lifecycle progress cannot overwrite or remove it. On attach/reconnect, durable permission or waiting
-execution state and the bounded active draft checkpoint are applied together, restoring the latest
-preview without replaying the full log. Durable request/result replay reconstructs the same final
-slot identities; live drafts are intentionally absent after daemon restart.
+The target tool contract reserves one primary identity per invocation. Request metadata, current
+plugin-owned visual payload, canonical model-visible result, lifecycle, and timing are fields of that
+one semantic item rather than separate request/progress/result transcript cards. Repeated output is
+an update to the current item. Completion closes the invocation update scope and preserves the last
+accepted retained presentation; there is no separate visual promotion mode. Independently meaningful
+supporting output may use explicitly keyed supplemental identities.
 
-Execution progress uses one replaceable slot per invocation/contribution identity. Terminal removal
-dominates stale updates. TUI adapters may provide terminal-native frames and HyperChad adapters may
-provide portable cards, but both consume identical `SessionView` semantics. Unknown schemas use a
-compact bounded fallback rather than exposing raw serialized payloads.
+Plugin payloads remain opaque and versioned. Renderers route them by producer, schema, and version,
+but do not infer lifecycle, timing, retention, or transcript identity from tool names or payloads.
+Unknown schemas use compact bounded fallback content and never expose raw argument or contribution
+JSON in normal transcript UI.
 
 Renderer-specific frame cadence, viewport anchoring, animation, hit testing, layout, and paint
-invalidation remain renderer-owned. Semantic generation, ordering, cleanup, and persistence
-classification do not.
+invalidation remain renderer-owned. Semantic generation, ordering, revision acceptance, closure,
+cleanup, and persistence classification do not.
 
-## Tool presentation slots
+## Update and closure semantics
 
-Tool contributions use a versioned `ToolContributionEnvelope` whose renderer-neutral placement is
-`request`, `progress`, `result`, `supplemental`, or `hidden`. Placement is host composition
-semantics, while the nested `ToolContributionEvent` remains an opaque producer-owned payload.
-Legacy unplaced contributions are retained in semantic contribution state but are hidden from normal
-transcript presentation.
+Invocation lifecycle is host-owned and independent from presentation updates. An open invocation
+accepts only authorized monotonically newer updates. Terminal closure is absorbing: it fixes outcome
+and duration, flushes already accepted updates, rejects later updates, and cannot remove the primary
+item. Tool elapsed invalidation is allowed only while authoritative lifecycle is active or waiting;
+terminal presentation never derives timing from a generic transcript `streaming` flag.
 
-`SessionView` owns stable slot identity:
+Presentation retention is orthogonal to whether an update was observed while work was active:
 
-* Request, progress, and result each have one replaceable slot per invocation. They coexist; a
-  result does not erase request context, and canonical semantic `ToolInvocationResultRecorded`
-  remains the authoritative invocation result card.
-* Supplemental slots are independently keyed by contribution identity and retain event order.
-* Hidden contributions have no transcript item.
-* Renderers route visible payloads by producer, schema, and version. Unsupported payloads must not be
-  exposed as serialized JSON in normal transcript UI.
+* **Retain latest:** keep one bounded current value and checkpoint the latest accepted value at the
+  terminal boundary. Primary shell, file-change, Vim edit, and other history-worthy output use this
+  policy.
+* **Active only:** keep bounded state only while the invocation is open and remove it at closure.
+  Sensitive argument drafts, spinners, and intentionally ephemeral diagnostics use this narrowly.
+* **Durable supplemental:** retain explicitly independent supporting output under its own stable
+  supplemental identity.
 
-Raw tool arguments remain available to permission, policy, audit, and explicit diagnostic paths, but
-compact transcript requests do not render them. This contract applies equally to live events and
-durable replay; renderers must not infer placement from tool names, schemas, or contribution IDs.
+Intermediate retained-latest frames are supersedable transport state, not append-only session
+history. Attach/reconnect hydrates the current bounded open checkpoint plus its generation/revision.
+Durable replay reconstructs the latest terminal checkpoint. The final live document, immediate
+reconnect document, and replayed closed document must converge to the same semantic item.
+
+## Legacy contribution-slot compatibility
+
+Persisted `ToolContributionEnvelope` placement (`request`, `progress`, `result`, `supplemental`, or
+`hidden`) remains a decode/replay compatibility fact while producers migrate. Historical events are
+applied chronologically into the current invocation presentation; the latest compatible primary
+update wins, supplemental identities remain independent, and hidden/unplaced payloads stay absent
+from normal transcript UI. New primary presentation APIs must not require plugins to coordinate
+separate request, progress, result, promotion, and removal objects.
+
+Request drafts remain bounded, live-only transport facts. During migration, their declared legacy
+placement identifies which old slot they update, but the target projection adapts them into the
+invocation's current primary presentation. Gaps, lag, reconnect, or truncation require a bounded
+replacement checkpoint. Complete request arguments continue to serve permission, policy, audit, and
+model execution independently from compact transcript presentation.
 
 ## State Authority
 

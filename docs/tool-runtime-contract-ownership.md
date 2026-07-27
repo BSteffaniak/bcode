@@ -58,22 +58,42 @@ One provider tool-call batch is the model's declaration that its calls may overl
 
 A host may explicitly disable parallel execution, and a non-reentrant adapter may serialize internally as a mechanical implementation constraint. Neither case introduces tool-domain policy into canonical orchestration.
 
-## Contribution placement ownership
+## Primary presentation update ownership
 
-A producer must wrap visible contributions in `ToolContributionEnvelope` and explicitly select
-request, progress, result, supplemental, or hidden placement. The host validates producer and
-invocation identity, transports transient envelopes live-only, and persists durable envelopes through
-the append-only placed-contribution session event. Legacy unplaced contributions remain accepted for
-compatibility but default to hidden presentation.
+A tool invocation owns one stable primary transcript presentation identity. A producer updates its
+current opaque payload through an invocation-scoped handle; it does not create distinct live and
+final objects or coordinate request/progress/result promotion. The host validates invocation and
+producer identity, generation, monotonic revision, payload bounds, retention, cancellation, and
+terminal dominance. Plugins continue to own payload schemas, artifact references, and renderer
+adapters.
 
-Placement selects semantic composition only; it never selects a renderer. Request, progress, and
-result contribution slots coexist; result placement does not replace request context or supersede the
-canonical semantic `ToolInvocationResultRecorded` result card. Placement is event-owned rather than
-manifest capability metadata: manifests advertise adapter schemas and versions, while an emitted
-envelope declares the slot used by that specific contribution. Plugins continue to own
-payload schemas and adapters, `SessionView` owns stable slot identity and ordering, and each renderer
-owns native styling. Renderers may expose raw contribution payloads only on an explicit diagnostic or
-developer surface, never as a normal transcript fallback.
+Primary updates use **retain latest** when output should remain in history: the host keeps one
+bounded current value and checkpoints only the latest accepted value at closure. **Active only** is
+explicit and limited to sensitive or intentionally ephemeral state. Independently meaningful
+supporting output may use stable supplemental identities, but supplemental output must not recreate
+phase-based primary cards.
+
+Closure and update delivery share one ordered boundary:
+
+```text
+stop producer acceptance -> flush accepted updates -> apply latest value
+-> record terminal outcome/timing/checkpoint -> close scope
+```
+
+Closed scope state is absorbing. Delayed, duplicate, stale, or otherwise late updates cannot reopen
+the invocation, restart timing, or replace retained output. Generic runtime and renderers never infer
+lifecycle or retention from tool names, payload schemas, placement, or a generic `streaming` flag.
+
+`ToolContributionEnvelope` placement remains supported while existing producers and historical
+sessions migrate. Historical placed events are compatibility inputs: chronological projection adapts
+the latest compatible primary contribution into the invocation's current item, preserves explicit
+supplementals independently, and keeps hidden/unplaced payloads out of normal transcript UI. New
+primary APIs must not require request, progress, or result slot selection.
+
+Manifests advertise adapter schemas and versions, not lifecycle or retention policy. Renderers choose
+compatible native adapters and own styling; they do not resolve competing semantic sources. Raw
+payloads remain available only through explicit diagnostics and never become a normal transcript
+fallback.
 
 ## Artifact write contract
 
@@ -114,27 +134,22 @@ Local cancellation changes active runtime work to `Cancelling` before cleanup be
 
 This separation keeps runtime-work state truthful: `Cancelling` means the owning operation has not yet reported terminal completion, regardless of whether its best-effort cleanup signal succeeded.
 
-### Live progress ownership
+### Live update ownership
 
-Incomplete provider arguments and execution visuals have separate live-only contracts:
+Provider request fragments remain host-owned bounded transport facts. Complete request arguments
+independently serve preparation, authorization, audit, and model execution. Gaps, lag, reconnect, or
+truncation require a bounded replacement checkpoint; omitted bytes are not retained for
+presentation.
 
-* Provider request drafts are bounded session transport facts keyed by turn/tool call. The host
-  batches contiguous UTF-8 byte appends and uses replacement checkpoints after gaps, reconnect, or
-  truncation. Draft bytes are observational only: they never enter preparation, authorization, or
-  invocation.
-* Execution progress is plugin-owned opaque data published with
-  `TransientProgressPublisher`. The SDK owns identity, sequence, transient/progress classification,
-  host limits, cadence, cancellation, and cleanup ergonomics; the server remains authoritative for
-  validation, accounting, terminal dominance, and teardown.
-* Plugins own schema interpretation and presentation. Generic runtime and host code route opaque
-  payloads and must not add filesystem-, Vim-, shell-, or provider-specific rendering branches.
-* Complete validated requests, permission decisions, terminal lifecycle outcomes, and final
-  results/artifacts remain the canonical durable semantics.
+Execution visuals are likewise replaceable current state. The SDK owns ergonomic replacement,
+identity, sequence, limits, cadence, cancellation, and cleanup. The server owns validation,
+accounting, attach/reconnect checkpoint hydration, closure, and durable latest-value checkpointing.
+Plugins own schema interpretation and presentation. Generic host code must not add filesystem-, Vim-,
+shell-, or provider-specific rendering branches.
 
 ```text
-provider draft -> server live registry -> SessionView draft -> plugin presentation adapter
-plugin publisher -> server live registry -> SessionView progress slot -> renderer adapter
-host terminal boundary -> live removal + canonical durable result
+provider/plugin update -> bounded current invocation presentation -> SessionView item replacement
+host terminal boundary -> flush latest update -> durable checkpoint + closed invocation
 ```
 
 See [`plugin-live-progress.md`](plugin-live-progress.md) for producer examples, limits, privacy
@@ -166,5 +181,7 @@ Legacy executor adaptation may reconstruct old transport requests only inside ex
 Persisted unplaced `ToolContribution` and legacy request-presentation fields are decode-only
 compatibility facts. Session decoding retains their semantic payload, and projection assigns hidden
 placement to unplaced contributions. TUI and web render paths do not inspect legacy presentation
-metadata or infer visibility from old contribution schemas. New writes use
-`ToolContributionEnvelope` and the append-only `ToolContributionPlaced` event.
+metadata or infer visibility from old contribution schemas. New primary presentation writes use the invocation-scoped update contract. New
+`ToolContributionEnvelope` writes are limited to migration compatibility and explicitly independent
+supplemental output; the append-only `ToolContributionPlaced` event remains readable for historical
+sessions.

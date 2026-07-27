@@ -1,127 +1,155 @@
-# Plugin Live Progress
+# Plugin Presentation Updates
 
-Plugins should use live progress for replaceable presentation state that is useful while an invocation is active but is not part of durable session history. Examples include a Vim frame, terminal recording checkpoint, or another bounded execution preview.
+Plugins use presentation updates for bounded replaceable visual state owned by a tool invocation. A
+presentation does not have separate live and finalized objects: each accepted update replaces the
+current value, and invocation closure preserves the last accepted retained value.
 
-## Streamed tool request presentation
+## Primary update contract
 
-Model-provider argument fragments are host-owned transport data, but a tool plugin may declare how
-those fragments are presented while the request is assembling. Add one exact-name declaration for
-each opted-in tool:
+Each invocation owns one stable primary transcript item. The host supplies an invocation-scoped
+presentation handle so plugins do not construct transcript IDs or coordinate request, progress,
+result, promotion, and removal objects.
 
-```toml
-[[tool_presentations]]
-tool_name                    = "example.apply"
-request_draft_schema         = "example.request-draft.apply"
-request_draft_schema_version = 1
-request_draft_placement      = "result"
+Conceptually:
 
-[[visual_adapters]]
-artifact_schema    = "example.request-draft.apply"
-id                 = "example-apply-draft"
-min_schema_version = 1
-max_schema_version = 1
-surfaces           = ["tui"]
+```rust
+let presentation = context.tool_presentation();
+presentation.replace(&payload)?;
+presentation.replace_artifact(&checkpoint)?;
 ```
 
-Legal placements are `request`, `progress`, and `result`. Use `result` only when the draft is a
-preview of the same primary visual later supplied by the canonical result/artifact. The host keeps
-that preview live through permission and execution, publishes the canonical result first, and then
-retires the draft from the same stable result slot. Keep durable request context in the request slot;
-a result-targeted draft does not turn request arguments into a durable result.
+The host binds invocation and producer identity, validates schema/version and payload bounds, assigns
+or validates monotonic revisions, coalesces superseded values, and rejects updates after closure.
+Plugins own opaque payload schemas and surface-specific adapters. Generic runtime and renderers do
+not inspect payloads for lifecycle, timing, retention, path, shell, or edit semantics.
 
-Plugins that omit `[[tool_presentations]]` remain compatible. Their argument drafts use the generic
-`bcode.tool.request-draft` schema, version `0`, and request placement. Renderers show bounded
-metadata-only fallback text when no compatible visual adapter exists; raw argument JSON is not a
-normal transcript fallback.
+Existing `TransientProgressPublisher`, request-draft placement declarations, and placed contribution
+envelopes are migration interfaces. They must converge through the same authoritative current-item
+projection and are not the target API for new primary presentation behavior.
 
-At plugin startup the host validates that:
+## Retention
 
-* the plugin provides `bcode.tool/v1`;
-* `tool_name` exactly matches a name returned by that plugin's `list_tools`;
-* the schema is non-empty and its version is greater than zero;
-* a declared visual adapter supports that schema version;
-* no tool declaration is duplicated or ambiguously owned.
+Retention is independent from whether an update happened while execution was active.
 
-Third-party plugins can migrate one tool at a time. Adding a declaration opts only that exact tool
-into rich streamed presentation; it does not alter other tools or ordinary request/progress/result
-contribution placement.
+### Retain latest
 
-## Execution progress
+Keep one bounded current value while the invocation is open and checkpoint the latest accepted value
+at terminal closure. Do not persist intermediate frames.
 
-Use `bcode_plugin_sdk::TransientProgressPublisher` rather than constructing transient contribution envelopes manually. The publisher owns:
+Use this for primary output expected to remain in history, including:
 
-* invocation and contribution identity
-* producer/schema identity
-* `Transient` persistence and `Progress` placement
-* monotonic sequence numbers
-* host-advertised encoded-byte and cadence limits
-* cancellation checks and idempotent terminal removal
+* shell terminal/recording checkpoints;
+* filesystem source or diff presentation;
+* Vim playback/diff presentation;
+* other bounded or artifact-backed tool output.
 
-Create the publisher from the invocation's `NativeServiceContext` values:
+### Active only
 
-```rust,ignore
-let mut progress = bcode_plugin_sdk::TransientProgressPublisher::with_limits_and_cancellation(
-    context.events,
-    invocation.tool_call_id.clone(),
-    "screen",
-    "example.plugin",
-    "example.live-screen",
-    1,
-    context.transient_progress_limits,
-    context.cancellation.clone(),
-);
+Keep the current value only while the invocation is open and remove it at closure. It must not enter
+session databases, event logs, projections, catalogs, manifests, artifact finalization, trace blobs,
+workflow state, crash reports, or structured telemetry.
 
-if progress.is_ready() {
-    let frame = build_bounded_frame();
-    let _ = progress.upsert(&frame)?;
-}
+Use this narrowly for:
 
-// Call on success, failure, timeout, and cancellation paths.
-progress.finish()?;
-```
+* sensitive request fragments;
+* spinners;
+* intentionally ephemeral diagnostics.
 
-Prefer `upsert_if_ready` when payload creation is cheap. Check `is_ready` before expensive frame capture or serialization so superseded work is skipped before crossing the plugin ABI. Use `append` only when the schema defines bounded append semantics; independently renderable frames should use replacement.
+### Supplemental
 
-`finish` is idempotent. Plugins must call it explicitly at every terminal boundary. The host also clears every active key for an invocation when the invocation terminates, covering plugin failure or process loss where plugin cleanup cannot run.
+Independently meaningful supporting output may use an explicitly keyed supplemental item. A
+supplemental item is not a phase-specific duplicate of the primary item.
 
-## Provider request drafts
+## Ordering and closure
 
-Provider request drafts are different from execution progress. They contain incomplete argument bytes observed before a canonical request exists. The host transports them as bounded `ToolRequestDraftEvent` append batches and checkpoints keyed by turn and tool call. They are never executable and never enter authorization.
+Updates and terminal closure share one per-invocation ordering boundary:
 
-A plugin that advertises request-draft presentation owns best-effort interpretation of its draft schema. Treat malformed JSON, split escapes, truncated prefixes, and incomplete UTF-8-level JSON structure as normal assembling states. Presentation receives a bounded preview plus:
+1. Stop accepting new producer work.
+2. Flush already accepted updates.
+3. Apply the latest accepted value.
+4. Record terminal outcome, fixed timing, canonical model result, and retained presentation
+   checkpoint.
+5. Close the update scope.
+6. Reject every later update.
 
-* tool and producer identity
-* schema and schema version
-* generation and revision
-* retained preview start offset
-* total observed argument bytes
-* truncation state
+Closed state is absorbing. A duplicate, stale, delayed, or even higher-revision live delivery cannot
+reopen an invocation, restart elapsed timing, or replace terminal presentation.
 
-Do not require successful deserialization before displaying a draft. Render known fields when available and otherwise use a compact assembling fallback. Never write partial filesystem content or start tool execution from draft bytes.
+Plugins normally do not manually finalize presentation. Returning from invocation or host teardown
+closes the scope. A manual flush may be exposed for tools that must guarantee a final artifact
+checkpoint before return, but it does not create a separate final presentation mode.
 
-## Limits and truncation
+## Streamed request presentation
 
-Current host defaults are:
+Provider argument fragments are host-owned observational transport data. A plugin may declare an
+adapter schema for displaying the current bounded draft, but draft bytes never enter preparation,
+authorization, or invocation. Complete validated arguments follow their normal permission, audit,
+redaction, and persistence policies independently.
 
-* transient contribution envelope: 256 KiB encoded
-* active transient contributions: 256 keys per session
-* aggregate active contribution state: 8 MiB per session
-* request-draft retained preview: 128 KiB per tool call
-* active request drafts: 256 keys and 4 MiB retained preview bytes per session
-* default producer cadence: 50 ms between replaceable updates
+Contiguous updates use UTF-8 byte offsets. A gap, lag, reconnect, or truncation requires a bounded
+replacement checkpoint. After truncation, producers continue with checkpoints so offsets remain
+trustworthy. Omitted bytes are not retained merely for presentation.
 
-The host remains authoritative even when a producer uses lower limits. Oversized updates are rejected rather than partially published. Request-draft producers switch to bounded checkpoints after truncation so byte offsets remain trustworthy. Omitted bytes are never retained merely to support presentation.
+During migration, `request_draft_placement` remains accepted in manifests and maps old slot behavior
+into the invocation's current primary presentation. It is compatibility metadata, not the target
+identity model.
+
+## Artifact-backed updates
+
+Large or incrementally produced output should replace a bounded artifact reference/revision rather
+than copying an unbounded payload on every frame. A checkpoint declares committed bytes, revision,
+finalization, availability, and content type. Renderers fetch only required bounded ranges for
+resident content.
+
+Artifact references do not own invocation lifecycle. A finalized artifact may still arrive before
+host closure, and an active artifact cannot keep a terminal invocation's elapsed timer running.
+
+## Limits and cadence
+
+The host enforces bounded encoded payload size, artifact range limits, and update cadence. Producers
+should emit updates only when visible state changes. Superseded updates may be dropped, but the latest
+accepted current value must remain available for attach/resynchronization.
+
+Plugins must not bypass publisher limits through raw event callbacks. Repeated payload rejection or
+serialization failure should be surfaced as bounded diagnostics without payload contents.
+
+## Attach, reconnect, and replay
+
+For an open invocation, attach/reconnect supplies the current bounded checkpoint plus its generation
+and revision. A client that misses updates replaces local state from that authoritative checkpoint.
+It does not replay every intermediate frame.
+
+For a closed invocation, durable replay reconstructs the latest retained checkpoint. The terminal
+live document, immediate reconnect document, and replayed document must converge to the same semantic
+item.
 
 ## Persistence, privacy, and telemetry
 
-Live progress and request drafts use `SessionLiveEvent`, not `SessionEvent`. They are absent after daemon restart and must not be written to session databases, event logs, projections, catalogs, manifests, artifact finalization, trace blobs, workflow state, crash reports, or structured telemetry fields.
+Metrics and logs may include bounded classifications, counts, byte sizes, cadence, and rejection
+reasons. They must not include presentation payloads, request fragments, unique paths, invocation IDs
+as metric labels, or secrets copied from tool arguments.
 
-Metrics and logs may contain bounded classifications, counts, byte sizes, and rejection reasons. They must not contain progress payloads, draft bytes, unique paths, invocation IDs as metric labels, or secrets copied from request arguments. A canonical completed request follows the normal permission, audit, redaction, and persistence policy independently of its live preview.
+Raw plugin payload JSON is never a normal transcript fallback. Unsupported adapters render bounded
+host metadata or outcome fallback.
+
+## Compatibility
+
+Historical `ToolContributionEnvelope` placement remains decodable. Chronological compatibility
+projection maps the latest compatible request/progress/result contribution to the invocation's
+current primary item, preserves explicit supplementals independently, and keeps hidden/unplaced
+payloads invisible. New primary producers must not rely on this placement model.
 
 ## Troubleshooting
 
-* **No updates appear:** verify the host supplied an event callback, the publisher schema matches the plugin manifest, and the invocation has not been cancelled or finished.
-* **Updates are skipped:** producer cadence intentionally drops superseded frames. Force only the final bounded checkpoint before cleanup when visual continuity requires it.
-* **An update is oversized:** reduce detail before serialization or emit a schema-defined bounded checkpoint. Do not split replacement frames into unbounded history.
-* **A reconnect misses deltas:** this is expected. The client must consume the host's current bounded checkpoint/resynchronization state.
-* **Progress remains visible:** ensure every terminal path calls `finish`; host invocation teardown is the final safety net.
+* **No updates appear:** verify the host supplied a presentation handle, the schema/version matches a
+  manifest adapter, payload limits are satisfied, and the invocation is still open.
+* **Updates are skipped:** cadence intentionally drops superseded values. Emit a bounded checkpoint
+  when continuity requires it.
+* **An update is oversized:** reduce detail or publish an artifact-backed checkpoint. Do not split
+  replacement state into unbounded history.
+* **Reconnect shows stale state:** verify generation/revision hydration and force authoritative
+  snapshot replacement after a mismatch.
+* **Progress remains visible after completion:** verify host closure ran. Do not add renderer cleanup
+  special cases; closed-scope projection must reconcile the authoritative item.
+* **Elapsed time continues after completion:** verify invocation lifecycle is terminal. Presentation
+  payloads and generic transcript streaming flags must not schedule tool timers.
