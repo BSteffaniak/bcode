@@ -32,6 +32,7 @@ Required migration invariants:
 | Event | `SessionView` behavior | Established TUI behavior | Shared status / next action |
 |---|---|---|---|
 | `SessionCreated` | Sets title and working directory. | Header/session metadata consumes the shared projection. | **Complete** for event semantics. |
+| `InertHistory` | No-op; migration-retained historical payloads are deliberately non-semantic. | No-op. | **Intentional no-op**. |
 | `ClientAttached` | No-op. | No-op. | **Intentional no-op**. |
 | `ClientDetached` | No-op. | No-op. | **Intentional no-op**. |
 | `UserMessage` | Derives a title when absent and appends a semantic user message. | Clears terminal-local tool presentation, updates input history/submission/anchor state, derives a title, and appends a terminal transcript item. | **Complete** for renderer semantics; input history, optimistic submission reconciliation, anchoring, and terminal presentation caches remain renderer-local. |

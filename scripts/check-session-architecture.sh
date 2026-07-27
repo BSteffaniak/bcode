@@ -143,7 +143,7 @@ if ! sed -n '/fn reject_unsupported_future_shape/,/fn is_unknown_variant_error/p
   | grep -q 'schema_version != CURRENT_SESSION_EVENT_SCHEMA_VERSION' \
   || ! sed -n '/fn decode_for_migration/,/#\[cfg(test)\]/p' packages/session-migration/src/execution.rs \
     | grep -q 'HistoricalEnvelope' \
-  || ! rg -q 'serde_json::from_str::<SessionEvent>' packages/session/src/db.rs; then
+  || ! rg -q 'serde_json::from_value::<PersistedSessionEvent>' packages/session/src/persisted.rs; then
   echo "Session architecture violation: current persistence must accept only the exact current schema while released structural decoding remains migration-only." >&2
   violations=1
 fi
@@ -543,6 +543,17 @@ if rg -n "std::fs|OpenOptions|fs::File|File::open|File::create" packages/session
   >/tmp/bcode-session-fs-violations.txt; then
   echo "Session persistence architecture violation: direct filesystem access outside approved store modules." >&2
   cat /tmp/bcode-session-fs-violations.txt >&2
+  violations=1
+fi
+
+if sed -n '/^\[dependencies\]/,/^\[dev-dependencies\]/p' packages/session/Cargo.toml \
+    | grep -q '^bcode_session_migration = ' \
+  || rg -n 'bcode_session_migration::' packages/session/src --glob '*.rs' --glob '!db.rs' \
+    >/tmp/bcode-session-production-migration-dependency-violations.txt \
+  || sed -n '760,3700p' packages/session/src/db.rs | rg -n 'bcode_session_migration::' \
+    >>/tmp/bcode-session-production-migration-dependency-violations.txt; then
+  echo "Session dependency-direction violation: production bcode_session must not depend on bcode_session_migration." >&2
+  cat /tmp/bcode-session-production-migration-dependency-violations.txt >&2 2>/dev/null || true
   violations=1
 fi
 

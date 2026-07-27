@@ -15,7 +15,6 @@ async-trait = { workspace = true }
 bcode_database_observability = { workspace = true }
 bcode_metrics = { workspace = true }
 bcode_plugin_sdk = { workspace = true }
-bcode_session_migration = { workspace = true }
 bcode_session_migration_target = { workspace = true }
 bcode_session_models = { workspace = true }
 bcode_skill_models = { workspace = true }
@@ -36,7 +35,8 @@ tokio = { workspace = true, features = ["macros", "rt", "sync"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+bcode_session_migration = { workspace = true }
+tempfile                = { workspace = true }
 
 [features]
 default          = []
