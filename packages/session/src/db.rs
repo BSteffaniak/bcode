@@ -12,6 +12,10 @@ use crate::current_schema::{global_migrations, session_migrations};
 use crate::db_connection::{
     init_turso_local_with_retry, is_database_lock_error, is_database_lock_error_message,
 };
+use crate::db_context::{
+    ContextHistoryRole, context_history_role, is_model_context_event_type,
+    model_context_event_kind_name,
+};
 use crate::db_event_store::{
     compatible_event_from_row, insert_event, last_sequence, strict_events,
 };
@@ -20,6 +24,10 @@ pub use crate::db_path::{
 };
 pub use crate::db_projection::MaterializedProjection;
 use crate::db_projection::ProjectionCheckpointState;
+use crate::db_row::{
+    i64_to_u64, optional_i64, optional_string, required_i64, required_non_negative_u64,
+    required_string,
+};
 use crate::db_validation::{
     compaction_boundary, validate_canonical_event_identity, validate_projection_checkpoint_snapshot,
 };
@@ -4423,52 +4431,6 @@ fn input_history_entry_from_row(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContextHistoryRole {
-    ModelVisible,
-    Structural,
-    Excluded,
-}
-
-const fn context_history_role(kind: &SessionEventKind) -> ContextHistoryRole {
-    match kind {
-        SessionEventKind::UserMessage { .. }
-        | SessionEventKind::AssistantMessage { .. }
-        | SessionEventKind::ToolCallRequested { .. }
-        | SessionEventKind::ToolInvocationResultRecorded { .. }
-        | SessionEventKind::SystemMessage { .. }
-        | SessionEventKind::WorkingDirectoryChanged { .. }
-        | SessionEventKind::ContextCompacted { .. }
-        | SessionEventKind::ProviderContextCompacted { .. } => ContextHistoryRole::ModelVisible,
-        SessionEventKind::ModelTurnStarted { .. } | SessionEventKind::ModelTurnFinished { .. } => {
-            ContextHistoryRole::Structural
-        }
-        _ => ContextHistoryRole::Excluded,
-    }
-}
-
-const fn context_history_role_from_name(event_type: &str) -> ContextHistoryRole {
-    match event_type.as_bytes() {
-        b"user_message"
-        | b"assistant_message"
-        | b"tool_call_requested"
-        | b"tool_invocation_result_recorded"
-        | b"system_message"
-        | b"working_directory_changed"
-        | b"context_compacted"
-        | b"provider_context_compacted" => ContextHistoryRole::ModelVisible,
-        b"model_turn_started" | b"model_turn_finished" => ContextHistoryRole::Structural,
-        _ => ContextHistoryRole::Excluded,
-    }
-}
-
-const fn is_model_context_event_type(event_type: &str) -> bool {
-    !matches!(
-        context_history_role_from_name(event_type),
-        ContextHistoryRole::Excluded
-    )
-}
-
 fn canonical_model_context_from_events(
     events: impl IntoIterator<Item = SessionEvent>,
 ) -> Vec<SessionEvent> {
@@ -4519,66 +4481,6 @@ fn canonical_model_context_from_events(
     context.push(marker);
     context.extend(retained);
     context
-}
-
-const fn model_context_event_kind_name(kind: &SessionEventKind) -> &'static str {
-    match kind {
-        SessionEventKind::UserMessage { .. } => "user_message",
-        SessionEventKind::AssistantMessage { .. } => "assistant_message",
-        SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
-        SessionEventKind::ToolInvocationResultRecorded { .. } => "tool_invocation_result_recorded",
-        SessionEventKind::SystemMessage { .. } => "system_message",
-        SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
-        SessionEventKind::ContextCompacted { .. } => "context_compacted",
-        SessionEventKind::ProviderContextCompacted { .. } => "provider_context_compacted",
-        SessionEventKind::ModelTurnStarted { .. } => "model_turn_started",
-        SessionEventKind::ModelTurnFinished { .. } => "model_turn_finished",
-        SessionEventKind::RequestContextObserved { .. } => "request_context_observed",
-        _ => "non_model_context",
-    }
-}
-
-fn required_string(row: &switchy::database::Row, column: &str) -> SessionDbResult<String> {
-    row.get(column)
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .ok_or_else(|| SessionDbError::InvalidRow {
-            column: column.to_string(),
-        })
-}
-
-fn optional_string(row: &switchy::database::Row, column: &str) -> Option<String> {
-    row.get(column)
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-}
-
-fn required_i64(row: &switchy::database::Row, column: &str) -> SessionDbResult<i64> {
-    row.get(column)
-        .and_then(|value| value.as_i64())
-        .ok_or_else(|| SessionDbError::InvalidRow {
-            column: column.to_string(),
-        })
-}
-
-fn required_non_negative_u64(row: &switchy::database::Row, column: &str) -> SessionDbResult<u64> {
-    let value = required_i64(row, column)?;
-    if value.is_negative() {
-        return Err(SessionDbError::InvalidRow {
-            column: column.to_owned(),
-        });
-    }
-    Ok(value.cast_unsigned())
-}
-
-fn optional_i64(row: &switchy::database::Row, column: &str) -> Option<i64> {
-    row.get(column).and_then(|value| value.as_i64())
-}
-
-const fn i64_to_u64(value: i64) -> u64 {
-    if value.is_negative() {
-        0
-    } else {
-        value.cast_unsigned()
-    }
 }
 
 const fn runtime_work_kind_name(kind: RuntimeWorkKind) -> &'static str {
