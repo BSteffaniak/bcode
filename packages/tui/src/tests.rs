@@ -5397,7 +5397,21 @@ async fn live_shell_recording_chunk_renders_once_through_canonical_request_contr
             ),
         },
     });
-    coordinator.observe_contribution(session_id, &contribution);
+    coordinator.observe_contribution(
+        session_id,
+        &contribution,
+        |producer, schema, version, key, content_type| {
+            app.plugin_presentation().is_some_and(|presentation| {
+                presentation.accepts_artifact_reference(
+                    producer,
+                    schema,
+                    version,
+                    key,
+                    content_type,
+                )
+            })
+        },
+    );
     let completion = tokio::time::timeout(Duration::from_secs(1), coordinator.next_completion())
         .await
         .expect("artifact fetch timeout")

@@ -228,10 +228,20 @@ impl ArtifactStreamCoordinator {
         &mut self,
         session_id: SessionId,
         event: &bcode_session_models::ToolContributionEvent,
+        accepts_reference: impl Fn(&str, &str, u32, &str, Option<&str>) -> bool,
     ) {
         let Some(artifact) = event.artifact.as_ref() else {
             return;
         };
+        if !accepts_reference(
+            &event.producer_id,
+            &event.schema,
+            event.schema_version,
+            &artifact.reference_key,
+            artifact.content_type.as_deref(),
+        ) {
+            return;
+        }
         let key = (
             session_id,
             event.invocation_id.clone(),
@@ -564,6 +574,48 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn contribution_hydration_requires_adapter_owned_reference() {
+        let session_id = SessionId::new();
+        let event = bcode_session_models::ToolContributionEvent {
+            invocation_id: "call".to_owned(),
+            contribution_id: "recording".to_owned(),
+            sequence: 2,
+            producer_id: "test.producer".to_owned(),
+            schema: "test.artifact".to_owned(),
+            schema_version: 1,
+            operation: bcode_session_models::ToolContributionOperation::Upsert,
+            persistence: bcode_session_models::ToolContributionPersistence::Transient,
+            artifact: Some(bcode_session_models::ToolContributionArtifact {
+                artifact_id: "artifact".to_owned(),
+                reference_key: "reference".to_owned(),
+                content_type: Some("application/octet-stream".to_owned()),
+                storage_uri: "untrusted://must-not-be-read".to_owned(),
+                committed_bytes: 9,
+                revision: 2,
+                finalized: false,
+                availability: None,
+            }),
+            payload: serde_json::Value::Null,
+        };
+
+        let mut rejected = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
+        rejected.observe_contribution(session_id, &event, |_, _, _, _, _| false);
+        assert!(rejected.artifact_fetches.is_empty());
+        assert_eq!(rejected.stats.observed_targets, 0);
+
+        let mut accepted = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
+        accepted.observe_contribution(session_id, &event, |producer, schema, version, key, ty| {
+            producer == "test.producer"
+                && schema == "test.artifact"
+                && version == 1
+                && key == "reference"
+                && ty == Some("application/octet-stream")
+        });
+        assert_eq!(accepted.artifact_fetches.len(), 1);
+        assert_eq!(accepted.stats.observed_targets, 1);
+    }
+
     #[test]
     fn incomplete_contribution_stops_without_scheduling_a_range_fetch() {
         let client = BcodeClient::default_endpoint();
@@ -591,7 +643,7 @@ mod tests {
             payload: serde_json::Value::Null,
         };
 
-        coordinator.observe_contribution(session_id, &event);
+        coordinator.observe_contribution(session_id, &event, |_, _, _, _, _| true);
 
         let key = (
             session_id,
@@ -738,6 +790,51 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn stale_or_mismatched_ranges_preserve_the_committed_prefix_and_retry() {
+        let mut coordinator = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
+        let session_id = SessionId::new();
+        let key = (
+            session_id,
+            "tool".to_owned(),
+            "artifact".to_owned(),
+            "reference".to_owned(),
+        );
+        coordinator.artifact_fetches.insert(
+            key.clone(),
+            ActiveArtifactFetchState {
+                next_offset: 4,
+                target: Some(target(8, 3, false)),
+                fetching: true,
+                ..ActiveArtifactFetchState::default()
+            },
+        );
+        let completion = ActiveArtifactFetchCompletion {
+            session_id,
+            key: key.clone(),
+            requested_offset: 4,
+            requested_end: 8,
+            target_revision: 3,
+            result: Ok(range(0, 8, 2, b"stale")),
+        };
+
+        let mut delivered = false;
+        assert!(
+            !coordinator.handle_completion(Some(session_id), completion, |_| {
+                delivered = true;
+                Ok(true)
+            })
+        );
+        assert!(!delivered);
+        let state = coordinator
+            .artifact_fetches
+            .get(&key)
+            .expect("artifact state");
+        assert_eq!(state.next_offset, 4);
+        assert!(state.retry_at.is_some());
+        assert!(state.terminal_error.is_none());
+    }
+
     #[tokio::test]
     async fn in_flight_live_fetch_accepts_a_newer_committed_revision() {
         let mut coordinator = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
@@ -822,6 +919,56 @@ mod tests {
         assert!(state.retry_at.is_none());
         assert!(state.terminal_error.is_some());
         assert!(coordinator.next_retry_at().is_none());
+    }
+
+    #[test]
+    fn finalized_unavailable_codes_stop_retrying_without_delivery() {
+        for code in ["artifact_not_found", "artifact_unavailable"] {
+            let mut coordinator = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
+            let session_id = SessionId::new();
+            let key = (
+                session_id,
+                format!("tool-{code}"),
+                format!("artifact-{code}"),
+                "reference".to_owned(),
+            );
+            coordinator.artifact_fetches.insert(
+                key.clone(),
+                ActiveArtifactFetchState {
+                    target: Some(target(3, 42, true)),
+                    fetching: true,
+                    ..ActiveArtifactFetchState::default()
+                },
+            );
+            let completion = ActiveArtifactFetchCompletion {
+                session_id,
+                key: key.clone(),
+                requested_offset: 0,
+                requested_end: 3,
+                target_revision: 42,
+                result: Err(ClientError::Server {
+                    code: code.to_owned(),
+                    message: "artifact bytes are unavailable".to_owned(),
+                }),
+            };
+
+            let mut delivered = false;
+            assert!(
+                !coordinator.handle_completion(Some(session_id), completion, |_| {
+                    delivered = true;
+                    Ok(true)
+                })
+            );
+            assert!(!delivered);
+            let state = coordinator
+                .artifact_fetches
+                .get(&key)
+                .expect("artifact state");
+            assert_eq!(state.next_offset, 0);
+            assert!(!state.fetching);
+            assert!(state.retry_at.is_none());
+            assert!(state.terminal_error.is_some());
+        }
     }
 
     #[test]

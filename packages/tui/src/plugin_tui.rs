@@ -416,6 +416,7 @@ mod tests {
     #[derive(Default)]
     struct StatefulTestAdapter {
         bytes: Mutex<Vec<u8>>,
+        chunks: Mutex<Vec<(String, String, u64, u64)>>,
     }
 
     impl bcode_plugin_sdk::tui::PluginTuiVisualAdapter for StatefulTestAdapter {
@@ -423,11 +424,31 @@ mod tests {
             kind == "bcode.shell.run"
         }
 
+        fn accepts_artifact_reference(
+            &self,
+            kind: &str,
+            reference_key: &str,
+            content_type: Option<&str>,
+        ) -> bool {
+            kind == "bcode.shell.run"
+                && reference_key == "shell_recording"
+                && content_type == Some("application/x-bcode-shell-recording; version=3")
+        }
+
         fn artifact_chunk(&self, chunk: &PluginTuiArtifactChunk) -> Result<(), String> {
             self.bytes
                 .lock()
                 .map_err(|_| "test adapter state poisoned".to_owned())?
                 .extend_from_slice(&chunk.bytes);
+            self.chunks
+                .lock()
+                .map_err(|_| "test adapter chunk state poisoned".to_owned())?
+                .push((
+                    chunk.artifact_id.clone(),
+                    chunk.reference_key.clone(),
+                    chunk.offset,
+                    chunk.revision,
+                ));
             Ok(())
         }
 
@@ -698,6 +719,67 @@ mod tests {
     }
 
     #[test]
+    fn artifact_delivery_routes_only_supported_references_and_invalidates_the_owner() {
+        let presentation = test_presentation();
+        let mut registry = PluginTuiRegistry::default();
+        registry.register_visual_adapter(Box::new(StatefulTestAdapter::default()));
+        presentation
+            .registries
+            .lock()
+            .expect("presentation registries")
+            .insert("bcode.shell".to_owned(), Arc::new(registry));
+
+        assert!(presentation.accepts_artifact_reference(
+            "bcode.shell",
+            "bcode.shell.run",
+            1,
+            "shell_recording",
+            Some("application/x-bcode-shell-recording; version=3"),
+        ));
+        assert!(!presentation.accepts_artifact_reference(
+            "bcode.shell",
+            "bcode.shell.run",
+            1,
+            "clean_output",
+            Some("text/plain"),
+        ));
+        assert!(!presentation.accepts_artifact_reference(
+            "bcode.shell",
+            "bcode.shell.run",
+            1,
+            "shell_recording",
+            Some("text/plain"),
+        ));
+
+        assert!(
+            presentation
+                .deliver_artifact_chunk(&PluginTuiArtifactChunk {
+                    tool_call_id: "call-owner".to_owned(),
+                    artifact_id: "artifact-owner".to_owned(),
+                    reference_key: "shell_recording".to_owned(),
+                    producer_plugin_id: "bcode.shell".to_owned(),
+                    schema: "bcode.shell.run".to_owned(),
+                    schema_version: 1,
+                    content_type: Some(
+                        "application/x-bcode-shell-recording; version=3".to_owned(),
+                    ),
+                    offset: 0,
+                    total_bytes: 3,
+                    revision: 7,
+                    finalized: false,
+                    bytes: b"abc".to_vec(),
+                })
+                .expect("deliver owned artifact chunk")
+        );
+        assert_eq!(presentation.visual_revision("call-owner"), 1);
+        assert_eq!(presentation.visual_revision("call-other"), 0);
+        assert_eq!(
+            presentation.drain_dirty_visuals(),
+            BTreeSet::from(["call-owner".to_owned()])
+        );
+    }
+
+    #[test]
     fn presentation_retains_one_registry_for_delivery_and_rendering() {
         let presentation = test_presentation();
         assert!(presentation.accepts_artifact_reference(
@@ -744,6 +826,11 @@ mod tests {
         );
         assert_eq!(presentation.revision(), 0);
         assert_eq!(presentation.visual_revision("call"), 1);
+        assert_eq!(presentation.visual_revision("other-call"), 0);
+        assert_eq!(
+            presentation.drain_dirty_visuals(),
+            BTreeSet::from(["call".to_owned()])
+        );
 
         let second = presentation.registry("bcode.shell").expect("registry");
         assert!(Arc::ptr_eq(&first, &second));

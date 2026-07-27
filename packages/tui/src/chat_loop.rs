@@ -2191,9 +2191,22 @@ fn absorb_bcode_event(
             if let bcode_session_models::SessionLiveEventKind::ToolContributionPlaced { envelope } =
                 &event.kind
             {
-                loop_state
-                    .artifact_stream
-                    .observe_contribution(event.session_id, &envelope.contribution);
+                let presentation = chat.app.plugin_presentation();
+                loop_state.artifact_stream.observe_contribution(
+                    event.session_id,
+                    &envelope.contribution,
+                    |producer_plugin_id, schema, schema_version, reference_key, content_type| {
+                        presentation.is_some_and(|presentation| {
+                            presentation.accepts_artifact_reference(
+                                producer_plugin_id,
+                                schema,
+                                schema_version,
+                                reference_key,
+                                content_type,
+                            )
+                        })
+                    },
+                );
             }
             chat.app.absorb_session_live_event(&event);
             true
