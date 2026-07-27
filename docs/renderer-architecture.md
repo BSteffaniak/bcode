@@ -4,7 +4,7 @@ Bcode's target renderer architecture uses a shared semantic session-view layer r
 
 ## Current migration status
 
-The target boundary exists but is not yet the single application boundary:
+The target boundary is active for tool transcript semantics in both established renderers:
 
 * `packages/session-view/models` defines renderer-neutral snapshot, transcript, tool, permission, runtime-work, composer, interaction, visual, action, and patch contracts.
 * `packages/session-view` projects bounded history and renderer-relevant live events and executes daemon-backed semantic actions.
