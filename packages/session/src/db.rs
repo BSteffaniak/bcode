@@ -27,8 +27,7 @@ pub use crate::db_path::{
     global_catalog_db_path, namespaced_catalog_db_path, session_db_path, session_dir_path,
 };
 pub use crate::db_projection::MaterializedProjection;
-use crate::db_projection::ProjectionCheckpointState;
-use crate::db_projection::update_projection_checkpoint;
+use crate::db_projection::{projection_checkpoint_snapshot, update_projection_checkpoint};
 use crate::db_projection_row::{
     input_history_entry_from_row, runtime_work_from_row, session_summary_from_catalog_row,
     tool_run_from_row, transcript_item_from_row,
@@ -43,9 +42,10 @@ const fn bool_to_value(value: bool) -> DatabaseValue {
     DatabaseValue::Int32(if value { 1 } else { 0 })
 }
 use crate::db_validation::{
-    compaction_boundary, validate_append_identity, validate_canonical_event_identity,
-    validate_context_occupancy_precondition, validate_model_context_precondition,
-    validate_projection_checkpoint_snapshot,
+    compaction_boundary, validate_append_identity, validate_append_tail,
+    validate_canonical_event_identity, validate_context_occupancy_precondition,
+    validate_model_context_postcondition, validate_model_context_precondition,
+    validate_projection_checkpoint_snapshot, validate_session_compatibility_precondition,
 };
 use crate::persisted::{
     CompatibleSessionEvent, PersistedSessionEventError, decode_session_event, encode_session_event,
@@ -2625,33 +2625,6 @@ async fn initialize_current_storage_contract(db: &dyn Database) -> SessionDbResu
     Ok(())
 }
 
-async fn projection_checkpoint_snapshot(
-    db: &dyn Database,
-) -> SessionDbResult<BTreeMap<String, ProjectionCheckpointState>> {
-    let rows = db
-        .select("projection_checkpoints")
-        .columns(&["projection_name", "projection_version", "last_event_seq"])
-        .where_in(
-            "projection_name",
-            MaterializedProjection::all()
-                .iter()
-                .map(|projection| DatabaseValue::String(projection.as_str().to_owned()))
-                .collect::<Vec<_>>(),
-        )
-        .execute(db)
-        .await?;
-    rows.into_iter()
-        .map(|row| {
-            let name = required_string(&row, "projection_name")?;
-            let state = ProjectionCheckpointState {
-                version: required_i64(&row, "projection_version").map(i64_to_u64)?,
-                checkpoint: required_i64(&row, "last_event_seq").map(i64_to_u64)?,
-            };
-            Ok((name, state))
-        })
-        .collect()
-}
-
 #[cfg(test)]
 async fn validate_all_projection_checkpoints_at_tail(
     db: &dyn Database,
@@ -3248,57 +3221,6 @@ async fn validate_storage_writer_contract(db: &dyn Database) -> SessionDbResult<
     validate_storage_writer_contract_for_epoch(db, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await
 }
 
-async fn validate_session_compatibility_precondition(
-    db: &dyn Database,
-    canonical_tail: Option<u64>,
-) -> SessionDbResult<()> {
-    let row = db
-        .select("session_compatibility_state")
-        .columns(&["schema_version", "last_event_seq"])
-        .where_eq("projection_id", DatabaseValue::Int32(1))
-        .execute_first(db)
-        .await?;
-    let Some(row) = row.as_ref() else {
-        if canonical_tail.is_none() {
-            return Ok(());
-        }
-        return Err(SessionDbError::ProjectionStale {
-            projection: "session_compatibility",
-            checkpoint: None,
-            expected: canonical_tail.unwrap_or_default(),
-        });
-    };
-    let actual = required_non_negative_u64(row, "schema_version")?;
-    let expected = u64::from(SESSION_COMPATIBILITY_PROJECTION_SCHEMA_VERSION);
-    if actual != expected {
-        return Err(SessionDbError::ProjectionIncompatible {
-            projection: "session_compatibility",
-            actual,
-            expected,
-        });
-    }
-    let checkpoint = required_non_negative_u64(row, "last_event_seq")?;
-    if Some(checkpoint) != canonical_tail {
-        return Err(SessionDbError::ProjectionStale {
-            projection: "session_compatibility",
-            checkpoint: Some(checkpoint),
-            expected: canonical_tail.unwrap_or_default(),
-        });
-    }
-    let issue_count = db
-        .select("session_compatibility_issues")
-        .columns(&["event_seq"])
-        .execute(db)
-        .await?
-        .len();
-    if issue_count > 0 {
-        return Err(SessionDbError::CompatibilityDegraded {
-            issue_count: u64::try_from(issue_count).unwrap_or(u64::MAX),
-        });
-    }
-    Ok(())
-}
-
 async fn validate_append_preconditions_without_writer(
     db: &dyn Database,
     event: &SessionEvent,
@@ -3319,7 +3241,13 @@ async fn validate_append_preconditions_without_writer(
         CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION,
     )
     .await?;
-    validate_session_compatibility_precondition(db, canonical_tail).await?;
+    validate_session_compatibility_precondition(
+        db,
+        canonical_tail,
+        1,
+        SESSION_COMPATIBILITY_PROJECTION_SCHEMA_VERSION,
+    )
+    .await?;
     if let Some(expected) = canonical_tail {
         let snapshot = projection_checkpoint_snapshot(db).await?;
         validate_projection_checkpoint_snapshot(&snapshot, expected)?;
@@ -3332,39 +3260,16 @@ async fn validate_append_postconditions(
     event: &SessionEvent,
 ) -> SessionDbResult<()> {
     let canonical_tail = last_sequence(db).await?;
-    if canonical_tail != Some(event.sequence) {
-        return Err(SessionDbError::InvalidCanonicalAppendSequence {
-            expected: event.sequence,
-            actual: canonical_tail.unwrap_or_default(),
-        });
-    }
+    validate_append_tail(canonical_tail, event)?;
     let snapshot = projection_checkpoint_snapshot(db).await?;
     validate_projection_checkpoint_snapshot(&snapshot, event.sequence)?;
-    let model_context = db
-        .select("model_context_projection_state")
-        .columns(&["schema_version", "last_event_seq"])
-        .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
-        .execute_first(db)
-        .await?
-        .ok_or(SessionDbError::ProjectionStale {
-            projection: "model_context",
-            checkpoint: None,
-            expected: event.sequence,
-        })?;
-    let schema_version = required_i64(&model_context, "schema_version").map(i64_to_u64)?;
-    if schema_version != u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION) {
-        return Err(SessionDbError::ModelContextProjectionVersion {
-            actual: schema_version,
-            expected: u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION),
-        });
-    }
-    let checkpoint = required_i64(&model_context, "last_event_seq").map(i64_to_u64)?;
-    if checkpoint != event.sequence {
-        return Err(SessionDbError::ModelContextProjectionStale {
-            checkpoint,
-            expected: event.sequence,
-        });
-    }
+    validate_model_context_postcondition(
+        db,
+        event,
+        MODEL_CONTEXT_PROJECTION_ID,
+        MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION,
+    )
+    .await?;
     validate_context_occupancy_precondition(
         db,
         event,
@@ -4192,6 +4097,7 @@ async fn project_artifact_references(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db_projection::ProjectionCheckpointState;
     use crate::persisted::decode_session_event_compatible;
     use bcode_session_models::{
         CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, RequestContextObservation,

@@ -2,8 +2,10 @@
 
 use crate::db::SessionDbResult;
 use crate::db_event_store::{event_created_at_ms, seq_to_value};
+use crate::db_row::{i64_to_u64, required_i64, required_string};
 use bcode_session_models::SessionEvent;
-use switchy::database::{Database, DatabaseValue};
+use std::collections::BTreeMap;
+use switchy::database::{Database, DatabaseValue, query::FilterableQuery};
 
 /// One current checkpointed materialized projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +69,33 @@ impl MaterializedProjection {
             Self::RequestContextOccupancy => "context_occupancy",
         }
     }
+}
+
+pub async fn projection_checkpoint_snapshot(
+    db: &dyn Database,
+) -> SessionDbResult<BTreeMap<String, ProjectionCheckpointState>> {
+    let rows = db
+        .select("projection_checkpoints")
+        .columns(&["projection_name", "projection_version", "last_event_seq"])
+        .where_in(
+            "projection_name",
+            MaterializedProjection::all()
+                .iter()
+                .map(|projection| DatabaseValue::String(projection.as_str().to_owned()))
+                .collect::<Vec<_>>(),
+        )
+        .execute(db)
+        .await?;
+    rows.into_iter()
+        .map(|row| {
+            let name = required_string(&row, "projection_name")?;
+            let state = ProjectionCheckpointState {
+                version: required_i64(&row, "projection_version").map(i64_to_u64)?,
+                checkpoint: required_i64(&row, "last_event_seq").map(i64_to_u64)?,
+            };
+            Ok((name, state))
+        })
+        .collect()
 }
 
 pub async fn update_projection_checkpoint(
