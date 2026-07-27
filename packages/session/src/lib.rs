@@ -16,6 +16,7 @@
 
 mod actor;
 mod attachment;
+mod catalog;
 mod current_schema;
 pub mod db;
 pub mod lease;
@@ -42,6 +43,9 @@ use bcode_session_models::{
     SessionLiveEventKind, SessionMigrationProgress, SessionMigrationStage, SessionOpenFailureKind,
     SessionOpenOperationId, SessionOpenOperationSnapshot, SessionOpenTerminalOutcome,
     SessionSummary, SessionTitleSource, SessionTokenUsage, SessionTraceEvent, SessionVisibility,
+};
+pub use catalog::{
+    CatalogLoadStatus, SessionCatalogEntry, SessionCatalogLoadStatus, SessionHealth,
 };
 use lease::{SessionLeaseGuard, SessionLeaseOwnerContext};
 pub use manifest::{
@@ -906,45 +910,6 @@ enum SessionLeaseLoadOutcome {
     Retry,
 }
 
-/// Current asynchronous catalog discovery status.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub enum CatalogLoadStatus {
-    NotStarted,
-    Loading,
-    Loaded,
-    Failed(String),
-}
-
-/// First-class session health for normal runtime UX.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionHealth {
-    /// DB-backed session is ready for normal runtime access.
-    Ready,
-    /// Session is inspectable but contains semantically opaque history and is read-only.
-    DegradedReadOnly { issue_count: u64 },
-    /// A known historical writer can be migrated by this build.
-    Migratable { source: u64, target: u64 },
-    /// A known historical writer is migratable but a live owner blocks exclusive maintenance.
-    BlockedOwner {
-        source: u64,
-        target: u64,
-        owners: Vec<lease::SessionLeaseOwner>,
-    },
-    /// Session storage requires a different writer epoch.
-    WriterIncompatible { actual: Option<u64>, expected: u64 },
-    /// A DB read model is missing or stale.
-    ProjectionStale {
-        projection: &'static str,
-        checkpoint: Option<u64>,
-        expected: u64,
-    },
-    /// Session storage exists but cannot be safely used without repair.
-    RepairRequired { reason: String },
-    /// No DB-backed session exists for the id.
-    NotFound,
-}
-
 async fn compatibility_health(db: &db::SessionDb, expected: u64) -> Option<SessionHealth> {
     match db.session_compatibility_status().await {
         Ok(db::SessionCompatibilityStatus::Compatible { .. }) => None,
@@ -1030,32 +995,6 @@ impl SessionLiveEventBroker {
         let _ = self.sender.send(event.clone());
         self.published.fetch_add(1, Ordering::Relaxed);
         Some(event)
-    }
-}
-
-/// Native catalog entry with maintenance/access metadata.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SessionCatalogEntry {
-    pub summary: SessionSummary,
-    pub load_status: SessionCatalogLoadStatus,
-}
-
-/// Session load status for catalog/status reporting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionCatalogLoadStatus {
-    Current,
-    SummaryOnly,
-}
-
-impl SessionCatalogEntry {
-    fn from_snapshot(snapshot: actor::SessionSnapshot) -> Self {
-        Self {
-            summary: snapshot.summary,
-            load_status: match snapshot.load_status {
-                SessionLoadStatusKind::Current => SessionCatalogLoadStatus::Current,
-                SessionLoadStatusKind::SummaryOnly => SessionCatalogLoadStatus::SummaryOnly,
-            },
-        }
     }
 }
 
