@@ -9,7 +9,7 @@
 //! standalone dynamic library so host tests can exercise dynamic loading without Cargo feature
 //! unification with static-bundled consumers.
 
-bcode_plugin_sdk::export_plugin!(
+bcode_plugin_sdk::export_concurrent_plugin!(
     bcode_question_plugin::QuestionPlugin,
     include_str!("../../../plugins/question-plugin/bcode-plugin.toml")
 );

@@ -31,15 +31,25 @@ pub struct QuestionPlugin;
 
 pub use question_types::*;
 
+impl ConcurrentRustPlugin for QuestionPlugin {
+    fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
+        invoke_question_service(&context)
+    }
+}
+
 impl RustPlugin for QuestionPlugin {
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
-        match context.request.interface_id.as_str() {
-            TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(&context),
-            _ => ServiceResponse::error(
-                "unsupported_interface",
-                "unsupported question plugin service interface",
-            ),
-        }
+        invoke_question_service(&context)
+    }
+}
+
+fn invoke_question_service(context: &NativeServiceContext) -> ServiceResponse {
+    match context.request.interface_id.as_str() {
+        TOOL_SERVICE_INTERFACE_ID => invoke_tool_service(context),
+        _ => ServiceResponse::error(
+            "unsupported_interface",
+            "unsupported question plugin service interface",
+        ),
     }
 }
 
@@ -622,7 +632,10 @@ const fn tool_error(output: String) -> ToolInvocationResponse {
 
 #[must_use]
 pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
-    bcode_plugin_sdk::static_plugin_vtable!(QuestionPlugin, include_str!("../bcode-plugin.toml"))
+    bcode_plugin_sdk::static_concurrent_plugin_vtable!(
+        QuestionPlugin,
+        include_str!("../bcode-plugin.toml")
+    )
 }
 
 #[cfg(feature = "static-bundled")]
@@ -665,7 +678,7 @@ pub fn question_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
 }
 
 #[cfg(all(feature = "dynamic-export", not(feature = "static-bundled")))]
-bcode_plugin_sdk::export_plugin!(QuestionPlugin, include_str!("../bcode-plugin.toml"));
+bcode_plugin_sdk::export_concurrent_plugin!(QuestionPlugin, include_str!("../bcode-plugin.toml"));
 
 #[cfg(test)]
 mod tests {

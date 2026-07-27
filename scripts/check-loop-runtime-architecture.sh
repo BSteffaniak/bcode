@@ -569,10 +569,13 @@ if ! grep -F 'presentation_and_exchange_payloads_are_excluded_from_model_context
 fi
 
 if ! grep -F 'server_question_exchange_completes_original_plugin_invocation' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'pending_question_does_not_block_other_session_tool_preparation' packages/server/src/lib.rs >/dev/null ||
+   ! grep -F 'static_pending_question_does_not_block_plugin_services' packages/plugin/src/lib.rs >/dev/null ||
+   ! grep -F 'dynamic_pending_question_does_not_block_plugin_services' packages/plugin/src/lib.rs >/dev/null ||
    ! grep -F 'exchange_lifecycle_projects_opaque_active_state_and_terminal_resolution' packages/session-view/src/lib.rs >/dev/null ||
    ! grep -F 'ToolExchangeRequested' packages/session/src/persisted.rs >/dev/null ||
    ! grep -F 'ToolExchangeResolved' packages/session/src/persisted.rs >/dev/null; then
-  echo "Runtime architecture violation: neutral durable exchange lifecycle coverage was removed." >&2
+  echo "Runtime architecture violation: neutral durable exchange lifecycle or concurrency coverage was removed." >&2
   violations=1
 fi
 

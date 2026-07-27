@@ -35418,6 +35418,129 @@ library = "test"
     #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
+    async fn pending_question_does_not_block_other_session_tool_preparation() {
+        let sessions = SessionManager::default();
+        let question_session = sessions
+            .create_session(
+                Some("pending question".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("question session");
+        let other_session = sessions
+            .create_session(Some("other session".to_owned()), test_working_directory())
+            .await
+            .expect("other session");
+        let trace_dir = tempfile::tempdir().expect("question concurrency trace dir");
+        let mut state = test_server_state_with_question_plugin(sessions);
+        state.trace_store = TraceStore::new(trace_dir.path().to_path_buf());
+        let state = Arc::new(state);
+        state
+            .set_client_runtime_context(
+                ClientId::new(),
+                Some(ClientRuntimeContext {
+                    interaction_adapters: bcode_bundled_plugins::interaction_adapters("tui"),
+                    ..ClientRuntimeContext::default()
+                }),
+            )
+            .await;
+        let question_call = bcode_model::ToolCall {
+            id: "blocking-question-call".to_owned(),
+            name: "question".to_owned(),
+            arguments: serde_json::json!({
+                "questions": [{
+                    "question": "Proceed?",
+                    "options": [{"label": "Yes", "value": "yes"}],
+                    "required": true
+                }]
+            }),
+        };
+        let (tool, preparation) =
+            prepare_server_tool(state.as_ref(), question_session.id, &question_call)
+                .await
+                .expect("question tool preparation");
+        let policy_metadata =
+            tool_policy_authorization_metadata(&preparation.authorization, &question_call.name)
+                .expect("question tool policy fact");
+        let cancel_state = Arc::new(TurnCancelState::default());
+        let task_state = Arc::clone(&state);
+        let task_call = question_call.clone();
+        let task_cancel = Arc::clone(&cancel_state);
+        let question_task = tokio::spawn(async move {
+            invoke_prepared_tool_for_test(
+                task_state.as_ref(),
+                question_session.id,
+                &task_call,
+                tool,
+                preparation,
+                &policy_metadata,
+                task_cancel.as_ref(),
+            )
+            .await
+        });
+
+        let interaction_id = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let interaction_id = state
+                    .pending_tool_exchanges
+                    .lock()
+                    .await
+                    .keys()
+                    .next()
+                    .cloned();
+                if let Some(interaction_id) = interaction_id {
+                    break interaction_id;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("question exchange should become pending");
+
+        let other_call = bcode_model::ToolCall {
+            id: "other-question-preparation".to_owned(),
+            name: "question".to_owned(),
+            arguments: serde_json::json!({
+                "questions": [{"question": "Another question?", "required": false}]
+            }),
+        };
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            prepare_server_tool(state.as_ref(), other_session.id, &other_call),
+        )
+        .await
+        .expect("another session must not wait for the pending question")
+        .expect("other session tool preparation should succeed");
+
+        let pending = state
+            .pending_tool_exchanges
+            .lock()
+            .await
+            .get(&interaction_id)
+            .cloned()
+            .expect("question exchange remains pending");
+        complete_pending_tool_exchange(
+            state.as_ref(),
+            &pending,
+            ToolExchangeResolution::Responded {
+                payload: serde_json::json!({
+                    "status": "answered",
+                    "questions": [{"question_index": 0, "selected": ["yes"]}]
+                }),
+            },
+        )
+        .await;
+        let response = tokio::time::timeout(Duration::from_secs(2), question_task)
+            .await
+            .expect("question invocation should resume")
+            .expect("question task should join")
+            .expect("question invocation should succeed");
+        assert!(!response.is_error, "{}", response.output);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn server_question_exchange_completes_original_plugin_invocation() {
         let sessions = SessionManager::default();
         let summary = sessions

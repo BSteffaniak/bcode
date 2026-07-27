@@ -5132,14 +5132,107 @@ library = "libexample_plugin.dylib"
         ));
     }
 
+    fn assert_pending_question_does_not_block_plugin_services(plugin: LoadedPlugin) {
+        let plugin = Arc::new(plugin);
+        let request = bcode_tool::ToolInvocationRequest {
+            tool_call_id: "blocking-question-call".to_string(),
+            name: "question".to_string(),
+            arguments: serde_json::json!({
+                "questions": [{
+                    "question": "Proceed?",
+                    "options": [{"label": "Yes", "value": "yes"}],
+                    "required": true
+                }]
+            }),
+            preparation_descriptor: serde_json::Value::Null,
+        };
+        let payload = serde_json::to_vec(&request).expect("question request encodes");
+        let (bridge_started_tx, bridge_started_rx) = std::sync::mpsc::sync_channel(1);
+        let (answer_tx, answer_rx) = std::sync::mpsc::sync_channel(1);
+        let question_plugin = Arc::clone(&plugin);
+        let question = std::thread::spawn(move || {
+            question_plugin.invoke_service_with_bridge(
+                bcode_tool::TOOL_SERVICE_INTERFACE_ID,
+                bcode_tool::OP_INVOKE_TOOL,
+                payload,
+                |_| {},
+                |request, _| {
+                    bridge_started_tx
+                        .send(())
+                        .expect("question bridge start should be observed");
+                    answer_rx
+                        .recv()
+                        .expect("question answer should be delivered");
+                    assert!(matches!(request, ServiceBridgeRequest::Exchange(_)));
+                    Ok(ServiceBridgeResponse::Exchange(
+                        bcode_tool::ToolExchangeResolution::Responded {
+                            payload: serde_json::json!({
+                                "status": "answered",
+                                "questions": [{
+                                    "question_index": 0,
+                                    "selected": ["yes"]
+                                }]
+                            }),
+                        },
+                    ))
+                },
+                &bcode_plugin_sdk::ServiceCancellation::default(),
+            )
+        });
+        bridge_started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("question bridge should start");
+
+        let list_plugin = Arc::clone(&plugin);
+        let (list_tx, list_rx) = std::sync::mpsc::sync_channel(1);
+        let list = std::thread::spawn(move || {
+            let payload = serde_json::to_vec(&bcode_tool::ListToolsRequest::default())
+                .expect("list request encodes");
+            let response = list_plugin.invoke_service(
+                bcode_tool::TOOL_SERVICE_INTERFACE_ID,
+                bcode_tool::OP_LIST_TOOLS,
+                payload,
+            );
+            let _ = list_tx.send(response);
+        });
+        let list_response = list_rx.recv_timeout(Duration::from_secs(1));
+
+        answer_tx.send(()).expect("question answer should send");
+        let question_response = question
+            .join()
+            .expect("question invocation thread should join")
+            .expect("question invocation should complete");
+        let question_response: bcode_tool::ToolInvocationResponse =
+            decode_service_response(question_response).expect("question response decodes");
+        assert!(!question_response.is_error);
+        list.join().expect("list invocation thread should join");
+
+        let list_response = list_response
+            .expect("list_tools must not wait for an unrelated pending question")
+            .expect("list_tools invocation should complete");
+        let tools: bcode_tool::ToolList =
+            decode_service_response(list_response).expect("tool list response decodes");
+        assert!(tools.tools.iter().any(|tool| tool.name == "question"));
+    }
+
     #[test]
     fn dynamic_question_plugin_uses_same_invocation_exchange() {
         assert_question_exchange_plugin(&load_dynamic_question_plugin());
     }
 
     #[test]
+    fn dynamic_pending_question_does_not_block_plugin_services() {
+        assert_pending_question_does_not_block_plugin_services(load_dynamic_question_plugin());
+    }
+
+    #[test]
     fn static_question_plugin_uses_same_invocation_exchange() {
         assert_question_exchange_plugin(&load_static_question_plugin());
+    }
+
+    #[test]
+    fn static_pending_question_does_not_block_plugin_services() {
+        assert_pending_question_does_not_block_plugin_services(load_static_question_plugin());
     }
     #[test]
     fn dynamic_loader_supports_all_bridge_families_and_cancellation() {
