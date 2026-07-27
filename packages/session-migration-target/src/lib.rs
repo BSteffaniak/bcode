@@ -331,6 +331,11 @@ pub fn classify_storage_facts(
             "storage contract facts are inconsistent".to_owned(),
         ));
     }
+    if completed.len() == facts.current_migration_ids.len() {
+        return Err(StorageCompatibilityError::Classification(
+            "current migration ledger is missing its required storage contract".to_owned(),
+        ));
+    }
     Ok(StorageCompatibility::MigrationRequired {
         writer_epoch: u64::from(facts.legacy_writer_epoch),
     })

@@ -549,12 +549,9 @@ if rg -n "std::fs|OpenOptions|fs::File|File::open|File::create" packages/session
   violations=1
 fi
 
-if sed -n '/^\[dependencies\]/,/^\[dev-dependencies\]/p' packages/session/Cargo.toml \
-    | grep -q '^bcode_session_migration = ' \
-  || rg -n 'bcode_session_migration::' packages/session/src --glob '*.rs' --glob '!db.rs' \
-    >/tmp/bcode-session-production-migration-dependency-violations.txt \
-  || sed -n '760,3700p' packages/session/src/db.rs | rg -n 'bcode_session_migration::' \
-    >>/tmp/bcode-session-production-migration-dependency-violations.txt; then
+if rg -n '^bcode_session_migration = ' packages/session/Cargo.toml \
+  || rg -n 'bcode_session_migration::' packages/session/src --glob '*.rs' \
+    >/tmp/bcode-session-production-migration-dependency-violations.txt; then
   echo "Session dependency-direction violation: production bcode_session must not depend on bcode_session_migration." >&2
   cat /tmp/bcode-session-production-migration-dependency-violations.txt >&2 2>/dev/null || true
   violations=1

@@ -2322,7 +2322,6 @@ dependencies = [
  "bcode_database_observability",
  "bcode_metrics",
  "bcode_plugin_sdk",
- "bcode_session_migration",
  "bcode_session_migration_target",
  "bcode_session_models",
  "bcode_skill_models",
