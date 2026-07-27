@@ -1,23 +1,7 @@
 ---
-id: add-invariant
-name: Add Invariant
+name: add-invariant
 description: Evaluate a proposed Bcode requirement, classify it as an invariant, policy, architecture documentation, validation rule, or no change, and interactively apply the smallest approved update.
-version: 0.1.0
-activation:
-  keywords:
-    - add invariant
-    - new invariant
-    - codify boundary
-    - must always
-    - must never
-permissions:
-  tools:
-    - filesystem.read
-    - filesystem.grep
-    - filesystem.find
-    - filesystem.edit
-    - filesystem.write
-    - question
+allowed-tools: Read(*), Glob(*), Grep(*), Question(*), Edit(*), Write(*)
 ---
 
 # Add Invariant

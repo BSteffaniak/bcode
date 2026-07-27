@@ -1,23 +1,7 @@
 ---
-id: audit-invariants
-name: Audit Invariants
+name: audit-invariants
 description: Audit Bcode's invariant catalog for conflicts, overlap, ambiguity, misplaced policy, implementation-specific rules, and missing architectural boundaries, then interactively apply approved resolutions.
-version: 0.1.0
-activation:
-  keywords:
-    - audit invariants
-    - conflicting invariants
-    - invariant conflict
-    - review invariants
-    - resolve invariants
-permissions:
-  tools:
-    - filesystem.read
-    - filesystem.grep
-    - filesystem.find
-    - filesystem.edit
-    - filesystem.write
-    - question
+allowed-tools: Read(*), Glob(*), Grep(*), Question(*), Edit(*), Write(*)
 ---
 
 # Audit Invariants
