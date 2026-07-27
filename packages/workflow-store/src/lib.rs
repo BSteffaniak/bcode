@@ -15,7 +15,7 @@ use std::pin::Pin;
 use thiserror::Error;
 
 const DATABASE_FILE: &str = "workflow.db";
-const SCHEMA_VERSION: u32 = 5;
+const SCHEMA_VERSION: u32 = 6;
 const MAX_ID_BYTES: usize = 512;
 const MAX_DISPLAY_LABEL_BYTES: usize = 512;
 const MAX_INLINE_JSON_BYTES: usize = 1_048_576;
@@ -164,6 +164,20 @@ pub struct AttemptSummary {
     pub prepared_at_ms: u64,
     pub admitted_at_ms: Option<u64>,
     pub terminal_at_ms: Option<u64>,
+}
+
+/// Persisted automatic-retry backoff schedule for one exact next attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomaticRetrySchedule {
+    pub run_id: String,
+    pub node_id: String,
+    pub activation_id: String,
+    pub failed_attempt: u32,
+    pub next_attempt: u32,
+    pub failure_kind: bcode_workflow::AutomaticRetryFailureKind,
+    pub backoff_ms: u64,
+    pub next_attempt_at_ms: u64,
+    pub scheduled_at_ms: u64,
 }
 
 /// One bounded workflow event row.
@@ -564,6 +578,7 @@ pub trait WorkflowOutputFault: Sync {
 pub enum WorkflowOutputBoundary {
     OutputInserted,
     ActivationCompleted,
+    BranchDecisionPersisted,
     SuccessorsMaterialized,
 }
 
@@ -727,6 +742,20 @@ pub struct ValidatedOutput {
 }
 
 /// Errors returned by durable workflow persistence.
+/// Actionable identity and schema detail for one target-input validation failure.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Error)]
+#[error(
+    "workflow target input validation failed for {run_id}/{target_node_id} from {source_node_id}/{source_activation_id}: {message}"
+)]
+pub struct TargetInputValidationFailure {
+    pub run_id: String,
+    pub source_node_id: String,
+    pub source_activation_id: String,
+    pub target_node_id: String,
+    pub target_schema_id: String,
+    pub message: String,
+}
+
 #[derive(Debug, Error)]
 pub enum WorkflowStoreError {
     /// Database operation failed.
@@ -750,6 +779,9 @@ pub enum WorkflowStoreError {
     /// A durable cancellation request prevents further lifecycle changes.
     #[error("workflow cancellation prevents run state changes")]
     CancellationPreventsControl,
+    /// A computed successor value did not match the exact target input contract.
+    #[error("{0}")]
+    TargetInputValidation(Box<TargetInputValidationFailure>),
     /// Persisted data violated the storage contract.
     #[error("invalid workflow store data: {0}")]
     InvalidData(String),
@@ -1979,6 +2011,119 @@ impl WorkflowStore {
         Ok(identity)
     }
 
+    /// Persist an eligible automatic-retry schedule without sleeping or requeueing work.
+    ///
+    /// The exact next attempt and due time are durable and idempotent. Production capability
+    /// advertisement remains disabled until a scheduler consumes this state safely.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity, an ineligible policy decision, invalid/overflowing
+    /// backoff, conflicting schedule identity, or database failure.
+    #[allow(clippy::too_many_arguments)]
+    pub fn schedule_automatic_retry(
+        &mut self,
+        eligibility: bcode_workflow::AutomaticRetryEligibility,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+        failure_kind: bcode_workflow::AutomaticRetryFailureKind,
+        backoff_ms: u64,
+        scheduled_at_ms: u64,
+    ) -> Result<AutomaticRetrySchedule, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        validate_id("node_id", node_id)?;
+        validate_id("activation_id", activation_id)?;
+        if eligibility.failure != failure_kind {
+            return Err(WorkflowStoreError::InvalidData(
+                "automatic retry failure kind does not match eligibility facts".to_string(),
+            ));
+        }
+        let next_attempt = match bcode_workflow::automatic_retry_decision(eligibility) {
+            bcode_workflow::AutomaticRetryDecision::Eligible { next_attempt } => next_attempt,
+            bcode_workflow::AutomaticRetryDecision::Ineligible { reason } => {
+                return Err(WorkflowStoreError::InvalidData(format!(
+                    "automatic retry is ineligible: {reason:?}"
+                )));
+            }
+        };
+        let next_attempt_at_ms = scheduled_at_ms.checked_add(backoff_ms).ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "automatic retry backoff timestamp overflow".to_string(),
+            )
+        })?;
+        let schedule = AutomaticRetrySchedule {
+            run_id: run_id.to_string(),
+            node_id: node_id.to_string(),
+            activation_id: activation_id.to_string(),
+            failed_attempt: eligibility.attempts_completed,
+            next_attempt,
+            failure_kind,
+            backoff_ms,
+            next_attempt_at_ms,
+            scheduled_at_ms,
+        };
+        let failure_json = serde_json::to_string(&schedule.failure_kind)?;
+        let transaction = self.connection.transaction()?;
+        let inserted = transaction.execute(
+            "INSERT INTO workflow_retry_schedules \
+             (run_id, node_id, activation_id, failed_attempt, next_attempt, failure_kind, \
+              backoff_ms, next_attempt_at_ms, scheduled_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT(run_id, node_id, activation_id) DO NOTHING",
+            (
+                &schedule.run_id,
+                &schedule.node_id,
+                &schedule.activation_id,
+                schedule.failed_attempt,
+                schedule.next_attempt,
+                &failure_json,
+                schedule.backoff_ms,
+                schedule.next_attempt_at_ms,
+                schedule.scheduled_at_ms,
+            ),
+        )?;
+        let stored = automatic_retry_schedule(&transaction, run_id, node_id, activation_id)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "automatic retry schedule was not persisted".to_string(),
+                )
+            })?;
+        if stored != schedule {
+            return Err(WorkflowStoreError::InvalidData(
+                "automatic retry schedule identity conflict".to_string(),
+            ));
+        }
+        if inserted == 1 {
+            append_event(
+                &transaction,
+                run_id,
+                "automatic_retry_scheduled",
+                &serde_json::to_string(&schedule)?,
+                scheduled_at_ms,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(schedule)
+    }
+
+    /// Load one exact persisted automatic-retry schedule.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity, invalid stored failure data, or database failure.
+    pub fn automatic_retry_schedule(
+        &self,
+        run_id: &str,
+        node_id: &str,
+        activation_id: &str,
+    ) -> Result<Option<AutomaticRetrySchedule>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        validate_id("node_id", node_id)?;
+        validate_id("activation_id", activation_id)?;
+        automatic_retry_schedule(&self.connection, run_id, node_id, activation_id)
+    }
+
     /// Persist validated node output before marking its activation complete.
     ///
     /// # Errors
@@ -2815,9 +2960,20 @@ impl WorkflowStore {
                     "workflow repeat configuration is missing max_iterations".to_string(),
                 )
             })?;
+        let cycle_cap: u64 = transaction.query_row(
+            "SELECT cycle_cap FROM workflow_runs WHERE run_id = ?1",
+            [&activation.run_id],
+            |row| row.get(0),
+        )?;
+        let effective_iteration_bound = max_iterations.min(cycle_cap);
         let should_repeat = evaluate_predicate(&predicate, input)?;
-        let within_iteration_bound =
-            activation.dependency_generation.saturating_add(1) < max_iterations;
+        let next_generation = activation
+            .dependency_generation
+            .checked_add(1)
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData("workflow repeat generation overflow".to_string())
+            })?;
+        let within_iteration_bound = next_generation < effective_iteration_bound;
         transaction.execute(
             "UPDATE workflow_activations SET status = 'completed', output_id = ?4 \
              WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND status = 'pending'",
@@ -2847,7 +3003,6 @@ impl WorkflowStore {
         )?;
         let mut activated = Vec::new();
         if should_repeat && within_iteration_bound {
-            let next_generation = activation.dependency_generation.saturating_add(1);
             for edge in definition.edges.iter().filter(|edge| {
                 edge.from == activation.node_id
                     && matches!(edge.kind, bcode_workflow::EdgeKind::Back { .. })
@@ -2900,7 +3055,19 @@ impl WorkflowStore {
                     &format!("workflow repeat input for node {}", node.id),
                     &node.input.schema,
                     &transformed_input,
-                )?;
+                )
+                .map_err(|error| {
+                    WorkflowStoreError::TargetInputValidation(Box::new(
+                        TargetInputValidationFailure {
+                            run_id: activation.run_id.clone(),
+                            source_node_id: activation.node_id.clone(),
+                            source_activation_id: activation.activation_id.clone(),
+                            target_node_id: node.id.clone(),
+                            target_schema_id: node.input.type_name.clone(),
+                            message: error.to_string(),
+                        },
+                    ))
+                })?;
                 insert_activation_with_status(
                     &transaction,
                     &next,
@@ -2922,6 +3089,9 @@ impl WorkflowStore {
                     "node_id": activation.node_id,
                     "reason": "repeat_iteration_limit_exhausted",
                     "max_iterations": max_iterations,
+                    "cycle_cap": cycle_cap,
+                    "effective_iteration_bound": effective_iteration_bound,
+                    "generation": activation.dependency_generation,
                 })
                 .to_string(),
                 settled_at_ms,
@@ -2948,6 +3118,11 @@ impl WorkflowStore {
                 "node_id": activation.node_id,
                 "activation_id": activation.activation_id,
                 "repeat": should_repeat && within_iteration_bound,
+                "generation": activation.dependency_generation,
+                "next_generation": should_repeat.then_some(next_generation),
+                "max_iterations": max_iterations,
+                "cycle_cap": cycle_cap,
+                "effective_iteration_bound": effective_iteration_bound,
                 "iteration_bound_exhausted": should_repeat && !within_iteration_bound,
             })
             .to_string(),
@@ -3702,7 +3877,7 @@ where
         &serde_json::to_string(output)?,
         output.created_at_ms,
     )?;
-    let (activated, completed_is_exit) = materialize_direct_successors(transaction, output)?;
+    let (activated, completed_is_exit) = materialize_direct_successors(transaction, output, fault)?;
     fault.after_boundary(WorkflowOutputBoundary::SuccessorsMaterialized, output)?;
     let active_count: u64 = transaction.query_row(
         "SELECT COUNT(*) FROM workflow_activations WHERE run_id = ?1 \
@@ -3738,23 +3913,9 @@ fn evaluate_predicate(
     expression: &bcode_workflow::PredicateExpression,
     value: &serde_json::Value,
 ) -> Result<bool, WorkflowStoreError> {
-    match expression {
-        bcode_workflow::PredicateExpression::Equals {
-            path,
-            value: expected,
-        } => {
-            let actual = path
-                .split('.')
-                .filter(|part| !part.is_empty())
-                .try_fold(value, |current, part| current.get(part))
-                .ok_or_else(|| {
-                    WorkflowStoreError::InvalidData(format!(
-                        "workflow predicate field was not present: {path}"
-                    ))
-                })?;
-            Ok(actual == expected)
-        }
-    }
+    expression
+        .evaluate_value(value)
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))
 }
 
 fn configured_node_ids(
@@ -3912,15 +4073,29 @@ fn activation_input(
         &format!("workflow activation input for node {}", target.id),
         &target.input.schema,
         &input,
-    )?;
+    )
+    .map_err(|error| {
+        WorkflowStoreError::TargetInputValidation(Box::new(TargetInputValidationFailure {
+            run_id: output.run_id.clone(),
+            source_node_id: output.node_id.clone(),
+            source_activation_id: output.activation_id.clone(),
+            target_node_id: target.id.clone(),
+            target_schema_id: target.input.type_name.clone(),
+            message: error.to_string(),
+        }))
+    })?;
     Ok(input)
 }
 
 #[allow(clippy::too_many_lines)]
-fn materialize_direct_successors(
+fn materialize_direct_successors<F>(
     transaction: &Transaction<'_>,
     output: &ValidatedOutput,
-) -> Result<(Vec<NewActivation>, bool), WorkflowStoreError> {
+    fault: &F,
+) -> Result<(Vec<NewActivation>, bool), WorkflowStoreError>
+where
+    F: WorkflowOutputFault + ?Sized,
+{
     let (definition_json, generation): (String, u64) = transaction.query_row(
         "SELECT definition.definition_json, activation.dependency_generation \
          FROM workflow_runs run \
@@ -3993,7 +4168,7 @@ fn materialize_direct_successors(
             &skipped_nodes,
             output.created_at_ms,
         )?;
-        targets.extend(selected_entries);
+        targets.extend(selected_entries.iter().cloned());
         transaction.execute(
             "INSERT INTO workflow_decisions \
              (decision_id, run_id, node_id, decision_type, value_json, created_at_ms) \
@@ -4003,12 +4178,16 @@ fn materialize_direct_successors(
                 &output.run_id,
                 &output.node_id,
                 serde_json::to_string(&serde_json::json!({
+                    "predicate_version": bcode_workflow::WORKFLOW_PREDICATE_VERSION,
                     "selected": selected,
                     "predicate": expression,
+                    "selected_entries": selected_entries,
+                    "skipped_nodes": skipped_nodes,
                 }))?,
                 output.created_at_ms,
             ),
         )?;
+        fault.after_boundary(WorkflowOutputBoundary::BranchDecisionPersisted, output)?;
     }
     targets.sort();
     targets.dedup();
@@ -5346,6 +5525,55 @@ fn validate_output_against_node_schema(
     Ok(())
 }
 
+fn automatic_retry_schedule(
+    connection: &Connection,
+    run_id: &str,
+    node_id: &str,
+    activation_id: &str,
+) -> Result<Option<AutomaticRetrySchedule>, WorkflowStoreError> {
+    connection
+        .query_row(
+            "SELECT failed_attempt, next_attempt, failure_kind, backoff_ms, next_attempt_at_ms, \
+             scheduled_at_ms FROM workflow_retry_schedules \
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3",
+            (run_id, node_id, activation_id),
+            |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, u64>(5)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(
+            |(
+                failed_attempt,
+                next_attempt,
+                failure_kind,
+                backoff_ms,
+                next_attempt_at_ms,
+                scheduled_at_ms,
+            )| {
+                Ok(AutomaticRetrySchedule {
+                    run_id: run_id.to_string(),
+                    node_id: node_id.to_string(),
+                    activation_id: activation_id.to_string(),
+                    failed_attempt,
+                    next_attempt,
+                    failure_kind: serde_json::from_str(&failure_kind)?,
+                    backoff_ms,
+                    next_attempt_at_ms,
+                    scheduled_at_ms,
+                })
+            },
+        )
+        .transpose()
+}
+
 fn persist_definition_transaction(
     transaction: &Transaction<'_>,
     stored: &StoredWorkflowDefinition,
@@ -5449,6 +5677,20 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
              admitted_at_ms INTEGER,\
              terminal_at_ms INTEGER,\
              PRIMARY KEY (run_id, node_id, activation_id, attempt),\
+             FOREIGN KEY (run_id, node_id, activation_id)\
+                 REFERENCES workflow_activations(run_id, node_id, activation_id)\
+         );\
+         CREATE TABLE IF NOT EXISTS workflow_retry_schedules (\
+             run_id TEXT NOT NULL,\
+             node_id TEXT NOT NULL,\
+             activation_id TEXT NOT NULL,\
+             failed_attempt INTEGER NOT NULL CHECK (failed_attempt > 0),\
+             next_attempt INTEGER NOT NULL CHECK (next_attempt > failed_attempt),\
+             failure_kind TEXT NOT NULL,\
+             backoff_ms INTEGER NOT NULL,\
+             next_attempt_at_ms INTEGER NOT NULL,\
+             scheduled_at_ms INTEGER NOT NULL,\
+             PRIMARY KEY (run_id, node_id, activation_id),\
              FOREIGN KEY (run_id, node_id, activation_id)\
                  REFERENCES workflow_activations(run_id, node_id, activation_id)\
          );\
@@ -5567,6 +5809,11 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
     transaction.execute(
         "UPDATE workflow_store_contract SET schema_version = 5 \
          WHERE contract_id = 1 AND schema_version = 4",
+        [],
+    )?;
+    transaction.execute(
+        "UPDATE workflow_store_contract SET schema_version = 6 \
+         WHERE contract_id = 1 AND schema_version = 5",
         [],
     )?;
     let actual: u32 = transaction.query_row(
@@ -5710,6 +5957,32 @@ mod tests {
             inspect.branch(
                 "choose",
                 bcode_workflow::field::<u32>("").eq(1_u32),
+                selected,
+                other,
+            ),
+        )
+        .build()
+        .expect("workflow")
+        .definition()
+        .clone()
+    }
+
+    fn conditional_nested_definition() -> WorkflowDefinition {
+        let inspect = Step::task("inspect", |value: serde_json::Value, _context| async move {
+            Ok(value)
+        });
+        let selected = Step::task(
+            "selected",
+            |value: serde_json::Value, _context| async move { Ok(value) },
+        );
+        let other = Step::task("other", |value: serde_json::Value, _context| async move {
+            Ok(value)
+        });
+        WorkflowBuilder::new(
+            "conditional-nested",
+            inspect.branch(
+                "choose",
+                bcode_workflow::field::<serde_json::Value>("review.result.passed").eq(true),
                 selected,
                 other,
             ),
@@ -6314,6 +6587,242 @@ mod tests {
     }
 
     #[test]
+    fn repeat_restart_cannot_duplicate_or_skip_generation() {
+        let temp = tempfile::tempdir().expect("temp");
+        let definition = repeat_definition();
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("repeat-restart", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "repeat-restart-run".to_string(),
+                definition_id: "repeat-restart".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                binding: None,
+                input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
+                created_at_ms: 1,
+                limits: WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let body = store
+            .pending_activations(10)
+            .expect("body")
+            .pop()
+            .expect("body");
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "restart-body-0".to_string(),
+                run_id: "repeat-restart-run".to_string(),
+                node_id: "body".to_string(),
+                activation_id: body.activation_id,
+                schema_id: definition.nodes["body"].output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::json!({"condition_met": false, "iteration": 1}),
+                artifact_reference: None,
+                created_at_ms: 2,
+            })
+            .expect("output");
+        drop(store);
+
+        let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let first = reopened
+            .settle_pending_control_nodes("repeat-restart-run", 10, 3)
+            .expect("settle after restart");
+        assert_eq!(first.activated.len(), 1);
+        assert_eq!(first.activated[0].dependency_generation, 1);
+        let second = reopened
+            .settle_pending_control_nodes("repeat-restart-run", 10, 4)
+            .expect("idempotent settle");
+        assert!(second.activated.is_empty());
+        drop(reopened);
+
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("second reopen");
+        let rows = reopened
+            .connection
+            .prepare(
+                "SELECT dependency_generation, status FROM workflow_activations \
+                 WHERE run_id = 'repeat-restart-run' AND node_id = 'body' \
+                 ORDER BY dependency_generation",
+            )
+            .expect("query")
+            .query_map([], |row| {
+                Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(
+            rows,
+            vec![(0, "completed".to_string()), (1, "pending".to_string())]
+        );
+        let repeat_rows: u64 = reopened
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_activations \
+                 WHERE run_id = 'repeat-restart-run' AND node_id = 'repeat-control'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("repeat count");
+        assert_eq!(repeat_rows, 1);
+    }
+
+    #[test]
+    fn repeat_predicate_clearing_at_bound_completes_and_records_accounting() {
+        let temp = tempfile::tempdir().expect("temp");
+        let definition = repeat_definition();
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("repeat-clear", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "repeat-clear-run".to_string(),
+                definition_id: "repeat-clear".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                binding: None,
+                input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
+                created_at_ms: 1,
+                limits: WorkflowRunLimits {
+                    cycle_cap: 2,
+                    ..WorkflowRunLimits::default()
+                },
+            })
+            .expect("run");
+        let body = store
+            .pending_activations(10)
+            .expect("body")
+            .pop()
+            .expect("body");
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "clear-body-0".to_string(),
+                run_id: "repeat-clear-run".to_string(),
+                node_id: "body".to_string(),
+                activation_id: body.activation_id,
+                schema_id: definition.nodes["body"].output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::json!({"condition_met": false, "iteration": 1}),
+                artifact_reference: None,
+                created_at_ms: 2,
+            })
+            .expect("output");
+        store
+            .settle_pending_control_nodes("repeat-clear-run", 10, 3)
+            .expect("advance");
+        let body = store
+            .pending_activations(10)
+            .expect("body")
+            .pop()
+            .expect("body");
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "clear-body-1".to_string(),
+                run_id: "repeat-clear-run".to_string(),
+                node_id: "body".to_string(),
+                activation_id: body.activation_id,
+                schema_id: definition.nodes["body"].output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::json!({"condition_met": true, "iteration": 2}),
+                artifact_reference: None,
+                created_at_ms: 4,
+            })
+            .expect("output");
+        store
+            .settle_pending_control_nodes("repeat-clear-run", 10, 5)
+            .expect("complete");
+        assert_eq!(
+            store
+                .run_summary("repeat-clear-run")
+                .expect("run")
+                .expect("run")
+                .status,
+            RunStatus::Completed
+        );
+        let settled = store
+            .event_history("repeat-clear-run", None, 30)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.event_type == "control_node_settled")
+            .collect::<Vec<_>>();
+        assert_eq!(settled.len(), 2);
+        assert_eq!(settled[0].payload["generation"], 0);
+        assert_eq!(settled[0].payload["next_generation"], 1);
+        assert_eq!(settled[1].payload["generation"], 1);
+        assert_eq!(settled[1].payload["repeat"], false);
+        assert_eq!(settled[1].payload["effective_iteration_bound"], 2);
+    }
+
+    #[test]
+    fn repeat_cycle_cap_is_enforced_with_definition_bound() {
+        let temp = tempfile::tempdir().expect("temp");
+        let definition = repeat_definition();
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("repeat-cap", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "repeat-cap-run".to_string(),
+                definition_id: "repeat-cap".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                binding: None,
+                input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
+                created_at_ms: 1,
+                limits: WorkflowRunLimits {
+                    cycle_cap: 1,
+                    ..WorkflowRunLimits::default()
+                },
+            })
+            .expect("run");
+        let body = store
+            .pending_activations(10)
+            .expect("body")
+            .pop()
+            .expect("body");
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "cap-body".to_string(),
+                run_id: "repeat-cap-run".to_string(),
+                node_id: "body".to_string(),
+                activation_id: body.activation_id,
+                schema_id: definition.nodes["body"].output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::json!({"condition_met": false, "iteration": 1}),
+                artifact_reference: None,
+                created_at_ms: 2,
+            })
+            .expect("output");
+        store
+            .settle_pending_control_nodes("repeat-cap-run", 10, 3)
+            .expect("settle");
+        assert_eq!(
+            store
+                .run_summary("repeat-cap-run")
+                .expect("run")
+                .expect("run")
+                .status,
+            RunStatus::Failed
+        );
+        let failure = store
+            .event_history("repeat-cap-run", None, 20)
+            .expect("events")
+            .into_iter()
+            .find(|event| event.event_type == "run_failed")
+            .expect("failure");
+        assert_eq!(failure.payload["max_iterations"], 2);
+        assert_eq!(failure.payload["cycle_cap"], 1);
+        assert_eq!(failure.payload["effective_iteration_bound"], 1);
+    }
+
+    #[test]
     fn explicit_failed_node_retry_is_bounded_exact_and_reuses_activation() {
         struct FailedObserver;
         impl AttemptStatusObserver for FailedObserver {
@@ -6390,6 +6899,62 @@ mod tests {
                 .retry_failed_node("run-1", "review", &activation_id(), 1, 23)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn explicit_operator_retry_remains_distinct_from_ambiguity_repair() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = initialized_store_at(temp.path());
+        let identity = store
+            .prepare_attempt(&PreparedAttempt {
+                run_id: "run-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id: activation_id(),
+                attempt: 1,
+                side_effect: DispatchSideEffect::Mutating,
+                intent: serde_json::json!({"operation": "mutate"}),
+                prepared_at_ms: 12,
+            })
+            .expect("prepare");
+        store
+            .reconcile_prepared_attempts(10, 20)
+            .expect("repair required");
+        assert!(
+            store
+                .retry_failed_node("run-1", "review", &activation_id(), 1, 21)
+                .is_err()
+        );
+        drop(store);
+
+        let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let repaired = reopened
+            .repair_attempt(
+                &identity,
+                &RepairResolution::AbandonForExplicitRetry {
+                    reason: "operator verified no side effect".to_string(),
+                },
+                22,
+            )
+            .expect("repair");
+        assert_eq!(repaired.attempt_status, "abandoned");
+        assert_eq!(repaired.run_status, RunStatus::Running);
+        assert!(
+            reopened
+                .retry_failed_node("run-1", "review", &activation_id(), 1, 23)
+                .is_err()
+        );
+        let prepared = reopened
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::Mutating,
+                serde_json::json!({"operation": "mutate"}),
+                24,
+            )
+            .expect("prepare")
+            .expect("next attempt");
+        assert_eq!(prepared.attempt, 2);
     }
 
     #[tokio::test]
@@ -6480,6 +7045,186 @@ mod tests {
             )
             .expect("activation");
         assert_eq!(activation_status, "completed");
+    }
+
+    #[test]
+    fn automatic_retry_backoff_schedule_survives_restart_without_requeueing() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = initialized_store_at(temp.path());
+        let eligibility = bcode_workflow::AutomaticRetryEligibility {
+            version: bcode_workflow::WORKFLOW_AUTOMATIC_RETRY_POLICY_VERSION,
+            effect: bcode_workflow::WorkflowBlockEffect::ReadOnly,
+            reconciliation: bcode_workflow::WorkflowBlockReconciliation::ReceiptStatus,
+            failure: bcode_workflow::AutomaticRetryFailureKind::OwnerReportedRetryable,
+            attempts_completed: 1,
+            max_attempts: 3,
+            retry_cap: 2,
+        };
+        let schedule = store
+            .schedule_automatic_retry(
+                eligibility,
+                "run-1",
+                "review",
+                &activation_id(),
+                bcode_workflow::AutomaticRetryFailureKind::OwnerReportedRetryable,
+                5_000,
+                100,
+            )
+            .expect("schedule");
+        assert_eq!(schedule.next_attempt, 2);
+        assert_eq!(schedule.next_attempt_at_ms, 5_100);
+        drop(store);
+
+        let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(
+            reopened
+                .automatic_retry_schedule("run-1", "review", &activation_id())
+                .expect("load"),
+            Some(schedule.clone())
+        );
+        assert_eq!(
+            reopened
+                .attempt_history("run-1", None, 10)
+                .expect("attempts")
+                .len(),
+            0
+        );
+        assert_eq!(
+            reopened
+                .schedule_automatic_retry(
+                    eligibility,
+                    "run-1",
+                    "review",
+                    &activation_id(),
+                    bcode_workflow::AutomaticRetryFailureKind::OwnerReportedRetryable,
+                    5_000,
+                    100,
+                )
+                .expect("idempotent"),
+            schedule
+        );
+        assert!(
+            reopened
+                .schedule_automatic_retry(
+                    eligibility,
+                    "run-1",
+                    "review",
+                    &activation_id(),
+                    bcode_workflow::AutomaticRetryFailureKind::OwnerReportedRetryable,
+                    6_000,
+                    100,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            reopened
+                .event_history("run-1", None, 20)
+                .expect("events")
+                .iter()
+                .filter(|event| event.event_type == "automatic_retry_scheduled")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn retry_boundaries_survive_restart_without_automatic_scheduling() {
+        struct FailedObserver;
+        impl AttemptStatusObserver for FailedObserver {
+            fn observe(
+                &self,
+                _request: &AttemptReconciliationRequest,
+            ) -> Result<AttemptObservation, WorkflowStoreError> {
+                Ok(AttemptObservation::Failed {
+                    message: "terminal failure".to_string(),
+                })
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = initialized_store_at(temp.path());
+        let prepared = store
+            .prepare_pending_activation(
+                "run-1",
+                "review",
+                &activation_id(),
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"operation": "review"}),
+                12,
+            )
+            .expect("prepare")
+            .expect("attempt");
+        drop(store);
+
+        let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("prepared restart");
+        let prepared_rows = reopened
+            .attempt_history("run-1", None, 10)
+            .expect("history");
+        assert_eq!(prepared_rows[0].status, "prepared");
+        assert_eq!(prepared_rows[0].attempt, 1);
+        reopened
+            .persist_dispatch_receipt(&DispatchReceipt {
+                run_id: "run-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id: activation_id(),
+                attempt: prepared.attempt,
+                dispatch_identity: prepared.dispatch_identity,
+                receipt: serde_json::json!({"turn_id": "turn-1"}),
+                admitted_at_ms: 13,
+            })
+            .expect("receipt");
+        drop(reopened);
+
+        let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("receipt restart");
+        assert_eq!(
+            reopened
+                .attempt_history("run-1", None, 10)
+                .expect("history")[0]
+                .status,
+            "admitted"
+        );
+        reopened
+            .reconcile_receipt_backed_attempts(&FailedObserver, 10, 20)
+            .expect("terminal failure");
+        drop(reopened);
+
+        let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("terminal restart");
+        assert!(
+            reopened
+                .pending_activations(10)
+                .expect("pending")
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .attempt_history("run-1", None, 10)
+                .expect("history")[0]
+                .status,
+            "failed"
+        );
+        let retry = reopened
+            .retry_failed_node("run-1", "review", &activation_id(), 1, 21)
+            .expect("operator retry");
+        assert_eq!(retry.next_attempt, 2);
+        drop(reopened);
+
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("retry restart");
+        assert_eq!(
+            reopened
+                .pending_activations(10)
+                .expect("pending")
+                .pop()
+                .expect("activation")
+                .activation_id,
+            activation_id()
+        );
+        assert_eq!(
+            reopened
+                .attempt_history("run-1", None, 10)
+                .expect("history")
+                .len(),
+            1
+        );
     }
 
     #[test]
@@ -7807,6 +8552,75 @@ mod tests {
     }
 
     #[test]
+    fn target_input_mismatch_returns_actionable_typed_diagnostic_atomically() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut definition = sequential_definition();
+        definition
+            .nodes
+            .get_mut("second")
+            .expect("second")
+            .input
+            .schema = serde_json::json!({"type": "string"});
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("typed-mismatch", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "typed-mismatch-run".to_string(),
+                definition_id: "typed-mismatch".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                binding: None,
+                input: Some(serde_json::json!(1)),
+                created_at_ms: 1,
+                limits: WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let error = store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "first-output".to_string(),
+                run_id: "typed-mismatch-run".to_string(),
+                node_id: "first".to_string(),
+                activation_id: activation_identity("typed-mismatch-run", "first", 0),
+                schema_id: definition.nodes["first"].output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::json!(2),
+                artifact_reference: None,
+                created_at_ms: 2,
+            })
+            .expect_err("mismatch");
+        assert!(matches!(
+            &error,
+            WorkflowStoreError::TargetInputValidation(failure)
+                if failure.run_id == "typed-mismatch-run"
+                    && failure.source_node_id == "first"
+                    && failure.source_activation_id
+                        == activation_identity("typed-mismatch-run", "first", 0)
+                    && failure.target_node_id == "second"
+                    && failure.target_schema_id == definition.nodes["second"].input.type_name
+                    && failure.message.contains("does not match schema")
+        ));
+        let output_count: u64 = store
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM workflow_outputs WHERE run_id = 'typed-mismatch-run'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("outputs");
+        assert_eq!(output_count, 0);
+        assert!(
+            store
+                .pending_activations(10)
+                .expect("pending")
+                .iter()
+                .all(|activation| activation.node_id != "second")
+        );
+    }
+
+    #[test]
     fn branch_target_input_validation_rolls_back_selected_activation() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
@@ -7846,7 +8660,13 @@ mod tests {
         let error = store
             .settle_pending_control_nodes(&run.run_id, 10, 3)
             .expect_err("selected target mismatch");
-        assert!(error.to_string().contains("workflow activation input"));
+        assert!(matches!(
+            &error,
+            WorkflowStoreError::TargetInputValidation(failure)
+                if failure.run_id == "invalid-branch-run"
+                    && failure.source_node_id == "choose"
+                    && failure.target_node_id == "selected"
+        ));
         assert!(
             store
                 .pending_activations(10)
@@ -8245,6 +9065,187 @@ mod tests {
     }
 
     #[test]
+    fn durable_branch_predicate_failures_roll_back_output_decision_and_paths() {
+        for (name, value, expected) in [
+            (
+                "missing",
+                serde_json::json!({"review": {"result": {}}}),
+                "was not present",
+            ),
+            (
+                "incompatible",
+                serde_json::json!({"review": {"result": {"passed": "true"}}}),
+                "incompatible",
+            ),
+            (
+                "nested",
+                serde_json::json!({"review": []}),
+                "was not present",
+            ),
+        ] {
+            let temp = tempfile::tempdir().expect("temp");
+            let definition = conditional_nested_definition();
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            store
+                .persist_definition("conditional-nested", 1, &definition)
+                .expect("definition");
+            let run_id = format!("branch-{name}-run");
+            store
+                .create_run(&NewWorkflowRun {
+                    run_id: run_id.clone(),
+                    definition_id: "conditional-nested".to_string(),
+                    definition_version: 1,
+                    workspace_snapshot: "snapshot".to_string(),
+                    parent_session_id: None,
+                    binding: None,
+                    input: Some(value.clone()),
+                    created_at_ms: 1,
+                    limits: WorkflowRunLimits::default(),
+                })
+                .expect("run");
+            store
+                .persist_validated_output(&ValidatedOutput {
+                    output_id: format!("{name}-inspect-output"),
+                    run_id: run_id.clone(),
+                    node_id: "inspect".to_string(),
+                    activation_id: activation_identity(&run_id, "inspect", 0),
+                    schema_id: definition.nodes["inspect"].output.type_name.clone(),
+                    schema_version: 1,
+                    value: value.clone(),
+                    artifact_reference: None,
+                    created_at_ms: 2,
+                })
+                .expect("inspect output");
+            let branch_output = ValidatedOutput {
+                output_id: format!("{name}-branch-output"),
+                run_id: run_id.clone(),
+                node_id: "choose".to_string(),
+                activation_id: activation_identity(&run_id, "choose", 0),
+                schema_id: definition.nodes["choose"].output.type_name.clone(),
+                schema_version: 1,
+                value,
+                artifact_reference: None,
+                created_at_ms: 3,
+            };
+            let error = store
+                .persist_validated_output(&branch_output)
+                .expect_err("predicate failure");
+            assert!(error.to_string().contains(expected));
+            assert!(
+                store
+                    .decision(&format!("{}:branch", branch_output.activation_id))
+                    .expect("decision")
+                    .is_none()
+            );
+            let output_count: u64 = store
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM workflow_outputs WHERE output_id = ?1",
+                    [&branch_output.output_id],
+                    |row| row.get(0),
+                )
+                .expect("output count");
+            assert_eq!(output_count, 0);
+            assert!(
+                store
+                    .pending_activations(10)
+                    .expect("pending")
+                    .iter()
+                    .all(|activation| {
+                        activation.node_id != "selected" && activation.node_id != "other"
+                    })
+            );
+        }
+    }
+
+    #[test]
+    fn branch_decision_commits_before_successor_materialization_and_survives_restart() {
+        struct Fault;
+        impl WorkflowOutputFault for Fault {
+            fn after_boundary(
+                &self,
+                boundary: WorkflowOutputBoundary,
+                _output: &ValidatedOutput,
+            ) -> Result<(), WorkflowStoreError> {
+                if boundary == WorkflowOutputBoundary::SuccessorsMaterialized {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "crash after successors".to_string(),
+                    ));
+                }
+                Ok(())
+            }
+        }
+
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("conditional", 1, &conditional_definition())
+            .expect("definition");
+        let mut run = new_run();
+        run.run_id = "branch-restart-run".to_string();
+        run.definition_id = "conditional".to_string();
+        store.create_run(&run).expect("run");
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "inspect-output".to_string(),
+                run_id: run.run_id.clone(),
+                node_id: "inspect".to_string(),
+                activation_id: activation_identity(&run.run_id, "inspect", 0),
+                schema_id: "u32".to_string(),
+                schema_version: 1,
+                value: serde_json::json!(1),
+                artifact_reference: None,
+                created_at_ms: 20,
+            })
+            .expect("inspect output");
+        let branch_output = ValidatedOutput {
+            output_id: "branch-output".to_string(),
+            run_id: run.run_id.clone(),
+            node_id: "choose".to_string(),
+            activation_id: activation_identity(&run.run_id, "choose", 0),
+            schema_id: "u32".to_string(),
+            schema_version: 1,
+            value: serde_json::json!(1),
+            artifact_reference: None,
+            created_at_ms: 21,
+        };
+        store
+            .persist_validated_output_with_fault(&branch_output, &Fault)
+            .expect_err("fault");
+        assert!(
+            store
+                .decision(&format!("{}:branch", branch_output.activation_id))
+                .expect("decision query")
+                .is_none()
+        );
+        drop(store);
+
+        let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        let result = reopened
+            .persist_validated_output(&branch_output)
+            .expect("branch output");
+        assert_eq!(result.activated.len(), 1);
+        assert_eq!(result.activated[0].node_id, "selected");
+        let decision = reopened
+            .decision(&format!("{}:branch", branch_output.activation_id))
+            .expect("decision query")
+            .expect("decision");
+        assert_eq!(
+            decision.value["selected_entries"],
+            serde_json::json!(["selected"])
+        );
+        let skipped: String = reopened
+            .connection
+            .query_row(
+                "SELECT status FROM workflow_activations WHERE run_id = 'branch-restart-run' AND node_id = 'other'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("skipped");
+        assert_eq!(skipped, "skipped");
+    }
+
+    #[test]
     fn durable_branch_selects_one_path_and_persists_decision() {
         let temp = tempfile::tempdir().expect("temp");
         let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
@@ -8301,7 +9302,16 @@ mod tests {
             ))
             .expect("decision query")
             .expect("decision");
+        assert_eq!(decision.value["predicate_version"], 1);
         assert_eq!(decision.value["selected"], true);
+        assert_eq!(
+            decision.value["selected_entries"],
+            serde_json::json!(["selected"])
+        );
+        assert_eq!(
+            decision.value["skipped_nodes"],
+            serde_json::json!(["other"])
+        );
     }
 
     #[test]

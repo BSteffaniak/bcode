@@ -63,6 +63,15 @@ slice requires these identities and relationships:
 Stable dispatch identity is derived from `(run_id, node_id, activation_id, attempt)` and persisted
 with prepared intent before an external operation is invoked.
 
+## Explicit retained state
+
+Durable definitions carry retained context with the version 1
+`WorkflowStateEnvelope<State, Value>` schema. `state` is the explicitly forwarded original/evolving
+workflow state, `value` is the narrow request or result for the current node, and `artifacts` holds
+typed `ArtifactReference` values for large data that must not be copied inline. The envelope is
+ordinary serialized node data: it participates in schemas, transforms, checksums, outputs, and
+history. Hosts must not maintain a second hidden mutable workflow-context object.
+
 ## Target-input validation
 
 Once durable support is enabled, activation input is validated against the exact target node schema
@@ -70,7 +79,41 @@ at every insertion boundary. This includes run entry materialization, direct and
 successors, parallel join values, repeat back-edges, public activation insertion, and waiting-gate
 successors. Validation occurs in the same transaction as output completion and successor
 materialization, so a mismatch leaves the source activation/output and target activation unchanged.
+The returned typed diagnostic identifies the run, source node and activation, target node and schema,
+and the exact validator failure so callers can surface or persist an actionable failure without
+inferring context from an unstructured message.
 
+Automatic retry eligibility is a versioned owner-neutral policy over persisted facts: node effect,
+owner reconciliation contract, stable failure kind, completed attempt count, definition maximum, and
+run retry cap. Cancellation, terminal timeout, approval denial, schema failure, ambiguous mutation,
+and terminal failure are never eligible. A mutating owner-reported failure requires receipt/status
+reconciliation; repair-required mutation is never automatically retried. This pure decision does not
+schedule work. The workflow store schema version 6 persists one
+exact retry schedule per activation with failed/next attempt numbers, failure kind, backoff duration,
+due timestamp, and scheduling timestamp. Scheduling is idempotent and never sleeps or creates the
+attempt; conflicting reschedules fail closed. Production automatic retry remains unsupported until a
+bounded scheduler safely consumes due schedules.
+
+Repeat iteration is the persisted activation `dependency_generation`, starting at zero. Settlement
+computes the next generation with checked arithmetic and applies the effective bound
+`min(definition.max_iterations, run.cycle_cap)`. The settlement event records current/next
+generation plus both configured bounds. If the predicate clears at the final allowed generation the
+run completes; if it remains true, the run fails with `repeat_iteration_limit_exhausted`. Back-edge
+input is transformed and schema-validated before the next-generation activation is inserted. Stable
+activation identity plus transactional settlement makes reopening idempotent: the pending controller
+can create only its exact next generation, and subsequent settlement cannot duplicate or skip it.
+
+Canonical branch decisions include the predicate contract version, the selected boolean, selected
+entry IDs, and skipped node IDs. The decision row is inserted in the same transaction before any
+selected successor activation. A failure after that insertion rolls back the decision, skipped
+markers, output, and activation together, allowing restart to recompute the same decision from the
+persisted definition and source input.
+
+Canonical fan-out results use version 1 `{ index, value }` members in strict contiguous ascending
+input-index order. This shape is independent of completion order and rejects sparse or reordered
+members. The in-process SDK implementation enforces bounded concurrency and preserves this ordering,
+but production `FanOut` remains rejected until durable item admission, resource/cancellation state,
+and restart-safe partial completion are implemented.
 
 Canonical parallel joins declare non-empty, disjoint `left_exits` and `right_exits` sets whose
 members have direct edges to the join. Durable materialization always serializes the tuple as

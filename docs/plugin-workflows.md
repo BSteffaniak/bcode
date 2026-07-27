@@ -5,8 +5,12 @@ persistence or start. This production contract is intentionally narrower than th
 surface. The current production host accepts `Agent`, `Branch`, `Repeat`, wait-all `Parallel`,
 `PluginBlock`, `Input`, and `Approval`. Closure-backed `Task` is explicitly in-process-only;
 `Retry`, `FanOut`, retry edges, and fail-fast parallel joins are rejected until their complete
-durable implementations ship. Versioned bounded edge transforms are supported, including immutable
-run-state and canonical parallel `join.left`/`join.right` sources.
+durable implementations ship. Explicit operator retry of a terminal failed activation remains a
+separate bounded store operation; ambiguous mutation requires explicit repair before any later
+attempt and is never automatic retry. Deterministic branch and repeat predicates use the explicit version 1
+contract and are bounded and validated during production admission. Versioned bounded edge
+transforms are supported, including immutable run-state and canonical parallel `join.left`/`join.right`
+sources.
 
 Registration and start both rerun production admission. Plugin block nodes must resolve to one
 byte-equivalent enabled manifest declaration, so a definition cannot be persisted or started with
@@ -42,6 +46,10 @@ host.start_workflow(request).await?;
 
 Rules:
 
+* Carry evolving/original context explicitly with `WorkflowStateEnvelope<State, Value>` when a node
+  accepts or returns a narrower value.
+* Put large retained values in the envelope's typed `artifacts` references rather than copying bytes
+  inline.
 * Keep per-run values in typed input.
 * Let `WorkflowSpec` derive the exact content-addressed definition identity.
 * Use the logical workflow kind for product vocabulary and durable binding.

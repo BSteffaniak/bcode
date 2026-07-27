@@ -977,6 +977,90 @@ impl ArtifactReference {
     }
 }
 
+/// Stable durable workflow-state envelope contract version.
+pub const WORKFLOW_STATE_ENVELOPE_VERSION: u32 = 1;
+
+/// Explicit typed dataflow envelope carrying retained workflow state beside a narrow value.
+///
+/// Hosts persist this value like any other node input/output. Retention is therefore visible in
+/// schemas, transforms, checksums, and event history rather than hidden mutable host context.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowStateEnvelope<T, R> {
+    /// Envelope contract version.
+    pub schema_version: u32,
+    /// Retained workflow state forwarded explicitly between nodes.
+    pub state: T,
+    /// Narrow request or result owned by the current node boundary.
+    pub value: R,
+    /// Large retained values represented by typed references instead of inline copies.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ArtifactReference>,
+}
+
+impl<T, R> WorkflowStateEnvelope<T, R> {
+    /// Construct the current state envelope without artifact references.
+    #[must_use]
+    pub const fn new(state: T, value: R) -> Self {
+        Self {
+            schema_version: WORKFLOW_STATE_ENVELOPE_VERSION,
+            state,
+            value,
+            artifacts: Vec::new(),
+        }
+    }
+
+    /// Attach explicit artifact references for large retained values.
+    #[must_use]
+    pub fn with_artifacts(mut self, artifacts: Vec<ArtifactReference>) -> Self {
+        self.artifacts = artifacts;
+        self
+    }
+}
+
+/// Stable fan-out result envelope contract version.
+pub const WORKFLOW_FAN_OUT_RESULT_VERSION: u32 = 1;
+
+/// One homogeneous fan-out member, canonically ordered by original input index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowFanOutMember<T> {
+    /// Zero-based original input index.
+    pub index: u32,
+    /// Typed member output.
+    pub value: T,
+}
+
+/// Canonical durable fan-out output shape.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowFanOutResult<T> {
+    /// Fan-out result contract version.
+    pub version: u32,
+    /// Members sorted strictly by ascending original input index.
+    pub members: Vec<WorkflowFanOutMember<T>>,
+}
+
+impl<T> WorkflowFanOutResult<T> {
+    /// Construct and validate canonical fan-out ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when indices are not the exact contiguous sequence `0..members.len()`.
+    pub fn new(members: Vec<WorkflowFanOutMember<T>>) -> Result<Self, WorkflowError> {
+        for (expected, member) in members.iter().enumerate() {
+            if usize::try_from(member.index).ok() != Some(expected) {
+                return Err(WorkflowError::Build {
+                    path: "fan_out.members".to_string(),
+                    message: "fan-out members must be contiguous and ordered by input index"
+                        .to_string(),
+                });
+            }
+        }
+        Ok(Self {
+            version: WORKFLOW_FAN_OUT_RESULT_VERSION,
+            members,
+        })
+    }
+}
+
 /// Stable durable transform contract version.
 pub const WORKFLOW_TRANSFORM_VERSION: u32 = 1;
 
@@ -1025,6 +1109,154 @@ pub enum WorkflowBlockReconciliation {
     ReceiptStatus,
     /// An unknown outcome must stop for explicit repair.
     RepairRequired,
+}
+
+/// Stable owner-neutral automatic retry eligibility contract version.
+pub const WORKFLOW_AUTOMATIC_RETRY_POLICY_VERSION: u32 = 1;
+
+/// Durable failure classification used only to decide whether automatic retry is safe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomaticRetryFailureKind {
+    /// The owner was unavailable before accepting external work.
+    OwnerUnavailableBeforeAcceptance,
+    /// A trustworthy owner receipt reports a terminal failure that the owner declares retryable.
+    OwnerReportedRetryable,
+    /// Cancellation is terminal and requires no retry.
+    Cancellation,
+    /// The configured timeout class is terminal.
+    TerminalTimeout,
+    /// Approval was denied.
+    ApprovalDenied,
+    /// Input or output failed its declared schema.
+    SchemaFailure,
+    /// A mutation may have happened but cannot be proved either way.
+    AmbiguousMutation,
+    /// The owner reports a non-retryable terminal failure.
+    TerminalFailure,
+}
+
+/// Persisted facts required to decide automatic retry eligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutomaticRetryEligibility {
+    /// Retry policy contract version.
+    pub version: u32,
+    /// Side-effect class of the failed node.
+    pub effect: WorkflowBlockEffect,
+    /// Owner reconciliation contract.
+    pub reconciliation: WorkflowBlockReconciliation,
+    /// Stable failure classification.
+    pub failure: AutomaticRetryFailureKind,
+    /// Number of attempts already admitted for this activation.
+    pub attempts_completed: u32,
+    /// Definition-level maximum attempts.
+    pub max_attempts: u32,
+    /// Run-level maximum attempts per activation.
+    pub retry_cap: u32,
+}
+
+/// Stable reason an activation cannot be retried automatically.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutomaticRetryIneligibleReason {
+    UnsupportedPolicyVersion,
+    InvalidLimit,
+    AttemptsExhausted,
+    Cancellation,
+    TerminalTimeout,
+    ApprovalDenied,
+    SchemaFailure,
+    AmbiguousMutation,
+    TerminalFailure,
+    UnsafeEffectOrReconciliation,
+}
+
+/// Result of evaluating the finite owner-neutral automatic retry policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "decision", rename_all = "snake_case")]
+pub enum AutomaticRetryDecision {
+    /// Retry is safe; a durable scheduler may create exactly this next attempt later.
+    Eligible { next_attempt: u32 },
+    /// Automatic retry is forbidden for the stable reason.
+    Ineligible {
+        reason: AutomaticRetryIneligibleReason,
+    },
+}
+
+/// Evaluate automatic retry safety from persisted bounded facts.
+///
+/// This function does not schedule or sleep. Production capabilities continue to reject automatic
+/// retry until durable next-attempt/backoff scheduling exists.
+#[must_use]
+pub const fn automatic_retry_decision(
+    eligibility: AutomaticRetryEligibility,
+) -> AutomaticRetryDecision {
+    use AutomaticRetryFailureKind as Failure;
+    use AutomaticRetryIneligibleReason as Reason;
+    if eligibility.version != WORKFLOW_AUTOMATIC_RETRY_POLICY_VERSION {
+        return AutomaticRetryDecision::Ineligible {
+            reason: Reason::UnsupportedPolicyVersion,
+        };
+    }
+    if eligibility.max_attempts == 0 || eligibility.retry_cap == 0 {
+        return AutomaticRetryDecision::Ineligible {
+            reason: Reason::InvalidLimit,
+        };
+    }
+    let effective_limit = if eligibility.max_attempts < eligibility.retry_cap {
+        eligibility.max_attempts
+    } else {
+        eligibility.retry_cap
+    };
+    let Some(next_attempt) = eligibility.attempts_completed.checked_add(1) else {
+        return AutomaticRetryDecision::Ineligible {
+            reason: Reason::AttemptsExhausted,
+        };
+    };
+    if next_attempt > effective_limit {
+        return AutomaticRetryDecision::Ineligible {
+            reason: Reason::AttemptsExhausted,
+        };
+    }
+    let excluded = match eligibility.failure {
+        Failure::Cancellation => Some(Reason::Cancellation),
+        Failure::TerminalTimeout => Some(Reason::TerminalTimeout),
+        Failure::ApprovalDenied => Some(Reason::ApprovalDenied),
+        Failure::SchemaFailure => Some(Reason::SchemaFailure),
+        Failure::AmbiguousMutation => Some(Reason::AmbiguousMutation),
+        Failure::TerminalFailure => Some(Reason::TerminalFailure),
+        Failure::OwnerUnavailableBeforeAcceptance | Failure::OwnerReportedRetryable => None,
+    };
+    if let Some(reason) = excluded {
+        return AutomaticRetryDecision::Ineligible { reason };
+    }
+    let safe = match eligibility.failure {
+        Failure::OwnerUnavailableBeforeAcceptance => true,
+        Failure::OwnerReportedRetryable => match eligibility.effect {
+            WorkflowBlockEffect::ReadOnly => matches!(
+                eligibility.reconciliation,
+                WorkflowBlockReconciliation::IdempotentReplay
+                    | WorkflowBlockReconciliation::ReceiptStatus
+            ),
+            WorkflowBlockEffect::Mutating => matches!(
+                eligibility.reconciliation,
+                WorkflowBlockReconciliation::ReceiptStatus
+            ),
+        },
+        Failure::Cancellation
+        | Failure::TerminalTimeout
+        | Failure::ApprovalDenied
+        | Failure::SchemaFailure
+        | Failure::AmbiguousMutation
+        | Failure::TerminalFailure => false,
+    };
+    if safe {
+        AutomaticRetryDecision::Eligible { next_attempt }
+    } else {
+        AutomaticRetryDecision::Ineligible {
+            reason: Reason::UnsafeEffectOrReconciliation,
+        }
+    }
 }
 
 /// One real plugin-owned workflow block contract.
@@ -1736,6 +1968,8 @@ impl EdgeKind {
 pub enum PredicateExpression {
     /// Compare the value at a dotted field path for equality.
     Equals {
+        /// Predicate contract version.
+        version: u32,
         /// Dotted object field path. An empty path addresses the complete value.
         path: String,
         /// Expected JSON value.
@@ -1749,23 +1983,59 @@ impl PredicateExpression {
             path: "predicate".to_string(),
             message: format!("failed to serialize predicate input: {error}"),
         })?;
+        self.evaluate_value(&value)
+    }
+
+    /// Evaluate this predicate against an already serialized workflow value.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a referenced field is missing or its JSON value category is
+    /// incompatible with the expected value.
+    pub fn evaluate_value(&self, value: &serde_json::Value) -> Result<bool, WorkflowError> {
         match self {
             Self::Equals {
+                version: _,
                 path,
                 value: expected,
             } => {
                 let actual = path
                     .split('.')
                     .filter(|part| !part.is_empty())
-                    .try_fold(&value, |current, part| current.get(part))
+                    .try_fold(value, |current, part| current.get(part))
                     .ok_or_else(|| WorkflowError::Build {
                         path: path.clone(),
                         message: "predicate field was not present in the structured value"
                             .to_string(),
                     })?;
+                if !predicate_values_compatible(actual, expected) {
+                    return Err(WorkflowError::Build {
+                        path: path.clone(),
+                        message: format!(
+                            "predicate value type {} is incompatible with expected type {}",
+                            predicate_value_kind(actual),
+                            predicate_value_kind(expected)
+                        ),
+                    });
+                }
                 Ok(actual == expected)
             }
         }
+    }
+}
+
+fn predicate_values_compatible(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
+    std::mem::discriminant(actual) == std::mem::discriminant(expected)
+}
+
+const fn predicate_value_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
     }
 }
 
@@ -1786,6 +2056,7 @@ impl<T> Field<T> {
     pub fn eq<V: Serialize>(self, expected: V) -> Predicate<T> {
         Predicate {
             expression: PredicateExpression::Equals {
+                version: WORKFLOW_PREDICATE_VERSION,
                 path: self.path,
                 value: serde_json::to_value(expected)
                     .expect("workflow predicate value should serialize to JSON"),
@@ -2816,6 +3087,7 @@ where
             output: ValueSchema::of::<O>(),
             resources: Vec::new(),
             configuration: serde_json::json!({
+                "predicate_version": WORKFLOW_PREDICATE_VERSION,
                 "predicate": expression,
                 "max_iterations": max_iterations,
                 "iteration_state": "explicit_back_edge_transform",
@@ -3012,6 +3284,7 @@ where
             output: ValueSchema::of::<O>(),
             resources: Vec::new(),
             configuration: serde_json::json!({
+                "predicate_version": WORKFLOW_PREDICATE_VERSION,
                 "predicate": expression,
                 "true_entries": &true_entries,
                 "false_entries": &false_entries,
@@ -3211,6 +3484,7 @@ pub enum ParallelFailurePolicy {
 /// Results preserve input order regardless of completion order. The first observed failure aborts
 /// unfinished sibling tasks.
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn fan_out<I, O>(
     name: impl Into<String>,
     step: Step<I, O>,
@@ -3245,7 +3519,14 @@ where
         input: ValueSchema::of::<Vec<I>>(),
         output: ValueSchema::of::<Vec<O>>(),
         resources: Vec::new(),
-        configuration: serde_json::json!({"max_concurrency": max_concurrency}),
+        configuration: serde_json::json!({
+            "fan_out_version": WORKFLOW_FAN_OUT_RESULT_VERSION,
+            "max_concurrency": max_concurrency,
+            "ordering": "input_index_ascending",
+            "member_shape": {"index": "u32", "value": "typed_output"},
+            "body_entries": body_entries,
+            "body_exits": body_exits,
+        }),
     });
     body.entries = body_entries;
     body.exits = vec![fan_out_id.clone()];
@@ -4171,7 +4452,19 @@ fn validate_production_agent_node(
 
 fn validate_predicate_expression(expression: &PredicateExpression) -> Result<(), WorkflowError> {
     match expression {
-        PredicateExpression::Equals { path, value } => {
+        PredicateExpression::Equals {
+            version,
+            path,
+            value,
+        } => {
+            if *version != WORKFLOW_PREDICATE_VERSION {
+                return Err(WorkflowError::Build {
+                    path: path.clone(),
+                    message: format!(
+                        "unsupported workflow predicate version {version}; expected {WORKFLOW_PREDICATE_VERSION}"
+                    ),
+                });
+            }
             if path.len() > 512 || path.split('.').any(|part| part.len() > 256) {
                 return Err(WorkflowError::Build {
                     path: path.clone(),
@@ -4258,6 +4551,55 @@ pub fn validate_parallel_join_configuration(
 }
 
 fn validate_control_node(node: &NodeDefinition) -> Result<(), WorkflowError> {
+    if matches!(node.kind, NodeKind::Branch | NodeKind::Repeat)
+        && node
+            .configuration
+            .get("predicate_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(WORKFLOW_PREDICATE_VERSION))
+    {
+        return Err(WorkflowError::Build {
+            path: node.id.clone(),
+            message: format!(
+                "control node must declare predicate_version {WORKFLOW_PREDICATE_VERSION}"
+            ),
+        });
+    }
+    if matches!(node.kind, NodeKind::Branch | NodeKind::Repeat) {
+        let predicate = node
+            .configuration
+            .get("predicate")
+            .cloned()
+            .ok_or_else(|| WorkflowError::Build {
+                path: node.id.clone(),
+                message: "control node must declare a predicate".to_string(),
+            })?;
+        let predicate: PredicateExpression =
+            serde_json::from_value(predicate).map_err(|error| WorkflowError::Build {
+                path: node.id.clone(),
+                message: format!("control node predicate is invalid: {error}"),
+            })?;
+        validate_predicate_expression(&predicate)?;
+    }
+    if node.kind == NodeKind::FanOut
+        && (node
+            .configuration
+            .get("fan_out_version")
+            .and_then(serde_json::Value::as_u64)
+            != Some(u64::from(WORKFLOW_FAN_OUT_RESULT_VERSION))
+            || node
+                .configuration
+                .get("ordering")
+                .and_then(serde_json::Value::as_str)
+                != Some("input_index_ascending"))
+    {
+        return Err(WorkflowError::Build {
+            path: node.id.clone(),
+            message: format!(
+                "fan_out must declare version {WORKFLOW_FAN_OUT_RESULT_VERSION} and input-index ordering"
+            ),
+        });
+    }
     let invalid = match node.kind {
         NodeKind::Repeat => node
             .configuration
@@ -4441,7 +4783,14 @@ mod tests {
             ),
             (
                 NodeKind::FanOut,
-                serde_json::json!({"max_concurrency": 2}),
+                serde_json::json!({
+                    "fan_out_version": WORKFLOW_FAN_OUT_RESULT_VERSION,
+                    "max_concurrency": 2,
+                    "ordering": "input_index_ascending",
+                    "member_shape": {"index": "u32", "value": "typed_output"},
+                    "body_entries": ["node"],
+                    "body_exits": ["node"]
+                }),
                 "unsupported_node_kind",
             ),
         ] {
@@ -4471,6 +4820,94 @@ mod tests {
                 .expect("structurally valid definition");
             assert!(admission.diagnostics.iter().any(|item| item.code == code));
         }
+    }
+
+    #[test]
+    fn automatic_retry_policy_is_bounded_effect_aware_and_excludes_terminal_failures() {
+        let base = AutomaticRetryEligibility {
+            version: WORKFLOW_AUTOMATIC_RETRY_POLICY_VERSION,
+            effect: WorkflowBlockEffect::ReadOnly,
+            reconciliation: WorkflowBlockReconciliation::ReceiptStatus,
+            failure: AutomaticRetryFailureKind::OwnerReportedRetryable,
+            attempts_completed: 1,
+            max_attempts: 3,
+            retry_cap: 2,
+        };
+        assert_eq!(
+            automatic_retry_decision(base),
+            AutomaticRetryDecision::Eligible { next_attempt: 2 }
+        );
+        assert_eq!(
+            automatic_retry_decision(AutomaticRetryEligibility {
+                effect: WorkflowBlockEffect::Mutating,
+                reconciliation: WorkflowBlockReconciliation::RepairRequired,
+                ..base
+            }),
+            AutomaticRetryDecision::Ineligible {
+                reason: AutomaticRetryIneligibleReason::UnsafeEffectOrReconciliation
+            }
+        );
+        assert_eq!(
+            automatic_retry_decision(AutomaticRetryEligibility {
+                attempts_completed: 2,
+                ..base
+            }),
+            AutomaticRetryDecision::Ineligible {
+                reason: AutomaticRetryIneligibleReason::AttemptsExhausted
+            }
+        );
+        for (failure, reason) in [
+            (
+                AutomaticRetryFailureKind::Cancellation,
+                AutomaticRetryIneligibleReason::Cancellation,
+            ),
+            (
+                AutomaticRetryFailureKind::TerminalTimeout,
+                AutomaticRetryIneligibleReason::TerminalTimeout,
+            ),
+            (
+                AutomaticRetryFailureKind::ApprovalDenied,
+                AutomaticRetryIneligibleReason::ApprovalDenied,
+            ),
+            (
+                AutomaticRetryFailureKind::SchemaFailure,
+                AutomaticRetryIneligibleReason::SchemaFailure,
+            ),
+            (
+                AutomaticRetryFailureKind::AmbiguousMutation,
+                AutomaticRetryIneligibleReason::AmbiguousMutation,
+            ),
+        ] {
+            assert_eq!(
+                automatic_retry_decision(AutomaticRetryEligibility { failure, ..base }),
+                AutomaticRetryDecision::Ineligible { reason }
+            );
+        }
+        assert_eq!(
+            WorkflowProductionCapabilities::current().automatic_retry,
+            WorkflowCapabilitySupport::Unsupported
+        );
+        assert_eq!(
+            WorkflowProductionCapabilities::current().automatic_retry_policy_version,
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_operator_retry_is_distinct_from_automatic_and_repair_retry() {
+        let capabilities = WorkflowProductionCapabilities::current();
+        assert_eq!(
+            capabilities.node_support(NodeKind::Retry),
+            WorkflowCapabilitySupport::Unsupported
+        );
+        assert_eq!(
+            capabilities.edge_support(WorkflowEdgeKind::Retry),
+            WorkflowCapabilitySupport::Unsupported
+        );
+        assert_eq!(
+            capabilities.automatic_retry,
+            WorkflowCapabilitySupport::Unsupported
+        );
     }
 
     #[test]
@@ -5429,6 +5866,61 @@ mod tests {
     }
 
     #[test]
+    fn durable_predicates_require_the_current_version_and_bounds() {
+        let workflow = WorkflowBuilder::new(
+            "branch",
+            Step::map("source", |value: u32| Ok(value)).branch(
+                "choose",
+                field::<u32>("").eq(1_u32),
+                Step::map("selected", |value: u32| Ok(value)),
+                Step::map("other", |value: u32| Ok(value)),
+            ),
+        )
+        .build()
+        .expect("workflow");
+        let definition = workflow.definition();
+        assert_eq!(
+            definition.nodes["choose"].configuration["predicate_version"],
+            WORKFLOW_PREDICATE_VERSION
+        );
+        assert!(
+            definition
+                .edges
+                .iter()
+                .filter_map(|edge| match &edge.kind {
+                    EdgeKind::Conditional { predicate, .. } => Some(predicate),
+                    _ => None,
+                })
+                .all(|predicate| matches!(
+                    predicate,
+                    PredicateExpression::Equals { version, .. }
+                        if *version == WORKFLOW_PREDICATE_VERSION
+                ))
+        );
+
+        let mut unsupported = definition.clone();
+        unsupported
+            .nodes
+            .get_mut("choose")
+            .expect("choose")
+            .configuration["predicate_version"] = serde_json::json!(WORKFLOW_PREDICATE_VERSION + 1);
+        assert!(unsupported.validate().is_err());
+
+        let mut unbounded = definition.clone();
+        for edge in &mut unbounded.edges {
+            if let EdgeKind::Conditional { predicate, .. } = &mut edge.kind {
+                *predicate = PredicateExpression::Equals {
+                    version: WORKFLOW_PREDICATE_VERSION,
+                    path: "x".repeat(513),
+                    value: serde_json::Value::Null,
+                };
+                break;
+            }
+        }
+        assert!(unbounded.validate().is_err());
+    }
+
+    #[test]
     fn deserialized_definition_validation_rejects_invalid_structure() {
         let workflow =
             WorkflowBuilder::new("validated", Step::map("first", |value: u32| Ok(value)))
@@ -5447,6 +5939,123 @@ mod tests {
                 .to_string()
                 .contains("unsupported workflow definition schema version")
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn exact_git_commit_request_is_built_from_retained_state_git_metadata_and_message() {
+        let retained = serde_json::to_value(
+            WorkflowStateEnvelope::new(
+                serde_json::json!({
+                    "git": {
+                        "repo_path": ".",
+                        "expected_head": "abc123",
+                        "paths": ["src/lib.rs", "Cargo.toml"]
+                    }
+                }),
+                serde_json::json!({"message": "Implement durable state envelope"}),
+            )
+            .with_artifacts(vec![ArtifactReference::new(
+                "verification-1",
+                "bcode.verification-result",
+                1,
+                "application/json",
+                "verification/result.json",
+            )]),
+        )
+        .expect("envelope");
+        let transform = WorkflowTransform {
+            version: WORKFLOW_TRANSFORM_VERSION,
+            expression: WorkflowTransformExpression::Object {
+                fields: BTreeMap::from([
+                    (
+                        "repo_path".to_string(),
+                        WorkflowTransformExpression::Input {
+                            source: "retained".to_string(),
+                            path: "state.git.repo_path".to_string(),
+                        },
+                    ),
+                    (
+                        "expected_head".to_string(),
+                        WorkflowTransformExpression::Input {
+                            source: "retained".to_string(),
+                            path: "state.git.expected_head".to_string(),
+                        },
+                    ),
+                    (
+                        "paths".to_string(),
+                        WorkflowTransformExpression::Input {
+                            source: "retained".to_string(),
+                            path: "state.git.paths".to_string(),
+                        },
+                    ),
+                    (
+                        "message".to_string(),
+                        WorkflowTransformExpression::Input {
+                            source: "retained".to_string(),
+                            path: "value.message".to_string(),
+                        },
+                    ),
+                ]),
+            },
+            output: ValueSchema {
+                type_name: "bcode.git.commit-request/v1".to_string(),
+                schema: serde_json::json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["repo_path", "expected_head", "message", "paths"],
+                    "properties": {
+                        "repo_path": {"type": "string"},
+                        "expected_head": {"type": "string"},
+                        "message": {"type": "string"},
+                        "paths": {"type": "array", "items": {"type": "string"}}
+                    }
+                }),
+            },
+        };
+        assert_eq!(
+            transform
+                .evaluate(&[WorkflowTransformInput {
+                    name: "retained",
+                    value: &retained,
+                }])
+                .expect("commit request"),
+            serde_json::json!({
+                "repo_path": ".",
+                "expected_head": "abc123",
+                "message": "Implement durable state envelope",
+                "paths": ["src/lib.rs", "Cargo.toml"]
+            })
+        );
+    }
+
+    #[test]
+    fn state_envelope_carries_retained_state_value_and_artifact_references_explicitly() {
+        let reference = ArtifactReference::new(
+            "artifact-1",
+            "bcode.verification-output",
+            1,
+            "application/json",
+            "verification/output.json",
+        );
+        let envelope = WorkflowStateEnvelope::new(
+            serde_json::json!({
+                "git": {"expected_head": "abc", "paths": ["src/lib.rs"]}
+            }),
+            serde_json::json!({"message": "Implement retained state"}),
+        )
+        .with_artifacts(vec![reference]);
+        let value = serde_json::to_value(&envelope).expect("serialize");
+        assert_eq!(value["schema_version"], WORKFLOW_STATE_ENVELOPE_VERSION);
+        assert_eq!(value["state"]["git"]["expected_head"], "abc");
+        assert_eq!(value["value"]["message"], "Implement retained state");
+        assert_eq!(value["artifacts"][0]["artifact_id"], "artifact-1");
+        let schema =
+            ValueSchema::of::<WorkflowStateEnvelope<serde_json::Value, serde_json::Value>>();
+        jsonschema::validator_for(&schema.schema)
+            .expect("schema")
+            .validate(&value)
+            .expect("valid envelope");
     }
 
     #[test]
@@ -5499,6 +6108,36 @@ mod tests {
     struct ReviewState {
         needs_fixes: bool,
         attempts: u32,
+    }
+
+    #[test]
+    fn branch_predicates_reject_missing_incompatible_and_bad_nested_paths() {
+        let predicate = PredicateExpression::Equals {
+            version: WORKFLOW_PREDICATE_VERSION,
+            path: "review.result.passed".to_string(),
+            value: serde_json::json!(true),
+        };
+        assert!(
+            predicate
+                .evaluate_value(&serde_json::json!({
+                    "review": {"result": {"passed": true}}
+                }))
+                .expect("nested predicate")
+        );
+        let missing = predicate
+            .evaluate_value(&serde_json::json!({"review": {"result": {}}}))
+            .expect_err("missing field");
+        assert!(missing.to_string().contains("was not present"));
+        let incompatible = predicate
+            .evaluate_value(&serde_json::json!({
+                "review": {"result": {"passed": "true"}}
+            }))
+            .expect_err("incompatible value");
+        assert!(incompatible.to_string().contains("incompatible"));
+        let non_object = predicate
+            .evaluate_value(&serde_json::json!({"review": []}))
+            .expect_err("nested non-object");
+        assert!(non_object.to_string().contains("was not present"));
     }
 
     #[tokio::test]
@@ -6037,6 +6676,54 @@ mod tests {
             vec![6, 2, 4]
         );
         assert!(maximum.load(Ordering::SeqCst) <= 2);
+        let controller = &workflow.definition().nodes["workers"];
+        assert_eq!(
+            controller.configuration["fan_out_version"],
+            WORKFLOW_FAN_OUT_RESULT_VERSION
+        );
+        assert_eq!(
+            controller.configuration["ordering"],
+            "input_index_ascending"
+        );
+        let canonical = WorkflowFanOutResult::new(vec![
+            WorkflowFanOutMember {
+                index: 0,
+                value: 6_u32,
+            },
+            WorkflowFanOutMember {
+                index: 1,
+                value: 2_u32,
+            },
+            WorkflowFanOutMember {
+                index: 2,
+                value: 4_u32,
+            },
+        ])
+        .expect("canonical output");
+        assert_eq!(
+            serde_json::to_value(canonical).expect("serialize"),
+            serde_json::json!({
+                "version": WORKFLOW_FAN_OUT_RESULT_VERSION,
+                "members": [
+                    {"index": 0, "value": 6},
+                    {"index": 1, "value": 2},
+                    {"index": 2, "value": 4}
+                ]
+            })
+        );
+        assert!(
+            WorkflowFanOutResult::new(vec![
+                WorkflowFanOutMember {
+                    index: 1,
+                    value: 2_u32,
+                },
+                WorkflowFanOutMember {
+                    index: 0,
+                    value: 6_u32,
+                },
+            ])
+            .is_err()
+        );
     }
 
     #[tokio::test]

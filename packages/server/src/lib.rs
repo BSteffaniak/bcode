@@ -2552,6 +2552,9 @@ fn workflow_store_error_response(error: &WorkflowStoreError) -> ErrorResponse {
         WorkflowStoreError::CancellationPreventsControl => {
             ErrorResponse::new("workflow_cancellation_prevents_control", error.to_string())
         }
+        WorkflowStoreError::TargetInputValidation(_) => {
+            ErrorResponse::new("workflow_target_input_invalid", error.to_string())
+        }
         WorkflowStoreError::Database(_)
         | WorkflowStoreError::Io(_)
         | WorkflowStoreError::Serialization(_)
@@ -37783,8 +37786,10 @@ library = "test"
                 output: schema.clone(),
                 resources: Vec::new(),
                 configuration: serde_json::json!({
+                    "predicate_version": bcode_workflow::WORKFLOW_PREDICATE_VERSION,
                     "predicate": {
                         "operation": "equals",
+                        "version": bcode_workflow::WORKFLOW_PREDICATE_VERSION,
                         "path": "condition_met",
                         "value": false
                     },
@@ -37814,6 +37819,7 @@ library = "test"
                         to: "loop.implementation".to_string(),
                         kind: bcode_workflow::EdgeKind::Back {
                             predicate: bcode_workflow::PredicateExpression::Equals {
+                                version: bcode_workflow::WORKFLOW_PREDICATE_VERSION,
                                 path: "condition_met".to_string(),
                                 value: serde_json::json!(false),
                             },
@@ -39401,6 +39407,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         output: schema.clone(),
                         resources: Vec::new(),
                         configuration: serde_json::json!({
+                            "predicate_version": bcode_workflow::WORKFLOW_PREDICATE_VERSION,
                             "predicate": predicate,
                             "max_iterations": 3,
                         }),
@@ -39557,7 +39564,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         output: schema.clone(),
                         resources: Vec::new(),
                         configuration: serde_json::json!({
-                            "predicate": {"operation": "equals", "path": "condition_met", "value": false},
+                            "predicate_version": bcode_workflow::WORKFLOW_PREDICATE_VERSION,
+                            "predicate": {"operation": "equals", "version": bcode_workflow::WORKFLOW_PREDICATE_VERSION, "path": "condition_met", "value": false},
                             "true_entries": ["repeat"],
                             "false_entries": [],
                             "true_nodes": [],
@@ -39575,7 +39583,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         output: schema.clone(),
                         resources: Vec::new(),
                         configuration: serde_json::json!({
-                            "predicate": {"operation": "equals", "path": "condition_met", "value": false},
+                            "predicate_version": bcode_workflow::WORKFLOW_PREDICATE_VERSION,
+                            "predicate": {"operation": "equals", "version": bcode_workflow::WORKFLOW_PREDICATE_VERSION, "path": "condition_met", "value": false},
                             "max_iterations": 2,
                         }),
                     },
