@@ -22654,6 +22654,10 @@ enum PendingLiveEventKey {
         invocation_id: String,
         contribution_id: String,
     },
+    Presentation {
+        invocation_id: String,
+        identity: bcode_tool::ToolPresentationIdentity,
+    },
     RequestDraft {
         turn_id: String,
         tool_call_id: String,
@@ -22830,6 +22834,12 @@ fn pending_live_event_key(
             Some(PendingLiveEventKey::Contribution {
                 invocation_id: envelope.contribution.invocation_id.clone(),
                 contribution_id: envelope.contribution.contribution_id.clone(),
+            })
+        }
+        SessionLiveEventKind::ToolPresentationUpdated { update } => {
+            Some(PendingLiveEventKey::Presentation {
+                invocation_id: update.invocation_id.clone(),
+                identity: update.identity.clone(),
             })
         }
         SessionLiveEventKind::ToolRequestDraft { event }
@@ -35181,6 +35191,128 @@ library = "test"
         server.abort();
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // One real-IPC workload covers publication flood, coalescing metrics, disconnect, and checkpoint convergence.
+    async fn presentation_flood_coalesces_and_reconnects_at_latest_checkpoint() {
+        let workspace = tempfile::tempdir().expect("presentation flood workspace");
+        let sessions = SessionManager::persistent(workspace.path().join("sessions"))
+            .expect("persistent session manager");
+        let session_id = sessions
+            .create_session(
+                Some("presentation flood".to_owned()),
+                workspace.path().to_path_buf(),
+            )
+            .await
+            .expect("session")
+            .id;
+        let state = Arc::new(test_server_state(sessions));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut slow = client
+            .connect("presentation-flood-slow")
+            .await
+            .expect("slow");
+        slow.attach_session_projection_window_with_input_history(
+            session_id,
+            projection_ipc_window_request(
+                bcode_session_models::ProjectionWindowAnchor::Latest,
+                bcode_session_models::ProjectionWindowDirection::Backward,
+            ),
+        )
+        .await
+        .expect("attach slow");
+
+        for revision in 1..=500 {
+            publish_plugin_tool_presentation_update(
+                &state,
+                session_id,
+                "call-presentation",
+                "test.plugin",
+                bcode_tool::ToolPresentationUpdate {
+                    invocation_id: "call-presentation".to_owned(),
+                    producer_id: "test.plugin".to_owned(),
+                    generation: 0,
+                    revision,
+                    identity: bcode_tool::ToolPresentationIdentity::Primary,
+                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    schema: "test.presentation".to_owned(),
+                    schema_version: 1,
+                    artifact: None,
+                    payload: serde_json::json!({"revision": revision}),
+                },
+            )
+            .await
+            .expect("presentation update");
+        }
+        tokio::time::sleep(SESSION_LIVE_FAN_OUT_FLUSH_INTERVAL * 2).await;
+        assert!(
+            state
+                .metrics
+                .snapshot()
+                .counters
+                .get("server.live_state.coalesced_updates_total")
+                .copied()
+                .unwrap_or_default()
+                > 0
+        );
+
+        let mut keeper = client
+            .connect("presentation-flood-keeper")
+            .await
+            .expect("keeper");
+        keeper
+            .attach_session_projection_window_with_input_history(
+                session_id,
+                projection_ipc_window_request(
+                    bcode_session_models::ProjectionWindowAnchor::Latest,
+                    bcode_session_models::ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .expect("keeper attach");
+        drop(slow);
+        let mut reconnected = client
+            .connect("presentation-flood-reconnect")
+            .await
+            .expect("reconnect");
+        reconnected
+            .attach_session_projection_window_with_input_history(
+                session_id,
+                projection_ipc_window_request(
+                    bcode_session_models::ProjectionWindowAnchor::Latest,
+                    bcode_session_models::ProjectionWindowDirection::Backward,
+                ),
+            )
+            .await
+            .expect("reattach");
+        let checkpoint = tokio::time::timeout(Duration::from_secs(2), reconnected.recv_event())
+            .await
+            .expect("checkpoint timeout")
+            .expect("checkpoint");
+        assert!(matches!(
+            checkpoint,
+            bcode_ipc::Event::SessionLive(bcode_session_models::SessionLiveEvent {
+                kind: SessionLiveEventKind::ToolPresentationUpdated { update },
+                ..
+            }) if update.revision == 500
+                && update.payload == serde_json::json!({"revision": 500})
+        ));
+        drop(keeper);
+        server.abort();
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn permission_resolution_crosses_real_ipc_and_persists_resolution() {
@@ -40406,6 +40538,69 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(pending.len(), before_keys);
         assert_eq!(pending.encoded_bytes(), before_bytes);
         assert!(before_bytes <= MAX_PENDING_LIVE_BYTES_PER_CLIENT);
+    }
+
+    #[test]
+    fn pending_live_event_buffer_coalesces_presentation_replacements_by_identity() {
+        let session_id = SessionId::new();
+        let presentation = |revision, identity| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolPresentationUpdated {
+                update: bcode_tool::ToolPresentationUpdate {
+                    invocation_id: "call-presentation".to_owned(),
+                    producer_id: "test.plugin".to_owned(),
+                    generation: 0,
+                    revision,
+                    identity,
+                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    schema: "test.presentation".to_owned(),
+                    schema_version: 1,
+                    artifact: None,
+                    payload: serde_json::json!({"revision": revision}),
+                },
+            },
+        };
+        let mut pending = PendingLiveEventBuffer::default();
+        assert!(matches!(
+            pending.push(presentation(
+                1,
+                bcode_tool::ToolPresentationIdentity::Primary,
+            )),
+            BufferLiveEventResult::Buffered { superseded: false }
+        ));
+        assert!(matches!(
+            pending.push(presentation(
+                2,
+                bcode_tool::ToolPresentationIdentity::Primary,
+            )),
+            BufferLiveEventResult::Buffered { superseded: true }
+        ));
+        assert!(matches!(
+            pending.push(presentation(
+                1,
+                bcode_tool::ToolPresentationIdentity::Supplemental {
+                    item_id: "details".to_owned(),
+                },
+            )),
+            BufferLiveEventResult::Buffered { superseded: false }
+        ));
+
+        assert_eq!(pending.len(), 2);
+        let events = pending.take_events();
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            SessionLiveEventKind::ToolPresentationUpdated { update }
+                if update.identity == bcode_tool::ToolPresentationIdentity::Primary
+                    && update.revision == 2
+                    && update.payload == serde_json::json!({"revision": 2})
+        )));
+        assert!(events.iter().any(|event| matches!(
+            &event.kind,
+            SessionLiveEventKind::ToolPresentationUpdated { update }
+                if update.identity == bcode_tool::ToolPresentationIdentity::Supplemental {
+                    item_id: "details".to_owned(),
+                }
+        )));
     }
 
     #[tokio::test]
