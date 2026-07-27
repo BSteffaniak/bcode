@@ -19,6 +19,7 @@ mod attachment;
 mod catalog;
 mod current_schema;
 pub mod db;
+mod fork;
 pub mod lease;
 mod manifest;
 mod migration_execution;
@@ -26,7 +27,11 @@ pub mod ownership;
 pub mod persisted;
 pub mod projection;
 pub mod repair;
+mod runtime_work;
+pub(crate) mod state;
+mod store;
 mod store_executor;
+mod subscription;
 
 use actor::{AttachMode, SessionHandle};
 pub use attachment::{
@@ -35,14 +40,14 @@ pub use attachment::{
 };
 use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ClientId, ExecutionSessionContextMode,
-    ExecutionSessionProvenance, ModelTurnOutcome, ProjectionWindow, ProjectionWindowRequest,
-    SessionEvent, SessionEventKind, SessionEventProvenance, SessionForkKind, SessionForkResult,
-    SessionForkSummary, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
-    SessionId, SessionImportSummary, SessionInputHistoryEntry, SessionLiveEvent,
-    SessionLiveEventKind, SessionMigrationProgress, SessionMigrationStage, SessionOpenFailureKind,
-    SessionOpenOperationId, SessionOpenOperationSnapshot, SessionOpenTerminalOutcome,
-    SessionSummary, SessionTitleSource, SessionTokenUsage, SessionTraceEvent, SessionVisibility,
+    ClientId, ExecutionSessionContextMode, ExecutionSessionProvenance, ModelTurnOutcome,
+    ProjectionWindow, ProjectionWindowRequest, SessionEvent, SessionEventKind,
+    SessionEventProvenance, SessionForkKind, SessionHistoryDirection, SessionHistoryPage,
+    SessionHistoryQuery, SessionId, SessionImportSummary, SessionInputHistoryEntry,
+    SessionLiveEvent, SessionLiveEventKind, SessionMigrationProgress, SessionMigrationStage,
+    SessionOpenFailureKind, SessionOpenOperationId, SessionOpenOperationSnapshot,
+    SessionOpenTerminalOutcome, SessionSummary, SessionTitleSource, SessionTokenUsage,
+    SessionTraceEvent, SessionVisibility,
 };
 pub use catalog::{
     CatalogLoadStatus, SessionCatalogEntry, SessionCatalogLoadStatus, SessionHealth,
@@ -52,8 +57,8 @@ pub use manifest::{
     CURRENT_SESSION_FORMAT_EPOCH, SESSION_FORMAT_FAMILY, SESSION_MANIFEST_SCHEMA_VERSION,
 };
 use manifest::{SessionFormatMarker, SessionManifest};
+use state::{SessionLiveEventBroker, SessionLoadStatusKind, SessionState};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::{
@@ -61,6 +66,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+pub use store::{SessionStore, SessionStoreError};
 use store_executor::SessionStoreExecutor;
 use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, watch};
@@ -481,388 +487,6 @@ pub enum SessionError {
     Lease(#[from] lease::SessionLeaseError),
 }
 
-/// Errors returned by the session store.
-#[derive(Debug, Error)]
-pub enum SessionStoreError {
-    #[error("I/O error: {0}")]
-    Io(#[from] std::io::Error),
-    #[error("blocking session store task failed: {0}")]
-    BlockingTask(#[from] tokio::task::JoinError),
-    #[error("session catalog load failed: {0}")]
-    CatalogLoad(String),
-    #[error(transparent)]
-    Lease(#[from] lease::SessionLeaseError),
-}
-
-/// Filesystem-rooted session store for DB-backed session histories.
-#[derive(Debug, Clone)]
-pub struct SessionStore {
-    root: PathBuf,
-    pub(crate) metrics: MetricsRegistry,
-    lease_owner: SessionLeaseOwnerContext,
-}
-
-impl SessionStore {
-    /// Create an event store rooted at the provided directory.
-    #[must_use]
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self {
-            root: root.into(),
-            metrics: MetricsRegistry::default(),
-            lease_owner: SessionLeaseOwnerContext::default(),
-        }
-    }
-
-    /// Create an event store rooted at the provided directory with metrics instrumentation.
-    #[must_use]
-    pub fn with_metrics(root: impl Into<PathBuf>, metrics: MetricsRegistry) -> Self {
-        Self {
-            root: root.into(),
-            metrics,
-            lease_owner: SessionLeaseOwnerContext::default(),
-        }
-    }
-
-    fn load_catalog(&self) -> Result<BTreeMap<SessionId, SessionState>, SessionStoreError> {
-        let mut summaries = if self.catalog_db_path().exists() {
-            match self.load_global_catalog_summaries() {
-                Ok(summaries) => summaries,
-                Err(error) => {
-                    eprintln!("ignoring unreadable derived session catalog: {error}");
-                    Vec::new()
-                }
-            }
-        } else {
-            Vec::new()
-        };
-        summaries.extend(self.load_session_manifests()?);
-        summaries.extend(self.discover_canonical_session_summaries()?);
-        match self.load_legacy_catalog_summaries() {
-            Ok(legacy) => summaries.extend(legacy),
-            Err(error) => eprintln!("ignoring unreadable legacy session catalog: {error}"),
-        }
-        summaries.sort_by(|left, right| {
-            left.id
-                .cmp(&right.id)
-                .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
-        });
-        summaries.dedup_by_key(|summary| summary.id);
-
-        let mut sessions = BTreeMap::new();
-        for summary in summaries {
-            let summary = match self.load_session_manifest(summary.id) {
-                Ok(Some(manifest_summary)) => manifest_summary,
-                Ok(None) => summary,
-                Err(error) => {
-                    eprintln!(
-                        "using canonical fallback for session {} with unreadable manifest metadata: {error}",
-                        summary.id
-                    );
-                    summary
-                }
-            };
-            sessions.insert(summary.id, SessionState::from_catalog_summary(summary));
-        }
-        Ok(sessions)
-    }
-
-    fn backfill_catalog(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
-        let mut summaries = self.load_session_manifests()?;
-        summaries.extend(self.discover_canonical_session_summaries()?);
-        match self.load_legacy_catalog_summaries() {
-            Ok(legacy) => summaries.extend(legacy),
-            Err(error) => eprintln!("ignoring unreadable legacy session catalog: {error}"),
-        }
-        summaries.sort_by(|left, right| {
-            left.id
-                .cmp(&right.id)
-                .then_with(|| right.updated_at_ms.cmp(&left.updated_at_ms))
-        });
-        summaries.dedup_by_key(|summary| summary.id);
-        summaries.sort_by_key(|summary| std::cmp::Reverse(summary.updated_at_ms));
-        if summaries.is_empty() {
-            return Ok(summaries);
-        }
-
-        self.write_global_catalog_summaries(&summaries)?;
-        Ok(summaries)
-    }
-
-    fn discover_canonical_session_summaries(
-        &self,
-    ) -> Result<Vec<SessionSummary>, SessionStoreError> {
-        let mut summaries = Vec::new();
-        if !self.root.exists() {
-            return Ok(summaries);
-        }
-        for entry in fs::read_dir(&self.root)? {
-            let path = entry?.path();
-            let Some(session_id) = canonical_session_id_from_dir(&path) else {
-                continue;
-            };
-            if !db::session_db_path(&self.root, session_id).exists() {
-                continue;
-            }
-            summaries.push(SessionSummary {
-                id: session_id,
-                name: None,
-                explicit_name: None,
-                derived_title: None,
-                title_source: SessionTitleSource::EmptyDraft,
-                client_count: 0,
-                created_at_ms: 0,
-                updated_at_ms: 0,
-                working_directory: self.root.clone(),
-                import: None,
-                fork: None,
-                execution: None,
-            });
-        }
-        Ok(summaries)
-    }
-
-    fn load_session_manifests(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
-        let mut summaries = Vec::new();
-        if !self.root.exists() {
-            return Ok(summaries);
-        }
-        for entry in fs::read_dir(&self.root)? {
-            let path = entry?.path();
-            let Some(session_id) = canonical_session_id_from_dir(&path) else {
-                continue;
-            };
-            match self.load_session_manifest(session_id) {
-                Ok(Some(summary)) => summaries.push(summary),
-                Ok(None) => {}
-                Err(error) => {
-                    eprintln!("skipping unreadable session manifest {session_id}: {error}");
-                }
-            }
-        }
-        Ok(summaries)
-    }
-
-    fn load_session_manifest(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<SessionSummary>, SessionStoreError> {
-        let path = self.session_manifest_path(session_id);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let contents = fs::read(&path)?;
-        let value: serde_json::Value = serde_json::from_slice(&contents)
-            .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-        let schema_version = value
-            .get("schema_version")
-            .and_then(serde_json::Value::as_u64);
-        if schema_version == Some(1) {
-            let summary: SessionSummary =
-                serde_json::from_value(value.get("summary").cloned().ok_or_else(|| {
-                    SessionStoreError::CatalogLoad(
-                        "legacy session manifest is missing its summary".to_owned(),
-                    )
-                })?)
-                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-            if summary.id != session_id {
-                return Err(SessionStoreError::CatalogLoad(format!(
-                    "session manifest id mismatch: expected {session_id}, found {}",
-                    summary.id
-                )));
-            }
-            return Ok(Some(summary));
-        }
-        if schema_version != Some(u64::from(SESSION_MANIFEST_SCHEMA_VERSION)) {
-            return Err(SessionStoreError::CatalogLoad(format!(
-                "unsupported session manifest schema version {schema_version:?}"
-            )));
-        }
-        let format_family = value
-            .pointer("/session_format/family")
-            .and_then(serde_json::Value::as_str);
-        let format_epoch = value
-            .pointer("/session_format/epoch")
-            .and_then(serde_json::Value::as_u64);
-        if format_family != Some(SESSION_FORMAT_FAMILY)
-            || format_epoch != Some(u64::from(CURRENT_SESSION_FORMAT_EPOCH))
-        {
-            return Err(SessionStoreError::CatalogLoad(format!(
-                "unsupported session format family={format_family:?} epoch={format_epoch:?}"
-            )));
-        }
-        let manifest: SessionManifest = serde_json::from_value(value)
-            .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-        if manifest.schema_version != SESSION_MANIFEST_SCHEMA_VERSION {
-            return Err(SessionStoreError::CatalogLoad(format!(
-                "unsupported session manifest schema version {}",
-                manifest.schema_version
-            )));
-        }
-        if manifest.session_format.family != SESSION_FORMAT_FAMILY
-            || manifest.session_format.epoch != CURRENT_SESSION_FORMAT_EPOCH
-        {
-            return Err(SessionStoreError::CatalogLoad(format!(
-                "unsupported session format family={} epoch={}",
-                manifest.session_format.family, manifest.session_format.epoch
-            )));
-        }
-        if manifest.summary.id != session_id {
-            return Err(SessionStoreError::CatalogLoad(format!(
-                "session manifest id mismatch: expected {session_id}, found {}",
-                manifest.summary.id
-            )));
-        }
-        Ok(Some(manifest.summary))
-    }
-
-    fn load_legacy_catalog_summaries(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
-        if self.catalog_namespace().is_none() || !db::global_catalog_db_path(&self.root).exists() {
-            return Ok(Vec::new());
-        }
-        Self::load_catalog_summaries_at_path(db::global_catalog_db_path(&self.root))
-    }
-
-    fn load_catalog_summaries_at_path(
-        path: PathBuf,
-    ) -> Result<Vec<SessionSummary>, SessionStoreError> {
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-            runtime.block_on(async move {
-                let catalog = db::GlobalSessionDb::open_turso_without_catalog_lock(&path)
-                    .await
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-                catalog
-                    .list_sessions()
-                    .await
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))
-            })
-        })
-        .join()
-        .map_err(|_| SessionStoreError::CatalogLoad("catalog loader panicked".to_string()))?
-    }
-
-    fn write_global_catalog_summaries(
-        &self,
-        summaries: &[SessionSummary],
-    ) -> Result<(), SessionStoreError> {
-        let root = self.root.clone();
-        let namespace = self.catalog_namespace();
-        let summaries = summaries.to_vec();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-            runtime.block_on(async move {
-                let catalog = match namespace.as_deref() {
-                    Some(namespace) => {
-                        db::GlobalSessionDb::open_turso_in_root_namespace(&root, namespace).await
-                    }
-                    None => db::GlobalSessionDb::open_turso_in_root(&root).await,
-                }
-                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-                for summary in summaries {
-                    catalog
-                        .upsert_session(&summary, &db::session_db_path(&root, summary.id))
-                        .await
-                        .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-                }
-                Ok(())
-            })
-        })
-        .join()
-        .map_err(|_| SessionStoreError::CatalogLoad("catalog writer panicked".to_string()))?
-    }
-
-    pub(crate) fn write_session_manifest(
-        &self,
-        summary: &SessionSummary,
-    ) -> Result<(), SessionStoreError> {
-        let path = self.session_manifest_path(summary.id);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut summary = summary.clone();
-        summary.client_count = 0;
-        let manifest = SessionManifest {
-            schema_version: SESSION_MANIFEST_SCHEMA_VERSION,
-            session_format: SessionFormatMarker {
-                family: SESSION_FORMAT_FAMILY.to_owned(),
-                epoch: CURRENT_SESSION_FORMAT_EPOCH,
-            },
-            summary,
-        };
-        let temp_path = path.with_extension("json.tmp");
-        fs::write(
-            &temp_path,
-            serde_json::to_vec_pretty(&manifest)
-                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?,
-        )?;
-        fs::rename(&temp_path, path)?;
-        Ok(())
-    }
-
-    fn session_manifest_path(&self, session_id: SessionId) -> PathBuf {
-        db::session_dir_path(&self.root, session_id).join("manifest.json")
-    }
-
-    fn catalog_namespace(&self) -> Option<String> {
-        self.lease_owner
-            .build_fingerprint
-            .as_deref()
-            .map(safe_catalog_namespace)
-    }
-
-    fn catalog_db_path(&self) -> PathBuf {
-        self.catalog_namespace().map_or_else(
-            || db::global_catalog_db_path(&self.root),
-            |namespace| db::namespaced_catalog_db_path(&self.root, &namespace),
-        )
-    }
-
-    fn load_global_catalog_summaries(&self) -> Result<Vec<SessionSummary>, SessionStoreError> {
-        let root = self.root.clone();
-        let namespace = self.catalog_namespace();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-            runtime.block_on(async move {
-                let catalog = match namespace.as_deref() {
-                    Some(namespace) => {
-                        db::GlobalSessionDb::open_turso_in_root_namespace(&root, namespace).await
-                    }
-                    None => db::GlobalSessionDb::open_turso_in_root(&root).await,
-                }
-                .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))?;
-                catalog
-                    .list_sessions()
-                    .await
-                    .map_err(|error| SessionStoreError::CatalogLoad(error.to_string()))
-            })
-        })
-        .join()
-        .map_err(|_| SessionStoreError::CatalogLoad("global catalog loader panicked".to_string()))?
-    }
-
-    pub(crate) fn root(&self) -> &Path {
-        self.root.as_path()
-    }
-
-    fn with_lease_owner(mut self, lease_owner: SessionLeaseOwnerContext) -> Self {
-        self.lease_owner = lease_owner;
-        self
-    }
-
-    pub(crate) const fn lease_owner(&self) -> &SessionLeaseOwnerContext {
-        &self.lease_owner
-    }
-}
-
 /// Input for appending a tool-call request event.
 #[derive(Debug, Clone, Default)]
 pub struct AppendToolCallRequestedInput {
@@ -897,12 +521,6 @@ struct SessionManagerInner {
     sessions: BTreeMap<SessionId, SessionHandle>,
     leases: BTreeMap<SessionId, SessionLeaseGuard>,
     load_gates: BTreeMap<SessionId, Arc<Mutex<()>>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SessionLoadStatusKind {
-    Current,
-    SummaryOnly,
 }
 
 enum SessionLeaseLoadOutcome {
@@ -942,79 +560,6 @@ async fn compatibility_health(db: &db::SessionDb, expected: u64) -> Option<Sessi
     }
 }
 
-#[derive(Debug)]
-pub(crate) struct SessionState {
-    summary: SessionSummary,
-    working_directory: PathBuf,
-    clients: BTreeSet<ClientId>,
-    events: Option<Vec<SessionEvent>>,
-    next_sequence: u64,
-    event_count: usize,
-    has_user_message: bool,
-    current_provider: Option<String>,
-    current_model: Option<String>,
-    reasoning_effort: Option<String>,
-    reasoning_summary: Option<String>,
-    current_agent: Option<String>,
-    latest_compaction_sequence: Option<u64>,
-    context_epoch: u64,
-    context_occupancy: Option<bcode_session_models::RequestContextOccupancy>,
-    turn_receipts: BTreeMap<(String, String), bcode_session_models::TurnReceipt>,
-    total_metered_tokens: u64,
-    load_status: SessionLoadStatusKind,
-    sender: broadcast::Sender<SessionEvent>,
-    live_events: SessionLiveEventBroker,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct SessionLiveEventBroker {
-    sender: broadcast::Sender<SessionLiveEvent>,
-    published: Arc<AtomicU64>,
-    dropped_no_receivers: Arc<AtomicU64>,
-}
-
-impl SessionLiveEventBroker {
-    fn new(capacity: usize) -> Self {
-        let (sender, _) = broadcast::channel(capacity);
-        Self {
-            sender,
-            published: Arc::new(AtomicU64::new(0)),
-            dropped_no_receivers: Arc::new(AtomicU64::new(0)),
-        }
-    }
-
-    fn subscribe(&self) -> broadcast::Receiver<SessionLiveEvent> {
-        self.sender.subscribe()
-    }
-
-    fn publish(&self, event: SessionLiveEvent) -> Option<SessionLiveEvent> {
-        if self.sender.receiver_count() == 0 {
-            self.dropped_no_receivers.fetch_add(1, Ordering::Relaxed);
-            return None;
-        }
-        let _ = self.sender.send(event.clone());
-        self.published.fetch_add(1, Ordering::Relaxed);
-        Some(event)
-    }
-}
-
-impl Default for SessionManager {
-    fn default() -> Self {
-        let (catalog_status_tx, catalog_status_rx) = watch::channel(CatalogLoadStatus::Loaded);
-        Self {
-            inner: Arc::new(Mutex::new(SessionManagerInner::default())),
-            store: None,
-            activity_clock_ms: Arc::new(AtomicU64::new(current_unix_millis())),
-            catalog_status_tx,
-            catalog_status_rx,
-            mutation_tx: broadcast::channel(1024).0,
-            migration_operations: bcode_session_migration::SessionMigrationOperations::default(),
-            shared_execution_locks: Arc::new(Mutex::new(BTreeMap::new())),
-            metrics: MetricsRegistry::default(),
-        }
-    }
-}
-
 async fn classify_known_current_session_open(
     session_id: SessionId,
     db: &db::SessionDb,
@@ -1051,6 +596,23 @@ async fn classify_known_current_session_open(
             },
             "Session storage requires repair".to_owned(),
         )),
+    }
+}
+
+impl Default for SessionManager {
+    fn default() -> Self {
+        let (catalog_status_tx, catalog_status_rx) = watch::channel(CatalogLoadStatus::Loaded);
+        Self {
+            inner: Arc::new(Mutex::new(SessionManagerInner::default())),
+            store: None,
+            activity_clock_ms: Arc::new(AtomicU64::new(current_unix_millis())),
+            catalog_status_tx,
+            catalog_status_rx,
+            mutation_tx: broadcast::channel(1024).0,
+            migration_operations: bcode_session_migration::SessionMigrationOperations::default(),
+            shared_execution_locks: Arc::new(Mutex::new(BTreeMap::new())),
+            metrics: MetricsRegistry::default(),
+        }
     }
 }
 
@@ -1292,61 +854,6 @@ impl SessionManager {
             return Ok(operation.snapshot());
         }
         classify_known_current_session_open(session_id, &db).await
-    }
-
-    /// Return one operation snapshot when both session and operation identities match.
-    pub async fn session_open_operation(
-        &self,
-        session_id: SessionId,
-        operation_id: SessionOpenOperationId,
-    ) -> Option<SessionOpenOperationSnapshot> {
-        self.migration_operations
-            .get(session_id, operation_id)
-            .await
-            .map(|operation| operation.snapshot())
-    }
-
-    /// Subscribe to one matching session-open operation.
-    pub async fn subscribe_session_open_operation(
-        &self,
-        session_id: SessionId,
-        operation_id: SessionOpenOperationId,
-    ) -> Option<watch::Receiver<SessionOpenOperationSnapshot>> {
-        self.migration_operations
-            .get(session_id, operation_id)
-            .await
-            .map(|operation| operation.subscribe())
-    }
-
-    #[cfg(test)]
-    async fn session_open_operation_history(
-        &self,
-        session_id: SessionId,
-        operation_id: SessionOpenOperationId,
-    ) -> Vec<SessionOpenOperationSnapshot> {
-        self.migration_operations
-            .get(session_id, operation_id)
-            .await
-            .map_or_else(Vec::new, |operation| operation.history())
-    }
-
-    /// Return the number of migrations currently running.
-    pub async fn active_session_migration_count(&self) -> usize {
-        self.migration_operations.active_count().await
-    }
-
-    /// Subscribe to committed durable session mutations.
-    #[must_use]
-    pub fn subscribe_mutations(&self) -> broadcast::Receiver<SessionMutationCommitted> {
-        self.mutation_tx.subscribe()
-    }
-
-    fn publish_committed_mutation(&self, event: SessionEvent, summary: SessionSummary) {
-        let _ = self.mutation_tx.send(SessionMutationCommitted {
-            session_id: event.session_id,
-            event,
-            summary,
-        });
     }
 
     /// Return the persistent session store root, when this manager is store-backed.
@@ -2748,203 +2255,6 @@ impl SessionManager {
         handle.input_history().await
     }
 
-    /// Fork a session from a selected user prompt into a new session.
-    ///
-    /// The selected prompt is returned as draft text and is not appended to the new session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the source session does not exist, the prompt cannot be found,
-    /// or the copied events cannot be persisted.
-    pub async fn fork_session_from_prompt(
-        &self,
-        source_session_id: SessionId,
-        prompt_sequence: u64,
-        name: Option<String>,
-    ) -> Result<SessionForkResult, SessionError> {
-        let source = self.session_summary(source_session_id).await?;
-        let events = self.session_history(source_session_id).await?;
-        let Some(prompt_event) = events
-            .iter()
-            .find(|event| event.sequence == prompt_sequence)
-        else {
-            return Err(SessionError::ForkPromptNotFound {
-                session_id: source_session_id,
-                sequence: prompt_sequence,
-            });
-        };
-        let SessionEventKind::UserMessage { text: draft, .. } = &prompt_event.kind else {
-            return Err(SessionError::ForkPromptNotFound {
-                session_id: source_session_id,
-                sequence: prompt_sequence,
-            });
-        };
-        let copied_events = events
-            .iter()
-            .filter(|event| event.sequence < prompt_sequence)
-            .cloned()
-            .collect::<Vec<_>>();
-        let source_title = Some(source.display_title().to_string());
-        let forked_at_ms = self.next_activity_timestamp_ms();
-        let fork_name = normalize_session_name(name)
-            .or_else(|| Some(format!("[fork] {}", source.display_title())));
-        let session = self
-            .copy_session_events(
-                fork_name,
-                source.working_directory,
-                copied_events,
-                SessionEventKind::SessionForked {
-                    source_session_id,
-                    source_title,
-                    source_cutoff_sequence: prompt_sequence.checked_sub(1),
-                    source_prompt_sequence: Some(prompt_sequence),
-                    forked_at_ms,
-                    kind: SessionForkKind::Fork,
-                },
-            )
-            .await?;
-        Ok(SessionForkResult {
-            session,
-            draft: Some(draft.clone()),
-        })
-    }
-
-    /// Clone a session's complete event history into a new session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the source session does not exist or the copied events cannot be
-    /// persisted.
-    pub async fn clone_session(
-        &self,
-        source_session_id: SessionId,
-        name: Option<String>,
-    ) -> Result<SessionForkResult, SessionError> {
-        self.clone_session_at_generation(source_session_id, name, None)
-            .await
-    }
-
-    /// Clone a session's complete history if its snapshot matches an expected generation.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the source session does not exist, the source generation differs
-    /// from `expected_generation`, or copied events cannot be persisted.
-    pub async fn clone_session_at_generation(
-        &self,
-        source_session_id: SessionId,
-        name: Option<String>,
-        expected_generation: Option<u64>,
-    ) -> Result<SessionForkResult, SessionError> {
-        let events = self.session_history(source_session_id).await?;
-        let source_cutoff_sequence = events.last().map_or(0, |event| event.sequence);
-        if let Some(expected) = expected_generation
-            && source_cutoff_sequence != expected
-        {
-            return Err(SessionError::CloneGenerationChanged {
-                session_id: source_session_id,
-                expected,
-                current: source_cutoff_sequence,
-            });
-        }
-        let source = self.session_summary(source_session_id).await?;
-        if let Some(expected) = expected_generation {
-            let current = self
-                .session_history_page(
-                    source_session_id,
-                    SessionHistoryQuery {
-                        cursor: None,
-                        limit: 1,
-                        direction: SessionHistoryDirection::Backward,
-                    },
-                )
-                .await?
-                .events
-                .first()
-                .map_or(0, |event| event.sequence);
-            if current != expected {
-                return Err(SessionError::CloneGenerationChanged {
-                    session_id: source_session_id,
-                    expected,
-                    current,
-                });
-            }
-        }
-        let source_title = Some(source.display_title().to_string());
-        let source_cutoff_sequence = events.last().map(|event| event.sequence);
-        let forked_at_ms = self.next_activity_timestamp_ms();
-        let clone_name = normalize_session_name(name)
-            .or_else(|| Some(format!("[clone] {}", source.display_title())));
-        let session = self
-            .copy_session_events(
-                clone_name,
-                source.working_directory,
-                events,
-                SessionEventKind::SessionForked {
-                    source_session_id,
-                    source_title,
-                    source_cutoff_sequence,
-                    source_prompt_sequence: None,
-                    forked_at_ms,
-                    kind: SessionForkKind::Clone,
-                },
-            )
-            .await?;
-        Ok(SessionForkResult {
-            session,
-            draft: None,
-        })
-    }
-
-    async fn copy_session_events(
-        &self,
-        name: Option<String>,
-        working_directory: PathBuf,
-        events: Vec<SessionEvent>,
-        marker: SessionEventKind,
-    ) -> Result<SessionSummary, SessionError> {
-        self.copy_session_events_with_execution(name, working_directory, events, marker, None)
-            .await
-    }
-
-    async fn copy_session_events_with_execution(
-        &self,
-        name: Option<String>,
-        working_directory: PathBuf,
-        events: Vec<SessionEvent>,
-        marker: SessionEventKind,
-        execution: Option<ExecutionSessionProvenance>,
-    ) -> Result<SessionSummary, SessionError> {
-        let session = self
-            .create_session_record(name, working_directory, execution)
-            .await?;
-        let handle = self.session_handle(session.id).await?;
-        let mut sequence_map = BTreeMap::new();
-        for event in events {
-            if !is_copyable_fork_event(&event.kind) {
-                continue;
-            }
-            let kind = rewrite_copied_event_kind(event.kind.clone(), &sequence_map);
-            let copied = handle
-                .append_event_with_provenance(
-                    kind,
-                    Some(copy_event_provenance(&event)),
-                    self.next_activity_timestamp_ms(),
-                )
-                .await?;
-            sequence_map.insert(event.sequence, copied.sequence);
-        }
-        let marker_event = handle
-            .append_event(marker.clone(), self.next_activity_timestamp_ms())
-            .await?;
-        let mut summary = handle.summary().await?;
-        self.release_persistent_idle_session_resources(session.id)
-            .await;
-        summary.fork = session_fork_summary_from_marker(&marker);
-        self.publish_committed_mutation(marker_event, summary.clone());
-        Ok(summary)
-    }
-
     /// Return active tool runs from the DB read model.
     ///
     /// # Errors
@@ -2957,52 +2267,6 @@ impl SessionManager {
     ) -> Result<Vec<db::ToolRun>, SessionError> {
         let handle = self.session_handle(session_id).await?;
         handle.active_tool_runs().await
-    }
-
-    /// Return active runtime-work rows through the session actor's DB connection.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SessionError::NotFound`] when the session does not exist, or
-    /// [`SessionError::ProjectionStale`] when the DB projection is not current.
-    pub async fn active_runtime_work(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Vec<db::RuntimeWorkProjection>, SessionError> {
-        let handle = self.session_handle(session_id).await?;
-        handle.active_runtime_work().await
-    }
-
-    /// Return latest runtime-work rows from the DB read model.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SessionError::NotFound`] when the session does not exist, or
-    /// [`SessionError::ProjectionStale`] when the DB projection is not current.
-    pub async fn runtime_work_history(
-        &self,
-        session_id: SessionId,
-        limit: usize,
-    ) -> Result<Vec<db::RuntimeWorkProjection>, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
-        let store = self
-            .store
-            .as_ref()
-            .ok_or(SessionError::DbUnavailable(session_id))?;
-        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
-        let expected_last_sequence = db.last_event_sequence().await?.unwrap_or(0);
-        let checkpoint = db
-            .materialized_projection_checkpoint(db::MaterializedProjection::RuntimeWork)
-            .await?;
-        if checkpoint.is_some_and(|checkpoint| checkpoint >= expected_last_sequence) {
-            return Ok(db.runtime_work_history(limit).await?);
-        }
-        Err(SessionError::ProjectionStale {
-            session_id,
-            projection: "runtime_work",
-            checkpoint,
-            expected: expected_last_sequence,
-        })
     }
 
     /// Return the current context generation.
@@ -3092,25 +2356,6 @@ impl SessionManager {
     ) -> Result<Option<String>, SessionError> {
         let handle = self.session_handle(session_id).await?;
         handle.current_agent_selection().await
-    }
-
-    /// Subscribe to a session's committed/live events without registering as an attached client.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the session does not exist.
-    pub async fn subscribe_session_events(
-        &self,
-        session_id: SessionId,
-    ) -> Result<SessionEventSubscription, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
-        let handle = self.session_handle(session_id).await?;
-        let (session, events, live_events) = handle.subscribe_events().await?;
-        Ok(SessionEventSubscription {
-            session,
-            events,
-            live_events,
-        })
     }
 
     /// Attach a client to an existing session.
@@ -3559,67 +2804,6 @@ impl SessionManager {
         handle.publish_live_event(event).await.ok().flatten()
     }
 
-    /// Append a runtime-work started event to a session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the session does not exist or the event cannot be persisted.
-    pub async fn append_runtime_work_started(
-        &self,
-        session_id: SessionId,
-        event: SessionEventKind,
-    ) -> Result<SessionEvent, SessionError> {
-        self.append_event(session_id, event).await
-    }
-
-    /// Append a runtime-work cancellation request event to a session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the session does not exist or the event cannot be persisted.
-    pub async fn append_runtime_work_cancel_requested(
-        &self,
-        session_id: SessionId,
-        work_id: bcode_session_models::WorkId,
-        requested_at_ms: Option<u64>,
-        client_id: Option<ClientId>,
-    ) -> Result<SessionEvent, SessionError> {
-        self.append_event(
-            session_id,
-            SessionEventKind::RuntimeWorkCancelRequested {
-                work_id,
-                requested_at_ms,
-                client_id,
-            },
-        )
-        .await
-    }
-
-    /// Append a runtime-work finished event to a session.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the session does not exist or the event cannot be persisted.
-    pub async fn append_runtime_work_finished(
-        &self,
-        session_id: SessionId,
-        work_id: bcode_session_models::WorkId,
-        status: bcode_session_models::RuntimeWorkStatus,
-        finished_at_ms: Option<u64>,
-        message: Option<String>,
-    ) -> Result<SessionEvent, SessionError> {
-        self.append_event(
-            session_id,
-            SessionEventKind::RuntimeWorkFinished {
-                work_id,
-                status,
-                finished_at_ms,
-                message,
-            },
-        )
-        .await
-    }
-
     /// Append a permission-requested event to a session.
     ///
     /// # Errors
@@ -3978,316 +3162,6 @@ impl SessionManager {
                 return next;
             }
         }
-    }
-}
-
-impl SessionState {
-    pub(crate) fn from_catalog_summary(summary: SessionSummary) -> Self {
-        let (sender, _) = broadcast::channel(512);
-        let live_events = SessionLiveEventBroker::new(512);
-        let working_directory = normalize_working_directory(&summary.working_directory);
-        Self {
-            summary,
-            working_directory,
-            clients: BTreeSet::new(),
-            events: None,
-            next_sequence: 0,
-            event_count: 0,
-            has_user_message: false,
-            current_provider: None,
-            current_model: None,
-            reasoning_effort: None,
-            reasoning_summary: None,
-            current_agent: None,
-            latest_compaction_sequence: None,
-            context_epoch: 0,
-            context_occupancy: None,
-            turn_receipts: BTreeMap::new(),
-            total_metered_tokens: 0,
-            load_status: SessionLoadStatusKind::SummaryOnly,
-            sender,
-            live_events,
-        }
-    }
-
-    pub(crate) fn from_db_state(
-        state: db::SessionDbState,
-        created_at_ms: u64,
-        updated_at_ms: u64,
-    ) -> Self {
-        let (sender, _) = broadcast::channel(512);
-        let live_events = SessionLiveEventBroker::new(512);
-        let working_directory = normalize_working_directory(&state.working_directory);
-        let title_source = if state.title.is_some() {
-            SessionTitleSource::Explicit
-        } else {
-            SessionTitleSource::EmptyDraft
-        };
-        Self {
-            summary: SessionSummary {
-                id: state.session_id,
-                name: state.title.clone(),
-                explicit_name: state.title,
-                derived_title: None,
-                title_source,
-                client_count: 0,
-                created_at_ms,
-                updated_at_ms,
-                working_directory: working_directory.clone(),
-                import: None,
-                fork: None,
-                execution: state.execution.map(|provenance| {
-                    Box::new(bcode_session_models::ExecutionSessionSummary {
-                        provenance,
-                        visibility: state.visibility,
-                    })
-                }),
-            },
-            working_directory,
-            clients: BTreeSet::new(),
-            events: None,
-            next_sequence: state.last_event_seq.saturating_add(1),
-            event_count: usize::try_from(state.last_event_seq.saturating_add(1))
-                .unwrap_or(usize::MAX),
-            has_user_message: state.has_user_message,
-            current_provider: state.current_provider,
-            current_model: state.current_model,
-            reasoning_effort: state.reasoning_effort,
-            reasoning_summary: state.reasoning_summary,
-            current_agent: state.current_agent,
-            latest_compaction_sequence: state.latest_compaction_sequence,
-            context_epoch: state.latest_compaction_sequence.unwrap_or_default(),
-            context_occupancy: None,
-            turn_receipts: BTreeMap::new(),
-            total_metered_tokens: 0,
-            load_status: SessionLoadStatusKind::Current,
-            sender,
-            live_events,
-        }
-    }
-
-    fn summary(&self) -> SessionSummary {
-        let mut summary = self.summary.clone();
-        if summary.name.is_none() {
-            summary.name = summary
-                .explicit_name
-                .clone()
-                .or_else(|| summary.derived_title.clone());
-        }
-        summary
-    }
-
-    const fn build_next_event(&self, kind: SessionEventKind, timestamp_ms: u64) -> SessionEvent {
-        SessionEvent {
-            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
-            sequence: self.next_sequence,
-            timestamp_ms,
-            session_id: self.summary.id,
-            provenance: None,
-            kind,
-        }
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn apply_persisted_event(&mut self, event: SessionEvent, activity_timestamp_ms: u64) {
-        self.summary.updated_at_ms = activity_timestamp_ms;
-        self.next_sequence += 1;
-        self.event_count = self.event_count.saturating_add(1);
-        match &event.kind {
-            SessionEventKind::ExecutionSessionCreated {
-                provenance,
-                visibility,
-            } => {
-                self.summary.execution =
-                    Some(Box::new(bcode_session_models::ExecutionSessionSummary {
-                        provenance: (**provenance).clone(),
-                        visibility: *visibility,
-                    }));
-            }
-            SessionEventKind::SessionRenamed { name } => {
-                self.summary.name.clone_from(name);
-                self.summary.explicit_name.clone_from(name);
-                if name.is_some() {
-                    self.summary.title_source = SessionTitleSource::Explicit;
-                } else if self.summary.derived_title.is_some() {
-                    self.summary.title_source = SessionTitleSource::FirstUserMessage;
-                } else {
-                    self.summary.title_source = SessionTitleSource::EmptyDraft;
-                }
-            }
-            SessionEventKind::SessionImported {
-                source_id,
-                source_display_name,
-                external_session_id,
-                imported_at_ms,
-            } => {
-                self.summary.import = Some(SessionImportSummary {
-                    source_id: source_id.clone(),
-                    source_display_name: source_display_name.clone(),
-                    external_session_id: external_session_id.clone(),
-                    imported_at_ms: *imported_at_ms,
-                });
-                if self.summary.explicit_name.is_none() && self.summary.derived_title.is_none() {
-                    self.summary.derived_title = Some(external_session_id.clone());
-                    self.summary.name.clone_from(&self.summary.derived_title);
-                    self.summary.title_source = SessionTitleSource::Imported;
-                }
-            }
-            SessionEventKind::SessionForked {
-                source_session_id,
-                source_title,
-                source_cutoff_sequence,
-                source_prompt_sequence,
-                forked_at_ms,
-                kind,
-            } => {
-                self.summary.fork = Some(SessionForkSummary {
-                    source_session_id: *source_session_id,
-                    source_title: source_title.clone(),
-                    source_cutoff_sequence: *source_cutoff_sequence,
-                    source_prompt_sequence: *source_prompt_sequence,
-                    forked_at_ms: *forked_at_ms,
-                    kind: *kind,
-                });
-            }
-            SessionEventKind::UserMessage { text, .. } => {
-                self.has_user_message = true;
-                if self.summary.derived_title.is_none() {
-                    self.summary.derived_title = Some(title_from_first_prompt(text));
-                    if self.summary.explicit_name.is_none() {
-                        self.summary.name.clone_from(&self.summary.derived_title);
-                        self.summary.title_source = SessionTitleSource::FirstUserMessage;
-                    }
-                }
-            }
-            SessionEventKind::WorkingDirectoryChanged {
-                new_working_directory,
-                ..
-            } => {
-                self.working_directory = normalize_working_directory(new_working_directory);
-                self.summary
-                    .working_directory
-                    .clone_from(&self.working_directory);
-            }
-            SessionEventKind::ModelChanged { provider, model } => {
-                self.current_provider = Some(provider.clone());
-                self.current_model = Some(model.clone());
-                self.context_epoch = event.sequence;
-                self.context_occupancy = None;
-            }
-            SessionEventKind::ReasoningChanged { effort, summary } => {
-                self.reasoning_effort.clone_from(effort);
-                self.reasoning_summary.clone_from(summary);
-            }
-            SessionEventKind::AgentChanged { agent_id } => {
-                self.current_agent = Some(agent_id.clone());
-            }
-            SessionEventKind::ContextCompacted {
-                compacted_through_sequence,
-                ..
-            }
-            | SessionEventKind::ProviderContextCompacted {
-                compacted_through_sequence,
-                ..
-            } => {
-                self.latest_compaction_sequence = Some(*compacted_through_sequence);
-                self.context_epoch = event.sequence;
-                self.context_occupancy = None;
-            }
-            SessionEventKind::RequestContextObserved { observation } => {
-                self.context_occupancy = bcode_session_models::RequestContextOccupancy::reconcile(
-                    self.context_occupancy.as_ref(),
-                    self.context_epoch,
-                    event.sequence,
-                    observation.clone(),
-                );
-            }
-            SessionEventKind::ModelUsage { usage, .. } => {
-                if let Some(total) = usage.metered_total_tokens() {
-                    self.total_metered_tokens =
-                        self.total_metered_tokens.saturating_add(u64::from(total));
-                }
-            }
-            _ => {}
-        }
-        if let Some(events) = &mut self.events {
-            events.push(event.clone());
-        }
-        let _ = self.sender.send(event);
-    }
-}
-
-fn session_fork_summary_from_marker(marker: &SessionEventKind) -> Option<SessionForkSummary> {
-    if let SessionEventKind::SessionForked {
-        source_session_id,
-        source_title,
-        source_cutoff_sequence,
-        source_prompt_sequence,
-        forked_at_ms,
-        kind,
-    } = marker
-    {
-        Some(SessionForkSummary {
-            source_session_id: *source_session_id,
-            source_title: source_title.clone(),
-            source_cutoff_sequence: *source_cutoff_sequence,
-            source_prompt_sequence: *source_prompt_sequence,
-            forked_at_ms: *forked_at_ms,
-            kind: *kind,
-        })
-    } else {
-        None
-    }
-}
-
-fn copy_event_provenance(event: &SessionEvent) -> SessionEventProvenance {
-    let source_locator = format!(
-        "bcode://session/{}/event/{}",
-        event.session_id, event.sequence
-    );
-    SessionEventProvenance {
-        source_event_id: Some(event.sequence.to_string()),
-        source_timestamp_ms: None,
-        source_locator: Some(source_locator),
-    }
-}
-
-const fn is_copyable_fork_event(kind: &SessionEventKind) -> bool {
-    !matches!(
-        kind,
-        SessionEventKind::SessionCreated { .. }
-            | SessionEventKind::ClientAttached { .. }
-            | SessionEventKind::ClientDetached { .. }
-            | SessionEventKind::SessionForked { .. }
-    )
-}
-
-fn rewrite_copied_event_kind(
-    kind: SessionEventKind,
-    sequence_map: &BTreeMap<u64, u64>,
-) -> SessionEventKind {
-    match kind {
-        SessionEventKind::ContextCompacted {
-            summary,
-            compacted_through_sequence,
-        } => SessionEventKind::ContextCompacted {
-            summary,
-            compacted_through_sequence: sequence_map
-                .get(&compacted_through_sequence)
-                .copied()
-                .unwrap_or(compacted_through_sequence),
-        },
-        SessionEventKind::ProviderContextCompacted {
-            snapshot,
-            compacted_through_sequence,
-        } => SessionEventKind::ProviderContextCompacted {
-            snapshot,
-            compacted_through_sequence: sequence_map
-                .get(&compacted_through_sequence)
-                .copied()
-                .unwrap_or(compacted_through_sequence),
-        },
-        other => other,
     }
 }
 
@@ -5153,7 +4027,7 @@ mod tests {
 
     #[test]
     fn copied_local_boundary_is_rewritten_to_destination_sequence() {
-        let rewritten = super::rewrite_copied_event_kind(
+        let rewritten = super::fork::rewrite_copied_event_kind(
             SessionEventKind::ContextCompacted {
                 summary: "summary".to_string(),
                 compacted_through_sequence: 10,
@@ -5171,7 +4045,7 @@ mod tests {
 
     #[test]
     fn copied_provider_boundary_is_rewritten_to_destination_sequence() {
-        let rewritten = super::rewrite_copied_event_kind(
+        let rewritten = super::fork::rewrite_copied_event_kind(
             SessionEventKind::ProviderContextCompacted {
                 snapshot: provider_snapshot(),
                 compacted_through_sequence: 10,

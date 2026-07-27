@@ -80,6 +80,7 @@ clone_files="$(rg -l 'clone_session_at_generation' packages plugins --glob '*.rs
 expected_clone_files="$(cat <<'EOF'
 packages/client/src/lib.rs
 packages/server/src/lib.rs
+packages/session/src/fork.rs
 packages/session/src/lib.rs
 EOF
 )"

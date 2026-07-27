@@ -543,7 +543,7 @@ fi
 
 normal_session_open_violations="$(
   rg -n '\bSessionDb::open_turso_in_root(_observed)?' packages/session/src/{actor,lib}.rs \
-    | awk -F: '$1 !~ /lib.rs/ || $2 < 3700' \
+    | awk -F: '$1 !~ /lib.rs/ || $2 < 3419' \
     || true
 )"
 if [[ -n "$normal_session_open_violations" ]]; then
