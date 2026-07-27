@@ -44,7 +44,7 @@ const fn bool_to_value(value: bool) -> DatabaseValue {
 }
 use crate::db_validation::{
     compaction_boundary, validate_append_identity, validate_canonical_event_identity,
-    validate_projection_checkpoint_snapshot,
+    validate_model_context_precondition, validate_projection_checkpoint_snapshot,
 };
 use crate::persisted::{
     CompatibleSessionEvent, PersistedSessionEventError, decode_session_event, encode_session_event,
@@ -3247,44 +3247,6 @@ async fn validate_storage_writer_contract(db: &dyn Database) -> SessionDbResult<
     validate_storage_writer_contract_for_epoch(db, CURRENT_SESSION_STORAGE_WRITER_EPOCH).await
 }
 
-async fn validate_model_context_precondition(
-    db: &dyn Database,
-    event: &SessionEvent,
-) -> SessionDbResult<()> {
-    let state = db
-        .select("model_context_projection_state")
-        .columns(&["schema_version", "last_event_seq"])
-        .where_eq("projection_id", MODEL_CONTEXT_PROJECTION_ID)
-        .execute_first(db)
-        .await?;
-    let Some(state) = state.as_ref() else {
-        if event.sequence == 0 {
-            return Ok(());
-        }
-        return Err(SessionDbError::ProjectionStale {
-            projection: "model_context",
-            checkpoint: None,
-            expected: event.sequence.saturating_sub(1),
-        });
-    };
-    let schema_version = required_i64(state, "schema_version").map(i64_to_u64)?;
-    if schema_version != u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION) {
-        return Err(SessionDbError::ModelContextProjectionVersion {
-            actual: schema_version,
-            expected: u64::from(MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION),
-        });
-    }
-    let checkpoint = required_i64(state, "last_event_seq").map(i64_to_u64)?;
-    let expected = event.sequence.saturating_sub(1);
-    if event.sequence == 0 || checkpoint != expected {
-        return Err(SessionDbError::ModelContextProjectionStale {
-            checkpoint,
-            expected,
-        });
-    }
-    Ok(())
-}
-
 async fn validate_context_occupancy_precondition(
     db: &dyn Database,
     event: &SessionEvent,
@@ -3374,7 +3336,13 @@ async fn validate_append_preconditions_without_writer(
 ) -> SessionDbResult<()> {
     let canonical_tail = last_sequence(db).await?;
     validate_append_identity(event, canonical_tail)?;
-    validate_model_context_precondition(db, event).await?;
+    validate_model_context_precondition(
+        db,
+        event,
+        MODEL_CONTEXT_PROJECTION_ID,
+        MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION,
+    )
+    .await?;
     validate_context_occupancy_precondition(db, event).await?;
     validate_session_compatibility_precondition(db, canonical_tail).await?;
     if let Some(expected) = canonical_tail {

@@ -2,8 +2,50 @@
 
 use crate::db::{MaterializedProjection, SessionDbError, SessionDbResult};
 use crate::db_projection::ProjectionCheckpointState;
+use crate::db_row::{i64_to_u64, required_i64};
 use bcode_session_models::{SessionEvent, SessionId};
 use std::collections::BTreeMap;
+use switchy::database::{Database, query::FilterableQuery};
+
+pub async fn validate_model_context_precondition(
+    db: &dyn Database,
+    event: &SessionEvent,
+    projection_id: i32,
+    schema_version: u32,
+) -> SessionDbResult<()> {
+    let state = db
+        .select("model_context_projection_state")
+        .columns(&["schema_version", "last_event_seq"])
+        .where_eq("projection_id", projection_id)
+        .execute_first(db)
+        .await?;
+    let Some(state) = state.as_ref() else {
+        if event.sequence == 0 {
+            return Ok(());
+        }
+        return Err(SessionDbError::ProjectionStale {
+            projection: "model_context",
+            checkpoint: None,
+            expected: event.sequence.saturating_sub(1),
+        });
+    };
+    let actual = required_i64(state, "schema_version").map(i64_to_u64)?;
+    if actual != u64::from(schema_version) {
+        return Err(SessionDbError::ModelContextProjectionVersion {
+            actual,
+            expected: u64::from(schema_version),
+        });
+    }
+    let checkpoint = required_i64(state, "last_event_seq").map(i64_to_u64)?;
+    let expected = event.sequence.saturating_sub(1);
+    if event.sequence == 0 || checkpoint != expected {
+        return Err(SessionDbError::ModelContextProjectionStale {
+            checkpoint,
+            expected,
+        });
+    }
+    Ok(())
+}
 
 pub fn validate_canonical_event_identity(
     event: &SessionEvent,
