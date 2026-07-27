@@ -21,10 +21,7 @@ use std::str::FromStr;
 use thiserror::Error;
 
 const DEFAULT_MAX_SKILL_FILE_BYTES: u64 = 256 * 1024;
-const DEFAULT_MAX_CONTEXT_BYTES: usize = 24 * 1024;
 const SKILL_FILE_NAMES: &[&str] = &["SKILL.md", "skill.md", "README.md"];
-const DEFAULT_PROMPT_CATALOG_BYTES: usize = 8 * 1024;
-const DEFAULT_PROMPT_DESCRIPTION_CHARS: usize = 240;
 
 /// Skill prompt catalog rendering mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,10 +39,10 @@ pub enum SkillPromptCatalogMode {
 pub struct SkillPromptCatalogOptions {
     /// Catalog rendering mode.
     pub mode: SkillPromptCatalogMode,
-    /// Maximum bytes returned.
-    pub max_bytes: usize,
-    /// Maximum description characters per skill.
-    pub max_description_chars: usize,
+    /// Optional maximum bytes returned.
+    pub max_bytes: Option<usize>,
+    /// Optional maximum description characters per skill.
+    pub max_description_chars: Option<usize>,
     /// Include source labels.
     pub include_sources: bool,
     /// Include activation keywords.
@@ -56,8 +53,8 @@ impl Default for SkillPromptCatalogOptions {
     fn default() -> Self {
         Self {
             mode: SkillPromptCatalogMode::Summary,
-            max_bytes: DEFAULT_PROMPT_CATALOG_BYTES,
-            max_description_chars: DEFAULT_PROMPT_DESCRIPTION_CHARS,
+            max_bytes: None,
+            max_description_chars: None,
             include_sources: true,
             include_keywords: false,
         }
@@ -167,8 +164,8 @@ pub fn skill_source_roots_from_config(config: &bcode_config::BcodeConfig) -> Vec
 pub struct SkillRegistryOptions {
     /// Maximum bytes accepted for a `SKILL.md` file.
     pub max_skill_file_bytes: u64,
-    /// Maximum skill context bytes returned by default.
-    pub max_context_bytes: usize,
+    /// Optional maximum skill context bytes returned by default.
+    pub max_context_bytes: Option<usize>,
     /// Whether source scanning follows symlinks.
     pub follow_symlinks: bool,
     /// Disabled skill IDs.
@@ -179,7 +176,7 @@ impl Default for SkillRegistryOptions {
     fn default() -> Self {
         Self {
             max_skill_file_bytes: DEFAULT_MAX_SKILL_FILE_BYTES,
-            max_context_bytes: DEFAULT_MAX_CONTEXT_BYTES,
+            max_context_bytes: None,
             follow_symlinks: true,
             disabled_ids: BTreeSet::new(),
         }
@@ -192,7 +189,7 @@ pub fn format_skill_catalog_for_prompt(
     list: &SkillList,
     options: &SkillPromptCatalogOptions,
 ) -> String {
-    if options.mode == SkillPromptCatalogMode::Off || options.max_bytes == 0 {
+    if options.mode == SkillPromptCatalogMode::Off || options.max_bytes == Some(0) {
         return String::new();
     }
     let visible_skills = list
@@ -251,7 +248,9 @@ When a skill file references a relative path, resolve it against the skill direc
         }
         block.push_str("\n  </skill>");
 
-        if output.len() + block.len() + "\n</available_skills>".len() > options.max_bytes {
+        if options.max_bytes.is_some_and(|max_bytes| {
+            output.len() + block.len() + "\n</available_skills>".len() > max_bytes
+        }) {
             truncated = true;
             break;
         }
@@ -261,8 +260,10 @@ When a skill file references a relative path, resolve it against the skill direc
         output.push_str("\n  <truncated>true</truncated>");
     }
     output.push_str("\n</available_skills>");
-    if output.len() > options.max_bytes {
-        output.truncate(options.max_bytes);
+    if let Some(max_bytes) = options.max_bytes
+        && output.len() > max_bytes
+    {
+        truncate_utf8_bytes(&mut output, max_bytes);
     }
     output
 }
@@ -276,13 +277,27 @@ fn escape_xml(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn truncate_chars(value: &str, max_chars: usize) -> String {
+fn truncate_chars(value: &str, max_chars: Option<usize>) -> String {
+    let Some(max_chars) = max_chars else {
+        return value.to_string();
+    };
     if value.chars().count() <= max_chars {
         return value.to_string();
     }
     let mut truncated = value.chars().take(max_chars).collect::<String>();
     truncated.push('…');
     truncated
+}
+
+fn truncate_utf8_bytes(value: &mut String, max_bytes: usize) {
+    if value.len() <= max_bytes {
+        return;
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
 }
 
 /// In-memory skill registry.
@@ -368,7 +383,7 @@ impl SkillRegistry {
     ) -> Result<String, SkillRegistryError> {
         let entry = self.entry(skill_id)?;
         let manifest = self.describe(skill_id)?;
-        let budget = max_bytes.unwrap_or(self.options.max_context_bytes);
+        let budget = max_bytes.or(self.options.max_context_bytes);
         let skill_file = entry.path.to_string_lossy();
         let skill_directory = entry
             .path
@@ -390,8 +405,10 @@ impl SkillRegistry {
             manifest.summary.version.as_deref().unwrap_or("unknown"),
             manifest.instructions
         );
-        if context.len() > budget {
-            context.truncate(budget);
+        if let Some(budget) = budget
+            && context.len() > budget
+        {
+            truncate_utf8_bytes(&mut context, budget);
         }
         Ok(context)
     }
@@ -1358,6 +1375,71 @@ mod tests {
 
     fn is_ask(outcome: &SkillToolPolicyOutcome) -> bool {
         matches!(outcome, SkillToolPolicyOutcome::Ask { .. })
+    }
+
+    #[test]
+    fn prompt_catalog_is_unbounded_by_default() {
+        let list = SkillList {
+            skills: vec![SkillSummary {
+                id: SkillId::new("large-skill"),
+                name: "Large Skill".to_string(),
+                description: Some("é".repeat(10_000)),
+                source: SkillSource {
+                    kind: SkillSourceKind::Repository,
+                    label: "test".to_string(),
+                    path: Some("skills/large-skill/SKILL.md".to_string()),
+                    precedence: 0,
+                },
+                version: None,
+                activation: SkillActivation::default(),
+                diagnostics: Vec::new(),
+                disable_model_invocation: false,
+            }],
+            diagnostics: Vec::new(),
+        };
+
+        let output = format_skill_catalog_for_prompt(&list, &SkillPromptCatalogOptions::default());
+
+        assert!(output.contains(&"é".repeat(10_000)));
+        assert!(!output.contains("<truncated>true</truncated>"));
+    }
+
+    #[test]
+    fn prompt_catalog_explicit_byte_limit_is_utf8_safe() {
+        let list = SkillList {
+            skills: vec![SkillSummary {
+                id: SkillId::new("unicode-skill"),
+                name: "é".repeat(100),
+                source: SkillSource {
+                    kind: SkillSourceKind::Repository,
+                    label: "test".to_string(),
+                    path: Some("skills/unicode-skill/SKILL.md".to_string()),
+                    precedence: 0,
+                },
+                description: None,
+                version: None,
+                activation: SkillActivation::default(),
+                diagnostics: Vec::new(),
+                disable_model_invocation: false,
+            }],
+            diagnostics: Vec::new(),
+        };
+        let options = SkillPromptCatalogOptions {
+            max_bytes: Some(255),
+            ..SkillPromptCatalogOptions::default()
+        };
+
+        let output = format_skill_catalog_for_prompt(&list, &options);
+
+        assert!(output.len() <= 255);
+        assert!(std::str::from_utf8(output.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn description_truncation_is_optional() {
+        let value = "description".repeat(1_000);
+        assert_eq!(truncate_chars(&value, None), value);
+        assert_eq!(truncate_chars("abcdef", Some(3)), "abc…");
     }
 
     proptest! {

@@ -213,7 +213,7 @@ pub struct ServerState {
     auto_compaction: bcode_config::CompactionConfig,
     system_prompt: bcode_config::SystemPromptConfig,
     skills: Option<SkillRegistry>,
-    skill_context_bytes: usize,
+    skill_context_bytes: Option<usize>,
     skill_prompt_options: SkillPromptCatalogOptions,
     skill_model_policy: bcode_config::SkillModelPolicyConfig,
     active_skills: Mutex<BTreeMap<SessionId, BTreeSet<SkillId>>>,
@@ -1218,7 +1218,7 @@ struct ServerStateInit {
     auto_compaction: bcode_config::CompactionConfig,
     system_prompt: bcode_config::SystemPromptConfig,
     skills: Option<SkillRegistry>,
-    skill_context_bytes: usize,
+    skill_context_bytes: Option<usize>,
     skill_prompt_options: SkillPromptCatalogOptions,
     skill_model_policy: bcode_config::SkillModelPolicyConfig,
     daemon_status: DaemonStatus,
@@ -16263,8 +16263,7 @@ Tool and safety rules:
 * Treat tool output as potentially partial or truncated.
 ";
 
-const MAX_REPOSITORY_CONTEXT_CHARS: usize = 12_000;
-const MAX_CONTEXT_FILE_CHARS: usize = 6_000;
+const MAX_DYNAMIC_REPOSITORY_CONTEXT_CHARS: usize = 12_000;
 const MAX_GIT_STATUS_CHARS: usize = 4_000;
 const REPOSITORY_INVARIANTS_FILE: &str = "INVARIANTS.md";
 
@@ -16274,7 +16273,8 @@ fn build_coding_system_prompt_parts(
     agent_prompt_suffix: Option<&str>,
     skill_catalog: Option<&str>,
 ) -> (String, String) {
-    let (stable_context, dynamic_context) = build_repository_context_parts(cwd);
+    let (stable_context, dynamic_context) =
+        build_repository_context_parts(cwd, config.repository_instructions_max_chars);
     let mut stable = match config.mode {
         bcode_config::SystemPromptMode::Default => DEFAULT_CODING_SYSTEM_PROMPT.to_string(),
         bcode_config::SystemPromptMode::Replace => config.text.clone().unwrap_or_default(),
@@ -16291,10 +16291,7 @@ fn build_coding_system_prompt_parts(
     }
     if config.sections.repository_context {
         stable.push_str("\n\n");
-        stable.push_str(&truncate_text(
-            &stable_context,
-            MAX_REPOSITORY_CONTEXT_CHARS,
-        ));
+        stable.push_str(&stable_context);
     }
     if config.sections.agent_suffix
         && let Some(suffix) = agent_prompt_suffix
@@ -16305,7 +16302,7 @@ fn build_coding_system_prompt_parts(
     }
 
     let mut dynamic = if config.sections.dynamic_repository_context {
-        truncate_text(&dynamic_context, MAX_REPOSITORY_CONTEXT_CHARS)
+        truncate_text(&dynamic_context, MAX_DYNAMIC_REPOSITORY_CONTEXT_CHARS)
     } else {
         String::new()
     };
@@ -16318,7 +16315,7 @@ fn build_coding_system_prompt_parts(
     (stable, dynamic)
 }
 
-fn read_repository_invariants(cwd: &Path, max_chars: usize) -> Option<String> {
+fn read_repository_invariants(cwd: &Path, max_chars: Option<usize>) -> Option<String> {
     let repo_root = discover_git_root(cwd);
     let context_root = repo_root.as_deref().unwrap_or(cwd);
     let path = context_root.join(REPOSITORY_INVARIANTS_FILE);
@@ -16327,7 +16324,10 @@ fn read_repository_invariants(cwd: &Path, max_chars: usize) -> Option<String> {
     if contents.is_empty() {
         return None;
     }
-    Some(truncate_repository_invariants(contents, max_chars))
+    Some(max_chars.map_or_else(
+        || contents.to_string(),
+        |max_chars| truncate_repository_invariants(contents, max_chars),
+    ))
 }
 
 fn truncate_repository_invariants(contents: &str, max_chars: usize) -> String {
@@ -16348,7 +16348,10 @@ fn truncate_repository_invariants(contents: &str, max_chars: usize) -> String {
     truncated
 }
 
-fn build_repository_context_parts(cwd: &Path) -> (String, String) {
+fn build_repository_context_parts(
+    cwd: &Path,
+    repository_instructions_max_chars: Option<usize>,
+) -> (String, String) {
     let repo_root = discover_git_root(cwd);
     let context_root = repo_root.as_deref().unwrap_or(cwd);
 
@@ -16357,7 +16360,9 @@ fn build_repository_context_parts(cwd: &Path) -> (String, String) {
         "* Detected project files: {}",
         detected_project_files(context_root).join(", ")
     ));
-    if let Some(instructions) = read_nearest_agent_instructions(cwd, context_root) {
+    if let Some(instructions) =
+        read_nearest_agent_instructions(cwd, context_root, repository_instructions_max_chars)
+    {
         stable_lines.push(format!("* Project instructions excerpt:\n{instructions}"));
     }
 
@@ -16427,12 +16432,16 @@ fn detected_project_files(root: &Path) -> Vec<String> {
     }
 }
 
-fn read_nearest_agent_instructions(cwd: &Path, stop_at: &Path) -> Option<String> {
+fn read_nearest_agent_instructions(
+    cwd: &Path,
+    stop_at: &Path,
+    max_chars: Option<usize>,
+) -> Option<String> {
     let mut current = Some(cwd);
     while let Some(directory) = current {
         let candidate = directory.join("AGENTS.md");
         if candidate.exists() {
-            return read_file_excerpt(&candidate, MAX_CONTEXT_FILE_CHARS);
+            return read_file_with_optional_limit(&candidate, max_chars);
         }
         if directory == stop_at {
             break;
@@ -16442,10 +16451,14 @@ fn read_nearest_agent_instructions(cwd: &Path, stop_at: &Path) -> Option<String>
     None
 }
 
-fn read_file_excerpt(path: &Path, max_chars: usize) -> Option<String> {
-    fs::read_to_string(path)
-        .ok()
-        .map(|text| truncate_text(text.trim(), max_chars))
+fn read_file_with_optional_limit(path: &Path, max_chars: Option<usize>) -> Option<String> {
+    fs::read_to_string(path).ok().map(|text| {
+        let text = text.trim();
+        max_chars.map_or_else(
+            || text.to_string(),
+            |max_chars| truncate_text(text, max_chars),
+        )
+    })
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {
@@ -19968,7 +19981,7 @@ fn session_events_to_sanitized_model_messages(
                     append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
                     messages.push(plain_context_message(format!(
                         "Historical assistant tool call omitted from structured tool protocol because its call id was duplicated. Call id: {tool_call_id}; tool: {tool_name}; arguments: {}",
-                        truncate_text(arguments_json, MAX_CONTEXT_FILE_CHARS),
+                        truncate_text(arguments_json, 6_000),
                     )));
                     continue;
                 }
@@ -19976,7 +19989,7 @@ fn session_events_to_sanitized_model_messages(
                     append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
                     messages.push(plain_context_message(format!(
                         "Historical assistant tool call omitted from structured tool protocol because its arguments were malformed or truncated. Call id: {tool_call_id}; tool: {tool_name}; raw arguments: {}",
-                        truncate_text(arguments_json, MAX_CONTEXT_FILE_CHARS),
+                        truncate_text(arguments_json, 6_000),
                     )));
                     continue;
                 };
@@ -23586,7 +23599,7 @@ async fn turn_skill_contexts(
     let Some(summary) = registry.summary(&skill_id) else {
         return Vec::new();
     };
-    let context = match registry.context(&skill_id, Some(state.skill_context_bytes)) {
+    let context = match registry.context(&skill_id, state.skill_context_bytes) {
         Ok(context) => context,
         Err(error) => {
             let _ = state
@@ -23611,7 +23624,9 @@ async fn turn_skill_contexts(
     };
     write!(context, "\n\nSkill invocation arguments:\n{arguments}").expect("write to string");
     let bytes_loaded = context.len();
-    let truncated = bytes_loaded >= state.skill_context_bytes;
+    let truncated = state
+        .skill_context_bytes
+        .is_some_and(|budget| bytes_loaded >= budget);
     let model_policy = registry
         .describe(&skill_id)
         .ok()
@@ -23642,7 +23657,7 @@ async fn active_skill_contexts(
         .unwrap_or_default();
     let per_skill_budget = state
         .skill_context_bytes
-        .checked_div(skill_ids.len().max(1));
+        .and_then(|budget| budget.checked_div(skill_ids.len().max(1)));
     let mut contexts = Vec::new();
     for skill_id in skill_ids {
         let Some(summary) = registry.summary(&skill_id) else {
@@ -31611,6 +31626,44 @@ library = "test"
     }
 
     #[test]
+    fn coding_system_prompt_preserves_complete_repository_files_by_default() {
+        let cwd = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf();
+        let agents = fs::read_to_string(cwd.join("AGENTS.md")).expect("AGENTS.md");
+        let invariants = fs::read_to_string(cwd.join("INVARIANTS.md")).expect("INVARIANTS.md");
+
+        let (stable, _) = build_coding_system_prompt_parts(
+            &cwd,
+            &bcode_config::SystemPromptConfig::default(),
+            None,
+            None,
+        );
+
+        assert!(stable.contains(agents.trim()));
+        assert!(stable.contains(invariants.trim()));
+        assert!(!stable.contains("[truncated]"));
+        assert!(!stable.contains("Repository invariants truncated"));
+    }
+
+    #[test]
+    fn coding_system_prompt_applies_explicit_repository_limits() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let config = bcode_config::SystemPromptConfig {
+            repository_instructions_max_chars: Some(200),
+            repository_invariants_max_chars: Some(300),
+            ..bcode_config::SystemPromptConfig::default()
+        };
+
+        let (stable, _) = build_coding_system_prompt_parts(&cwd, &config, None, None);
+
+        assert!(stable.contains("[truncated]"));
+        assert!(stable.contains("Repository invariants truncated"));
+    }
+
+    #[test]
     fn coding_system_prompt_includes_invariants_with_replacement_mode() {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let mut config = bcode_config::SystemPromptConfig {
@@ -36373,7 +36426,7 @@ library = "test"
                 model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
                 skills: None,
-                skill_context_bytes: 0,
+                skill_context_bytes: Some(0),
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
                 skill_model_policy: bcode_config::SkillModelPolicyConfig::default(),
                 system_prompt: bcode_config::SystemPromptConfig::default(),
@@ -43764,7 +43817,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
                 skills: None,
-                skill_context_bytes: 0,
+                skill_context_bytes: Some(0),
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
                 skill_model_policy: bcode_config::SkillModelPolicyConfig::default(),
                 system_prompt: bcode_config::SystemPromptConfig::default(),
@@ -44447,7 +44500,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
                 skills: None,
-                skill_context_bytes: 0,
+                skill_context_bytes: Some(0),
                 skill_prompt_options: SkillPromptCatalogOptions::default(),
                 skill_model_policy: bcode_config::SkillModelPolicyConfig::default(),
                 system_prompt: bcode_config::SystemPromptConfig::default(),

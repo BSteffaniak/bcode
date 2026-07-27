@@ -98,7 +98,7 @@ include_repo_skills = true
 include_generic_repo_skills = true
 include_user_skills = true
 include_compat_claude_skills = true
-max_context_bytes = 24000
+# max_context_bytes = 24000 # optional; omitted means unlimited
 max_skill_file_bytes = 262144
 max_resource_file_bytes = 1048576
 follow_symlinks = true
@@ -117,8 +117,8 @@ Bcode injects a compact skill catalog into dynamic system context by default. Th
 ```toml
 [skills.prompt]
 catalog = "summary" # off | names_only | summary
-max_bytes = 8192
-max_description_chars = 240
+# max_bytes = 8192 # optional; omitted means unlimited
+# max_description_chars = 240 # optional; omitted means unlimited
 include_sources = true
 include_keywords = false
 ```
@@ -129,7 +129,8 @@ Catalog behavior:
 * `names_only`: include IDs, names, and locations.
 * `summary`: include IDs, names, descriptions, locations, sources, and optionally keywords.
 * Skills with `disable_model_invocation = true` are omitted from the catalog.
-* Catalog output is byte-bounded and may include a truncation marker.
+* Skill context, catalog output, and catalog descriptions are untruncated by default. `skills.max_context_bytes`, `skills.prompt.max_bytes`, and `skills.prompt.max_description_chars` apply optional explicit limits.
+* Catalog output may include a truncation marker when `skills.prompt.max_bytes` is configured.
 
 The catalog uses an XML-style format similar to Pi/Agent Skills:
 
@@ -158,7 +159,8 @@ The base system prompt can be used as-is or replaced while still keeping selecte
 [system_prompt]
 mode = "default" # default | replace
 text = ""
-repository_invariants_max_chars = 16000
+# repository_instructions_max_chars = 6000 # optional; omitted means unlimited
+# repository_invariants_max_chars = 16000 # optional; omitted means unlimited
 
 [system_prompt.sections]
 repository_invariants = true
@@ -174,7 +176,7 @@ Behavior:
 * `mode = "replace"` uses `text` as the base prompt.
 * Enabled sections are appended to either base mode.
 * `system_prompt.sections.repository_invariants = true` loads root `INVARIANTS.md` into a dedicated stable prompt section independently of ordinary repository context. Replacement mode does not disable it.
-* `system_prompt.repository_invariants_max_chars` sets its independent character budget. Truncation is explicitly marked in model context.
+* Repository instructions and invariants are untruncated by default. Set `system_prompt.repository_instructions_max_chars` or `system_prompt.repository_invariants_max_chars` to apply independent character limits; configured invariant truncation is explicitly marked in model context.
 * `system_prompt.sections.skill_catalog = false` disables catalog injection even if `[skills.prompt]` is enabled.
 * `skills.enabled = false` disables skill discovery and therefore disables the skill catalog.
 * `skills.prompt.catalog = "off"` disables only the prompt catalog while keeping skills available elsewhere.
@@ -204,7 +206,7 @@ Version: 0.1.0
 </skill>
 ```
 
-The skill body is bounded by `skills.max_context_bytes`. Relative references should be resolved against the skill directory using available Bcode filesystem/document tools.
+By default the complete skill body is included. `skills.max_context_bytes` can apply an explicit bound. Relative references should be resolved against the skill directory using available Bcode filesystem/document tools.
 
 ### Suggestion
 
@@ -269,7 +271,7 @@ Flow:
 3. Match or list summaries without reading large bodies.
 4. Lazy-load full instructions only when a skill is activated or described.
 5. Inject only active/invoked skill contexts into model turns.
-6. Enforce `max_context_bytes` for active skill context.
+6. Enforce `max_context_bytes` for active skill context when explicitly configured.
 7. Include provenance in injected context and session events.
 
 ## Session events and TUI visibility

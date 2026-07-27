@@ -1094,9 +1094,14 @@ pub struct SystemPromptConfig {
     /// Replacement system prompt text when replacement mode is active.
     #[serde(default)]
     pub text: Option<String>,
-    /// Maximum characters loaded from a repository invariant catalog.
-    #[serde(default = "default_repository_invariants_max_chars")]
-    pub repository_invariants_max_chars: usize,
+    /// Optional maximum characters loaded from repository agent instructions.
+    /// Omitted values load the complete file.
+    #[serde(default)]
+    pub repository_instructions_max_chars: Option<usize>,
+    /// Optional maximum characters loaded from a repository invariant catalog.
+    /// Omitted values load the complete file.
+    #[serde(default)]
+    pub repository_invariants_max_chars: Option<usize>,
     /// Toggleable built-in system prompt sections.
     #[config_doc(nested)]
     #[serde(default)]
@@ -1108,14 +1113,11 @@ impl Default for SystemPromptConfig {
         Self {
             mode: SystemPromptMode::Default,
             text: None,
-            repository_invariants_max_chars: default_repository_invariants_max_chars(),
+            repository_instructions_max_chars: None,
+            repository_invariants_max_chars: None,
             sections: SystemPromptSectionsConfig::default(),
         }
     }
-}
-
-const fn default_repository_invariants_max_chars() -> usize {
-    16_000
 }
 
 /// Base system prompt mode.
@@ -1184,9 +1186,10 @@ pub struct SkillsConfig {
     /// Whether Claude-compatible skill layouts are discovered.
     #[serde(default = "default_true")]
     pub include_compat_claude_skills: bool,
-    /// Maximum bytes of skill context that may be included in prompts.
-    #[serde(default = "default_skill_context_bytes")]
-    pub max_context_bytes: usize,
+    /// Optional maximum bytes of skill context included in prompts.
+    /// Omitted values include complete skill instructions.
+    #[serde(default)]
+    pub max_context_bytes: Option<usize>,
     /// Maximum bytes read from a single skill definition file.
     #[serde(default = "default_skill_file_bytes")]
     pub max_skill_file_bytes: u64,
@@ -1223,7 +1226,7 @@ impl Default for SkillsConfig {
             include_generic_repo_skills: true,
             include_user_skills: true,
             include_compat_claude_skills: true,
-            max_context_bytes: default_skill_context_bytes(),
+            max_context_bytes: None,
             max_skill_file_bytes: default_skill_file_bytes(),
             max_resource_file_bytes: default_skill_resource_file_bytes(),
             follow_symlinks: true,
@@ -1332,12 +1335,14 @@ pub struct SkillPromptConfig {
     /// Catalog rendering mode.
     #[serde(default)]
     pub catalog: SkillPromptCatalogMode,
-    /// Maximum skill catalog bytes included in prompts.
-    #[serde(default = "default_skill_prompt_catalog_bytes")]
-    pub max_bytes: usize,
-    /// Maximum skill description characters included in prompts.
-    #[serde(default = "default_skill_prompt_description_chars")]
-    pub max_description_chars: usize,
+    /// Optional maximum skill catalog bytes included in prompts.
+    /// Omitted values include the complete catalog.
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+    /// Optional maximum skill description characters included in prompts.
+    /// Omitted values include complete descriptions.
+    #[serde(default)]
+    pub max_description_chars: Option<usize>,
     /// Whether skill source paths are included in the prompt catalog.
     #[serde(default = "default_true")]
     pub include_sources: bool,
@@ -1350,8 +1355,8 @@ impl Default for SkillPromptConfig {
     fn default() -> Self {
         Self {
             catalog: SkillPromptCatalogMode::Summary,
-            max_bytes: default_skill_prompt_catalog_bytes(),
-            max_description_chars: default_skill_prompt_description_chars(),
+            max_bytes: None,
+            max_description_chars: None,
             include_sources: true,
             include_keywords: false,
         }
@@ -1366,14 +1371,6 @@ pub enum SkillPromptCatalogMode {
     NamesOnly,
     #[default]
     Summary,
-}
-
-const fn default_skill_prompt_catalog_bytes() -> usize {
-    8 * 1024
-}
-
-const fn default_skill_prompt_description_chars() -> usize {
-    240
 }
 
 /// Additional skill source paths.
@@ -1392,10 +1389,6 @@ pub struct DisabledSkillsConfig {
     /// Skill IDs disabled by configuration.
     #[serde(default)]
     pub ids: BTreeSet<String>,
-}
-
-const fn default_skill_context_bytes() -> usize {
-    24 * 1024
 }
 
 const fn default_skill_file_bytes() -> u64 {
@@ -4837,13 +4830,12 @@ fn write_system_prompt_toml(output: &mut String, system_prompt: &SystemPromptCon
     if let Some(text) = &system_prompt.text {
         writeln!(output, "text = {}", toml_string(text)).expect("write to string");
     }
-    if system_prompt.repository_invariants_max_chars != default_repository_invariants_max_chars() {
-        writeln!(
-            output,
-            "repository_invariants_max_chars = {}",
-            system_prompt.repository_invariants_max_chars
-        )
-        .expect("write to string");
+    if let Some(max_chars) = system_prompt.repository_instructions_max_chars {
+        writeln!(output, "repository_instructions_max_chars = {max_chars}")
+            .expect("write to string");
+    }
+    if let Some(max_chars) = system_prompt.repository_invariants_max_chars {
+        writeln!(output, "repository_invariants_max_chars = {max_chars}").expect("write to string");
     }
     output.push('\n');
     if system_prompt.sections != SystemPromptSectionsConfig::default() {
@@ -5177,9 +5169,8 @@ fn write_skills_toml(output: &mut String, skills: &SkillsConfig) {
     if !skills.include_compat_claude_skills {
         output.push_str("include_compat_claude_skills = false\n");
     }
-    if skills.max_context_bytes != default_skill_context_bytes() {
-        writeln!(output, "max_context_bytes = {}", skills.max_context_bytes)
-            .expect("write to string");
+    if let Some(max_context_bytes) = skills.max_context_bytes {
+        writeln!(output, "max_context_bytes = {max_context_bytes}").expect("write to string");
     }
     if skills.max_skill_file_bytes != default_skill_file_bytes() {
         writeln!(
@@ -5212,16 +5203,12 @@ fn write_skills_toml(output: &mut String, skills: &SkillsConfig) {
             )
             .expect("write to string");
         }
-        if skills.prompt.max_bytes != default_skill_prompt_catalog_bytes() {
-            writeln!(output, "max_bytes = {}", skills.prompt.max_bytes).expect("write to string");
+        if let Some(max_bytes) = skills.prompt.max_bytes {
+            writeln!(output, "max_bytes = {max_bytes}").expect("write to string");
         }
-        if skills.prompt.max_description_chars != default_skill_prompt_description_chars() {
-            writeln!(
-                output,
-                "max_description_chars = {}",
-                skills.prompt.max_description_chars
-            )
-            .expect("write to string");
+        if let Some(max_description_chars) = skills.prompt.max_description_chars {
+            writeln!(output, "max_description_chars = {max_description_chars}")
+                .expect("write to string");
         }
         if !skills.prompt.include_sources {
             output.push_str("include_sources = false\n");
@@ -6794,11 +6781,16 @@ disabled = ["vim_edit.apply"]
     #[test]
     fn config_to_toml_writes_repository_invariant_prompt_settings() {
         let mut config = BcodeConfig::default();
-        config.system_prompt.repository_invariants_max_chars = 8_000;
+        config.system_prompt.repository_instructions_max_chars = Some(6_000);
+        config.system_prompt.repository_invariants_max_chars = Some(8_000);
         config.system_prompt.sections.repository_invariants = false;
 
         let rendered = super::config_to_toml(&config);
 
+        assert!(
+            rendered.contains("repository_instructions_max_chars = 6000"),
+            "{rendered}"
+        );
         assert!(
             rendered.contains("repository_invariants_max_chars = 8000"),
             "{rendered}"
@@ -6809,7 +6801,14 @@ disabled = ["vim_edit.apply"]
         );
 
         let parsed: BcodeConfig = toml::from_str(&rendered).expect("rendered config parses");
-        assert_eq!(parsed.system_prompt.repository_invariants_max_chars, 8_000);
+        assert_eq!(
+            parsed.system_prompt.repository_instructions_max_chars,
+            Some(6_000)
+        );
+        assert_eq!(
+            parsed.system_prompt.repository_invariants_max_chars,
+            Some(8_000)
+        );
         assert!(!parsed.system_prompt.sections.repository_invariants);
     }
 
