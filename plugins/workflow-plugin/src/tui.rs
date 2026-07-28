@@ -10,6 +10,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::style::{Color, Style};
 use bmux_tui::text::Line;
+use std::fmt::Write as _;
 
 pub const WORKFLOW_STATUS_SURFACE_KIND: &str = "workflow.status";
 pub const WORKFLOW_AUTHOR_SURFACE_KIND: &str = "workflow.author";
@@ -516,7 +517,36 @@ fn append_graph(lines: &mut Vec<String>, stored: &serde_json::Value) {
     ));
     if let Some(nodes) = nodes {
         for (id, node) in nodes {
-            lines.push(format!("  [{id}] {}", text(node, "kind")));
+            let mut line = format!("  [{id}] {}", text(node, "kind"));
+            if text(node, "kind") == "agent"
+                && let Some(configuration) = node.get("configuration")
+            {
+                let skills = configuration
+                    .get("skills")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or_else(
+                        || "-".to_string(),
+                        |skills| {
+                            skills
+                                .iter()
+                                .map(|skill| {
+                                    format!("{}:{}", text(skill, "skill_id"), text(skill, "mode"))
+                                })
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        },
+                    );
+                write!(
+                    line,
+                    " · target={} · profile={} · provider={} · model={} · skills={skills}",
+                    text(configuration, "execution_target"),
+                    text(configuration, "agent_profile"),
+                    text(configuration, "provider"),
+                    text(configuration, "model")
+                )
+                .expect("writing to String cannot fail");
+            }
+            lines.push(line);
         }
     }
     if let Some(edges) = edges {
@@ -636,7 +666,19 @@ mod tests {
     #[test]
     fn status_lines_render_daemon_backed_sections() {
         let definition = serde_json::json!({
-            "nodes": {"review": {"kind": "agent"}, "approve": {"kind": "approval"}},
+            "nodes": {
+                "review": {
+                    "kind": "agent",
+                    "configuration": {
+                        "execution_target": "fresh_isolated",
+                        "agent_profile": "review",
+                        "provider": "bcode.fake-provider",
+                        "model": "fake-review",
+                        "skills": [{"skill_id": "code-review", "mode": "required"}]
+                    }
+                },
+                "approve": {"kind": "approval"}
+            },
             "edges": [{"from": "review", "to": "approve", "kind": "direct"}],
         });
         let lines = surface_lines(
@@ -674,6 +716,9 @@ mod tests {
         assert!(rendered.contains("code_review.bundle v1 · bcode.code_review"));
         assert!(rendered.contains("Run run-1 · running · review v2"));
         assert!(rendered.contains("Graph (2 nodes, 1 edges)"));
+        assert!(rendered.contains("target=fresh_isolated · profile=review"));
+        assert!(rendered.contains("provider=bcode.fake-provider · model=fake-review"));
+        assert!(rendered.contains("skills=code-review:required"));
         assert!(rendered.contains("review -> approve · direct"));
         assert!(rendered.contains("Waits (1)"));
         assert!(rendered.contains("Mutation approvals (1)"));
