@@ -14,6 +14,20 @@ use std::sync::RwLock;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 const SESSION_DATABASE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const MAX_ACTIVE_TEXT_STREAM_KEYS: usize = 32;
+const MAX_ACTIVE_TEXT_STREAM_BYTES_PER_KEY: usize = 256 * 1024;
+const MAX_ACTIVE_TEXT_STREAM_BYTES_PER_SESSION: usize = 1024 * 1024;
+
+fn bounded_text_suffix(text: &str, max_bytes: usize) -> (&str, usize) {
+    if text.len() <= max_bytes {
+        return (text, 0);
+    }
+    let mut start = text.len().saturating_sub(max_bytes);
+    while !text.is_char_boundary(start) {
+        start = start.saturating_add(1);
+    }
+    (&text[start..], start)
+}
 
 const fn append_rejection_metric(error: &SessionDbError) -> &'static str {
     match error {
@@ -1119,6 +1133,7 @@ impl SessionActor {
             session,
             history,
             input_history,
+            live_checkpoints: self.state.live_text_checkpoints.values().cloned().collect(),
             events,
             live_events: self.state.live_events.subscribe(),
         })
@@ -1439,13 +1454,137 @@ impl SessionActor {
         self.refresh_snapshot();
     }
 
-    fn publish_live_event(&self, kind: SessionLiveEventKind) -> Option<SessionLiveEvent> {
+    fn publish_live_event(&mut self, kind: SessionLiveEventKind) -> Option<SessionLiveEvent> {
+        self.update_live_text_checkpoint(&kind);
         let event = SessionLiveEvent {
             session_id: self.state.summary.id,
             kind,
         };
         self.state.live_events.publish(event)
     }
+
+    fn update_live_text_checkpoint(&mut self, kind: &SessionLiveEventKind) {
+        use bcode_session_models::{TextStreamOperation, TextStreamUpdate};
+        let SessionLiveEventKind::AssistantTextStreamUpdated {
+            turn_id,
+            segment_id,
+            segment_order,
+            update,
+        } = kind
+        else {
+            return;
+        };
+        let key = (turn_id.clone(), segment_id.clone());
+        if matches!(update.operation, TextStreamOperation::Terminal { .. }) {
+            self.state.live_text_checkpoints.remove(&key);
+            self.state
+                .live_text_checkpoint_order
+                .retain(|item| item != &key);
+            return;
+        }
+        let (mut text, mut start_offset, mut total_bytes, mut truncated) = match self
+            .state
+            .live_text_checkpoints
+            .get(&key)
+            .map(|event| &event.kind)
+        {
+            Some(SessionLiveEventKind::AssistantTextStreamUpdated {
+                update:
+                    TextStreamUpdate {
+                        operation:
+                            TextStreamOperation::Checkpoint {
+                                start_offset,
+                                text,
+                                total_bytes,
+                                truncated,
+                            },
+                        ..
+                    },
+                ..
+            }) => (text.clone(), *start_offset, *total_bytes, *truncated),
+            _ => (String::new(), 0, 0, false),
+        };
+        match &update.operation {
+            TextStreamOperation::Append {
+                expected_offset,
+                text: appended,
+            } if *expected_offset == total_bytes => {
+                text.push_str(appended);
+                total_bytes = total_bytes.saturating_add(appended.len());
+            }
+            TextStreamOperation::Checkpoint {
+                start_offset: checkpoint_start,
+                text: checkpoint_text,
+                total_bytes: checkpoint_total,
+                truncated: checkpoint_truncated,
+            } => {
+                text.clone_from(checkpoint_text);
+                start_offset = *checkpoint_start;
+                total_bytes = *checkpoint_total;
+                truncated = *checkpoint_truncated;
+            }
+            _ => return,
+        }
+        let (retained, omitted) = bounded_text_suffix(&text, MAX_ACTIVE_TEXT_STREAM_BYTES_PER_KEY);
+        start_offset = start_offset.saturating_add(omitted);
+        truncated |= omitted != 0;
+        let checkpoint = SessionLiveEvent {
+            session_id: self.state.summary.id,
+            kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                turn_id: turn_id.clone(),
+                segment_id: segment_id.clone(),
+                segment_order: *segment_order,
+                update: TextStreamUpdate {
+                    generation: update.generation,
+                    revision: update.revision,
+                    operation: TextStreamOperation::Checkpoint {
+                        start_offset,
+                        text: retained.to_owned(),
+                        total_bytes,
+                        truncated,
+                    },
+                },
+            },
+        };
+        if !self.state.live_text_checkpoints.contains_key(&key) {
+            self.state.live_text_checkpoint_order.push(key.clone());
+        }
+        self.state.live_text_checkpoints.insert(key, checkpoint);
+        self.enforce_live_text_checkpoint_bounds();
+    }
+
+    fn enforce_live_text_checkpoint_bounds(&mut self) {
+        while self.state.live_text_checkpoints.len() > MAX_ACTIVE_TEXT_STREAM_KEYS
+            || live_text_checkpoint_bytes(&self.state.live_text_checkpoints)
+                > MAX_ACTIVE_TEXT_STREAM_BYTES_PER_SESSION
+        {
+            let Some(oldest) = self.state.live_text_checkpoint_order.first().cloned() else {
+                break;
+            };
+            self.state.live_text_checkpoint_order.remove(0);
+            self.state.live_text_checkpoints.remove(&oldest);
+        }
+    }
+}
+
+fn live_text_checkpoint_bytes(
+    checkpoints: &std::collections::BTreeMap<(String, String), SessionLiveEvent>,
+) -> usize {
+    checkpoints
+        .values()
+        .filter_map(|event| match &event.kind {
+            SessionLiveEventKind::AssistantTextStreamUpdated {
+                update:
+                    bcode_session_models::TextStreamUpdate {
+                        operation:
+                            bcode_session_models::TextStreamOperation::Checkpoint { text, .. },
+                        ..
+                    },
+                ..
+            } => Some(text.len()),
+            _ => None,
+        })
+        .sum()
 }
 
 fn select_event_range_from_events(

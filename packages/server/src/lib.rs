@@ -12294,6 +12294,8 @@ struct ModelStreamAccumulator {
     segment_order: u32,
     assistant_text: String,
     pending_text: String,
+    pending_text_offset: usize,
+    next_text_revision: u64,
     pending_legacy_reasoning: String,
     last_flush: Instant,
     cancel_state: Arc<TurnCancelState>,
@@ -12313,6 +12315,8 @@ impl ModelStreamAccumulator {
             segment_order,
             assistant_text: String::new(),
             pending_text: String::new(),
+            pending_text_offset: 0,
+            next_text_revision: 1,
             pending_legacy_reasoning: String::new(),
             last_flush: Instant::now(),
             cancel_state,
@@ -12354,18 +12358,29 @@ impl ModelStreamAccumulator {
         }
         let text = std::mem::take(&mut self.pending_text);
         if !text.is_empty() {
+            let text_bytes = text.len();
+            let revision = self.next_text_revision;
             let _ = state
                 .sessions
                 .publish_live_event(
                     self.session_id,
-                    SessionLiveEventKind::AssistantTextDelta {
+                    SessionLiveEventKind::AssistantTextStreamUpdated {
                         turn_id: self.turn_id.clone(),
                         segment_id: self.segment_id.clone(),
                         segment_order: self.segment_order,
-                        text,
+                        update: bcode_session_models::TextStreamUpdate {
+                            generation: 0,
+                            revision,
+                            operation: bcode_session_models::TextStreamOperation::Append {
+                                expected_offset: self.pending_text_offset,
+                                text,
+                            },
+                        },
                     },
                 )
                 .await;
+            self.pending_text_offset = self.pending_text_offset.saturating_add(text_bytes);
+            self.next_text_revision = revision.saturating_add(1);
         }
         let reasoning = std::mem::take(&mut self.pending_legacy_reasoning);
         if !reasoning.is_empty() {
@@ -12395,6 +12410,8 @@ impl ModelStreamAccumulator {
     fn advance_segment(&mut self, segment_order: u32) {
         self.segment_order = segment_order;
         self.segment_id = format!("segment-{segment_order}");
+        self.pending_text_offset = 0;
+        self.next_text_revision = 1;
     }
 
     fn finish(self) -> Option<AssistantSegmentOutput> {
@@ -23811,6 +23828,11 @@ enum PendingLiveEventKey {
         tool_call_id: String,
         generation: u64,
     },
+    AssistantText {
+        turn_id: String,
+        segment_id: String,
+        generation: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -23990,6 +24012,22 @@ fn pending_live_event_key(
                 identity: update.identity.clone(),
             })
         }
+        SessionLiveEventKind::AssistantTextStreamUpdated {
+            turn_id,
+            segment_id,
+            update,
+            ..
+        } if !matches!(
+            update.operation,
+            bcode_session_models::TextStreamOperation::Terminal { .. }
+        ) =>
+        {
+            Some(PendingLiveEventKey::AssistantText {
+                turn_id: turn_id.clone(),
+                segment_id: segment_id.clone(),
+                generation: update.generation,
+            })
+        }
         SessionLiveEventKind::ToolRequestDraft { event }
             if !matches!(
                 event.operation,
@@ -24016,6 +24054,48 @@ fn merge_pending_live_event(
     pending: &bcode_session_models::SessionLiveEvent,
     next: &bcode_session_models::SessionLiveEvent,
 ) -> MergePendingLiveEvent {
+    if let (
+        SessionLiveEventKind::AssistantTextStreamUpdated {
+            update: pending_update,
+            ..
+        },
+        SessionLiveEventKind::AssistantTextStreamUpdated {
+            update: next_update,
+            ..
+        },
+    ) = (&pending.kind, &next.kind)
+    {
+        let bcode_session_models::TextStreamOperation::Append {
+            expected_offset: pending_offset,
+            text: pending_text,
+        } = &pending_update.operation
+        else {
+            return MergePendingLiveEvent::Replace;
+        };
+        let bcode_session_models::TextStreamOperation::Append {
+            expected_offset: next_offset,
+            text: next_text,
+        } = &next_update.operation
+        else {
+            return MergePendingLiveEvent::Replace;
+        };
+        if pending_update.revision.saturating_add(1) != next_update.revision
+            || pending_offset.saturating_add(pending_text.len()) != *next_offset
+        {
+            return MergePendingLiveEvent::Gap;
+        }
+        let mut merged = next.clone();
+        let SessionLiveEventKind::AssistantTextStreamUpdated { update, .. } = &mut merged.kind
+        else {
+            unreachable!("cloned assistant stream update changed kind");
+        };
+        update.operation = bcode_session_models::TextStreamOperation::Append {
+            expected_offset: *pending_offset,
+            text: format!("{pending_text}{next_text}"),
+        };
+        return MergePendingLiveEvent::Merged(Box::new(merged));
+    }
+
     let SessionLiveEventKind::ToolRequestDraft {
         event: pending_draft,
     } = &pending.kind

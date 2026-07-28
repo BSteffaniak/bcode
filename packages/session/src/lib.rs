@@ -1323,6 +1323,8 @@ impl SessionManager {
             load_status: SessionLoadStatusKind::Current,
             sender,
             live_events,
+            live_text_checkpoints: BTreeMap::new(),
+            live_text_checkpoint_order: Vec::new(),
         };
         let lease = self
             .store

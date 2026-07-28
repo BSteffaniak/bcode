@@ -11,6 +11,7 @@ pub struct SessionAttachment {
     pub session: SessionSummary,
     pub history: Vec<SessionEvent>,
     pub input_history: Vec<SessionInputHistoryEntry>,
+    pub live_checkpoints: Vec<SessionLiveEvent>,
     pub events: broadcast::Receiver<SessionEvent>,
     pub live_events: broadcast::Receiver<SessionLiveEvent>,
 }

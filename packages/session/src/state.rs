@@ -44,6 +44,8 @@ pub struct SessionState {
     pub(crate) load_status: SessionLoadStatusKind,
     pub(crate) sender: broadcast::Sender<SessionEvent>,
     pub(crate) live_events: SessionLiveEventBroker,
+    pub(crate) live_text_checkpoints: BTreeMap<(String, String), SessionLiveEvent>,
+    pub(crate) live_text_checkpoint_order: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +106,8 @@ impl SessionState {
             load_status: SessionLoadStatusKind::SummaryOnly,
             sender,
             live_events,
+            live_text_checkpoints: BTreeMap::new(),
+            live_text_checkpoint_order: Vec::new(),
         }
     }
 
@@ -160,6 +164,8 @@ impl SessionState {
             load_status: SessionLoadStatusKind::Current,
             sender,
             live_events,
+            live_text_checkpoints: BTreeMap::new(),
+            live_text_checkpoint_order: Vec::new(),
         }
     }
 

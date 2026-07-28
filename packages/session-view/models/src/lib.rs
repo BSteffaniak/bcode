@@ -219,6 +219,9 @@ pub struct SessionViewSnapshot {
     pub notice: Option<SessionViewNotice>,
     /// Renderer-neutral transcript items.
     pub transcript: TranscriptViewDocument,
+    /// Renderer-neutral integrity state for active ordered text streams.
+    #[serde(default)]
+    pub text_streams: BTreeMap<TranscriptViewItemId, TextStreamViewState>,
     /// Active opaque contributions keyed by invocation and contribution identity.
     #[serde(default)]
     pub contributions: BTreeMap<String, bcode_session_models::ToolContributionEvent>,
@@ -271,6 +274,7 @@ impl SessionViewSnapshot {
             catalog_status: SessionCatalogViewStatus::default(),
             notice: None,
             transcript: TranscriptViewDocument::default(),
+            text_streams: BTreeMap::new(),
             contributions: BTreeMap::new(),
             active_exchanges: BTreeMap::new(),
             active_invocations: BTreeMap::new(),
@@ -842,6 +846,33 @@ fn transcript_items_are_incrementally_compatible(
         }
     }
     true
+}
+
+/// Renderer-neutral integrity state for an ordered live text stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextStreamViewState {
+    /// Current stream generation.
+    pub generation: u64,
+    /// Last accepted operation revision.
+    pub revision: u64,
+    /// Total contiguous source bytes represented when healthy.
+    pub accepted_bytes: usize,
+    /// Whether retained text omits an earlier prefix.
+    pub truncated: bool,
+    /// Current reducer health/lifecycle.
+    pub status: TextStreamViewStatus,
+}
+
+/// Ordered live text stream reducer status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextStreamViewStatus {
+    /// All accepted operations are contiguous and current.
+    Healthy,
+    /// A gap or conflicting duplicate requires authoritative resync.
+    Degraded,
+    /// The stream reached an absorbing terminal state.
+    Terminal(bcode_session_models::TextStreamTerminalStatus),
 }
 
 /// Renderer-neutral transcript item.

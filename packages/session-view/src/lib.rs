@@ -18,9 +18,9 @@ use bcode_session_models::{
 use bcode_session_view_models::{
     ChatMessageView, CompactionView, CompactionViewStatus, ComposerViewState,
     InteractionViewSummary, PluginStatusView, ProviderProgressView, SessionViewSnapshot, SkillView,
-    SkillViewStatus, TextFormat, ThinkingViewState, ToolInvocationView, ToolInvocationViewStatus,
-    ToolRequestDraftView, ToolResultView, ToolTimingView, TranscriptViewItem, TranscriptViewItemId,
-    TranscriptViewItemKind,
+    SkillViewStatus, TextFormat, TextStreamViewState, TextStreamViewStatus, ThinkingViewState,
+    ToolInvocationView, ToolInvocationViewStatus, ToolRequestDraftView, ToolResultView,
+    ToolTimingView, TranscriptViewItem, TranscriptViewItemId, TranscriptViewItemKind,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -133,6 +133,8 @@ pub struct SessionView {
     contribution_placements: BTreeMap<String, bcode_session_models::ToolContributionPlacement>,
     terminal_runtime_work: BTreeSet<bcode_session_models::WorkId>,
     live_reasoning: BTreeMap<(String, String), LiveReasoningActivity>,
+    last_text_stream_updates:
+        BTreeMap<TranscriptViewItemId, bcode_session_models::TextStreamUpdate>,
 }
 
 impl Default for SessionView {
@@ -154,6 +156,7 @@ impl SessionView {
             contribution_placements: BTreeMap::new(),
             terminal_runtime_work: BTreeSet::new(),
             live_reasoning: BTreeMap::new(),
+            last_text_stream_updates: BTreeMap::new(),
         }
     }
 
@@ -721,15 +724,38 @@ impl SessionView {
                 text,
                 ..
             } => {
+                let id = TranscriptViewItemId::new(format!(
+                    "assistant-turn:{turn_id}:segment:{segment_id}"
+                ));
                 self.finish_or_push_message(
-                    TranscriptViewItemId::new(format!(
-                        "assistant-turn:{turn_id}:segment:{segment_id}"
-                    )),
+                    id.clone(),
                     event.sequence,
                     Some(event.timestamp_ms),
                     StreamingMessageKind::Assistant,
                     text,
                 );
+                let accepted_bytes = text.len();
+                self.snapshot.text_streams.insert(
+                    id.clone(),
+                    TextStreamViewState {
+                        generation: self
+                            .snapshot
+                            .text_streams
+                            .get(&id)
+                            .map_or(0, |state| state.generation),
+                        revision: self
+                            .snapshot
+                            .text_streams
+                            .get(&id)
+                            .map_or(0, |state| state.revision.saturating_add(1)),
+                        accepted_bytes,
+                        truncated: false,
+                        status: TextStreamViewStatus::Terminal(
+                            bcode_session_models::TextStreamTerminalStatus::Completed,
+                        ),
+                    },
+                );
+                self.last_text_stream_updates.remove(&id);
             }
             SessionEventKind::AssistantReasoningDelta { text } => {
                 self.snapshot.thinking = ThinkingViewState {
@@ -1511,6 +1537,17 @@ impl SessionView {
     pub fn apply_live_event(&mut self, event: &SessionLiveEvent) {
         self.snapshot.session_id = Some(event.session_id);
         match &event.kind {
+            SessionLiveEventKind::AssistantTextStreamUpdated {
+                turn_id,
+                segment_id,
+                update,
+                ..
+            } => {
+                let id = TranscriptViewItemId::new(format!(
+                    "assistant-turn:{turn_id}:segment:{segment_id}"
+                ));
+                self.apply_ordered_assistant_update(id, update);
+            }
             SessionLiveEventKind::AssistantTextDelta {
                 turn_id,
                 segment_id,
@@ -2699,6 +2736,174 @@ impl SessionView {
         }
     }
 
+    fn apply_ordered_assistant_update(
+        &mut self,
+        id: TranscriptViewItemId,
+        update: &bcode_session_models::TextStreamUpdate,
+    ) {
+        use bcode_session_models::TextStreamOperation;
+
+        let existing = self.snapshot.text_streams.get(&id).cloned();
+        if existing.as_ref().is_some_and(|state| {
+            matches!(state.status, TextStreamViewStatus::Terminal(_))
+                || update.generation < state.generation
+        }) {
+            return;
+        }
+        if existing
+            .as_ref()
+            .is_some_and(|state| update.generation > state.generation)
+        {
+            self.remove_transcript_item(&id);
+            self.snapshot.text_streams.remove(&id);
+        }
+        let state = self
+            .snapshot
+            .text_streams
+            .entry(id.clone())
+            .or_insert(TextStreamViewState {
+                generation: update.generation,
+                revision: 0,
+                accepted_bytes: 0,
+                truncated: false,
+                status: TextStreamViewStatus::Healthy,
+            });
+        if update.revision < state.revision {
+            return;
+        }
+        if update.revision == state.revision {
+            if self.last_text_stream_updates.get(&id) != Some(update) {
+                state.status = TextStreamViewStatus::Degraded;
+                self.bump_revision();
+            }
+            return;
+        }
+        let is_checkpoint = matches!(update.operation, TextStreamOperation::Checkpoint { .. });
+        if !is_checkpoint && update.revision != state.revision.saturating_add(1) {
+            state.status = TextStreamViewStatus::Degraded;
+            self.bump_revision();
+            return;
+        }
+
+        match &update.operation {
+            TextStreamOperation::Append {
+                expected_offset,
+                text,
+            } => {
+                if state.status != TextStreamViewStatus::Healthy
+                    || state.accepted_bytes != *expected_offset
+                {
+                    state.status = TextStreamViewStatus::Degraded;
+                    self.bump_revision();
+                    return;
+                }
+                state.revision = update.revision;
+                state.accepted_bytes = state.accepted_bytes.saturating_add(text.len());
+                self.last_text_stream_updates
+                    .insert(id.clone(), update.clone());
+                self.push_or_append_streaming_message_by_id(
+                    id,
+                    StreamingMessageKind::Assistant,
+                    text,
+                );
+            }
+            TextStreamOperation::Checkpoint {
+                start_offset,
+                text,
+                total_bytes,
+                truncated,
+            } => {
+                if start_offset.saturating_add(text.len()) > *total_bytes {
+                    state.status = TextStreamViewStatus::Degraded;
+                    self.bump_revision();
+                    return;
+                }
+                state.generation = update.generation;
+                state.revision = update.revision;
+                state.accepted_bytes = *total_bytes;
+                state.truncated = *truncated || *start_offset != 0;
+                state.status = TextStreamViewStatus::Healthy;
+                self.last_text_stream_updates
+                    .insert(id.clone(), update.clone());
+                self.replace_streaming_message_by_id(id, text);
+            }
+            TextStreamOperation::Terminal { status } => {
+                state.revision = update.revision;
+                state.status = TextStreamViewStatus::Terminal(*status);
+                self.last_text_stream_updates
+                    .insert(id.clone(), update.clone());
+                if let Some(item) = self
+                    .snapshot
+                    .transcript
+                    .items
+                    .iter_mut()
+                    .find(|item| item.id == id)
+                {
+                    item.streaming = false;
+                    item.revision = item.revision.saturating_add(1);
+                    self.snapshot.transcript.revision =
+                        self.snapshot.transcript.revision.saturating_add(1);
+                }
+                self.bump_revision();
+            }
+        }
+    }
+
+    fn push_or_append_streaming_message_by_id(
+        &mut self,
+        id: TranscriptViewItemId,
+        kind: StreamingMessageKind,
+        text: &str,
+    ) {
+        if let Some(item) = self
+            .snapshot
+            .transcript
+            .items
+            .iter_mut()
+            .find(|item| item.id == id)
+        {
+            append_text_to_item(item, text);
+            item.revision = item.revision.saturating_add(1);
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+            return;
+        }
+        self.push_item(id, 0, None, true, kind.item_kind(text.to_owned()));
+    }
+
+    fn replace_streaming_message_by_id(&mut self, id: TranscriptViewItemId, text: &str) {
+        if let Some(item) = self
+            .snapshot
+            .transcript
+            .items
+            .iter_mut()
+            .find(|item| item.id == id)
+        {
+            let _ = replace_text_in_item(item, text);
+            item.streaming = true;
+            item.revision = item.revision.saturating_add(1);
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+            return;
+        }
+        self.push_item(
+            id,
+            0,
+            None,
+            true,
+            StreamingMessageKind::Assistant.item_kind(text.to_owned()),
+        );
+    }
+
+    fn remove_transcript_item(&mut self, id: &TranscriptViewItemId) {
+        let before = self.snapshot.transcript.items.len();
+        self.snapshot.transcript.items.retain(|item| item.id != *id);
+        if self.snapshot.transcript.items.len() != before {
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+        }
+    }
+
     fn push_or_append_streaming_message(
         &mut self,
         id: TranscriptViewItemId,
@@ -3272,6 +3477,21 @@ mod tests {
             provenance: None,
             kind,
         }
+    }
+
+    fn transcript_item_text<'a>(
+        snapshot: &'a SessionViewSnapshot,
+        id: &TranscriptViewItemId,
+    ) -> Option<&'a str> {
+        snapshot
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.id == *id)
+            .and_then(|item| match &item.kind {
+                TranscriptViewItemKind::AssistantMessage { message } => Some(message.text.as_str()),
+                _ => None,
+            })
     }
 
     fn assert_reasoning_text(item: &TranscriptViewItem, text: &str, streaming: bool) {
@@ -7778,6 +7998,126 @@ mod tests {
                     if item == &contribution
             )
         }));
+    }
+
+    #[test]
+    fn ordered_assistant_stream_validates_offsets_duplicates_checkpoints_and_terminal_state() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let update = |revision, operation| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                update: bcode_session_models::TextStreamUpdate {
+                    generation: 0,
+                    revision,
+                    operation,
+                },
+            },
+        };
+        let append = |revision, expected_offset, text: &str| {
+            update(
+                revision,
+                bcode_session_models::TextStreamOperation::Append {
+                    expected_offset,
+                    text: text.to_owned(),
+                },
+            )
+        };
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-0");
+
+        view.apply_live_event(&append(1, 0, "abc"));
+        view.apply_live_event(&append(2, 3, "def"));
+        view.apply_live_event(&append(2, 3, "def"));
+        assert_eq!(transcript_item_text(view.snapshot(), &id), Some("abcdef"));
+        assert_eq!(
+            view.snapshot().text_streams[&id].status,
+            TextStreamViewStatus::Healthy
+        );
+
+        view.apply_live_event(&append(2, 3, "conflict"));
+        assert_eq!(transcript_item_text(view.snapshot(), &id), Some("abcdef"));
+        assert_eq!(
+            view.snapshot().text_streams[&id].status,
+            TextStreamViewStatus::Degraded
+        );
+
+        view.apply_live_event(&append(4, 6, "gap"));
+        assert_eq!(transcript_item_text(view.snapshot(), &id), Some("abcdef"));
+        view.apply_live_event(&update(
+            5,
+            bcode_session_models::TextStreamOperation::Checkpoint {
+                start_offset: 0,
+                text: "authoritative".to_owned(),
+                total_bytes: 13,
+                truncated: false,
+            },
+        ));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("authoritative")
+        );
+        assert_eq!(
+            view.snapshot().text_streams[&id].status,
+            TextStreamViewStatus::Healthy
+        );
+
+        view.apply_live_event(&update(
+            6,
+            bcode_session_models::TextStreamOperation::Terminal {
+                status: bcode_session_models::TextStreamTerminalStatus::Cancelled,
+            },
+        ));
+        view.apply_live_event(&append(7, 13, "late"));
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("authoritative")
+        );
+        assert_eq!(
+            view.snapshot().text_streams[&id].status,
+            TextStreamViewStatus::Terminal(
+                bcode_session_models::TextStreamTerminalStatus::Cancelled
+            )
+        );
+    }
+
+    #[test]
+    fn ordered_assistant_stream_targets_exact_segment_identity() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        for (segment_order, text) in [(0, "before"), (1, "after")] {
+            view.apply_live_event(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                    turn_id: "turn-1".to_owned(),
+                    segment_id: format!("segment-{segment_order}"),
+                    segment_order,
+                    update: bcode_session_models::TextStreamUpdate {
+                        generation: 0,
+                        revision: 1,
+                        operation: bcode_session_models::TextStreamOperation::Append {
+                            expected_offset: 0,
+                            text: text.to_owned(),
+                        },
+                    },
+                },
+            });
+        }
+
+        let items = &view.snapshot().transcript.items;
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id.get(), "assistant-turn:turn-1:segment:segment-0");
+        assert_eq!(items[1].id.get(), "assistant-turn:turn-1:segment:segment-1");
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &items[0].id),
+            Some("before")
+        );
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &items[1].id),
+            Some("after")
+        );
     }
 
     #[test]

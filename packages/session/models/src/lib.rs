@@ -1503,11 +1503,78 @@ impl ReasoningActivityEvent {
     }
 }
 
+/// Generation-scoped ordered text stream mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TextStreamUpdate {
+    /// Stream generation. A replacement stream advances this value.
+    pub generation: u64,
+    /// Monotonic operation revision within `generation`.
+    pub revision: u64,
+    /// Ordered mutation applied at this revision.
+    pub operation: TextStreamOperation,
+}
+
+/// Ordered live-only text stream operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TextStreamOperation {
+    /// Append UTF-8 text at the exact accepted byte offset.
+    Append {
+        /// Accepted byte count required before this append.
+        expected_offset: usize,
+        /// Contiguous UTF-8 text.
+        text: String,
+    },
+    /// Replace local state with an authoritative bounded checkpoint.
+    Checkpoint {
+        /// Original stream offset represented by the first checkpoint byte.
+        start_offset: usize,
+        /// Bounded retained UTF-8 text.
+        text: String,
+        /// Total source bytes accepted by the producer.
+        total_bytes: usize,
+        /// Whether bytes before `start_offset` were omitted.
+        truncated: bool,
+    },
+    /// Close the active stream. Terminal state is absorbing.
+    Terminal {
+        /// Terminal stream outcome.
+        status: TextStreamTerminalStatus,
+    },
+}
+
+/// Terminal outcome for an ordered live text stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextStreamTerminalStatus {
+    /// Complete durable content superseded the live stream.
+    Completed,
+    /// The owning turn was cancelled.
+    Cancelled,
+    /// The owning turn failed.
+    Failed,
+    /// A newer generation superseded the stream.
+    Superseded,
+}
+
 /// Live-only session event payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionLiveEventKind {
+    /// Ordered assistant segment update produced by a new application model turn.
+    AssistantTextStreamUpdated {
+        /// Application model turn that owns the segment.
+        turn_id: String,
+        /// Stable segment identifier scoped to `turn_id`.
+        segment_id: String,
+        /// Zero-based semantic order of the segment within the turn.
+        segment_order: u32,
+        /// Generation/revision/offset-validated stream operation.
+        update: TextStreamUpdate,
+    },
     /// Coalesced assistant text produced by an active model turn.
+    ///
+    /// Legacy compatibility adapter. New producers emit [`Self::AssistantTextStreamUpdated`].
     AssistantTextDelta {
         /// Application model turn that owns the segment.
         turn_id: String,
