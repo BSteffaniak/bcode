@@ -31,6 +31,9 @@ pub type StepFuture<T> = Pin<Box<dyn Future<Output = Result<T, WorkflowError>> +
 type StepFn<I, O> = dyn Fn(I, StepContext) -> StepFuture<O> + Send + Sync;
 
 const DEFAULT_MAX_CONCURRENCY: usize = Semaphore::MAX_PERMITS;
+const MAX_DEFINITION_NODES: usize = 10_000;
+const MAX_DEFINITION_EDGES: usize = 100_000;
+const MAX_DEFINITION_BOUNDARIES: usize = 10_000;
 
 /// Stable workflow definition schema version.
 pub const WORKFLOW_DEFINITION_SCHEMA_VERSION: u32 = 1;
@@ -4526,6 +4529,18 @@ fn validate_compiled_definition(definition: &WorkflowDefinition) -> Result<(), W
             message: "workflow must contain at least one step".to_string(),
         });
     }
+    if definition.nodes.len() > MAX_DEFINITION_NODES
+        || definition.edges.len() > MAX_DEFINITION_EDGES
+        || definition.entries.len() > MAX_DEFINITION_BOUNDARIES
+        || definition.exits.len() > MAX_DEFINITION_BOUNDARIES
+    {
+        return Err(WorkflowError::Build {
+            path: definition.name.clone(),
+            message: format!(
+                "workflow exceeds definition bounds: nodes<={MAX_DEFINITION_NODES}, edges<={MAX_DEFINITION_EDGES}, entries/exits<={MAX_DEFINITION_BOUNDARIES}"
+            ),
+        });
+    }
     if definition.entries.is_empty() || definition.exits.is_empty() {
         return Err(WorkflowError::Build {
             path: definition.name.clone(),
@@ -5626,6 +5641,31 @@ mod tests {
             diagnostic.code == "invalid_parallel_join_configuration"
                 && diagnostic.node_id.as_deref() == Some("join")
         }));
+    }
+
+    #[test]
+    fn compiled_definition_rejects_excessive_topology() {
+        let schema = ValueSchema::of::<u32>();
+        let node = NodeDefinition {
+            id: "node".to_string(),
+            name: "node".to_string(),
+            kind: NodeKind::Input,
+            input: schema.clone(),
+            output: schema.clone(),
+            resources: Vec::new(),
+            configuration: serde_json::json!({"version": 1}),
+        };
+        let definition = WorkflowDefinition {
+            schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "oversized-topology".to_string(),
+            input: schema.clone(),
+            output: schema,
+            nodes: BTreeMap::from([("node".to_string(), node)]),
+            entries: vec!["node".to_string(); MAX_DEFINITION_BOUNDARIES + 1],
+            exits: vec!["node".to_string()],
+            edges: Vec::new(),
+        };
+        assert!(definition.validate().is_err());
     }
 
     #[test]

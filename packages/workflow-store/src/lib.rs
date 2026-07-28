@@ -551,6 +551,15 @@ pub enum WorkflowDoctorIssue {
         run_status: RunStatus,
         repair_required_attempts: u64,
     },
+    /// A persisted workflow grant is expired or its scope/row identity is inconsistent.
+    InvalidGrant { grant_id: String, reason: String },
+    /// An active external attempt has no receipt proving accepted owner identity.
+    OrphanedAttempt {
+        dispatch_identity: String,
+        status: String,
+        side_effect: DispatchSideEffect,
+        guidance: String,
+    },
     /// A completed activation has no matching validated output, or a non-completed activation
     /// references one.
     ActivationOutputMismatch {
@@ -926,6 +935,11 @@ impl WorkflowStore {
             ));
         }
         let definition_json = serde_json::to_string(definition)?;
+        if definition_json.len() > MAX_INLINE_JSON_BYTES {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "workflow definition exceeds {MAX_INLINE_JSON_BYTES} bytes"
+            )));
+        }
         let checksum_sha256 = sha256_hex(definition_json.as_bytes());
         let stored = StoredWorkflowDefinition {
             definition_id: definition_id.to_string(),
@@ -3078,6 +3092,92 @@ impl WorkflowStore {
         let report_limit = limit;
         let fetch_limit = report_limit.saturating_add(1);
         let mut scan_truncated = false;
+        if issues.len() < fetch_limit {
+            let remaining = fetch_limit - issues.len();
+            let mut statement = self.connection.prepare(
+                "SELECT grant_id, node_id, scope_json, expires_at_ms FROM workflow_grants \
+                 WHERE run_id = ?1 ORDER BY granted_at_ms, grant_id LIMIT ?2",
+            )?;
+            let mut invalid_count = 0;
+            for row in statement.query_map(
+                (
+                    run_id,
+                    i64::try_from(remaining.saturating_add(1)).unwrap_or(i64::MAX),
+                ),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<u64>>(3)?,
+                    ))
+                },
+            )? {
+                let (grant_id, node_id, scope_json, expires_at_ms) = row?;
+                let reason = match serde_json::from_str::<bcode_workflow::WorkflowMutationGrantScope>(
+                    &scope_json,
+                ) {
+                    Ok(scope)
+                        if scope.validate().is_ok()
+                            && scope.run_id == run_id
+                            && scope.node_id == node_id
+                            && expires_at_ms.is_none() =>
+                    {
+                        None
+                    }
+                    Ok(_) => Some("grant scope does not match its durable row".to_string()),
+                    Err(error) => Some(format!("grant scope is malformed: {error}")),
+                };
+                if let Some(reason) = reason {
+                    issues.push(WorkflowDoctorIssue::InvalidGrant { grant_id, reason });
+                    invalid_count += 1;
+                    if issues.len() >= fetch_limit || invalid_count >= remaining {
+                        break;
+                    }
+                }
+            }
+        }
+        if issues.len() < fetch_limit {
+            let remaining = fetch_limit - issues.len();
+            let mut statement = self.connection.prepare(
+                "SELECT dispatch_identity, status, side_effect FROM workflow_attempts \
+                 WHERE run_id = ?1 AND status IN ('prepared', 'admitted', 'running') \
+                   AND receipt_json IS NULL ORDER BY prepared_at_ms, dispatch_identity LIMIT ?2",
+            )?;
+            for row in statement.query_map(
+                (
+                    run_id,
+                    i64::try_from(remaining.saturating_add(1)).unwrap_or(i64::MAX),
+                ),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )? {
+                let (dispatch_identity, status, side_effect) = row?;
+                let side_effect = parse_side_effect(&side_effect)?;
+                let guidance = match side_effect {
+                    DispatchSideEffect::ReadOnly => {
+                        "query the owner by dispatch identity; replay only when its contract proves idempotency"
+                    }
+                    DispatchSideEffect::Mutating => {
+                        "do not replay; inspect persisted intent and owner evidence, then use explicit repair"
+                    }
+                };
+                issues.push(WorkflowDoctorIssue::OrphanedAttempt {
+                    dispatch_identity,
+                    status,
+                    side_effect,
+                    guidance: guidance.to_string(),
+                });
+                if issues.len() >= fetch_limit {
+                    break;
+                }
+            }
+        }
         if issues.len() < fetch_limit {
             let remaining = fetch_limit - issues.len();
             let mut statement = self.connection.prepare(
@@ -9164,6 +9264,28 @@ mod tests {
     }
 
     #[test]
+    fn oversized_definition_is_rejected_before_persistence() {
+        let (_temp, mut store) = initialized_store();
+        let mut definition = definition("oversized");
+        definition
+            .nodes
+            .get_mut("review")
+            .expect("node")
+            .configuration = serde_json::json!({"padding": "x".repeat(MAX_INLINE_JSON_BYTES)});
+        assert!(
+            store
+                .persist_definition("oversized-definition", 1, &definition)
+                .is_err()
+        );
+        assert!(
+            store
+                .definition("oversized-definition", 1)
+                .expect("lookup")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn doctor_is_bounded_non_mutating_and_reports_corruption() {
         let (_temp, mut store) = initialized_store();
         let identity = store
@@ -9192,6 +9314,15 @@ mod tests {
                 [],
             )
             .expect("corrupt activation");
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_grants \
+                 (grant_id, run_id, node_id, scope_json, granted_at_ms, expires_at_ms) \
+                 VALUES ('corrupt-grant', 'run-1', 'review', '{}', 10, NULL)",
+                [],
+            )
+            .expect("corrupt grant");
         let event_count_before: u64 = store
             .connection
             .query_row("SELECT COUNT(*) FROM workflow_events", [], |row| row.get(0))
@@ -9201,7 +9332,7 @@ mod tests {
         assert!(first.truncated);
         assert_eq!(first.issues.len(), 1);
         let full = store.doctor_run("run-1", 10).expect("doctor");
-        assert_eq!(full.issues.len(), 3);
+        assert_eq!(full.issues.len(), 4);
         assert!(
             full.issues
                 .iter()
@@ -9211,6 +9342,11 @@ mod tests {
             full.issues
                 .iter()
                 .any(|issue| matches!(issue, WorkflowDoctorIssue::ActivationOutputMismatch { .. }))
+        );
+        assert!(
+            full.issues
+                .iter()
+                .any(|issue| matches!(issue, WorkflowDoctorIssue::InvalidGrant { .. }))
         );
         assert!(
             full.issues
