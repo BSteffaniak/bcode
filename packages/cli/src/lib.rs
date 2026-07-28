@@ -814,7 +814,11 @@ enum ServerCommand {
         #[arg(long)]
         json: bool,
     },
-    Stop,
+    Stop {
+        /// Force termination if graceful shutdown does not complete.
+        #[arg(long)]
+        force: bool,
+    },
     Cleanup,
     StopAll,
     /// Gracefully stop every live daemon whose storage writer epoch is incompatible.
@@ -1333,7 +1337,7 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
         ServerCommand::Status { verbose } => server_status(verbose).await?,
         ServerCommand::Metrics { json, report } => server_metrics(json, report).await?,
         ServerCommand::Diagnose { json } => server_diagnose(json).await?,
-        ServerCommand::Stop => server_stop().await?,
+        ServerCommand::Stop { force } => server_stop(force).await?,
         ServerCommand::Cleanup => server_cleanup(false).await?,
         ServerCommand::StopAll => server_cleanup(true).await?,
         ServerCommand::RetireIncompatible => retire_incompatible_daemons().await?,
@@ -6491,9 +6495,32 @@ async fn terminate_verified_daemon(
     wait_for_daemon_exit(expected).await
 }
 
-async fn server_stop() -> Result<(), CliError> {
+async fn server_stop(force: bool) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint()
         .with_daemon_availability(DaemonAvailability::RequireRunning);
+    if force {
+        let status = match client.server_status().await {
+            Ok(status) => status,
+            Err(error) if server_is_unreachable(&error) => {
+                println!("server not running");
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let record = bcode_daemon_lifecycle::read_records(&bcode_config::default_state_dir())
+            .into_iter()
+            .map(|(_, record)| record)
+            .find(|record| daemon_status_matches(record, &status.daemon))
+            .ok_or_else(|| {
+                CliError::InvalidArguments(
+                    "refusing forced stop because the responding daemon does not match its registry identity"
+                        .to_owned(),
+                )
+            })?;
+        terminate_verified_daemon(&record).await?;
+        println!("server stopped");
+        return Ok(());
+    }
     match client.server_stop().await {
         Ok(()) => println!("server stopping"),
         Err(error) if server_is_unreachable(&error) => println!("server not running"),
@@ -8212,6 +8239,18 @@ mod web_command_tests {
             assert!(rendered.contains("schema 39"));
             assert!(rendered.contains("upgrade Bcode"));
         }
+    }
+
+    #[test]
+    fn server_stop_force_command_parses() {
+        let cli = Cli::try_parse_from(["bcode", "server", "stop", "--force"])
+            .expect("forced stop command should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Server {
+                command: ServerCommand::Stop { force: true }
+            })
+        ));
     }
 
     #[test]
