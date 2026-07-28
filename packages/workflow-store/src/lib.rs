@@ -132,6 +132,18 @@ pub struct WaitingActivation {
     pub requested_at_ms: u64,
 }
 
+/// Bounded activation summary for workflow status and next-action projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowActivationSummary {
+    pub run_id: String,
+    pub node_id: String,
+    pub activation_id: String,
+    pub dependency_generation: u64,
+    pub status: String,
+    pub has_output: bool,
+    pub created_at_ms: u64,
+}
+
 /// Result of resolving one exact durable waiting activation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WaitingResolutionResult {
@@ -1461,6 +1473,47 @@ impl WorkflowStore {
         }
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Load bounded newest-first durable decisions for one run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid identity/limit, malformed persisted JSON, or query failure.
+    pub fn decisions_for_run(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkflowDecision>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT decision_id, node_id, decision_type, value_json, created_at_ms \
+             FROM workflow_decisions WHERE run_id = ?1 \
+             ORDER BY created_at_ms DESC, decision_id DESC LIMIT ?2",
+        )?;
+        statement
+            .query_map((run_id, limit), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u64>(4)?,
+                ))
+            })?
+            .map(|row| {
+                let (decision_id, node_id, decision_type, value_json, created_at_ms) = row?;
+                Ok(WorkflowDecision {
+                    decision_id,
+                    run_id: run_id.to_string(),
+                    node_id,
+                    decision_type,
+                    value: serde_json::from_str(&value_json)?,
+                    created_at_ms,
+                })
+            })
+            .collect()
     }
 
     /// Load one exact durable workflow decision.
@@ -4001,6 +4054,39 @@ impl WorkflowStore {
             .optional()?
             .map(parse_run_summary)
             .transpose()
+    }
+
+    /// Return bounded activations for one run without event replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid identity/limit or query failure.
+    pub fn activations_for_run(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkflowActivationSummary>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT node_id, activation_id, dependency_generation, status, output_id IS NOT NULL, \
+             created_at_ms FROM workflow_activations WHERE run_id = ?1 \
+             ORDER BY dependency_generation DESC, created_at_ms DESC, node_id LIMIT ?2",
+        )?;
+        statement
+            .query_map((run_id, limit), |row| {
+                Ok(WorkflowActivationSummary {
+                    run_id: run_id.to_string(),
+                    node_id: row.get(0)?,
+                    activation_id: row.get(1)?,
+                    dependency_generation: row.get(2)?,
+                    status: row.get(3)?,
+                    has_output: row.get(4)?,
+                    created_at_ms: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(WorkflowStoreError::from)
     }
 
     /// Return bounded pending activations with exact compiled node definitions.

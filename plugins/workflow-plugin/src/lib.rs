@@ -358,6 +358,10 @@ pub(crate) async fn execute_command(
                     "definition".to_string(),
                     serde_json::json!(inspection.definition),
                 ),
+                (
+                    "activations".to_string(),
+                    serde_json::json!(inspection.activations),
+                ),
                 ("waits".to_string(), serde_json::json!(inspection.waits)),
                 (
                     "mutation_approvals".to_string(),
@@ -368,6 +372,10 @@ pub(crate) async fn execute_command(
                     serde_json::json!(inspection.attempts),
                 ),
                 ("events".to_string(), serde_json::json!(inspection.events)),
+                (
+                    "decisions".to_string(),
+                    serde_json::json!(inspection.decisions),
+                ),
                 ("grants".to_string(), serde_json::json!(inspection.grants)),
                 (
                     "resource_leases".to_string(),

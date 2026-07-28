@@ -1212,10 +1212,12 @@ pub struct WorkflowDefinitionRegistrationRequest {
 pub struct WorkflowRunInspection {
     pub run: bcode_workflow_store::WorkflowRunSummary,
     pub definition: bcode_workflow_store::StoredWorkflowDefinition,
+    pub activations: Vec<bcode_workflow_store::WorkflowActivationSummary>,
     pub waits: Vec<bcode_workflow_store::WaitingActivation>,
     pub mutation_approvals: Vec<bcode_workflow_store::WorkflowMutationApproval>,
     pub attempts: Vec<bcode_workflow_store::AttemptSummary>,
     pub events: Vec<bcode_workflow_store::WorkflowEventRow>,
+    pub decisions: Vec<bcode_workflow_store::WorkflowDecision>,
     pub grants: Vec<bcode_workflow_store::WorkflowGrant>,
     pub resource_leases: Vec<bcode_workflow_store::WorkflowResourceLease>,
     pub outputs: Vec<bcode_workflow_store::WorkflowOutputSummary>,

@@ -199,6 +199,9 @@ A process crash may leave an attempt prepared, admitted, or running. Restart rec
 use the persisted identity and receipt. It must never blindly duplicate an operation whose
 mutating outcome is unknown.
 
+Git preparation, exact commit composition/approval, owner re-verification, and explicit commit
+reconciliation are documented in [`git-workflow-blocks.md`](git-workflow-blocks.md).
+
 ## Bounded normal reads
 
 List, status, open, and attach paths read bounded run/projection rows and paged workflow events.
@@ -223,6 +226,9 @@ The workflow database has its own migration ledger and storage contract. Migrati
 idempotent where practical, and never selected by build namespace. A newer incompatible schema or
 unknown migration fails closed with an upgrade/repair diagnostic. Destructive rebuilds require an
 explicit maintenance command and verified backup once user-created durable runs exist.
+
+Operator status, doctor, shell/Git reconciliation, explicit repair, and backup-safe maintenance
+procedures are documented in [`workflow-operations.md`](workflow-operations.md).
 
 ## Architecture enforcement
 

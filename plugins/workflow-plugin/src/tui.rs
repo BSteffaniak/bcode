@@ -277,6 +277,19 @@ impl PluginTuiSurface for WorkflowStatusSurface {
     }
 }
 
+fn next_action(activation: &serde_json::Value) -> &'static str {
+    match text(activation, "status") {
+        "pending" => "dispatch",
+        "running" => "await owner",
+        "waiting_input" => "provide input",
+        "waiting_approval" | "waiting_mutation_approval" => "approve or deny",
+        "failed" => "inspect or explicit retry",
+        "repair_required" => "doctor or repair",
+        "completed" | "cancelled" | "skipped" => "none",
+        _ => "inspect",
+    }
+}
+
 fn mutation_approval_command(
     options: &serde_json::Value,
     selected_approval: usize,
@@ -348,6 +361,15 @@ fn surface_lines(options: &serde_json::Value, selected_approval: usize) -> Vec<S
     if let Some(definition) = options.get("definition") {
         append_graph(&mut lines, definition);
     }
+    append_named_rows(&mut lines, options, "activations", "Activations", |value| {
+        format!(
+            "  {} · generation {} · {} · next={}",
+            text(value, "node_id"),
+            number(value, "dependency_generation"),
+            text(value, "status"),
+            next_action(value)
+        )
+    });
     append_named_rows(&mut lines, options, "waits", "Waits", |value| {
         format!(
             "  {} · {} · {}",
@@ -363,6 +385,14 @@ fn surface_lines(options: &serde_json::Value, selected_approval: usize) -> Vec<S
             text(value, "node_id"),
             number(value, "attempt"),
             text(value, "status")
+        )
+    });
+    append_named_rows(&mut lines, options, "decisions", "Decisions", |value| {
+        format!(
+            "  {} · {} · {}",
+            text(value, "node_id"),
+            text(value, "decision_type"),
+            compact_json(value.get("value"))
         )
     });
     append_named_rows(&mut lines, options, "grants", "Grants", |value| {
