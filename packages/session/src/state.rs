@@ -46,6 +46,8 @@ pub struct SessionState {
     pub(crate) live_events: SessionLiveEventBroker,
     pub(crate) live_text_checkpoints: BTreeMap<(String, String), SessionLiveEvent>,
     pub(crate) live_text_checkpoint_order: Vec<(String, String)>,
+    pub(crate) live_text_tombstones: BTreeMap<(String, String), (u64, u64)>,
+    pub(crate) live_text_tombstone_order: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -108,6 +110,8 @@ impl SessionState {
             live_events,
             live_text_checkpoints: BTreeMap::new(),
             live_text_checkpoint_order: Vec::new(),
+            live_text_tombstones: BTreeMap::new(),
+            live_text_tombstone_order: Vec::new(),
         }
     }
 
@@ -166,6 +170,8 @@ impl SessionState {
             live_events,
             live_text_checkpoints: BTreeMap::new(),
             live_text_checkpoint_order: Vec::new(),
+            live_text_tombstones: BTreeMap::new(),
+            live_text_tombstone_order: Vec::new(),
         }
     }
 

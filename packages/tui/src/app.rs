@@ -2563,6 +2563,16 @@ impl BmuxApp {
     pub fn absorb_session_live_event(&mut self, event: &SessionLiveEvent) {
         self.session_view.apply_live_event(event);
         match &event.kind {
+            SessionLiveEventKind::AssistantTextStreamUpdated { .. } => {
+                let should_anchor = self.should_anchor_new_assistant_stream();
+                self.pending_visual_overflow_bottom = Some(
+                    self.viewport
+                        .bottom_row(self.transcript_layout.total_rows()),
+                );
+                self.viewport.preserve_for_append();
+                self.sync_shared_message_items();
+                self.maybe_request_assistant_stream_anchor(should_anchor);
+            }
             SessionLiveEventKind::AssistantTextDelta { text, .. } => {
                 let should_anchor = self.should_anchor_new_assistant_stream();
                 self.pending_visual_overflow_bottom = Some(

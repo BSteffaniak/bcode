@@ -1508,7 +1508,12 @@ impl ReasoningActivityEvent {
 pub struct TextStreamUpdate {
     /// Stream generation. A replacement stream advances this value.
     pub generation: u64,
-    /// Monotonic operation revision within `generation`.
+    /// First operation revision represented by this update.
+    ///
+    /// This equals `revision` for an unmerged operation and preserves contiguous revision spans
+    /// when transport fan-out coalesces adjacent appends.
+    pub first_revision: u64,
+    /// Last monotonic operation revision represented within `generation`.
     pub revision: u64,
     /// Ordered mutation applied at this revision.
     pub operation: TextStreamOperation,

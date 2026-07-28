@@ -81,7 +81,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 16;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 17;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =

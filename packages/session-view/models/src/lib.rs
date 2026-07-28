@@ -258,7 +258,7 @@ pub struct SessionViewSnapshot {
 
 impl SessionViewSnapshot {
     /// Current snapshot schema version.
-    pub const SCHEMA_VERSION: u16 = 12;
+    pub const SCHEMA_VERSION: u16 = 13;
 
     /// Create an empty snapshot.
     #[must_use]

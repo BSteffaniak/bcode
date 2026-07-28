@@ -14,9 +14,10 @@ use std::sync::RwLock;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 const SESSION_DATABASE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-const MAX_ACTIVE_TEXT_STREAM_KEYS: usize = 32;
-const MAX_ACTIVE_TEXT_STREAM_BYTES_PER_KEY: usize = 256 * 1024;
-const MAX_ACTIVE_TEXT_STREAM_BYTES_PER_SESSION: usize = 1024 * 1024;
+pub(crate) const MAX_ACTIVE_TEXT_STREAM_KEYS: usize = 32;
+const MAX_ACTIVE_TEXT_STREAM_TOMBSTONES: usize = 64;
+pub(crate) const MAX_ACTIVE_TEXT_STREAM_BYTES_PER_KEY: usize = 256 * 1024;
+pub(crate) const MAX_ACTIVE_TEXT_STREAM_BYTES_PER_SESSION: usize = 1024 * 1024;
 
 fn bounded_text_suffix(text: &str, max_bytes: usize) -> (&str, usize) {
     if text.len() <= max_bytes {
@@ -911,6 +912,7 @@ impl SessionActor {
             event.provenance = provenance;
             event
         };
+        self.retire_live_text_checkpoint_for_durable_event(&event.kind);
         self.state
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
         self.update_manifest_and_catalog_after_append().await;
@@ -1463,6 +1465,74 @@ impl SessionActor {
         self.state.live_events.publish(event)
     }
 
+    fn retire_live_text_checkpoint_for_durable_event(&mut self, kind: &SessionEventKind) {
+        match kind {
+            SessionEventKind::AssistantResponseSegment {
+                turn_id,
+                segment_id,
+                ..
+            } => {
+                let key = (turn_id.clone(), segment_id.clone());
+                let (generation, revision) = self
+                    .state
+                    .live_text_checkpoints
+                    .get(&key)
+                    .and_then(|event| match &event.kind {
+                        SessionLiveEventKind::AssistantTextStreamUpdated { update, .. } => {
+                            Some((update.generation, update.revision))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                self.retire_live_text_checkpoint(&key);
+                self.insert_live_text_tombstone(key, generation, revision);
+            }
+            SessionEventKind::ModelTurnFinished { turn_id, .. } => {
+                self.state
+                    .live_text_checkpoints
+                    .retain(|(event_turn_id, _), _| event_turn_id != turn_id);
+                self.state
+                    .live_text_checkpoint_order
+                    .retain(|(event_turn_id, _)| event_turn_id != turn_id);
+                self.state
+                    .live_text_tombstones
+                    .retain(|(event_turn_id, _), _| event_turn_id != turn_id);
+                self.state
+                    .live_text_tombstone_order
+                    .retain(|(event_turn_id, _)| event_turn_id != turn_id);
+            }
+            _ => {}
+        }
+    }
+
+    fn retire_live_text_checkpoint(&mut self, key: &(String, String)) {
+        self.state.live_text_checkpoints.remove(key);
+        self.state
+            .live_text_checkpoint_order
+            .retain(|item| item != key);
+    }
+
+    fn insert_live_text_tombstone(
+        &mut self,
+        key: (String, String),
+        generation: u64,
+        revision: u64,
+    ) {
+        if !self.state.live_text_tombstones.contains_key(&key) {
+            self.state.live_text_tombstone_order.push(key.clone());
+        }
+        self.state
+            .live_text_tombstones
+            .insert(key, (generation, revision));
+        while self.state.live_text_tombstones.len() > MAX_ACTIVE_TEXT_STREAM_TOMBSTONES {
+            let Some(oldest) = self.state.live_text_tombstone_order.first().cloned() else {
+                break;
+            };
+            self.state.live_text_tombstone_order.remove(0);
+            self.state.live_text_tombstones.remove(&oldest);
+        }
+    }
+
     fn update_live_text_checkpoint(&mut self, kind: &SessionLiveEventKind) {
         use bcode_session_models::{TextStreamOperation, TextStreamUpdate};
         let SessionLiveEventKind::AssistantTextStreamUpdated {
@@ -1475,11 +1545,17 @@ impl SessionActor {
             return;
         };
         let key = (turn_id.clone(), segment_id.clone());
+        if self
+            .state
+            .live_text_tombstones
+            .get(&key)
+            .is_some_and(|(generation, _revision)| update.generation <= *generation)
+        {
+            return;
+        }
         if matches!(update.operation, TextStreamOperation::Terminal { .. }) {
-            self.state.live_text_checkpoints.remove(&key);
-            self.state
-                .live_text_checkpoint_order
-                .retain(|item| item != &key);
+            self.retire_live_text_checkpoint(&key);
+            self.insert_live_text_tombstone(key, update.generation, update.revision);
             return;
         }
         let (mut text, mut start_offset, mut total_bytes, mut truncated) = match self
@@ -1536,6 +1612,7 @@ impl SessionActor {
                 segment_order: *segment_order,
                 update: TextStreamUpdate {
                     generation: update.generation,
+                    first_revision: update.revision,
                     revision: update.revision,
                     operation: TextStreamOperation::Checkpoint {
                         start_offset,

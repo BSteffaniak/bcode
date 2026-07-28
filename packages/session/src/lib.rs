@@ -1325,6 +1325,8 @@ impl SessionManager {
             live_events,
             live_text_checkpoints: BTreeMap::new(),
             live_text_checkpoint_order: Vec::new(),
+            live_text_tombstones: BTreeMap::new(),
+            live_text_tombstone_order: Vec::new(),
         };
         let lease = self
             .store
@@ -3242,6 +3244,125 @@ mod tests {
                 && artifact.metadata["output_tail"] == "hello\n"
         )));
         std::fs::remove_dir_all(root).expect("temp session dir should be removed");
+    }
+
+    #[tokio::test]
+    async fn active_assistant_checkpoint_hydrates_attach_and_retires_at_boundaries() {
+        let manager = SessionManager::default();
+        let session = manager
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should create");
+        let publish = |revision, expected_offset, text: &str| {
+            SessionLiveEventKind::AssistantTextStreamUpdated {
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                update: bcode_session_models::TextStreamUpdate {
+                    generation: 0,
+                    revision,
+                    operation: bcode_session_models::TextStreamOperation::Append {
+                        expected_offset,
+                        text: text.to_owned(),
+                    },
+                },
+            }
+        };
+        let _ = manager
+            .publish_live_event(session.id, publish(1, 0, "hello "))
+            .await;
+        let _ = manager
+            .publish_live_event(session.id, publish(2, 6, "world"))
+            .await;
+
+        let attachment = manager
+            .attach_session(session.id, ClientId::new())
+            .await
+            .expect("session should attach");
+        assert_eq!(attachment.live_checkpoints.len(), 1);
+        assert!(matches!(
+            &attachment.live_checkpoints[0].kind,
+            SessionLiveEventKind::AssistantTextStreamUpdated {
+                update: bcode_session_models::TextStreamUpdate {
+                    first_revision: 2,
+                    revision: 2,
+                    operation: bcode_session_models::TextStreamOperation::Checkpoint {
+                        start_offset: 0,
+                        text,
+                        total_bytes: 11,
+                        truncated: false,
+                    },
+                    ..
+                },
+                ..
+            } if text == "hello world"
+        ));
+
+        manager
+            .append_assistant_response_segment(
+                session.id,
+                "turn-1".to_owned(),
+                "segment-0".to_owned(),
+                0,
+                "hello world".to_owned(),
+            )
+            .await
+            .expect("durable segment should append");
+        let attachment = manager
+            .attach_session(session.id, ClientId::new())
+            .await
+            .expect("session should reattach");
+        assert!(attachment.live_checkpoints.is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_assistant_checkpoint_is_utf8_safe_and_per_key_bounded() {
+        let manager = SessionManager::default();
+        let session = manager
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should create");
+        let text = "é".repeat((super::actor::MAX_ACTIVE_TEXT_STREAM_BYTES_PER_KEY / 2) + 10);
+        let _ = manager
+            .publish_live_event(
+                session.id,
+                SessionLiveEventKind::AssistantTextStreamUpdated {
+                    turn_id: "turn-1".to_owned(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
+                    update: bcode_session_models::TextStreamUpdate {
+                        generation: 0,
+                        first_revision: 1,
+                        revision: 1,
+                        operation: bcode_session_models::TextStreamOperation::Append {
+                            expected_offset: 0,
+                            text: text.clone(),
+                        },
+                    },
+                },
+            )
+            .await;
+        let attachment = manager
+            .attach_session(session.id, ClientId::new())
+            .await
+            .expect("session should attach");
+        assert!(matches!(
+            &attachment.live_checkpoints[0].kind,
+            SessionLiveEventKind::AssistantTextStreamUpdated {
+                update: bcode_session_models::TextStreamUpdate {
+                    operation: bcode_session_models::TextStreamOperation::Checkpoint {
+                        start_offset,
+                        text: retained,
+                        total_bytes,
+                        truncated: true,
+                    },
+                    ..
+                },
+                ..
+            } if *start_offset > 0
+                && retained.len() <= super::actor::MAX_ACTIVE_TEXT_STREAM_BYTES_PER_KEY
+                && *total_bytes == text.len()
+        ));
     }
 
     #[test]

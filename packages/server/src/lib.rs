@@ -7731,6 +7731,7 @@ async fn handle_attach_session(
             )
             .await?;
             let sink = ClientEventSink::new(client_id, writer.clone(), state.metrics.clone());
+            send_live_checkpoints(&sink, &attachment.live_checkpoints).await?;
             send_active_runtime_snapshots(state, session_id, &sink).await?;
             let handle =
                 forward_session_events(sink, session_id, attachment.events, attachment.live_events);
@@ -8010,6 +8011,7 @@ async fn finish_attach_session_projection_window_success(
         context.writer.clone(),
         state.metrics.clone(),
     );
+    send_live_checkpoints(&sink, &attachment.live_checkpoints).await?;
     send_active_runtime_snapshots(state, session_id, &sink).await?;
     let handle =
         forward_session_events(sink, session_id, attachment.events, attachment.live_events);
@@ -8100,6 +8102,7 @@ async fn finish_attach_session_recent_success(
         context.writer.clone(),
         state.metrics.clone(),
     );
+    send_live_checkpoints(&sink, &attachment.live_checkpoints).await?;
     send_active_runtime_snapshots(state, session_id, &sink).await?;
     let handle =
         forward_session_events(sink, session_id, attachment.events, attachment.live_events);
@@ -12370,6 +12373,7 @@ impl ModelStreamAccumulator {
                         segment_order: self.segment_order,
                         update: bcode_session_models::TextStreamUpdate {
                             generation: 0,
+                            first_revision: revision,
                             revision,
                             operation: bcode_session_models::TextStreamOperation::Append {
                                 expected_offset: self.pending_text_offset,
@@ -24079,7 +24083,7 @@ fn merge_pending_live_event(
         else {
             return MergePendingLiveEvent::Replace;
         };
-        if pending_update.revision.saturating_add(1) != next_update.revision
+        if pending_update.revision.saturating_add(1) != next_update.first_revision
             || pending_offset.saturating_add(pending_text.len()) != *next_offset
         {
             return MergePendingLiveEvent::Gap;
@@ -24089,6 +24093,7 @@ fn merge_pending_live_event(
         else {
             unreachable!("cloned assistant stream update changed kind");
         };
+        update.first_revision = pending_update.first_revision;
         update.operation = bcode_session_models::TextStreamOperation::Append {
             expected_offset: *pending_offset,
             text: format!("{pending_text}{next_text}"),
@@ -24166,6 +24171,16 @@ async fn send_session_resync_required(
         .increment_counter(format!("server.live_state.resync.{cause}_total"));
     sink.send(Event::SessionViewResyncRequired { session_id })
         .await
+}
+
+async fn send_live_checkpoints(
+    sink: &ClientEventSink,
+    checkpoints: &[bcode_session_models::SessionLiveEvent],
+) -> Result<(), CodecError> {
+    for checkpoint in checkpoints {
+        sink.send(Event::SessionLive(checkpoint.clone())).await?;
+    }
+    Ok(())
 }
 
 async fn send_active_runtime_snapshots(

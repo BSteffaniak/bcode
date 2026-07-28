@@ -7658,6 +7658,15 @@ fn session_live_event_description(event: &SessionLiveEvent) -> String {
             envelope.contribution.schema_version,
             envelope.contribution.operation,
         ),
+        SessionLiveEventKind::AssistantTextStreamUpdated {
+            turn_id,
+            segment_id,
+            update,
+            ..
+        } => format!(
+            "live assistant stream ({turn_id}/{segment_id}) generation={} revision={}: {:?}",
+            update.generation, update.revision, update.operation
+        ),
         SessionLiveEventKind::AssistantTextDelta { turn_id, text, .. } => {
             format!("live assistant delta ({turn_id}): {text}")
         }

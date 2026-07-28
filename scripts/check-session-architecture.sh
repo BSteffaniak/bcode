@@ -755,7 +755,7 @@ if ! rg -q 'unknown_historical_kind_fails_writable_migration' packages/session-m
   violations=1
 fi
 
-if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 16' packages/ipc/src/lib.rs \
+if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 17' packages/ipc/src/lib.rs \
   || ! rg -q 'PrepareSessionOpen' packages/ipc/src/lib.rs \
   || ! rg -q 'WaitSessionOpenProgress' packages/ipc/src/lib.rs \
   || ! rg -q 'SessionOpenPrepared' packages/ipc/src/lib.rs \
@@ -769,7 +769,7 @@ if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 16' packages/ipc/src/lib.rs \
   || ! rg -q 'migration_stage_families_and_terminal_failure_render_through_status_chrome' packages/tui/src/tests.rs \
   || ! rg -q 'session_open_progress_ignores_stale_session_updates' packages/tui/src/chat_loop.rs \
   || ! rg -q 'prepare_session_open_until_terminal' packages/client/src/lib.rs; then
-  echo "Session migration IPC violation: protocol-v16 prepare/wait routing, bounded revision waits, exact operation errors, codec coverage, and client APIs must remain present." >&2
+  echo "Session migration IPC violation: protocol-v17 prepare/wait routing, bounded revision waits, exact operation errors, codec coverage, and client APIs must remain present." >&2
   violations=1
 fi
 

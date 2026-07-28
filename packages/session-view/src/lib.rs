@@ -2779,7 +2779,7 @@ impl SessionView {
             return;
         }
         let is_checkpoint = matches!(update.operation, TextStreamOperation::Checkpoint { .. });
-        if !is_checkpoint && update.revision != state.revision.saturating_add(1) {
+        if !is_checkpoint && update.first_revision != state.revision.saturating_add(1) {
             state.status = TextStreamViewStatus::Degraded;
             self.bump_revision();
             return;
@@ -8012,6 +8012,7 @@ mod tests {
                 segment_order: 0,
                 update: bcode_session_models::TextStreamUpdate {
                     generation: 0,
+                    first_revision: revision,
                     revision,
                     operation,
                 },
@@ -8096,6 +8097,7 @@ mod tests {
                     segment_order,
                     update: bcode_session_models::TextStreamUpdate {
                         generation: 0,
+                        first_revision: 1,
                         revision: 1,
                         operation: bcode_session_models::TextStreamOperation::Append {
                             expected_offset: 0,

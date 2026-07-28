@@ -4182,6 +4182,22 @@ impl ReviewAgentSessionStreamState {
 
     fn apply_live_event(&mut self, kind: SessionLiveEventKind) -> bool {
         match kind {
+            SessionLiveEventKind::AssistantTextStreamUpdated {
+                turn_id, update, ..
+            } => {
+                if let bcode_session_models::TextStreamOperation::Append { text, .. } =
+                    update.operation
+                {
+                    self.live_answer_by_turn
+                        .entry(turn_id.clone())
+                        .or_default()
+                        .push_str(&text);
+                }
+                self.active_turn_id = Some(turn_id);
+                self.phase = ReviewAgentThreadPhase::Running;
+                self.status = "receiving model response…".to_string();
+                self.error = None;
+            }
             SessionLiveEventKind::AssistantTextDelta { turn_id, text, .. } => {
                 self.live_answer_by_turn
                     .entry(turn_id.clone())
