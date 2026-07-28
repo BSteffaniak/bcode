@@ -364,6 +364,35 @@ pub struct WorkflowGrant {
     pub expires_at_ms: Option<u64>,
 }
 
+/// One exact pending workflow mutation approval request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowMutationApproval {
+    pub approval_id: String,
+    pub run_id: String,
+    pub node_id: String,
+    pub activation_id: String,
+    pub scope: bcode_workflow::WorkflowMutationGrantScope,
+    pub requested_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
+}
+
+/// Terminal decision applied to one exact pending mutation approval.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowMutationApprovalDecision {
+    Approve,
+    Deny,
+}
+
+/// Result of atomically resolving one mutation approval.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowMutationApprovalResolution {
+    pub approval_id: String,
+    pub status: String,
+    pub grant_id: Option<String>,
+    pub activation_status: String,
+}
+
 /// Access mode for one durable workflow resource lease.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -703,6 +732,7 @@ pub struct PreparedActivationDispatch {
     pub activation: PendingActivation,
     pub attempt: u32,
     pub dispatch_identity: String,
+    pub intent: serde_json::Value,
 }
 
 /// Result of atomically persisting output and materializing direct successors.
@@ -1539,6 +1569,409 @@ impl WorkflowStore {
         Ok(())
     }
 
+    /// Persist one exact mutation approval wait before a mutating activation becomes dispatchable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid identity/scope, stale input, conflicting requests, or storage
+    /// failure. No prepared attempt or external dispatch is created by this operation.
+    pub fn request_mutation_approval(
+        &mut self,
+        approval: &WorkflowMutationApproval,
+    ) -> Result<(), WorkflowStoreError> {
+        validate_mutation_approval(approval)?;
+        let scope_json = bounded_json("workflow mutation approval scope", &approval.scope)?;
+        let transaction = self.connection.transaction()?;
+        let (status, definition_id, definition_version, workspace_snapshot, input_json) =
+            transaction.query_row(
+                "SELECT activation.status, run.definition_id, run.definition_version, \
+                 run.workspace_snapshot, activation.input_json \
+                 FROM workflow_activations activation \
+                 JOIN workflow_runs run ON run.run_id = activation.run_id \
+                 WHERE activation.run_id = ?1 AND activation.node_id = ?2 \
+                   AND activation.activation_id = ?3",
+                (&approval.run_id, &approval.node_id, &approval.activation_id),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, u32>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )?;
+        if !matches!(status.as_str(), "pending" | "waiting_mutation_approval")
+            || definition_id != approval.scope.definition_id
+            || definition_version != approval.scope.definition_version
+            || workspace_snapshot != approval.scope.workspace_snapshot
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "mutation approval does not match dispatchable activation identity".to_string(),
+            ));
+        }
+        let input = input_json
+            .as_deref()
+            .map_or_else(|| "null".to_string(), ToString::to_string);
+        if sha256_hex(input.as_bytes()) != approval.scope.input_checksum_sha256 {
+            return Err(WorkflowStoreError::InvalidData(
+                "mutation approval input checksum is stale".to_string(),
+            ));
+        }
+        let changed = transaction.execute(
+            "INSERT OR IGNORE INTO workflow_mutation_approvals \
+             (approval_id, run_id, node_id, activation_id, scope_json, status, requested_at_ms, expires_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7)",
+            (
+                &approval.approval_id,
+                &approval.run_id,
+                &approval.node_id,
+                &approval.activation_id,
+                &scope_json,
+                approval.requested_at_ms,
+                approval.expires_at_ms,
+            ),
+        )?;
+        if changed == 0 {
+            let existing: (String, String, String, String, String, u64, Option<u64>) =
+                transaction.query_row(
+                    "SELECT run_id, node_id, activation_id, scope_json, status, requested_at_ms, expires_at_ms \
+                     FROM workflow_mutation_approvals WHERE approval_id = ?1",
+                    [&approval.approval_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?, row.get(6)?)),
+                )?;
+            if existing
+                != (
+                    approval.run_id.clone(),
+                    approval.node_id.clone(),
+                    approval.activation_id.clone(),
+                    scope_json,
+                    "pending".to_string(),
+                    approval.requested_at_ms,
+                    approval.expires_at_ms,
+                )
+            {
+                return Err(WorkflowStoreError::InvalidData(format!(
+                    "mutation approval identity conflict: {}",
+                    approval.approval_id
+                )));
+            }
+        } else {
+            transaction.execute(
+                "UPDATE workflow_activations SET status = 'waiting_mutation_approval' \
+                 WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND status = 'pending'",
+                (&approval.run_id, &approval.node_id, &approval.activation_id),
+            )?;
+            append_event(
+                &transaction,
+                &approval.run_id,
+                "mutation_approval_requested",
+                &serde_json::to_string(approval)?,
+                approval.requested_at_ms,
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Resolve one exact pending mutation approval in one transaction.
+    ///
+    /// Approval persists the exact grant before restoring dispatch eligibility. Denial records the
+    /// decision and fails the activation/run without creating an attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for stale/expired/wrong identity, conflicting duplicate decisions, or
+    /// storage failure. Any error rolls back decision, grant, and activation state together.
+    #[allow(clippy::too_many_lines)]
+    pub fn resolve_mutation_approval(
+        &mut self,
+        approval_id: &str,
+        decision: WorkflowMutationApprovalDecision,
+        resolved_at_ms: u64,
+    ) -> Result<WorkflowMutationApprovalResolution, WorkflowStoreError> {
+        validate_id("approval_id", approval_id)?;
+        let transaction = self.connection.transaction()?;
+        let row = transaction
+            .query_row(
+                "SELECT approval.run_id, approval.node_id, approval.activation_id, \
+                 approval.scope_json, approval.status, approval.requested_at_ms, \
+                 approval.expires_at_ms, approval.grant_id, activation.status, \
+                 activation.input_json, run.definition_id, run.definition_version, \
+                 run.workspace_snapshot, run.status, run.cancellation_requested_at_ms \
+                 FROM workflow_mutation_approvals approval \
+                 JOIN workflow_activations activation ON activation.run_id = approval.run_id \
+                   AND activation.node_id = approval.node_id \
+                   AND activation.activation_id = approval.activation_id \
+                 JOIN workflow_runs run ON run.run_id = approval.run_id \
+                 WHERE approval.approval_id = ?1",
+                [approval_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, u64>(5)?,
+                        row.get::<_, Option<u64>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, Option<String>>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, u32>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, String>(13)?,
+                        row.get::<_, Option<u64>>(14)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "mutation approval not found: {approval_id}"
+                ))
+            })?;
+        let (
+            run_id,
+            node_id,
+            activation_id,
+            scope_json,
+            status,
+            _requested_at_ms,
+            expires_at_ms,
+            existing_grant_id,
+            activation_status,
+            input_json,
+            definition_id,
+            definition_version,
+            workspace_snapshot,
+            run_status,
+            cancellation_requested_at_ms,
+        ) = row;
+        let expected_status = match decision {
+            WorkflowMutationApprovalDecision::Approve => "approved",
+            WorkflowMutationApprovalDecision::Deny => "denied",
+        };
+        if status == expected_status {
+            return Ok(WorkflowMutationApprovalResolution {
+                approval_id: approval_id.to_string(),
+                status,
+                grant_id: existing_grant_id,
+                activation_status,
+            });
+        }
+        if status != "pending" || activation_status != "waiting_mutation_approval" {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "mutation approval decision conflict: {approval_id} is {status}"
+            )));
+        }
+        if parse_run_status(&run_status)? != RunStatus::Running
+            || cancellation_requested_at_ms.is_some()
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow run is not accepting mutation approval decisions".to_string(),
+            ));
+        }
+        if expires_at_ms.is_some_and(|expires| resolved_at_ms >= expires) {
+            transaction.execute(
+                "UPDATE workflow_mutation_approvals SET status = 'expired', resolved_at_ms = ?2 \
+                 WHERE approval_id = ?1 AND status = 'pending'",
+                (approval_id, resolved_at_ms),
+            )?;
+            transaction.execute(
+                "UPDATE workflow_activations SET status = 'failed' \
+                 WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 \
+                   AND status = 'waiting_mutation_approval'",
+                (&run_id, &node_id, &activation_id),
+            )?;
+            transaction.execute(
+                "UPDATE workflow_runs SET status = 'failed', updated_at_ms = ?2 \
+                 WHERE run_id = ?1 AND status = 'running'",
+                (&run_id, resolved_at_ms),
+            )?;
+            append_event(
+                &transaction,
+                &run_id,
+                "mutation_approval_expired",
+                &serde_json::json!({"approval_id": approval_id}).to_string(),
+                resolved_at_ms,
+            )?;
+            transaction.commit()?;
+            return Ok(WorkflowMutationApprovalResolution {
+                approval_id: approval_id.to_string(),
+                status: "expired".to_string(),
+                grant_id: None,
+                activation_status: "failed".to_string(),
+            });
+        }
+        let scope: bcode_workflow::WorkflowMutationGrantScope = serde_json::from_str(&scope_json)?;
+        scope
+            .validate()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        let input = input_json.unwrap_or_else(|| "null".to_string());
+        if scope.definition_id != definition_id
+            || scope.definition_version != definition_version
+            || scope.run_id != run_id
+            || scope.node_id != node_id
+            || scope.activation_id != activation_id
+            || scope.workspace_snapshot != workspace_snapshot
+            || sha256_hex(input.as_bytes()) != scope.input_checksum_sha256
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "mutation approval scope became stale before decision".to_string(),
+            ));
+        }
+        let decision_id = format!("mutation-approval:{approval_id}");
+        let decision_value = serde_json::json!({
+            "approval_id": approval_id,
+            "decision": expected_status,
+            "scope": scope,
+        });
+        transaction.execute(
+            "INSERT INTO workflow_decisions \
+             (decision_id, run_id, node_id, decision_type, value_json, created_at_ms) \
+             VALUES (?1, ?2, ?3, 'mutation_approval', ?4, ?5)",
+            (
+                &decision_id,
+                &run_id,
+                &node_id,
+                &serde_json::to_string(&decision_value)?,
+                resolved_at_ms,
+            ),
+        )?;
+        match decision {
+            WorkflowMutationApprovalDecision::Approve => {
+                let grant_id = format!("mutation-grant:{approval_id}");
+                transaction.execute(
+                    "INSERT INTO workflow_grants \
+                     (grant_id, run_id, node_id, scope_json, granted_at_ms, expires_at_ms) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (
+                        &grant_id,
+                        &run_id,
+                        &node_id,
+                        &scope_json,
+                        resolved_at_ms,
+                        expires_at_ms,
+                    ),
+                )?;
+                transaction.execute(
+                    "UPDATE workflow_mutation_approvals SET status = 'approved', \
+                     resolved_at_ms = ?2, grant_id = ?3 WHERE approval_id = ?1 AND status = 'pending'",
+                    (approval_id, resolved_at_ms, &grant_id),
+                )?;
+                let changed = transaction.execute(
+                    "UPDATE workflow_activations SET status = 'pending' \
+                     WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 \
+                       AND status = 'waiting_mutation_approval'",
+                    (&run_id, &node_id, &activation_id),
+                )?;
+                if changed != 1 {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "approved mutation activation is no longer waiting".to_string(),
+                    ));
+                }
+                append_event(
+                    &transaction,
+                    &run_id,
+                    "mutation_approval_approved",
+                    &decision_value.to_string(),
+                    resolved_at_ms,
+                )?;
+                transaction.commit()?;
+                Ok(WorkflowMutationApprovalResolution {
+                    approval_id: approval_id.to_string(),
+                    status: "approved".to_string(),
+                    grant_id: Some(grant_id),
+                    activation_status: "pending".to_string(),
+                })
+            }
+            WorkflowMutationApprovalDecision::Deny => {
+                transaction.execute(
+                    "UPDATE workflow_mutation_approvals SET status = 'denied', resolved_at_ms = ?2 \
+                     WHERE approval_id = ?1 AND status = 'pending'",
+                    (approval_id, resolved_at_ms),
+                )?;
+                transaction.execute(
+                    "UPDATE workflow_activations SET status = 'failed' \
+                     WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 \
+                       AND status = 'waiting_mutation_approval'",
+                    (&run_id, &node_id, &activation_id),
+                )?;
+                transaction.execute(
+                    "UPDATE workflow_runs SET status = 'failed', updated_at_ms = ?2 \
+                     WHERE run_id = ?1 AND status = 'running'",
+                    (&run_id, resolved_at_ms),
+                )?;
+                append_event(
+                    &transaction,
+                    &run_id,
+                    "mutation_approval_denied",
+                    &decision_value.to_string(),
+                    resolved_at_ms,
+                )?;
+                transaction.commit()?;
+                Ok(WorkflowMutationApprovalResolution {
+                    approval_id: approval_id.to_string(),
+                    status: "denied".to_string(),
+                    grant_id: None,
+                    activation_status: "failed".to_string(),
+                })
+            }
+        }
+    }
+
+    /// Load bounded pending mutation approval requests for one run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid identity/limit or malformed durable state.
+    pub fn pending_mutation_approvals(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkflowMutationApproval>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT approval_id, node_id, activation_id, scope_json, requested_at_ms, expires_at_ms \
+             FROM workflow_mutation_approvals WHERE run_id = ?1 AND status = 'pending' \
+             ORDER BY requested_at_ms, approval_id LIMIT ?2",
+        )?;
+        statement
+            .query_map((run_id, limit), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u64>(4)?,
+                    row.get::<_, Option<u64>>(5)?,
+                ))
+            })?
+            .map(|row| {
+                let (
+                    approval_id,
+                    node_id,
+                    activation_id,
+                    scope_json,
+                    requested_at_ms,
+                    expires_at_ms,
+                ) = row?;
+                Ok(WorkflowMutationApproval {
+                    approval_id,
+                    run_id: run_id.to_string(),
+                    node_id,
+                    activation_id,
+                    scope: serde_json::from_str(&scope_json)?,
+                    requested_at_ms,
+                    expires_at_ms,
+                })
+            })
+            .collect()
+    }
+
     /// Load one exact durable workflow grant.
     ///
     /// # Errors
@@ -2034,6 +2467,7 @@ impl WorkflowStore {
             activation,
             attempt,
             dispatch_identity,
+            intent: prepared.intent,
         }))
     }
 
@@ -3252,6 +3686,11 @@ impl WorkflowStore {
             (run_id, requested_at_ms),
         )?;
         if changed == 1 {
+            let cancelled_approvals = transaction.execute(
+                "UPDATE workflow_mutation_approvals SET status = 'cancelled', resolved_at_ms = ?2 \
+                 WHERE run_id = ?1 AND status = 'pending'",
+                (run_id, requested_at_ms),
+            )?;
             append_event(
                 &transaction,
                 run_id,
@@ -3259,6 +3698,15 @@ impl WorkflowStore {
                 &serde_json::json!({"requested_at_ms": requested_at_ms}).to_string(),
                 requested_at_ms,
             )?;
+            if cancelled_approvals > 0 {
+                append_event(
+                    &transaction,
+                    run_id,
+                    "mutation_approvals_cancelled",
+                    &serde_json::json!({"count": cancelled_approvals}).to_string(),
+                    requested_at_ms,
+                )?;
+            }
         } else if transaction
             .query_row(
                 "SELECT cancellation_requested_at_ms IS NOT NULL FROM workflow_runs \
@@ -4526,7 +4974,7 @@ fn prepared_read_only_dispatches(
     let mut statement = connection.prepare(
         "SELECT attempt.run_id, attempt.node_id, attempt.activation_id, attempt.attempt, \
          attempt.dispatch_identity, activation.dependency_generation, activation.input_json, \
-         activation.created_at_ms, definition.definition_json \
+         activation.created_at_ms, definition.definition_json, attempt.intent_json \
          FROM workflow_attempts attempt \
          JOIN workflow_activations activation ON activation.run_id = attempt.run_id \
            AND activation.node_id = attempt.node_id \
@@ -4551,6 +4999,7 @@ fn prepared_read_only_dispatches(
                 row.get::<_, Option<String>>(6)?,
                 row.get::<_, u64>(7)?,
                 row.get::<_, String>(8)?,
+                row.get::<_, String>(9)?,
             ))
         })?
         .map(|row| {
@@ -4564,6 +5013,7 @@ fn prepared_read_only_dispatches(
                 input_json,
                 created_at_ms,
                 definition_json,
+                intent_json,
             ) = row?;
             let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
             let node = definition.node(&node_id).cloned().ok_or_else(|| {
@@ -4585,6 +5035,7 @@ fn prepared_read_only_dispatches(
                 },
                 attempt,
                 dispatch_identity,
+                intent: serde_json::from_str(&intent_json)?,
             })
         })
         .collect()
@@ -5468,7 +5919,7 @@ fn finalize_run_cancellation_if_settled(
         transaction.execute(
             "UPDATE workflow_activations SET status = 'cancelled' \
              WHERE run_id = ?1 AND status IN ('pending', 'running', 'waiting_input', \
-             'waiting_approval') AND output_id IS NULL",
+             'waiting_approval', 'waiting_mutation_approval') AND output_id IS NULL",
             [run_id],
         )?;
         append_event(transaction, run_id, "run_cancelled", "{}", cancelled_at_ms)?;
@@ -5637,6 +6088,35 @@ fn validate_decision(decision: &WorkflowDecision) -> Result<(), WorkflowStoreErr
     validate_id("decision_type", &decision.decision_type)?;
     if let Some(node_id) = &decision.node_id {
         validate_id("node_id", node_id)?;
+    }
+    Ok(())
+}
+
+fn validate_mutation_approval(
+    approval: &WorkflowMutationApproval,
+) -> Result<(), WorkflowStoreError> {
+    for (label, value) in [
+        ("approval_id", approval.approval_id.as_str()),
+        ("run_id", approval.run_id.as_str()),
+        ("node_id", approval.node_id.as_str()),
+        ("activation_id", approval.activation_id.as_str()),
+    ] {
+        validate_id(label, value)?;
+    }
+    approval
+        .scope
+        .validate()
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    if approval.scope.run_id != approval.run_id
+        || approval.scope.node_id != approval.node_id
+        || approval.scope.activation_id != approval.activation_id
+        || approval
+            .expires_at_ms
+            .is_some_and(|expires| expires <= approval.requested_at_ms)
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "mutation approval scope or expiry does not match its durable identity".to_string(),
+        ));
     }
     Ok(())
 }
@@ -6077,6 +6557,22 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
              expires_at_ms INTEGER,\
              FOREIGN KEY (run_id) REFERENCES workflow_runs(run_id)\
          );\
+         CREATE TABLE IF NOT EXISTS workflow_mutation_approvals (\
+             approval_id TEXT PRIMARY KEY NOT NULL,\
+             run_id TEXT NOT NULL,\
+             node_id TEXT NOT NULL,\
+             activation_id TEXT NOT NULL,\
+             scope_json TEXT NOT NULL,\
+             status TEXT NOT NULL CHECK (status IN ('pending', 'approved', 'denied', 'cancelled', 'expired')),\
+             requested_at_ms INTEGER NOT NULL,\
+             resolved_at_ms INTEGER,\
+             expires_at_ms INTEGER,\
+             grant_id TEXT,\
+             FOREIGN KEY (run_id, node_id, activation_id)\
+                 REFERENCES workflow_activations(run_id, node_id, activation_id)\
+         );\
+         CREATE INDEX IF NOT EXISTS idx_workflow_mutation_approvals_pending \
+             ON workflow_mutation_approvals(run_id, status, requested_at_ms);\
          CREATE TABLE IF NOT EXISTS workflow_resource_leases (\
              lease_id TEXT PRIMARY KEY NOT NULL,\
              run_id TEXT NOT NULL,\
@@ -6205,6 +6701,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use bcode_workflow::{Step, WorkflowBuilder};
+    use std::collections::BTreeMap;
 
     fn definition(name: &str) -> WorkflowDefinition {
         WorkflowBuilder::new(
@@ -6342,6 +6839,404 @@ mod tests {
         .expect("workflow")
         .definition()
         .clone()
+    }
+
+    fn mutation_approval_definition() -> WorkflowDefinition {
+        let schema = bcode_workflow::ValueSchema::of::<serde_json::Value>();
+        WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "mutation-approval".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([(
+                "git.commit".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "git.commit".to_string(),
+                    name: "commit".to_string(),
+                    kind: bcode_workflow::NodeKind::PluginBlock,
+                    input: schema.clone(),
+                    output: schema,
+                    resources: Vec::new(),
+                    configuration: serde_json::json!({}),
+                },
+            )]),
+            entries: vec!["git.commit".to_string()],
+            exits: vec!["git.commit".to_string()],
+            edges: Vec::new(),
+        }
+    }
+
+    fn mutation_approval(input: &serde_json::Value) -> WorkflowMutationApproval {
+        let input_json = serde_json::to_string(input).expect("input");
+        WorkflowMutationApproval {
+            approval_id: "approval-1".to_string(),
+            run_id: "mutation-run".to_string(),
+            node_id: "git.commit".to_string(),
+            activation_id: activation_identity("mutation-run", "git.commit", 0),
+            scope: bcode_workflow::WorkflowMutationGrantScope {
+                version: bcode_workflow::WORKFLOW_MUTATION_GRANT_SCOPE_VERSION,
+                definition_id: "mutation-definition".to_string(),
+                definition_version: 1,
+                run_id: "mutation-run".to_string(),
+                node_id: "git.commit".to_string(),
+                activation_id: activation_identity("mutation-run", "git.commit", 0),
+                workspace_snapshot: "snapshot-1".to_string(),
+                plugin_id: "bcode.git".to_string(),
+                block_id: "git.commit".to_string(),
+                block_version: 1,
+                operation: "git.commit".to_string(),
+                input_checksum_sha256: sha256_hex(input_json.as_bytes()),
+                input_summary: input.clone(),
+                resource_claims: vec![bcode_workflow::ResourceClaim {
+                    resource: "repository".to_string(),
+                    access: bcode_workflow::ResourceAccess::Write,
+                }],
+                reconciliation: bcode_workflow::WorkflowBlockReconciliation::RepairRequired,
+                capability: bcode_workflow::WorkflowToolCapability::Mutating,
+            },
+            requested_at_ms: 20,
+            expires_at_ms: Some(100),
+        }
+    }
+
+    #[test]
+    fn mutation_approval_cancellation_settles_wait_without_grant_or_attempt() {
+        let temp = tempfile::tempdir().expect("temp");
+        let input = serde_json::json!({"expected_head": "abc"});
+        let approval = mutation_approval(&input);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("mutation-definition", 1, &mutation_approval_definition())
+            .expect("definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "mutation-run".to_string(),
+                definition_id: "mutation-definition".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot-1".to_string(),
+                parent_session_id: None,
+                binding: None,
+                input: Some(input),
+                created_at_ms: 10,
+                limits: WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        store.request_mutation_approval(&approval).expect("request");
+        assert!(
+            store
+                .request_cancellation("mutation-run", 30)
+                .expect("cancel")
+        );
+        assert!(
+            store
+                .pending_mutation_approvals("mutation-run", 10)
+                .expect("approvals")
+                .is_empty()
+        );
+        assert!(
+            store
+                .grants_for_run("mutation-run", 10)
+                .expect("grants")
+                .is_empty()
+        );
+        assert!(
+            store
+                .attempt_history("mutation-run", None, 10)
+                .expect("attempts")
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .run_summary("mutation-run")
+                .expect("run")
+                .expect("run")
+                .status,
+            RunStatus::Cancelled
+        );
+        assert!(
+            store
+                .resolve_mutation_approval(
+                    &approval.approval_id,
+                    WorkflowMutationApprovalDecision::Approve,
+                    31,
+                )
+                .is_err()
+        );
+    }
+
+    struct MutationDispatchOwner(std::sync::atomic::AtomicUsize);
+
+    impl ActivationDispatchOwner for MutationDispatchOwner {
+        fn plan(
+            &self,
+            _activation: &PendingActivation,
+        ) -> Result<Option<ActivationDispatchPlan>, WorkflowStoreError> {
+            Ok(Some(ActivationDispatchPlan {
+                side_effect: DispatchSideEffect::Mutating,
+                intent: serde_json::json!({"operation": "git.commit"}),
+            }))
+        }
+
+        fn dispatch<'a>(
+            &'a self,
+            request: &'a PreparedActivationDispatch,
+        ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, WorkflowStoreError>> + Send + 'a>>
+        {
+            Box::pin(async move {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(serde_json::json!({"dispatch_identity": request.dispatch_identity}))
+            })
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn mutation_approval_approve_persists_grant_before_restart_dispatchability() {
+        let temp = tempfile::tempdir().expect("temp");
+        let input = serde_json::json!({"expected_head": "abc"});
+        let approval = mutation_approval(&input);
+        {
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            store
+                .persist_definition("mutation-definition", 1, &mutation_approval_definition())
+                .expect("definition");
+            store
+                .create_run(&NewWorkflowRun {
+                    run_id: "mutation-run".to_string(),
+                    definition_id: "mutation-definition".to_string(),
+                    definition_version: 1,
+                    workspace_snapshot: "snapshot-1".to_string(),
+                    parent_session_id: None,
+                    binding: None,
+                    input: Some(input),
+                    created_at_ms: 10,
+                    limits: WorkflowRunLimits::default(),
+                })
+                .expect("run");
+            store.request_mutation_approval(&approval).expect("request");
+            let resolved = store
+                .resolve_mutation_approval(
+                    &approval.approval_id,
+                    WorkflowMutationApprovalDecision::Approve,
+                    30,
+                )
+                .expect("approve");
+            assert_eq!(resolved.status, "approved");
+            assert_eq!(resolved.activation_status, "pending");
+            let grant_id = resolved.grant_id.expect("grant");
+            let grant = store
+                .grant(&grant_id)
+                .expect("grant lookup")
+                .expect("grant");
+            assert_eq!(
+                grant.scope,
+                serde_json::to_value(&approval.scope).expect("scope")
+            );
+            assert_eq!(store.pending_activations(10).expect("pending").len(), 1);
+            assert_eq!(
+                store
+                    .resolve_mutation_approval(
+                        &approval.approval_id,
+                        WorkflowMutationApprovalDecision::Approve,
+                        31,
+                    )
+                    .expect("duplicate approve")
+                    .grant_id
+                    .as_deref(),
+                Some(grant_id.as_str())
+            );
+            assert!(
+                store
+                    .resolve_mutation_approval(
+                        &approval.approval_id,
+                        WorkflowMutationApprovalDecision::Deny,
+                        32,
+                    )
+                    .is_err()
+            );
+        }
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(store.pending_activations(10).expect("pending").len(), 1);
+        assert!(
+            store
+                .attempt_history("mutation-run", None, 10)
+                .expect("attempts")
+                .is_empty()
+        );
+        let owner = MutationDispatchOwner(std::sync::atomic::AtomicUsize::new(0));
+        let first = store
+            .dispatch_pending_activations(&owner, 10, 40)
+            .await
+            .expect("dispatch after restart");
+        assert_eq!(first.admitted.len(), 1);
+        let dispatch_identity = first.admitted[0].clone();
+        assert_eq!(owner.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(
+            store
+                .dispatch_pending_activations(&owner, 10, 41)
+                .await
+                .expect("second scan")
+                .admitted
+                .is_empty()
+        );
+        assert_eq!(owner.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let attempts = store
+            .attempt_history("mutation-run", None, 10)
+            .expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].dispatch_identity, dispatch_identity);
+    }
+
+    #[test]
+    fn mutation_approval_deny_and_expiry_never_dispatch() {
+        for (decision, resolved_at_ms, expected) in [
+            (WorkflowMutationApprovalDecision::Deny, 30, "denied"),
+            (WorkflowMutationApprovalDecision::Approve, 100, "expired"),
+        ] {
+            let temp = tempfile::tempdir().expect("temp");
+            let input = serde_json::json!({"expected_head": "abc"});
+            let approval = mutation_approval(&input);
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            store
+                .persist_definition("mutation-definition", 1, &mutation_approval_definition())
+                .expect("definition");
+            store
+                .create_run(&NewWorkflowRun {
+                    run_id: "mutation-run".to_string(),
+                    definition_id: "mutation-definition".to_string(),
+                    definition_version: 1,
+                    workspace_snapshot: "snapshot-1".to_string(),
+                    parent_session_id: None,
+                    binding: None,
+                    input: Some(input),
+                    created_at_ms: 10,
+                    limits: WorkflowRunLimits::default(),
+                })
+                .expect("run");
+            store.request_mutation_approval(&approval).expect("request");
+            let resolved = store
+                .resolve_mutation_approval(&approval.approval_id, decision, resolved_at_ms)
+                .expect("resolution");
+            assert_eq!(resolved.status, expected);
+            assert!(resolved.grant_id.is_none());
+            assert!(store.pending_activations(10).expect("pending").is_empty());
+            assert!(
+                store
+                    .attempt_history("mutation-run", None, 10)
+                    .expect("attempts")
+                    .is_empty()
+            );
+            assert_eq!(
+                store
+                    .run_summary("mutation-run")
+                    .expect("run")
+                    .expect("run")
+                    .status,
+                RunStatus::Failed
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_approval_wait_is_exact_persisted_and_restart_safe() {
+        let temp = tempfile::tempdir().expect("temp");
+        let input = serde_json::json!({"expected_head": "abc", "paths": ["src/lib.rs"]});
+        {
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            store
+                .persist_definition("mutation-definition", 1, &mutation_approval_definition())
+                .expect("definition");
+            store
+                .create_run(&NewWorkflowRun {
+                    run_id: "mutation-run".to_string(),
+                    definition_id: "mutation-definition".to_string(),
+                    definition_version: 1,
+                    workspace_snapshot: "snapshot-1".to_string(),
+                    parent_session_id: None,
+                    binding: None,
+                    input: Some(input.clone()),
+                    created_at_ms: 10,
+                    limits: WorkflowRunLimits::default(),
+                })
+                .expect("run");
+            let approval = mutation_approval(&input);
+            store
+                .request_mutation_approval(&approval)
+                .expect("request approval");
+            store
+                .request_mutation_approval(&approval)
+                .expect("idempotent request");
+            assert!(store.pending_activations(10).expect("pending").is_empty());
+            assert_eq!(
+                store
+                    .pending_mutation_approvals("mutation-run", 10)
+                    .expect("approvals"),
+                vec![approval]
+            );
+            assert!(
+                store
+                    .attempt_history("mutation-run", None, 10)
+                    .expect("attempts")
+                    .is_empty()
+            );
+        }
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(
+            store
+                .pending_mutation_approvals("mutation-run", 10)
+                .expect("reopened approvals")
+                .len(),
+            1
+        );
+        assert!(store.pending_activations(10).expect("pending").is_empty());
+    }
+
+    #[test]
+    fn mutation_approval_rejects_stale_or_wrong_identity_without_waiting() {
+        let temp = tempfile::tempdir().expect("temp");
+        let input = serde_json::json!({"expected_head": "abc"});
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("mutation-definition", 1, &mutation_approval_definition())
+            .expect("definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "mutation-run".to_string(),
+                definition_id: "mutation-definition".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot-1".to_string(),
+                parent_session_id: None,
+                binding: None,
+                input: Some(input.clone()),
+                created_at_ms: 10,
+                limits: WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let mut stale = mutation_approval(&input);
+        stale.scope.input_checksum_sha256 = "0".repeat(64);
+        assert!(store.request_mutation_approval(&stale).is_err());
+        let mut wrong_workspace = mutation_approval(&input);
+        wrong_workspace.scope.workspace_snapshot = "other".to_string();
+        assert!(store.request_mutation_approval(&wrong_workspace).is_err());
+        let mut wrong_run = mutation_approval(&input);
+        wrong_run.run_id = "other-run".to_string();
+        wrong_run.scope.run_id = "other-run".to_string();
+        assert!(store.request_mutation_approval(&wrong_run).is_err());
+        let mut wrong_node = mutation_approval(&input);
+        wrong_node.node_id = "other-node".to_string();
+        wrong_node.scope.node_id = "other-node".to_string();
+        assert!(store.request_mutation_approval(&wrong_node).is_err());
+        let mut wrong_activation = mutation_approval(&input);
+        wrong_activation.activation_id = "other-activation".to_string();
+        wrong_activation.scope.activation_id = "other-activation".to_string();
+        assert!(store.request_mutation_approval(&wrong_activation).is_err());
+        assert_eq!(store.pending_activations(10).expect("pending").len(), 1);
+        assert!(
+            store
+                .pending_mutation_approvals("mutation-run", 10)
+                .expect("approvals")
+                .is_empty()
+        );
     }
 
     fn new_run() -> NewWorkflowRun {

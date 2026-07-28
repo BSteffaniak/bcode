@@ -32,14 +32,50 @@ Current durable support is:
 * supported: `Agent`, `Branch`, `Repeat`, wait-all `Parallel`, `PluginBlock`, `Input`, and
   `Approval`;
 * in-process-only: closure-backed `Task`;
-* rejected pending complete durable behavior: `Retry`, retry edges, `FanOut`, fail-fast parallel,
-  and declarative transforms.
+* rejected pending complete durable behavior: `Retry`, retry edges, `FanOut`, and fail-fast
+  parallel.
+
+Versioned bounded declarative edge transforms are supported for direct, conditional, repeat, and
+canonical parallel join materialization.
 
 Registration rejects unsupported definitions before persistence and resolves every plugin block to
 an exact enabled manifest declaration. Start repeats the same admission and resolution so a
 previously registered definition fails closed when its owner plugin is disabled or incompatible.
 Unsupported definitions and unavailable capabilities use the stable IPC error codes
 `workflow_definition_unsupported` and `workflow_capability_unavailable`.
+
+Versioned durable agent configuration is serialized into definition identity and covers execution
+target, profile, provider/model, structured output, read-only/tool policy, allowlist, timeout,
+prompt, and exact required/preferred/disabled skill IDs. Before prepared intent, the server resolves
+required and preferred skills against the bounded registry. Required failures fail closed; preferred
+failures omit context with a bounded diagnostic; disabled selections never attach. Exact resolved
+context and source/model-policy metadata enter the prepared intent and the immutable turn execution
+metadata, so attachment is turn-local and never mutates session-wide active-skill state. Compatible
+skill model policy is applied to the turn-local provider/model selection, while conflicting required
+selection fails closed. Read-only workflow agents require read-only tool capability and reject skills
+that declare tool access.
+
+## Durable mutation approval requests
+
+Mutating plugin-block approval uses `WorkflowMutationGrantScope` version 1. Its immutable identity
+binds definition/version, run, node, activation, workspace snapshot, plugin/block/version/operation,
+mutating capability, and the SHA-256 checksum of the canonical activation input. The workflow store
+persists this request and changes the activation from `pending` to `waiting_mutation_approval` in
+one transaction. No attempt is prepared and no owner is called first. Equivalent duplicate requests
+are idempotent; stale input, workspace, or activation identity fails closed. Pending requests are
+bounded and survive restart.
+
+Resolution is also one transaction. Approval writes the immutable decision and exact grant before
+changing the activation back to `pending`; denial writes the decision and fails the activation/run
+without dispatch. Expired requests fail closed without a grant. Equivalent duplicate approvals
+return the existing grant, while conflicting later decisions fail. Bounded indexed request/grant
+queries expose identity and status without activation input. Approved pending work and its single
+exact grant survive restart with no attempt created before scheduler admission. Portable IPC and
+client APIs list bounded pending approvals and resolve exact approval IDs with typed approve/deny
+decisions and typed resolution results; the server delegates those operations to the same atomic
+store boundary. Run cancellation changes pending approvals to `cancelled` in the cancellation-intent
+transaction before normal run finalization, creating no grant or attempt and rejecting later
+approval decisions.
 
 ## Initial normalized schema
 

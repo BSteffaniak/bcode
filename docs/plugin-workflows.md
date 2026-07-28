@@ -16,6 +16,14 @@ Registration and start both rerun production admission. Plugin block nodes must 
 byte-equivalent enabled manifest declaration, so a definition cannot be persisted or started with
 an ownerless or stale block contract.
 
+Durable agent nodes use the versioned `WorkflowAgentConfiguration` contract. The server resolves
+required/preferred/disabled skill selections before preparing external dispatch and embeds exact
+bounded resolved context in the prepared intent and immutable turn metadata. Required resolution
+fails closed, preferred failures omit context with a bounded diagnostic, and read-only nodes reject
+skills declaring tool access. Compatible skill model policy updates only that turn's provider/model
+selection; conflicting required selection fails closed. This does not modify session-wide active-skill
+state.
+
 Use typed workflow composition for domain behavior and let the host own durable registration,
 execution, discovery, and lifecycle state.
 

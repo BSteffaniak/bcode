@@ -362,6 +362,16 @@ pub enum Request {
         activation_id: String,
         approved: bool,
     },
+    /// List bounded pending durable mutation approvals for one workflow run.
+    ListWorkflowMutationApprovals {
+        run_id: String,
+        limit: usize,
+    },
+    /// Resolve one exact durable mutation approval by stable approval identity.
+    ResolveWorkflowMutationApproval {
+        approval_id: String,
+        decision: bcode_workflow_store::WorkflowMutationApprovalDecision,
+    },
     /// Return one bounded page of durable workflow attempts.
     WorkflowAttemptHistory {
         run_id: String,
@@ -1155,6 +1165,7 @@ pub struct WorkflowRunInspection {
     pub run: bcode_workflow_store::WorkflowRunSummary,
     pub definition: bcode_workflow_store::StoredWorkflowDefinition,
     pub waits: Vec<bcode_workflow_store::WaitingActivation>,
+    pub mutation_approvals: Vec<bcode_workflow_store::WorkflowMutationApproval>,
     pub attempts: Vec<bcode_workflow_store::AttemptSummary>,
     pub events: Vec<bcode_workflow_store::WorkflowEventRow>,
     pub grants: Vec<bcode_workflow_store::WorkflowGrant>,
@@ -1440,6 +1451,12 @@ pub enum ResponsePayload {
     },
     WorkflowWaitResolved {
         result: bcode_workflow_store::WaitingResolutionResult,
+    },
+    WorkflowMutationApprovalList {
+        approvals: Vec<bcode_workflow_store::WorkflowMutationApproval>,
+    },
+    WorkflowMutationApprovalResolved {
+        result: bcode_workflow_store::WorkflowMutationApprovalResolution,
     },
     WorkflowAttemptHistory {
         attempts: Vec<bcode_workflow_store::AttemptSummary>,
@@ -2389,6 +2406,14 @@ mod tests {
                 node_id: "approve".to_string(),
                 activation_id: "activation-2".to_string(),
                 approved: true,
+            },
+            Request::ListWorkflowMutationApprovals {
+                run_id: "run-1".to_string(),
+                limit: 25,
+            },
+            Request::ResolveWorkflowMutationApproval {
+                approval_id: "approval-1".to_string(),
+                decision: bcode_workflow_store::WorkflowMutationApprovalDecision::Approve,
             },
             Request::WorkflowAttemptHistory {
                 run_id: "run-1".to_string(),

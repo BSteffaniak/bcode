@@ -13,7 +13,7 @@
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5;
 
-use bcode_skill_models::{SkillActivationMode, SkillId, SkillSource};
+use bcode_skill_models::{SkillActivationMode, SkillContextResponse, SkillId, SkillSource};
 pub use bcode_tool_models::{
     ToolContributionArtifact, ToolContributionEnvelope, ToolContributionEvent,
     ToolContributionOperation, ToolContributionPersistence, ToolContributionPlacement,
@@ -928,6 +928,9 @@ pub struct TurnExecutionOptions {
     /// Optional provider-neutral structured-output request for this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_output: Option<TurnStructuredOutputRequest>,
+    /// Exact bounded skill contexts resolved for this turn before external dispatch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skill_contexts: Vec<SkillContextResponse>,
 }
 
 /// Current persisted turn execution-options schema version.
@@ -948,6 +951,7 @@ impl Default for TurnExecutionOptions {
             provider_plugin_id: None,
             model_id: None,
             structured_output: None,
+            skill_contexts: Vec::new(),
         }
     }
 }
@@ -974,6 +978,8 @@ const MAX_TURN_PROVIDER_PLUGIN_ID_BYTES: usize = 256;
 const MAX_TURN_MODEL_ID_BYTES: usize = 512;
 const MAX_TURN_TOOL_ALLOWLIST_ENTRIES: usize = 256;
 const MAX_TURN_TOOL_NAME_BYTES: usize = 256;
+const MAX_TURN_SKILL_CONTEXTS: usize = 32;
+const MAX_TURN_SKILL_ID_BYTES: usize = 256;
 /// Maximum bytes in a provider-portable structured-output name.
 pub const MAX_TURN_STRUCTURED_OUTPUT_NAME_BYTES: usize = 64;
 const MAX_TURN_STRUCTURED_OUTPUT_SCHEMA_BYTES: usize = 256 * 1024;
@@ -1047,6 +1053,13 @@ pub enum TurnAdmissionMetadataError {
     StructuredOutputNameTooLong,
     StructuredOutputSchemaTooLarge,
     InvalidStructuredOutputSchema,
+    TooManySkillContexts,
+    EmptySkillId,
+    SkillIdTooLong,
+    DuplicateSkillContext,
+    InvalidSkillContextLength,
+    EmptySkillContext,
+    TruncatedSkillContext,
 }
 
 impl Display for TurnAdmissionMetadataError {
@@ -1085,6 +1098,17 @@ impl Display for TurnAdmissionMetadataError {
             Self::InvalidStructuredOutputSchema => {
                 "turn structured-output schema must be a JSON object"
             }
+            Self::TooManySkillContexts => "turn has too many resolved skill contexts",
+            Self::EmptySkillId => "turn skill context ID must not be empty",
+            Self::SkillIdTooLong => "turn skill context ID is too long",
+            Self::DuplicateSkillContext => "turn has a duplicate resolved skill context",
+            Self::InvalidSkillContextLength => {
+                "turn skill context byte count does not match its content"
+            }
+            Self::EmptySkillContext => "turn skill context must contain at least one byte",
+            Self::TruncatedSkillContext => {
+                "turn skill context must be complete rather than truncated"
+            }
         })
     }
 }
@@ -1110,6 +1134,36 @@ fn validate_structured_output_request(
     }
     if !request.schema.is_object() {
         return Err(TurnAdmissionMetadataError::InvalidStructuredOutputSchema);
+    }
+    Ok(())
+}
+
+fn validate_skill_contexts(
+    contexts: &[SkillContextResponse],
+) -> Result<(), TurnAdmissionMetadataError> {
+    if contexts.len() > MAX_TURN_SKILL_CONTEXTS {
+        return Err(TurnAdmissionMetadataError::TooManySkillContexts);
+    }
+    let mut skill_ids = std::collections::BTreeSet::new();
+    for skill in contexts {
+        if skill.skill_id.as_str().is_empty() {
+            return Err(TurnAdmissionMetadataError::EmptySkillId);
+        }
+        if skill.skill_id.as_str().len() > MAX_TURN_SKILL_ID_BYTES {
+            return Err(TurnAdmissionMetadataError::SkillIdTooLong);
+        }
+        if !skill_ids.insert(skill.skill_id.as_str()) {
+            return Err(TurnAdmissionMetadataError::DuplicateSkillContext);
+        }
+        if skill.bytes_loaded == 0 || skill.context.is_empty() {
+            return Err(TurnAdmissionMetadataError::EmptySkillContext);
+        }
+        if skill.bytes_loaded != skill.context.len() {
+            return Err(TurnAdmissionMetadataError::InvalidSkillContextLength);
+        }
+        if skill.truncated {
+            return Err(TurnAdmissionMetadataError::TruncatedSkillContext);
+        }
     }
     Ok(())
 }
@@ -1208,6 +1262,7 @@ impl TurnAdmissionMetadata {
         if let Some(request) = &self.execution.structured_output {
             validate_structured_output_request(request)?;
         }
+        validate_skill_contexts(&self.execution.skill_contexts)?;
         Ok(())
     }
 

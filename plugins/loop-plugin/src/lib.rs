@@ -5,6 +5,7 @@
 //! Workflow-native deterministic prompt loops for Bcode sessions.
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -148,6 +149,16 @@ fn associated_workflow_run(
     })
 }
 
+fn associated_workflow_inspection(
+    session_id: SessionId,
+) -> Result<Option<bcode_ipc::WorkflowRunInspection>, LoopIpcError> {
+    run_async(async move {
+        BcodeClient::default_endpoint()
+            .inspect_associated_workflow_run(workflow_binding_key(session_id), 100)
+            .await
+    })
+}
+
 fn control_associated_workflow_run(
     session_id: SessionId,
     action: bcode_ipc::WorkflowRunControlAction,
@@ -198,6 +209,18 @@ fn format_workflow_status(run: &bcode_workflow_store::WorkflowRunSummary) -> Str
     )
 }
 
+fn format_workflow_inspection_status(inspection: &bcode_ipc::WorkflowRunInspection) -> String {
+    let mut status = format_workflow_status(&inspection.run);
+    if !inspection.mutation_approvals.is_empty() {
+        let _ = write!(
+            status,
+            " · {} mutation approval(s) waiting",
+            inspection.mutation_approvals.len()
+        );
+    }
+    status
+}
+
 fn format_plugin_workflow_status(run: &bcode_plugin_sdk::tui::PluginWorkflowSummary) -> String {
     if run.status == bcode_plugin_sdk::tui::PluginWorkflowStatus::RepairRequired {
         return format!(
@@ -226,8 +249,8 @@ const fn unsupported_legacy_message() -> &'static str {
 }
 
 fn status_for_session(session_id: SessionId) -> InvokeCommandResponse {
-    match associated_workflow_run(session_id) {
-        Ok(Some(run)) => status_response(&format_workflow_status(&run)),
+    match associated_workflow_inspection(session_id) {
+        Ok(Some(inspection)) => status_response(&format_workflow_inspection_status(&inspection)),
         Ok(None) if legacy_state_exists(session_id) => {
             status_response(unsupported_legacy_message())
         }
@@ -868,35 +891,196 @@ struct LoopWorkflowIteration {
     summary: String,
 }
 
+#[allow(dead_code)]
+const WORKFLOW_COMMIT_MESSAGE_CONTRACT_VERSION: u32 = 1;
+#[allow(dead_code)]
+const MAX_COMMIT_MESSAGE_TITLE_BYTES: usize = 72;
+#[allow(dead_code)]
+const MAX_COMMIT_MESSAGE_DESCRIPTION_BYTES: usize = 4_096;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CommitMessageRequest {
+    version: u32,
+    repository_root: String,
+    expected_head: String,
+    paths: Vec<String>,
+}
+
+#[allow(dead_code)]
+impl CommitMessageRequest {
+    fn validate(&self) -> Result<(), String> {
+        if self.version != WORKFLOW_COMMIT_MESSAGE_CONTRACT_VERSION
+            || self.repository_root.trim().is_empty()
+            || self.repository_root.len() > 4_096
+            || self.expected_head.trim().is_empty()
+            || self.expected_head.len() > 256
+            || self.paths.is_empty()
+            || self.paths.len() > 1_024
+        {
+            return Err("commit-message request identity or bounds are invalid".to_string());
+        }
+        let paths = self.paths.iter().collect::<std::collections::BTreeSet<_>>();
+        if paths.len() != self.paths.len()
+            || self
+                .paths
+                .iter()
+                .any(|path| path.trim().is_empty() || path.len() > 4_096)
+        {
+            return Err(
+                "commit-message request paths must be unique, non-empty, and bounded".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct CommitMessageResult {
+    version: u32,
+    title: String,
+    description: String,
+}
+
+#[allow(dead_code)]
+impl CommitMessageResult {
+    fn validate(&self) -> Result<(), String> {
+        if self.version != WORKFLOW_COMMIT_MESSAGE_CONTRACT_VERSION {
+            return Err("unsupported commit-message result version".to_string());
+        }
+        let title = self.title.trim();
+        let description = self.description.trim();
+        if title.is_empty()
+            || title.len() > MAX_COMMIT_MESSAGE_TITLE_BYTES
+            || title.contains(['\r', '\n'])
+            || description.is_empty()
+            || description.len() > MAX_COMMIT_MESSAGE_DESCRIPTION_BYTES
+            || description.contains('\r')
+        {
+            return Err(
+                "commit-message title/description content is invalid or unbounded".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    fn commit_message(&self) -> Result<String, String> {
+        self.validate()?;
+        Ok(format!(
+            "{}\n\n{}",
+            self.title.trim(),
+            self.description.trim()
+        ))
+    }
+}
+
+#[allow(dead_code)]
+fn commit_message_agent_configuration(
+    skill_id: &str,
+) -> Result<bcode_workflow::WorkflowAgentConfiguration, String> {
+    if skill_id.trim().is_empty() || skill_id.len() > 256 {
+        return Err("commit-message skill ID is invalid".to_string());
+    }
+    Ok(bcode_workflow::WorkflowAgentConfiguration {
+        version: bcode_workflow::WORKFLOW_AGENT_CONFIGURATION_VERSION,
+        execution_target: bcode_workflow::AgentExecutionTarget::FreshIsolated,
+        agent_profile: "plan".to_string(),
+        provider: None,
+        model: None,
+        structured_output: bcode_workflow::AgentStructuredOutputPolicy {
+            schema: bcode_workflow::ValueSchema::of::<CommitMessageResult>(),
+            strict: true,
+        },
+        read_only: true,
+        tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
+        tool_allowlist: vec!["git.diff".to_string()],
+        timeout_ms: 120_000,
+        skills: vec![bcode_workflow::AgentSkillSelection {
+            skill_id: skill_id.to_string(),
+            mode: bcode_workflow::AgentSkillActivationMode::Required,
+        }],
+        prompt_mode: "json_input".to_string(),
+        system_prompt: "Generate only the typed commit-message result for the exact repository snapshot and changed paths. Remain read-only and never commit or mutate Git state.".to_string(),
+    })
+}
+
+#[allow(dead_code)]
+fn commit_message_agent_step(
+    skill_id: &str,
+) -> Result<bcode_workflow::Step<CommitMessageRequest, CommitMessageResult>, String> {
+    let configuration = commit_message_agent_configuration(skill_id)?;
+    configuration
+        .validate()
+        .map_err(|error| error.to_string())?;
+    Ok(bcode_workflow::Step::configured_task(
+        "loop.commit-message",
+        bcode_workflow::NodeKind::Agent,
+        serde_json::to_value(configuration)
+            .map_err(|error| format!("commit-message agent configuration failed: {error}"))?,
+        |request: CommitMessageRequest, _context| async move {
+            request.validate().map_err(|error| {
+                bcode_workflow::WorkflowError::step("loop.commit-message", error)
+            })?;
+            Err(bcode_workflow::WorkflowError::step(
+                "loop.commit-message",
+                "durable host execution is required for the skill-backed commit-message node",
+            ))
+        },
+    ))
+}
+
+fn loop_agent_configuration(
+    system_prompt: &str,
+    read_only: bool,
+) -> bcode_workflow::WorkflowAgentConfiguration {
+    bcode_workflow::WorkflowAgentConfiguration {
+        version: bcode_workflow::WORKFLOW_AGENT_CONFIGURATION_VERSION,
+        execution_target: bcode_workflow::AgentExecutionTarget::SharedParentSequential,
+        agent_profile: if read_only { "plan" } else { "build" }.to_string(),
+        provider: None,
+        model: None,
+        structured_output: bcode_workflow::AgentStructuredOutputPolicy {
+            schema: bcode_workflow::ValueSchema::of::<LoopWorkflowIteration>(),
+            strict: true,
+        },
+        read_only,
+        tool_capability: if read_only {
+            bcode_workflow::WorkflowToolCapability::ReadOnly
+        } else {
+            bcode_workflow::WorkflowToolCapability::Mutating
+        },
+        tool_allowlist: Vec::new(),
+        timeout_ms: 3_600_000,
+        skills: Vec::new(),
+        prompt_mode: "json_input".to_string(),
+        system_prompt: system_prompt.to_string(),
+    }
+}
+
 fn loop_workflow_spec(
     input: &LoopWorkflowInput,
 ) -> Result<bcode_workflow::WorkflowSpec<LoopWorkflowIteration>, String> {
     let implementation = bcode_workflow::Step::configured_task(
         "loop.implementation",
         bcode_workflow::NodeKind::Agent,
-        serde_json::json!({
-            "agent_id": null,
-            "agent_profile_configured": false,
-            "system_prompt": "Implement the requested work. Preserve the workflow envelope fields including iteration, set condition_met false, and provide no evaluation evidence.",
-            "prompt_mode": "json_input",
-            "read_only": false,
-            "tools": null,
-            "loop_role": "implementation",
-        }),
+        serde_json::to_value(loop_agent_configuration(
+            "Implement the requested work. Preserve the workflow envelope fields including iteration, set condition_met false, and provide no evaluation evidence.",
+            false,
+        ))
+        .expect("loop agent configuration should serialize"),
         |state: LoopWorkflowIteration, _context| async move { Ok(state) },
     );
     let evaluation = bcode_workflow::Step::configured_task(
         "loop.evaluation",
         bcode_workflow::NodeKind::Agent,
-        serde_json::json!({
-            "agent_id": null,
-            "agent_profile_configured": false,
-            "system_prompt": "Read-only loop completion evaluation. Inspect repository/session state against stop_condition. Preserve implementation_prompt, stop_condition, max_iterations, and iteration. Return condition_met, non-empty concrete evidence, and a concise non-empty summary in the exact structured schema.",
-            "prompt_mode": "json_input",
-            "read_only": true,
-            "tools": null,
-            "loop_role": "evaluation",
-        }),
+        serde_json::to_value(loop_agent_configuration(
+            "Read-only loop completion evaluation. Inspect repository/session state against stop_condition. Preserve implementation_prompt, stop_condition, max_iterations, and iteration. Return condition_met, non-empty concrete evidence, and a concise non-empty summary in the exact structured schema.",
+            true,
+        ))
+        .expect("loop evaluation configuration should serialize"),
         |state: LoopWorkflowIteration, _context| async move { Ok(state) },
     );
     let cycle =
@@ -1016,6 +1200,88 @@ mod tests {
                 ))
             })
         }
+    }
+
+    #[test]
+    fn commit_message_contract_is_typed_bounded_and_read_only() {
+        let request = CommitMessageRequest {
+            version: WORKFLOW_COMMIT_MESSAGE_CONTRACT_VERSION,
+            repository_root: "/repo".to_string(),
+            expected_head: "0123456789abcdef".to_string(),
+            paths: vec!["src/lib.rs".to_string()],
+        };
+        request.validate().expect("request");
+        let result = CommitMessageResult {
+            version: WORKFLOW_COMMIT_MESSAGE_CONTRACT_VERSION,
+            title: "Add durable workflow skills".to_string(),
+            description: "Resolve exact skill context before dispatch.".to_string(),
+        };
+        assert_eq!(
+            result.commit_message().expect("message"),
+            "Add durable workflow skills\n\nResolve exact skill context before dispatch."
+        );
+        assert!(
+            CommitMessageResult {
+                title: "line one\nline two".to_string(),
+                ..result
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            CommitMessageRequest {
+                paths: vec!["src/lib.rs".to_string(), "src/lib.rs".to_string()],
+                ..request
+            }
+            .validate()
+            .is_err()
+        );
+
+        let step = commit_message_agent_step("commit-message").expect("step");
+        let workflow = bcode_workflow::WorkflowBuilder::new("commit-message", step)
+            .build()
+            .expect("workflow");
+        let node = &workflow.definition().nodes["loop.commit-message"];
+        let configuration: bcode_workflow::WorkflowAgentConfiguration =
+            serde_json::from_value(node.configuration.clone()).expect("configuration");
+        assert!(configuration.read_only);
+        assert_eq!(
+            configuration.tool_capability,
+            bcode_workflow::WorkflowToolCapability::ReadOnly
+        );
+        assert_eq!(configuration.tool_allowlist, ["git.diff"]);
+        assert_eq!(configuration.skills.len(), 1);
+        assert_eq!(
+            configuration.skills[0].mode,
+            bcode_workflow::AgentSkillActivationMode::Required
+        );
+        assert_eq!(
+            configuration.structured_output.schema.type_name,
+            std::any::type_name::<CommitMessageResult>()
+        );
+    }
+
+    #[test]
+    fn commit_message_contract_rejects_unbounded_content_and_invalid_skill() {
+        assert!(commit_message_agent_configuration("").is_err());
+        assert!(
+            CommitMessageResult {
+                version: WORKFLOW_COMMIT_MESSAGE_CONTRACT_VERSION,
+                title: "x".repeat(MAX_COMMIT_MESSAGE_TITLE_BYTES + 1),
+                description: "body".to_string(),
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            CommitMessageResult {
+                version: WORKFLOW_COMMIT_MESSAGE_CONTRACT_VERSION,
+                title: "title".to_string(),
+                description: "x".repeat(MAX_COMMIT_MESSAGE_DESCRIPTION_BYTES + 1),
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]

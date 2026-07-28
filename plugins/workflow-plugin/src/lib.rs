@@ -97,6 +97,16 @@ fn command_contributions() -> Vec<CommandContribution> {
             "Workflow: Provide Input",
             "Resolve a waiting input",
         ),
+        (
+            "workflow.approve-mutation",
+            "Workflow: Approve Mutation",
+            "Approve one exact pending mutation dispatch",
+        ),
+        (
+            "workflow.deny-mutation",
+            "Workflow: Deny Mutation",
+            "Deny one exact pending mutation dispatch",
+        ),
     ]
     .into_iter()
     .map(|(id, title, description)| CommandContribution {
@@ -254,6 +264,10 @@ pub(crate) async fn execute_command(
                 ),
                 ("waits".to_string(), serde_json::json!(inspection.waits)),
                 (
+                    "mutation_approvals".to_string(),
+                    serde_json::json!(inspection.mutation_approvals),
+                ),
+                (
                     "attempts".to_string(),
                     serde_json::json!(inspection.attempts),
                 ),
@@ -295,6 +309,23 @@ pub(crate) async fn execute_command(
                 .map_err(|error| error.to_string())?;
             options.insert("resolution".to_string(), serde_json::json!(result));
             "workflow input recorded".to_string()
+        }
+        "workflow.approve-mutation" | "workflow.deny-mutation" => {
+            let approval_id = required_arg(&request, "approval_id")?;
+            let decision = if request.command_id == "workflow.approve-mutation" {
+                bcode_workflow_store::WorkflowMutationApprovalDecision::Approve
+            } else {
+                bcode_workflow_store::WorkflowMutationApprovalDecision::Deny
+            };
+            let result = client
+                .resolve_workflow_mutation_approval(approval_id, decision)
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert(
+                "mutation_approval_resolution".to_string(),
+                serde_json::json!(result),
+            );
+            format!("workflow mutation approval {decision:?}")
         }
         command => return Err(format!("unsupported workflow command '{command}'")),
     };
@@ -448,6 +479,8 @@ mod tests {
             "workflow.inspect",
             "workflow.retry-node",
             "workflow.provide-input",
+            "workflow.approve-mutation",
+            "workflow.deny-mutation",
         ] {
             assert!(ids.contains(expected));
         }

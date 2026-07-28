@@ -32,6 +32,7 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
         Box::pin(async move {
             Ok(Box::new(WorkflowStatusSurface {
                 options: request.options,
+                selected_approval: 0,
             }) as BoxedPluginTuiSurface)
         })
     }
@@ -40,6 +41,7 @@ impl PluginTuiSurfaceFactory for WorkflowStatusFactory {
 #[derive(Debug)]
 struct WorkflowStatusSurface {
     options: serde_json::Value,
+    selected_approval: usize,
 }
 
 impl PluginTuiSurface for WorkflowStatusSurface {
@@ -53,7 +55,10 @@ impl PluginTuiSurface for WorkflowStatusSurface {
 
     fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
         frame.fill(area, " ", Style::new().fg(Color::White).bg(Color::Black));
-        for (offset, row) in surface_lines(&self.options).into_iter().enumerate() {
+        for (offset, row) in surface_lines(&self.options, self.selected_approval)
+            .into_iter()
+            .enumerate()
+        {
             if offset >= usize::from(area.height) {
                 break;
             }
@@ -66,17 +71,62 @@ impl PluginTuiSurface for WorkflowStatusSurface {
     }
 
     fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+        let approval_count =
+            mutation_approvals(&self.options).map_or(0, <[serde_json::Value]>::len);
         match event {
             Event::Key(key) if matches!(key.key, KeyCode::Escape | KeyCode::Char('q')) => {
                 PluginTuiAction::Close { outcome: None }
+            }
+            Event::Key(key) if matches!(key.key, KeyCode::Down | KeyCode::Char('j')) => {
+                if approval_count > 0 {
+                    self.selected_approval = (self.selected_approval + 1).min(approval_count - 1);
+                    PluginTuiAction::Redraw
+                } else {
+                    PluginTuiAction::None
+                }
+            }
+            Event::Key(key) if matches!(key.key, KeyCode::Up | KeyCode::Char('k')) => {
+                self.selected_approval = self.selected_approval.saturating_sub(1);
+                PluginTuiAction::Redraw
+            }
+            Event::Key(key) if matches!(key.key, KeyCode::Char('a' | 'd')) => {
+                let approve = key.key == KeyCode::Char('a');
+                mutation_approval_command(&self.options, self.selected_approval, approve)
+                    .map_or(PluginTuiAction::None, |command| {
+                        PluginTuiAction::RunCommand { command }
+                    })
             }
             _ => PluginTuiAction::None,
         }
     }
 }
 
+fn mutation_approval_command(
+    options: &serde_json::Value,
+    selected_approval: usize,
+    approve: bool,
+) -> Option<String> {
+    let approval_id = mutation_approvals(options)?
+        .get(selected_approval)?
+        .get("approval_id")?
+        .as_str()?;
+    let action = if approve {
+        "approve-mutation"
+    } else {
+        "deny-mutation"
+    };
+    Some(format!("/workflow {action} approval_id={approval_id}"))
+}
+
+fn mutation_approvals(options: &serde_json::Value) -> Option<&[serde_json::Value]> {
+    options
+        .get("mutation_approvals")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+}
+
 #[allow(clippy::too_many_lines)]
-fn surface_lines(options: &serde_json::Value) -> Vec<String> {
+fn surface_lines(options: &serde_json::Value, selected_approval: usize) -> Vec<String> {
     let command = options
         .get("command_id")
         .and_then(serde_json::Value::as_str)
@@ -130,6 +180,7 @@ fn surface_lines(options: &serde_json::Value) -> Vec<String> {
             text(value, "activation_id")
         )
     });
+    append_mutation_approvals(&mut lines, options, selected_approval);
     append_named_rows(&mut lines, options, "attempts", "Attempts", |value| {
         format!(
             "  {} #{} · {}",
@@ -264,6 +315,52 @@ fn append_runs(lines: &mut Vec<String>, runs: &[serde_json::Value]) {
     }
 }
 
+fn append_mutation_approvals(
+    lines: &mut Vec<String>,
+    options: &serde_json::Value,
+    selected_approval: usize,
+) {
+    let Some(approvals) = mutation_approvals(options) else {
+        return;
+    };
+    lines.push(format!("Mutation approvals ({})", approvals.len()));
+    for (index, value) in approvals.iter().enumerate() {
+        let scope = value.get("scope").unwrap_or(&serde_json::Value::Null);
+        let marker = if index == selected_approval { ">" } else { " " };
+        lines.push(format!(
+            "{marker} {} · {} / {} v{} · {} · workspace {} · mutating",
+            text(value, "approval_id"),
+            text(scope, "plugin_id"),
+            text(scope, "block_id"),
+            number(scope, "block_version"),
+            text(scope, "operation"),
+            text(scope, "workspace_snapshot")
+        ));
+        lines.push(format!(
+            "    immutable input {} · checksum {}",
+            compact_json(scope.get("input_summary")),
+            short_checksum(text(scope, "input_checksum_sha256"))
+        ));
+        lines.push(format!(
+            "    resources {} · reconciliation {}{}",
+            compact_json(scope.get("resource_claims")),
+            text(scope, "reconciliation"),
+            if text(scope, "reconciliation") == "repair_required" {
+                " (ambiguous accepted execution requires explicit repair)"
+            } else {
+                ""
+            }
+        ));
+    }
+    if !approvals.is_empty() {
+        lines.push("  ↑/↓ select · a approve exact request · d deny exact request".to_string());
+    }
+}
+
+fn compact_json(value: Option<&serde_json::Value>) -> String {
+    value.map_or_else(|| "-".to_string(), serde_json::Value::to_string)
+}
+
 fn append_named_rows(
     lines: &mut Vec<String>,
     options: &serde_json::Value,
@@ -305,19 +402,36 @@ mod tests {
             "nodes": {"review": {"kind": "agent"}, "approve": {"kind": "approval"}},
             "edges": [{"from": "review", "to": "approve", "kind": "direct"}],
         });
-        let lines = surface_lines(&serde_json::json!({
-            "command_id": "workflow.inspect",
-            "definition": {"definition_json": definition.to_string()},
-            "blocks": [{"block_id": "code_review.bundle", "block_version": 1, "plugin_id": "bcode.code_review"}],
-            "run": {"run_id": "run-1", "status": "running", "definition_id": "review", "definition_version": 2},
-            "waits": [{"node_id": "approve", "kind": "approval", "activation_id": "a1"}],
-            "attempts": [{"node_id": "review", "attempt": 1, "status": "succeeded"}],
-            "grants": [{"grant_id": "grant-1", "node_id": "review", "scope": {"capability": "read_only"}}],
-            "resource_leases": [{"node_id": "review", "mode": "read", "resource_key": "repo"}],
-            "outputs": [{"node_id": "review", "schema_id": "review/v1", "artifact_reference": "bcode-artifact://result"}],
-            "child_sessions": [{"id": "session-1", "name": "reviewer"}],
-            "events": [{"event_seq": 3, "event_type": "attempt_succeeded"}],
-        }));
+        let lines = surface_lines(
+            &serde_json::json!({
+                "command_id": "workflow.inspect",
+                "definition": {"definition_json": definition.to_string()},
+                "blocks": [{"block_id": "code_review.bundle", "block_version": 1, "plugin_id": "bcode.code_review"}],
+                "run": {"run_id": "run-1", "status": "running", "definition_id": "review", "definition_version": 2},
+                "waits": [{"node_id": "approve", "kind": "approval", "activation_id": "a1"}],
+                "mutation_approvals": [{
+                    "approval_id": "mutation-1",
+                    "scope": {
+                        "plugin_id": "bcode.git",
+                        "block_id": "git.commit",
+                        "block_version": 1,
+                        "operation": "git.commit",
+                        "workspace_snapshot": "/repo",
+                        "input_checksum_sha256": "0123456789abcdef",
+                        "input_summary": {"expected_head": "abc", "paths": ["src/lib.rs"]},
+                        "resource_claims": [{"resource": "repository", "access": "write"}],
+                        "reconciliation": "repair_required"
+                    }
+                }],
+                "attempts": [{"node_id": "review", "attempt": 1, "status": "succeeded"}],
+                "grants": [{"grant_id": "grant-1", "node_id": "review", "scope": {"capability": "read_only"}}],
+                "resource_leases": [{"node_id": "review", "mode": "read", "resource_key": "repo"}],
+                "outputs": [{"node_id": "review", "schema_id": "review/v1", "artifact_reference": "bcode-artifact://result"}],
+                "child_sessions": [{"id": "session-1", "name": "reviewer"}],
+                "events": [{"event_seq": 3, "event_type": "attempt_succeeded"}],
+            }),
+            0,
+        );
         let rendered = lines.join("\n");
         assert!(rendered.contains("Available plugin blocks (1)"));
         assert!(rendered.contains("code_review.bundle v1 · bcode.code_review"));
@@ -325,11 +439,34 @@ mod tests {
         assert!(rendered.contains("Graph (2 nodes, 1 edges)"));
         assert!(rendered.contains("review -> approve · direct"));
         assert!(rendered.contains("Waits (1)"));
+        assert!(rendered.contains("Mutation approvals (1)"));
+        assert!(rendered.contains("bcode.git / git.commit v1 · git.commit · workspace /repo"));
+        assert!(
+            rendered
+                .contains("immutable input {\"expected_head\":\"abc\",\"paths\":[\"src/lib.rs\"]}")
+        );
+        assert!(rendered.contains("checksum 0123456789ab"));
+        assert!(
+            rendered.contains("resources [{\"access\":\"write\",\"resource\":\"repository\"}]")
+        );
+        assert!(rendered.contains("reconciliation repair_required"));
+        assert!(rendered.contains("ambiguous accepted execution requires explicit repair"));
         assert!(rendered.contains("Attempts (1)"));
         assert!(rendered.contains("Grants (1)"));
         assert!(rendered.contains("Resource leases (1)"));
         assert!(rendered.contains("Outputs/artifacts (1)"));
         assert!(rendered.contains("Child sessions (1)"));
         assert!(rendered.contains("Events (1)"));
+        let options = serde_json::json!({
+            "mutation_approvals": [{"approval_id": "mutation-1"}]
+        });
+        assert_eq!(
+            mutation_approval_command(&options, 0, true).as_deref(),
+            Some("/workflow approve-mutation approval_id=mutation-1")
+        );
+        assert_eq!(
+            mutation_approval_command(&options, 0, false).as_deref(),
+            Some("/workflow deny-mutation approval_id=mutation-1")
+        );
     }
 }

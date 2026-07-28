@@ -2239,6 +2239,47 @@ impl BcodeClient {
         }
     }
 
+    /// List bounded pending mutation approvals for one run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the bounded request.
+    pub async fn list_workflow_mutation_approvals(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> Result<Vec<bcode_workflow_store::WorkflowMutationApproval>, ClientError> {
+        match self
+            .send_request(Request::ListWorkflowMutationApprovals { run_id, limit })
+            .await?
+        {
+            ResponsePayload::WorkflowMutationApprovalList { approvals } => Ok(approvals),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Resolve one exact durable mutation approval.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the identity or decision.
+    pub async fn resolve_workflow_mutation_approval(
+        &self,
+        approval_id: String,
+        decision: bcode_workflow_store::WorkflowMutationApprovalDecision,
+    ) -> Result<bcode_workflow_store::WorkflowMutationApprovalResolution, ClientError> {
+        match self
+            .send_request(Request::ResolveWorkflowMutationApproval {
+                approval_id,
+                decision,
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowMutationApprovalResolved { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Return one bounded page of workflow attempts.
     ///
     /// # Errors

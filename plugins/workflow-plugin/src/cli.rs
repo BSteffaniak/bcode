@@ -11,7 +11,8 @@ use std::path::PathBuf;
     about = "Discover, register, run, and inspect durable workflows"
 )]
 struct WorkflowCli {
-    /// Workflow action: list, register, run, status, pause, resume, cancel, inspect, retry-node, or provide-input.
+    /// Workflow action: list, register, run, status, pause, resume, cancel, inspect,
+    /// retry-node, provide-input, approve-mutation, or deny-mutation.
     #[arg(default_value = "status")]
     action: String,
     /// Definition or run identity for the selected action.
@@ -38,6 +39,9 @@ struct WorkflowCli {
     /// Exact latest failed attempt number for `retry-node`.
     #[arg(long)]
     attempt: Option<u32>,
+    /// Exact pending mutation approval identity for `approve-mutation` or `deny-mutation`.
+    #[arg(long)]
+    approval: Option<String>,
     /// Parent session identity required by `run`.
     #[arg(long)]
     session: Option<String>,
@@ -97,6 +101,9 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
         }
         if let Some(attempt) = cli.attempt {
             args.insert("failed_attempt".to_string(), attempt.to_string());
+        }
+        if let Some(approval) = cli.approval {
+            args.insert("approval_id".to_string(), approval);
         }
         if let Some(session) = cli.session {
             args.insert("session_id".to_string(), session);

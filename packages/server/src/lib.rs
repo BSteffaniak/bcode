@@ -113,8 +113,8 @@ use bcode_tool::{
     ToolResultContent,
 };
 use bcode_workflow::{
-    WorkflowApprovalResolver, WorkflowError, WorkflowGrantScope, WorkflowPolicyGrant,
-    WorkflowToolCapability,
+    AgentSkillActivationMode, WorkflowAgentConfiguration, WorkflowApprovalResolver, WorkflowError,
+    WorkflowGrantScope, WorkflowPolicyGrant, WorkflowToolCapability,
 };
 use bcode_workflow_store::{ActivationDispatchOwner, WorkflowStoreError};
 #[cfg(test)]
@@ -3331,6 +3331,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ListWorkflowWaits { .. } => "list_workflow_waits",
         Request::ProvideWorkflowInput { .. } => "provide_workflow_input",
         Request::ResolveWorkflowApproval { .. } => "resolve_workflow_approval",
+        Request::ListWorkflowMutationApprovals { .. } => "list_workflow_mutation_approvals",
+        Request::ResolveWorkflowMutationApproval { .. } => "resolve_workflow_mutation_approval",
         Request::WorkflowAttemptHistory { .. } => "workflow_attempt_history",
         Request::WorkflowEventHistory { .. } => "workflow_event_history",
         Request::SubscribeRuntimeWork { .. } => "subscribe_runtime_work",
@@ -3845,6 +3847,22 @@ async fn handle_request_inner(
                 node_id,
                 activation_id,
                 approved,
+            )
+            .await
+        }
+        Request::ListWorkflowMutationApprovals { run_id, limit } => {
+            handle_list_workflow_mutation_approvals(request_id, state, writer, run_id, limit).await
+        }
+        Request::ResolveWorkflowMutationApproval {
+            approval_id,
+            decision,
+        } => {
+            handle_resolve_workflow_mutation_approval(
+                request_id,
+                state,
+                writer,
+                approval_id,
+                decision,
             )
             .await
         }
@@ -11135,7 +11153,17 @@ async fn workflow_run_inspection(
     run_id: &str,
     limit: usize,
 ) -> Result<bcode_ipc::WorkflowRunInspection, ServerError> {
-    let (run, definition, waits, attempts, events, grants, resource_leases, outputs) = {
+    let (
+        run,
+        definition,
+        waits,
+        mutation_approvals,
+        attempts,
+        events,
+        grants,
+        resource_leases,
+        outputs,
+    ) = {
         let store = state
             .workflow_store
             .lock()
@@ -11155,6 +11183,7 @@ async fn workflow_run_inspection(
             run,
             definition,
             store.waiting_activations(run_id, limit)?,
+            store.pending_mutation_approvals(run_id, limit)?,
             store.attempt_history(run_id, None, limit)?,
             store.event_history(run_id, None, limit)?,
             store.grants_for_run(run_id, limit)?,
@@ -11179,6 +11208,7 @@ async fn workflow_run_inspection(
         run,
         definition,
         waits,
+        mutation_approvals,
         attempts,
         events,
         grants,
@@ -11539,6 +11569,46 @@ async fn handle_resolve_workflow_approval(
         writer,
         request_id,
         Response::Ok(ResponsePayload::WorkflowWaitResolved { result }),
+    )
+    .await
+}
+
+async fn handle_list_workflow_mutation_approvals(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    run_id: String,
+    limit: usize,
+) -> Result<(), ServerError> {
+    let approvals = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pending_mutation_approvals(&run_id, limit)?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowMutationApprovalList { approvals }),
+    )
+    .await
+}
+
+async fn handle_resolve_workflow_mutation_approval(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    approval_id: String,
+    decision: bcode_workflow_store::WorkflowMutationApprovalDecision,
+) -> Result<(), ServerError> {
+    let result = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .resolve_mutation_approval(&approval_id, decision, current_unix_millis())?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowMutationApprovalResolved { result }),
     )
     .await
 }
@@ -16125,7 +16195,12 @@ async fn prepare_static_model_turn_context(
             }],
         });
     }
-    for skill_context in turn_skill_contexts(state, session_id, trigger_event_sequence).await {
+    let skill_contexts = if execution.skill_contexts.is_empty() {
+        turn_skill_contexts(state, session_id, trigger_event_sequence).await
+    } else {
+        execution.skill_contexts.clone()
+    };
+    for skill_context in skill_contexts {
         let preview = skill_context_preview(&skill_context.context, state.skill_preview_max_chars);
         system_messages.push(ModelMessage {
             role: MessageRole::System,
@@ -22328,6 +22403,7 @@ async fn observe_workflow_turn(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn authorize_workflow_plugin_block(
     state: &ServerState,
     activation: &bcode_workflow_store::PendingActivation,
@@ -22362,24 +22438,85 @@ fn authorize_workflow_plugin_block(
                 && grant
                     .expires_at_ms
                     .is_none_or(|expires| expires >= current_unix_millis())
-                && serde_json::from_value::<bcode_workflow::WorkflowPolicyGrant>(grant.scope)
-                    .is_ok_and(|grant| {
-                        grant.capability >= bcode_workflow::WorkflowToolCapability::Mutating
-                            && grant.scope.definition == run.definition_id
-                            && grant.scope.definition_version == run.definition_version
-                            && grant.scope.workspace == run.workspace_snapshot
-                            && grant.scope.node == activation.node_id
-                            && grant.scope.run.as_deref() == Some(activation.run_id.as_str())
-                    })
+                && (serde_json::from_value::<bcode_workflow::WorkflowMutationGrantScope>(
+                    grant.scope.clone(),
+                )
+                .is_ok_and(|scope| {
+                    scope.definition_id == run.definition_id
+                        && scope.definition_version == run.definition_version
+                        && scope.workspace_snapshot == run.workspace_snapshot
+                        && scope.run_id == activation.run_id
+                        && scope.node_id == activation.node_id
+                        && scope.activation_id == activation.activation_id
+                        && scope.plugin_id == block.plugin_id
+                        && scope.block_id == block.block_id
+                        && scope.block_version == block.block_version
+                        && scope.operation == block.operation
+                }) || serde_json::from_value::<bcode_workflow::WorkflowPolicyGrant>(
+                    grant.scope,
+                )
+                .is_ok_and(|grant| {
+                    grant.capability >= bcode_workflow::WorkflowToolCapability::Mutating
+                        && grant.scope.definition == run.definition_id
+                        && grant.scope.definition_version == run.definition_version
+                        && grant.scope.workspace == run.workspace_snapshot
+                        && grant.scope.node == activation.node_id
+                        && grant.scope.run.as_deref() == Some(activation.run_id.as_str())
+                }))
         });
     drop(store);
-    if approved {
-        Ok(())
-    } else {
-        Err(WorkflowStoreError::InvalidData(
-            "workflow plugin block requires an exact persisted mutating grant".to_string(),
-        ))
+    if !approved {
+        let input = activation.input.as_ref().ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "workflow plugin block activation has no approval input".to_string(),
+            )
+        })?;
+        let input_json = serde_json::to_vec(input)?;
+        if input_json.len() > 16_384 {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow mutation approval input summary exceeds 16384 bytes".to_string(),
+            ));
+        }
+        let scope = bcode_workflow::WorkflowMutationGrantScope {
+            version: bcode_workflow::WORKFLOW_MUTATION_GRANT_SCOPE_VERSION,
+            definition_id: run.definition_id,
+            definition_version: run.definition_version,
+            run_id: activation.run_id.clone(),
+            node_id: activation.node_id.clone(),
+            activation_id: activation.activation_id.clone(),
+            workspace_snapshot: run.workspace_snapshot,
+            plugin_id: block.plugin_id.clone(),
+            block_id: block.block_id.clone(),
+            block_version: block.block_version,
+            operation: block.operation.clone(),
+            input_checksum_sha256: {
+                use sha2::Digest as _;
+                format!("{:x}", sha2::Sha256::digest(&input_json))
+            },
+            input_summary: input.clone(),
+            resource_claims: bcode_workflow::normalize_resource_claims(
+                activation.node.resources.clone(),
+            )
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?,
+            reconciliation: block.reconciliation,
+            capability: bcode_workflow::WorkflowToolCapability::Mutating,
+        };
+        let approval = bcode_workflow_store::WorkflowMutationApproval {
+            approval_id: format!("mutation-approval:{}", activation.activation_id),
+            run_id: activation.run_id.clone(),
+            node_id: activation.node_id.clone(),
+            activation_id: activation.activation_id.clone(),
+            scope,
+            requested_at_ms: current_unix_millis(),
+            expires_at_ms: None,
+        };
+        state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .request_mutation_approval(&approval)?;
     }
+    Ok(())
 }
 
 struct WorkflowActivationOwner<'a> {
@@ -22594,19 +22731,187 @@ async fn dispatch_workflow_plugin_block(
     }))
 }
 
-fn workflow_agent_execution_target(
+fn workflow_agent_configuration(
     configuration: &serde_json::Value,
-) -> Result<bcode_workflow::AgentExecutionTarget, WorkflowStoreError> {
-    configuration.get("execution_target").map_or_else(
-        || Ok(bcode_workflow::AgentExecutionTarget::FreshIsolated),
-        |value| {
-            serde_json::from_value(value.clone()).map_err(|error| {
-                WorkflowStoreError::InvalidData(format!(
-                    "invalid workflow agent execution target: {error}"
-                ))
+) -> Result<WorkflowAgentConfiguration, WorkflowStoreError> {
+    let contract: WorkflowAgentConfiguration = serde_json::from_value(configuration.clone())
+        .map_err(|error| {
+            WorkflowStoreError::InvalidData(format!(
+                "invalid versioned workflow agent configuration: {error}"
+            ))
+        })?;
+    contract
+        .validate()
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    Ok(contract)
+}
+
+#[derive(Debug, Default)]
+struct WorkflowAgentSkillResolution {
+    contexts: Vec<SkillContextResponse>,
+    diagnostics: Vec<String>,
+}
+
+fn apply_workflow_skill_model_policy(
+    configuration: &mut WorkflowAgentConfiguration,
+    skill_id: &str,
+    policy: &bcode_skill_models::SkillModelPolicy,
+) -> Result<(), WorkflowStoreError> {
+    if let Some(required) = &policy.required {
+        if configuration
+            .model
+            .as_deref()
+            .is_some_and(|model| model != required.model)
+            || required.provider.as_deref().is_some_and(|provider| {
+                configuration
+                    .provider
+                    .as_deref()
+                    .is_some_and(|configured| configured != provider)
             })
-        },
+        {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "workflow agent skill '{skill_id}' requires an incompatible model selection"
+            )));
+        }
+        configuration.model = Some(required.model.clone());
+        if let Some(provider) = &required.provider {
+            configuration.provider = Some(provider.clone());
+        }
+    } else if configuration.model.is_none()
+        && let Some(preferred) = &policy.preferred
+    {
+        configuration.model = Some(preferred.model.clone());
+        if configuration.provider.is_none() {
+            configuration.provider.clone_from(&preferred.provider);
+        }
+    }
+    Ok(())
+}
+
+fn resolve_workflow_agent_skills(
+    state: &ServerState,
+    configuration: &mut WorkflowAgentConfiguration,
+) -> Result<WorkflowAgentSkillResolution, WorkflowStoreError> {
+    if configuration.read_only && configuration.tool_capability != WorkflowToolCapability::ReadOnly
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "read-only workflow agent must use read-only tool capability".to_string(),
+        ));
+    }
+    let mut resolution = WorkflowAgentSkillResolution::default();
+    let selections = configuration.skills.clone();
+    for selection in selections {
+        if selection.mode == AgentSkillActivationMode::Disabled {
+            continue;
+        }
+        let skill_id = SkillId::from_str(&selection.skill_id).map_err(|error| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow agent skill '{}' is invalid: {error}",
+                selection.skill_id
+            ))
+        })?;
+        let resolved = state.skills.as_ref().map_or_else(
+            || Err("skill registry is unavailable".to_string()),
+            |registry| {
+                let summary = registry
+                    .summary(&skill_id)
+                    .ok_or_else(|| "skill is unknown or disabled".to_string())?;
+                let context = registry
+                    .context(&skill_id, state.skill_context_bytes)
+                    .map_err(|error| error.to_string())?;
+                let truncated = state
+                    .skill_context_bytes
+                    .is_some_and(|budget| context.len() >= budget);
+                if truncated {
+                    return Err("skill context exceeds the configured turn budget".to_string());
+                }
+                let manifest = registry
+                    .describe(&skill_id)
+                    .map_err(|error| error.to_string())?;
+                if summary.disable_model_invocation {
+                    return Err("skill disables model invocation".to_string());
+                }
+                if configuration.read_only
+                    && (!manifest.permissions.tools.is_empty()
+                        || !manifest.permissions.categories.is_empty()
+                        || !manifest.permission_policy.tools.is_empty()
+                        || !manifest.permission_policy.categories.is_empty())
+                {
+                    return Err(
+                        "read-only workflow agents cannot attach skills that request tools"
+                            .to_string(),
+                    );
+                }
+                let bytes_loaded = context.len();
+                if bytes_loaded == 0 {
+                    return Err("skill context is empty".to_string());
+                }
+                Ok((
+                    SkillContextResponse {
+                        skill_id: skill_id.clone(),
+                        context,
+                        source: summary.source.clone(),
+                        bytes_loaded,
+                        truncated,
+                        model_policy: Some(manifest.model_policy.clone()),
+                    },
+                    manifest.model_policy,
+                ))
+            },
+        );
+        match (selection.mode, resolved) {
+            (_, Ok((context, model_policy))) => {
+                apply_workflow_skill_model_policy(
+                    configuration,
+                    &selection.skill_id,
+                    &model_policy,
+                )?;
+                resolution.contexts.push(context);
+            }
+            (AgentSkillActivationMode::Preferred, Err(error)) => {
+                resolution.diagnostics.push(format!(
+                    "preferred workflow agent skill '{}' was unavailable: {error}",
+                    selection.skill_id
+                ));
+            }
+            (AgentSkillActivationMode::Required, Err(error)) => {
+                return Err(WorkflowStoreError::InvalidData(format!(
+                    "required workflow agent skill '{}' is unavailable: {error}",
+                    selection.skill_id
+                )));
+            }
+            (AgentSkillActivationMode::Disabled, _) => unreachable!("disabled skills are skipped"),
+        }
+    }
+    Ok(resolution)
+}
+
+fn workflow_agent_configuration_from_intent(
+    request: &bcode_workflow_store::PreparedActivationDispatch,
+) -> Result<WorkflowAgentConfiguration, WorkflowStoreError> {
+    let configuration = request.intent.get("configuration").ok_or_else(|| {
+        WorkflowStoreError::InvalidData(
+            "workflow agent dispatch intent has no resolved configuration".to_string(),
+        )
+    })?;
+    workflow_agent_configuration(configuration)
+}
+
+fn workflow_agent_skill_contexts_from_intent(
+    request: &bcode_workflow_store::PreparedActivationDispatch,
+) -> Result<Vec<SkillContextResponse>, WorkflowStoreError> {
+    serde_json::from_value(
+        request
+            .intent
+            .get("skill_contexts")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!([])),
     )
+    .map_err(|error| {
+        WorkflowStoreError::InvalidData(format!(
+            "workflow agent dispatch intent has invalid resolved skill contexts: {error}"
+        ))
+    })
 }
 
 struct WorkflowAgentTurnOwner<'a> {
@@ -22621,36 +22926,16 @@ impl ActivationDispatchOwner for WorkflowAgentTurnOwner<'_> {
         if activation.node.kind != bcode_workflow::NodeKind::Agent {
             return Ok(None);
         }
-        let configuration = &activation.node.configuration;
-        let execution_target = workflow_agent_execution_target(configuration)?;
-        if execution_target == bcode_workflow::AgentExecutionTarget::SharedParentSequential
-            && activation
-                .node
-                .configuration
-                .get("prompt_mode")
-                .and_then(serde_json::Value::as_str)
-                != Some("json_input")
-        {
-            return Err(WorkflowStoreError::InvalidData(
-                "shared-parent workflow agents require json_input prompt mode".to_string(),
-            ));
-        }
-        if configuration
-            .get("prompt_mode")
-            .and_then(serde_json::Value::as_str)
-            != Some("json_input")
-        {
-            return Ok(None);
-        }
-        let read_only = configuration
-            .get("read_only")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
+        let mut configuration = workflow_agent_configuration(&activation.node.configuration)?;
+        let read_only = configuration.read_only;
+        let skill_resolution = resolve_workflow_agent_skills(self.state, &mut configuration)?;
         let intent = serde_json::json!({
             "owner": "bcode.server.agent-turn/v1",
             "input": activation.input,
             "node": activation.node,
-            "execution_target": execution_target,
+            "configuration": configuration,
+            "skill_contexts": skill_resolution.contexts,
+            "skill_diagnostics": skill_resolution.diagnostics,
         });
         Ok(Some(bcode_workflow_store::ActivationDispatchPlan {
             side_effect: if read_only {
@@ -22697,17 +22982,14 @@ async fn dispatch_workflow_agent_turn(
     state: &Arc<ServerState>,
     request: &bcode_workflow_store::PreparedActivationDispatch,
 ) -> Result<serde_json::Value, WorkflowStoreError> {
-    let configuration = &request.activation.node.configuration;
-    let execution_target = workflow_agent_execution_target(configuration)?;
+    let configuration = workflow_agent_configuration_from_intent(request)?;
+    let execution_target = configuration.execution_target;
     let input = request.activation.input.as_ref().ok_or_else(|| {
         WorkflowStoreError::InvalidData("workflow agent activation has no input".to_string())
     })?;
     let mut prompt = serde_json::to_string_pretty(input)?;
-    if let Some(system) = configuration
-        .get("system_prompt")
-        .and_then(serde_json::Value::as_str)
-    {
-        prompt = format!("{system}\n\n{prompt}");
+    if !configuration.system_prompt.is_empty() {
+        prompt = format!("{}\n\n{prompt}", configuration.system_prompt);
     }
     let run = state
         .workflow_store
@@ -22786,20 +23068,7 @@ async fn dispatch_workflow_agent_turn(
         CancellationHandle::WorkflowNode(Arc::clone(&cancellation)),
     )
     .await;
-    let tools = configuration
-        .get("tools")
-        .and_then(serde_json::Value::as_array)
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(serde_json::Value::as_str)
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        });
-    let read_only = configuration
-        .get("read_only")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false);
+    let skill_contexts = workflow_agent_skill_contexts_from_intent(request)?;
     let metadata = bcode_session_models::TurnAdmissionMetadata {
         origin: Some(TurnOrigin {
             producer: "bcode.workflow".to_string(),
@@ -22809,51 +23078,50 @@ async fn dispatch_workflow_agent_turn(
         priority: TurnPriority::Background,
         idempotency_key: Some(request.dispatch_identity.clone()),
         execution: TurnExecutionOptions {
-            tools: if read_only {
-                TurnToolPolicy::ReadOnly
-            } else {
-                TurnToolPolicy::Enabled
+            tools: match configuration.tool_capability {
+                WorkflowToolCapability::Disabled => TurnToolPolicy::Disabled,
+                WorkflowToolCapability::ReadOnly => TurnToolPolicy::ReadOnly,
+                WorkflowToolCapability::Mutating => TurnToolPolicy::Enabled,
             },
             correlation: Some(TurnExecutionCorrelation {
                 execution_id: request.activation.run_id.clone(),
                 unit_id: request.activation.node_id.clone(),
                 attempt: request.attempt,
             }),
-            agent_profile: configuration
-                .get("agent_id")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string),
-            tool_allowlist: tools,
-            provider_plugin_id: configuration
-                .get("provider_plugin_id")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string),
-            model_id: configuration
-                .get("model_id")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string),
+            agent_profile: Some(configuration.agent_profile.clone()),
+            tool_allowlist: (!configuration.tool_allowlist.is_empty())
+                .then(|| configuration.tool_allowlist.clone()),
+            provider_plugin_id: configuration.provider.clone(),
+            model_id: configuration.model.clone(),
             structured_output: Some(TurnStructuredOutputRequest {
                 name: bcode_session_models::structured_output_name(
                     &request.activation.node.output.type_name,
                 ),
-                schema: request.activation.node.output.schema.clone(),
-                strict: configuration
-                    .get("strict")
-                    .and_then(serde_json::Value::as_bool)
-                    .unwrap_or(true),
+                schema: configuration.structured_output.schema.schema.clone(),
+                strict: configuration.structured_output.strict,
             }),
+            skill_contexts,
             ..TurnExecutionOptions::default()
         },
     };
-    let submitted = submit_session_model_turn_with_admission(
-        state,
-        target_session_id,
-        prompt,
-        None,
-        metadata,
-        Some(Arc::clone(&cancellation)),
+    let submitted = tokio::time::timeout(
+        Duration::from_millis(configuration.timeout_ms),
+        submit_session_model_turn_with_admission(
+            state,
+            target_session_id,
+            prompt,
+            None,
+            metadata,
+            Some(Arc::clone(&cancellation)),
+        ),
     )
     .await
+    .map_err(|_| {
+        WorkflowStoreError::InvalidData(format!(
+            "workflow agent admission timed out after {} ms",
+            configuration.timeout_ms
+        ))
+    })?
     .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
     let (receipt, completion_receiver) = match submitted {
         SubmittedModelTurn::Started {
@@ -38351,6 +38619,22 @@ library = "test"
         state
     }
 
+    fn test_skill_registry() -> SkillRegistry {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let repository = root
+            .parent()
+            .and_then(Path::parent)
+            .expect("repository root");
+        let source = bcode_skill::SkillSourceRoot::new(
+            repository.join(".bcode/skills"),
+            bcode_skill_models::SkillSourceKind::Repository,
+            "test repository skills",
+            0,
+        );
+        SkillRegistry::discover(&[source], SkillRegistryOptions::default())
+            .expect("test skill registry")
+    }
+
     fn test_server_state_with_ralph_store(
         sessions: SessionManager,
         ralph_store: bcode_ralph::RalphStateStore,
@@ -40396,37 +40680,41 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .pop()
             .expect("activation");
         let owner = WorkflowActivationOwner { state: &state };
-        assert!(owner.plan(&pending).is_err(), "grant is mandatory");
-        let grant = bcode_workflow::WorkflowPolicyGrant {
-            grant_id: "git-grant".to_string(),
-            scope: bcode_workflow::WorkflowGrantScope {
-                definition: "git-commit".to_string(),
-                definition_version: 1,
-                workspace: pending
-                    .input
-                    .as_ref()
-                    .and_then(|value| value.get("expected_head"))
-                    .and_then(serde_json::Value::as_str)
-                    .expect("head")
-                    .to_string(),
-                node: "git.commit".to_string(),
-                run: Some("git-commit-run".to_string()),
-            },
-            capability: bcode_workflow::WorkflowToolCapability::Mutating,
-        };
+        assert!(owner.plan(&pending).is_ok(), "approval wait is admitted");
+        let approval = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_mutation_approvals("git-commit-run", 1)
+            .expect("approvals")
+            .pop()
+            .expect("approval");
+        assert_eq!(
+            approval.scope.input_summary,
+            pending.input.clone().expect("input")
+        );
         state
             .workflow_store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .persist_grant(&bcode_workflow_store::WorkflowGrant {
-                grant_id: grant.grant_id.clone(),
-                run_id: "git-commit-run".to_string(),
-                node_id: "git.commit".to_string(),
-                scope: serde_json::to_value(grant).expect("grant"),
-                granted_at_ms: 2,
-                expires_at_ms: None,
-            })
-            .expect("persist grant");
+            .resolve_mutation_approval(
+                &approval.approval_id,
+                bcode_workflow_store::WorkflowMutationApprovalDecision::Approve,
+                current_unix_millis(),
+            )
+            .expect("approve");
+        let pending = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .pending_activations(1)
+            .expect("pending")
+            .pop()
+            .expect("activation");
+        assert!(
+            owner.plan(&pending).is_ok(),
+            "exact approval authorizes dispatch"
+        );
         let path = state
             .workflow_store
             .lock()
@@ -40497,12 +40785,29 @@ event_symbol = "bcode_plugin_handle_event_v1"
             input: schema.clone(),
             output: schema.clone(),
             resources: Vec::new(),
-            configuration: serde_json::json!({
-                "prompt_mode": "json_input",
-                "read_only": read_only,
-                "strict": true,
-                "execution_target": "shared_parent_sequential",
-            }),
+            configuration: serde_json::to_value(bcode_workflow::WorkflowAgentConfiguration {
+                version: bcode_workflow::WORKFLOW_AGENT_CONFIGURATION_VERSION,
+                execution_target: bcode_workflow::AgentExecutionTarget::SharedParentSequential,
+                agent_profile: "build".to_string(),
+                provider: None,
+                model: None,
+                structured_output: bcode_workflow::AgentStructuredOutputPolicy {
+                    schema: schema.clone(),
+                    strict: true,
+                },
+                read_only,
+                tool_capability: if read_only {
+                    bcode_workflow::WorkflowToolCapability::ReadOnly
+                } else {
+                    bcode_workflow::WorkflowToolCapability::Mutating
+                },
+                tool_allowlist: Vec::new(),
+                timeout_ms: 30_000,
+                skills: Vec::new(),
+                prompt_mode: "json_input".to_string(),
+                system_prompt: String::new(),
+            })
+            .expect("agent configuration"),
         };
         let definition = bcode_workflow::WorkflowDefinition {
             schema_version: 1,
@@ -40659,13 +40964,29 @@ event_symbol = "bcode_plugin_handle_event_v1"
             input: schema.clone(),
             output: schema.clone(),
             resources: Vec::new(),
-            configuration: serde_json::json!({
-                "system_prompt": prompt,
-                "prompt_mode": "json_input",
-                "read_only": read_only,
-                "strict": true,
-                "execution_target": "shared_parent_sequential",
-            }),
+            configuration: serde_json::to_value(bcode_workflow::WorkflowAgentConfiguration {
+                version: bcode_workflow::WORKFLOW_AGENT_CONFIGURATION_VERSION,
+                execution_target: bcode_workflow::AgentExecutionTarget::SharedParentSequential,
+                agent_profile: "build".to_string(),
+                provider: None,
+                model: None,
+                structured_output: bcode_workflow::AgentStructuredOutputPolicy {
+                    schema: schema.clone(),
+                    strict: true,
+                },
+                read_only,
+                tool_capability: if read_only {
+                    bcode_workflow::WorkflowToolCapability::ReadOnly
+                } else {
+                    bcode_workflow::WorkflowToolCapability::Mutating
+                },
+                tool_allowlist: Vec::new(),
+                timeout_ms: 30_000,
+                skills: Vec::new(),
+                prompt_mode: "json_input".to_string(),
+                system_prompt: prompt.to_string(),
+            })
+            .expect("agent configuration"),
         };
         let predicate = bcode_workflow::field::<serde_json::Value>("condition_met")
             .eq(false)
@@ -40921,10 +41242,28 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         input: schema.clone(),
                         output: schema.clone(),
                         resources: Vec::new(),
-                        configuration: serde_json::json!({
-                            "prompt_mode": "json_input",
-                            "read_only": true,
-                        }),
+                        configuration: serde_json::to_value(
+                            bcode_workflow::WorkflowAgentConfiguration {
+                                version: bcode_workflow::WORKFLOW_AGENT_CONFIGURATION_VERSION,
+                                execution_target:
+                                    bcode_workflow::AgentExecutionTarget::FreshIsolated,
+                                agent_profile: "plan".to_string(),
+                                provider: None,
+                                model: None,
+                                structured_output: bcode_workflow::AgentStructuredOutputPolicy {
+                                    schema: schema.clone(),
+                                    strict: true,
+                                },
+                                read_only: true,
+                                tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
+                                tool_allowlist: Vec::new(),
+                                timeout_ms: 30_000,
+                                skills: Vec::new(),
+                                prompt_mode: "json_input".to_string(),
+                                system_prompt: String::new(),
+                            },
+                        )
+                        .expect("agent configuration"),
                     },
                 ),
             ]),
@@ -40994,6 +41333,256 @@ event_symbol = "bcode_plugin_handle_event_v1"
         })
         .await
         .expect("repeat successor dispatched");
+    }
+
+    #[test]
+    fn workflow_agent_skill_resolution_is_exact_bounded_and_read_only_safe() {
+        let sessions = SessionManager::default();
+        let mut state = test_server_state(sessions);
+        state.skills = Some(test_skill_registry());
+        state.skill_context_bytes = None;
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "result/v1".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+        };
+        let configuration = |skills, read_only| bcode_workflow::WorkflowAgentConfiguration {
+            version: bcode_workflow::WORKFLOW_AGENT_CONFIGURATION_VERSION,
+            execution_target: bcode_workflow::AgentExecutionTarget::FreshIsolated,
+            agent_profile: "build".to_string(),
+            provider: None,
+            model: None,
+            structured_output: bcode_workflow::AgentStructuredOutputPolicy {
+                schema: schema.clone(),
+                strict: true,
+            },
+            read_only,
+            tool_capability: if read_only {
+                bcode_workflow::WorkflowToolCapability::ReadOnly
+            } else {
+                bcode_workflow::WorkflowToolCapability::Mutating
+            },
+            tool_allowlist: Vec::new(),
+            timeout_ms: 30_000,
+            skills,
+            prompt_mode: "json_input".to_string(),
+            system_prompt: String::new(),
+        };
+        let required = bcode_workflow::AgentSkillSelection {
+            skill_id: "audit-invariants".to_string(),
+            mode: bcode_workflow::AgentSkillActivationMode::Required,
+        };
+        let mut required_configuration = configuration(vec![required.clone()], false);
+        let resolved = resolve_workflow_agent_skills(&state, &mut required_configuration)
+            .expect("required skill")
+            .contexts;
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].skill_id.as_str(), "audit-invariants");
+
+        let missing = bcode_workflow::AgentSkillSelection {
+            skill_id: "missing-skill".to_string(),
+            mode: bcode_workflow::AgentSkillActivationMode::Required,
+        };
+        let mut missing_configuration = configuration(vec![missing.clone()], false);
+        assert!(resolve_workflow_agent_skills(&state, &mut missing_configuration).is_err());
+        let preferred = bcode_workflow::AgentSkillSelection {
+            mode: bcode_workflow::AgentSkillActivationMode::Preferred,
+            ..missing
+        };
+        let mut preferred_configuration = configuration(vec![preferred], false);
+        let preferred_resolution =
+            resolve_workflow_agent_skills(&state, &mut preferred_configuration)
+                .expect("preferred missing skill");
+        assert!(preferred_resolution.contexts.is_empty());
+        assert_eq!(preferred_resolution.diagnostics.len(), 1);
+        let mut read_only_configuration = configuration(vec![required], true);
+        assert!(
+            resolve_workflow_agent_skills(&state, &mut read_only_configuration).is_err(),
+            "read-only agent must reject a skill that declares tool access"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn workflow_agent_completion_maps_provider_cancellation_and_schema_failures() {
+        let sessions = SessionManager::default();
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+            .expect("workflow store");
+        let mut state = test_server_state(sessions);
+        state.workflow_store = StdMutex::new(store);
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "commit-message/v1".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "required": ["version", "title", "description"],
+                "properties": {
+                    "version": {"const": 1},
+                    "title": {"type": "string"},
+                    "description": {"type": "string"}
+                }
+            }),
+        };
+        let request = bcode_workflow_store::PreparedActivationDispatch {
+            activation: bcode_workflow_store::PendingActivation {
+                run_id: "run".to_string(),
+                node_id: "loop.commit-message".to_string(),
+                activation_id: "activation".to_string(),
+                dependency_generation: 0,
+                input: Some(serde_json::Value::Null),
+                node: bcode_workflow::NodeDefinition {
+                    id: "loop.commit-message".to_string(),
+                    name: "commit message".to_string(),
+                    kind: bcode_workflow::NodeKind::Agent,
+                    input: bcode_workflow::ValueSchema::of::<serde_json::Value>(),
+                    output: schema,
+                    resources: Vec::new(),
+                    configuration: serde_json::json!({}),
+                },
+                created_at_ms: 1,
+            },
+            attempt: 1,
+            dispatch_identity: "dispatch".to_string(),
+            intent: serde_json::json!({}),
+        };
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "commit-message-test".to_string(),
+            input: bcode_workflow::ValueSchema::of::<serde_json::Value>(),
+            output: request.activation.node.output.clone(),
+            nodes: BTreeMap::from([(
+                request.activation.node_id.clone(),
+                request.activation.node.clone(),
+            )]),
+            entries: vec![request.activation.node_id.clone()],
+            exits: vec![request.activation.node_id.clone()],
+            edges: Vec::new(),
+        };
+        {
+            let mut store = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            store
+                .persist_definition("commit-message-test", 1, &definition)
+                .expect("definition");
+            store
+                .create_run(&bcode_workflow_store::NewWorkflowRun {
+                    run_id: request.activation.run_id.clone(),
+                    definition_id: "commit-message-test".to_string(),
+                    definition_version: 1,
+                    workspace_snapshot: "snapshot".to_string(),
+                    parent_session_id: None,
+                    binding: None,
+                    input: Some(serde_json::Value::Null),
+                    created_at_ms: 1,
+                    limits: bcode_workflow_store::WorkflowRunLimits::default(),
+                })
+                .expect("run");
+        }
+        assert!(matches!(
+            workflow_attempt_observation_from_completion(
+                &state,
+                &request,
+                ModelTurnCompletion::with_message(
+                    ModelTurnOutcome::ProviderUnavailable,
+                    "provider unavailable",
+                ),
+            )
+            .expect("provider observation"),
+            bcode_workflow_store::AttemptObservation::Paused {
+                reason: bcode_workflow_store::AttemptPauseReason::ProviderUnavailable,
+                ..
+            }
+        ));
+        assert!(matches!(
+            workflow_attempt_observation_from_completion(
+                &state,
+                &request,
+                ModelTurnCompletion::with_message(ModelTurnOutcome::Cancelled, "cancelled"),
+            )
+            .expect("cancellation observation"),
+            bcode_workflow_store::AttemptObservation::Paused {
+                reason: bcode_workflow_store::AttemptPauseReason::Steering,
+                ..
+            }
+        ));
+        let malformed = workflow_attempt_observation_from_completion(
+            &state,
+            &request,
+            ModelTurnCompletion {
+                outcome: ModelTurnOutcome::Completed,
+                message: None,
+                output: Some("{\"version\":1,\"title\":9}".to_string()),
+            },
+        )
+        .expect("malformed structured output observation");
+        let bcode_workflow_store::AttemptObservation::Succeeded { output } = malformed else {
+            panic!("completed model output should reach schema validation");
+        };
+        let mut store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            store.persist_validated_output(&output).is_err(),
+            "malformed structured output must fail at the canonical durable schema boundary"
+        );
+        drop(store);
+    }
+
+    #[test]
+    fn workflow_agent_skill_contexts_remain_turn_local() {
+        let skill = |id: &str| bcode_skill_models::SkillContextResponse {
+            skill_id: SkillId::new(id),
+            context: format!("context for {id}"),
+            source: bcode_skill_models::SkillSource {
+                kind: bcode_skill_models::SkillSourceKind::Repository,
+                label: "test".to_string(),
+                path: None,
+                precedence: 0,
+            },
+            bytes_loaded: format!("context for {id}").len(),
+            truncated: false,
+            model_policy: None,
+        };
+        let request = |id: &str, context: bcode_skill_models::SkillContextResponse| {
+            bcode_workflow_store::PreparedActivationDispatch {
+                activation: bcode_workflow_store::PendingActivation {
+                    run_id: "run".to_string(),
+                    node_id: id.to_string(),
+                    activation_id: format!("{id}-activation"),
+                    dependency_generation: 0,
+                    input: Some(serde_json::Value::Null),
+                    node: bcode_workflow::NodeDefinition {
+                        id: id.to_string(),
+                        name: id.to_string(),
+                        kind: bcode_workflow::NodeKind::Agent,
+                        input: bcode_workflow::ValueSchema::of::<serde_json::Value>(),
+                        output: bcode_workflow::ValueSchema::of::<serde_json::Value>(),
+                        resources: Vec::new(),
+                        configuration: serde_json::json!({}),
+                    },
+                    created_at_ms: 1,
+                },
+                attempt: 1,
+                dispatch_identity: id.to_string(),
+                intent: serde_json::json!({"skill_contexts": [context]}),
+            }
+        };
+        let first = request("first", skill("audit-invariants"));
+        let second = request("second", skill("add-invariant"));
+        assert_eq!(
+            workflow_agent_skill_contexts_from_intent(&first).expect("first")[0]
+                .skill_id
+                .as_str(),
+            "audit-invariants"
+        );
+        assert_eq!(
+            workflow_agent_skill_contexts_from_intent(&second).expect("second")[0]
+                .skill_id
+                .as_str(),
+            "add-invariant"
+        );
     }
 
     #[tokio::test]
@@ -41140,16 +41729,29 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     name: "agent".to_string(),
                     kind: bcode_workflow::NodeKind::Agent,
                     input: schema.clone(),
-                    output: schema,
+                    output: schema.clone(),
                     resources: Vec::new(),
-                    configuration: serde_json::json!({
-                        "agent_id": "build",
-                        "provider_plugin_id": "bcode.fake-provider",
-                        "model_id": "fake-echo",
-                        "prompt_mode": "json_input",
-                        "read_only": true,
-                        "strict": true,
-                    }),
+                    configuration: serde_json::to_value(
+                        bcode_workflow::WorkflowAgentConfiguration {
+                            version: bcode_workflow::WORKFLOW_AGENT_CONFIGURATION_VERSION,
+                            execution_target: bcode_workflow::AgentExecutionTarget::FreshIsolated,
+                            agent_profile: "build".to_string(),
+                            provider: Some("bcode.fake-provider".to_string()),
+                            model: Some("fake-echo".to_string()),
+                            structured_output: bcode_workflow::AgentStructuredOutputPolicy {
+                                schema,
+                                strict: true,
+                            },
+                            read_only: true,
+                            tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
+                            tool_allowlist: Vec::new(),
+                            timeout_ms: 30_000,
+                            skills: Vec::new(),
+                            prompt_mode: "json_input".to_string(),
+                            system_prompt: String::new(),
+                        },
+                    )
+                    .expect("agent configuration"),
                 },
             )]),
             entries: vec!["agent".to_string()],

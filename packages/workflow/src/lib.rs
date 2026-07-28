@@ -681,7 +681,12 @@ impl ResourceCoordinator {
     }
 }
 
-fn normalize_resource_claims(
+/// Validate, deduplicate, and deterministically order resource claims.
+///
+/// # Errors
+///
+/// Returns an error when a resource identity is empty.
+pub fn normalize_resource_claims(
     claims: impl IntoIterator<Item = ResourceClaim>,
 ) -> Result<Vec<ResourceClaim>, WorkflowError> {
     let mut normalized = BTreeMap::<String, ResourceAccess>::new();
@@ -1362,6 +1367,77 @@ pub enum WorkflowToolCapability {
     Mutating,
 }
 
+/// Stable exact mutation-grant scope contract version.
+pub const WORKFLOW_MUTATION_GRANT_SCOPE_VERSION: u32 = 1;
+
+/// Immutable facts binding one durable workflow mutation approval to exactly one dispatch input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowMutationGrantScope {
+    pub version: u32,
+    pub definition_id: String,
+    pub definition_version: u32,
+    pub run_id: String,
+    pub node_id: String,
+    pub activation_id: String,
+    pub workspace_snapshot: String,
+    pub plugin_id: String,
+    pub block_id: String,
+    pub block_version: u32,
+    pub operation: String,
+    pub input_checksum_sha256: String,
+    /// Bounded renderer-neutral summary of the immutable dispatch input.
+    pub input_summary: serde_json::Value,
+    /// Exact normalized resource claims required by the dispatch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resource_claims: Vec<ResourceClaim>,
+    /// Owner-declared restart reconciliation behavior for the external operation.
+    pub reconciliation: WorkflowBlockReconciliation,
+    pub capability: WorkflowToolCapability,
+}
+
+impl WorkflowMutationGrantScope {
+    /// Validate complete bounded exact-grant identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the contract version, identity, capability, or checksum is invalid.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        let identities = [
+            self.definition_id.as_str(),
+            self.run_id.as_str(),
+            self.node_id.as_str(),
+            self.activation_id.as_str(),
+            self.workspace_snapshot.as_str(),
+            self.plugin_id.as_str(),
+            self.block_id.as_str(),
+            self.operation.as_str(),
+        ];
+        if self.version != WORKFLOW_MUTATION_GRANT_SCOPE_VERSION
+            || self.definition_version == 0
+            || self.block_version == 0
+            || self.capability != WorkflowToolCapability::Mutating
+            || normalize_resource_claims(self.resource_claims.clone()).is_err()
+            || serde_json::to_vec(&self.input_summary)
+                .map_or(true, |summary| summary.len() > 16_384)
+            || identities
+                .iter()
+                .any(|value| value.trim().is_empty() || value.len() > 4_096)
+            || self.input_checksum_sha256.len() != 64
+            || !self
+                .input_checksum_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(WorkflowError::Build {
+                path: "workflow.mutation_grant".to_string(),
+                message: "mutation grant scope is invalid or unbounded".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Bounded grant scope used by workflow policy preflight.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowGrantScope {
@@ -1702,10 +1778,43 @@ impl WorkflowAgentConfiguration {
                     .to_string(),
             });
         }
-        if self.read_only && self.tool_capability == WorkflowToolCapability::Mutating {
+        if self.read_only && self.tool_capability != WorkflowToolCapability::ReadOnly {
             return Err(WorkflowError::Build {
                 path: "agent.tool_capability".to_string(),
-                message: "read-only agent cannot request mutating tools".to_string(),
+                message: "read-only agent must request the read-only tool capability".to_string(),
+            });
+        }
+        if !self.read_only && self.tool_capability == WorkflowToolCapability::ReadOnly {
+            return Err(WorkflowError::Build {
+                path: "agent.tool_capability".to_string(),
+                message: "read-write agent cannot claim a read-only tool capability".to_string(),
+            });
+        }
+        if self
+            .provider
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty())
+            || self
+                .model
+                .as_ref()
+                .is_some_and(|value| value.trim().is_empty())
+            || self.agent_profile.len() > 256
+            || self
+                .provider
+                .as_ref()
+                .is_some_and(|value| value.len() > 256)
+            || self.model.as_ref().is_some_and(|value| value.len() > 512)
+            || self.tool_allowlist.len() > 256
+            || self.skills.len() > 32
+            || self
+                .tool_allowlist
+                .iter()
+                .any(|tool| tool.trim().is_empty() || tool.len() > 256)
+            || self.skills.iter().any(|skill| skill.skill_id.len() > 256)
+        {
+            return Err(WorkflowError::Build {
+                path: "agent.configuration".to_string(),
+                message: "agent identity, tool, or skill fields exceed durable bounds".to_string(),
             });
         }
         let tools = self.tool_allowlist.iter().collect::<BTreeSet<_>>();
@@ -4507,27 +4616,30 @@ fn validate_production_agent_node(
         return;
     };
     if configuration.contains_key("version") {
-        match serde_json::from_value::<WorkflowAgentConfiguration>(node.configuration.clone()) {
-            Ok(contract) => {
-                if let Err(error) = contract.validate() {
-                    diagnostics.push(WorkflowCapabilityDiagnostic {
-                        code: "invalid_agent_configuration".to_string(),
-                        node_id: Some(node.id.clone()),
-                        message: error.to_string(),
-                    });
-                }
+        let contract = match serde_json::from_value::<WorkflowAgentConfiguration>(
+            node.configuration.clone(),
+        ) {
+            Ok(contract) => contract,
+            Err(error) => {
+                diagnostics.push(WorkflowCapabilityDiagnostic {
+                    code: "invalid_agent_configuration".to_string(),
+                    node_id: Some(node.id.clone()),
+                    message: format!(
+                        "agent node '{}' has an invalid versioned configuration: {error}",
+                        node.id
+                    ),
+                });
+                return;
             }
-            Err(error) => diagnostics.push(WorkflowCapabilityDiagnostic {
+        };
+        if let Err(error) = contract.validate() {
+            diagnostics.push(WorkflowCapabilityDiagnostic {
                 code: "invalid_agent_configuration".to_string(),
                 node_id: Some(node.id.clone()),
-                message: format!(
-                    "agent node '{}' has an invalid versioned configuration: {error}",
-                    node.id
-                ),
-            }),
+                message: error.to_string(),
+            });
         }
-    }
-    if configuration
+    } else if configuration
         .get("configuration_version")
         .is_some_and(|value| {
             value.as_u64() != Some(u64::from(capabilities.agent_configuration_version))
