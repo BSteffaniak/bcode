@@ -22892,7 +22892,17 @@ impl ActivationDispatchOwner for WorkflowActivationOwner<'_> {
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, WorkflowStoreError>> + Send + 'a>>
     {
         Box::pin(async move {
-            match request.activation.node.kind {
+            let started_at = std::time::Instant::now();
+            tracing::debug!(
+                run_id = %request.activation.run_id,
+                node_id = %request.activation.node_id,
+                activation_id = %request.activation.activation_id,
+                attempt = request.attempt,
+                dispatch_identity = %request.dispatch_identity,
+                node_kind = bcode_workflow::node_kind_name(request.activation.node.kind),
+                "workflow activation dispatch started"
+            );
+            let result = match request.activation.node.kind {
                 bcode_workflow::NodeKind::Agent => {
                     dispatch_workflow_agent_turn(self.state, request).await
                 }
@@ -22902,7 +22912,22 @@ impl ActivationDispatchOwner for WorkflowActivationOwner<'_> {
                 _ => Err(WorkflowStoreError::InvalidData(
                     "workflow activation has no production owner".to_string(),
                 )),
-            }
+            };
+            self.state.metrics.record_histogram_with_labels(
+                "workflow.activation.execution.duration_ms",
+                u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+                BTreeMap::from([
+                    (
+                        "node_kind".to_string(),
+                        bcode_workflow::node_kind_name(request.activation.node.kind).to_string(),
+                    ),
+                    (
+                        "outcome".to_string(),
+                        if result.is_ok() { "ok" } else { "error" }.to_string(),
+                    ),
+                ]),
+            );
+            result
         })
     }
 }
