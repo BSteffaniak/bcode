@@ -63,6 +63,16 @@ slice requires these identities and relationships:
 Stable dispatch identity is derived from `(run_id, node_id, activation_id, attempt)` and persisted
 with prepared intent before an external operation is invoked.
 
+## Durable agent configuration
+
+Version 1 `WorkflowAgentConfiguration` is the strict serialized agent-node contract. It includes the
+execution target, profile, provider/model overrides, strict structured-output schema, read-only and
+tool-capability policy, tool allowlist, timeout, prompt mode/system prompt, and exact skill IDs with
+`required`, `preferred`, or `disabled` activation modes. Unknown fields, unsupported versions,
+duplicate IDs, invalid schemas, and read-only mutation escalation fail admission. Because this
+configuration is ordinary node JSON, exact skills participate in canonical definition identity and
+checksums; resolution must remain turn-local and is a separate execution concern.
+
 ## Explicit retained state
 
 Durable definitions carry retained context with the version 1

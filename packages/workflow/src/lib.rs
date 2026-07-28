@@ -1626,6 +1626,116 @@ impl ResourceClaim {
     }
 }
 
+/// Stable durable agent-node configuration version.
+pub const WORKFLOW_AGENT_CONFIGURATION_VERSION: u32 = 1;
+
+/// Skill activation behavior for one durable agent node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentSkillActivationMode {
+    Required,
+    Preferred,
+    Disabled,
+}
+
+/// Exact skill selection embedded in durable definition identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSkillSelection {
+    pub skill_id: String,
+    pub mode: AgentSkillActivationMode,
+}
+
+/// Typed structured-output policy for a durable agent node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentStructuredOutputPolicy {
+    pub schema: ValueSchema,
+    pub strict: bool,
+}
+
+/// Versioned serializable durable agent-node configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAgentConfiguration {
+    pub version: u32,
+    pub execution_target: AgentExecutionTarget,
+    pub agent_profile: String,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub structured_output: AgentStructuredOutputPolicy,
+    pub read_only: bool,
+    pub tool_capability: WorkflowToolCapability,
+    pub tool_allowlist: Vec<String>,
+    pub timeout_ms: u64,
+    pub skills: Vec<AgentSkillSelection>,
+    pub prompt_mode: String,
+    pub system_prompt: String,
+}
+
+impl WorkflowAgentConfiguration {
+    /// Validate bounded identity, policy, and skill-isolation rules.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, empty identities, invalid timeout/prompt mode,
+    /// duplicate skills/tools, or read-only policy escalation.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_AGENT_CONFIGURATION_VERSION {
+            return Err(WorkflowError::Build {
+                path: "agent.configuration.version".to_string(),
+                message: format!(
+                    "unsupported agent configuration version {}; expected {WORKFLOW_AGENT_CONFIGURATION_VERSION}",
+                    self.version
+                ),
+            });
+        }
+        if self.agent_profile.trim().is_empty()
+            || self.prompt_mode != "json_input"
+            || self.timeout_ms == 0
+            || self.timeout_ms > 3_600_000
+            || self.system_prompt.len() > 262_144
+        {
+            return Err(WorkflowError::Build {
+                path: "agent.configuration".to_string(),
+                message: "agent profile, prompt mode, timeout, or system prompt is invalid"
+                    .to_string(),
+            });
+        }
+        if self.read_only && self.tool_capability == WorkflowToolCapability::Mutating {
+            return Err(WorkflowError::Build {
+                path: "agent.tool_capability".to_string(),
+                message: "read-only agent cannot request mutating tools".to_string(),
+            });
+        }
+        let tools = self.tool_allowlist.iter().collect::<BTreeSet<_>>();
+        let skills = self
+            .skills
+            .iter()
+            .map(|skill| skill.skill_id.as_str())
+            .collect::<BTreeSet<_>>();
+        if tools.len() != self.tool_allowlist.len()
+            || skills.len() != self.skills.len()
+            || self
+                .skills
+                .iter()
+                .any(|skill| skill.skill_id.trim().is_empty())
+        {
+            return Err(WorkflowError::Build {
+                path: "agent.configuration".to_string(),
+                message: "agent tools and skill IDs must be non-empty and unique".to_string(),
+            });
+        }
+        jsonschema::validator_for(&self.structured_output.schema.schema).map_err(|error| {
+            WorkflowError::Build {
+                path: "agent.structured_output".to_string(),
+                message: format!("invalid structured output schema: {error}"),
+            }
+        })?;
+        Ok(())
+    }
+}
+
 /// Execution target for a daemon-hosted workflow agent node.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
@@ -4396,6 +4506,27 @@ fn validate_production_agent_node(
         });
         return;
     };
+    if configuration.contains_key("version") {
+        match serde_json::from_value::<WorkflowAgentConfiguration>(node.configuration.clone()) {
+            Ok(contract) => {
+                if let Err(error) = contract.validate() {
+                    diagnostics.push(WorkflowCapabilityDiagnostic {
+                        code: "invalid_agent_configuration".to_string(),
+                        node_id: Some(node.id.clone()),
+                        message: error.to_string(),
+                    });
+                }
+            }
+            Err(error) => diagnostics.push(WorkflowCapabilityDiagnostic {
+                code: "invalid_agent_configuration".to_string(),
+                node_id: Some(node.id.clone()),
+                message: format!(
+                    "agent node '{}' has an invalid versioned configuration: {error}",
+                    node.id
+                ),
+            }),
+        }
+    }
     if configuration
         .get("configuration_version")
         .is_some_and(|value| {
@@ -5420,6 +5551,66 @@ mod tests {
             item.code == "unsupported_parallel_policy"
                 && item.node_id.as_deref() == Some("parallel")
         }));
+    }
+
+    #[test]
+    fn versioned_agent_configuration_validates_skills_identity_and_read_only_policy() {
+        let contract = WorkflowAgentConfiguration {
+            version: WORKFLOW_AGENT_CONFIGURATION_VERSION,
+            execution_target: AgentExecutionTarget::FreshIsolated,
+            agent_profile: "build".to_string(),
+            provider: Some("configured".to_string()),
+            model: Some("configured".to_string()),
+            structured_output: AgentStructuredOutputPolicy {
+                schema: ValueSchema::of::<serde_json::Value>(),
+                strict: true,
+            },
+            read_only: true,
+            tool_capability: WorkflowToolCapability::ReadOnly,
+            tool_allowlist: vec!["filesystem.read".to_string()],
+            timeout_ms: 30_000,
+            skills: vec![
+                AgentSkillSelection {
+                    skill_id: "commit-message".to_string(),
+                    mode: AgentSkillActivationMode::Required,
+                },
+                AgentSkillSelection {
+                    skill_id: "style-guide".to_string(),
+                    mode: AgentSkillActivationMode::Preferred,
+                },
+                AgentSkillSelection {
+                    skill_id: "legacy".to_string(),
+                    mode: AgentSkillActivationMode::Disabled,
+                },
+            ],
+            prompt_mode: "json_input".to_string(),
+            system_prompt: "Return structured output.".to_string(),
+        };
+        contract.validate().expect("valid contract");
+        let encoded = serde_json::to_value(&contract).expect("serialize");
+        assert_eq!(encoded["skills"][0]["skill_id"], "commit-message");
+        assert!(
+            serde_json::from_value::<WorkflowAgentConfiguration>(serde_json::json!({
+                "version": 1,
+                "execution_target": "fresh_isolated",
+                "agent_profile": "build",
+                "provider": null,
+                "model": null,
+                "structured_output": {"schema": {"type": "object"}, "strict": true},
+                "read_only": true,
+                "tool_capability": "mutating",
+                "tool_allowlist": [],
+                "timeout_ms": 30000,
+                "skills": [],
+                "prompt_mode": "json_input",
+                "system_prompt": "test",
+                "unknown": true
+            }))
+            .is_err()
+        );
+        let mut escalated = contract;
+        escalated.tool_capability = WorkflowToolCapability::Mutating;
+        assert!(escalated.validate().is_err());
     }
 
     #[test]
