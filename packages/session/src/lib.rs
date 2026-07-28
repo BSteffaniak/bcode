@@ -3246,6 +3246,7 @@ mod tests {
         std::fs::remove_dir_all(root).expect("temp session dir should be removed");
     }
 
+    #[allow(clippy::too_many_lines)] // Exercises append, durable retirement, late rejection, and turn cleanup as one lifecycle.
     #[tokio::test]
     async fn active_assistant_checkpoint_hydrates_attach_and_retires_at_boundaries() {
         let manager = SessionManager::default();
@@ -3366,7 +3367,7 @@ mod tests {
             .create_session(Some("test".to_owned()), test_working_directory())
             .await
             .expect("session should create");
-        let text = "é".repeat((super::actor::MAX_ACTIVE_TEXT_STREAM_BYTES_PER_KEY / 2) + 10);
+        let text = "é".repeat((256 * 1024 / 2) + 10);
         let _ = manager
             .publish_live_event(
                 session.id,
@@ -3404,7 +3405,7 @@ mod tests {
                 },
                 ..
             } if *start_offset > 0
-                && retained.len() <= super::actor::MAX_ACTIVE_TEXT_STREAM_BYTES_PER_KEY
+                && retained.len() <= 256 * 1024
                 && *total_bytes == text.len()
         ));
     }

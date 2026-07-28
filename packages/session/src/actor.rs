@@ -14,10 +14,10 @@ use std::sync::RwLock;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 const SESSION_DATABASE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-pub(crate) const MAX_ACTIVE_TEXT_STREAM_KEYS: usize = 32;
+const MAX_ACTIVE_TEXT_STREAM_KEYS: usize = 32;
 const MAX_ACTIVE_TEXT_STREAM_TOMBSTONES: usize = 64;
-pub(crate) const MAX_ACTIVE_TEXT_STREAM_BYTES_PER_KEY: usize = 256 * 1024;
-pub(crate) const MAX_ACTIVE_TEXT_STREAM_BYTES_PER_SESSION: usize = 1024 * 1024;
+const MAX_ACTIVE_TEXT_STREAM_BYTES_PER_KEY: usize = 256 * 1024;
+const MAX_ACTIVE_TEXT_STREAM_BYTES_PER_SESSION: usize = 1024 * 1024;
 
 fn bounded_text_suffix(text: &str, max_bytes: usize) -> (&str, usize) {
     if text.len() <= max_bytes {
@@ -912,9 +912,9 @@ impl SessionActor {
             event.provenance = provenance;
             event
         };
-        self.retire_live_text_checkpoint_for_durable_event(&event.kind);
         self.state
             .apply_persisted_event(event.clone(), activity_timestamp_ms);
+        self.retire_live_text_checkpoint_for_durable_event(&event.kind);
         self.update_manifest_and_catalog_after_append().await;
         self.state.load_status = SessionLoadStatusKind::Current;
         self.refresh_snapshot();
@@ -1533,6 +1533,7 @@ impl SessionActor {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // One actor-owned reducer keeps bounds and lifecycle transitions atomic.
     fn update_live_text_checkpoint(&mut self, kind: &SessionLiveEventKind) {
         use bcode_session_models::{TextStreamOperation, TextStreamUpdate};
         let SessionLiveEventKind::AssistantTextStreamUpdated {

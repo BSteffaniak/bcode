@@ -2736,6 +2736,7 @@ impl SessionView {
         }
     }
 
+    #[allow(clippy::too_many_lines)] // One reducer keeps generation/revision/offset transitions atomic.
     fn apply_ordered_assistant_update(
         &mut self,
         id: TranscriptViewItemId,
