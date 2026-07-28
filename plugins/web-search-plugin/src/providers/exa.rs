@@ -938,6 +938,15 @@ mod tests {
                 && !result.title.trim().is_empty()
                 && result.snippet.chars().count() <= MAX_CONTENT_CHARACTERS
         }));
+        println!(
+            "live Exa basic search: results={}, hosts={}, snippet_chars={:?}",
+            basic.len(),
+            result_hosts(&basic).join(","),
+            basic
+                .iter()
+                .map(|result| result.snippet.chars().count())
+                .collect::<Vec<_>>()
+        );
 
         let rich = search(
             &client,
@@ -966,6 +975,26 @@ mod tests {
                 && !result.snippet.trim().is_empty()
                 && result.snippet.chars().count() <= 500
         }));
+        println!(
+            "live Exa filtered text search: results={}, hosts={}, snippet_chars={:?}",
+            rich.len(),
+            result_hosts(&rich).join(","),
+            rich.iter()
+                .map(|result| result.snippet.chars().count())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn result_hosts(results: &[NormalizedResult]) -> Vec<&str> {
+        results
+            .iter()
+            .filter_map(|result| {
+                result
+                    .url
+                    .split_once("://")
+                    .map(|(_, rest)| rest.split('/').next().unwrap_or(rest))
+            })
+            .collect()
     }
 
     #[tokio::test]
