@@ -1511,9 +1511,16 @@ impl SessionView {
     pub fn apply_live_event(&mut self, event: &SessionLiveEvent) {
         self.snapshot.session_id = Some(event.session_id);
         match &event.kind {
-            SessionLiveEventKind::AssistantTextDelta { turn_id, text } => {
+            SessionLiveEventKind::AssistantTextDelta {
+                turn_id,
+                segment_id,
+                text,
+                ..
+            } => {
                 self.push_or_append_streaming_message(
-                    TranscriptViewItemId::new(format!("assistant-turn:{turn_id}")),
+                    TranscriptViewItemId::new(format!(
+                        "assistant-turn:{turn_id}:segment:{segment_id}"
+                    )),
                     0,
                     None,
                     StreamingMessageKind::Assistant,
@@ -7781,10 +7788,13 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::AssistantTextDelta {
                 turn_id: "turn-1".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
                 text: "live answer".to_owned(),
             },
         });
         let live_id = view.snapshot().transcript.items[0].id.clone();
+        assert_eq!(live_id.get(), "assistant-turn:turn-1:segment:segment-0");
 
         view.apply_event(&event(
             session_id,
@@ -7897,6 +7907,8 @@ mod tests {
                 session_id,
                 kind: SessionLiveEventKind::AssistantTextDelta {
                     turn_id: "turn-1".to_owned(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
                     text: text.to_owned(),
                 },
             });
@@ -7926,6 +7938,8 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::AssistantTextDelta {
                 turn_id: "turn-1".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
                 text: " again".to_owned(),
             },
         });
@@ -8070,6 +8084,8 @@ mod tests {
                 session_id,
                 kind: SessionLiveEventKind::AssistantTextDelta {
                     turn_id: "turn-1".to_owned(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
                     text: text.to_owned(),
                 },
             });

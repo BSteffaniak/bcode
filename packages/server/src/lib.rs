@@ -12279,10 +12279,19 @@ struct ModelStreamProgress {
     generations: BTreeMap<String, u64>,
 }
 
+#[derive(Debug, Clone)]
+struct AssistantSegmentOutput {
+    segment_id: String,
+    segment_order: u32,
+    text: String,
+}
+
 #[derive(Debug)]
 struct ModelStreamAccumulator {
     session_id: SessionId,
     turn_id: String,
+    segment_id: String,
+    segment_order: u32,
     assistant_text: String,
     pending_text: String,
     pending_legacy_reasoning: String,
@@ -12291,10 +12300,17 @@ struct ModelStreamAccumulator {
 }
 
 impl ModelStreamAccumulator {
-    fn new(session_id: SessionId, turn_id: &str, cancel_state: Arc<TurnCancelState>) -> Self {
+    fn new(
+        session_id: SessionId,
+        turn_id: &str,
+        segment_order: u32,
+        cancel_state: Arc<TurnCancelState>,
+    ) -> Self {
         Self {
             session_id,
             turn_id: turn_id.to_owned(),
+            segment_id: format!("segment-{segment_order}"),
+            segment_order,
             assistant_text: String::new(),
             pending_text: String::new(),
             pending_legacy_reasoning: String::new(),
@@ -12344,6 +12360,8 @@ impl ModelStreamAccumulator {
                     self.session_id,
                     SessionLiveEventKind::AssistantTextDelta {
                         turn_id: self.turn_id.clone(),
+                        segment_id: self.segment_id.clone(),
+                        segment_order: self.segment_order,
                         text,
                     },
                 )
@@ -12365,12 +12383,26 @@ impl ModelStreamAccumulator {
         self.last_flush = Instant::now();
     }
 
-    fn take_assistant_text(&mut self) -> String {
-        std::mem::take(&mut self.assistant_text)
+    fn take_assistant_segment(&mut self) -> Option<AssistantSegmentOutput> {
+        let text = std::mem::take(&mut self.assistant_text);
+        (!text.is_empty()).then(|| AssistantSegmentOutput {
+            segment_id: self.segment_id.clone(),
+            segment_order: self.segment_order,
+            text,
+        })
     }
 
-    fn finish(self) -> String {
-        self.assistant_text
+    fn advance_segment(&mut self, segment_order: u32) {
+        self.segment_order = segment_order;
+        self.segment_id = format!("segment-{segment_order}");
+    }
+
+    fn finish(self) -> Option<AssistantSegmentOutput> {
+        (!self.assistant_text.is_empty()).then_some(AssistantSegmentOutput {
+            segment_id: self.segment_id,
+            segment_order: self.segment_order,
+            text: self.assistant_text,
+        })
     }
 }
 
@@ -13982,7 +14014,6 @@ async fn run_model_turn_round(
             next_assistant_segment_order,
             provider_plugin_id,
             provider_turn_id: &start.provider_turn_id,
-            provider_request_id: &request.turn_id,
         },
         Arc::clone(&cancel_state),
         command_context,
@@ -14026,8 +14057,10 @@ async fn run_model_turn_round(
         .await;
     }
 
-    if !assistant_text.is_empty() && !cancel_state.is_cancelled() {
-        outcome.assistant_output = Some(assistant_text.clone());
+    if let Some(segment) = assistant_text.as_ref()
+        && !cancel_state.is_cancelled()
+    {
+        outcome.assistant_output = Some(segment.text.clone());
     }
     if cancel_state.is_cancelled() && outcome.completion.is_none() {
         outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
@@ -14037,13 +14070,15 @@ async fn run_model_turn_round(
         ));
     }
     persist_reasoning_activities(state, session_id, turn_id, &mut outcome).await;
-    if !assistant_text.is_empty() && !cancel_state.is_cancelled() {
-        append_assistant_response_segment_event(
+    if let Some(segment) = assistant_text
+        && !cancel_state.is_cancelled()
+    {
+        let _ = append_assistant_response_segment_event(
             state,
             session_id,
             turn_id,
             next_assistant_segment_order,
-            assistant_text,
+            segment,
         )
         .await;
     }
@@ -14184,7 +14219,6 @@ struct ModelPollContext<'a> {
     next_assistant_segment_order: &'a mut u32,
     provider_plugin_id: Option<&'a str>,
     provider_turn_id: &'a str,
-    provider_request_id: &'a str,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -14194,16 +14228,19 @@ async fn poll_model_turn_events(
     poll: ModelPollContext<'_>,
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
-) -> (String, ModelPollOutcome) {
+) -> (Option<AssistantSegmentOutput>, ModelPollOutcome) {
     let ModelPollContext {
         turn_id,
         next_assistant_segment_order,
         provider_plugin_id,
         provider_turn_id,
-        provider_request_id,
     } = poll;
-    let mut stream =
-        ModelStreamAccumulator::new(session_id, provider_request_id, Arc::clone(&cancel_state));
+    let mut stream = ModelStreamAccumulator::new(
+        session_id,
+        turn_id,
+        *next_assistant_segment_order,
+        Arc::clone(&cancel_state),
+    );
     let mut outcome = ModelPollOutcome::default();
     let mut stream_progress = ModelStreamProgress::default();
     let mut idle_for = Duration::ZERO;
@@ -15027,20 +15064,21 @@ async fn handle_provider_tool_call_finished_event(
     )
     .await;
     stream.flush(state).await;
-    let assistant_text = stream.take_assistant_text();
-    if !assistant_text.is_empty()
+    let segment = stream.take_assistant_segment();
+    if let Some(segment) = segment
         && active_turn_cancel_state(state, session_id)
             .await
             .is_some_and(|cancel_state| !cancel_state.is_cancelled())
-    {
-        append_assistant_response_segment_event(
+        && append_assistant_response_segment_event(
             state,
             session_id,
             turn_id,
             next_assistant_segment_order,
-            assistant_text,
+            segment,
         )
-        .await;
+        .await
+    {
+        stream.advance_segment(*next_assistant_segment_order);
     }
 }
 
@@ -21331,26 +21369,29 @@ async fn append_assistant_response_segment_event(
     session_id: SessionId,
     turn_id: &str,
     next_segment_order: &mut u32,
-    text: String,
-) {
-    let segment_order = *next_segment_order;
-    let segment_id = format!("segment-{segment_order}");
+    segment: AssistantSegmentOutput,
+) -> bool {
+    debug_assert_eq!(segment.segment_order, *next_segment_order);
     match state
         .sessions
         .append_assistant_response_segment(
             session_id,
             turn_id.to_owned(),
-            segment_id,
-            segment_order,
-            text,
+            segment.segment_id,
+            segment.segment_order,
+            segment.text,
         )
         .await
     {
         Ok(event) => {
             *next_segment_order = next_segment_order.saturating_add(1);
             publish_session_event(state, &event).await;
+            true
         }
-        Err(error) => tracing::warn!("failed to append assistant response segment: {error}"),
+        Err(error) => {
+            tracing::warn!("failed to append assistant response segment: {error}");
+            false
+        }
     }
 }
 
@@ -29624,6 +29665,7 @@ library = "test"
         let mut stream = ModelStreamAccumulator::new(
             SessionId::new(),
             "turn-1",
+            0,
             Arc::new(TurnCancelState::default()),
         );
         stream.push_text(&"x".repeat(1024 * 1024));
@@ -29640,6 +29682,7 @@ library = "test"
         let mut stream = ModelStreamAccumulator::new(
             SessionId::new(),
             "turn-1",
+            0,
             Arc::new(TurnCancelState::default()),
         );
         stream.push_legacy_reasoning("legacy");
@@ -29649,13 +29692,25 @@ library = "test"
     }
 
     #[test]
-    fn assistant_segment_identity_and_order_advance_only_after_commit() {
-        let mut next_order = 0_u32;
-        let first_id = format!("segment-{next_order}");
-        assert_eq!(first_id, "segment-0");
-        next_order = next_order.saturating_add(1);
-        let second_id = format!("segment-{next_order}");
-        assert_eq!(second_id, "segment-1");
+    fn assistant_segment_identity_rotates_only_after_commit() {
+        let cancel_state = Arc::new(TurnCancelState::default());
+        let mut stream =
+            ModelStreamAccumulator::new(SessionId::new(), "turn-1", 0, Arc::clone(&cancel_state));
+        stream.push_text("before tool");
+
+        let first = stream
+            .take_assistant_segment()
+            .expect("first segment should be available");
+        assert_eq!(first.segment_id, "segment-0");
+        assert_eq!(first.segment_order, 0);
+        assert_eq!(first.text, "before tool");
+
+        stream.advance_segment(1);
+        stream.push_text("after tool");
+        let second = stream.finish().expect("second segment should be available");
+        assert_eq!(second.segment_id, "segment-1");
+        assert_eq!(second.segment_order, 1);
+        assert_eq!(second.text, "after tool");
     }
 
     #[test]
@@ -36172,6 +36227,8 @@ library = "test"
                     session_id,
                     SessionLiveEventKind::AssistantTextDelta {
                         turn_id: "turn-1".to_owned(),
+                        segment_id: "segment-0".to_owned(),
+                        segment_order: 0,
                         text: text.to_owned(),
                     },
                 )

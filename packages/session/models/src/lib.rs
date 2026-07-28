@@ -1508,7 +1508,16 @@ impl ReasoningActivityEvent {
 #[serde(rename_all = "snake_case")]
 pub enum SessionLiveEventKind {
     /// Coalesced assistant text produced by an active model turn.
-    AssistantTextDelta { turn_id: String, text: String },
+    AssistantTextDelta {
+        /// Application model turn that owns the segment.
+        turn_id: String,
+        /// Stable segment identifier scoped to `turn_id`.
+        segment_id: String,
+        /// Zero-based semantic order of the segment within the turn.
+        segment_order: u32,
+        /// Contiguous text appended to the segment.
+        text: String,
+    },
     /// Coalesced provider-exposed reasoning text produced by an active model turn.
     ///
     /// Legacy compatibility adapter: the text has no representation kind, part identity, or
@@ -2429,6 +2438,21 @@ pub enum SessionEventKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn assistant_live_segment_identity_round_trips() {
+        let event = SessionLiveEventKind::AssistantTextDelta {
+            turn_id: "turn-1".to_owned(),
+            segment_id: "segment-2".to_owned(),
+            segment_order: 2,
+            text: "answer".to_owned(),
+        };
+        let encoded = serde_json::to_value(&event).expect("live event should serialize");
+        let decoded: SessionLiveEventKind =
+            serde_json::from_value(encoded).expect("live event should deserialize");
+
+        assert_eq!(decoded, event);
+    }
 
     #[test]
     fn all_reasoning_activity_events_round_trip_without_provider_payload_fields() {

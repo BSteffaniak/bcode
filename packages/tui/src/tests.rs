@@ -4445,6 +4445,8 @@ fn shared_streaming_updates_remain_one_resident_terminal_item() {
             session_id,
             kind: bcode_session_models::SessionLiveEventKind::AssistantTextDelta {
                 turn_id: "turn-stream".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
                 text: format!("{index},"),
             },
         });

@@ -3073,6 +3073,8 @@ mod tests {
                 session.id,
                 SessionLiveEventKind::AssistantTextDelta {
                     turn_id: "turn-1".to_string(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
                     text: "live text".to_string(),
                 },
             )
@@ -3088,6 +3090,8 @@ mod tests {
             received.kind,
             SessionLiveEventKind::AssistantTextDelta {
                 turn_id: "turn-1".to_string(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
                 text: "live text".to_string(),
             }
         );
@@ -3246,6 +3250,8 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::AssistantTextDelta {
                 turn_id: "turn-1".to_string(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
                 text: "hello".to_string(),
             },
         };
@@ -4587,6 +4593,8 @@ mod tests {
                 session.id,
                 SessionLiveEventKind::AssistantTextDelta {
                     turn_id: "turn-after-idle".to_owned(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
                     text: "live after idle".to_owned(),
                 },
             )

@@ -5072,6 +5072,8 @@ mod tests {
             session_id,
             kind: bcode_session_models::SessionLiveEventKind::AssistantTextDelta {
                 turn_id: "turn-1".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
                 text: "stale partial".to_owned(),
             },
         });
@@ -5148,6 +5150,8 @@ mod tests {
             session_id,
             kind: bcode_session_models::SessionLiveEventKind::AssistantTextDelta {
                 turn_id: "turn-2".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
                 text: "live".to_owned(),
             },
         });
@@ -6057,6 +6061,8 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::AssistantTextDelta {
                 turn_id: "turn-1".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
                 text: text.to_owned(),
             },
         };

@@ -7658,7 +7658,7 @@ fn session_live_event_description(event: &SessionLiveEvent) -> String {
             envelope.contribution.schema_version,
             envelope.contribution.operation,
         ),
-        SessionLiveEventKind::AssistantTextDelta { turn_id, text } => {
+        SessionLiveEventKind::AssistantTextDelta { turn_id, text, .. } => {
             format!("live assistant delta ({turn_id}): {text}")
         }
         SessionLiveEventKind::AssistantReasoningDelta { turn_id, text } => {

@@ -4182,7 +4182,7 @@ impl ReviewAgentSessionStreamState {
 
     fn apply_live_event(&mut self, kind: SessionLiveEventKind) -> bool {
         match kind {
-            SessionLiveEventKind::AssistantTextDelta { turn_id, text } => {
+            SessionLiveEventKind::AssistantTextDelta { turn_id, text, .. } => {
                 self.live_answer_by_turn
                     .entry(turn_id.clone())
                     .or_default()
@@ -14296,6 +14296,8 @@ mod tests {
                 session_id,
                 kind: SessionLiveEventKind::AssistantTextDelta {
                     turn_id: "t1".to_string(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
                     text: "Hello".to_string(),
                 },
             },
@@ -14305,6 +14307,8 @@ mod tests {
                 session_id,
                 kind: SessionLiveEventKind::AssistantTextDelta {
                     turn_id: "t1".to_string(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
                     text: " world".to_string(),
                 },
             },
@@ -14329,6 +14333,8 @@ mod tests {
                 session_id,
                 kind: SessionLiveEventKind::AssistantTextDelta {
                     turn_id: "t1".to_string(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
                     text: "Hello world".to_string(),
                 },
             },
