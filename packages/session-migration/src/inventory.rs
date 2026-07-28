@@ -1425,8 +1425,7 @@ impl ReleasedEventVariantDescriptor {
 
 fn released_event_schema_range(kind: &str) -> (u16, u16) {
     match kind {
-        "assistant_reasoning_activity" => (41, 41),
-        "assistant_response_segment" => (41, 41),
+        "assistant_reasoning_activity" | "assistant_response_segment" => (41, 41),
         "agent_changed" => (3, 39),
         "assistant_reasoning_delta"
         | "assistant_reasoning_message"

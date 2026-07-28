@@ -8111,15 +8111,9 @@ fn print_timeline_event(event: &SessionEvent, first_trace_time: Option<u64>) {
         SessionEventKind::AssistantMessage { text } => {
             println!("{prefix} assistant: {}", one_line(text));
         }
-        SessionEventKind::AssistantResponseSegment {
-            turn_id,
-            segment_id,
-            segment_order,
-            text,
-        } => println!(
-            "{prefix} assistant {turn_id}/{segment_id} order={segment_order}: {}",
-            one_line(text)
-        ),
+        SessionEventKind::AssistantResponseSegment { text, .. } => {
+            println!("{prefix} assistant segment: {}", one_line(text));
+        }
         SessionEventKind::ToolCallRequested {
             tool_call_id,
             tool_name,

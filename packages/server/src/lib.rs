@@ -12713,7 +12713,6 @@ async fn run_model_turn(
         state,
         session_id,
         trigger_event,
-        &turn_id,
         runtime_context,
         Arc::clone(&cancel_state),
         command_context,
@@ -12763,13 +12762,13 @@ async fn run_model_turn_inner(
     state: &ServerState,
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
-    turn_id: &str,
     runtime_context: Option<ClientRuntimeContext>,
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
     phase: &Arc<Mutex<SessionRuntimePhase>>,
 ) -> ModelTurnCompletion {
     let execution = turn_execution_options(trigger_event);
+    let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
     let mut selection =
         session_model_selection_with_runtime_context(state, session_id, runtime_context).await;
     apply_turn_model_selection(&mut selection, &execution);
@@ -13000,11 +12999,13 @@ async fn run_model_turn_inner(
         let outcome = match Box::pin(run_model_turn_round(
             state,
             session_id,
-            turn_id,
-            &mut next_assistant_segment_order,
-            provider_plugin_id.as_deref(),
-            &request,
-            &context_projection,
+            ModelTurnRoundContext {
+                turn_id: &turn_id,
+                next_assistant_segment_order: &mut next_assistant_segment_order,
+                provider_plugin_id: provider_plugin_id.as_deref(),
+                request: &request,
+                context_projection: &context_projection,
+            },
             Arc::clone(&cancel_state),
             command_context,
         ))
@@ -13850,18 +13851,29 @@ async fn active_plugin_scope_for_tool_call(
         })
 }
 
+struct ModelTurnRoundContext<'a> {
+    turn_id: &'a str,
+    next_assistant_segment_order: &'a mut u32,
+    provider_plugin_id: Option<&'a str>,
+    request: &'a ModelTurnRequest,
+    context_projection: &'a bcode_session_models::RequestContextObservation,
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_model_turn_round(
     state: &ServerState,
     session_id: SessionId,
-    turn_id: &str,
-    next_assistant_segment_order: &mut u32,
-    provider_plugin_id: Option<&str>,
-    request: &ModelTurnRequest,
-    context_projection: &bcode_session_models::RequestContextObservation,
+    round: ModelTurnRoundContext<'_>,
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
 ) -> Result<ModelPollOutcome, ModelTurnCompletion> {
+    let ModelTurnRoundContext {
+        turn_id,
+        next_assistant_segment_order,
+        provider_plugin_id,
+        request,
+        context_projection,
+    } = round;
     let round_start = Instant::now();
     let provider_label = provider_plugin_id.unwrap_or("<auto>").to_string();
     let provider_labels = provider_lifecycle_metric_labels(
@@ -13965,11 +13977,13 @@ async fn run_model_turn_round(
     let (assistant_text, mut outcome) = poll_model_turn_events(
         state,
         session_id,
-        turn_id,
-        next_assistant_segment_order,
-        provider_plugin_id,
-        &start.provider_turn_id,
-        &request.turn_id,
+        ModelPollContext {
+            turn_id,
+            next_assistant_segment_order,
+            provider_plugin_id,
+            provider_turn_id: &start.provider_turn_id,
+            provider_request_id: &request.turn_id,
+        },
         Arc::clone(&cancel_state),
         command_context,
     )
@@ -14165,18 +14179,29 @@ async fn append_model_provider_round_finished_trace(
     .await;
 }
 
+struct ModelPollContext<'a> {
+    turn_id: &'a str,
+    next_assistant_segment_order: &'a mut u32,
+    provider_plugin_id: Option<&'a str>,
+    provider_turn_id: &'a str,
+    provider_request_id: &'a str,
+}
+
 #[allow(clippy::too_many_lines)]
 async fn poll_model_turn_events(
     state: &ServerState,
     session_id: SessionId,
-    turn_id: &str,
-    next_assistant_segment_order: &mut u32,
-    provider_plugin_id: Option<&str>,
-    provider_turn_id: &str,
-    provider_request_id: &str,
+    poll: ModelPollContext<'_>,
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
 ) -> (String, ModelPollOutcome) {
+    let ModelPollContext {
+        turn_id,
+        next_assistant_segment_order,
+        provider_plugin_id,
+        provider_turn_id,
+        provider_request_id,
+    } = poll;
     let mut stream =
         ModelStreamAccumulator::new(session_id, provider_request_id, Arc::clone(&cancel_state));
     let mut outcome = ModelPollOutcome::default();
@@ -21749,11 +21774,6 @@ fn workflow_attempt_observation_from_completion(
                 )
             })?;
             let output: serde_json::Value = serde_json::from_str(&output)?;
-            #[cfg(test)]
-            eprintln!(
-                "workflow completion node={} input={:?} output={output}",
-                request.activation.node_id, request.activation.input
-            );
             if let Err(message) =
                 validate_loop_evaluation_evidence(&request.activation.node_id, &output)
             {
@@ -21846,8 +21866,6 @@ fn workflow_turn_output(
         .max_by_key(|(segment_order, sequence, _)| (*segment_order, *sequence))
         .map(|(_, _, text)| text.clone());
     if correlated.is_some() {
-        #[cfg(test)]
-        eprintln!("workflow_turn_output correlated turn={turn_id} output={correlated:?}");
         return correlated;
     }
 
