@@ -2158,6 +2158,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_agent_profile",
  "bcode_command",
+ "bcode_plugin_sdk",
  "bcode_session_models",
  "bcode_tool",
  "bcode_workflow",
