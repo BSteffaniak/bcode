@@ -12,6 +12,7 @@ use bcode_tool::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::BTreeSet;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -246,13 +247,45 @@ fn decode_optional_owner_context<T: serde::de::DeserializeOwned>(
         .map_err(|error| format!("invalid host context {schema}@{version}: {error}"))
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct CommitRequest {
     repo_path: PathBuf,
     expected_head: String,
     message: String,
     paths: Vec<PathBuf>,
+}
+
+const MAX_COMMIT_MESSAGE_BYTES: usize = 8_192;
+const MAX_COMMIT_PATHS: usize = 10_000;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ComposeCommitRequest {
+    preparation: PrepareResponse,
+    message: ProposedCommitMessage,
+    no_changes: NoChangesDecision,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProposedCommitMessage {
+    title: String,
+    description: String,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum NoChangesDecision {
+    Fail,
+    NoOp,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ComposedCommitRequest {
+    Ready { request: CommitRequest },
+    NoChanges,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -262,7 +295,64 @@ struct CommitResponse {
     paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CommitStatusRequest {
+    repo_path: PathBuf,
+    expected_head: String,
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CommitReconciliationOutcome {
+    NotCommitted,
+    CandidateCommit,
+    Diverged,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CommitStatusResponse {
+    expected_head: String,
+    actual_head: String,
+    outcome: CommitReconciliationOutcome,
+    actual_commit_paths: Vec<PathBuf>,
+    guidance: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareRequest {
+    #[serde(default)]
+    include_prefixes: Vec<PathBuf>,
+    #[serde(default)]
+    exclude_prefixes: Vec<PathBuf>,
+    max_paths: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct PreparedChangedPath {
+    path: PathBuf,
+    status: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+struct PrepareResponse {
+    repository_root: PathBuf,
+    head: String,
+    changed_paths: Vec<PreparedChangedPath>,
+}
+
 fn invoke_workflow_block(context: &NativeServiceContext) -> ServiceResponse {
+    if context.request.operation == "git.prepare" {
+        return prepare_workflow_repository(context);
+    }
+    if context.request.operation == "git.commit-status" {
+        return commit_status_workflow(context);
+    }
+    if context.request.operation == "git.compose-commit" {
+        return compose_workflow_commit(context);
+    }
     if context.request.operation != "git.commit" {
         return ServiceResponse::error(
             "unsupported_operation",
@@ -289,23 +379,286 @@ fn invoke_workflow_block(context: &NativeServiceContext) -> ServiceResponse {
     }
 }
 
-fn commit_repository(request: &CommitRequest) -> Result<CommitResponse, GitError> {
+fn commit_status_workflow(context: &NativeServiceContext) -> ServiceResponse {
+    let invocation = match context
+        .request
+        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
+    {
+        Ok(invocation) => invocation,
+        Err(error) => return invalid_request(&error),
+    };
+    let request = match invocation.typed_input::<CommitStatusRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error),
+    };
+    match commit_status(&request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("commit_status_failed", error.to_string()),
+    }
+}
+
+fn commit_status(request: &CommitStatusRequest) -> Result<CommitStatusResponse, GitError> {
     let repo = request.repo_path.canonicalize()?;
-    if !repo.is_dir() || request.message.trim().is_empty() || request.paths.is_empty() {
+    if request.expected_head.trim().is_empty() || request.paths.is_empty() {
         return Err(GitError::InvalidRequest(
-            "commit requires a repository, non-empty message, and bounded paths".to_string(),
+            "commit status requires expected HEAD and exact paths".to_string(),
         ));
     }
+    let expected_paths = normalize_commit_paths(&request.paths)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
     let actual_head = git_stdout(&repo, ["rev-parse", "HEAD"])?;
-    if actual_head != request.expected_head {
-        return Err(GitError::InvalidRequest(format!(
-            "repository HEAD changed: expected {}, found {actual_head}",
-            request.expected_head
-        )));
+    if actual_head == request.expected_head {
+        return Ok(CommitStatusResponse {
+            expected_head: request.expected_head.clone(),
+            actual_head,
+            outcome: CommitReconciliationOutcome::NotCommitted,
+            actual_commit_paths: Vec::new(),
+            guidance: "HEAD has not advanced; verify owner acceptance before retrying".to_string(),
+        });
     }
-    let mut normalized = Vec::with_capacity(request.paths.len());
-    let mut seen = std::collections::BTreeSet::new();
-    for path in &request.paths {
+    let parent = git_stdout(&repo, ["rev-parse", "HEAD^"])?;
+    let actual_commit_paths = git_stdout(
+        &repo,
+        ["diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD"],
+    )?
+    .lines()
+    .map(PathBuf::from)
+    .collect::<Vec<_>>();
+    let actual_paths = actual_commit_paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<BTreeSet<_>>();
+    let (outcome, guidance) = if parent == request.expected_head && actual_paths == expected_paths {
+        (
+            CommitReconciliationOutcome::CandidateCommit,
+            "HEAD advanced exactly once from expected HEAD with the requested paths; verify commit identity before recording success".to_string(),
+        )
+    } else {
+        (
+            CommitReconciliationOutcome::Diverged,
+            "repository evidence is inconsistent with the expected commit; explicit repair is required".to_string(),
+        )
+    };
+    Ok(CommitStatusResponse {
+        expected_head: request.expected_head.clone(),
+        actual_head,
+        outcome,
+        actual_commit_paths,
+        guidance,
+    })
+}
+
+fn compose_workflow_commit(context: &NativeServiceContext) -> ServiceResponse {
+    let invocation = match context
+        .request
+        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
+    {
+        Ok(invocation) => invocation,
+        Err(error) => return invalid_request(&error),
+    };
+    let request = match invocation.typed_input::<ComposeCommitRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error),
+    };
+    match compose_commit_request(request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("compose_failed", error.to_string()),
+    }
+}
+
+fn compose_commit_request(
+    request: ComposeCommitRequest,
+) -> Result<ComposedCommitRequest, GitError> {
+    let title = request.message.title.trim();
+    let description = request.message.description.trim();
+    if title.is_empty()
+        || title.contains(['\r', '\n'])
+        || title.len() > 256
+        || description.len() > 7_935
+    {
+        return Err(GitError::InvalidRequest(
+            "commit message title/description is empty, multiline, or unbounded".to_string(),
+        ));
+    }
+    let message = if description.is_empty() {
+        title.to_string()
+    } else {
+        format!("{title}\n\n{description}")
+    };
+    if message.len() > MAX_COMMIT_MESSAGE_BYTES
+        || request.preparation.head.trim().is_empty()
+        || request.preparation.head.len() > 256
+        || request.preparation.changed_paths.len() > MAX_COMMIT_PATHS
+    {
+        return Err(GitError::InvalidRequest(
+            "commit request exceeds message, HEAD, or path bounds".to_string(),
+        ));
+    }
+    if request.preparation.changed_paths.is_empty() {
+        return match request.no_changes {
+            NoChangesDecision::NoOp => Ok(ComposedCommitRequest::NoChanges),
+            NoChangesDecision::Fail => Err(GitError::InvalidRequest(
+                "Git preparation found no changes and policy requires failure".to_string(),
+            )),
+        };
+    }
+    let mut paths = Vec::with_capacity(request.preparation.changed_paths.len());
+    let mut unique = BTreeSet::new();
+    for changed in request.preparation.changed_paths {
+        let path = changed.path;
+        if path.is_absolute()
+            || path.as_os_str().is_empty()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+            || !unique.insert(path.clone())
+        {
+            return Err(GitError::InvalidRequest(
+                "prepared commit paths must be unique bounded repository-relative paths"
+                    .to_string(),
+            ));
+        }
+        paths.push(path);
+    }
+    Ok(ComposedCommitRequest::Ready {
+        request: CommitRequest {
+            repo_path: request.preparation.repository_root,
+            expected_head: request.preparation.head,
+            message,
+            paths,
+        },
+    })
+}
+
+fn prepare_workflow_repository(context: &NativeServiceContext) -> ServiceResponse {
+    let invocation = match context
+        .request
+        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
+    {
+        Ok(invocation) => invocation,
+        Err(error) => return invalid_request(&error),
+    };
+    let request = match invocation.typed_input::<PrepareRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error),
+    };
+    match prepare_repository(&invocation.workspace_root, &request) {
+        Ok(response) => json_response(&response),
+        Err(error) => ServiceResponse::error("prepare_failed", error.to_string()),
+    }
+}
+
+fn prepare_repository(root: &Path, request: &PrepareRequest) -> Result<PrepareResponse, GitError> {
+    if request.max_paths == 0 || request.max_paths > 10_000 {
+        return Err(GitError::InvalidRequest(
+            "git preparation max_paths must be between 1 and 10000".to_string(),
+        ));
+    }
+    let repo = root.canonicalize()?;
+    let repository_root = PathBuf::from(git_stdout(&repo, ["rev-parse", "--show-toplevel"])?);
+    let repository_root = repository_root.canonicalize()?;
+    if !repo.starts_with(&repository_root) {
+        return Err(GitError::InvalidRequest(
+            "workflow workspace is outside the resolved repository".to_string(),
+        ));
+    }
+    let include = normalize_path_prefixes(&request.include_prefixes)?;
+    let exclude = normalize_path_prefixes(&request.exclude_prefixes)?;
+    let status = Command::new("git")
+        .current_dir(&repository_root)
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .output()?;
+    if !status.status.success() {
+        return Err(GitError::CloneFailed {
+            status: status.status.to_string(),
+            stderr: String::from_utf8_lossy(&status.stderr).trim().to_string(),
+        });
+    }
+    let mut changed_paths = Vec::new();
+    for record in status
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|row| !row.is_empty())
+    {
+        let record = String::from_utf8_lossy(record);
+        if record.len() < 4 {
+            return Err(GitError::InvalidRequest(
+                "Git status returned a malformed path record".to_string(),
+            ));
+        }
+        let status = record[..2].to_string();
+        let path = PathBuf::from(&record[3..]);
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(GitError::InvalidRequest(
+                "Git status returned an unsafe changed path".to_string(),
+            ));
+        }
+        if !include.is_empty() && !include.iter().any(|prefix| path.starts_with(prefix)) {
+            continue;
+        }
+        if exclude.iter().any(|prefix| path.starts_with(prefix)) {
+            continue;
+        }
+        changed_paths.push(PreparedChangedPath { path, status });
+        if changed_paths.len() > usize::try_from(request.max_paths).unwrap_or(usize::MAX) {
+            return Err(GitError::InvalidRequest(
+                "changed path set exceeds configured max_paths".to_string(),
+            ));
+        }
+    }
+    changed_paths.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(PrepareResponse {
+        repository_root,
+        head: git_stdout(&repo, ["rev-parse", "HEAD"])?,
+        changed_paths,
+    })
+}
+
+fn normalize_path_prefixes(paths: &[PathBuf]) -> Result<Vec<PathBuf>, GitError> {
+    let mut normalized = BTreeSet::new();
+    for path in paths {
+        if path.is_absolute()
+            || path.as_os_str().is_empty()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(GitError::InvalidRequest(
+                "Git path prefixes must be non-empty repository-relative paths".to_string(),
+            ));
+        }
+        normalized.insert(path.clone());
+    }
+    Ok(normalized.into_iter().collect())
+}
+
+fn normalize_commit_paths(paths: &[PathBuf]) -> Result<Vec<String>, GitError> {
+    if paths.is_empty() || paths.len() > MAX_COMMIT_PATHS {
+        return Err(GitError::InvalidRequest(
+            "commit paths must be non-empty and bounded".to_string(),
+        ));
+    }
+    let mut normalized = Vec::with_capacity(paths.len());
+    let mut seen = BTreeSet::new();
+    for path in paths {
         if path.is_absolute()
             || path.components().any(|component| {
                 matches!(
@@ -329,6 +682,37 @@ fn commit_repository(request: &CommitRequest) -> Result<CommitResponse, GitError
         }
         normalized.push(text);
     }
+    Ok(normalized)
+}
+
+fn commit_repository(request: &CommitRequest) -> Result<CommitResponse, GitError> {
+    let repo = request.repo_path.canonicalize()?;
+    if !repo.is_dir() || request.message.trim().is_empty() || request.paths.is_empty() {
+        return Err(GitError::InvalidRequest(
+            "commit requires a repository, non-empty message, and bounded paths".to_string(),
+        ));
+    }
+    let actual_head = git_stdout(&repo, ["rev-parse", "HEAD"])?;
+    if actual_head != request.expected_head {
+        return Err(GitError::InvalidRequest(format!(
+            "repository HEAD changed: expected {}, found {actual_head}",
+            request.expected_head
+        )));
+    }
+    let normalized = normalize_commit_paths(&request.paths)?;
+    let expected = normalized
+        .iter()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let staged_before = git_stdout(&repo, ["diff", "--cached", "--name-only", "--"])?
+        .lines()
+        .map(str::to_string)
+        .collect::<std::collections::BTreeSet<_>>();
+    if !staged_before.is_subset(&expected) {
+        return Err(GitError::InvalidRequest(format!(
+            "unrelated staged paths would be included: {staged_before:?}"
+        )));
+    }
     let mut add = Command::new("git");
     add.current_dir(&repo).arg("add").arg("--");
     add.args(&normalized);
@@ -336,10 +720,6 @@ fn commit_repository(request: &CommitRequest) -> Result<CommitResponse, GitError
 
     let staged = git_stdout(&repo, ["diff", "--cached", "--name-only", "--"])?;
     let staged = staged.lines().map(str::to_string).collect::<Vec<_>>();
-    let expected = normalized
-        .iter()
-        .cloned()
-        .collect::<std::collections::BTreeSet<_>>();
     let actual = staged
         .iter()
         .cloned()
@@ -744,6 +1124,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn typed_commit_enforces_snapshot_paths_and_returns_commit_hash() {
         let directory = tempfile::tempdir().expect("repo");
         run_git(
@@ -787,6 +1168,13 @@ mod tests {
         )
         .expect("commit");
         let head = git_stdout(directory.path(), ["rev-parse", "HEAD"]).expect("head");
+        let before = commit_status(&CommitStatusRequest {
+            repo_path: directory.path().to_path_buf(),
+            expected_head: head.clone(),
+            paths: vec![PathBuf::from("tracked.txt")],
+        })
+        .expect("status before commit");
+        assert_eq!(before.outcome, CommitReconciliationOutcome::NotCommitted);
         std::fs::write(directory.path().join("tracked.txt"), "after\n").expect("change");
         std::fs::write(directory.path().join("other.txt"), "not committed\n").expect("other");
 
@@ -800,6 +1188,15 @@ mod tests {
         assert_eq!(response.previous_head, head);
         assert_ne!(response.commit_hash, response.previous_head);
         assert_eq!(response.paths, [PathBuf::from("tracked.txt")]);
+        let status = commit_status(&CommitStatusRequest {
+            repo_path: directory.path().to_path_buf(),
+            expected_head: response.previous_head.clone(),
+            paths: response.paths.clone(),
+        })
+        .expect("status");
+        assert_eq!(status.outcome, CommitReconciliationOutcome::CandidateCommit);
+        assert_eq!(status.actual_head, response.commit_hash);
+        assert_eq!(status.actual_commit_paths, [PathBuf::from("tracked.txt")]);
         assert_eq!(
             git_stdout(
                 directory.path(),
@@ -809,6 +1206,30 @@ mod tests {
             "tracked.txt"
         );
         assert!(directory.path().join("other.txt").exists());
+
+        std::fs::write(directory.path().join("tracked.txt"), "second change\n").expect("change");
+        run_git(
+            Command::new("git")
+                .current_dir(directory.path())
+                .args(["add", "other.txt"]),
+            "stage unrelated",
+        )
+        .expect("stage unrelated");
+        let before_rejected_commit = git_stdout(directory.path(), ["rev-parse", "HEAD"])
+            .expect("head before rejected commit");
+        assert!(
+            commit_repository(&CommitRequest {
+                repo_path: directory.path().to_path_buf(),
+                expected_head: before_rejected_commit.clone(),
+                message: "reject unrelated staged path".to_string(),
+                paths: vec![PathBuf::from("tracked.txt")],
+            })
+            .is_err()
+        );
+        assert_eq!(
+            git_stdout(directory.path(), ["rev-parse", "HEAD"]).expect("head"),
+            before_rejected_commit
+        );
 
         assert!(
             commit_repository(&CommitRequest {
@@ -831,10 +1252,175 @@ mod tests {
     }
 
     #[test]
+    fn compose_commit_preserves_prepared_head_paths_and_no_changes_policy() {
+        let preparation = PrepareResponse {
+            repository_root: PathBuf::from("/repo"),
+            head: "abc123".to_string(),
+            changed_paths: vec![PreparedChangedPath {
+                path: PathBuf::from("src/lib.rs"),
+                status: " M".to_string(),
+            }],
+        };
+        let composed = compose_commit_request(ComposeCommitRequest {
+            preparation,
+            message: ProposedCommitMessage {
+                title: "Implement workflow".to_string(),
+                description: "Preserve exact preparation facts.".to_string(),
+            },
+            no_changes: NoChangesDecision::Fail,
+        })
+        .expect("compose");
+        let ComposedCommitRequest::Ready { request } = composed else {
+            panic!("expected ready commit");
+        };
+        assert_eq!(request.repo_path, PathBuf::from("/repo"));
+        assert_eq!(request.expected_head, "abc123");
+        assert_eq!(request.paths, [PathBuf::from("src/lib.rs")]);
+        assert_eq!(
+            request.message,
+            "Implement workflow\n\nPreserve exact preparation facts."
+        );
+
+        let empty = PrepareResponse {
+            repository_root: PathBuf::from("/repo"),
+            head: "abc123".to_string(),
+            changed_paths: Vec::new(),
+        };
+        assert_eq!(
+            compose_commit_request(ComposeCommitRequest {
+                preparation: empty.clone(),
+                message: ProposedCommitMessage {
+                    title: "No changes".to_string(),
+                    description: String::new(),
+                },
+                no_changes: NoChangesDecision::NoOp,
+            })
+            .expect("no-op"),
+            ComposedCommitRequest::NoChanges
+        );
+        assert!(
+            compose_commit_request(ComposeCommitRequest {
+                preparation: empty,
+                message: ProposedCommitMessage {
+                    title: "No changes".to_string(),
+                    description: String::new(),
+                },
+                no_changes: NoChangesDecision::Fail,
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn prepare_repository_is_read_only_bounded_and_filtered() {
+        let directory = tempfile::tempdir().expect("repository");
+        run_git(
+            Command::new("git")
+                .arg("init")
+                .current_dir(directory.path()),
+            "init",
+        )
+        .expect("init");
+        run_git(
+            Command::new("git")
+                .args(["config", "user.email", "bcode@example.invalid"])
+                .current_dir(directory.path()),
+            "config",
+        )
+        .expect("config");
+        run_git(
+            Command::new("git")
+                .args(["config", "user.name", "Bcode Test"])
+                .current_dir(directory.path()),
+            "config",
+        )
+        .expect("config");
+        std::fs::create_dir_all(directory.path().join("src")).expect("src");
+        std::fs::write(directory.path().join("src/lib.rs"), "before\n").expect("file");
+        run_git(
+            Command::new("git")
+                .args(["add", "src/lib.rs"])
+                .current_dir(directory.path()),
+            "add",
+        )
+        .expect("add");
+        run_git(
+            Command::new("git")
+                .args(["commit", "-m", "initial"])
+                .current_dir(directory.path()),
+            "commit",
+        )
+        .expect("commit");
+        std::fs::write(directory.path().join("src/lib.rs"), "after\n").expect("change");
+        std::fs::write(directory.path().join("ignored.txt"), "ignored\n").expect("ignored");
+        let before = git_stdout(directory.path(), ["rev-parse", "HEAD"]).expect("head");
+        let response = prepare_repository(
+            directory.path(),
+            &PrepareRequest {
+                include_prefixes: vec![PathBuf::from("src")],
+                exclude_prefixes: Vec::new(),
+                max_paths: 10,
+            },
+        )
+        .expect("prepare");
+        assert_eq!(response.head, before);
+        assert_eq!(response.changed_paths.len(), 1);
+        assert_eq!(response.changed_paths[0].path, PathBuf::from("src/lib.rs"));
+        assert_eq!(
+            git_stdout(directory.path(), ["rev-parse", "HEAD"]).expect("head"),
+            before
+        );
+        assert!(
+            prepare_repository(
+                directory.path(),
+                &PrepareRequest {
+                    include_prefixes: Vec::new(),
+                    exclude_prefixes: Vec::new(),
+                    max_paths: 1,
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn commit_manifest_declares_mutating_repair_and_write_resources() {
         let manifest: bcode_plugin::PluginManifest =
             toml::from_str(include_str!("../bcode-plugin.toml")).expect("manifest");
-        let block = &manifest.services[1].workflow_blocks[0];
+        let prepare = &manifest.services[1].workflow_blocks[0];
+        assert_eq!(prepare.block_id, "git.prepare");
+        assert_eq!(
+            prepare.effect,
+            bcode_workflow::WorkflowBlockEffect::ReadOnly
+        );
+        assert_eq!(
+            prepare.reconciliation,
+            bcode_workflow::WorkflowBlockReconciliation::IdempotentReplay
+        );
+        assert!(!prepare.authorization.explicit_grant_required);
+        assert_eq!(
+            prepare.resources,
+            [bcode_workflow::ResourceClaim::read("repository")]
+        );
+        let compose = &manifest.services[1].workflow_blocks[1];
+        assert_eq!(compose.block_id, "git.compose-commit");
+        assert_eq!(
+            compose.effect,
+            bcode_workflow::WorkflowBlockEffect::ReadOnly
+        );
+        assert_eq!(
+            compose.reconciliation,
+            bcode_workflow::WorkflowBlockReconciliation::IdempotentReplay
+        );
+        assert!(!compose.authorization.explicit_grant_required);
+        let status = &manifest.services[1].workflow_blocks[2];
+        assert_eq!(status.block_id, "git.commit-status");
+        assert_eq!(status.effect, bcode_workflow::WorkflowBlockEffect::ReadOnly);
+        assert_eq!(
+            status.reconciliation,
+            bcode_workflow::WorkflowBlockReconciliation::IdempotentReplay
+        );
+        let block = &manifest.services[1].workflow_blocks[3];
         assert_eq!(block.block_id, "git.commit");
         assert_eq!(block.effect, bcode_workflow::WorkflowBlockEffect::Mutating);
         assert_eq!(

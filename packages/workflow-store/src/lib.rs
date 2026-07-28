@@ -5304,6 +5304,13 @@ fn apply_attempt_observation(
                 (&request.run_id, &request.node_id, &request.activation_id),
             )?;
             finalize_run_cancellation_if_settled(transaction, &request.run_id, reconciled_at_ms)?;
+            append_event(
+                transaction,
+                &request.run_id,
+                "attempt_cancelled",
+                &serde_json::json!({"dispatch_identity": request.dispatch_identity}).to_string(),
+                reconciled_at_ms,
+            )?;
             summary.cancelled.push(request.dispatch_identity.clone());
         }
         AttemptObservation::Unknown => {
@@ -8796,7 +8803,10 @@ mod tests {
             .apply_attempt_observation(&identity, AttemptObservation::Cancelled, 22)
             .expect("cancelled observation");
 
-        assert_eq!(summary.cancelled, [identity]);
+        assert_eq!(
+            summary.cancelled.as_slice(),
+            std::slice::from_ref(&identity)
+        );
         assert_eq!(
             store
                 .run_summary("run-1")
@@ -8808,6 +8818,21 @@ mod tests {
         assert_eq!(
             store.attempt_history("run-1", None, 10).expect("attempts")[0].status,
             "cancelled"
+        );
+        assert!(
+            store
+                .apply_attempt_observation(&identity, AttemptObservation::Cancelled, 23)
+                .is_err(),
+            "terminal cancellation cannot settle a second time"
+        );
+        assert_eq!(
+            store
+                .event_history("run-1", None, 100)
+                .expect("events")
+                .iter()
+                .filter(|event| event.event_type == "attempt_cancelled")
+                .count(),
+            1
         );
     }
 

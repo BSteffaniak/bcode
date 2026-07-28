@@ -40637,7 +40637,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
             "../../../plugins/git-plugin/bcode-plugin.toml"
         ))
         .expect("manifest");
-        let block = manifest.services[1].workflow_blocks[0].clone();
+        let block = manifest.services[1]
+            .workflow_blocks
+            .iter()
+            .find(|block| block.block_id == "git.commit")
+            .expect("git commit block")
+            .clone();
         let definition = bcode_workflow::WorkflowDefinition {
             schema_version: 1,
             name: "git-commit".to_string(),

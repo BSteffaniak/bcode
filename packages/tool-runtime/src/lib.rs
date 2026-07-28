@@ -37,6 +37,10 @@ pub struct ProcessExecutionRequest {
     pub cwd: Option<std::path::PathBuf>,
     pub timeout: Option<Duration>,
     pub max_output_bytes: usize,
+    /// Whether to inherit the parent process environment.
+    pub inherit_environment: bool,
+    /// Explicit environment entries applied after inheritance/clear policy.
+    pub environment: BTreeMap<String, String>,
 }
 
 /// Captured process output stream bytes.
@@ -207,6 +211,20 @@ impl ToolExecutionRuntime {
         self.run_process_streaming(request, |_| {}).await
     }
 
+    /// Run one process with a caller-owned cancellation handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when process spawning, output collection, or task joining fails.
+    pub async fn run_process_cancellable(
+        &self,
+        request: ProcessExecutionRequest,
+        cancel: &ToolExecutionCancelHandle,
+    ) -> Result<ProcessExecutionResult, ToolRuntimeError> {
+        self.run_process_streaming_with_cancel(request, cancel, |_| {})
+            .await
+    }
+
     /// Run a process and emit output events as chunks are read.
     ///
     /// # Errors
@@ -217,13 +235,26 @@ impl ToolExecutionRuntime {
         request: ProcessExecutionRequest,
         on_output: impl FnMut(ProcessOutputEvent) + Send + 'static,
     ) -> Result<ProcessExecutionResult, ToolRuntimeError> {
+        let cancel = self.cancellation_handle();
+        self.run_process_streaming_with_cancel(request, &cancel, on_output)
+            .await
+    }
+
+    async fn run_process_streaming_with_cancel(
+        &self,
+        request: ProcessExecutionRequest,
+        cancel: &ToolExecutionCancelHandle,
+        on_output: impl FnMut(ProcessOutputEvent) + Send + 'static,
+    ) -> Result<ProcessExecutionResult, ToolRuntimeError> {
         if request.program.trim().is_empty() {
             return Err(ToolRuntimeError::InvalidRequest(
                 "program must not be empty".to_string(),
             ));
         }
-        let id = ToolExecutionId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let cancel = Arc::new(Notify::new());
+        let id = cancel.id;
+        self.next_id
+            .fetch_max(id.0.saturating_add(1), Ordering::Relaxed);
+        let cancel_notify = Arc::clone(&cancel.notify);
         {
             let mut metrics = self.metrics.lock().await;
             metrics.queued += 1;
@@ -242,10 +273,10 @@ impl ToolExecutionRuntime {
         self.running.lock().await.insert(
             id,
             RunningExecution {
-                cancel: Arc::clone(&cancel),
+                cancel: Arc::clone(&cancel_notify),
             },
         );
-        let result = run_process_inner(id, request, cancel, on_output).await;
+        let result = run_process_inner(id, request, cancel_notify, on_output).await;
         drop(permit);
         self.running.lock().await.remove(&id);
         {
@@ -279,6 +310,10 @@ async fn run_process_inner(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if !request.inherit_environment {
+        command.env_clear();
+    }
+    command.envs(request.environment);
     if let Some(cwd) = request.cwd {
         command.current_dir(cwd);
     }
@@ -478,6 +513,8 @@ mod tests {
                 cwd: None,
                 timeout: Some(Duration::from_millis(100)),
                 max_output_bytes: 1024,
+                inherit_environment: true,
+                environment: BTreeMap::new(),
             })
             .await
             .expect("process returns timeout result");
@@ -486,6 +523,43 @@ mod tests {
         let status = runtime.status().await;
         assert_eq!(status.running, 0);
         assert_eq!(status.completed, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn caller_cancellation_terminates_process_group_once() {
+        let runtime = ToolExecutionRuntime::new(1);
+        let cancel = runtime.cancellation_handle();
+        let cancellation = cancel.clone();
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            async move {
+                runtime
+                    .run_process_cancellable(
+                        ProcessExecutionRequest {
+                            program: "sh".to_string(),
+                            args: vec!["-c".to_string(), "sleep 5 & wait".to_string()],
+                            cwd: None,
+                            timeout: Some(Duration::from_secs(10)),
+                            max_output_bytes: 1024,
+                            inherit_environment: true,
+                            environment: BTreeMap::new(),
+                        },
+                        &cancellation,
+                    )
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+        cancel.cancel();
+        let result = task.await.expect("task").expect("cancelled result");
+        assert!(result.cancelled);
+        assert!(!result.timed_out);
+        let status = runtime.status().await;
+        assert_eq!(status.running, 0);
+        assert_eq!(status.cancelled, 1);
+        assert_eq!(status.completed, 0);
     }
 
     #[tokio::test]
@@ -498,6 +572,8 @@ mod tests {
                 cwd: None,
                 timeout: Some(Duration::from_secs(1)),
                 max_output_bytes: 3,
+                inherit_environment: true,
+                environment: BTreeMap::new(),
             })
             .await
             .expect("process returns output");
