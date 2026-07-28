@@ -758,14 +758,12 @@ if ! rg -q 'let tx = db\.db\.begin_transaction\(\)\.await' packages/session/src/
 fi
 
 if ! sed -n '/async fn session_export(/,/^}/p' packages/cli/src/lib.rs \
-    | grep -q 'session_export_events_from_root' \
-  || ! sed -n '/async fn session_export_events_from_root(/,/^}/p' packages/cli/src/lib.rs \
-    | grep -q 'open_existing_turso_in_root' \
-  || ! sed -n '/async fn session_export_events_from_root(/,/^}/p' packages/cli/src/lib.rs \
-    | grep -q 'all_events_strict' \
-  || rg -q 'explicit_export_reads_legacy_stream_history_without_migration|ToolInvocationStreamEvent|ToolOutputStream' \
+    | grep -q 'BcodeClient::default_endpoint' \
+  || ! sed -n '/async fn session_export(/,/^}/p' packages/cli/src/lib.rs \
+    | grep -q 'session_history(session_id)' \
+  || rg -q 'session_export_events_from_root|explicit_export_reads_legacy_stream_history_without_migration|ToolInvocationStreamEvent|ToolOutputStream' \
     packages/cli/src packages/session/src --glob '*.rs'; then
-  echo "Session export violation: current export must remain strict and must not restore legacy stream decoding." >&2
+  echo "Session export violation: export must use the daemon-owned strict canonical history boundary and must not restore legacy stream decoding." >&2
   violations=1
 fi
 

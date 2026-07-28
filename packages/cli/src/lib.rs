@@ -927,7 +927,7 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Export complete canonical events using strict non-migrating storage decoding.
+    /// Export complete canonical events through the daemon-owned strict history boundary.
     Export {
         session_id: SessionId,
         #[arg(long, value_enum, default_value_t = SessionExportFormat::Jsonl)]
@@ -7109,8 +7109,9 @@ async fn session_export(
     session_id: SessionId,
     format: SessionExportFormat,
 ) -> Result<(), CliError> {
-    let root = bcode_config::default_session_store_dir();
-    let events = session_export_events_from_root(session_id, &root).await?;
+    let events = BcodeClient::default_endpoint()
+        .session_history(session_id)
+        .await?;
     match format {
         SessionExportFormat::Jsonl => {
             for event in events {
@@ -7119,14 +7120,6 @@ async fn session_export(
         }
     }
     Ok(())
-}
-
-async fn session_export_events_from_root(
-    session_id: SessionId,
-    root: &Path,
-) -> Result<Vec<SessionEvent>, CliError> {
-    let db = bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, root).await?;
-    Ok(db.all_events_strict().await?)
 }
 
 async fn session_timeline(session_id: SessionId) -> Result<(), CliError> {
