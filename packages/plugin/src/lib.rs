@@ -146,6 +146,162 @@ extern "C" fn service_cancellation_wait_callback(
     cancellation.wait_cancelled(Duration::from_millis(timeout_ms))
 }
 
+/// Stable plugin-owned workflow template contribution version.
+pub const WORKFLOW_TEMPLATE_CONTRIBUTION_VERSION: u32 = 1;
+
+/// Maximum serialized bytes accepted for one declarative workflow template definition.
+pub const MAX_WORKFLOW_TEMPLATE_DEFINITION_BYTES: usize = 1_048_576;
+
+/// One stable plugin-owned workflow template contribution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowTemplateContribution {
+    /// Contribution contract version.
+    pub contribution_version: u32,
+    /// Stable owner-local template identity.
+    pub template_id: String,
+    /// Owner-controlled template version.
+    pub template_version: u32,
+    /// User-facing title.
+    pub title: String,
+    /// User-facing summary.
+    pub description: String,
+    /// Typed configuration schema validated before definition compilation.
+    pub configuration_schema: bcode_workflow::ValueSchema,
+    /// Exact declarative compiled definition for this template version.
+    pub definition: bcode_workflow::WorkflowDefinition,
+    /// Plugin IDs required by the compiled definition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_plugins: Vec<String>,
+    /// Skill IDs required by the compiled definition.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_skills: Vec<String>,
+    /// Capability labels required from the production host.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_capabilities: Vec<String>,
+    /// Renderer-neutral bounded presentation metadata.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub presentation: BTreeMap<String, String>,
+}
+
+impl WorkflowTemplateContribution {
+    /// Validate this contribution without starting or persisting a workflow run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, malformed or oversized metadata, duplicate
+    /// requirements, invalid configuration schemas, or unsupported compiled definitions.
+    pub fn validate(&self) -> Result<(), bcode_workflow::WorkflowError> {
+        let invalid = |message: String| bcode_workflow::WorkflowError::Build {
+            path: self.template_id.clone(),
+            message,
+        };
+        if self.contribution_version != WORKFLOW_TEMPLATE_CONTRIBUTION_VERSION {
+            return Err(invalid(format!(
+                "unsupported workflow template contribution version {}",
+                self.contribution_version
+            )));
+        }
+        if self.template_id.trim().is_empty() || self.template_id.len() > 256 {
+            return Err(invalid(
+                "template_id must contain 1..=256 bytes".to_string(),
+            ));
+        }
+        if self.template_version == 0 {
+            return Err(invalid(
+                "template_version must be greater than zero".to_string(),
+            ));
+        }
+        if self.title.trim().is_empty() || self.title.len() > 256 || self.description.len() > 4096 {
+            return Err(invalid(
+                "template display metadata is empty or oversized".to_string(),
+            ));
+        }
+        if self.configuration_schema.type_name.trim().is_empty()
+            || self.configuration_schema.type_name.len() > 256
+            || !self.configuration_schema.schema.is_object()
+        {
+            return Err(invalid(
+                "configuration schema must have a bounded type name and object schema".to_string(),
+            ));
+        }
+        validate_template_values("required_plugins", &self.required_plugins)?;
+        validate_template_values("required_skills", &self.required_skills)?;
+        validate_template_values("required_capabilities", &self.required_capabilities)?;
+        if self.presentation.len() > 64
+            || self
+                .presentation
+                .iter()
+                .any(|(key, value)| key.trim().is_empty() || key.len() > 128 || value.len() > 4096)
+        {
+            return Err(invalid(
+                "template presentation metadata is invalid or oversized".to_string(),
+            ));
+        }
+        self.definition.validate()?;
+        let definition_bytes = serde_json::to_vec(&self.definition).map_err(|error| {
+            invalid(format!("template definition cannot be serialized: {error}"))
+        })?;
+        if definition_bytes.len() > MAX_WORKFLOW_TEMPLATE_DEFINITION_BYTES {
+            return Err(invalid(format!(
+                "template definition exceeds {MAX_WORKFLOW_TEMPLATE_DEFINITION_BYTES} bytes"
+            )));
+        }
+        let admission = self
+            .definition
+            .production_admission(&bcode_workflow::WorkflowProductionCapabilities::current())?;
+        if !admission.is_supported() {
+            return Err(invalid(format!(
+                "template definition is not production-supported: {}",
+                admission
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.code.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+        Ok(())
+    }
+
+    /// Derive the exact topology- and policy-sensitive compiled definition identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the contribution or definition is invalid.
+    pub fn definition_identity(
+        &self,
+        owner_plugin_id: &str,
+    ) -> Result<bcode_workflow::WorkflowDefinitionIdentity, bcode_workflow::WorkflowError> {
+        self.validate()?;
+        bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+            format!(
+                "{owner_plugin_id}/{}@{}",
+                self.template_id, self.template_version
+            ),
+            &self.definition,
+        )
+    }
+}
+
+fn validate_template_values(
+    field: &str,
+    values: &[String],
+) -> Result<(), bcode_workflow::WorkflowError> {
+    let mut seen = BTreeSet::new();
+    if values.len() > 256
+        || values
+            .iter()
+            .any(|value| value.trim().is_empty() || value.len() > 256 || !seen.insert(value))
+    {
+        return Err(bcode_workflow::WorkflowError::Build {
+            path: field.to_string(),
+            message: "template requirements must be bounded, non-empty, and unique".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Plugin manifest loaded from `bcode-plugin.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginManifest {
@@ -162,6 +318,8 @@ pub struct PluginManifest {
     pub tool_presentations: Vec<PluginToolPresentationDeclaration>,
     #[serde(default)]
     pub command_contributions: Vec<PluginCommandContribution>,
+    #[serde(default)]
+    pub workflow_templates: Vec<WorkflowTemplateContribution>,
     #[serde(default)]
     pub event_subscriptions: Vec<PluginEventSubscription>,
     #[serde(default)]
@@ -2148,7 +2306,21 @@ impl PluginRegistry {
     fn from_manifests(manifests: BTreeMap<String, PluginManifest>) -> Self {
         validate_tool_presentation_declarations(manifests.values())
             .expect("loaded plugin tool presentation contracts must be valid");
+        let mut template_identities = BTreeSet::new();
         for manifest in manifests.values() {
+            for template in &manifest.workflow_templates {
+                template
+                    .validate()
+                    .expect("manifest workflow template contract must be valid");
+                assert!(
+                    template_identities.insert((
+                        manifest.id.clone(),
+                        template.template_id.clone(),
+                        template.template_version,
+                    )),
+                    "plugin workflow template identity/version must be unique"
+                );
+            }
             for service in &manifest.services {
                 for block in &service.workflow_blocks {
                     assert_eq!(
@@ -2224,6 +2396,20 @@ impl PluginRegistry {
             .flat_map(|manifest| &manifest.services)
             .flat_map(|service| &service.workflow_blocks)
             .cloned()
+            .collect()
+    }
+
+    /// Return all loaded, validated workflow template declarations in deterministic order.
+    #[must_use]
+    pub fn workflow_templates(&self) -> Vec<(&str, &WorkflowTemplateContribution)> {
+        self.manifests
+            .iter()
+            .flat_map(|(plugin_id, manifest)| {
+                manifest
+                    .workflow_templates
+                    .iter()
+                    .map(move |template| (plugin_id.as_str(), template))
+            })
             .collect()
     }
 
@@ -4398,6 +4584,7 @@ library = "libcommands.dylib"
             visual_adapters: Vec::new(),
             tool_presentations: Vec::new(),
             command_contributions: Vec::new(),
+            workflow_templates: Vec::new(),
             event_subscriptions: Vec::new(),
             config: Some(PluginManifestConfig {
                 section: Some("example".to_string()),
@@ -4444,6 +4631,7 @@ library = "libcommands.dylib"
             visual_adapters: Vec::new(),
             tool_presentations: Vec::new(),
             command_contributions: Vec::new(),
+            workflow_templates: Vec::new(),
             event_subscriptions: Vec::new(),
             config: Some(PluginManifestConfig {
                 section: Some(" ".to_string()),
@@ -5631,6 +5819,7 @@ library = "libexample_plugin.dylib"
                 visual_adapters: Vec::new(),
                 tool_presentations: Vec::new(),
                 command_contributions: Vec::new(),
+                workflow_templates: Vec::new(),
                 event_subscriptions: Vec::new(),
                 concurrency: PluginConcurrencyConfig::Exclusive,
                 runtime: PluginRuntime::Native(NativePluginRuntime {
@@ -6276,6 +6465,83 @@ library = "libexample_plugin.dylib"
         }
     }
 
+    fn workflow_template() -> WorkflowTemplateContribution {
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "bcode.example.config/v1".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+        };
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "example-template".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([(
+                "transform".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "transform".to_string(),
+                    name: "Transform".to_string(),
+                    kind: bcode_workflow::NodeKind::Input,
+                    input: schema.clone(),
+                    output: schema,
+                    resources: Vec::new(),
+                    configuration: serde_json::json!({"version": 1}),
+                },
+            )]),
+            entries: vec!["transform".to_string()],
+            exits: vec!["transform".to_string()],
+            edges: Vec::new(),
+        };
+        WorkflowTemplateContribution {
+            contribution_version: WORKFLOW_TEMPLATE_CONTRIBUTION_VERSION,
+            template_id: "example".to_string(),
+            template_version: 1,
+            title: "Example".to_string(),
+            description: "A declarative example workflow.".to_string(),
+            configuration_schema: definition.input.clone(),
+            definition,
+            required_plugins: Vec::new(),
+            required_skills: Vec::new(),
+            required_capabilities: vec!["transforms/v1".to_string()],
+            presentation: BTreeMap::from([("category".to_string(), "examples".to_string())]),
+        }
+    }
+
+    #[test]
+    fn workflow_templates_validate_without_starting_and_have_exact_identity() {
+        let template = workflow_template();
+        template.validate().expect("template validates");
+        let identity = template
+            .definition_identity("bcode.example")
+            .expect("identity");
+        assert!(
+            identity
+                .definition_id
+                .starts_with("bcode.example/example@1@")
+        );
+
+        let mut changed = template;
+        changed.definition.name = "changed-topology-policy".to_string();
+        assert_ne!(
+            identity.definition_id,
+            changed
+                .definition_identity("bcode.example")
+                .expect("changed identity")
+                .definition_id
+        );
+    }
+
+    #[test]
+    fn registry_exposes_only_loaded_plugin_templates() {
+        let mut enabled = test_manifest("bcode.enabled");
+        enabled.workflow_templates.push(workflow_template());
+        let registry =
+            PluginRegistry::from_manifests(BTreeMap::from([(enabled.id.clone(), enabled)]));
+        let templates = registry.workflow_templates();
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].0, "bcode.enabled");
+        assert_eq!(templates[0].1.template_id, "example");
+    }
+
     fn test_manifest(id: &str) -> PluginManifest {
         PluginManifest {
             config: None,
@@ -6295,6 +6561,7 @@ library = "libexample_plugin.dylib"
             visual_adapters: Vec::new(),
             tool_presentations: Vec::new(),
             command_contributions: Vec::new(),
+            workflow_templates: Vec::new(),
             event_subscriptions: Vec::new(),
             concurrency: PluginConcurrencyConfig::Exclusive,
             runtime: PluginRuntime::Native(NativePluginRuntime {
