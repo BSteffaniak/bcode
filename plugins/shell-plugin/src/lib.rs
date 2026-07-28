@@ -1812,6 +1812,24 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
+    fn windows_shell_plan_uses_cmd_contract() {
+        let plan = shell_program_and_args(
+            "echo windows-smoke",
+            None,
+            ShellToolEnvConfig {
+                mode: ShellToolEnvMode::Inherit,
+                ..ShellToolEnvConfig::default()
+            },
+            "windows-shell-test",
+        )
+        .expect("Windows shell plan");
+        assert_eq!(plan.program, "cmd");
+        assert_eq!(plan.args, ["/C", "echo windows-smoke"]);
+        assert!(plan.prelude_marker.is_none());
+    }
+
+    #[test]
     fn shell_preparation_serializes_owner_resolved_workspace_and_artifact_roots() {
         let response = prepare_shell_tool(&preparation_request_with_context(
             serde_json::json!({"command": "printf hello"}),

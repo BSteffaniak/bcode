@@ -12829,7 +12829,9 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "reqwest",
  "sha2 0.10.9",
+ "tempfile",
  "toml_edit 0.23.10+spec-1.0.0",
+ "zip",
 ]
 
 [[package]]

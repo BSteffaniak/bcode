@@ -378,7 +378,11 @@ mod bundled {
 
         let leptonica_include = leptonica_install.join("include");
         let leptonica_lib = leptonica_install.join("lib");
-        let leptonica_library = find_dynamic_library(&leptonica_lib, "leptonica");
+        let leptonica_library = if cfg!(target_os = "windows") {
+            find_import_library(&leptonica_lib, "leptonica")
+        } else {
+            find_dynamic_library(&leptonica_lib, "leptonica")
+        };
 
         let tesseract_install = cmake::Config::new(tesseract_source)
             .define("CMAKE_POLICY_VERSION_MINIMUM", "3.5")
@@ -411,36 +415,54 @@ mod bundled {
     }
 
     fn find_dynamic_library(lib_dir: &Path, name: &str) -> PathBuf {
-        let expected = lib_dir.join(dynamic_library_name(name));
-        if expected.exists() {
-            return expected;
+        find_library_file(lib_dir, name, |file_name| {
+            file_name.ends_with(".dylib")
+                || file_name.contains(".so")
+                || file_name.ends_with(".dll")
+        })
+    }
+
+    fn find_import_library(lib_dir: &Path, name: &str) -> PathBuf {
+        find_library_file(lib_dir, name, |file_name| file_name.ends_with(".lib"))
+    }
+
+    fn find_library_file(
+        lib_dir: &Path,
+        name: &str,
+        matches_kind: impl Fn(&str) -> bool,
+    ) -> PathBuf {
+        let candidates = [lib_dir.to_path_buf(), lib_dir.join("Release")];
+        for candidate in candidates {
+            let Ok(entries) = fs::read_dir(&candidate) else {
+                continue;
+            };
+            if let Some(path) = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.file_name()
+                        .and_then(|file_name| file_name.to_str())
+                        .is_some_and(|file_name| {
+                            file_name.contains(name) && matches_kind(file_name)
+                        })
+                })
+            {
+                return path;
+            }
         }
-        fs::read_dir(lib_dir)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", lib_dir.display()))
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|file_name| file_name.to_str())
-                    .is_some_and(|file_name| {
-                        file_name.contains(name)
-                            && (file_name.ends_with(".dylib")
-                                || file_name.ends_with(".so")
-                                || file_name.ends_with(".dll"))
-                    })
-            })
-            .unwrap_or_else(|| {
-                panic!(
-                    "failed to find dynamic library {name} in {}",
-                    lib_dir.display()
-                )
-            })
+        panic!("failed to find library {name} in {}", lib_dir.display());
     }
 
     fn copy_runtime_libraries(source_lib_dir: &Path, runtime_lib: &Path, name: &str) {
-        for path in dynamic_libraries(source_lib_dir, name) {
+        let libraries = dynamic_libraries(source_lib_dir, name);
+        assert!(
+            !libraries.is_empty(),
+            "failed to find runtime library {name} under {}",
+            source_lib_dir.display()
+        );
+        for path in &libraries {
             fs::copy(
-                &path,
+                path,
                 runtime_lib.join(path.file_name().expect("library file name is required")),
             )
             .unwrap_or_else(|error| {
@@ -451,11 +473,35 @@ mod bundled {
                 )
             });
         }
+        if cfg!(target_os = "windows") {
+            let canonical = runtime_lib.join(dynamic_library_name(name));
+            if !canonical.is_file() {
+                fs::copy(&libraries[0], &canonical).unwrap_or_else(|error| {
+                    panic!(
+                        "failed to create canonical Windows runtime library {} from {}: {error}",
+                        canonical.display(),
+                        libraries[0].display()
+                    )
+                });
+            }
+        }
     }
 
     fn dynamic_libraries(lib_dir: &Path, name: &str) -> Vec<PathBuf> {
-        let mut libraries: Vec<_> = fs::read_dir(lib_dir)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", lib_dir.display()))
+        let mut search_dirs = vec![lib_dir.to_path_buf()];
+        if cfg!(target_os = "windows")
+            && let Some(install_dir) = lib_dir.parent()
+        {
+            search_dirs.extend([
+                lib_dir.join("Release"),
+                install_dir.join("bin"),
+                install_dir.join("bin").join("Release"),
+            ]);
+        }
+        let mut libraries: Vec<_> = search_dirs
+            .into_iter()
+            .filter_map(|dir| fs::read_dir(dir).ok())
+            .flatten()
             .filter_map(Result::ok)
             .map(|entry| entry.path())
             .filter(|path| {
@@ -465,7 +511,7 @@ mod bundled {
                         file_name.contains(name)
                             && (file_name.ends_with(".dylib")
                                 || file_name.contains(".so")
-                                || file_name.ends_with(".dll"))
+                                || file_name.to_ascii_lowercase().ends_with(".dll"))
                     })
             })
             .collect();
@@ -605,15 +651,21 @@ mod bundled {
         name: &str,
     ) -> PathBuf {
         let extracted = target_dir.join(name);
-        if extracted.join("CMakeLists.txt").is_file() {
+        if valid_source_dir(&extracted) {
             return extracted;
+        }
+        if extracted.exists() {
+            fs::remove_dir_all(&extracted).expect("failed to remove incomplete source directory");
         }
 
         let source_cache = source_cache_dir().join(expected_sha256);
-        if source_cache.join("CMakeLists.txt").is_file() {
+        if valid_source_dir(&source_cache) {
             copy_dir_all(&source_cache, &extracted)
                 .expect("failed to copy cached source directory");
             return extracted;
+        }
+        if source_cache.exists() {
+            fs::remove_dir_all(&source_cache).expect("failed to remove incomplete source cache");
         }
 
         let bytes = download_verified(url, expected_sha256);
@@ -645,6 +697,10 @@ mod bundled {
             fs::remove_dir_all(&tmp_dir).expect("failed to clean source tmp directory");
         }
         extracted
+    }
+
+    fn valid_source_dir(path: &Path) -> bool {
+        path.join("CMakeLists.txt").is_file() && path.join("src").is_dir()
     }
 
     fn download_runtime_tessdata(

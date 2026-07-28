@@ -8,6 +8,7 @@ Bcode release artifacts are produced by the repository `xtask` release automatio
 ```sh
 cargo xtask release --target aarch64-apple-darwin --version v0.1.0
 cargo xtask release --target x86_64-unknown-linux-gnu --version v0.1.0
+cargo xtask release --target x86_64-pc-windows-msvc --version v0.1.0
 cargo xtask verify-release --target aarch64-apple-darwin --version v0.1.0
 cargo xtask dev-release
 ```
@@ -18,10 +19,33 @@ Supported v1 targets:
 * `x86_64-apple-darwin`
 * `aarch64-unknown-linux-gnu`
 * `x86_64-unknown-linux-gnu`
+* `x86_64-pc-windows-msvc`
 
-Artifacts are written to `target/dist/` with adjacent `sha256` files. macOS
-artifacts are `.zip` archives so Apple notarization can accept them; Linux
-artifacts are `.tar.gz` archives.
+Artifacts are written to `target/dist/` with adjacent `sha256` files. macOS and Windows
+artifacts are `.zip` archives; Linux artifacts are `.tar.gz` archives. Every archive contains
+`bcode` and the process-isolated `bcode-mermaid-worker` (with `.exe` suffixes on Windows), plus
+the bundled Tesseract runtime tree required by the default application build. Windows source
+builds use the MSVC Rust target and require Visual Studio Build Tools with C++ support and CMake.
+Windows x64 CI currently uses GitHub's `windows-latest` image; a minimum end-user Windows version
+has not yet been established and must not be inferred from that runner.
+
+### Windows source build
+
+From a Developer PowerShell with the MSVC C++ tools available:
+
+```powershell
+rustup target add x86_64-pc-windows-msvc
+cargo build --release --package bcode --bin bcode --bin bcode-mermaid-worker `
+  --features app --target x86_64-pc-windows-msvc
+cargo xtask release --target x86_64-pc-windows-msvc --version v0.1.0
+cargo xtask verify-release --target x86_64-pc-windows-msvc --version v0.1.0
+```
+
+Extract the ZIP as a directory and preserve its relative layout: `bcode.exe` and
+`bcode-mermaid-worker.exe` remain at the root, while the versioned OCR DLLs and language data stay
+under `bcode-runtimes\\tesseract`. Run `bcode.exe --version` from the extracted directory as a basic
+installation check. Release verification additionally exercises the Mermaid worker, bundled OCR,
+and named-pipe daemon lifecycle on a native Windows host.
 
 ## macOS release signing
 
@@ -103,8 +127,11 @@ Required for macOS jobs:
 * `APPLE_ID`
 * `APPLE_APP_SPECIFIC_PASSWORD`
 
-Linux jobs do not perform platform binary signing in v1. They build, package,
-and checksum artifacts.
+Linux and Windows jobs do not perform platform binary signing in v1. They build, package,
+checksum, and verify artifacts. Windows provider secrets use current-user DPAPI, and Windows shell
+tool commands currently execute with `cmd.exe /C`; commands written for POSIX shells may need to be
+adapted. Public Windows artifacts should be treated as unsigned until an Authenticode signing policy
+and workflow are documented here.
 
 ## Release workflow
 
@@ -113,5 +140,5 @@ Run **Release** from GitHub Actions with:
 * `version`: release tag/version, such as `v0.1.0`
 * `publish`: whether to create/update the GitHub release
 
-The workflow builds macOS and Linux artifacts, uploads all artifacts, and when
+The workflow builds macOS, Linux, and Windows x64 artifacts, uploads all artifacts, and when
 `publish=true` attaches them to a GitHub release.

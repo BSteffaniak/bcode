@@ -289,12 +289,13 @@ impl TesseractRuntime {
             .join("lib")
             .join(dynamic_library_name("tesseract"));
         let tessdata_dir = runtime_dir.join("tessdata");
-        let library = unsafe { libloading::Library::new(&library_path) }.map_err(|error| {
-            Error::LoadBundledRuntime {
-                version: version.to_string(),
-                message: runtime_load_diagnostics(&library_path, &error.to_string()),
-            }
-        })?;
+        let library =
+            load_bundled_library(&library_path, &runtime_dir.join("lib")).map_err(|error| {
+                Error::LoadBundledRuntime {
+                    version: version.to_string(),
+                    message: runtime_load_diagnostics(&library_path, &error.to_string()),
+                }
+            })?;
         let symbols = unsafe { load_tesseract_symbols(&library) }.map_err(|error| {
             Error::LoadBundledRuntime {
                 version: version.to_string(),
@@ -350,6 +351,30 @@ fn executable_relative_runtime_root() -> Option<PathBuf> {
     let exe_dir = exe.parent()?;
     let root = exe_dir.join("bcode-runtimes").join("tesseract");
     root.is_dir().then_some(root)
+}
+
+#[cfg(not(windows))]
+fn load_bundled_library(
+    library_path: &Path,
+    _library_dir: &Path,
+) -> std::result::Result<libloading::Library, libloading::Error> {
+    unsafe { libloading::Library::new(library_path) }
+}
+
+#[cfg(windows)]
+fn load_bundled_library(
+    library_path: &Path,
+    _library_dir: &Path,
+) -> std::result::Result<libloading::Library, libloading::Error> {
+    const LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR: u32 = 0x0000_0100;
+    const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
+    let library = unsafe {
+        libloading::os::windows::Library::load_with_flags(
+            library_path,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        )?
+    };
+    Ok(library.into())
 }
 
 fn runtime_load_diagnostics(library_path: &Path, loader_error: &str) -> String {

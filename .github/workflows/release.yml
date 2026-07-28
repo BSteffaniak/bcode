@@ -32,6 +32,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
 
     steps:
       - name: Checkout
@@ -86,6 +88,10 @@ jobs:
 
       - name: Verify release artifact
         run: cargo xtask verify-release --target ${{ matrix.target }} --version ${{ inputs.version }}
+
+      - name: Smoke-test bundled Tesseract runtime
+        if: runner.os == 'Windows'
+        run: cargo xtask smoke-test-tesseract --target ${{ matrix.target }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

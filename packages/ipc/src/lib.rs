@@ -2234,6 +2234,17 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
+    #[cfg(windows)]
+    fn default_windows_endpoint_is_a_namespaced_named_pipe() {
+        let endpoint = default_endpoint();
+        let name = endpoint
+            .as_windows_named_pipe()
+            .expect("Windows default endpoint must be a named pipe");
+        assert!(name.starts_with(r"\\.\pipe\bcode-"));
+        assert!(name.ends_with(&daemon_namespace()));
+    }
+
+    #[test]
     fn permission_batch_correlation_round_trips_and_defaults_when_absent() {
         let summary = PermissionSummary {
             permission_id: "perm-1".to_string(),

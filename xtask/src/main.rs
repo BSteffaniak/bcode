@@ -9,8 +9,8 @@ use std::env;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fmt::Write as FmtWrite;
-use std::fs;
-use std::io;
+use std::fs::{self, File};
+use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -19,6 +19,7 @@ use sha2::{Digest, Sha256};
 
 const PACKAGE_NAME: &str = "bcode";
 const BINARY_NAME: &str = "bcode";
+const MERMAID_WORKER_BINARY_NAME: &str = "bcode-mermaid-worker";
 const DIST_DIR: &str = "target/dist";
 const DEFAULT_DEV_CODESIGN_IDENTITY: &str = "Bcode Dev";
 const DEV_CODESIGN_KEYCHAIN_RELATIVE_DIR: &str = "Library/Application Support/bcode/dev-signing";
@@ -41,6 +42,12 @@ impl std::error::Error for XtaskError {}
 
 impl From<io::Error> for XtaskError {
     fn from(error: io::Error) -> Self {
+        Self(error.to_string())
+    }
+}
+
+impl From<zip::result::ZipError> for XtaskError {
+    fn from(error: zip::result::ZipError) -> Self {
         Self(error.to_string())
     }
 }
@@ -913,11 +920,12 @@ fn sync_bcode_features(path: &Path, policy: &TesseractSyncPolicy, options: &Opti
 }
 
 fn package_tesseract_runtimes(options: &Options) -> Result<()> {
+    let target_kind = TargetKind::parse(&options.target)?;
     let source = latest_bundled_runtime_root(&options.target)?;
     let binary = options
         .dev_binary
         .clone()
-        .unwrap_or_else(|| built_binary(&options.target));
+        .unwrap_or_else(|| built_binary(&options.target, target_kind));
     let binary_dir = binary.parent().ok_or_else(|| {
         format_error(format!(
             "failed to determine binary directory for {}",
@@ -941,10 +949,11 @@ fn package_tesseract_runtimes(options: &Options) -> Result<()> {
 }
 
 fn smoke_test_tesseract(options: &Options) -> Result<()> {
+    let target_kind = TargetKind::parse(&options.target)?;
     let binary = options
         .dev_binary
         .clone()
-        .unwrap_or_else(|| built_binary(&options.target));
+        .unwrap_or_else(|| built_binary(&options.target, target_kind));
     let runtime_root = if options.out_dir == Path::new(DIST_DIR) {
         binary
             .parent()
@@ -1051,6 +1060,12 @@ fn write_runtime_manifest(runtime_root: &Path) -> Result<()> {
         .filter_map(|entry| entry.file_name().into_string().ok())
         .collect::<Vec<_>>();
     versions.sort();
+    if versions.is_empty() {
+        return Err(format_error(format!(
+            "bundled Tesseract runtime root {} contains no version directories",
+            runtime_root.display()
+        )));
+    }
     let mut languages = Vec::new();
     if let Some(first_version) = versions.first() {
         let tessdata = runtime_root.join(first_version).join("tessdata");
@@ -1102,6 +1117,8 @@ fn build_bcode_release(target: &str) -> Result<()> {
             .arg(PACKAGE_NAME)
             .arg("--bin")
             .arg(BINARY_NAME)
+            .arg("--bin")
+            .arg(MERMAID_WORKER_BINARY_NAME)
             .arg("--features")
             .arg("app")
             .arg("--target")
@@ -1113,30 +1130,31 @@ fn release(options: &Options) -> Result<()> {
     let target_kind = TargetKind::parse(&options.target)?;
     build_bcode_release(&options.target)?;
 
-    let binary = built_binary(&options.target);
+    let binary = built_binary(&options.target, target_kind);
+    let mermaid_worker = built_mermaid_worker(&options.target, target_kind);
+    ensure_file(&binary)?;
+    ensure_file(&mermaid_worker)?;
     if target_kind == TargetKind::Macos {
         sign_macos_release_binary(&binary)?;
         verify_macos_signature(&binary)?;
+        sign_macos_release_binary(&mermaid_worker)?;
+        verify_macos_signature(&mermaid_worker)?;
     } else if target_kind == TargetKind::Linux {
         strip_binary(&binary);
+        strip_binary(&mermaid_worker);
     }
 
     let staging_dir = staging_dir(options);
     recreate_dir(&staging_dir)?;
     let staged_binary = staging_dir.join(binary_file_name(target_kind));
-    fs::copy(&binary, &staged_binary).map_err(|error| {
-        format_error(format!(
-            "failed to copy {} to {}: {error}",
-            binary.display(),
-            staged_binary.display()
-        ))
-    })?;
-    if let Ok(runtime_source) = latest_bundled_runtime_root(&options.target) {
-        let runtime_destination = staging_dir.join("bcode-runtimes").join("tesseract");
-        recreate_dir(&runtime_destination)?;
-        copy_dir_recursive(&runtime_source, &runtime_destination)?;
-        write_runtime_manifest(&runtime_destination)?;
-    }
+    copy_release_binary(&binary, &staged_binary)?;
+    let staged_mermaid_worker = staging_dir.join(mermaid_worker_file_name(target_kind));
+    copy_release_binary(&mermaid_worker, &staged_mermaid_worker)?;
+    let runtime_source = latest_bundled_runtime_root(&options.target)?;
+    let runtime_destination = staging_dir.join("bcode-runtimes").join("tesseract");
+    recreate_dir(&runtime_destination)?;
+    copy_dir_recursive(&runtime_source, &runtime_destination)?;
+    write_runtime_manifest(&runtime_destination)?;
 
     let archive = archive_path(options, target_kind);
     if archive.exists() {
@@ -1159,11 +1177,24 @@ fn verify_release(options: &Options) -> Result<()> {
     ensure_file(&archive)?;
     ensure_file(&checksum_path(&archive))?;
     verify_checksum(&archive)?;
+    verify_archive_contents(&archive, target_kind)?;
 
     if target_kind == TargetKind::Macos {
-        let binary = built_binary(&options.target);
+        let binary = built_binary(&options.target, target_kind);
         ensure_file(&binary)?;
         verify_macos_signature(&binary)?;
+        let mermaid_worker = built_mermaid_worker(&options.target, target_kind);
+        ensure_file(&mermaid_worker)?;
+        verify_macos_signature(&mermaid_worker)?;
+    }
+    if options.target == host_target() {
+        smoke_test_release_archive(&archive, target_kind)?;
+    } else {
+        println!(
+            "skipping extracted artifact execution for non-host target {} on {}",
+            options.target,
+            host_target()
+        );
     }
 
     println!("verified release artifact: {}", archive.display());
@@ -1173,7 +1204,7 @@ fn verify_release(options: &Options) -> Result<()> {
 fn dev_release(options: &Options) -> Result<()> {
     let target_kind = TargetKind::parse(&options.target)?;
     build_bcode_release(&options.target)?;
-    let binary = built_binary(&options.target);
+    let binary = built_binary(&options.target, target_kind);
     ensure_file(&binary)?;
 
     match target_kind {
@@ -1194,6 +1225,9 @@ fn dev_release(options: &Options) -> Result<()> {
             strip_binary(&binary);
             println!("dev release ready: {}", binary.display());
         }
+        TargetKind::Windows => {
+            println!("dev release ready: {}", binary.display());
+        }
     }
 
     Ok(())
@@ -1210,7 +1244,7 @@ fn dev_sign(options: &Options) -> Result<()> {
     let binary = options
         .dev_binary
         .clone()
-        .unwrap_or_else(|| built_binary(&options.target));
+        .unwrap_or_else(|| built_binary(&options.target, target_kind));
     ensure_file(&binary)?;
     let (signing_identity, keychain) =
         ensure_dev_codesign_identity(&options.dev_identity, options.allow_create_dev_identity)?;
@@ -1228,18 +1262,21 @@ fn dev_sign(options: &Options) -> Result<()> {
 enum TargetKind {
     Macos,
     Linux,
+    Windows,
 }
 
 impl TargetKind {
     fn parse(target: &str) -> Result<Self> {
-        if target.contains("apple-darwin") {
-            Ok(Self::Macos)
-        } else if target.contains("linux") {
-            Ok(Self::Linux)
-        } else {
-            Err(format_error(format!(
-                "unsupported release target `{target}`; v1 supports macOS and Linux"
-            )))
+        match target {
+            "aarch64-apple-darwin" | "x86_64-apple-darwin" => Ok(Self::Macos),
+            "aarch64-unknown-linux-gnu" | "x86_64-unknown-linux-gnu" => Ok(Self::Linux),
+            "x86_64-pc-windows-msvc" => Ok(Self::Windows),
+            "x86_64-windows" => Err(format_error(
+                "unsupported release target `x86_64-windows`; use `x86_64-pc-windows-msvc`",
+            )),
+            _ => Err(format_error(format!(
+                "unsupported release target `{target}`; supported targets are listed by `cargo xtask help`"
+            ))),
         }
     }
 }
@@ -1714,25 +1751,16 @@ fn create_archive(archive: &Path, staging_dir: &Path) -> Result<()> {
         .parent()
         .ok_or_else(|| format_error("archive path has no parent directory"))?;
     fs::create_dir_all(parent)?;
-    let file_name = archive
-        .file_name()
-        .ok_or_else(|| format_error("archive path has no file name"))?;
 
     if archive
         .extension()
         .is_some_and(|extension| extension == "zip")
     {
-        run_command(
-            Command::new("ditto")
-                .arg("-c")
-                .arg("-k")
-                .arg("--sequesterRsrc")
-                .arg("--keepParent")
-                .arg(staging_dir)
-                .arg(file_name)
-                .current_dir(parent),
-        )
+        create_zip_archive(archive, staging_dir)
     } else {
+        let file_name = archive
+            .file_name()
+            .ok_or_else(|| format_error("archive path has no file name"))?;
         run_command(
             Command::new("tar")
                 .arg("-czf")
@@ -1745,33 +1773,350 @@ fn create_archive(archive: &Path, staging_dir: &Path) -> Result<()> {
     }
 }
 
+fn create_zip_archive(archive: &Path, staging_dir: &Path) -> Result<()> {
+    let mut paths = archive_source_files(staging_dir)?;
+    paths.sort();
+    let file = File::create(archive)?;
+    let mut writer = zip::ZipWriter::new(file);
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated);
+    for path in paths {
+        let relative = path.strip_prefix(staging_dir).map_err(|error| {
+            format_error(format!(
+                "failed to make {} relative to {}: {error}",
+                path.display(),
+                staging_dir.display()
+            ))
+        })?;
+        let name = zip_entry_name(relative)?;
+        writer.start_file(name, options)?;
+        let mut source = File::open(&path)?;
+        io::copy(&mut source, &mut writer)?;
+    }
+    writer.finish()?;
+    Ok(())
+}
+
+fn archive_source_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            files.extend(archive_source_files(&path)?);
+        } else if path.is_file() {
+            files.push(path);
+        } else {
+            return Err(format_error(format!(
+                "release staging contains unsupported entry {}",
+                path.display()
+            )));
+        }
+    }
+    Ok(files)
+}
+
+fn zip_entry_name(path: &Path) -> Result<String> {
+    let components = path
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => {
+                value.to_str().map(str::to_owned).ok_or_else(|| {
+                    format_error(format!("release path is not UTF-8: {}", path.display()))
+                })
+            }
+            _ => Err(format_error(format!(
+                "release path is not a safe relative path: {}",
+                path.display()
+            ))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if components.is_empty() {
+        return Err(format_error("release archive entry path is empty"));
+    }
+    Ok(components.join("/"))
+}
+
+fn archive_sha256(archive: &Path) -> Result<String> {
+    let mut file = File::open(archive)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 fn write_checksum(archive: &Path) -> Result<()> {
-    let digest = command_output(Command::new("shasum").arg("-a").arg("256").arg(archive))?;
+    let file_name = archive
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| format_error("archive path has no UTF-8 file name"))?;
     let checksum = checksum_path(archive);
-    fs::write(&checksum, digest).map_err(|error| {
-        format_error(format!(
-            "failed to write checksum {}: {error}",
-            checksum.display()
-        ))
-    })
+    fs::write(
+        checksum,
+        format!("{}  {file_name}\n", archive_sha256(archive)?),
+    )?;
+    Ok(())
 }
 
 fn verify_checksum(archive: &Path) -> Result<()> {
-    let checksum = checksum_path(archive);
+    let checksum_path = checksum_path(archive);
+    let checksum_text = fs::read_to_string(&checksum_path)?;
+    let expected = checksum_text
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| format_error(format!("empty checksum file {}", checksum_path.display())))?;
+    let actual = archive_sha256(archive)?;
+    if expected.eq_ignore_ascii_case(&actual) {
+        Ok(())
+    } else {
+        Err(format_error(format!(
+            "checksum mismatch for {}: expected {expected}, got {actual}",
+            archive.display()
+        )))
+    }
+}
+
+fn verify_archive_contents(archive: &Path, target_kind: TargetKind) -> Result<()> {
+    if target_kind == TargetKind::Linux {
+        return verify_tar_archive_contents(archive, target_kind);
+    }
+    let mut zip = zip::ZipArchive::new(File::open(archive)?)?;
+    let mut entries = std::collections::BTreeSet::new();
+    for index in 0..zip.len() {
+        let entry = zip.by_index(index)?;
+        if !entry.is_dir() {
+            entries.insert(entry.name().to_owned());
+        }
+    }
+    verify_required_archive_entries(&entries, archive, target_kind)
+}
+
+fn verify_tar_archive_contents(archive: &Path, target_kind: TargetKind) -> Result<()> {
+    let listing = command_output(Command::new("tar").arg("-tzf").arg(archive))?;
+    let entries = listing
+        .lines()
+        .map(|entry| entry.trim_start_matches("./").to_owned())
+        .collect::<std::collections::BTreeSet<_>>();
+    verify_required_archive_entries(&entries, archive, target_kind)
+}
+
+fn smoke_test_release_archive(archive: &Path, target_kind: TargetKind) -> Result<()> {
+    let extraction = archive.with_extension(format!(
+        "{}.verify",
+        archive
+            .extension()
+            .and_then(OsStr::to_str)
+            .unwrap_or("archive")
+    ));
+    recreate_dir(&extraction)?;
+    if target_kind == TargetKind::Linux {
+        run_command(
+            Command::new("tar")
+                .arg("-xzf")
+                .arg(archive)
+                .arg("-C")
+                .arg(&extraction),
+        )?;
+    } else {
+        let mut zip = zip::ZipArchive::new(File::open(archive)?)?;
+        extract_zip_confined(&mut zip, &extraction)?;
+    }
+    let binary = extraction.join(binary_file_name(target_kind));
+    ensure_file(&binary)?;
+    run_command(Command::new(&binary).arg("--version"))?;
+    smoke_test_mermaid_worker(&extraction.join(mermaid_worker_file_name(target_kind)))?;
+    smoke_test_extracted_tesseract(&extraction)?;
+    if target_kind == TargetKind::Windows {
+        smoke_test_windows_daemon(&binary, &extraction)?;
+    }
+    fs::remove_dir_all(&extraction)?;
+    Ok(())
+}
+
+fn smoke_test_extracted_tesseract(extraction: &Path) -> Result<()> {
+    let runtime_root = extraction.join("bcode-runtimes").join("tesseract");
+    ensure_dir(&runtime_root)?;
     run_command(
-        Command::new("shasum")
-            .arg("-a")
-            .arg("256")
-            .arg("-c")
-            .arg(&checksum),
+        Command::new("cargo")
+            .arg("run")
+            .arg("--package")
+            .arg("bcode_tesseract_ocr")
+            .arg("--bin")
+            .arg("tesseract-smoke")
+            .arg("--no-default-features")
+            .arg("--features")
+            .arg("bundled-tesseract-default")
+            .env("BCODE_TESSERACT_RUNTIME_ROOT", runtime_root),
     )
 }
 
-fn built_binary(target: &str) -> PathBuf {
+fn smoke_test_windows_daemon(binary: &Path, extraction: &Path) -> Result<()> {
+    let smoke_root = extraction.join("windows smoke 状态");
+    fs::create_dir_all(&smoke_root)?;
+    let config = smoke_root.join("config.toml");
+    fs::write(&config, "")?;
+    let isolated_environment = |command: &mut Command| {
+        command
+            .env("BCODE_CONFIG", &config)
+            .env("APPDATA", smoke_root.join("appdata"))
+            .env("LOCALAPPDATA", smoke_root.join("local-appdata"))
+            .env("BCODE_DAEMON_LOG", smoke_root.join("daemon.log"));
+    };
+    let mut start = Command::new(binary);
+    start.args(["server", "start"]);
+    isolated_environment(&mut start);
+    run_command(&mut start)?;
+
+    let mut status = Command::new(binary);
+    status.args(["server", "status", "--verbose"]);
+    isolated_environment(&mut status);
+    if let Err(error) = run_command(&mut status) {
+        let mut stop = Command::new(binary);
+        stop.args(["server", "stop", "--force"]);
+        isolated_environment(&mut stop);
+        let _ = stop.status();
+        return Err(error);
+    }
+
+    let mut stop = Command::new(binary);
+    stop.args(["server", "stop"]);
+    isolated_environment(&mut stop);
+    run_command(&mut stop)
+}
+
+fn extract_zip_confined<R: io::Read + io::Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    destination: &Path,
+) -> Result<()> {
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index)?;
+        let enclosed = entry
+            .enclosed_name()
+            .ok_or_else(|| format_error(format!("unsafe ZIP entry path `{}`", entry.name())))?;
+        let output = destination.join(enclosed);
+        if entry.is_dir() {
+            fs::create_dir_all(&output)?;
+            continue;
+        }
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = File::create(output)?;
+        io::copy(&mut entry, &mut file)?;
+    }
+    Ok(())
+}
+
+fn smoke_test_mermaid_worker(worker: &Path) -> Result<()> {
+    ensure_file(worker)?;
+    let source = b"graph TD; A-->B";
+    let mut request = Vec::new();
+    request.extend_from_slice(b"BCMW");
+    request.extend_from_slice(&1_u16.to_be_bytes());
+    request.extend_from_slice(&800_u32.to_be_bytes());
+    request.extend_from_slice(&600_u32.to_be_bytes());
+    request.extend_from_slice(&(4_u32 * 1024 * 1024).to_be_bytes());
+    request.extend_from_slice(
+        &u32::try_from(source.len())
+            .map_err(|_| format_error("Mermaid smoke request is too large"))?
+            .to_be_bytes(),
+    );
+    request.extend_from_slice(source);
+    let mut child = Command::new(worker)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| format_error("Mermaid worker stdin was unavailable"))?
+        .write_all(&request)?;
+    let output = child.wait_with_output()?;
+    if !output.status.success()
+        || output.stdout.len() < 11
+        || &output.stdout[..4] != b"BCMR"
+        || output.stdout[6] != 1
+    {
+        return Err(format_error(format!(
+            "packaged Mermaid worker smoke test failed with {} and {} response bytes",
+            output.status,
+            output.stdout.len()
+        )));
+    }
+    Ok(())
+}
+
+fn verify_required_archive_entries(
+    entries: &std::collections::BTreeSet<String>,
+    archive: &Path,
+    target_kind: TargetKind,
+) -> Result<()> {
+    for name in [
+        binary_file_name(target_kind),
+        mermaid_worker_file_name(target_kind),
+        "bcode-runtimes/tesseract/manifest.json",
+    ] {
+        if !entries.contains(name) {
+            return Err(format_error(format!(
+                "release archive {} is missing required entry `{name}`",
+                archive.display()
+            )));
+        }
+    }
+    let runtime_prefix = "bcode-runtimes/tesseract/";
+    if !entries.iter().any(|name| {
+        name.starts_with(runtime_prefix)
+            && (name.ends_with("/lib/tesseract.dll")
+                || name.ends_with("/lib/libtesseract.dylib")
+                || name.ends_with("/lib/libtesseract.so"))
+    }) {
+        return Err(format_error(format!(
+            "release archive {} contains no canonical bundled Tesseract runtime library",
+            archive.display()
+        )));
+    }
+    if !entries
+        .iter()
+        .any(|name| name.starts_with(runtime_prefix) && name.ends_with("/tessdata/eng.traineddata"))
+    {
+        return Err(format_error(format!(
+            "release archive {} contains no bundled English Tesseract language data",
+            archive.display()
+        )));
+    }
+    Ok(())
+}
+
+fn built_binary(target: &str, target_kind: TargetKind) -> PathBuf {
+    built_release_binary(target, binary_file_name(target_kind))
+}
+
+fn built_mermaid_worker(target: &str, target_kind: TargetKind) -> PathBuf {
+    built_release_binary(target, mermaid_worker_file_name(target_kind))
+}
+
+fn built_release_binary(target: &str, file_name: &str) -> PathBuf {
     PathBuf::from("target")
         .join(target)
         .join("release")
-        .join(BINARY_NAME)
+        .join(file_name)
+}
+
+fn copy_release_binary(source: &Path, destination: &Path) -> Result<()> {
+    fs::copy(source, destination).map_err(|error| {
+        format_error(format!(
+            "failed to copy {} to {}: {error}",
+            source.display(),
+            destination.display()
+        ))
+    })?;
+    Ok(())
 }
 
 fn staging_dir(options: &Options) -> PathBuf {
@@ -1779,13 +2124,18 @@ fn staging_dir(options: &Options) -> PathBuf {
 }
 
 fn archive_path(options: &Options, target_kind: TargetKind) -> PathBuf {
-    let extension = match target_kind {
-        TargetKind::Macos => "zip",
+    options.out_dir.join(format!(
+        "{}.{}",
+        artifact_stem(options),
+        archive_extension(target_kind)
+    ))
+}
+
+const fn archive_extension(target_kind: TargetKind) -> &'static str {
+    match target_kind {
+        TargetKind::Macos | TargetKind::Windows => "zip",
         TargetKind::Linux => "tar.gz",
-    };
-    options
-        .out_dir
-        .join(format!("{}.{extension}", artifact_stem(options)))
+    }
 }
 
 fn artifact_stem(options: &Options) -> String {
@@ -1796,8 +2146,18 @@ fn checksum_path(archive: &Path) -> PathBuf {
     PathBuf::from(format!("{}.sha256", archive.display()))
 }
 
-const fn binary_file_name(_target_kind: TargetKind) -> &'static str {
-    BINARY_NAME
+const fn binary_file_name(target_kind: TargetKind) -> &'static str {
+    match target_kind {
+        TargetKind::Macos | TargetKind::Linux => BINARY_NAME,
+        TargetKind::Windows => "bcode.exe",
+    }
+}
+
+const fn mermaid_worker_file_name(target_kind: TargetKind) -> &'static str {
+    match target_kind {
+        TargetKind::Macos | TargetKind::Linux => MERMAID_WORKER_BINARY_NAME,
+        TargetKind::Windows => "bcode-mermaid-worker.exe",
+    }
 }
 
 fn recreate_dir(path: &Path) -> Result<()> {
@@ -1903,13 +2263,16 @@ fn env_flag(name: &str) -> bool {
 }
 
 fn host_target() -> String {
-    let os = env::consts::OS;
-    let arch = env::consts::ARCH;
+    host_target_for(env::consts::ARCH, env::consts::OS)
+}
+
+fn host_target_for(arch: &str, os: &str) -> String {
     match (arch, os) {
         ("aarch64", "macos") => "aarch64-apple-darwin".to_owned(),
         ("x86_64", "macos") => "x86_64-apple-darwin".to_owned(),
         ("aarch64", "linux") => "aarch64-unknown-linux-gnu".to_owned(),
         ("x86_64", "linux") => "x86_64-unknown-linux-gnu".to_owned(),
+        ("x86_64", "windows") => "x86_64-pc-windows-msvc".to_owned(),
         _ => format!("{arch}-{os}"),
     }
 }
@@ -1937,7 +2300,8 @@ fn print_help() {
            * aarch64-apple-darwin\n\
            * x86_64-apple-darwin\n\
            * aarch64-unknown-linux-gnu\n\
-           * x86_64-unknown-linux-gnu\n\n\
+           * x86_64-unknown-linux-gnu\n\
+           * x86_64-pc-windows-msvc\n\n\
          macOS release env:\n\
            * APPLE_CODESIGN_IDENTITY\n\
            * APPLE_ID, APPLE_APP_SPECIFIC_PASSWORD, APPLE_TEAM_ID for notarization\n\n\
@@ -1945,4 +2309,100 @@ fn print_help() {
            * defaults to `Bcode Dev`\n\
            * override with --identity or BCODE_DEV_CODESIGN_IDENTITY"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn release_targets_are_exact_and_canonical() {
+        assert_eq!(
+            TargetKind::parse("x86_64-pc-windows-msvc").expect("Windows target"),
+            TargetKind::Windows
+        );
+        assert_eq!(
+            TargetKind::parse("aarch64-apple-darwin").expect("macOS target"),
+            TargetKind::Macos
+        );
+        assert_eq!(
+            TargetKind::parse("x86_64-unknown-linux-gnu").expect("Linux target"),
+            TargetKind::Linux
+        );
+        assert!(TargetKind::parse("aarch64-pc-windows-msvc").is_err());
+        assert!(TargetKind::parse("custom-linux-target").is_err());
+    }
+
+    #[test]
+    fn windows_host_uses_the_canonical_msvc_target() {
+        assert_eq!(
+            host_target_for("x86_64", "windows"),
+            "x86_64-pc-windows-msvc"
+        );
+    }
+
+    #[test]
+    fn windows_shorthand_suggests_the_canonical_target() {
+        let error = TargetKind::parse("x86_64-windows").expect_err("shorthand must fail");
+        assert!(error.0.contains("x86_64-pc-windows-msvc"));
+    }
+
+    #[test]
+    fn platform_release_file_names_and_extensions_are_explicit() {
+        assert_eq!(binary_file_name(TargetKind::Windows), "bcode.exe");
+        assert_eq!(
+            mermaid_worker_file_name(TargetKind::Windows),
+            "bcode-mermaid-worker.exe"
+        );
+        assert_eq!(archive_extension(TargetKind::Windows), "zip");
+        assert_eq!(archive_extension(TargetKind::Macos), "zip");
+        assert_eq!(archive_extension(TargetKind::Linux), "tar.gz");
+    }
+
+    #[test]
+    fn zip_entry_names_are_safe_and_portable() {
+        assert_eq!(
+            zip_entry_name(Path::new("bcode-runtimes/tesseract/manifest.json")).expect("safe path"),
+            "bcode-runtimes/tesseract/manifest.json"
+        );
+        assert!(zip_entry_name(Path::new("../bcode.exe")).is_err());
+        assert!(zip_entry_name(Path::new("/bcode.exe")).is_err());
+    }
+
+    #[test]
+    fn zip_archive_contains_staged_files_and_rejects_missing_required_entries() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = temp.path().join("staging");
+        let runtime = staging.join("bcode-runtimes/tesseract/5.5.2");
+        fs::create_dir_all(runtime.join("lib")).expect("runtime lib dir");
+        fs::create_dir_all(runtime.join("tessdata")).expect("tessdata dir");
+        fs::write(staging.join("bcode.exe"), b"bcode").expect("bcode");
+        fs::write(staging.join("bcode-mermaid-worker.exe"), b"mermaid worker").expect("worker");
+        fs::write(
+            staging.join("bcode-runtimes/tesseract/manifest.json"),
+            b"{}",
+        )
+        .expect("manifest");
+        fs::write(runtime.join("lib/tesseract.dll"), b"runtime").expect("runtime DLL");
+        fs::write(runtime.join("tessdata/eng.traineddata"), b"language").expect("language data");
+        let archive = temp.path().join("release.zip");
+        create_zip_archive(&archive, &staging).expect("create archive");
+        verify_archive_contents(&archive, TargetKind::Windows).expect("complete archive");
+
+        fs::remove_file(staging.join("bcode-mermaid-worker.exe")).expect("remove worker");
+        let incomplete = temp.path().join("incomplete.zip");
+        create_zip_archive(&incomplete, &staging).expect("create incomplete archive");
+        assert!(verify_archive_contents(&incomplete, TargetKind::Windows).is_err());
+    }
+
+    #[test]
+    fn checksum_round_trip_detects_archive_changes() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let archive = temp.path().join("release.zip");
+        fs::write(&archive, b"original").expect("archive");
+        write_checksum(&archive).expect("write checksum");
+        verify_checksum(&archive).expect("valid checksum");
+        fs::write(&archive, b"changed").expect("change archive");
+        assert!(verify_checksum(&archive).is_err());
+    }
 }
