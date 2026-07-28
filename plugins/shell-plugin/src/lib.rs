@@ -35,7 +35,8 @@ use contracts::{
     DEFAULT_SHELL_TIMEOUT_MS, SHELL_INVOCATION_INPUT_SCHEMA, SHELL_RECORDING_CONTENT_TYPE,
     SHELL_RECORDING_REF_KEY, SHELL_RUN_SCHEMA, SHELL_RUN_TOOL_NAME, SHELL_SCHEMA_VERSION,
     ShellInvocationAction, ShellLiveRecordingPayload, ShellRunArguments, ShellRunResult,
-    ShellWorkflowCommandPlan, TERMINAL_PTY_STREAM_CONTENT_TYPE, TERMINAL_PTY_STREAM_REF_KEY,
+    ShellWorkflowCommandPlan, ShellWorkflowCommandPlanResult, ShellWorkflowCommandResult,
+    ShellWorkflowCommandStatus, TERMINAL_PTY_STREAM_CONTENT_TYPE, TERMINAL_PTY_STREAM_REF_KEY,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -267,9 +268,16 @@ fn invoke_workflow_block_contract(context: &NativeServiceContext) -> ServiceResp
     if context.cancellation.is_cancelled() {
         return ServiceResponse::error("cancelled", "shell command plan cancelled");
     }
-    let plan = match context.request.payload_json::<ShellWorkflowCommandPlan>() {
-        Ok(plan) => plan,
+    let invocation = match context
+        .request
+        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
+    {
+        Ok(invocation) => invocation,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let plan = match invocation.typed_input::<ShellWorkflowCommandPlan>() {
+        Ok(plan) => plan,
+        Err(error) => return ServiceResponse::error("invalid_request", error),
     };
     if plan.version != contracts::SHELL_COMMAND_PLAN_VERSION
         || plan.commands.is_empty()
@@ -297,10 +305,311 @@ fn invoke_workflow_block_contract(context: &NativeServiceContext) -> ServiceResp
             "shell command plan exceeds version, path, command, timeout, environment, or output bounds",
         );
     }
-    ServiceResponse::error(
-        "not_implemented",
-        "shell command-plan execution is not enabled until durable receipt/output handling is complete",
+    match execute_workflow_command_plan(context, &invocation, &plan) {
+        Ok(result) => json_response(&result),
+        Err(error) => ServiceResponse::error("command_plan_failed", error),
+    }
+}
+
+const SHELL_WORKFLOW_ARTIFACT_CONTENT_TYPE: &str = "application/octet-stream";
+const SHELL_WORKFLOW_STDOUT_SCHEMA: &str = "bcode.shell.command-plan.stdout";
+const SHELL_WORKFLOW_STDERR_SCHEMA: &str = "bcode.shell.command-plan.stderr";
+
+fn execute_workflow_command_plan(
+    context: &NativeServiceContext,
+    invocation: &bcode_workflow::WorkflowBlockInvocation,
+    plan: &ShellWorkflowCommandPlan,
+) -> Result<ShellWorkflowCommandPlanResult, String> {
+    let workspace = invocation
+        .workspace_root
+        .canonicalize()
+        .map_err(|error| format!("workflow workspace is unavailable: {error}"))?;
+    let cwd = workspace.join(&plan.cwd);
+    let cwd = cwd
+        .canonicalize()
+        .map_err(|error| format!("workflow cwd is unavailable: {error}"))?;
+    if !cwd.starts_with(&workspace) || !cwd.is_dir() {
+        return Err("workflow cwd escapes the immutable workspace".to_string());
+    }
+    validate_workflow_environment(&plan.environment)?;
+    let mut commands = Vec::with_capacity(plan.commands.len());
+    let mut artifacts = Vec::new();
+    for (index, command) in plan.commands.iter().enumerate() {
+        if context.cancellation.is_cancelled() {
+            commands.push(cancelled_workflow_command_result(index));
+            break;
+        }
+        let (result, command_artifacts) =
+            execute_workflow_command(context, invocation, plan, command, index, &cwd)?;
+        let should_stop = result.status != ShellWorkflowCommandStatus::Exited
+            || result.exit_code != Some(0) && !command.continue_on_nonzero;
+        commands.push(result);
+        artifacts.extend(command_artifacts);
+        if should_stop {
+            break;
+        }
+    }
+    let passed = commands.len() == plan.commands.len()
+        && commands.iter().all(|result| {
+            result.status == ShellWorkflowCommandStatus::Exited && result.exit_code == Some(0)
+        });
+    Ok(ShellWorkflowCommandPlanResult {
+        version: contracts::SHELL_COMMAND_PLAN_VERSION,
+        passed,
+        commands,
+        artifacts,
+    })
+}
+
+fn validate_workflow_environment(
+    environment: &contracts::ShellWorkflowEnvironment,
+) -> Result<(), String> {
+    if environment.set.iter().any(|(name, value)| {
+        name.is_empty()
+            || name.contains(['=', '\0'])
+            || value.contains('\0')
+            || name.len() > 256
+            || value.len() > 65_536
+    }) {
+        return Err("workflow command plan contains an invalid environment entry".to_string());
+    }
+    Ok(())
+}
+
+fn execute_workflow_command(
+    context: &NativeServiceContext,
+    invocation: &bcode_workflow::WorkflowBlockInvocation,
+    plan: &ShellWorkflowCommandPlan,
+    command: &contracts::ShellWorkflowCommand,
+    index: usize,
+    cwd: &Path,
+) -> Result<
+    (
+        ShellWorkflowCommandResult,
+        Vec<bcode_workflow::ArtifactReference>,
+    ),
+    String,
+> {
+    let started = Instant::now();
+    let mut process = Command::new(&command.argv[0]);
+    process
+        .args(&command.argv[1..])
+        .current_dir(cwd)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    if !plan.environment.inherit {
+        process.env_clear();
+    }
+    process.envs(&plan.environment.set);
+    let child = match process.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Ok((
+                ShellWorkflowCommandResult {
+                    index: u32::try_from(index).map_err(|error| error.to_string())?,
+                    status: ShellWorkflowCommandStatus::SpawnFailed,
+                    exit_code: None,
+                    signal: None,
+                    duration_ms: elapsed_millis(started),
+                    stdout_preview: String::new(),
+                    stderr_preview: bounded_preview(
+                        error.to_string().as_bytes(),
+                        plan.output.preview_bytes,
+                    )
+                    .0,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+                Vec::new(),
+            ));
+        }
+    };
+    let outcome = wait_for_workflow_command(
+        child,
+        &context.cancellation,
+        Duration::from_millis(command.timeout_ms),
+    )?;
+    let (stdout_preview, stdout_truncated) =
+        bounded_preview(&outcome.output.stdout, plan.output.preview_bytes);
+    let (stderr_preview, stderr_truncated) =
+        bounded_preview(&outcome.output.stderr, plan.output.preview_bytes);
+    let mut artifacts = Vec::new();
+    if plan.output.artifact_spill && stdout_truncated {
+        artifacts.push(write_workflow_output_artifact(
+            context,
+            invocation,
+            index,
+            "stdout",
+            SHELL_WORKFLOW_STDOUT_SCHEMA,
+            outcome.output.stdout,
+        )?);
+    }
+    if plan.output.artifact_spill && stderr_truncated {
+        artifacts.push(write_workflow_output_artifact(
+            context,
+            invocation,
+            index,
+            "stderr",
+            SHELL_WORKFLOW_STDERR_SCHEMA,
+            outcome.output.stderr,
+        )?);
+    }
+    Ok((
+        ShellWorkflowCommandResult {
+            index: u32::try_from(index).map_err(|error| error.to_string())?,
+            status: outcome.status,
+            exit_code: outcome.output.status.code(),
+            signal: workflow_exit_signal(outcome.output.status),
+            duration_ms: elapsed_millis(started),
+            stdout_preview,
+            stderr_preview,
+            stdout_truncated,
+            stderr_truncated,
+        },
+        artifacts,
+    ))
+}
+
+struct WorkflowCommandOutcome {
+    status: ShellWorkflowCommandStatus,
+    output: std::process::Output,
+}
+
+fn wait_for_workflow_command(
+    mut child: std::process::Child,
+    cancellation: &bcode_plugin_sdk::ServiceCancellation,
+    timeout: Duration,
+) -> Result<WorkflowCommandOutcome, String> {
+    let stdout = child.stdout.take().map(|mut stdout| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).map(|_| bytes)
+        })
+    });
+    let stderr = child.stderr.take().map(|mut stderr| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        })
+    });
+    let started = Instant::now();
+    let (terminal, status) = loop {
+        if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+            break (ShellWorkflowCommandStatus::Exited, status);
+        }
+        if cancellation.is_cancelled() {
+            child.kill().map_err(|error| error.to_string())?;
+            let status = child.wait().map_err(|error| error.to_string())?;
+            break (ShellWorkflowCommandStatus::Cancelled, status);
+        }
+        if started.elapsed() >= timeout {
+            child.kill().map_err(|error| error.to_string())?;
+            let status = child.wait().map_err(|error| error.to_string())?;
+            break (ShellWorkflowCommandStatus::TimedOut, status);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = join_workflow_output_reader(stdout)?;
+    let stderr = join_workflow_output_reader(stderr)?;
+    Ok(WorkflowCommandOutcome {
+        status: terminal,
+        output: std::process::Output {
+            status,
+            stdout,
+            stderr,
+        },
+    })
+}
+
+fn join_workflow_output_reader(
+    reader: Option<std::thread::JoinHandle<io::Result<Vec<u8>>>>,
+) -> Result<Vec<u8>, String> {
+    reader.map_or_else(
+        || Ok(Vec::new()),
+        |reader| {
+            reader
+                .join()
+                .map_err(|_| "workflow command output reader panicked".to_string())?
+                .map_err(|error| error.to_string())
+        },
     )
+}
+
+fn bounded_preview(bytes: &[u8], limit: u32) -> (String, bool) {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let retained = bytes.get(..bytes.len().min(limit)).unwrap_or(bytes);
+    (
+        String::from_utf8_lossy(retained).into_owned(),
+        bytes.len() > retained.len(),
+    )
+}
+
+fn write_workflow_output_artifact(
+    context: &NativeServiceContext,
+    invocation: &bcode_workflow::WorkflowBlockInvocation,
+    index: usize,
+    stream: &str,
+    schema: &str,
+    bytes: Vec<u8>,
+) -> Result<bcode_workflow::ArtifactReference, String> {
+    let artifact_id = format!("command-{index}-{stream}");
+    let response = context
+        .bridge
+        .request(&ServiceBridgeRequest::WriteArtifact(
+            bcode_tool::ToolArtifactWriteRequest {
+                invocation_id: invocation.dispatch_identity.clone(),
+                artifact_id: artifact_id.clone(),
+                content_type: SHELL_WORKFLOW_ARTIFACT_CONTENT_TYPE.to_string(),
+                bytes,
+                metadata: serde_json::json!({"schema": schema, "schema_version": 1}),
+            },
+        ))
+        .map_err(|error| error.to_string())?;
+    match response {
+        ServiceBridgeResponse::Artifact(bcode_tool::ToolArtifactWriteResolution::Written {
+            reference,
+            ..
+        }) => Ok(bcode_workflow::ArtifactReference::new(
+            artifact_id,
+            schema,
+            1,
+            SHELL_WORKFLOW_ARTIFACT_CONTENT_TYPE,
+            reference.to_string(),
+        )),
+        ServiceBridgeResponse::Artifact(resolution) => Err(format!(
+            "workflow output artifact was not written: {resolution:?}"
+        )),
+        _ => Err("workflow output artifact returned an unexpected response".to_string()),
+    }
+}
+
+fn cancelled_workflow_command_result(index: usize) -> ShellWorkflowCommandResult {
+    ShellWorkflowCommandResult {
+        index: u32::try_from(index).unwrap_or(u32::MAX),
+        status: ShellWorkflowCommandStatus::Cancelled,
+        exit_code: None,
+        signal: None,
+        duration_ms: 0,
+        stdout_preview: String::new(),
+        stderr_preview: String::new(),
+        stdout_truncated: false,
+        stderr_truncated: false,
+    }
+}
+
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+#[cfg(unix)]
+fn workflow_exit_signal(status: std::process::ExitStatus) -> Option<i32> {
+    use std::os::unix::process::ExitStatusExt as _;
+    status.signal()
+}
+
+#[cfg(not(unix))]
+fn workflow_exit_signal(_status: std::process::ExitStatus) -> Option<i32> {
+    None
 }
 
 fn list_tools(request: &ServiceRequest) -> ServiceResponse {
@@ -1787,6 +2096,174 @@ bcode_plugin_sdk::export_concurrent_plugin!(ShellPlugin, include_str!("../bcode-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn workflow_command_plan(
+        workspace: &Path,
+        commands: Vec<contracts::ShellWorkflowCommand>,
+    ) -> (
+        bcode_workflow::WorkflowBlockInvocation,
+        ShellWorkflowCommandPlan,
+    ) {
+        (
+            bcode_workflow::WorkflowBlockInvocation {
+                version: bcode_workflow::WorkflowBlockInvocation::VERSION,
+                dispatch_identity: "dispatch-test".to_string(),
+                workspace_root: workspace.to_path_buf(),
+                input: serde_json::Value::Null,
+            },
+            ShellWorkflowCommandPlan {
+                version: contracts::SHELL_COMMAND_PLAN_VERSION,
+                cwd: PathBuf::from("."),
+                commands,
+                environment: contracts::ShellWorkflowEnvironment {
+                    inherit: false,
+                    set: std::collections::BTreeMap::new(),
+                },
+                output: contracts::ShellWorkflowOutputPolicy {
+                    preview_bytes: 4,
+                    artifact_spill: false,
+                },
+            },
+        )
+    }
+
+    fn workflow_context(
+        invocation: &bcode_workflow::WorkflowBlockInvocation,
+        cancellation: bcode_plugin_sdk::ServiceCancellation,
+    ) -> NativeServiceContext {
+        NativeServiceContext {
+            plugin_id: "bcode.shell".to_string(),
+            request: ServiceRequest {
+                interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.to_string(),
+                operation: "shell.command-plan".to_string(),
+                payload: serde_json::to_vec(invocation).expect("invocation"),
+            },
+            config: bcode_plugin_sdk::PluginConfigContext::default(),
+            events: ServiceEventEmitter::default(),
+            cancellation,
+            bridge: ServiceBridge::default(),
+            transient_progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_command_plan_runs_sequentially_and_branches_on_nonzero() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let command = |script: &str, continue_on_nonzero| contracts::ShellWorkflowCommand {
+            argv: vec!["sh".to_string(), "-c".to_string(), script.to_string()],
+            timeout_ms: 5_000,
+            continue_on_nonzero,
+        };
+        let (invocation, plan) = workflow_command_plan(
+            workspace.path(),
+            vec![
+                command("printf first; printf error >&2; exit 7", true),
+                command("printf second", false),
+            ],
+        );
+        let result = execute_workflow_command_plan(
+            &workflow_context(
+                &invocation,
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            ),
+            &invocation,
+            &plan,
+        )
+        .expect("result");
+        assert!(!result.passed);
+        assert_eq!(result.commands.len(), 2);
+        assert_eq!(result.commands[0].exit_code, Some(7));
+        assert_eq!(result.commands[0].stdout_preview, "firs");
+        assert!(result.commands[0].stdout_truncated);
+        assert_eq!(result.commands[1].stdout_preview, "seco");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workflow_command_plan_reports_timeout_spawn_failure_and_cancellation() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let cases = [
+            (
+                contracts::ShellWorkflowCommand {
+                    argv: vec!["sh".to_string(), "-c".to_string(), "sleep 1".to_string()],
+                    timeout_ms: 10,
+                    continue_on_nonzero: false,
+                },
+                ShellWorkflowCommandStatus::TimedOut,
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            ),
+            (
+                contracts::ShellWorkflowCommand {
+                    argv: vec!["bcode-definitely-missing-command".to_string()],
+                    timeout_ms: 1_000,
+                    continue_on_nonzero: false,
+                },
+                ShellWorkflowCommandStatus::SpawnFailed,
+                bcode_plugin_sdk::ServiceCancellation::default(),
+            ),
+        ];
+        for (command, expected, cancellation) in cases {
+            let (invocation, plan) = workflow_command_plan(workspace.path(), vec![command]);
+            let result = execute_workflow_command_plan(
+                &workflow_context(&invocation, cancellation),
+                &invocation,
+                &plan,
+            )
+            .expect("result");
+            assert_eq!(result.commands[0].status, expected);
+        }
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::new(cancelled);
+        let (invocation, plan) = workflow_command_plan(
+            workspace.path(),
+            vec![contracts::ShellWorkflowCommand {
+                argv: vec!["sh".to_string(), "-c".to_string(), "sleep 1".to_string()],
+                timeout_ms: 1_000,
+                continue_on_nonzero: false,
+            }],
+        );
+        let result = execute_workflow_command_plan(
+            &workflow_context(&invocation, cancellation),
+            &invocation,
+            &plan,
+        )
+        .expect("result");
+        assert_eq!(
+            result.commands[0].status,
+            ShellWorkflowCommandStatus::Cancelled
+        );
+    }
+
+    #[test]
+    fn workflow_command_plan_rejects_cwd_escape_and_invalid_environment() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (invocation, mut plan) = workflow_command_plan(
+            workspace.path(),
+            vec![contracts::ShellWorkflowCommand {
+                argv: vec!["command".to_string()],
+                timeout_ms: 1_000,
+                continue_on_nonzero: false,
+            }],
+        );
+        plan.cwd = PathBuf::from("../escape");
+        assert!(
+            execute_workflow_command_plan(
+                &workflow_context(
+                    &invocation,
+                    bcode_plugin_sdk::ServiceCancellation::default()
+                ),
+                &invocation,
+                &plan,
+            )
+            .is_err()
+        );
+        plan.cwd = PathBuf::from(".");
+        plan.environment
+            .set
+            .insert("BAD=NAME".to_string(), "value".to_string());
+        assert!(validate_workflow_environment(&plan.environment).is_err());
+    }
 
     fn preparation_request_with_context(
         arguments: serde_json::Value,

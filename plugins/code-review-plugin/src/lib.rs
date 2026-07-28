@@ -688,9 +688,16 @@ fn review_diff_get(context: &NativeServiceContext) -> ServiceResponse {
 }
 
 fn review_bundle_get(context: &NativeServiceContext) -> ServiceResponse {
-    let request = match context.request.payload_json::<PublishReviewRequest>() {
-        Ok(request) => request,
+    let invocation = match context
+        .request
+        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
+    {
+        Ok(invocation) => invocation,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let request = match invocation.typed_input::<PublishReviewRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error),
     };
     let config = match plugin_config(context) {
         Ok(config) => config,

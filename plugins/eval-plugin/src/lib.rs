@@ -67,9 +67,13 @@ fn invoke_workflow_block(request: &ServiceRequest) -> ServiceResponse {
             "unsupported eval workflow block operation",
         );
     }
-    let suite = match serde_json::from_slice::<bcode_eval_models::EvalSuite>(&request.payload) {
-        Ok(suite) => suite,
+    let invocation = match request.payload_json::<bcode_workflow::WorkflowBlockInvocation>() {
+        Ok(invocation) => invocation,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let suite = match invocation.typed_input::<bcode_eval_models::EvalSuite>() {
+        Ok(suite) => suite,
+        Err(error) => return ServiceResponse::error("invalid_request", error),
     };
     match validate_suite(&suite) {
         Ok(()) => json_response(&serde_json::json!({
@@ -279,7 +283,13 @@ pattern = "ok"
         let request = ServiceRequest {
             interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.to_string(),
             operation: OP_VALIDATE_SUITE.to_string(),
-            payload: serde_json::to_vec(&suite).expect("request"),
+            payload: serde_json::to_vec(&bcode_workflow::WorkflowBlockInvocation {
+                version: bcode_workflow::WorkflowBlockInvocation::VERSION,
+                dispatch_identity: "test-dispatch".to_string(),
+                workspace_root: std::env::temp_dir(),
+                input: serde_json::to_value(&suite).expect("suite"),
+            })
+            .expect("request"),
         };
         let response = invoke_workflow_block(&request);
         assert_eq!(response.error, None);
@@ -290,7 +300,13 @@ pattern = "ok"
 
         suite.cases.clear();
         let invalid = invoke_workflow_block(&ServiceRequest {
-            payload: serde_json::to_vec(&suite).expect("invalid request"),
+            payload: serde_json::to_vec(&bcode_workflow::WorkflowBlockInvocation {
+                version: bcode_workflow::WorkflowBlockInvocation::VERSION,
+                dispatch_identity: "test-dispatch".to_string(),
+                workspace_root: std::env::temp_dir(),
+                input: serde_json::to_value(&suite).expect("suite"),
+            })
+            .expect("invalid request"),
             ..request
         });
         assert_eq!(

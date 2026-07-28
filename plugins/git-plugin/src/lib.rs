@@ -272,9 +272,16 @@ fn invoke_workflow_block(context: &NativeServiceContext) -> ServiceResponse {
     if context.cancellation.is_cancelled() {
         return ServiceResponse::error("cancelled", "Git commit cancelled");
     }
-    let request = match context.request.payload_json::<CommitRequest>() {
-        Ok(request) => request,
+    let invocation = match context
+        .request
+        .payload_json::<bcode_workflow::WorkflowBlockInvocation>()
+    {
+        Ok(invocation) => invocation,
         Err(error) => return invalid_request(&error),
+    };
+    let request = match invocation.typed_input::<CommitRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error),
     };
     match commit_repository(&request) {
         Ok(response) => json_response(&response),

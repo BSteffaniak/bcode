@@ -22612,9 +22612,6 @@ async fn dispatch_workflow_plugin_block(
 ) -> Result<serde_json::Value, WorkflowStoreError> {
     let block: bcode_workflow::WorkflowBlockDefinition =
         serde_json::from_value(request.activation.node.configuration.clone())?;
-    let payload = serde_json::to_vec(request.activation.input.as_ref().ok_or_else(|| {
-        WorkflowStoreError::InvalidData("workflow plugin block activation has no input".to_string())
-    })?)?;
     let run = state
         .workflow_store
         .lock()
@@ -22631,6 +22628,21 @@ async fn dispatch_workflow_plugin_block(
             SessionId::from_str(value)
                 .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))
         })?;
+    let payload = serde_json::to_vec(&bcode_workflow::WorkflowBlockInvocation {
+        version: bcode_workflow::WorkflowBlockInvocation::VERSION,
+        dispatch_identity: request.dispatch_identity.clone(),
+        workspace_root: state
+            .sessions
+            .session_summary(parent_session_id)
+            .await
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+            .working_directory,
+        input: request.activation.input.clone().ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "workflow plugin block activation has no input".to_string(),
+            )
+        })?,
+    })?;
     let run_work_id = WorkId::new(format!("workflow:{}", request.activation.run_id));
     let mut invocation = state
         .plugins

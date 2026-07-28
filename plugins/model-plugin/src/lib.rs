@@ -33,9 +33,13 @@ fn invoke_workflow_block(request: &ServiceRequest) -> ServiceResponse {
             "unsupported provider-auth security workflow block operation",
         );
     }
-    let request = match request.payload_json::<AuthSecurityInspectRequest>() {
-        Ok(request) => request,
+    let invocation = match request.payload_json::<bcode_workflow::WorkflowBlockInvocation>() {
+        Ok(invocation) => invocation,
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+    let request = match invocation.typed_input::<AuthSecurityInspectRequest>() {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error),
     };
     if request.profile.trim().is_empty() || !request.vault_path.is_absolute() {
         return ServiceResponse::error(
@@ -458,11 +462,16 @@ mod tests {
         let response = invoke_workflow_block(&ServiceRequest {
             interface_id: bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID.to_string(),
             operation: "provider_auth.security.inspect".to_string(),
-            payload: serde_json::to_vec(&serde_json::json!({
-                "vault_path": missing,
-                "profile": "openai",
-                "policy": "required",
-            }))
+            payload: serde_json::to_vec(&bcode_workflow::WorkflowBlockInvocation {
+                version: bcode_workflow::WorkflowBlockInvocation::VERSION,
+                dispatch_identity: "test-dispatch".to_string(),
+                workspace_root: std::env::temp_dir(),
+                input: serde_json::json!({
+                    "vault_path": missing,
+                    "profile": "openai",
+                    "policy": "required",
+                }),
+            })
             .expect("request"),
         });
         assert_eq!(response.error, None);

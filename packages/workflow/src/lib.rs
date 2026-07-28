@@ -1086,6 +1086,38 @@ const MAX_TRANSFORM_VALUE_BYTES: usize = 1_048_576;
 /// Stable plugin workflow-block service interface.
 pub const WORKFLOW_BLOCK_INTERFACE_ID: &str = "bcode.workflow-block/v1";
 
+/// Versioned host envelope for one exact plugin-owned workflow-block invocation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowBlockInvocation {
+    pub version: u32,
+    pub dispatch_identity: String,
+    pub workspace_root: std::path::PathBuf,
+    pub input: serde_json::Value,
+}
+
+impl WorkflowBlockInvocation {
+    /// Current workflow-block invocation envelope version.
+    pub const VERSION: u32 = 1;
+
+    /// Decode and validate a typed block input.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported envelope version, non-absolute workspace root, invalid
+    /// dispatch identity, or input schema mismatch.
+    pub fn typed_input<T: serde::de::DeserializeOwned>(&self) -> Result<T, String> {
+        if self.version != Self::VERSION
+            || self.dispatch_identity.trim().is_empty()
+            || self.dispatch_identity.len() > 4_096
+            || !self.workspace_root.is_absolute()
+        {
+            return Err("workflow block invocation envelope is invalid".to_string());
+        }
+        serde_json::from_value(self.input.clone()).map_err(|error| error.to_string())
+    }
+}
+
 /// Side-effect declaration for one plugin-owned workflow block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

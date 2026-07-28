@@ -13,6 +13,10 @@ Oversized output is represented by typed artifact references.
 
 The block is declared mutating because arbitrary commands can modify the workspace. It therefore
 requires an exact workflow grant, uses repair-required reconciliation for ambiguous accepted work,
-and claims repository write access. The current owner validates this contract but returns
-`not_implemented` before execution until durable acceptance receipts, result persistence, artifact
-spill, and cancellation settlement are complete.
+and claims repository write access. The owner resolves workspace-relative cwd against the canonical
+workflow workspace, executes exact argv commands sequentially, applies explicit inherited/cleared
+environment policy, enforces per-command timeout and cancellation, and reports ordinary nonzero
+exits as typed data. Bounded previews include truncation flags; when artifact spill is enabled,
+truncated complete streams are written through the invocation-scoped host artifact bridge. The
+workflow runtime persists prepared intent before invoking the owner and records owner acceptance
+before terminal observation, so an ambiguous accepted command is never automatically replayed.
