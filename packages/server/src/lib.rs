@@ -2004,31 +2004,12 @@ fn register_daemon(
     endpoint: &IpcEndpoint,
 ) -> Result<bcode_daemon_lifecycle::DaemonRecord, ServerError> {
     let instance_id = daemon_instance_id()?;
-    let executable_path = std::env::current_exe().ok();
-    let executable_digest = executable_path
-        .as_deref()
-        .and_then(|path| bcode_daemon_lifecycle::executable_sha256(path).ok());
     let mut record = bcode_daemon_lifecycle::DaemonRecord::current(
         endpoint,
         daemon_log_path(),
-        executable_path,
+        std::env::current_exe().ok(),
         instance_id,
     )?;
-    if let (Some(path), Some(digest)) = (
-        record.executable_path.as_deref(),
-        executable_digest.as_deref(),
-    ) && !bcode_daemon_lifecycle::executable_path_matches_digest(path, digest)
-    {
-        return Err(ServerError::DaemonLifecycle(
-            bcode_daemon_lifecycle::DaemonLifecycleError::Io {
-                path: path.to_path_buf(),
-                source: std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "daemon executable is not running from its content-addressed image",
-                ),
-            },
-        ));
-    }
     record.storage_writer_epoch = Some(bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH);
     bcode_daemon_lifecycle::write_record(&bcode_config::default_state_dir(), &record)?;
     Ok(record)

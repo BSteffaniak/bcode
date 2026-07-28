@@ -669,6 +669,24 @@ mod tests {
     }
 
     #[test]
+    fn daemon_record_accepts_verified_executable_outside_cache() {
+        let (executable_path, digest) = current_executable_identity().unwrap();
+        let record = DaemonRecord::current(
+            &bcode_ipc::default_endpoint(),
+            PathBuf::from("test.log"),
+            Some(executable_path.clone()),
+            "foreground-test".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            record.executable_path.as_deref(),
+            Some(executable_path.as_path())
+        );
+        assert_eq!(record.executable_digest.as_deref(), Some(digest.as_str()));
+    }
+
+    #[test]
     fn cached_daemon_executable_path_is_content_addressed() {
         assert_eq!(
             cached_daemon_executable_path_for_digest(Path::new("/state"), "abc123"),
