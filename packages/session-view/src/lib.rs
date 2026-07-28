@@ -1534,6 +1534,7 @@ impl SessionView {
     }
 
     /// Apply one live-only session event.
+    #[allow(clippy::too_many_lines)] // Exhaustive live-event routing remains explicit at the projection boundary.
     pub fn apply_live_event(&mut self, event: &SessionLiveEvent) {
         self.snapshot.session_id = Some(event.session_id);
         match &event.kind {
@@ -1893,6 +1894,144 @@ impl SessionView {
         }
         if changed {
             self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn apply_ordered_reasoning_update(
+        &mut self,
+        turn_id: &str,
+        activity_id: &str,
+        activity_order: u32,
+        part_id: &str,
+        kind: bcode_session_models::ReasoningContentKind,
+        role: bcode_session_models::ReasoningContentRole,
+        part_order: u32,
+        update: &bcode_session_models::TextStreamUpdate,
+    ) {
+        use bcode_session_models::TextStreamOperation;
+
+        let stream_id = TranscriptViewItemId::new(format!(
+            "reasoning-stream:{turn_id}:activity:{activity_id}:part:{part_id}"
+        ));
+        let existing = self.snapshot.text_streams.get(&stream_id).cloned();
+        if existing.as_ref().is_some_and(|state| {
+            matches!(state.status, TextStreamViewStatus::Terminal(_))
+                || update.generation < state.generation
+        }) {
+            return;
+        }
+        if existing
+            .as_ref()
+            .is_some_and(|state| update.generation > state.generation)
+        {
+            self.snapshot.text_streams.remove(&stream_id);
+            self.last_text_stream_updates.remove(&stream_id);
+            if let Some(activity) = self
+                .live_reasoning
+                .get_mut(&(turn_id.to_owned(), activity_id.to_owned()))
+            {
+                activity.parts.remove(part_id);
+            }
+        }
+        let state = self
+            .snapshot
+            .text_streams
+            .entry(stream_id.clone())
+            .or_insert(TextStreamViewState {
+                generation: update.generation,
+                revision: 0,
+                accepted_bytes: 0,
+                truncated: false,
+                status: TextStreamViewStatus::Healthy,
+            });
+        if update.revision < state.revision {
+            return;
+        }
+        if update.revision == state.revision {
+            if self.last_text_stream_updates.get(&stream_id) != Some(update) {
+                state.status = TextStreamViewStatus::Degraded;
+                self.bump_revision();
+            }
+            return;
+        }
+        let is_checkpoint = matches!(update.operation, TextStreamOperation::Checkpoint { .. });
+        if !is_checkpoint && update.first_revision != state.revision.saturating_add(1) {
+            state.status = TextStreamViewStatus::Degraded;
+            self.bump_revision();
+            return;
+        }
+
+        let activity_key = (turn_id.to_owned(), activity_id.to_owned());
+        let current_text = self
+            .live_reasoning
+            .get(&activity_key)
+            .and_then(|activity| activity.parts.get(part_id))
+            .map_or_else(String::new, |part| part.text.clone());
+        let next_text = match &update.operation {
+            TextStreamOperation::Append {
+                expected_offset,
+                text,
+            } => {
+                if *expected_offset != state.accepted_bytes {
+                    state.status = TextStreamViewStatus::Degraded;
+                    self.bump_revision();
+                    return;
+                }
+                let mut next = current_text;
+                next.push_str(text);
+                state.generation = update.generation;
+                state.revision = update.revision;
+                state.accepted_bytes = state.accepted_bytes.saturating_add(text.len());
+                state.status = TextStreamViewStatus::Healthy;
+                Some(next)
+            }
+            TextStreamOperation::Checkpoint {
+                start_offset,
+                text,
+                total_bytes,
+                truncated,
+            } => {
+                if start_offset.saturating_add(text.len()) > *total_bytes {
+                    state.status = TextStreamViewStatus::Degraded;
+                    self.bump_revision();
+                    return;
+                }
+                state.generation = update.generation;
+                state.revision = update.revision;
+                state.accepted_bytes = *total_bytes;
+                state.truncated = *truncated || *start_offset != 0;
+                state.status = if state.truncated {
+                    TextStreamViewStatus::Incomplete
+                } else {
+                    TextStreamViewStatus::Healthy
+                };
+                Some(text.clone())
+            }
+            TextStreamOperation::Terminal { status } => {
+                state.generation = update.generation;
+                state.revision = update.revision;
+                state.status = TextStreamViewStatus::Terminal(*status);
+                None
+            }
+        };
+        self.last_text_stream_updates
+            .insert(stream_id, update.clone());
+        if let Some(text) = next_text {
+            self.apply_live_reasoning_activity(
+                turn_id,
+                &bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                    activity_id: activity_id.to_owned(),
+                    activity_order,
+                    part_id: part_id.to_owned(),
+                    kind,
+                    role,
+                    part_order,
+                    text,
+                },
+            );
+        } else {
+            self.bump_revision();
         }
     }
 
@@ -7967,6 +8106,152 @@ mod tests {
             items[2].id,
             TranscriptViewItemId::tool_supplemental("call-1", "supplemental-two")
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One ordered stream fixture covers identity, ordering, gap, checkpoint, and terminal behavior.
+    fn ordered_reasoning_stream_validates_identity_order_and_integrity() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let live = |part_id: &str,
+                    activity_order,
+                    part_order,
+                    generation,
+                    first_revision,
+                    revision,
+                    operation| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                turn_id: "turn-1".to_owned(),
+                activity_id: "activity-1".to_owned(),
+                activity_order,
+                part_id: part_id.to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order,
+                update: bcode_session_models::TextStreamUpdate {
+                    generation,
+                    first_revision,
+                    revision,
+                    operation,
+                },
+            },
+        };
+        view.apply_live_event(&live(
+            "part-1",
+            2,
+            1,
+            0,
+            1,
+            1,
+            bcode_session_models::TextStreamOperation::Append {
+                expected_offset: 0,
+                text: "second".to_owned(),
+            },
+        ));
+        view.apply_live_event(&live(
+            "part-0",
+            2,
+            0,
+            0,
+            1,
+            1,
+            bcode_session_models::TextStreamOperation::Append {
+                expected_offset: 0,
+                text: "first".to_owned(),
+            },
+        ));
+        let item = &view.snapshot().transcript.items[0];
+        assert_eq!(
+            item.id,
+            TranscriptViewItemId::reasoning("turn-1", "activity-1")
+        );
+        assert!(matches!(
+            &item.kind,
+            TranscriptViewItemKind::ReasoningActivity { activity }
+                if activity.order == 2
+                    && activity.parts[0].part_id == "part-0"
+                    && activity.parts[0].text == "first"
+                    && activity.parts[1].part_id == "part-1"
+                    && activity.parts[1].text == "second"
+        ));
+
+        view.apply_live_event(&live(
+            "part-0",
+            2,
+            0,
+            0,
+            3,
+            3,
+            bcode_session_models::TextStreamOperation::Append {
+                expected_offset: 5,
+                text: " gap".to_owned(),
+            },
+        ));
+        let stream_id =
+            TranscriptViewItemId::new("reasoning-stream:turn-1:activity:activity-1:part:part-0");
+        assert!(matches!(
+            view.snapshot().text_streams[&stream_id].status,
+            TextStreamViewStatus::Degraded
+        ));
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::ReasoningActivity { activity }
+                if activity.parts[0].text == "first"
+        ));
+
+        view.apply_live_event(&live(
+            "part-0",
+            2,
+            0,
+            0,
+            4,
+            4,
+            bcode_session_models::TextStreamOperation::Checkpoint {
+                start_offset: 3,
+                text: "tail".to_owned(),
+                total_bytes: 7,
+                truncated: true,
+            },
+        ));
+        assert!(matches!(
+            view.snapshot().text_streams[&stream_id].status,
+            TextStreamViewStatus::Incomplete
+        ));
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::ReasoningActivity { activity }
+                if activity.parts[0].text == "tail"
+        ));
+
+        view.apply_live_event(&live(
+            "part-0",
+            2,
+            0,
+            0,
+            5,
+            5,
+            bcode_session_models::TextStreamOperation::Terminal {
+                status: bcode_session_models::TextStreamTerminalStatus::Cancelled,
+            },
+        ));
+        view.apply_live_event(&live(
+            "part-0",
+            2,
+            0,
+            0,
+            6,
+            6,
+            bcode_session_models::TextStreamOperation::Append {
+                expected_offset: 7,
+                text: " ignored".to_owned(),
+            },
+        ));
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::ReasoningActivity { activity }
+                if activity.parts[0].text == "tail"
+        ));
     }
 
     #[test]

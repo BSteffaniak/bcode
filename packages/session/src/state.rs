@@ -22,6 +22,27 @@ pub enum SessionLoadStatusKind {
     SummaryOnly,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LiveTextStreamKey {
+    Assistant {
+        turn_id: String,
+        segment_id: String,
+    },
+    Reasoning {
+        turn_id: String,
+        activity_id: String,
+        part_id: String,
+    },
+}
+
+impl LiveTextStreamKey {
+    pub fn turn_id(&self) -> &str {
+        match self {
+            Self::Assistant { turn_id, .. } | Self::Reasoning { turn_id, .. } => turn_id,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SessionState {
     pub(crate) summary: SessionSummary,
@@ -44,10 +65,10 @@ pub struct SessionState {
     pub(crate) load_status: SessionLoadStatusKind,
     pub(crate) sender: broadcast::Sender<SessionEvent>,
     pub(crate) live_events: SessionLiveEventBroker,
-    pub(crate) live_text_checkpoints: BTreeMap<(String, String), SessionLiveEvent>,
-    pub(crate) live_text_checkpoint_order: Vec<(String, String)>,
-    pub(crate) live_text_tombstones: BTreeMap<(String, String), (u64, u64)>,
-    pub(crate) live_text_tombstone_order: Vec<(String, String)>,
+    pub(crate) live_text_checkpoints: BTreeMap<LiveTextStreamKey, SessionLiveEvent>,
+    pub(crate) live_text_checkpoint_order: Vec<LiveTextStreamKey>,
+    pub(crate) live_text_tombstones: BTreeMap<LiveTextStreamKey, (u64, u64)>,
+    pub(crate) live_text_tombstone_order: Vec<LiveTextStreamKey>,
 }
 
 #[derive(Debug, Clone)]

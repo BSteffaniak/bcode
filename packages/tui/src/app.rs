@@ -214,6 +214,57 @@ impl ReasoningSupport {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+struct SessionViewTerminalAdapter {
+    document_revision: Option<bcode_session_view_models::ViewRevision>,
+    item_revisions: BTreeMap<
+        bcode_session_view_models::TranscriptViewItemId,
+        bcode_session_view_models::ViewRevision,
+    >,
+}
+
+impl SessionViewTerminalAdapter {
+    fn reset(&mut self) {
+        self.document_revision = None;
+        self.item_revisions.clear();
+    }
+
+    fn apply(
+        &mut self,
+        source: &bcode_session_view_models::TranscriptViewDocument,
+        target: &mut TranscriptDocument,
+    ) {
+        let source_items = source.items.iter().filter(|item| {
+            matches!(
+                item.kind,
+                bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { .. }
+                    | bcode_session_view_models::TranscriptViewItemKind::ReasoningMessage { .. }
+                    | bcode_session_view_models::TranscriptViewItemKind::ReasoningActivity { .. }
+            )
+        });
+        let source_ids = source_items
+            .clone()
+            .map(|item| item.id.clone())
+            .collect::<BTreeSet<_>>();
+        let managed_ids = self.item_revisions.keys().cloned().collect::<BTreeSet<_>>();
+        target.retain(|item| {
+            item.source_view_item_id()
+                .is_none_or(|id| !managed_ids.contains(id) || source_ids.contains(id))
+        });
+        self.item_revisions.retain(|id, _| source_ids.contains(id));
+        for item in source_items {
+            let target_has_item = target
+                .iter()
+                .any(|existing| existing.source_view_item_id() == Some(&item.id));
+            if !target_has_item || self.item_revisions.get(&item.id) != Some(&item.revision) {
+                target.upsert_shared_item(terminal_item_from_shared(item));
+                self.item_revisions.insert(item.id.clone(), item.revision);
+            }
+        }
+        self.document_revision = Some(source.revision);
+    }
+}
+
 /// State owned by the terminal user interface.
 #[derive(Debug, Clone)]
 pub struct BmuxApp {
@@ -237,7 +288,7 @@ pub struct BmuxApp {
     composer: TextInputState,
     input_history: InputHistory,
     transcript: TranscriptDocument,
-    authoritative_transcript: bcode_session_view_models::TranscriptViewDocument,
+    session_view_terminal_adapter: SessionViewTerminalAdapter,
     session_view: bcode_session_view::SessionView,
     transcript_window: TranscriptResidentWindow,
     latest_history_sequence: Option<u64>,
@@ -444,7 +495,7 @@ impl BmuxApp {
             composer: TextInputState::new(TextEditBuffer::new()),
             input_history: InputHistory::from_entries(input_history),
             transcript: TranscriptDocument::default(),
-            authoritative_transcript: bcode_session_view_models::TranscriptViewDocument::default(),
+            session_view_terminal_adapter: SessionViewTerminalAdapter::default(),
             session_view: bcode_session_view::SessionView::new(),
             transcript_window: TranscriptResidentWindow::default(),
             latest_history_sequence: None,
@@ -2415,14 +2466,13 @@ impl BmuxApp {
             self.session_view.apply_event(event);
             self.apply_session_event(event, SessionEventApplication::Replay);
         }
-        self.sync_authoritative_transcript_items();
-        self.sync_shared_message_items();
         self.trim_resident_transcript_window_if_needed();
     }
 
     fn rebuild_transcript_from_history(&mut self) {
         let events = self.transcript_window.events().to_vec();
         self.session_view.clear_history_window();
+        self.session_view_terminal_adapter.reset();
         self.transcript.replace(Vec::new());
         self.tool_call_contexts.clear();
         self.active_tool_calls.clear();
@@ -2430,8 +2480,6 @@ impl BmuxApp {
             self.session_view.apply_event(event);
             self.apply_session_event(event, SessionEventApplication::Replay);
         }
-        self.sync_authoritative_transcript_items();
-        self.sync_shared_message_items();
     }
 
     fn trim_resident_transcript_window_if_needed(&mut self) {
@@ -2555,13 +2603,14 @@ impl BmuxApp {
         }
         self.session_view.apply_event(event);
         self.apply_session_event(event, SessionEventApplication::Live);
-        self.sync_authoritative_transcript_items();
+        self.apply_session_view_terminal_adapter();
         self.trim_resident_transcript_window_if_needed();
     }
 
     /// Absorb one live-only session event.
     pub fn absorb_session_live_event(&mut self, event: &SessionLiveEvent) {
         self.session_view.apply_live_event(event);
+        self.apply_session_view_terminal_adapter();
         match &event.kind {
             SessionLiveEventKind::AssistantTextStreamUpdated { .. } => {
                 let should_anchor = self.should_anchor_new_assistant_stream();
@@ -2570,7 +2619,6 @@ impl BmuxApp {
                         .bottom_row(self.transcript_layout.total_rows()),
                 );
                 self.viewport.preserve_for_append();
-                self.sync_shared_message_items();
                 self.maybe_request_assistant_stream_anchor(should_anchor);
             }
             SessionLiveEventKind::AssistantTextDelta { text, .. } => {
@@ -2580,24 +2628,17 @@ impl BmuxApp {
                         .bottom_row(self.transcript_layout.total_rows()),
                 );
                 self.viewport.preserve_for_append();
-                self.push_live_assistant_delta(text, SessionEventApplication::Live);
+                self.add_streaming_delta(text, SessionEventApplication::Live);
                 self.maybe_request_assistant_stream_anchor(should_anchor);
             }
-            SessionLiveEventKind::AssistantReasoningDelta { text, .. } => {
+            SessionLiveEventKind::AssistantReasoningDelta { .. }
+            | SessionLiveEventKind::AssistantReasoningTextStreamUpdated { .. }
+            | SessionLiveEventKind::AssistantReasoningActivity { .. } => {
                 self.pending_visual_overflow_bottom = Some(
                     self.viewport
                         .bottom_row(self.transcript_layout.total_rows()),
                 );
                 self.viewport.preserve_for_append();
-                self.push_live_reasoning_delta(text, SessionEventApplication::Live);
-            }
-            SessionLiveEventKind::AssistantReasoningActivity { .. } => {
-                self.pending_visual_overflow_bottom = Some(
-                    self.viewport
-                        .bottom_row(self.transcript_layout.total_rows()),
-                );
-                self.viewport.preserve_for_append();
-                self.sync_shared_message_items();
             }
             SessionLiveEventKind::ToolContributionPlaced { .. }
             | SessionLiveEventKind::ToolPresentationUpdated { .. }
@@ -2612,7 +2653,6 @@ impl BmuxApp {
                 self.apply_shared_provider_stream_progress(event);
             }
         }
-        self.sync_authoritative_transcript_items();
     }
 
     #[allow(clippy::too_many_lines)]
@@ -2644,16 +2684,13 @@ impl BmuxApp {
                 );
             }
             SessionEventKind::AssistantDelta { text } => {
-                self.push_live_assistant_delta(text, application);
+                self.apply_session_view_terminal_adapter();
+                self.add_streaming_delta(text, application);
                 self.maybe_request_assistant_stream_anchor(should_anchor);
             }
             SessionEventKind::AssistantMessage { .. }
             | SessionEventKind::AssistantResponseSegment { .. } => {
-                self.upsert_required_latest_shared_message_item(
-                    "Assistant",
-                    false,
-                    "final assistant message",
-                );
+                self.apply_session_view_terminal_adapter();
                 if application.live_activity()
                     && matches!(self.activity, ActivityState::Streaming { .. })
                 {
@@ -2796,19 +2833,17 @@ impl BmuxApp {
             SessionEventKind::SkillInvocationFailed { .. } => {
                 self.push_required_shared_terminal_item(event.sequence, "failed skill invocation");
             }
-            SessionEventKind::AssistantReasoningDelta { text } => {
-                self.push_live_reasoning_delta(text, application);
+            SessionEventKind::AssistantReasoningDelta { .. }
+            | SessionEventKind::AssistantReasoningActivity { .. } => {
+                self.apply_session_view_terminal_adapter();
             }
-            SessionEventKind::AssistantReasoningMessage { .. } if self.reasoning_visible() => {
-                self.upsert_required_shared_reasoning_items(false, "final reasoning message");
+            SessionEventKind::AssistantReasoningMessage { .. } => {
+                self.apply_session_view_terminal_adapter();
                 if application.live_activity()
                     && matches!(self.activity, ActivityState::Streaming { .. })
                 {
                     self.set_activity(ActivityState::FinalizingModelTurn);
                 }
-            }
-            SessionEventKind::AssistantReasoningActivity { .. } => {
-                self.push_required_shared_terminal_item(event.sequence, "reasoning activity");
             }
             SessionEventKind::AgentChanged { .. } => {
                 self.apply_shared_agent_changed();
@@ -3153,22 +3188,6 @@ impl BmuxApp {
         self.push_user_message(sequence, text, timestamp_ms);
     }
 
-    fn push_live_assistant_delta(&mut self, text: &str, application: SessionEventApplication) {
-        self.add_streaming_delta(text, application);
-        self.upsert_required_latest_shared_message_item(
-            "Assistant",
-            true,
-            "streaming assistant delta",
-        );
-    }
-
-    fn push_live_reasoning_delta(&mut self, text: &str, application: SessionEventApplication) {
-        self.add_streaming_delta(text, application);
-        if self.reasoning_visible() {
-            self.upsert_required_shared_reasoning_items(true, "streaming reasoning delta");
-        }
-    }
-
     fn push_user_message(&mut self, sequence: u64, text: &str, timestamp_ms: u64) {
         self.remove_pending_submission(text);
         if sequence == 0 {
@@ -3192,107 +3211,11 @@ impl BmuxApp {
         self.transcript.upsert_shared_item(item);
     }
 
-    fn upsert_required_latest_shared_message_item(
-        &mut self,
-        role: &'static str,
-        streaming: bool,
-        event_kind: &str,
-    ) {
-        let shared_item = self
-            .session_view
-            .snapshot()
-            .transcript
-            .items
-            .iter()
-            .rev()
-            .find(|item| {
-                let terminal = terminal_item_from_shared(item);
-                terminal.role == role && terminal.streaming == streaming
-            })
-            .unwrap_or_else(|| panic!("shared session view must project {event_kind}"));
-        let item = terminal_item_from_shared(shared_item);
-        self.transcript.upsert_shared_item(item);
-    }
-
-    fn sync_authoritative_transcript_items(&mut self) {
-        self.authoritative_transcript = self.session_view.snapshot().transcript.clone();
-        self.reconcile_authoritative_transcript_items();
-    }
-
-    fn reconcile_authoritative_transcript_items(&mut self) {
-        let shared_items = self
-            .authoritative_transcript
-            .items
-            .iter()
-            .map(terminal_item_from_shared)
-            .collect::<Vec<_>>();
-        let source_ids = shared_items
-            .iter()
-            .filter_map(|item| item.source_view_item_id().cloned())
-            .collect::<BTreeSet<_>>();
-        self.transcript.retain(|item| {
-            item.source_view_item_id()
-                .is_none_or(|id| source_ids.contains(id))
-        });
-        for item in shared_items {
-            self.transcript.upsert_shared_item(item);
-        }
-    }
-
-    #[cfg(test)]
-    fn apply_authoritative_transcript_patch(
-        &mut self,
-        patch: &bcode_session_view_models::SessionViewPatch,
-        recovery: &bcode_session_view_models::TranscriptViewDocument,
-    ) -> bool {
-        let applied = self.authoritative_transcript.apply_patch(patch).is_ok();
-        if !applied {
-            self.authoritative_transcript.clone_from(recovery);
-        }
-        self.reconcile_authoritative_transcript_items();
-        applied
-    }
-
-    fn sync_shared_message_items(&mut self) {
-        let source_ids = self
-            .session_view
-            .snapshot()
-            .transcript
-            .items
-            .iter()
-            .filter(|item| {
-                matches!(
-                    item.kind,
-                    bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { .. }
-                        | bcode_session_view_models::TranscriptViewItemKind::ReasoningMessage { .. }
-                )
-            })
-            .map(|item| item.id.clone())
-            .collect::<BTreeSet<_>>();
-        self.transcript.retain(|item| {
-            item.source_view_item_id().is_none_or(|id| {
-                source_ids.contains(id) || !matches!(item.role(), "Assistant" | "Reasoning summary")
-            })
-        });
-    }
-
-    fn upsert_required_shared_reasoning_items(&mut self, streaming: bool, event_kind: &str) {
-        let items = self
-            .session_view
-            .snapshot()
-            .transcript
-            .items
-            .iter()
-            .map(terminal_item_from_shared)
-            .filter(|item| item.role == "Reasoning summary" && item.streaming == streaming)
-            .collect::<Vec<_>>();
-        assert!(
-            !items.is_empty(),
-            "shared session view must project {event_kind}"
+    fn apply_session_view_terminal_adapter(&mut self) {
+        self.session_view_terminal_adapter.apply(
+            &self.session_view.snapshot().transcript,
+            &mut self.transcript,
         );
-        for item in items {
-            self.transcript.upsert_shared_item(item);
-        }
     }
 
     fn shared_terminal_item(&self, sequence: u64) -> Option<TranscriptItem> {
@@ -4904,106 +4827,23 @@ mod tests {
     }
 
     #[test]
-    fn authoritative_patch_revision_mismatch_recovers_from_snapshot() {
+    fn session_view_terminal_adapter_reconciles_replaced_and_removed_message_items_by_stable_id() {
         let session_id = bcode_session_models::SessionId::new();
         let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        let mut recovery = bcode_session_view_models::TranscriptViewDocument {
-            revision: 4,
-            ..Default::default()
-        };
-        recovery
-            .items
-            .push(bcode_session_view_models::TranscriptViewItem {
-                id: bcode_session_view_models::TranscriptViewItemId::new("event:1"),
-                revision: 0,
-                sequence: Some(1),
-                timestamp_ms: Some(1),
-                streaming: false,
-                kind: bcode_session_view_models::TranscriptViewItemKind::SystemMessage {
-                    message: bcode_session_view_models::ChatMessageView::plain("recovered"),
-                },
-            });
-        let patch = bcode_session_view_models::SessionViewPatch::empty(3, 4);
-
-        assert!(!app.apply_authoritative_transcript_patch(&patch, &recovery));
-        assert_eq!(app.authoritative_transcript, recovery);
-        assert_eq!(app.transcript().len(), 1);
-        assert_eq!(app.transcript()[0].text(), "recovered");
-    }
-
-    #[test]
-    fn authoritative_patch_applies_incrementally_by_stable_identity() {
-        let session_id = bcode_session_models::SessionId::new();
-        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        let mut base = bcode_session_view_models::TranscriptViewDocument {
-            revision: 1,
-            ..Default::default()
-        };
-        base.items
-            .push(bcode_session_view_models::TranscriptViewItem {
-                id: bcode_session_view_models::TranscriptViewItemId::new("event:1"),
-                revision: 0,
-                sequence: Some(1),
-                timestamp_ms: Some(1),
-                streaming: false,
-                kind: bcode_session_view_models::TranscriptViewItemKind::SystemMessage {
-                    message: bcode_session_view_models::ChatMessageView::plain("before"),
-                },
-            });
-        app.authoritative_transcript.clone_from(&base);
-        app.reconcile_authoritative_transcript_items();
-        let mut next = base.clone();
-        next.revision = 2;
-        next.items[0].revision = 1;
-        next.items[0].kind = bcode_session_view_models::TranscriptViewItemKind::SystemMessage {
-            message: bcode_session_view_models::ChatMessageView::plain("after"),
-        };
-        next.source_start_sequence = Some(1);
-        next.source_end_sequence = Some(1);
-        let patch = bcode_session_view_models::SessionViewPatch::transcript_between(
-            1,
-            2,
-            Some(session_id),
-            &base,
-            &next,
-        );
-
-        assert!(app.apply_authoritative_transcript_patch(&patch, &next));
-        assert_eq!(app.authoritative_transcript, next);
-        assert_eq!(app.transcript().len(), 1);
-        assert_eq!(app.transcript()[0].text(), "after");
-    }
-
-    #[test]
-    fn authoritative_sync_reconciles_replaced_and_removed_items_by_stable_id() {
-        let session_id = bcode_session_models::SessionId::new();
-        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
-        let contribution = |sequence, operation| bcode_session_models::SessionLiveEvent {
+        let live = |text: &str| bcode_session_models::SessionLiveEvent {
             session_id,
-            kind: bcode_session_models::SessionLiveEventKind::ToolContributionPlaced {
-                envelope: bcode_session_models::ToolContributionEnvelope::new(
-                    bcode_session_models::ToolContributionPlacement::Progress,
-                    bcode_session_models::ToolContributionEvent {
-                        invocation_id: "call-1".to_owned(),
-                        contribution_id: "progress".to_owned(),
-                        sequence,
-                        producer_id: "test.plugin".to_owned(),
-                        schema: "test.progress".to_owned(),
-                        schema_version: 1,
-                        operation,
-                        persistence: bcode_session_models::ToolContributionPersistence::Transient,
-                        artifact: None,
-                        payload: serde_json::json!({"sequence": sequence}),
-                    },
-                ),
+            kind: bcode_session_models::SessionLiveEventKind::AssistantTextDelta {
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                text: text.to_owned(),
             },
         };
 
-        app.absorb_session_live_event(&contribution(
-            1,
-            bcode_session_models::ToolContributionOperation::Upsert,
-        ));
-        let id = bcode_session_view_models::TranscriptViewItemId::tool("call-1");
+        app.absorb_session_live_event(&live("first"));
+        let id = bcode_session_view_models::TranscriptViewItemId::new(
+            "assistant-turn:turn-1:segment:segment-0",
+        );
         let first_revision = app
             .transcript()
             .iter()
@@ -5012,10 +4852,7 @@ mod tests {
             .source_view_item_revision()
             .expect("primary revision");
 
-        app.absorb_session_live_event(&contribution(
-            2,
-            bcode_session_models::ToolContributionOperation::Upsert,
-        ));
+        app.absorb_session_live_event(&live(" second"));
         let replacement = app
             .transcript()
             .iter()
@@ -5034,10 +4871,8 @@ mod tests {
             1
         );
 
-        app.absorb_session_live_event(&contribution(
-            3,
-            bcode_session_models::ToolContributionOperation::Remove,
-        ));
+        app.session_view.clear_history_window();
+        app.apply_session_view_terminal_adapter();
         assert!(
             app.transcript()
                 .iter()

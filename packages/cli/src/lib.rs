@@ -7670,6 +7670,16 @@ fn session_live_event_description(event: &SessionLiveEvent) -> String {
         SessionLiveEventKind::AssistantTextDelta { turn_id, text, .. } => {
             format!("live assistant delta ({turn_id}): {text}")
         }
+        SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+            turn_id,
+            activity_id,
+            part_id,
+            update,
+            ..
+        } => format!(
+            "live reasoning stream ({turn_id}/{activity_id}/{part_id}) generation={} revision={}: {:?}",
+            update.generation, update.revision, update.operation
+        ),
         SessionLiveEventKind::AssistantReasoningDelta { turn_id, text } => {
             format!("live reasoning delta ({turn_id}): {text}")
         }

@@ -3410,6 +3410,237 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // Covers independent keys, attach hydration, durable retirement, terminal absorption, and turn cleanup.
+    async fn active_reasoning_checkpoints_hydrate_attach_and_retire_at_boundaries() {
+        let manager = SessionManager::default();
+        let session = manager
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should create");
+        let publish = |part_id: &str, generation, revision, expected_offset, text: &str| {
+            SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                turn_id: "turn-1".to_owned(),
+                activity_id: "activity-1".to_owned(),
+                activity_order: 0,
+                part_id: part_id.to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order: u32::from(part_id == "part-1"),
+                update: bcode_session_models::TextStreamUpdate {
+                    generation,
+                    first_revision: revision,
+                    revision,
+                    operation: bcode_session_models::TextStreamOperation::Append {
+                        expected_offset,
+                        text: text.to_owned(),
+                    },
+                },
+            }
+        };
+        let _ = manager
+            .publish_live_event(session.id, publish("part-0", 0, 1, 0, "first"))
+            .await;
+        let _ = manager
+            .publish_live_event(session.id, publish("part-1", 0, 1, 0, "second"))
+            .await;
+        let _ = manager
+            .publish_live_event(
+                session.id,
+                SessionLiveEventKind::AssistantTextStreamUpdated {
+                    turn_id: "turn-1".to_owned(),
+                    segment_id: "part-0".to_owned(),
+                    segment_order: 0,
+                    update: bcode_session_models::TextStreamUpdate {
+                        generation: 0,
+                        first_revision: 1,
+                        revision: 1,
+                        operation: bcode_session_models::TextStreamOperation::Append {
+                            expected_offset: 0,
+                            text: "assistant".to_owned(),
+                        },
+                    },
+                },
+            )
+            .await;
+
+        let attachment = manager
+            .attach_session(session.id, ClientId::new())
+            .await
+            .expect("session should attach");
+        assert_eq!(attachment.live_checkpoints.len(), 3);
+        assert!(attachment.live_checkpoints.iter().any(|event| matches!(
+            &event.kind,
+            SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                part_id,
+                update: bcode_session_models::TextStreamUpdate {
+                    operation: bcode_session_models::TextStreamOperation::Checkpoint {
+                        text,
+                        total_bytes: 5,
+                        truncated: false,
+                        ..
+                    },
+                    ..
+                },
+                ..
+            } if part_id == "part-0" && text == "first"
+        )));
+
+        manager
+            .append_assistant_reasoning_activity(
+                session.id,
+                "turn-1".to_owned(),
+                bcode_session_models::ReasoningActivity {
+                    activity_id: "activity-1".to_owned(),
+                    order: 0,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    parts: vec![bcode_session_models::ReasoningPart {
+                        part_id: "part-0".to_owned(),
+                        kind: bcode_session_models::ReasoningContentKind::Summary,
+                        role: bcode_session_models::ReasoningContentRole::Milestone,
+                        order: 0,
+                        text: "first".to_owned(),
+                    }],
+                    opaque: false,
+                },
+            )
+            .await
+            .expect("durable reasoning should append");
+        let _ = manager
+            .publish_live_event(session.id, publish("part-0", 0, 2, 5, " late"))
+            .await;
+        let attachment = manager
+            .attach_session(session.id, ClientId::new())
+            .await
+            .expect("session should reattach");
+        assert!(!attachment.live_checkpoints.iter().any(|event| matches!(
+            &event.kind,
+            SessionLiveEventKind::AssistantReasoningTextStreamUpdated { part_id, .. }
+                if part_id == "part-0"
+        )));
+        assert!(attachment.live_checkpoints.iter().any(|event| matches!(
+            &event.kind,
+            SessionLiveEventKind::AssistantReasoningTextStreamUpdated { part_id, .. }
+                if part_id == "part-1"
+        )));
+
+        let _ = manager
+            .publish_live_event(
+                session.id,
+                SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                    turn_id: "turn-1".to_owned(),
+                    activity_id: "activity-1".to_owned(),
+                    activity_order: 0,
+                    part_id: "part-1".to_owned(),
+                    kind: bcode_session_models::ReasoningContentKind::Summary,
+                    role: bcode_session_models::ReasoningContentRole::Milestone,
+                    part_order: 1,
+                    update: bcode_session_models::TextStreamUpdate {
+                        generation: 0,
+                        first_revision: 2,
+                        revision: 2,
+                        operation: bcode_session_models::TextStreamOperation::Terminal {
+                            status: bcode_session_models::TextStreamTerminalStatus::Cancelled,
+                        },
+                    },
+                },
+            )
+            .await;
+        let _ = manager
+            .publish_live_event(session.id, publish("part-1", 0, 3, 6, " late"))
+            .await;
+        let attachment = manager
+            .attach_session(session.id, ClientId::new())
+            .await
+            .expect("terminal reasoning should remain retired");
+        assert_eq!(attachment.live_checkpoints.len(), 1);
+        assert!(matches!(
+            attachment.live_checkpoints[0].kind,
+            SessionLiveEventKind::AssistantTextStreamUpdated { .. }
+        ));
+
+        manager
+            .append_model_turn_finished(
+                session.id,
+                "turn-1".to_owned(),
+                bcode_session_models::ModelTurnOutcome::Cancelled,
+                None,
+            )
+            .await
+            .expect("turn finish should clear checkpoints and tombstones");
+        let _ = manager
+            .publish_live_event(session.id, publish("part-0", 1, 1, 0, "new"))
+            .await;
+        let attachment = manager
+            .attach_session(session.id, ClientId::new())
+            .await
+            .expect("new generation should hydrate after turn cleanup");
+        assert_eq!(attachment.live_checkpoints.len(), 1);
+        assert!(matches!(
+            &attachment.live_checkpoints[0].kind,
+            SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                part_id,
+                update: bcode_session_models::TextStreamUpdate { generation: 1, .. },
+                ..
+            } if part_id == "part-0"
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_reasoning_checkpoint_is_utf8_safe_and_per_key_bounded() {
+        let manager = SessionManager::default();
+        let session = manager
+            .create_session(Some("test".to_owned()), test_working_directory())
+            .await
+            .expect("session should create");
+        let text = "é".repeat((256 * 1024 / 2) + 10);
+        let _ = manager
+            .publish_live_event(
+                session.id,
+                SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                    turn_id: "turn-1".to_owned(),
+                    activity_id: "activity-1".to_owned(),
+                    activity_order: 0,
+                    part_id: "part-0".to_owned(),
+                    kind: bcode_session_models::ReasoningContentKind::Raw,
+                    role: bcode_session_models::ReasoningContentRole::Detail,
+                    part_order: 0,
+                    update: bcode_session_models::TextStreamUpdate {
+                        generation: 0,
+                        first_revision: 1,
+                        revision: 1,
+                        operation: bcode_session_models::TextStreamOperation::Append {
+                            expected_offset: 0,
+                            text: text.clone(),
+                        },
+                    },
+                },
+            )
+            .await;
+        let attachment = manager
+            .attach_session(session.id, ClientId::new())
+            .await
+            .expect("session should attach");
+        assert!(matches!(
+            &attachment.live_checkpoints[0].kind,
+            SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                update: bcode_session_models::TextStreamUpdate {
+                    operation: bcode_session_models::TextStreamOperation::Checkpoint {
+                        start_offset,
+                        text: retained,
+                        total_bytes,
+                        truncated: true,
+                    },
+                    ..
+                },
+                ..
+            } if *start_offset > 0
+                && retained.len() <= 256 * 1024
+                && retained.is_char_boundary(0)
+                && *total_bytes == text.len()
+        ));
+    }
+
     #[test]
     fn live_event_broker_drops_without_receivers_and_tracks_publish_counts() {
         let broker = super::SessionLiveEventBroker::new(4);

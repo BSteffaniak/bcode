@@ -4208,7 +4208,8 @@ impl ReviewAgentSessionStreamState {
                 self.status = "receiving model response…".to_string();
                 self.error = None;
             }
-            SessionLiveEventKind::AssistantReasoningDelta { turn_id, .. }
+            SessionLiveEventKind::AssistantReasoningTextStreamUpdated { turn_id, .. }
+            | SessionLiveEventKind::AssistantReasoningDelta { turn_id, .. }
             | SessionLiveEventKind::AssistantReasoningActivity { turn_id, .. } => {
                 self.active_turn_id = Some(turn_id);
                 self.phase = ReviewAgentThreadPhase::Running;
