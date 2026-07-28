@@ -53,10 +53,12 @@ use sha2::{Digest as _, Sha256};
 use bcode_database_observability::ObservedDatabase;
 use bcode_metrics::{DatabaseMetrics, DatabaseOperation, MetricsRegistry};
 use bcode_session_models::{
-    ExecutionSessionProvenance, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind,
+    ExecutionSessionProvenance, MAX_SESSION_HISTORY_READ_EVENTS, MAX_SESSION_INSPECTION_EVENTS,
+    RuntimeWorkKind, RuntimeWorkStatus, SessionEvent, SessionEventKind, SessionHistoryAroundQuery,
     SessionHistoryCursor, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery,
-    SessionId, SessionInputHistoryEntry, SessionSummary, SessionVisibility, ToolInvocationResult,
-    WorkId,
+    SessionHistoryWindow, SessionId, SessionInputHistoryEntry, SessionInspectionCategory,
+    SessionInspectionPage, SessionInspectionQuery, SessionSummary, SessionVisibility,
+    ToolInvocationResult, WorkId,
 };
 use switchy::{
     database::{
@@ -185,6 +187,9 @@ pub enum SessionDbError {
     /// Session migration history is not a known clean prefix of this build's migrations.
     #[error("unsupported or inconsistent session migration history: {reason}")]
     MigrationHistoryIncompatible { reason: String },
+    /// A normal bounded history read requested too many events.
+    #[error("session history read limit {requested} exceeds maximum {maximum}")]
+    HistoryReadLimitExceeded { requested: usize, maximum: usize },
 }
 
 /// Read-only compatibility classification for a session database.
@@ -1784,6 +1789,12 @@ impl SessionDb {
         query: SessionHistoryQuery,
     ) -> SessionDbResult<SessionHistoryPage> {
         let limit = query.limit.max(1);
+        if limit > MAX_SESSION_HISTORY_READ_EVENTS {
+            return Err(SessionDbError::HistoryReadLimitExceeded {
+                requested: limit,
+                maximum: MAX_SESSION_HISTORY_READ_EVENTS,
+            });
+        }
         let fetch_limit = limit.saturating_add(1);
         let mut select = self
             .db
@@ -1837,6 +1848,132 @@ impl SessionDb {
             compatibility_issues,
             next_cursor,
             has_more,
+        })
+    }
+
+    /// Return a bounded canonical history window around one sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the requested window is too large or canonical events cannot be read.
+    pub async fn history_around(
+        &self,
+        query: SessionHistoryAroundQuery,
+    ) -> SessionDbResult<SessionHistoryWindow> {
+        let limit = query.event_limit();
+        if limit > MAX_SESSION_HISTORY_READ_EVENTS {
+            return Err(SessionDbError::HistoryReadLimitExceeded {
+                requested: limit,
+                maximum: MAX_SESSION_HISTORY_READ_EVENTS,
+            });
+        }
+        let start_sequence = query
+            .sequence
+            .saturating_sub(u64::try_from(query.before).unwrap_or(u64::MAX));
+        let end_sequence = query
+            .sequence
+            .saturating_add(u64::try_from(query.after).unwrap_or(u64::MAX));
+        let events = self
+            .events_range(start_sequence, end_sequence, limit)
+            .await?;
+        Ok(SessionHistoryWindow {
+            session_id: self.session_id,
+            requested_sequence: query.sequence,
+            anchor_present: events.iter().any(|event| event.sequence == query.sequence),
+            events,
+            first_available_sequence: self.first_event_sequence().await?,
+            last_available_sequence: self.last_event_sequence().await?,
+            compatibility_issues: Vec::new(),
+        })
+    }
+
+    /// Return one bounded structured investigation page from canonical events.
+    ///
+    /// The query reads only event types relevant to the requested category. Categories requiring
+    /// semantic confirmation, such as failed tool calls, decode at most a fixed candidate bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the requested result limit is too large or canonical candidates cannot
+    /// be queried or decoded.
+    pub async fn inspection_page(
+        &self,
+        query: SessionInspectionQuery,
+    ) -> SessionDbResult<SessionInspectionPage> {
+        let limit = query.limit.max(1);
+        if limit > MAX_SESSION_INSPECTION_EVENTS {
+            return Err(SessionDbError::HistoryReadLimitExceeded {
+                requested: limit,
+                maximum: MAX_SESSION_INSPECTION_EVENTS,
+            });
+        }
+        let candidate_limit = MAX_SESSION_HISTORY_READ_EVENTS.saturating_add(1);
+        let event_types = inspection_event_types(query.category)
+            .iter()
+            .map(|event_type| DatabaseValue::String((*event_type).to_owned()))
+            .collect::<Vec<_>>();
+        let mut select = self
+            .db
+            .select("events")
+            .columns(&["event_seq", "payload"])
+            .where_in("event_type", event_types)
+            .limit(candidate_limit);
+        select = match query.direction {
+            SessionHistoryDirection::Forward => {
+                let select = if let Some(cursor) = query.cursor {
+                    select.where_gte("event_seq", seq_to_value(cursor.sequence))
+                } else {
+                    select
+                };
+                select.sort("event_seq", SortDirection::Asc)
+            }
+            SessionHistoryDirection::Backward => {
+                let select = if let Some(cursor) = query.cursor {
+                    select.where_lte("event_seq", seq_to_value(cursor.sequence))
+                } else {
+                    select
+                };
+                select.sort("event_seq", SortDirection::Desc)
+            }
+        };
+        let rows = select.execute(&**self.db).await?;
+        let scan_limit = rows.len().min(MAX_SESSION_HISTORY_READ_EVENTS);
+        let mut events = Vec::new();
+        let mut scanned_events = 0;
+        let mut continuation_index = None;
+        for (index, row) in rows.iter().take(scan_limit).enumerate() {
+            scanned_events += 1;
+            let event = strict_event_from_row(row, self.session_id)?;
+            if inspection_event_matches(query.category, &event.kind) {
+                events.push(event);
+                if events.len() == limit {
+                    continuation_index = Some(index.saturating_add(1));
+                    break;
+                }
+            }
+        }
+        if continuation_index.is_none() && rows.len() > scan_limit {
+            continuation_index = Some(scan_limit);
+        }
+        let next_cursor = continuation_index
+            .and_then(|index| rows.get(index))
+            .map(|row| -> SessionDbResult<SessionHistoryCursor> {
+                Ok(SessionHistoryCursor {
+                    sequence: required_non_negative_u64(row, "event_seq")?,
+                })
+            })
+            .transpose()?;
+        if matches!(query.direction, SessionHistoryDirection::Backward) {
+            events.reverse();
+        }
+        Ok(SessionInspectionPage {
+            session_id: self.session_id,
+            category: query.category,
+            events,
+            scanned_events,
+            compatibility_issues: Vec::new(),
+            next_cursor,
+            has_more: next_cursor.is_some(),
         })
     }
 
@@ -3776,6 +3913,93 @@ async fn finalize_tool_transcript_item(
         .execute(db)
         .await?;
     Ok(())
+}
+
+const fn inspection_event_types(category: SessionInspectionCategory) -> &'static [&'static str] {
+    match category {
+        SessionInspectionCategory::FailedToolCalls => &[
+            "tool_invocation_result_recorded",
+            "tool_invocation_lifecycle",
+        ],
+        SessionInspectionCategory::Permissions => &["permission_requested", "permission_resolved"],
+        SessionInspectionCategory::SelectionChanges => &[
+            "model_changed",
+            "reasoning_changed",
+            "agent_changed",
+            "working_directory_changed",
+        ],
+        SessionInspectionCategory::RuntimeWork => &[
+            "runtime_work_started",
+            "runtime_work_cancel_requested",
+            "runtime_work_finished",
+            "runtime_work_progress",
+        ],
+        SessionInspectionCategory::Compactions => {
+            &["context_compacted", "provider_context_compacted"]
+        }
+        SessionInspectionCategory::TerminalOutcomes => &[
+            "model_turn_finished",
+            "tool_invocation_result_recorded",
+            "tool_invocation_lifecycle",
+            "runtime_work_finished",
+        ],
+    }
+}
+
+fn inspection_event_matches(category: SessionInspectionCategory, kind: &SessionEventKind) -> bool {
+    match category {
+        SessionInspectionCategory::FailedToolCalls => {
+            matches!(
+                kind,
+                SessionEventKind::ToolInvocationResultRecorded { record } if record.is_error
+            ) || matches!(
+                kind,
+                SessionEventKind::ToolInvocationLifecycle { event }
+                    if event.stage == bcode_session_models::ToolInvocationLifecycleStage::Failed
+            )
+        }
+        SessionInspectionCategory::Permissions => matches!(
+            kind,
+            SessionEventKind::PermissionRequested { .. }
+                | SessionEventKind::PermissionResolved { .. }
+        ),
+        SessionInspectionCategory::SelectionChanges => matches!(
+            kind,
+            SessionEventKind::ModelChanged { .. }
+                | SessionEventKind::ReasoningChanged { .. }
+                | SessionEventKind::AgentChanged { .. }
+                | SessionEventKind::WorkingDirectoryChanged { .. }
+        ),
+        SessionInspectionCategory::RuntimeWork => matches!(
+            kind,
+            SessionEventKind::RuntimeWorkStarted { .. }
+                | SessionEventKind::RuntimeWorkCancelRequested { .. }
+                | SessionEventKind::RuntimeWorkFinished { .. }
+                | SessionEventKind::RuntimeWorkProgress { .. }
+        ),
+        SessionInspectionCategory::Compactions => matches!(
+            kind,
+            SessionEventKind::ContextCompacted { .. }
+                | SessionEventKind::ProviderContextCompacted { .. }
+        ),
+        SessionInspectionCategory::TerminalOutcomes => {
+            matches!(
+                kind,
+                SessionEventKind::ModelTurnFinished { .. }
+                    | SessionEventKind::ToolInvocationResultRecorded { .. }
+                    | SessionEventKind::RuntimeWorkFinished { .. }
+            ) || matches!(
+                kind,
+                SessionEventKind::ToolInvocationLifecycle { event }
+                    if matches!(
+                        event.stage,
+                        bcode_session_models::ToolInvocationLifecycleStage::Completed
+                            | bcode_session_models::ToolInvocationLifecycleStage::Cancelled
+                            | bcode_session_models::ToolInvocationLifecycleStage::Failed
+                    )
+            )
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7986,6 +8210,161 @@ mod tests {
                 .expect("artifact checkpoint"),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn structured_inspection_filters_failed_tools_with_bounded_candidates() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        for (sequence, is_error) in [(0, false), (1, true), (2, true)] {
+            db.append_event(&event(
+                session_id,
+                sequence,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: format!("call-{sequence}"),
+                        model_output: format!("output {sequence}"),
+                        is_error,
+                        presentation: None,
+                        result: None,
+                    },
+                },
+            ))
+            .await
+            .expect("append tool result");
+        }
+
+        let page = db
+            .inspection_page(SessionInspectionQuery {
+                category: SessionInspectionCategory::FailedToolCalls,
+                cursor: None,
+                limit: 1,
+                direction: SessionHistoryDirection::Forward,
+            })
+            .await
+            .expect("inspection page");
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].sequence, 1);
+        assert_eq!(page.scanned_events, 2);
+        assert_eq!(page.next_cursor, Some(SessionHistoryCursor { sequence: 2 }));
+        assert!(page.has_more);
+
+        let next = db
+            .inspection_page(SessionInspectionQuery {
+                category: SessionInspectionCategory::FailedToolCalls,
+                cursor: page.next_cursor,
+                limit: 1,
+                direction: SessionHistoryDirection::Forward,
+            })
+            .await
+            .expect("next inspection page");
+        assert_eq!(next.events.len(), 1);
+        assert_eq!(next.events[0].sequence, 2);
+        assert!(!next.has_more);
+    }
+
+    #[tokio::test]
+    async fn structured_inspection_rejects_oversized_result_limit() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        let error = db
+            .inspection_page(SessionInspectionQuery {
+                category: SessionInspectionCategory::Permissions,
+                cursor: None,
+                limit: MAX_SESSION_INSPECTION_EVENTS + 1,
+                direction: SessionHistoryDirection::Forward,
+            })
+            .await
+            .expect_err("oversized inspection must fail");
+        assert!(matches!(
+            error,
+            SessionDbError::HistoryReadLimitExceeded {
+                maximum: MAX_SESSION_INSPECTION_EVENTS,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn history_around_reads_a_bounded_canonical_window() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+
+        for sequence in 0..5 {
+            db.append_event(&event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            ))
+            .await
+            .expect("append event");
+        }
+
+        let window = db
+            .history_around(SessionHistoryAroundQuery {
+                sequence: 2,
+                before: 1,
+                after: 1,
+            })
+            .await
+            .expect("history window");
+        assert_eq!(
+            window
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(window.anchor_present);
+        assert_eq!(window.first_available_sequence, Some(0));
+        assert_eq!(window.last_available_sequence, Some(4));
+    }
+
+    #[tokio::test]
+    async fn bounded_history_reads_reject_oversized_limits() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+
+        let page_error = db
+            .history_page(SessionHistoryQuery {
+                cursor: None,
+                direction: SessionHistoryDirection::Forward,
+                limit: MAX_SESSION_HISTORY_READ_EVENTS + 1,
+            })
+            .await
+            .expect_err("oversized page must fail");
+        assert!(matches!(
+            page_error,
+            SessionDbError::HistoryReadLimitExceeded { .. }
+        ));
+
+        let window_error = db
+            .history_around(SessionHistoryAroundQuery {
+                sequence: 0,
+                before: MAX_SESSION_HISTORY_READ_EVENTS,
+                after: 0,
+            })
+            .await
+            .expect_err("oversized window must fail");
+        assert!(matches!(
+            window_error,
+            SessionDbError::HistoryReadLimitExceeded { .. }
+        ));
     }
 
     #[tokio::test]

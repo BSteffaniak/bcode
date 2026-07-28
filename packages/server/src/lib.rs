@@ -3397,6 +3397,8 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::InvocationInput { session_id, .. }
         | Request::SessionHistory { session_id }
         | Request::SessionHistoryPage { session_id, .. }
+        | Request::SessionHistoryAround { session_id, .. }
+        | Request::SessionInspection { session_id, .. }
         | Request::PrepareSessionOpen { session_id }
         | Request::WaitSessionOpenProgress { session_id, .. }
         | Request::ReleaseSessionOwnership { session_id }
@@ -3450,6 +3452,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::InvocationInput { .. } => "invocation_input",
         Request::SessionHistory { .. } => "session_history",
         Request::SessionHistoryPage { .. } => "session_history_page",
+        Request::SessionHistoryAround { .. } => "session_history_around",
+        Request::SessionInspection { .. } => "session_inspection",
         Request::PrepareSessionOpen { .. } => "prepare_session_open",
         Request::WaitSessionOpenProgress { .. } => "wait_session_open_progress",
         Request::AttachSession { .. } => "attach_session",
@@ -3757,6 +3761,13 @@ async fn handle_request_inner(
         Request::SessionHistoryPage { session_id, query } => {
             handle_session_history_page(request_id, client_id, state, writer, session_id, query)
                 .await
+        }
+        Request::SessionHistoryAround { session_id, query } => {
+            handle_session_history_around(request_id, client_id, state, writer, session_id, query)
+                .await
+        }
+        Request::SessionInspection { session_id, query } => {
+            handle_session_inspection(request_id, client_id, state, writer, session_id, query).await
         }
         Request::PrepareSessionOpen { session_id } => {
             handle_prepare_session_open(request_id, state, writer, session_id).await
@@ -7988,6 +7999,84 @@ async fn handle_session_history_page(
     }
 }
 
+async fn handle_session_history_around(
+    request_id: u64,
+    client_id: ClientId,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    query: bcode_session_models::SessionHistoryAroundQuery,
+) -> Result<(), ServerError> {
+    if let Some(active_namespace) = state
+        .active_session_namespace_mismatch(session_id, client_id)
+        .await
+    {
+        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
+            .await;
+    }
+    match state
+        .sessions
+        .session_history_around(session_id, query)
+        .await
+    {
+        Ok(window) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionHistoryAround { window }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(session_error_response(&error)),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_session_inspection(
+    request_id: u64,
+    client_id: ClientId,
+    state: &ServerState,
+    writer: &SharedWriter,
+    session_id: SessionId,
+    query: bcode_session_models::SessionInspectionQuery,
+) -> Result<(), ServerError> {
+    if let Some(active_namespace) = state
+        .active_session_namespace_mismatch(session_id, client_id)
+        .await
+    {
+        return send_incompatible_active_session_response(writer, request_id, &active_namespace)
+            .await;
+    }
+    match state
+        .sessions
+        .session_inspection_page(session_id, query)
+        .await
+    {
+        Ok(page) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionInspection { page }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(session_error_response(&error)),
+            )
+            .await
+        }
+    }
+}
+
 async fn send_incompatible_active_session_response(
     writer: &SharedWriter,
     request_id: u64,
@@ -8073,6 +8162,9 @@ fn session_db_error_response(error: &bcode_session::db::SessionDbError) -> Error
         | bcode_session::db::SessionDbError::ModelContextProjectionVersion { .. }
         | bcode_session::db::SessionDbError::ModelContextProjectionStale { .. } => {
             ErrorResponse::new("projection_stale", error.to_string())
+        }
+        bcode_session::db::SessionDbError::HistoryReadLimitExceeded { .. } => {
+            ErrorResponse::new("session_history_limit_exceeded", error.to_string())
         }
         bcode_session::db::SessionDbError::MigrationHistoryIncompatible { .. }
         | bcode_session::db::SessionDbError::InvalidCanonicalSequence { .. }
@@ -26245,6 +26337,8 @@ const fn response_payload_kind(response: &Response) -> &'static str {
             ResponsePayload::Attached { .. } => "attached",
             ResponsePayload::SessionHistory { .. } => "session_history",
             ResponsePayload::SessionHistoryPage { .. } => "session_history_page",
+            ResponsePayload::SessionHistoryAround { .. } => "session_history_around",
+            ResponsePayload::SessionInspection { .. } => "session_inspection",
             ResponsePayload::SessionList { .. } => "session_list",
             ResponsePayload::SessionCatalogRefreshed { .. } => "session_catalog_refreshed",
             ResponsePayload::PermissionList { .. } => "permission_list",

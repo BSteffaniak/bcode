@@ -26,8 +26,9 @@ use bcode_session_migration::{
 };
 use bcode_session_models::{
     SessionEvent, SessionEventCompatibilityIssue, SessionEventCompatibilityKind, SessionEventKind,
-    SessionHistoryCursor, SessionHistoryDirection, SessionHistoryQuery, SessionId,
-    SessionLiveEvent, SessionLiveEventKind,
+    SessionHistoryAroundQuery, SessionHistoryCursor, SessionHistoryDirection, SessionHistoryQuery,
+    SessionId, SessionInspectionCategory, SessionInspectionQuery, SessionLiveEvent,
+    SessionLiveEventKind,
 };
 use bcode_worktree_models::WorktreeCreateRequest;
 use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
@@ -88,6 +89,8 @@ pub enum CliError {
     HyperChadRender(String),
     #[error("sshenv error: {0}")]
     Sshenv(String),
+    #[error("session history accepts only one of --after or --before")]
+    InvalidSessionHistoryRange,
     #[error("interrupted: {0}")]
     Signal(#[from] std::io::Error),
     #[error("--new cannot be combined with a subcommand")]
@@ -870,7 +873,11 @@ enum SessionCommand {
     Create {
         name: Option<String>,
     },
-    List,
+    List {
+        /// Print the session summaries as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     Rename {
         session_id: SessionId,
         name: String,
@@ -880,8 +887,47 @@ enum SessionCommand {
     },
     History {
         session_id: SessionId,
+        /// Return events starting at this canonical sequence.
+        #[arg(long)]
+        after: Option<u64>,
+        /// Return the newest events at or before this canonical sequence.
+        #[arg(long)]
+        before: Option<u64>,
+        /// Maximum events to return from this bounded read.
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        /// Print the bounded page as JSON.
+        #[arg(long)]
+        json: bool,
     },
-    /// Export canonical events, including migration-required pre-cutover stores.
+    /// Return bounded canonical context around one event sequence.
+    Around {
+        session_id: SessionId,
+        sequence: u64,
+        #[arg(long, default_value_t = 20)]
+        before: usize,
+        #[arg(long, default_value_t = 20)]
+        after: usize,
+        /// Print the complete window, including coverage metadata, as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect one high-value semantic event category with bounded canonical work.
+    Inspect {
+        session_id: SessionId,
+        #[arg(value_enum)]
+        category: SessionInspectionCategoryArg,
+        #[arg(long)]
+        after: Option<u64>,
+        #[arg(long)]
+        before: Option<u64>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Print the structured page and coverage metadata as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Export complete canonical events using strict non-migrating storage decoding.
     Export {
         session_id: SessionId,
         #[arg(long, value_enum, default_value_t = SessionExportFormat::Jsonl)]
@@ -957,6 +1003,29 @@ enum SessionImportCommand {
         source: String,
         external_session_id: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SessionInspectionCategoryArg {
+    FailedToolCalls,
+    Permissions,
+    SelectionChanges,
+    RuntimeWork,
+    Compactions,
+    TerminalOutcomes,
+}
+
+impl From<SessionInspectionCategoryArg> for SessionInspectionCategory {
+    fn from(value: SessionInspectionCategoryArg) -> Self {
+        match value {
+            SessionInspectionCategoryArg::FailedToolCalls => Self::FailedToolCalls,
+            SessionInspectionCategoryArg::Permissions => Self::Permissions,
+            SessionInspectionCategoryArg::SelectionChanges => Self::SelectionChanges,
+            SessionInspectionCategoryArg::RuntimeWork => Self::RuntimeWork,
+            SessionInspectionCategoryArg::Compactions => Self::Compactions,
+            SessionInspectionCategoryArg::TerminalOutcomes => Self::TerminalOutcomes,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1392,10 +1461,31 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
 async fn handle_session_command(command: SessionCommand) -> Result<(), CliError> {
     match command {
         SessionCommand::Create { name } => create_session(name).await?,
-        SessionCommand::List => list_sessions().await?,
+        SessionCommand::List { json } => list_sessions(json).await?,
         SessionCommand::Rename { session_id, name } => rename_session(session_id, name).await?,
         SessionCommand::Delete { session_id } => delete_session(session_id).await?,
-        SessionCommand::History { session_id } => session_history(session_id).await?,
+        SessionCommand::History {
+            session_id,
+            after,
+            before,
+            limit,
+            json,
+        } => session_history(session_id, after, before, limit, json).await?,
+        SessionCommand::Around {
+            session_id,
+            sequence,
+            before,
+            after,
+            json,
+        } => session_around(session_id, sequence, before, after, json).await?,
+        SessionCommand::Inspect {
+            session_id,
+            category,
+            after,
+            before,
+            limit,
+            json,
+        } => session_inspect(session_id, category, after, before, limit, json).await?,
         SessionCommand::Export { session_id, format } => {
             session_export(session_id, format).await?;
         }
@@ -6838,9 +6928,13 @@ async fn create_session(name: Option<String>) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn list_sessions() -> Result<(), CliError> {
+async fn list_sessions(json: bool) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let sessions = client.list_sessions().await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&sessions)?);
+        return Ok(());
+    }
     if sessions.is_empty() {
         println!("no sessions");
         return Ok(());
@@ -6876,13 +6970,137 @@ struct PagedSessionHistory {
     compatibility_issues: Vec<SessionEventCompatibilityIssue>,
 }
 
-async fn session_history(session_id: SessionId) -> Result<(), CliError> {
-    let history = paged_session_history(session_id).await?;
-    for issue in &history.compatibility_issues {
+async fn session_history(
+    session_id: SessionId,
+    after: Option<u64>,
+    before: Option<u64>,
+    limit: usize,
+    json: bool,
+) -> Result<(), CliError> {
+    if after.is_some() && before.is_some() {
+        return Err(CliError::InvalidSessionHistoryRange);
+    }
+    let direction = if before.is_some() {
+        SessionHistoryDirection::Backward
+    } else {
+        SessionHistoryDirection::Forward
+    };
+    let cursor = before
+        .or(after)
+        .map(|sequence| SessionHistoryCursor { sequence });
+    let page = BcodeClient::default_endpoint()
+        .session_history_page(
+            session_id,
+            SessionHistoryQuery {
+                cursor,
+                limit,
+                direction,
+            },
+        )
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&page)?);
+        return Ok(());
+    }
+    for issue in &page.compatibility_issues {
         eprintln!("{}", format_session_compatibility_issue(issue));
     }
-    for event in history.events {
+    for event in page.events {
         print_session_event(&event);
+    }
+    if page.has_more {
+        eprintln!(
+            "more history is available; next cursor: {}",
+            page.next_cursor.map_or_else(
+                || "unavailable".to_string(),
+                |cursor| cursor.sequence.to_string()
+            )
+        );
+    }
+    Ok(())
+}
+
+async fn session_around(
+    session_id: SessionId,
+    sequence: u64,
+    before: usize,
+    after: usize,
+    json: bool,
+) -> Result<(), CliError> {
+    let window = BcodeClient::default_endpoint()
+        .session_history_around(
+            session_id,
+            SessionHistoryAroundQuery {
+                sequence,
+                before,
+                after,
+            },
+        )
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&window)?);
+        return Ok(());
+    }
+    for issue in &window.compatibility_issues {
+        eprintln!("{}", format_session_compatibility_issue(issue));
+    }
+    if !window.anchor_present {
+        eprintln!("canonical event #{sequence} is not present");
+    }
+    for event in window.events {
+        print_session_event(&event);
+    }
+    Ok(())
+}
+
+async fn session_inspect(
+    session_id: SessionId,
+    category: SessionInspectionCategoryArg,
+    after: Option<u64>,
+    before: Option<u64>,
+    limit: usize,
+    json: bool,
+) -> Result<(), CliError> {
+    if after.is_some() && before.is_some() {
+        return Err(CliError::InvalidSessionHistoryRange);
+    }
+    let direction = if before.is_some() {
+        SessionHistoryDirection::Backward
+    } else {
+        SessionHistoryDirection::Forward
+    };
+    let cursor = before
+        .or(after)
+        .map(|sequence| SessionHistoryCursor { sequence });
+    let page = BcodeClient::default_endpoint()
+        .session_inspection(
+            session_id,
+            SessionInspectionQuery {
+                category: category.into(),
+                cursor,
+                limit,
+                direction,
+            },
+        )
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&page)?);
+        return Ok(());
+    }
+    for issue in &page.compatibility_issues {
+        eprintln!("{}", format_session_compatibility_issue(issue));
+    }
+    for event in page.events {
+        print_session_event(&event);
+    }
+    if page.has_more {
+        eprintln!(
+            "more matching history may be available; next cursor: {}",
+            page.next_cursor.map_or_else(
+                || "unavailable".to_string(),
+                |cursor| cursor.sequence.to_string()
+            )
+        );
     }
     Ok(())
 }
@@ -9311,6 +9529,96 @@ mod web_command_tests {
             assert!(rendered.contains("schema 39"));
             assert!(rendered.contains("upgrade Bcode"));
         }
+    }
+
+    #[test]
+    fn structured_session_inspection_command_parses() {
+        let session_id = SessionId::new();
+        let cli = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "inspect",
+            &session_id.to_string(),
+            "failed-tool-calls",
+            "--after",
+            "20",
+            "--limit",
+            "15",
+            "--json",
+        ])
+        .expect("inspection command should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Session {
+                command: SessionCommand::Inspect {
+                    category: SessionInspectionCategoryArg::FailedToolCalls,
+                    after: Some(20),
+                    before: None,
+                    limit: 15,
+                    json: true,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn bounded_session_history_command_parses() {
+        let session_id = SessionId::new();
+        let cli = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "history",
+            &session_id.to_string(),
+            "--after",
+            "40",
+            "--limit",
+            "25",
+            "--json",
+        ])
+        .expect("bounded history command should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Session {
+                command: SessionCommand::History {
+                    after: Some(40),
+                    before: None,
+                    limit: 25,
+                    json: true,
+                    ..
+                }
+            })
+        ));
+    }
+
+    #[test]
+    fn session_around_command_parses() {
+        let session_id = SessionId::new();
+        let cli = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "around",
+            &session_id.to_string(),
+            "42",
+            "--before",
+            "5",
+            "--after",
+            "7",
+            "--json",
+        ])
+        .expect("around command should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Session {
+                command: SessionCommand::Around {
+                    sequence: 42,
+                    before: 5,
+                    after: 7,
+                    json: true,
+                    ..
+                }
+            })
+        ));
     }
 
     #[test]

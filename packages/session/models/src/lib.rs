@@ -748,6 +748,9 @@ pub struct SessionHistoryCursor {
     pub sequence: u64,
 }
 
+/// Maximum events returned by one normal bounded session-history read.
+pub const MAX_SESSION_HISTORY_READ_EVENTS: usize = 1_000;
+
 /// Query for a bounded page of session history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionHistoryQuery {
@@ -755,6 +758,91 @@ pub struct SessionHistoryQuery {
     pub cursor: Option<SessionHistoryCursor>,
     pub limit: usize,
     pub direction: SessionHistoryDirection,
+}
+
+/// Query for a bounded canonical history window around one event sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHistoryAroundQuery {
+    /// Canonical sequence at the center of the requested window.
+    pub sequence: u64,
+    /// Maximum events requested before `sequence`.
+    pub before: usize,
+    /// Maximum events requested after `sequence`.
+    pub after: usize,
+}
+
+impl SessionHistoryAroundQuery {
+    /// Return the maximum number of events in this window, including the anchor.
+    #[must_use]
+    pub const fn event_limit(self) -> usize {
+        self.before.saturating_add(self.after).saturating_add(1)
+    }
+}
+
+/// Bounded canonical history window around one requested event sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionHistoryWindow {
+    pub session_id: SessionId,
+    pub requested_sequence: u64,
+    pub events: Vec<SessionEvent>,
+    /// Whether the requested canonical sequence was present in the returned window.
+    pub anchor_present: bool,
+    /// First canonical event sequence currently available for the session.
+    pub first_available_sequence: Option<u64>,
+    /// Last canonical event sequence currently available for the session.
+    pub last_available_sequence: Option<u64>,
+    /// Opaque-event diagnostics for events present in this window.
+    #[serde(default)]
+    pub compatibility_issues: Vec<SessionEventCompatibilityIssue>,
+}
+
+/// Maximum matching events returned by one structured session inspection read.
+pub const MAX_SESSION_INSPECTION_EVENTS: usize = 200;
+
+/// High-value semantic event category for bounded session investigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionInspectionCategory {
+    /// Failed terminal tool invocation records and lifecycle events.
+    FailedToolCalls,
+    /// Permission requests and their resolutions.
+    Permissions,
+    /// Model, reasoning, agent, and working-directory selection changes.
+    SelectionChanges,
+    /// Durable runtime-work lifecycle and progress events.
+    RuntimeWork,
+    /// Local and provider-native context compaction boundaries.
+    Compactions,
+    /// Durable model-turn, tool-invocation, and runtime-work terminal outcomes.
+    TerminalOutcomes,
+}
+
+/// Query for one bounded structured session investigation page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInspectionQuery {
+    pub category: SessionInspectionCategory,
+    #[serde(default)]
+    pub cursor: Option<SessionHistoryCursor>,
+    pub limit: usize,
+    pub direction: SessionHistoryDirection,
+}
+
+/// Bounded page of canonical events matching a structured investigation category.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInspectionPage {
+    pub session_id: SessionId,
+    pub category: SessionInspectionCategory,
+    pub events: Vec<SessionEvent>,
+    /// Number of bounded canonical candidate events decoded for this page.
+    pub scanned_events: usize,
+    /// Opaque-event diagnostics for events present in this page.
+    #[serde(default)]
+    pub compatibility_issues: Vec<SessionEventCompatibilityIssue>,
+    /// Cursor for continuing through canonical candidates in the requested direction.
+    #[serde(default)]
+    pub next_cursor: Option<SessionHistoryCursor>,
+    /// Whether additional canonical candidates may remain after this page.
+    pub has_more: bool,
 }
 
 /// Compatibility classification for a canonical event that remains inspectable

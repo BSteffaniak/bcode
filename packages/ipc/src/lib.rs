@@ -9,8 +9,9 @@ use bcode_metrics::MetricsSnapshot;
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkKind, RuntimeWorkStatus, SessionEvent,
-    SessionHistoryPage, SessionHistoryQuery, SessionId, SessionInputHistoryEntry, SessionLiveEvent,
-    SessionOpenOperationId, SessionOpenOperationSnapshot, SessionSummary, WorkId,
+    SessionHistoryAroundQuery, SessionHistoryPage, SessionHistoryQuery, SessionHistoryWindow,
+    SessionId, SessionInputHistoryEntry, SessionInspectionPage, SessionInspectionQuery,
+    SessionLiveEvent, SessionOpenOperationId, SessionOpenOperationSnapshot, SessionSummary, WorkId,
 };
 use bcode_skill_models::{SkillContextResponse, SkillId, SkillList, SkillManifest};
 pub use bcode_worktree_models::{
@@ -451,6 +452,10 @@ pub enum Request {
         session_id: SessionId,
         agent_id: String,
     },
+    SessionHistoryAround {
+        session_id: SessionId,
+        query: SessionHistoryAroundQuery,
+    },
     ListPermissions,
     ResolvePermission {
         permission_id: String,
@@ -593,6 +598,10 @@ pub enum Request {
     /// Ask this daemon to release runtime ownership when the session is quiescent.
     ReleaseSessionOwnership {
         session_id: SessionId,
+    },
+    SessionInspection {
+        session_id: SessionId,
+        query: SessionInspectionQuery,
     },
 }
 
@@ -1587,6 +1596,9 @@ pub enum ResponsePayload {
         checksum_sha256: Option<String>,
         bytes: Vec<u8>,
     },
+    SessionHistoryAround {
+        window: SessionHistoryWindow,
+    },
     InvocationInputAccepted,
     PermissionBatchResolved {
         resolved: usize,
@@ -1627,6 +1639,9 @@ pub enum SessionOwnershipReleaseOutcome {
     AlreadyUnowned,
     Blocked {
         blockers: Vec<SessionOwnershipBlocker>,
+    },
+    SessionInspection {
+        page: SessionInspectionPage,
     },
 }
 
@@ -2565,6 +2580,67 @@ mod tests {
                 created_at_ms: 1,
                 updated_at_ms: 2,
             }],
+        });
+        let encoded = encode_response(&response).expect("encode response");
+        assert_eq!(
+            decode_response(&encoded).expect("decode response"),
+            response
+        );
+    }
+
+    #[test]
+    fn session_inspection_contract_round_trips() {
+        let session_id = SessionId::new();
+        let query = bcode_session_models::SessionInspectionQuery {
+            category: bcode_session_models::SessionInspectionCategory::FailedToolCalls,
+            cursor: Some(bcode_session_models::SessionHistoryCursor { sequence: 10 }),
+            limit: 25,
+            direction: bcode_session_models::SessionHistoryDirection::Forward,
+        };
+        let request = Request::SessionInspection { session_id, query };
+        let encoded = encode_request(&request).expect("encode request");
+        assert_eq!(decode_request(&encoded).expect("decode request"), request);
+
+        let response = Response::Ok(ResponsePayload::SessionInspection {
+            page: bcode_session_models::SessionInspectionPage {
+                session_id,
+                category: query.category,
+                events: Vec::new(),
+                scanned_events: 0,
+                compatibility_issues: Vec::new(),
+                next_cursor: None,
+                has_more: false,
+            },
+        });
+        let encoded = encode_response(&response).expect("encode response");
+        assert_eq!(
+            decode_response(&encoded).expect("decode response"),
+            response
+        );
+    }
+
+    #[test]
+    fn session_history_around_contract_round_trips() {
+        let session_id = SessionId::new();
+        let query = bcode_session_models::SessionHistoryAroundQuery {
+            sequence: 42,
+            before: 5,
+            after: 7,
+        };
+        let request = Request::SessionHistoryAround { session_id, query };
+        let encoded = encode_request(&request).expect("encode request");
+        assert_eq!(decode_request(&encoded).expect("decode request"), request);
+
+        let response = Response::Ok(ResponsePayload::SessionHistoryAround {
+            window: bcode_session_models::SessionHistoryWindow {
+                session_id,
+                requested_sequence: 42,
+                events: Vec::new(),
+                anchor_present: false,
+                first_available_sequence: Some(1),
+                last_available_sequence: Some(100),
+                compatibility_issues: Vec::new(),
+            },
         });
         let encoded = encode_response(&response).expect("encode response");
         assert_eq!(

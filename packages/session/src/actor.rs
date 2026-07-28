@@ -11,7 +11,10 @@ use super::{
 use crate::db::{MaterializedProjection, SessionDb, SessionDbError};
 use crate::lease::SessionLeaseGuard;
 use bcode_metrics::MetricsContext;
-use bcode_session_models::ProjectionWindowAnchor;
+use bcode_session_models::{
+    ProjectionWindowAnchor, SessionHistoryAroundQuery, SessionHistoryPage, SessionHistoryQuery,
+    SessionHistoryWindow, SessionInspectionPage, SessionInspectionQuery,
+};
 use std::collections::BTreeMap;
 use std::sync::RwLock;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -62,7 +65,8 @@ const fn append_rejection_metric(error: &SessionDbError) -> &'static str {
         | SessionDbError::PersistedEvent(_)
         | SessionDbError::InvalidCompactionMarker { .. }
         | SessionDbError::InvalidRow { .. }
-        | SessionDbError::MigrationHistoryIncompatible { .. } => {
+        | SessionDbError::MigrationHistoryIncompatible { .. }
+        | SessionDbError::HistoryReadLimitExceeded { .. } => {
             "session.actor.append_event.rejected.storage_error_total"
         }
     }
@@ -366,6 +370,30 @@ impl SessionHandle {
         self.send(SessionCommand::History).await?
     }
 
+    pub async fn history_page(
+        &self,
+        query: SessionHistoryQuery,
+    ) -> Result<SessionHistoryPage, SessionError> {
+        self.send(|reply| SessionCommand::HistoryPage { query, reply })
+            .await?
+    }
+
+    pub async fn history_around(
+        &self,
+        query: SessionHistoryAroundQuery,
+    ) -> Result<SessionHistoryWindow, SessionError> {
+        self.send(|reply| SessionCommand::HistoryAround { query, reply })
+            .await?
+    }
+
+    pub async fn inspection_page(
+        &self,
+        query: SessionInspectionQuery,
+    ) -> Result<SessionInspectionPage, SessionError> {
+        self.send(|reply| SessionCommand::InspectionPage { query, reply })
+            .await?
+    }
+
     pub async fn projection_window(
         &self,
         request: ProjectionWindowRequest,
@@ -563,6 +591,18 @@ enum SessionCommand {
     ComposerDraft(oneshot::Sender<Result<Option<String>, SessionError>>),
     ValidateWriteReadiness(oneshot::Sender<Result<(), SessionError>>),
     History(oneshot::Sender<Result<Vec<SessionEvent>, SessionError>>),
+    HistoryPage {
+        query: SessionHistoryQuery,
+        reply: oneshot::Sender<Result<SessionHistoryPage, SessionError>>,
+    },
+    HistoryAround {
+        query: SessionHistoryAroundQuery,
+        reply: oneshot::Sender<Result<SessionHistoryWindow, SessionError>>,
+    },
+    InspectionPage {
+        query: SessionInspectionQuery,
+        reply: oneshot::Sender<Result<SessionInspectionPage, SessionError>>,
+    },
     ProjectionWindowFromIndex {
         request: ProjectionWindowRequest,
         reply: oneshot::Sender<Result<ProjectionWindow, SessionError>>,
@@ -772,6 +812,15 @@ impl SessionActor {
             }
             SessionCommand::History(reply) => {
                 let _ = reply.send(self.history().await);
+            }
+            SessionCommand::HistoryPage { query, reply } => {
+                let _ = reply.send(self.history_page(query).await);
+            }
+            SessionCommand::HistoryAround { query, reply } => {
+                let _ = reply.send(self.history_around(query).await);
+            }
+            SessionCommand::InspectionPage { query, reply } => {
+                let _ = reply.send(self.inspection_page(query).await);
             }
             SessionCommand::ProjectionWindowFromIndex { request, reply } => {
                 let _ = reply.send(self.projection_window(request).await);
@@ -1506,6 +1555,42 @@ impl SessionActor {
         Err(SessionError::NotFound(self.state.summary.id))
     }
 
+    async fn history_page(
+        &mut self,
+        query: SessionHistoryQuery,
+    ) -> Result<SessionHistoryPage, SessionError> {
+        if let Some(db) = self.existing_session_db().await? {
+            return Ok(db.history_page(query).await?);
+        }
+        if let Some(events) = &self.state.events {
+            return history_page_from_events(self.state.summary.id, events, query);
+        }
+        Err(SessionError::NotFound(self.state.summary.id))
+    }
+
+    async fn history_around(
+        &mut self,
+        query: SessionHistoryAroundQuery,
+    ) -> Result<SessionHistoryWindow, SessionError> {
+        if let Some(db) = self.existing_session_db().await? {
+            return Ok(db.history_around(query).await?);
+        }
+        if let Some(events) = &self.state.events {
+            return history_around_from_events(self.state.summary.id, events, query);
+        }
+        Err(SessionError::NotFound(self.state.summary.id))
+    }
+
+    async fn inspection_page(
+        &mut self,
+        query: SessionInspectionQuery,
+    ) -> Result<SessionInspectionPage, SessionError> {
+        if let Some(db) = self.existing_session_db().await? {
+            return Ok(db.inspection_page(query).await?);
+        }
+        Err(SessionError::DbUnavailable(self.state.summary.id))
+    }
+
     async fn projection_window(
         &mut self,
         request: ProjectionWindowRequest,
@@ -2071,6 +2156,95 @@ fn live_text_checkpoint_bytes(
             _ => None,
         })
         .sum()
+}
+
+fn history_page_from_events(
+    session_id: bcode_session_models::SessionId,
+    events: &[SessionEvent],
+    query: SessionHistoryQuery,
+) -> Result<SessionHistoryPage, SessionError> {
+    let limit = query.limit.max(1);
+    if limit > bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS {
+        return Err(crate::db::SessionDbError::HistoryReadLimitExceeded {
+            requested: limit,
+            maximum: bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS,
+        }
+        .into());
+    }
+    let mut matching = events
+        .iter()
+        .filter(|event| match query.direction {
+            bcode_session_models::SessionHistoryDirection::Forward => query
+                .cursor
+                .is_none_or(|cursor| event.sequence >= cursor.sequence),
+            bcode_session_models::SessionHistoryDirection::Backward => query
+                .cursor
+                .is_none_or(|cursor| event.sequence <= cursor.sequence),
+        })
+        .collect::<Vec<_>>();
+    if matches!(
+        query.direction,
+        bcode_session_models::SessionHistoryDirection::Backward
+    ) {
+        matching.reverse();
+    }
+    let has_more = matching.len() > limit;
+    let next_cursor = matching
+        .get(limit)
+        .map(|event| bcode_session_models::SessionHistoryCursor {
+            sequence: event.sequence,
+        });
+    let mut page_events = matching
+        .into_iter()
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    if matches!(
+        query.direction,
+        bcode_session_models::SessionHistoryDirection::Backward
+    ) {
+        page_events.reverse();
+    }
+    Ok(SessionHistoryPage {
+        session_id,
+        events: page_events,
+        compatibility_issues: Vec::new(),
+        next_cursor,
+        has_more,
+    })
+}
+
+fn history_around_from_events(
+    session_id: bcode_session_models::SessionId,
+    events: &[SessionEvent],
+    query: SessionHistoryAroundQuery,
+) -> Result<SessionHistoryWindow, SessionError> {
+    let limit = query.event_limit();
+    if limit > bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS {
+        return Err(crate::db::SessionDbError::HistoryReadLimitExceeded {
+            requested: limit,
+            maximum: bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS,
+        }
+        .into());
+    }
+    let start = query
+        .sequence
+        .saturating_sub(u64::try_from(query.before).unwrap_or(u64::MAX));
+    let end = query
+        .sequence
+        .saturating_add(u64::try_from(query.after).unwrap_or(u64::MAX));
+    let window_events = select_event_range_from_events(events, start, end, limit);
+    Ok(SessionHistoryWindow {
+        session_id,
+        requested_sequence: query.sequence,
+        anchor_present: window_events
+            .iter()
+            .any(|event| event.sequence == query.sequence),
+        events: window_events,
+        first_available_sequence: events.first().map(|event| event.sequence),
+        last_available_sequence: events.last().map(|event| event.sequence),
+        compatibility_issues: Vec::new(),
+    })
 }
 
 fn select_event_range_from_events(

@@ -59,9 +59,10 @@ use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_session_models::{
     ClientId, ExecutionSessionContextMode, ExecutionSessionProvenance, ProjectionWindow,
     ProjectionWindowRequest, SessionEvent, SessionEventKind, SessionEventProvenance,
-    SessionForkKind, SessionHistoryDirection, SessionHistoryPage, SessionHistoryQuery, SessionId,
-    SessionImportSummary, SessionInputHistoryEntry, SessionLiveEvent, SessionLiveEventKind,
-    SessionMigrationProgress, SessionMigrationStage, SessionOpenOperationId,
+    SessionForkKind, SessionHistoryAroundQuery, SessionHistoryDirection, SessionHistoryPage,
+    SessionHistoryQuery, SessionHistoryWindow, SessionId, SessionImportSummary,
+    SessionInputHistoryEntry, SessionInspectionPage, SessionInspectionQuery, SessionLiveEvent,
+    SessionLiveEventKind, SessionMigrationProgress, SessionMigrationStage, SessionOpenOperationId,
     SessionOpenOperationSnapshot, SessionOpenTerminalOutcome, SessionSummary, SessionTitleSource,
     SessionVisibility,
 };
@@ -1937,15 +1938,74 @@ impl SessionManager {
         session_id: SessionId,
         query: SessionHistoryQuery,
     ) -> Result<SessionHistoryPage, SessionError> {
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached_handle {
+            return handle.history_page(query).await;
+        }
         let Some(store) = &self.store else {
             return Err(SessionError::NotFound(session_id));
         };
-        let db_path = db::session_db_path(&store.root_path(), session_id);
-        if !db_path.exists() {
+        if !db::session_db_path(&store.root_path(), session_id).exists() {
             return Err(SessionError::NotFound(session_id));
         }
         let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
         Ok(db.history_page(query).await?)
+    }
+
+    /// Return a bounded canonical history window around one event sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist, or an error if the
+    /// requested window exceeds the normal-read bound.
+    pub async fn session_history_around(
+        &self,
+        session_id: SessionId,
+        query: SessionHistoryAroundQuery,
+    ) -> Result<SessionHistoryWindow, SessionError> {
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached_handle {
+            return handle.history_around(query).await;
+        }
+        let Some(store) = &self.store else {
+            return Err(SessionError::NotFound(session_id));
+        };
+        if !db::session_db_path(&store.root_path(), session_id).exists() {
+            return Err(SessionError::NotFound(session_id));
+        }
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+        Ok(db.history_around(query).await?)
+    }
+
+    /// Return one bounded structured session investigation page.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session does not exist, or an error if the
+    /// request exceeds normal-read bounds or canonical candidate events cannot be decoded.
+    pub async fn session_inspection_page(
+        &self,
+        session_id: SessionId,
+        query: SessionInspectionQuery,
+    ) -> Result<SessionInspectionPage, SessionError> {
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        let cached_handle = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached_handle {
+            return handle.inspection_page(query).await;
+        }
+        let Some(store) = &self.store else {
+            return Err(SessionError::NotFound(session_id));
+        };
+        if !db::session_db_path(&store.root_path(), session_id).exists() {
+            return Err(SessionError::NotFound(session_id));
+        }
+        let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+        Ok(db.inspection_page(query).await?)
     }
 
     /// Return canonical plugin status-note events for one stable note identity.

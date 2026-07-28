@@ -22,8 +22,9 @@ use bcode_ipc::{
 };
 use bcode_session_models::{
     ClientId, ProjectionWindowRequest, RuntimeWorkStatus, SessionEvent, SessionEventKind,
-    SessionForkResult, SessionHistoryPage, SessionHistoryQuery, SessionId,
-    SessionInputHistoryEntry, SessionSummary, WorkId,
+    SessionForkResult, SessionHistoryAroundQuery, SessionHistoryPage, SessionHistoryQuery,
+    SessionHistoryWindow, SessionId, SessionInputHistoryEntry, SessionInspectionPage,
+    SessionInspectionQuery, SessionSummary, WorkId,
 };
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
 use std::collections::{BTreeMap, VecDeque};
@@ -1713,6 +1714,44 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::SessionHistoryPage { page } => Ok(page),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return a bounded canonical history window around one event sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn session_history_around(
+        &self,
+        session_id: SessionId,
+        query: SessionHistoryAroundQuery,
+    ) -> Result<SessionHistoryWindow, ClientError> {
+        match self
+            .send_request(Request::SessionHistoryAround { session_id, query })
+            .await?
+        {
+            ResponsePayload::SessionHistoryAround { window } => Ok(window),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return one bounded structured session investigation page.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn session_inspection(
+        &self,
+        session_id: SessionId,
+        query: SessionInspectionQuery,
+    ) -> Result<SessionInspectionPage, ClientError> {
+        match self
+            .send_request(Request::SessionInspection { session_id, query })
+            .await?
+        {
+            ResponsePayload::SessionInspection { page } => Ok(page),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
