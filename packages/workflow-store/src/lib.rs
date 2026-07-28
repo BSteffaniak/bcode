@@ -5118,6 +5118,23 @@ fn cancellation_requested_for_run(
         .map_err(WorkflowStoreError::from)
 }
 
+fn parallel_member_ids(
+    join: &bcode_workflow::NodeDefinition,
+    member_node_id: &str,
+) -> Result<Vec<String>, WorkflowStoreError> {
+    let left = configured_node_ids(&join.configuration, "left_exits")?;
+    let right = configured_node_ids(&join.configuration, "right_exits")?;
+    if left.iter().any(|member| member == member_node_id)
+        && right.iter().any(|member| member == member_node_id)
+    {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "parallel join {} ambiguously includes member {} on both sides",
+            join.id, member_node_id
+        )));
+    }
+    Ok(left.into_iter().chain(right).collect())
+}
+
 fn settle_wait_all_parallel_failure(
     transaction: &Transaction<'_>,
     run_id: &str,
@@ -5141,9 +5158,7 @@ fn settle_wait_all_parallel_failure(
         .values()
         .filter(|node| node.kind == bcode_workflow::NodeKind::Parallel)
     {
-        let left = configured_node_ids(&join.configuration, "left_exits")?;
-        let right = configured_node_ids(&join.configuration, "right_exits")?;
-        let members = left.into_iter().chain(right).collect::<Vec<_>>();
+        let members = parallel_member_ids(join, member_node_id)?;
         if !members.iter().any(|member| member == member_node_id) {
             continue;
         }
