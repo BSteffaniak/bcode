@@ -26,8 +26,9 @@ artifacts are `.zip` archives; Linux artifacts are `.tar.gz` archives. Every arc
 `bcode` and the process-isolated `bcode-mermaid-worker` (with `.exe` suffixes on Windows), plus
 the bundled Tesseract runtime tree required by the default application build. Windows source
 builds use the MSVC Rust target and require Visual Studio Build Tools with C++ support and CMake.
-Windows x64 CI currently uses GitHub's `windows-latest` image; a minimum end-user Windows version
-has not yet been established and must not be inferred from that runner.
+Windows x64 CI currently uses GitHub's `windows-latest` image. The minimum supported end-user
+version is Windows 10, version 1809, because Bcode's terminal shell integration depends on ConPTY.
+Windows Server 2019 or newer is the corresponding server baseline.
 
 ### Windows source build
 

@@ -962,3 +962,36 @@ fn fingerprint_for_public_key_line(line: &str) -> Option<String> {
     let encoded = base64::engine::general_purpose::STANDARD_NO_PAD.encode(hash);
     Some(format!("SHA256:{encoded}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(windows)]
+    fn windows_dpapi_device_seal_round_trips_for_current_user() {
+        let options = sshenv_vault::device::DeviceSealOptions {
+            selection: sshenv_vault::device::DeviceSealSelection::Backend(
+                sshenv_vault::device::DeviceSealBackendSelection::WindowsDpapiCurrentUser,
+            ),
+            strict: true,
+        };
+        let (metadata, created) =
+            sshenv_vault::device::create_factor_with_options(options).expect("create DPAPI seal");
+        let loaded = sshenv_vault::device::derive_factor_from_metadata(&metadata)
+            .expect("load DPAPI seal for current user");
+        assert_eq!(&*created, &*loaded);
+        assert_eq!(
+            metadata.params.get("backend").map(String::as_str),
+            Some("windows-dpapi-current-user")
+        );
+    }
+
+    #[test]
+    fn explicit_windows_dpapi_backend_is_parsed_without_secret_data() {
+        assert_eq!(
+            parse_device_seal_backend("windows-dpapi-current-user"),
+            Some(sshenv_vault::device::DeviceSealBackendSelection::WindowsDpapiCurrentUser)
+        );
+    }
+}
