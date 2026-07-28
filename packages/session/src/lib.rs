@@ -3313,6 +3313,49 @@ mod tests {
             .await
             .expect("session should reattach");
         assert!(attachment.live_checkpoints.is_empty());
+
+        let _ = manager
+            .publish_live_event(session.id, publish(3, 11, "late"))
+            .await;
+        let attachment = manager
+            .attach_session(session.id, ClientId::new())
+            .await
+            .expect("late update should not revive checkpoint");
+        assert!(attachment.live_checkpoints.is_empty());
+
+        manager
+            .append_model_turn_finished(
+                session.id,
+                "turn-1".to_owned(),
+                bcode_session_models::ModelTurnOutcome::Completed,
+                None,
+            )
+            .await
+            .expect("turn finish should clear tombstone");
+        let _ = manager
+            .publish_live_event(
+                session.id,
+                SessionLiveEventKind::AssistantTextStreamUpdated {
+                    turn_id: "turn-1".to_owned(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
+                    update: bcode_session_models::TextStreamUpdate {
+                        generation: 1,
+                        first_revision: 1,
+                        revision: 1,
+                        operation: bcode_session_models::TextStreamOperation::Append {
+                            expected_offset: 0,
+                            text: "new generation".to_owned(),
+                        },
+                    },
+                },
+            )
+            .await;
+        let attachment = manager
+            .attach_session(session.id, ClientId::new())
+            .await
+            .expect("new generation should hydrate after turn boundary");
+        assert_eq!(attachment.live_checkpoints.len(), 1);
     }
 
     #[tokio::test]

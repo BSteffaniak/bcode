@@ -1545,13 +1545,32 @@ impl SessionActor {
             return;
         };
         let key = (turn_id.clone(), segment_id.clone());
-        if self
-            .state
-            .live_text_tombstones
-            .get(&key)
-            .is_some_and(|(generation, _revision)| update.generation <= *generation)
+        if let Some((terminal_generation, _)) = self.state.live_text_tombstones.get(&key).copied() {
+            if update.generation <= terminal_generation {
+                return;
+            }
+            self.state.live_text_tombstones.remove(&key);
+            self.state
+                .live_text_tombstone_order
+                .retain(|item| item != &key);
+        }
+        if let Some(current_generation) =
+            self.state
+                .live_text_checkpoints
+                .get(&key)
+                .and_then(|event| match &event.kind {
+                    SessionLiveEventKind::AssistantTextStreamUpdated { update, .. } => {
+                        Some(update.generation)
+                    }
+                    _ => None,
+                })
         {
-            return;
+            if update.generation < current_generation {
+                return;
+            }
+            if update.generation > current_generation {
+                self.retire_live_text_checkpoint(&key);
+            }
         }
         if matches!(update.operation, TextStreamOperation::Terminal { .. }) {
             self.retire_live_text_checkpoint(&key);

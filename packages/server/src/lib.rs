@@ -42731,6 +42731,62 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[test]
+    fn pending_live_event_buffer_coalesces_ordered_assistant_revision_span() {
+        let session_id = SessionId::new();
+        let append = |revision, offset, text: &str| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                update: bcode_session_models::TextStreamUpdate {
+                    generation: 0,
+                    first_revision: revision,
+                    revision,
+                    operation: bcode_session_models::TextStreamOperation::Append {
+                        expected_offset: offset,
+                        text: text.to_owned(),
+                    },
+                },
+            },
+        };
+        let mut pending = PendingLiveEventBuffer::default();
+        assert!(matches!(
+            pending.push(append(1, 0, "abc")),
+            BufferLiveEventResult::Buffered { superseded: false }
+        ));
+        assert!(matches!(
+            pending.push(append(2, 3, "def")),
+            BufferLiveEventResult::Buffered { superseded: true }
+        ));
+        let events = pending.take_pending_events();
+        assert!(matches!(
+            &events[0].event.kind,
+            SessionLiveEventKind::AssistantTextStreamUpdated {
+                update: bcode_session_models::TextStreamUpdate {
+                    first_revision: 1,
+                    revision: 2,
+                    operation: bcode_session_models::TextStreamOperation::Append {
+                        expected_offset: 0,
+                        text,
+                    },
+                    ..
+                },
+                ..
+            } if text == "abcdef"
+        ));
+
+        assert!(matches!(
+            pending.push(append(4, 6, "gap")),
+            BufferLiveEventResult::Buffered { superseded: false }
+        ));
+        assert!(matches!(
+            pending.push(append(6, 9, "later")),
+            BufferLiveEventResult::Rejected(BufferLiveEventError::Gap)
+        ));
+    }
+
+    #[test]
     fn pending_live_event_buffer_coalesces_snapshots_and_contiguous_appends() {
         let session_id = SessionId::new();
         let progress = |sequence| bcode_session_models::SessionLiveEvent {
