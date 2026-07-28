@@ -152,6 +152,27 @@ When a skill file references a relative path, resolve it against the skill direc
 </available_skills>
 ```
 
+## Invariant guidance configuration
+
+```toml
+[invariants]
+enabled = true # false disables all invariant prompt/selector behavior
+mode = "full" # full | relevant; full is the default
+max_selected = 6
+include_task_summary = true
+
+[invariants.selector]
+# model_profile = "fast" # active model is used when omitted
+# initial_timeout_ms = 2000 # omitted means wait without a deadline
+# background_timeout_ms = 10000 # omitted means wait without a deadline
+wait_for_background_on_next_prompt = false
+cancel_on_timeout = false
+cancel_stale = false
+on_timeout = "full" # full | previous | deterministic | none
+```
+
+`full` mode preserves the default complete-catalog behavior and performs no selector calls. `relevant` mode uses the selector for the first prompt, reuses the focused selection throughout the model/tool turn, and starts reevaluation only after the final assistant turn has been committed. The background reevaluation does not block response delivery. By default, a new prompt also does not wait for unfinished background work and uses the last valid selection; set `wait_for_background_on_next_prompt = true` to opt into waiting. Selector deadlines and provider cancellation are opt-in; omission waits without a deadline. `enabled = false` is the master kill switch and suppresses catalog loading, reminders, selector work, and invariant prompt metadata. Focused guidance is retained in a bounded per-session sidecar so normal reconnect does not replay event history to recover it.
+
 ## System prompt configuration
 
 The base system prompt can be used as-is or replaced while still keeping selected Bcode-managed sections.
@@ -177,7 +198,7 @@ Behavior:
 * `mode = "default"` uses Bcode's built-in coding-agent prompt as the base.
 * `mode = "replace"` uses `text` as the base prompt.
 * Enabled sections are appended to either base mode.
-* `system_prompt.sections.repository_invariants = true` loads root `INVARIANTS.md` into a dedicated stable prompt section independently of ordinary repository context. Replacement mode does not disable it.
+* `system_prompt.sections.repository_invariants` controls complete-catalog placement in full mode; the `[invariants] enabled` setting is the authoritative master switch across both modes. Replacement mode does not disable enabled invariant guidance.
 * Repository instructions and invariants are untruncated by default. Set `system_prompt.repository_instructions_max_chars` or `system_prompt.repository_invariants_max_chars` to apply independent character limits; configured invariant truncation is explicitly marked in model context.
 * Git status is generated repository context and remains bounded by default through configurable `system_prompt.git_status_max_chars`. There is no hidden aggregate cap on dynamic repository context.
 * Historical tool-call fallback text remains bounded through configurable `model.tool_output.fallback_argument_chars` (default `6000`) without changing canonical stored arguments.

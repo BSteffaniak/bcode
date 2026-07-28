@@ -227,6 +227,8 @@ pub struct BcodeConfig {
     #[serde(default)]
     pub skills: SkillsConfig,
     #[serde(default)]
+    pub invariants: InvariantsConfig,
+    #[serde(default)]
     pub system_prompt: SystemPromptConfig,
     #[serde(default)]
     pub tui: TuiConfig,
@@ -255,6 +257,7 @@ impl Default for BcodeConfig {
             observability: ObservabilityConfig::default(),
             metrics: MetricsConfig::default(),
             skills: SkillsConfig::default(),
+            invariants: InvariantsConfig::default(),
             system_prompt: SystemPromptConfig::default(),
             tui: TuiConfig::default(),
             session_import: SessionImportConfig::default(),
@@ -303,6 +306,10 @@ impl ConfigDocSchema for BcodeConfig {
             schema_section_doc::<SkillsConfig>(
                 "skills",
                 "Skill discovery, activation, source, disabled-skill, and prompt catalog settings.",
+            ),
+            schema_section_doc::<InvariantsConfig>(
+                "invariants",
+                "Repository invariant guidance mode and selector settings.",
             ),
             schema_section_doc::<SystemPromptConfig>(
                 "system_prompt",
@@ -422,6 +429,22 @@ impl BcodeConfig {
     #[must_use]
     pub fn resolved_model_selection(&self) -> ResolvedModelSelection {
         self.resolved_model_selection_with_environment(&ProcessConfigEnvironment)
+    }
+
+    /// Resolve a named model profile without applying environment profile overrides.
+    #[must_use]
+    pub fn resolved_model_profile(&self, profile_name: &str) -> Option<ResolvedModelSelection> {
+        self.model.profiles.get(profile_name)?;
+        let mut scoped = self.clone();
+        scoped.model.profile = Some(profile_name.to_string());
+        scoped.model.provider_plugin_id = None;
+        scoped.model.model_id = None;
+        Some(
+            scoped.resolved_model_selection_with_environment(&ConfigEnvironmentSnapshot::new(
+                BTreeMap::new(),
+                PathBuf::from("."),
+            )),
+        )
     }
 
     /// Resolve effective model/provider selection using an explicit environment.
@@ -1082,6 +1105,98 @@ pub fn bedrock_environment_is_configured_with_environment(
         .iter()
         .find(|spec| spec.plugin_id == "bcode.bedrock")
         .is_some_and(|spec| first_env_value_from_slice(environment, spec.signal_env_vars).is_some())
+}
+
+/// Repository invariant guidance configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "invariants")]
+pub struct InvariantsConfig {
+    /// Master switch for all invariant prompt and selector behavior.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Invariant guidance mode.
+    #[serde(default)]
+    pub mode: InvariantGuidanceMode,
+    /// Maximum invariants included by relevant mode.
+    #[serde(default = "default_invariant_max_selected")]
+    pub max_selected: std::num::NonZeroUsize,
+    /// Include the selector's compact task summary in reminders.
+    #[serde(default = "default_true")]
+    pub include_task_summary: bool,
+    /// Relevant-invariant selector behavior.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub selector: InvariantSelectorConfig,
+}
+
+impl Default for InvariantsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: InvariantGuidanceMode::Full,
+            max_selected: default_invariant_max_selected(),
+            include_task_summary: true,
+            selector: InvariantSelectorConfig::default(),
+        }
+    }
+}
+
+/// Repository invariant guidance mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum InvariantGuidanceMode {
+    /// Include the complete invariant catalog and perform no selector calls.
+    #[default]
+    Full,
+    /// Include only invariants selected for the current task.
+    Relevant,
+}
+
+/// Relevant-invariant selector configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "selector")]
+pub struct InvariantSelectorConfig {
+    /// Optional model profile used by selector requests. The active model is used when omitted.
+    #[serde(default)]
+    pub model_profile: Option<String>,
+    /// Optional initial selector deadline. Omitted values wait for completion.
+    #[serde(default)]
+    pub initial_timeout_ms: Option<std::num::NonZeroU64>,
+    /// Optional background selector deadline. Omitted values wait for completion.
+    #[serde(default)]
+    pub background_timeout_ms: Option<std::num::NonZeroU64>,
+    /// If a background selector is still running when a new user prompt arrives, wait for it
+    /// before using the previous selection.
+    #[serde(default)]
+    pub wait_for_background_on_next_prompt: bool,
+    /// Request provider cancellation when a configured deadline expires.
+    #[serde(default)]
+    pub cancel_on_timeout: bool,
+    /// Request cancellation for work superseded by newer guidance.
+    #[serde(default)]
+    pub cancel_stale: bool,
+    /// Behavior when a configured selector deadline expires.
+    #[serde(default)]
+    pub on_timeout: InvariantSelectorTimeoutPolicy,
+}
+
+/// Relevant-invariant behavior after an explicitly configured selector deadline.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum InvariantSelectorTimeoutPolicy {
+    /// Include the complete catalog for this request.
+    #[default]
+    Full,
+    /// Reuse prior focused guidance, falling back to the complete catalog.
+    Previous,
+    /// Use deterministic local relevance matching.
+    Deterministic,
+    /// Explicitly omit guidance for this request.
+    None,
+}
+
+const fn default_invariant_max_selected() -> std::num::NonZeroUsize {
+    std::num::NonZeroUsize::new(6).expect("invariant selection count is non-zero")
 }
 
 /// System prompt assembly configuration.
@@ -4329,6 +4444,7 @@ fn config_to_toml(config: &BcodeConfig) -> String {
     write_auth_toml(&mut output, &config.auth);
     write_observability_toml(&mut output, &config.observability);
     write_skills_toml(&mut output, &config.skills);
+    write_invariants_toml(&mut output, &config.invariants);
     write_system_prompt_toml(&mut output, &config.system_prompt);
     write_tui_toml(&mut output, &config.tui);
     write_client_toml(&mut output, &config.client);
@@ -4831,6 +4947,62 @@ fn write_model_metadata_toml(
         if let Some(max_output_tokens) = metadata.max_output_tokens {
             writeln!(output, "max_output_tokens = {max_output_tokens}")
                 .expect("writing to string should not fail");
+        }
+        output.push('\n');
+    }
+}
+
+fn write_invariants_toml(output: &mut String, invariants: &InvariantsConfig) {
+    if invariants == &InvariantsConfig::default() {
+        return;
+    }
+    output.push_str("[invariants]\n");
+    if !invariants.enabled {
+        output.push_str("enabled = false\n");
+    }
+    if invariants.mode != InvariantGuidanceMode::Full {
+        output.push_str("mode = \"relevant\"\n");
+    }
+    if invariants.max_selected != default_invariant_max_selected() {
+        writeln!(output, "max_selected = {}", invariants.max_selected).expect("write to string");
+    }
+    if !invariants.include_task_summary {
+        output.push_str("include_task_summary = false\n");
+    }
+    output.push('\n');
+
+    if invariants.selector != InvariantSelectorConfig::default() {
+        output.push_str("[invariants.selector]\n");
+        if let Some(profile) = &invariants.selector.model_profile {
+            writeln!(output, "model_profile = {}", toml_string(profile)).expect("write to string");
+        }
+        if let Some(timeout) = invariants.selector.initial_timeout_ms {
+            writeln!(output, "initial_timeout_ms = {timeout}").expect("write to string");
+        }
+        if let Some(timeout) = invariants.selector.background_timeout_ms {
+            writeln!(output, "background_timeout_ms = {timeout}").expect("write to string");
+        }
+        if invariants.selector.wait_for_background_on_next_prompt {
+            output.push_str("wait_for_background_on_next_prompt = true\n");
+        }
+        if invariants.selector.cancel_on_timeout {
+            output.push_str("cancel_on_timeout = true\n");
+        }
+        if invariants.selector.cancel_stale {
+            output.push_str("cancel_stale = true\n");
+        }
+        if invariants.selector.on_timeout != InvariantSelectorTimeoutPolicy::Full {
+            writeln!(
+                output,
+                "on_timeout = {}",
+                toml_string(match invariants.selector.on_timeout {
+                    InvariantSelectorTimeoutPolicy::Full => "full",
+                    InvariantSelectorTimeoutPolicy::Previous => "previous",
+                    InvariantSelectorTimeoutPolicy::Deterministic => "deterministic",
+                    InvariantSelectorTimeoutPolicy::None => "none",
+                })
+            )
+            .expect("write to string");
         }
         output.push('\n');
     }
@@ -5826,11 +5998,12 @@ fn read_config(path: &Path) -> Result<BcodeConfig, ConfigError> {
 mod tests {
     use super::{
         BcodeConfig, CompactionBackend, CompactionMode, ConfigDocSchema, ConfigEnvironmentSnapshot,
-        ConfigError, ConfigLoadOverrides, ContextStrategyMode, FieldDoc, NestedFieldDoc,
-        TuiAccentTransitionCurve, TuiMouseConfig, default_config_paths_from,
-        default_permissions_state_path, load_config_from_paths,
-        load_config_from_paths_with_overrides, load_permissions_state_from, merge_config_values,
-        plugin_selection_with_default_plugin_ids, upsert_agent_permission_rule,
+        ConfigError, ConfigLoadOverrides, ContextStrategyMode, FieldDoc, InvariantGuidanceMode,
+        InvariantSelectorTimeoutPolicy, InvariantsConfig, NestedFieldDoc, TuiAccentTransitionCurve,
+        TuiMouseConfig, default_config_paths_from, default_permissions_state_path,
+        load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
+        merge_config_values, plugin_selection_with_default_plugin_ids,
+        upsert_agent_permission_rule,
     };
     use bcode_agent_policy_models::Action;
     use bcode_plugin::{PluginSelection, PluginSelectionMode};
@@ -6861,6 +7034,96 @@ disabled = ["vim_edit.apply"]
             9_000
         );
         assert!(!parsed.system_prompt.sections.repository_invariants);
+    }
+
+    #[test]
+    fn resolves_named_model_profile_without_active_profile_environment() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[model.profiles.fast]
+provider_plugin_id = "bcode.fast"
+model_id = "fast-model"
+auth_profile = "fast-auth"
+"#,
+        )
+        .expect("profile config");
+
+        let selection = config.resolved_model_profile("fast").expect("selection");
+        assert_eq!(selection.provider_plugin_id.as_deref(), Some("bcode.fast"));
+        assert_eq!(selection.model_id.as_deref(), Some("fast-model"));
+        assert_eq!(selection.auth_profile.as_deref(), Some("fast-auth"));
+        assert_eq!(selection.model_profile.as_deref(), Some("fast"));
+        assert!(config.resolved_model_profile("missing").is_none());
+    }
+
+    #[test]
+    fn invariant_guidance_defaults_to_enabled_full_mode() {
+        let config = InvariantsConfig::default();
+        assert!(config.enabled);
+        assert_eq!(config.mode, InvariantGuidanceMode::Full);
+        assert_eq!(config.max_selected.get(), 6);
+        assert!(config.selector.initial_timeout_ms.is_none());
+        assert!(config.selector.background_timeout_ms.is_none());
+        assert!(!config.selector.cancel_on_timeout);
+        assert!(!config.selector.cancel_stale);
+    }
+
+    #[test]
+    fn invariant_kill_switch_serializes_without_selector_settings() {
+        let mut config = BcodeConfig::default();
+        config.invariants.enabled = false;
+        let rendered = super::config_to_toml(&config);
+        assert!(
+            rendered.contains("[invariants]\nenabled = false"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("[invariants.selector]"), "{rendered}");
+    }
+
+    #[test]
+    fn invariant_guidance_config_round_trips() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[invariants]
+enabled = true
+mode = "relevant"
+max_selected = 4
+include_task_summary = false
+
+[invariants.selector]
+model_profile = "fast"
+initial_timeout_ms = 2000
+background_timeout_ms = 10000
+cancel_on_timeout = true
+cancel_stale = true
+wait_for_background_on_next_prompt = true
+on_timeout = "deterministic"
+"#,
+        )
+        .expect("invariant config parses");
+        let rendered = super::config_to_toml(&config);
+        assert!(rendered.contains("[invariants]"), "{rendered}");
+        assert!(rendered.contains("mode = \"relevant\""), "{rendered}");
+        assert!(rendered.contains("[invariants.selector]"), "{rendered}");
+        let parsed: BcodeConfig = toml::from_str(&rendered).expect("rendered config parses");
+        assert_eq!(parsed.invariants.mode, InvariantGuidanceMode::Relevant);
+        assert_eq!(parsed.invariants.max_selected.get(), 4);
+        assert_eq!(
+            parsed.invariants.selector.model_profile.as_deref(),
+            Some("fast")
+        );
+        assert!(parsed.invariants.selector.cancel_on_timeout);
+        assert!(parsed.invariants.selector.cancel_stale);
+        assert!(
+            parsed
+                .invariants
+                .selector
+                .wait_for_background_on_next_prompt
+        );
+        assert_eq!(
+            parsed.invariants.selector.on_timeout,
+            InvariantSelectorTimeoutPolicy::Deterministic
+        );
     }
 
     #[test]

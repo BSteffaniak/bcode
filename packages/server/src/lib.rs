@@ -11,6 +11,7 @@
 
 pub(crate) mod context_accounting;
 pub(crate) mod context_compaction;
+mod invariant_guidance;
 mod model_ignores;
 mod runtime_work;
 mod session_migration_adapter;
@@ -67,7 +68,8 @@ use bcode_model::{
     ImageRefContent, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList, ModelMessage,
     ModelParameters, ModelTurnRequest, OP_AUTH_USAGE, OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS,
     OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
-    ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
+    ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage, ToolCallRequestPolicy,
+    ToolChoice,
 };
 use bcode_plugin::{
     PluginInvocationBridge, PluginInvocationScope, StreamingServiceInvocationEvent,
@@ -197,6 +199,23 @@ type ActivePresentationUpdateKey = (SessionId, String, bcode_tool::ToolPresentat
 type ActivePresentationUpdates =
     Arc<StdMutex<BTreeMap<ActivePresentationUpdateKey, bcode_tool::ToolPresentationUpdate>>>;
 
+#[derive(Debug, Clone)]
+struct InvariantSelectorModel {
+    provider_plugin_id: Option<String>,
+    model_id: String,
+    provider_context: bcode_model::ProviderRequestContext,
+}
+
+#[derive(Clone)]
+struct InvariantSelectorRuntime {
+    plugins: bcode_plugin::PluginRuntimeHost,
+    config: bcode_config::InvariantsConfig,
+    model: InvariantSelectorModel,
+    guidance: Arc<Mutex<BTreeMap<SessionId, invariant_guidance::InvariantGuidance>>>,
+    full_fallback: Arc<Mutex<BTreeSet<SessionId>>>,
+    generations: Arc<Mutex<BTreeMap<SessionId, u64>>>,
+}
+
 #[derive(Debug)]
 pub struct ServerState {
     pub sessions: SessionManager,
@@ -221,6 +240,12 @@ pub struct ServerState {
     model_streaming: bcode_config::StreamingConfig,
     model_retry: bcode_config::ModelRetryConfig,
     auto_compaction: bcode_config::CompactionConfig,
+    invariants: bcode_config::InvariantsConfig,
+    invariant_selector_model: Option<InvariantSelectorModel>,
+    invariant_guidance: Arc<Mutex<BTreeMap<SessionId, invariant_guidance::InvariantGuidance>>>,
+    invariant_full_fallback: Arc<Mutex<BTreeSet<SessionId>>>,
+    invariant_guidance_generation: Arc<Mutex<BTreeMap<SessionId, u64>>>,
+    invariant_background_tasks: Mutex<BTreeMap<SessionId, JoinHandle<()>>>,
     system_prompt: bcode_config::SystemPromptConfig,
     skills: Option<SkillRegistry>,
     skill_context_bytes: Option<usize>,
@@ -1228,6 +1253,8 @@ struct ServerStateInit {
     model_streaming: bcode_config::StreamingConfig,
     model_retry: bcode_config::ModelRetryConfig,
     auto_compaction: bcode_config::CompactionConfig,
+    invariants: bcode_config::InvariantsConfig,
+    invariant_selector_model: Option<InvariantSelectorModel>,
     system_prompt: bcode_config::SystemPromptConfig,
     skills: Option<SkillRegistry>,
     skill_context_bytes: Option<usize>,
@@ -1352,6 +1379,12 @@ impl ServerState {
             model_streaming: init.model_streaming,
             model_retry: init.model_retry,
             auto_compaction: init.auto_compaction,
+            invariants: init.invariants,
+            invariant_selector_model: init.invariant_selector_model,
+            invariant_guidance: Arc::new(Mutex::new(BTreeMap::new())),
+            invariant_full_fallback: Arc::new(Mutex::new(BTreeSet::new())),
+            invariant_guidance_generation: Arc::new(Mutex::new(BTreeMap::new())),
+            invariant_background_tasks: Mutex::new(BTreeMap::new()),
             system_prompt: init.system_prompt,
             skills: init.skills,
             skill_context_bytes: init.skill_context_bytes,
@@ -2174,6 +2207,504 @@ fn merge_json_values(base: &mut serde_json::Value, overlay: serde_json::Value) {
     }
 }
 
+fn resolve_invariant_selector_model(
+    config: &bcode_config::BcodeConfig,
+    active: &bcode_config::ResolvedModelSelection,
+) -> Option<InvariantSelectorModel> {
+    if !config.invariants.enabled
+        || config.invariants.mode != bcode_config::InvariantGuidanceMode::Relevant
+    {
+        return None;
+    }
+    let selection = if let Some(profile_name) = config.invariants.selector.model_profile.as_deref()
+    {
+        config.resolved_model_profile(profile_name)?
+    } else {
+        active.clone()
+    };
+    let provider_context = bcode_provider_auth::resolve_provider_request_context(
+        bcode_provider_auth::ProviderRequestContextResolution {
+            config,
+            selection: selection.clone(),
+        },
+    );
+    Some(InvariantSelectorModel {
+        provider_plugin_id: selection.provider_plugin_id,
+        model_id: selection.model_id.unwrap_or_default(),
+        provider_context,
+    })
+}
+
+fn invariant_selector_runtime(state: &ServerState) -> Option<InvariantSelectorRuntime> {
+    if !state.invariants.enabled
+        || state.invariants.mode != bcode_config::InvariantGuidanceMode::Relevant
+    {
+        return None;
+    }
+    Some(InvariantSelectorRuntime {
+        plugins: state.plugins.clone(),
+        config: state.invariants.clone(),
+        model: state.invariant_selector_model.clone()?,
+        guidance: Arc::clone(&state.invariant_guidance),
+        full_fallback: Arc::clone(&state.invariant_full_fallback),
+        generations: Arc::clone(&state.invariant_guidance_generation),
+    })
+}
+
+async fn prepare_initial_invariant_guidance(
+    state: &ServerState,
+    session_id: SessionId,
+    trigger_event: &bcode_session_models::SessionEvent,
+) {
+    let Some(runtime) = invariant_selector_runtime(state) else {
+        return;
+    };
+    let Some(task) = user_message_text(trigger_event) else {
+        return;
+    };
+    let cwd = state
+        .sessions
+        .session_working_directory(session_id)
+        .await
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let Some(catalog) = read_invariant_catalog(&cwd, &state.system_prompt) else {
+        return;
+    };
+    let generation = next_invariant_generation(&runtime, session_id).await;
+    let result = run_invariant_selector(
+        &runtime,
+        session_id,
+        &catalog,
+        task,
+        trigger_event.sequence,
+        state.invariants.selector.initial_timeout_ms,
+    )
+    .await;
+    if matches!(result, InvariantSelectorRun::TimedOut)
+        && state.invariants.selector.on_timeout
+            == bcode_config::InvariantSelectorTimeoutPolicy::Full
+    {
+        state
+            .invariant_full_fallback
+            .lock()
+            .await
+            .insert(session_id);
+        return;
+    }
+    apply_invariant_selector_result(&runtime, session_id, generation, &catalog, task, result).await;
+}
+
+struct BackgroundInvariantGuidanceWork {
+    runtime: InvariantSelectorRuntime,
+    catalog: invariant_guidance::InvariantCatalog,
+    task: String,
+    source_sequence: u64,
+    generation: u64,
+    timeout: Option<std::num::NonZeroU64>,
+}
+
+async fn prepare_background_invariant_guidance_work(
+    state: &ServerState,
+    session_id: SessionId,
+    source_sequence: u64,
+    assistant_output: Option<&str>,
+) -> Option<BackgroundInvariantGuidanceWork> {
+    let runtime = invariant_selector_runtime(state)?;
+    let history = state
+        .sessions
+        .model_context_events(session_id)
+        .await
+        .unwrap_or_default();
+    let task = completed_turn_selection_text(&history, assistant_output);
+    if task.trim().is_empty() {
+        return None;
+    }
+    let cwd = state
+        .sessions
+        .session_working_directory(session_id)
+        .await
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let catalog = read_invariant_catalog(&cwd, &state.system_prompt)?;
+    if let Some(previous) = state.invariant_guidance.lock().await.get(&session_id)
+        && previous.catalog_digest == catalog.digest
+        && previous.source_sequence >= source_sequence
+    {
+        return None;
+    }
+    let generation = next_invariant_generation(&runtime, session_id).await;
+    Some(BackgroundInvariantGuidanceWork {
+        timeout: runtime.config.selector.background_timeout_ms,
+        runtime,
+        catalog,
+        task,
+        source_sequence,
+        generation,
+    })
+}
+
+async fn launch_background_invariant_guidance(
+    state: &ServerState,
+    session_id: SessionId,
+    work: BackgroundInvariantGuidanceWork,
+) {
+    if work.runtime.config.selector.cancel_stale
+        && let Some(task) = state
+            .invariant_background_tasks
+            .lock()
+            .await
+            .remove(&session_id)
+    {
+        task.abort();
+    }
+    let handle = tokio::spawn(async move {
+        let result = run_invariant_selector(
+            &work.runtime,
+            session_id,
+            &work.catalog,
+            &work.task,
+            work.source_sequence,
+            work.timeout,
+        )
+        .await;
+        apply_invariant_selector_result(
+            &work.runtime,
+            session_id,
+            work.generation,
+            &work.catalog,
+            &work.task,
+            result,
+        )
+        .await;
+    });
+    state
+        .invariant_background_tasks
+        .lock()
+        .await
+        .insert(session_id, handle);
+}
+
+fn invariant_guidance_state_path(state_root: &Path, session_id: SessionId) -> PathBuf {
+    state_root
+        .join("invariant-guidance")
+        .join(format!("{session_id}.json"))
+}
+
+fn invariant_guidance_state_dir(session_id: SessionId) -> PathBuf {
+    invariant_guidance_state_path(&bcode_config::default_state_dir(), session_id)
+}
+
+fn load_persisted_invariant_guidance(
+    session_id: SessionId,
+) -> Option<invariant_guidance::InvariantGuidance> {
+    let contents = fs::read_to_string(invariant_guidance_state_dir(session_id)).ok()?;
+    serde_json::from_str(&contents).ok()
+}
+
+fn write_invariant_guidance_path(
+    path: &Path,
+    guidance: &invariant_guidance::InvariantGuidance,
+) -> bool {
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    if fs::create_dir_all(parent).is_err() {
+        return false;
+    }
+    let Ok(contents) = serde_json::to_vec(guidance) else {
+        return false;
+    };
+    let temporary = path.with_extension("json.tmp");
+    fs::write(&temporary, contents).is_ok() && fs::rename(temporary, path).is_ok()
+}
+
+fn persist_invariant_guidance(
+    session_id: SessionId,
+    guidance: &invariant_guidance::InvariantGuidance,
+) {
+    let _ = write_invariant_guidance_path(&invariant_guidance_state_dir(session_id), guidance);
+}
+
+fn clear_persisted_invariant_guidance(session_id: SessionId) {
+    let _ = fs::remove_file(invariant_guidance_state_dir(session_id));
+}
+
+fn user_message_text(event: &bcode_session_models::SessionEvent) -> Option<&str> {
+    match &event.kind {
+        SessionEventKind::UserMessage { text, .. } => Some(text),
+        _ => None,
+    }
+}
+
+fn completed_turn_selection_text(
+    history: &[bcode_session_models::SessionEvent],
+    assistant_output: Option<&str>,
+) -> String {
+    let user = history
+        .iter()
+        .rev()
+        .find_map(user_message_text)
+        .unwrap_or_default();
+    assistant_output
+        .filter(|output| !output.trim().is_empty())
+        .map_or_else(
+            || user.to_string(),
+            |output| format!("Latest user request:\n{user}\n\nFinal assistant response:\n{output}"),
+        )
+}
+
+fn read_invariant_catalog(
+    cwd: &Path,
+    system_prompt: &bcode_config::SystemPromptConfig,
+) -> Option<invariant_guidance::InvariantCatalog> {
+    let root = discover_git_root(cwd).unwrap_or_else(|| cwd.to_path_buf());
+    let contents = fs::read_to_string(root.join(REPOSITORY_INVARIANTS_FILE)).ok()?;
+    let contents = system_prompt.repository_invariants_max_chars.map_or_else(
+        || contents.trim().to_string(),
+        |limit| truncate_repository_invariants(contents.trim(), limit.get()),
+    );
+    invariant_guidance::parse_catalog(&contents)
+}
+
+#[allow(clippy::significant_drop_tightening)]
+async fn next_invariant_generation(
+    runtime: &InvariantSelectorRuntime,
+    session_id: SessionId,
+) -> u64 {
+    let mut generations = runtime.generations.lock().await;
+    let generation = generations.entry(session_id).or_default();
+    *generation = generation.saturating_add(1);
+    *generation
+}
+
+enum InvariantSelectorRun {
+    Selected(invariant_guidance::InvariantGuidance),
+    TimedOut,
+    Failed,
+}
+
+async fn run_invariant_selector(
+    runtime: &InvariantSelectorRuntime,
+    session_id: SessionId,
+    catalog: &invariant_guidance::InvariantCatalog,
+    task: &str,
+    source_sequence: u64,
+    timeout_ms: Option<std::num::NonZeroU64>,
+) -> InvariantSelectorRun {
+    let prompt = format!(
+        "Select the repository invariants most relevant to the task. Return JSON only with shape {{\"task_summary\":\"brief summary\",\"selected\":[1,2]}}. Select at most {} entries. Use only the exact numeric references below.\n\nTask/progress:\n{}\n\nInvariant catalog:\n{}",
+        runtime.config.max_selected,
+        task,
+        invariant_guidance::selector_catalog(catalog),
+    );
+    let parameters = ModelParameters {
+        max_output_tokens: Some(512),
+        ..ModelParameters::default()
+    };
+    let request = ModelTurnRequest {
+        session_id,
+        turn_id: format!("invariant-selector-{session_id}-{source_sequence}"),
+        model_id: runtime.model.model_id.clone(),
+        provider_context: runtime.model.provider_context.clone(),
+        system_prompt: Some("You select relevant repository invariants. Return valid JSON only; do not explain your reasoning.".to_string()),
+        messages: vec![ModelMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::Text { text: prompt }],
+        }],
+        tools: Vec::new(),
+        tool_call_policy: ToolCallRequestPolicy {
+            parallel: Some(false),
+            choice: ToolChoice::None,
+        },
+        parameters,
+        structured_output: None,
+        context_management: bcode_model::ContextManagementRequest::default(),
+        prompt_cache: bcode_model::PromptCacheHints::default(),
+        conversation_reuse: bcode_model::ConversationReuseHints::default(),
+        metadata: BTreeMap::from([(
+            "bcode_request_kind".to_string(),
+            "invariant_selector".to_string(),
+        )]),
+    };
+    let response = if let Some(timeout_ms) = timeout_ms {
+        let active_turn = Arc::new(Mutex::new(None::<(String, String)>));
+        let task_runtime = runtime.clone();
+        let task_active_turn = Arc::clone(&active_turn);
+        let mut selector_task = tokio::spawn(async move {
+            collect_invariant_selector_output(&task_runtime, request, Some(task_active_turn)).await
+        });
+        if let Ok(joined) =
+            tokio::time::timeout(Duration::from_millis(timeout_ms.get()), &mut selector_task).await
+        {
+            joined.unwrap_or_else(|error| Err(error.to_string()))
+        } else {
+            if runtime.config.selector.cancel_on_timeout
+                && let Some((provider, provider_turn_id)) = active_turn.lock().await.clone()
+            {
+                let _ = runtime
+                    .plugins
+                    .invoke_service_json::<_, bcode_model::AckResponse>(
+                        &provider,
+                        MODEL_PROVIDER_INTERFACE_ID,
+                        OP_CANCEL_TURN,
+                        &CancelTurnRequest { provider_turn_id },
+                    )
+                    .await;
+                selector_task.abort();
+            }
+            return InvariantSelectorRun::TimedOut;
+        }
+    } else {
+        collect_invariant_selector_output(runtime, request, None).await
+    };
+    let Ok(response) = response else {
+        return InvariantSelectorRun::Failed;
+    };
+    invariant_guidance::guidance_from_selector(
+        catalog,
+        &response,
+        runtime.config.max_selected.get(),
+        source_sequence,
+        runtime.config.include_task_summary,
+    )
+    .map_or(InvariantSelectorRun::Failed, InvariantSelectorRun::Selected)
+}
+
+type ActiveInvariantSelectorTurn = Arc<Mutex<Option<(String, String)>>>;
+
+async fn collect_invariant_selector_output(
+    runtime: &InvariantSelectorRuntime,
+    request: ModelTurnRequest,
+    active_turn: Option<ActiveInvariantSelectorTurn>,
+) -> Result<String, String> {
+    let provider = runtime.model.provider_plugin_id.clone().or_else(|| {
+        runtime
+            .plugins
+            .registry()
+            .service_registry()
+            .unique_provider(MODEL_PROVIDER_INTERFACE_ID)
+            .ok()
+            .map(ToString::to_string)
+    });
+    let Some(provider) = provider else {
+        return Err("no unique model provider is available for invariant selection".to_string());
+    };
+    let start = runtime
+        .plugins
+        .invoke_service_json::<_, StartTurnResponse>(
+            &provider,
+            MODEL_PROVIDER_INTERFACE_ID,
+            OP_START_TURN,
+            &request,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    if let Some(active_turn) = &active_turn {
+        *active_turn.lock().await = Some((provider.clone(), start.provider_turn_id.clone()));
+    }
+    let mut output = String::new();
+    let result = loop {
+        tokio::time::sleep(MODEL_POLL_INTERVAL).await;
+        let response = runtime
+            .plugins
+            .invoke_service_json::<_, PollTurnEventsResponse>(
+                &provider,
+                MODEL_PROVIDER_INTERFACE_ID,
+                OP_POLL_TURN_EVENTS,
+                &PollTurnEventsRequest {
+                    provider_turn_id: start.provider_turn_id.clone(),
+                },
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut finished = false;
+        for event in response.events {
+            match event {
+                ProviderTurnEvent::TextDelta { text } => output.push_str(&text),
+                ProviderTurnEvent::Error { error } => return Err(error.message),
+                ProviderTurnEvent::Cancelled => return Err("selector cancelled".to_string()),
+                ProviderTurnEvent::TurnFinished { stop_reason } => {
+                    if matches!(
+                        stop_reason,
+                        bcode_model::StopReason::Error | bcode_model::StopReason::Cancelled
+                    ) {
+                        return Err(format!("selector ended with {stop_reason:?}"));
+                    }
+                    finished = true;
+                }
+                _ => {}
+            }
+        }
+        if finished {
+            break Ok(output);
+        }
+    };
+    let _ = runtime
+        .plugins
+        .invoke_service_json::<_, bcode_model::AckResponse>(
+            &provider,
+            MODEL_PROVIDER_INTERFACE_ID,
+            OP_FINISH_TURN,
+            &FinishTurnRequest {
+                provider_turn_id: start.provider_turn_id,
+            },
+        )
+        .await;
+    result
+}
+
+async fn apply_invariant_selector_result(
+    runtime: &InvariantSelectorRuntime,
+    session_id: SessionId,
+    generation: u64,
+    catalog: &invariant_guidance::InvariantCatalog,
+    task: &str,
+    result: InvariantSelectorRun,
+) {
+    if runtime.generations.lock().await.get(&session_id).copied() != Some(generation) {
+        return;
+    }
+    let previous = runtime.guidance.lock().await.get(&session_id).cloned();
+    if matches!(result, InvariantSelectorRun::TimedOut)
+        && runtime.config.selector.on_timeout == bcode_config::InvariantSelectorTimeoutPolicy::Full
+    {
+        runtime.full_fallback.lock().await.insert(session_id);
+        return;
+    }
+    let guidance = match result {
+        InvariantSelectorRun::Selected(guidance) => Some(guidance),
+        InvariantSelectorRun::TimedOut => match runtime.config.selector.on_timeout {
+            bcode_config::InvariantSelectorTimeoutPolicy::Full
+            | bcode_config::InvariantSelectorTimeoutPolicy::None => None,
+            bcode_config::InvariantSelectorTimeoutPolicy::Previous => previous,
+            bcode_config::InvariantSelectorTimeoutPolicy::Deterministic => {
+                invariant_guidance::deterministic_guidance(
+                    catalog,
+                    task,
+                    runtime.config.max_selected.get(),
+                    generation,
+                )
+            }
+        },
+        InvariantSelectorRun::Failed => previous.or_else(|| {
+            invariant_guidance::deterministic_guidance(
+                catalog,
+                task,
+                runtime.config.max_selected.get(),
+                generation,
+            )
+        }),
+    };
+    let mut stored = runtime.guidance.lock().await;
+    runtime.full_fallback.lock().await.remove(&session_id);
+    if let Some(guidance) = guidance {
+        persist_invariant_guidance(session_id, &guidance);
+        stored.insert(session_id, guidance);
+    } else {
+        clear_persisted_invariant_guidance(session_id);
+        stored.remove(&session_id);
+    }
+}
+
 fn redact_plugin_config_value(value: &serde_json::Value) -> serde_json::Value {
     match value {
         serde_json::Value::Object(map) => serde_json::Value::Object(
@@ -2356,6 +2887,7 @@ async fn run_with_static_bundled_inner(
     );
     let configured_agent_ids: Vec<String> = config.agent.keys().cloned().collect();
     let skills = build_skill_registry(&config);
+    let invariant_selector_model = resolve_invariant_selector_model(&config, &resolved_model);
     let selected_provider_context = bcode_provider_auth::resolve_provider_request_context(
         bcode_provider_auth::ProviderRequestContextResolution {
             config: &config,
@@ -2388,6 +2920,8 @@ async fn run_with_static_bundled_inner(
             model_streaming: config.model.streaming,
             model_retry: config.model.retry,
             auto_compaction: config.model.compaction,
+            invariants: config.invariants,
+            invariant_selector_model,
             system_prompt: config.system_prompt,
             skill_context_bytes: config
                 .skills
@@ -12103,7 +12637,7 @@ impl ModelTurnCompletion {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn run_model_turn(
     state: &ServerState,
     permit: &mut SessionTurnPermit,
@@ -12135,6 +12669,40 @@ async fn run_model_turn(
     )
     .await;
     append_model_turn_started_event(state, session_id, turn_id.clone()).await;
+    if state.invariants.selector.wait_for_background_on_next_prompt
+        && let Some(task) = state
+            .invariant_background_tasks
+            .lock()
+            .await
+            .remove(&session_id)
+    {
+        let _ = task.await;
+    }
+    if state.invariants.enabled
+        && state.invariants.mode == bcode_config::InvariantGuidanceMode::Relevant
+        && !state
+            .invariant_guidance
+            .lock()
+            .await
+            .contains_key(&session_id)
+        && let Some(guidance) = load_persisted_invariant_guidance(session_id)
+    {
+        state
+            .invariant_guidance
+            .lock()
+            .await
+            .insert(session_id, guidance);
+    }
+    if state.invariants.enabled
+        && state.invariants.mode == bcode_config::InvariantGuidanceMode::Relevant
+        && !state
+            .invariant_guidance
+            .lock()
+            .await
+            .contains_key(&session_id)
+    {
+        prepare_initial_invariant_guidance(state, session_id, trigger_event).await;
+    }
     set_runtime_phase(phase, SessionRuntimePhase::ProviderActive).await;
     service_runtime_priority_commands(state, session_id, command_context).await;
     let completion = Box::pin(run_model_turn_inner(
@@ -12167,7 +12735,21 @@ async fn run_model_turn(
         completion.message.clone(),
     )
     .await;
+    let background_guidance = if completion.outcome == ModelTurnOutcome::Completed {
+        prepare_background_invariant_guidance_work(
+            state,
+            session_id,
+            trigger_event.sequence,
+            completion.output.as_deref(),
+        )
+        .await
+    } else {
+        None
+    };
     service_runtime_priority_commands(state, session_id, command_context).await;
+    if let Some(work) = background_guidance {
+        launch_background_invariant_guidance(state, session_id, work).await;
+    }
     completion
 }
 
@@ -15291,9 +15873,19 @@ async fn prepare_static_model_turn_context(
     } else {
         String::new()
     };
+    let invariant_mode = state.invariants.enabled.then_some(state.invariants.mode);
+    let full_fallback = state
+        .invariant_full_fallback
+        .lock()
+        .await
+        .remove(&session_id);
     let (system_prompt, dynamic_system_context) = build_coding_system_prompt_parts(
         &working_directory,
         &state.system_prompt,
+        matches!(
+            invariant_mode,
+            Some(bcode_config::InvariantGuidanceMode::Full)
+        ) || full_fallback,
         agent_context
             .as_ref()
             .and_then(|context| context.system_prompt_suffix.as_deref()),
@@ -15305,6 +15897,23 @@ async fn prepare_static_model_turn_context(
             role: MessageRole::System,
             content: vec![ContentBlock::Text {
                 text: dynamic_system_context,
+            }],
+        });
+    }
+    if matches!(
+        invariant_mode,
+        Some(bcode_config::InvariantGuidanceMode::Relevant)
+    ) && let Some(guidance) = state
+        .invariant_guidance
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned()
+    {
+        system_messages.push(ModelMessage {
+            role: MessageRole::System,
+            content: vec![ContentBlock::Text {
+                text: invariant_guidance::format_reminder(&guidance),
             }],
         });
     }
@@ -16506,6 +17115,7 @@ const REPOSITORY_INVARIANTS_FILE: &str = "INVARIANTS.md";
 fn build_coding_system_prompt_parts(
     cwd: &Path,
     config: &bcode_config::SystemPromptConfig,
+    include_full_invariants: bool,
     agent_prompt_suffix: Option<&str>,
     skill_catalog: Option<&str>,
 ) -> (String, String) {
@@ -16520,7 +17130,8 @@ fn build_coding_system_prompt_parts(
         bcode_config::SystemPromptMode::Default => DEFAULT_CODING_SYSTEM_PROMPT.to_string(),
         bcode_config::SystemPromptMode::Replace => config.text.clone().unwrap_or_default(),
     };
-    if config.sections.repository_invariants
+    if include_full_invariants
+        && config.sections.repository_invariants
         && let Some(invariants) = read_repository_invariants(
             cwd,
             config
@@ -31961,6 +32572,7 @@ library = "test"
         let (stable, dynamic) = build_coding_system_prompt_parts(
             &cwd,
             &bcode_config::SystemPromptConfig::default(),
+            true,
             Some("agent suffix"),
             Some("<skills />"),
         );
@@ -31987,6 +32599,7 @@ library = "test"
         let (stable, _) = build_coding_system_prompt_parts(
             &cwd,
             &bcode_config::SystemPromptConfig::default(),
+            true,
             None,
             None,
         );
@@ -32006,7 +32619,7 @@ library = "test"
             ..bcode_config::SystemPromptConfig::default()
         };
 
-        let (stable, _) = build_coding_system_prompt_parts(&cwd, &config, None, None);
+        let (stable, _) = build_coding_system_prompt_parts(&cwd, &config, true, None, None);
 
         assert!(stable.contains("[truncated]"));
         assert!(stable.contains("Repository invariants truncated"));
@@ -32025,7 +32638,7 @@ library = "test"
         config.sections.agent_suffix = false;
         config.sections.skill_catalog = false;
 
-        let (stable, dynamic) = build_coding_system_prompt_parts(&cwd, &config, None, None);
+        let (stable, dynamic) = build_coding_system_prompt_parts(&cwd, &config, true, None, None);
 
         assert!(stable.starts_with("custom base"));
         assert!(stable.contains("Repository invariants:"));
@@ -32039,10 +32652,43 @@ library = "test"
         let mut config = bcode_config::SystemPromptConfig::default();
         config.sections.repository_invariants = false;
 
-        let (stable, _) = build_coding_system_prompt_parts(&cwd, &config, None, None);
+        let (stable, _) = build_coding_system_prompt_parts(&cwd, &config, true, None, None);
 
         assert!(!stable.contains("Repository invariants:"));
         assert!(stable.contains("Stable repository context:"));
+    }
+
+    #[test]
+    fn invariant_guidance_sidecar_round_trips_without_event_replay() {
+        let root = tempfile::tempdir().expect("temp state");
+        let session_id = SessionId::new();
+        let catalog = invariant_guidance::parse_catalog(
+            "# Invariants\n\n## Rendering\n\n* **Neutral.** Keep it portable.",
+        )
+        .expect("catalog");
+        let guidance = invariant_guidance::InvariantGuidance {
+            catalog_digest: catalog.digest,
+            task_summary: Some("rendering".to_string()),
+            selected: catalog.entries,
+            source_sequence: 8,
+        };
+        let path = invariant_guidance_state_path(root.path(), session_id);
+
+        assert!(write_invariant_guidance_path(&path, &guidance));
+        let loaded: invariant_guidance::InvariantGuidance =
+            serde_json::from_slice(&fs::read(path).expect("sidecar")).expect("decode");
+        assert_eq!(loaded, guidance);
+    }
+
+    #[test]
+    fn coding_system_prompt_relevant_mode_omits_complete_catalog() {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let config = bcode_config::SystemPromptConfig::default();
+
+        let (stable, _) = build_coding_system_prompt_parts(&cwd, &config, false, None, None);
+
+        assert!(!stable.contains("Repository invariants:"));
+        assert!(!stable.contains("Shared rendering remains renderer-neutral"));
     }
 
     #[test]
@@ -37274,6 +37920,8 @@ library = "test"
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
+                invariants: bcode_config::InvariantsConfig::default(),
+                invariant_selector_model: None,
                 skills: None,
                 skill_context_bytes: Some(0),
                 skill_preview_max_chars: 2_000,
@@ -44691,6 +45339,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
+                invariants: bcode_config::InvariantsConfig::default(),
+                invariant_selector_model: None,
                 skills: None,
                 skill_context_bytes: Some(0),
                 skill_preview_max_chars: 2_000,
@@ -45376,6 +46026,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 model_streaming: bcode_config::StreamingConfig::default(),
                 model_retry: bcode_config::ModelRetryConfig::default(),
                 auto_compaction: bcode_config::CompactionConfig::default(),
+                invariants: bcode_config::InvariantsConfig::default(),
+                invariant_selector_model: None,
                 skills: None,
                 skill_context_bytes: Some(0),
                 skill_preview_max_chars: 2_000,
