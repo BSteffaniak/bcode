@@ -185,7 +185,7 @@ pub enum ClientError {
     Server { code: String, message: String },
     #[error("client request timed out after {timeout:?}")]
     RequestTimeout { timeout: Duration },
-    #[error("daemon executable identity mismatch: {message}")]
+    #[error("incompatible daemon: {message}")]
     IncompatibleDaemon { message: String },
     #[error("unexpected response payload")]
     UnexpectedResponse,
@@ -989,8 +989,6 @@ impl BcodeClient {
     }
 
     fn verify_daemon_identity(status: &bcode_ipc::DaemonStatus) -> Result<(), ClientError> {
-        let (_path, digest) = bcode_daemon_lifecycle::current_executable_identity()
-            .map_err(DaemonStartError::from)?;
         let expected_namespace = bcode_ipc::daemon_namespace();
         let expected_protocol = u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION);
         let expected_writer_epoch = bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH;
@@ -998,7 +996,6 @@ impl BcodeClient {
         if status.namespace == expected_namespace
             && status.protocol_version == expected_protocol
             && status.build_fingerprint == bcode_ipc::BUILD_FINGERPRINT
-            && status.executable_digest.as_deref() == Some(digest.as_str())
             && status.storage_writer_epoch == Some(expected_writer_epoch)
             && status.session_event_schema_version == Some(expected_event_schema)
         {
@@ -1006,7 +1003,7 @@ impl BcodeClient {
         }
         Err(ClientError::IncompatibleDaemon {
             message: format!(
-                "client expects namespace={expected_namespace} protocol={expected_protocol} build={} executable={digest} session_event_schema={expected_event_schema} storage_writer_epoch={expected_writer_epoch}; daemon reported namespace={} protocol={} build={} executable={} session_event_schema={} storage_writer_epoch={}",
+                "client expects namespace={expected_namespace} protocol={expected_protocol} build={} session_event_schema={expected_event_schema} storage_writer_epoch={expected_writer_epoch}; daemon reported namespace={} protocol={} build={} executable={} session_event_schema={} storage_writer_epoch={}",
                 bcode_ipc::BUILD_FINGERPRINT,
                 status.namespace,
                 status.protocol_version,
@@ -3510,6 +3507,18 @@ mod client_timeout_tests {
     }
 
     #[test]
+    fn daemon_identity_accepts_same_build_with_different_executable_digest() {
+        let matching = matching_daemon_status();
+        let resigned = bcode_ipc::DaemonStatus {
+            executable_digest: Some("different-signed-executable-digest".to_owned()),
+            ..matching
+        };
+
+        BcodeClient::verify_daemon_identity(&resigned)
+            .expect("executable digest is diagnostic, not a compatibility boundary");
+    }
+
+    #[test]
     fn daemon_identity_matrix_rejects_every_incompatible_capability() {
         let matching = matching_daemon_status();
         BcodeClient::verify_daemon_identity(&matching).expect("matching daemon");
@@ -3521,10 +3530,6 @@ mod client_timeout_tests {
             },
             bcode_ipc::DaemonStatus {
                 build_fingerprint: "other-build".to_owned(),
-                ..matching.clone()
-            },
-            bcode_ipc::DaemonStatus {
-                executable_digest: Some("other-digest".to_owned()),
                 ..matching.clone()
             },
             bcode_ipc::DaemonStatus {
