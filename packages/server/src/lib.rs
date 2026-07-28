@@ -11163,6 +11163,7 @@ async fn start_workflow(
     state: &Arc<ServerState>,
     request: bcode_ipc::WorkflowStartRequest,
 ) -> Result<bcode_ipc::WorkflowRunStartResponse, ServerError> {
+    let started_at = std::time::Instant::now();
     validate_workflow_definition_for_production(state, &request.definition)?;
     if request.identity.kind != request.binding.workflow_kind {
         return Err(WorkflowStoreError::InvalidData(
@@ -11198,7 +11199,7 @@ async fn start_workflow(
         )
         .into());
     }
-    start_workflow_run(
+    let result = start_workflow_run(
         state,
         bcode_ipc::WorkflowRunStartRequest {
             definition_id: request.identity.definition_id,
@@ -11211,7 +11212,16 @@ async fn start_workflow(
             limits: request.limits,
         },
     )
-    .await
+    .await;
+    state.metrics.record_histogram_with_labels(
+        "workflow.admission.duration_ms",
+        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        BTreeMap::from([(
+            "outcome".to_string(),
+            if result.is_ok() { "ok" } else { "error" }.to_string(),
+        )]),
+    );
+    result
 }
 
 async fn handle_start_workflow(
@@ -11318,6 +11328,7 @@ async fn start_workflow_run(
 }
 
 async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<(), ServerError> {
+    let started_at = std::time::Instant::now();
     let store_path = state
         .workflow_store
         .lock()
@@ -11325,6 +11336,7 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
         .path()
         .to_path_buf();
     loop {
+        let iteration_started_at = std::time::Instant::now();
         let settled = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
             .settle_pending_control_nodes(run_id, 1_000, current_unix_millis())?;
         let owner = WorkflowActivationOwner { state };
@@ -11338,10 +11350,18 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
                 "workflow run has pending activations without a production owner"
             );
         }
+        state.metrics.record_histogram(
+            "workflow.scheduler.iteration.duration_ms",
+            u64::try_from(iteration_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
         if settled.settled.is_empty() && dispatched.admitted.is_empty() {
             break;
         }
     }
+    state.metrics.record_histogram(
+        "workflow.scheduler.drive.duration_ms",
+        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
     Ok(())
 }
 
@@ -22892,6 +22912,7 @@ async fn dispatch_workflow_plugin_block(
     state: &Arc<ServerState>,
     request: &bcode_workflow_store::PreparedActivationDispatch,
 ) -> Result<serde_json::Value, WorkflowStoreError> {
+    let started_at = std::time::Instant::now();
     let block: bcode_workflow::WorkflowBlockDefinition =
         serde_json::from_value(request.activation.node.configuration.clone())?;
     let run = state
@@ -23011,6 +23032,33 @@ async fn dispatch_workflow_plugin_block(
         message.clone(),
     )
     .await;
+    state.metrics.record_histogram_with_labels(
+        "workflow.block.execution.duration_ms",
+        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        BTreeMap::from([
+            ("plugin_id".to_string(), block.plugin_id.clone()),
+            ("block_id".to_string(), block.block_id.clone()),
+            ("effect".to_string(), format!("{:?}", block.effect)),
+            (
+                "reconciliation".to_string(),
+                format!("{:?}", block.reconciliation),
+            ),
+            ("status".to_string(), status.to_string()),
+        ]),
+    );
+    tracing::debug!(
+        run_id = %request.activation.run_id,
+        node_id = %request.activation.node_id,
+        activation_id = %request.activation.activation_id,
+        attempt = request.attempt,
+        dispatch_identity = %request.dispatch_identity,
+        plugin_id = %block.plugin_id,
+        block_id = %block.block_id,
+        effect = ?block.effect,
+        reconciliation = ?block.reconciliation,
+        status,
+        "workflow plugin block terminal observation"
+    );
     Ok(serde_json::json!({
         "owner": bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID,
         "plugin_id": block.plugin_id,
