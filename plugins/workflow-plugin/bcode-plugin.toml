@@ -17,6 +17,11 @@ interface_id = "bcode.session-status/v1"
 name         = "Workflow Session Status"
 
 [[tui_surfaces]]
+description = "Configure and preview a plugin-owned workflow template before start"
+kind        = "workflow.author"
+title       = "Workflow Authoring"
+
+[[tui_surfaces]]
 description = "Inspect workflow graph, attempts, waits, grants, artifacts, and child work"
 kind        = "workflow.status"
 title       = "Workflow Status"

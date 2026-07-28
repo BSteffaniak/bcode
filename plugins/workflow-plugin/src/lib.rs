@@ -57,6 +57,21 @@ fn command_contributions() -> Vec<CommandContribution> {
             "List registered workflows",
         ),
         (
+            "workflow.templates",
+            "Workflow: Templates",
+            "List available workflow templates",
+        ),
+        (
+            "workflow.template-describe",
+            "Workflow: Configure Template",
+            "Describe and configure an exact workflow template",
+        ),
+        (
+            "workflow.template-start",
+            "Workflow: Start Template",
+            "Start a validated workflow template",
+        ),
+        (
             "workflow.register",
             "Workflow: Register",
             "Register a compiled workflow definition",
@@ -196,6 +211,65 @@ pub(crate) async fn execute_command(
                 definitions.len(),
                 blocks.len()
             )
+        }
+        "workflow.templates" => {
+            let templates = client
+                .list_workflow_templates(QUERY_LIMIT)
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert(
+                "templates".to_string(),
+                serde_json::to_value(&templates).map_err(|error| error.to_string())?,
+            );
+            format!("{} available workflow templates", templates.len())
+        }
+        "workflow.template-describe" => {
+            let owner_plugin_id = required_arg(&request, "owner_plugin_id")?;
+            let template_id = required_arg(&request, "template_id")?;
+            let template_version = parse_arg::<u32>(&request, "template_version")?;
+            let template = client
+                .describe_workflow_template(owner_plugin_id, template_id, template_version)
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "workflow template not found or disabled".to_string())?;
+            options.insert(
+                "template".to_string(),
+                serde_json::to_value(&template).map_err(|error| error.to_string())?,
+            );
+            if let Some(session_id) = request.args.get("session_id") {
+                options.insert("session_id".to_string(), serde_json::json!(session_id));
+            }
+            if let Some(configuration) = request.args.get("configuration") {
+                let configuration = serde_json::from_str(configuration)
+                    .map_err(|error| format!("invalid template configuration JSON: {error}"))?;
+                options.insert("configuration".to_string(), configuration);
+            }
+            format!(
+                "workflow template {} v{}",
+                template.template.template_id, template.template.template_version
+            )
+        }
+        "workflow.template-start" => {
+            let owner_plugin_id = required_arg(&request, "owner_plugin_id")?;
+            let template_id = required_arg(&request, "template_id")?;
+            let template_version = parse_arg::<u32>(&request, "template_version")?;
+            let configuration = serde_json::from_str(&required_arg(&request, "configuration")?)
+                .map_err(|error| format!("invalid template configuration JSON: {error}"))?;
+            let parent_session_id = parse_arg(&request, "session_id")?;
+            let started = client
+                .start_workflow_template(bcode_ipc::WorkflowTemplateStartRequest {
+                    owner_plugin_id,
+                    template_id,
+                    template_version,
+                    run_id: request.args.get("run_id").cloned(),
+                    parent_session_id,
+                    configuration,
+                    limits: bcode_workflow_store::WorkflowRunLimits::default(),
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert("runs".to_string(), serde_json::json!([started.run]));
+            "workflow template started".to_string()
         }
         "workflow.register" => {
             let definition_id = required_arg(&request, "definition_id")?;
@@ -470,6 +544,9 @@ mod tests {
             .collect::<BTreeSet<_>>();
         for expected in [
             "workflow.list",
+            "workflow.templates",
+            "workflow.template-describe",
+            "workflow.template-start",
             "workflow.register",
             "workflow.run",
             "workflow.status",

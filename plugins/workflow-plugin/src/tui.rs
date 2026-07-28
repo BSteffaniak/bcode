@@ -12,12 +12,188 @@ use bmux_tui::style::{Color, Style};
 use bmux_tui::text::Line;
 
 pub const WORKFLOW_STATUS_SURFACE_KIND: &str = "workflow.status";
+pub const WORKFLOW_AUTHOR_SURFACE_KIND: &str = "workflow.author";
 
 #[must_use]
 pub fn tui_registry() -> PluginTuiRegistry {
     let mut registry = PluginTuiRegistry::default();
     registry.register_factory(Box::new(WorkflowStatusFactory));
+    registry.register_factory(Box::new(WorkflowAuthorFactory));
     registry
+}
+
+#[derive(Debug)]
+struct WorkflowAuthorFactory;
+
+impl PluginTuiSurfaceFactory for WorkflowAuthorFactory {
+    fn surface_kind(&self) -> &'static str {
+        WORKFLOW_AUTHOR_SURFACE_KIND
+    }
+
+    fn open(&self, request: PluginTuiSurfaceOpenRequest) -> PluginTuiSurfaceFuture {
+        Box::pin(async move {
+            Ok(Box::new(WorkflowAuthorSurface {
+                options: request.options,
+            }) as BoxedPluginTuiSurface)
+        })
+    }
+}
+
+#[derive(Debug)]
+struct WorkflowAuthorSurface {
+    options: serde_json::Value,
+}
+
+impl PluginTuiSurface for WorkflowAuthorSurface {
+    fn id(&self) -> &'static str {
+        "bcode.workflow-author"
+    }
+
+    fn title(&self) -> &'static str {
+        "Workflow Authoring"
+    }
+
+    fn render(&mut self, area: Rect, frame: &mut Frame<'_>) {
+        frame.fill(area, " ", Style::new().fg(Color::White).bg(Color::Black));
+        for (offset, row) in author_lines(&self.options).into_iter().enumerate() {
+            if offset >= usize::from(area.height) {
+                break;
+            }
+            let offset = u16::try_from(offset).expect("workflow author has fewer than u16 rows");
+            frame.write_line(
+                Rect::new(area.x, area.y.saturating_add(offset), area.width, 1),
+                &Line::from(row),
+            );
+        }
+    }
+
+    fn handle_event(&mut self, event: &Event, _host: &dyn PluginTuiHost) -> PluginTuiAction {
+        match event {
+            Event::Key(key) if matches!(key.key, KeyCode::Escape | KeyCode::Char('q')) => {
+                PluginTuiAction::Close { outcome: None }
+            }
+            Event::Key(key) if key.key == KeyCode::Char('s') => {
+                template_start_command(&self.options).map_or(PluginTuiAction::None, |command| {
+                    PluginTuiAction::RunCommand { command }
+                })
+            }
+            _ => PluginTuiAction::None,
+        }
+    }
+}
+
+fn template_start_command(options: &serde_json::Value) -> Option<String> {
+    let template = options.get("template")?;
+    let owner = template.get("owner_plugin_id")?.as_str()?;
+    let contribution = template.get("template")?;
+    let template_id = contribution.get("template_id")?.as_str()?;
+    let version = contribution.get("template_version")?.as_u64()?;
+    let configuration = options.get("configuration")?;
+    let configuration = serde_json::to_string(configuration).ok()?;
+    let session_id = options.get("session_id")?.as_str()?;
+    Some(format!(
+        "/workflow template-start owner_plugin_id={owner} template_id={template_id} template_version={version} session_id={session_id} configuration={configuration}"
+    ))
+}
+
+fn author_lines(options: &serde_json::Value) -> Vec<String> {
+    let mut lines = vec!["Workflow template authoring".to_string(), String::new()];
+    let Some(description) = options.get("template") else {
+        lines.push("No template selected".to_string());
+        lines.push("Use /workflow template-describe with an exact template identity".to_string());
+        return lines;
+    };
+    let template = description
+        .get("template")
+        .unwrap_or(&serde_json::Value::Null);
+    lines.push(format!(
+        "{} · {} v{} · owner {}",
+        text(template, "title"),
+        text(template, "template_id"),
+        number(template, "template_version"),
+        text(description, "owner_plugin_id")
+    ));
+    lines.push(text(template, "description").to_string());
+    append_named_rows(
+        &mut lines,
+        description,
+        "diagnostics",
+        "Diagnostics",
+        |value| {
+            format!(
+                "  {} · {} · {}",
+                text(value, "code"),
+                text(value, "requirement"),
+                text(value, "message")
+            )
+        },
+    );
+    append_named_rows(
+        &mut lines,
+        template,
+        "required_plugins",
+        "Required plugins",
+        |value| format!("  {}", value.as_str().unwrap_or("-")),
+    );
+    append_named_rows(
+        &mut lines,
+        template,
+        "required_skills",
+        "Required skills",
+        |value| format!("  {}", value.as_str().unwrap_or("-")),
+    );
+    append_named_rows(
+        &mut lines,
+        template,
+        "required_capabilities",
+        "Required capabilities",
+        |value| format!("  {}", value.as_str().unwrap_or("-")),
+    );
+    if let Some(configuration) = options.get("configuration") {
+        lines.push("Validated configuration preview".to_string());
+        lines.push(format!("  {configuration}"));
+    }
+    lines.extend(effect_preview(template));
+    lines.push(String::new());
+    if description
+        .get("diagnostics")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(Vec::is_empty)
+        && options.get("configuration").is_some()
+    {
+        lines.push("s start exact template · Esc/q close".to_string());
+    } else {
+        lines.push("Resolve diagnostics and provide valid configuration before start".to_string());
+        lines.push("Esc/q close".to_string());
+    }
+    lines
+}
+
+fn effect_preview(template: &serde_json::Value) -> Vec<String> {
+    let blocks = template
+        .get("definition")
+        .and_then(|definition| definition.get("nodes"))
+        .and_then(serde_json::Value::as_object)
+        .into_iter()
+        .flat_map(serde_json::Map::values)
+        .filter_map(|node| node.get("configuration"))
+        .filter(|configuration| configuration.get("effect").is_some())
+        .collect::<Vec<_>>();
+    let mut lines = vec!["External effects and reconciliation".to_string()];
+    if blocks.is_empty() {
+        lines.push("  No manifest-declared external effects in this definition".to_string());
+    } else {
+        for block in blocks {
+            lines.push(format!(
+                "  {} / {} · effect={} · reconciliation={}",
+                text(block, "plugin_id"),
+                text(block, "block_id"),
+                text(block, "effect"),
+                text(block, "reconciliation")
+            ));
+        }
+    }
+    lines
 }
 
 #[derive(Debug)]
@@ -467,6 +643,67 @@ mod tests {
         assert_eq!(
             mutation_approval_command(&options, 0, false).as_deref(),
             Some("/workflow deny-mutation approval_id=mutation-1")
+        );
+    }
+
+    #[test]
+    fn author_surface_previews_requirements_effects_and_exact_start() {
+        let options = serde_json::json!({
+            "session_id": "00000000-0000-0000-0000-000000000001",
+            "configuration": {"prompt": "implement safely", "max_iterations": 3},
+            "template": {
+                "owner_plugin_id": "bcode.workflow",
+                "diagnostics": [],
+                "template": {
+                    "template_id": "implementation-verification-commit",
+                    "template_version": 1,
+                    "title": "Implementation verification commit",
+                    "description": "Implement, verify, and optionally commit.",
+                    "required_plugins": ["bcode.shell", "bcode.git"],
+                    "required_skills": ["commit-message"],
+                    "required_capabilities": ["workflow-production/v1"],
+                    "definition": {"nodes": {"commit": {"configuration": {
+                        "plugin_id": "bcode.git", "block_id": "git.commit",
+                        "effect": "mutating", "reconciliation": "repair_required"
+                    }}}}
+                }
+            }
+        });
+        let rendered = author_lines(&options).join("\n");
+        assert!(rendered.contains("Implementation verification commit"));
+        assert!(rendered.contains("Required plugins (2)"));
+        assert!(rendered.contains("Required skills (1)"));
+        assert!(rendered.contains("bcode.git / git.commit · effect=mutating"));
+        assert!(rendered.contains("reconciliation=repair_required"));
+        assert!(rendered.contains("Validated configuration preview"));
+        let command = template_start_command(&options).expect("start command");
+        assert!(command.contains("template_id=implementation-verification-commit"));
+        assert!(command.contains("session_id=00000000-0000-0000-0000-000000000001"));
+        assert!(command.contains("max_iterations"));
+    }
+
+    #[test]
+    fn author_surface_blocks_start_when_requirements_are_unavailable() {
+        let options = serde_json::json!({
+            "template": {
+                "owner_plugin_id": "bcode.workflow",
+                "diagnostics": [{
+                    "code": "missing_plugin", "requirement": "bcode.git",
+                    "message": "required plugin is not loaded"
+                }],
+                "template": {
+                    "template_id": "implementation-verification-commit",
+                    "template_version": 1,
+                    "title": "Implementation verification commit",
+                    "description": "Implement and verify."
+                }
+            }
+        });
+        assert!(template_start_command(&options).is_none());
+        assert!(
+            author_lines(&options)
+                .join("\n")
+                .contains("Resolve diagnostics and provide valid configuration before start")
         );
     }
 }
