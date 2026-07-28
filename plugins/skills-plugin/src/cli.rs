@@ -189,8 +189,11 @@ fn skill_registry_from_config() -> Result<SkillRegistry, CliError> {
     let config = bcode_config::load_config()?;
     let roots = skill_source_roots_from_config(&config);
     let options = SkillRegistryOptions {
-        max_skill_file_bytes: config.skills.max_skill_file_bytes,
-        max_context_bytes: config.skills.max_context_bytes,
+        max_skill_file_bytes: config.skills.max_skill_file_bytes.get(),
+        max_context_bytes: config
+            .skills
+            .max_context_bytes
+            .map(std::num::NonZeroUsize::get),
         follow_symlinks: config.skills.follow_symlinks,
         disabled_ids: config.skills.disabled_skill_ids(),
     };
@@ -357,8 +360,11 @@ fn check_skills(json: bool, strict: bool) -> Result<(), CliError> {
     let config = bcode_config::load_config()?;
     let roots = skill_source_roots_from_config(&config);
     let options = SkillRegistryOptions {
-        max_skill_file_bytes: config.skills.max_skill_file_bytes,
-        max_context_bytes: config.skills.max_context_bytes,
+        max_skill_file_bytes: config.skills.max_skill_file_bytes.get(),
+        max_context_bytes: config
+            .skills
+            .max_context_bytes
+            .map(std::num::NonZeroUsize::get),
         follow_symlinks: config.skills.follow_symlinks,
         disabled_ids: config.skills.disabled_skill_ids(),
     };
