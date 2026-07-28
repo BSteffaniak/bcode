@@ -840,6 +840,45 @@ const fn event_click_in(event: &Event, area: Rect) -> bool {
     )
 }
 
+#[allow(dead_code)]
+const REFERENCE_WORKFLOW_STATE_VERSION: u32 = 1;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ReferenceWorkflowState {
+    version: u32,
+    implementation_prompt: String,
+    stop_condition: String,
+    iteration_limit: u32,
+    iteration: u32,
+    condition_met: bool,
+    verification_passed: Option<bool>,
+    commit_enabled: bool,
+    committed_head: Option<String>,
+    outcome: String,
+}
+
+#[allow(dead_code)]
+impl ReferenceWorkflowState {
+    fn validate(&self) -> Result<(), String> {
+        if self.version != REFERENCE_WORKFLOW_STATE_VERSION
+            || self.implementation_prompt.trim().is_empty()
+            || self.stop_condition.trim().is_empty()
+            || self.implementation_prompt.len() > MAX_PROMPT_BYTES
+            || self.stop_condition.len() > MAX_PROMPT_BYTES
+            || self.iteration == 0
+            || self.iteration > self.iteration_limit
+            || self.iteration_limit > u32::try_from(HARD_MAX_ITERATIONS).unwrap_or(u32::MAX)
+            || self.outcome.trim().is_empty()
+            || self.outcome.len() > 256
+        {
+            return Err("reference workflow state is invalid or unbounded".to_string());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 struct LoopWorkflowInput {
     implementation_prompt: String,
@@ -1358,6 +1397,39 @@ mod tests {
             command.execution == bcode_command::CommandExecution::Immediate
                 && command.surfaces.contains(&CommandSurface::Slash)
         }));
+    }
+
+    #[test]
+    fn reference_workflow_state_envelope_is_versioned_bounded_and_explicit() {
+        let state = ReferenceWorkflowState {
+            version: REFERENCE_WORKFLOW_STATE_VERSION,
+            implementation_prompt: "implement".to_string(),
+            stop_condition: "tests pass".to_string(),
+            iteration_limit: 3,
+            iteration: 1,
+            condition_met: false,
+            verification_passed: None,
+            commit_enabled: true,
+            committed_head: None,
+            outcome: "implementing".to_string(),
+        };
+        state.validate().expect("valid state");
+        assert!(
+            ReferenceWorkflowState {
+                iteration: 4,
+                ..state.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ReferenceWorkflowState {
+                outcome: String::new(),
+                ..state
+            }
+            .validate()
+            .is_err()
+        );
     }
 
     #[test]
