@@ -2004,6 +2004,47 @@ impl BcodeClient {
         }
     }
 
+    /// Run one bounded non-mutating workflow doctor inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the bound.
+    pub async fn doctor_workflow_run(
+        &self,
+        run_id: String,
+        limit: usize,
+    ) -> Result<bcode_workflow_store::WorkflowDoctorReport, ClientError> {
+        match self
+            .send_request(Request::DoctorWorkflowRun { run_id, limit })
+            .await?
+        {
+            ResponsePayload::WorkflowDoctorReport { report } => Ok(report),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Apply one explicit typed repair resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the attempt/resolution is invalid.
+    pub async fn repair_workflow_attempt(
+        &self,
+        dispatch_identity: String,
+        resolution: bcode_workflow_store::RepairResolution,
+    ) -> Result<bcode_workflow_store::RepairResult, ClientError> {
+        match self
+            .send_request(Request::RepairWorkflowAttempt {
+                dispatch_identity,
+                resolution,
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowAttemptRepaired { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// List bounded, checksum-verified durable workflow definitions.
     ///
     /// # Errors

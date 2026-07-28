@@ -3330,6 +3330,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::CancelWorkflowRun { .. } => "cancel_workflow_run",
         Request::PauseWorkflowRun { .. } => "pause_workflow_run",
         Request::ResumeWorkflowRun { .. } => "resume_workflow_run",
+        Request::DoctorWorkflowRun { .. } => "doctor_workflow_run",
+        Request::RepairWorkflowAttempt { .. } => "repair_workflow_attempt",
         Request::RetryWorkflowNode { .. } => "retry_workflow_node",
         Request::ListWorkflowWaits { .. } => "list_workflow_waits",
         Request::ProvideWorkflowInput { .. } => "provide_workflow_input",
@@ -3819,6 +3821,16 @@ async fn handle_request_inner(
         }
         Request::ResumeWorkflowRun { run_id } => {
             handle_resume_workflow_run(request_id, state, writer, run_id).await
+        }
+        Request::DoctorWorkflowRun { run_id, limit } => {
+            handle_doctor_workflow_run(request_id, state, writer, run_id, limit).await
+        }
+        Request::RepairWorkflowAttempt {
+            dispatch_identity,
+            resolution,
+        } => {
+            handle_repair_workflow_attempt(request_id, state, writer, dispatch_identity, resolution)
+                .await
         }
         Request::RetryWorkflowNode {
             run_id,
@@ -11696,6 +11708,46 @@ async fn resume_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<b
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn handle_doctor_workflow_run(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    run_id: String,
+    limit: usize,
+) -> Result<(), ServerError> {
+    let report = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .doctor_run(&run_id, limit)?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowDoctorReport { report }),
+    )
+    .await
+}
+
+async fn handle_repair_workflow_attempt(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    dispatch_identity: String,
+    resolution: bcode_workflow_store::RepairResolution,
+) -> Result<(), ServerError> {
+    let result = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .repair_attempt(&dispatch_identity, &resolution, current_unix_millis())?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowAttemptRepaired { result }),
+    )
+    .await
+}
+
 async fn handle_retry_workflow_node(
     request_id: u64,
     state: &Arc<ServerState>,

@@ -48,6 +48,7 @@ impl RustPlugin for WorkflowPlugin {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn command_contributions() -> Vec<CommandContribution> {
     [
         ("workflow", "Workflow", "Open workflow status"),
@@ -101,6 +102,16 @@ fn command_contributions() -> Vec<CommandContribution> {
             "workflow.inspect",
             "Workflow: Inspect",
             "Inspect workflow graph and history",
+        ),
+        (
+            "workflow.doctor",
+            "Workflow: Doctor",
+            "Diagnose one workflow run without mutation",
+        ),
+        (
+            "workflow.repair",
+            "Workflow: Repair",
+            "Apply one explicit typed attempt repair",
         ),
         (
             "workflow.retry-node",
@@ -389,6 +400,26 @@ pub(crate) async fn execute_command(
             ]);
             format!("workflow run {run_id}")
         }
+        "workflow.doctor" => {
+            let run_id = required_arg(&request, "run_id")?;
+            let report = client
+                .doctor_workflow_run(run_id, QUERY_LIMIT)
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert("doctor".to_string(), serde_json::json!(report));
+            "workflow doctor completed without mutation".to_string()
+        }
+        "workflow.repair" => {
+            let dispatch_identity = required_arg(&request, "dispatch_identity")?;
+            let resolution = serde_json::from_str(&required_arg(&request, "resolution")?)
+                .map_err(|error| format!("invalid typed repair resolution: {error}"))?;
+            let result = client
+                .repair_workflow_attempt(dispatch_identity, resolution)
+                .await
+                .map_err(|error| error.to_string())?;
+            options.insert("repair".to_string(), serde_json::json!(result));
+            "workflow attempt repaired explicitly".to_string()
+        }
         "workflow.retry-node" => {
             let run_id = required_arg(&request, "run_id")?;
             let node_id = required_arg(&request, "node_id")?;
@@ -663,6 +694,8 @@ mod tests {
             "workflow.resume",
             "workflow.cancel",
             "workflow.inspect",
+            "workflow.doctor",
+            "workflow.repair",
             "workflow.retry-node",
             "workflow.provide-input",
             "workflow.approve-mutation",

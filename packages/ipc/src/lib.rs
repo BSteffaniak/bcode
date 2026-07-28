@@ -336,6 +336,16 @@ pub enum Request {
     ListWorkflowRuns {
         limit: usize,
     },
+    /// Run one bounded non-mutating workflow doctor inspection.
+    DoctorWorkflowRun {
+        run_id: String,
+        limit: usize,
+    },
+    /// Apply one explicit typed resolution to a repair-required attempt.
+    RepairWorkflowAttempt {
+        dispatch_identity: String,
+        resolution: bcode_workflow_store::RepairResolution,
+    },
     /// Explicitly retry one exact latest failed workflow node attempt.
     RetryWorkflowNode {
         run_id: String,
@@ -1494,6 +1504,12 @@ pub enum ResponsePayload {
     },
     WorkflowRunList {
         runs: Vec<bcode_workflow_store::WorkflowRunSummary>,
+    },
+    WorkflowDoctorReport {
+        report: bcode_workflow_store::WorkflowDoctorReport,
+    },
+    WorkflowAttemptRepaired {
+        result: bcode_workflow_store::RepairResult,
     },
     WorkflowRunCancellationRequested {
         recorded: bool,
