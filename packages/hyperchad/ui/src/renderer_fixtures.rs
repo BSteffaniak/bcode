@@ -9,6 +9,8 @@ pub struct RendererTranscriptFixture {
     #[serde(default)]
     pub forbidden: Vec<String>,
     pub item: bcode_session_view_models::TranscriptViewItem,
+    #[serde(default)]
+    pub revisions: Vec<bcode_session_view_models::TranscriptViewItem>,
 }
 
 pub fn renderer_tool_presentation_fixtures() -> Vec<RendererTranscriptFixture> {

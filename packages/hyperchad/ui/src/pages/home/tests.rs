@@ -2198,6 +2198,20 @@ fn shared_tool_presentation_fixtures_render_semantic_content_in_hyperchad() {
                 fixture.name
             );
         }
+        for revision in &fixture.revisions {
+            let revised = container_text_all(&transcript_item(revision));
+            let TranscriptViewItemKind::ToolInvocation { tool } = &revision.kind else {
+                unreachable!("shared fixture revisions are tool invocations");
+            };
+            assert!(revised.contains(tool.tool_name.as_deref().unwrap_or("Tool")));
+            for forbidden in &fixture.forbidden {
+                assert!(
+                    !revised.contains(forbidden),
+                    "{} exposed {forbidden:?}",
+                    fixture.name
+                );
+            }
+        }
         let TranscriptViewItemKind::ToolInvocation { tool } = &fixture.item.kind else {
             unreachable!("shared fixtures are tool invocations");
         };
@@ -2267,6 +2281,39 @@ fn primary_tool_presentation_uses_schema_adapter_and_falls_back_without_raw_payl
     let rendered = container_text_all(&transcript_item(&item));
     assert!(rendered.contains("developer arguments"));
     assert!(!rendered.contains("must-not-render"));
+}
+
+#[test]
+fn repeated_malformed_presentations_keep_bounded_semantic_fallback() {
+    let secret = "opaque-malformed-presentation-secret";
+    for revision in 1..=256 {
+        let mut tool = tool_fixture(ToolInvocationViewStatus::Running);
+        tool.tool_call_id = "call-malformed".to_owned();
+        tool.tool_name = Some("shell.run".to_owned());
+        tool.arguments_json = Some(r#"{"command":"cargo test"}"#.to_owned());
+        tool.presentation = Some(ToolPresentationView {
+            producer_id: "bcode.shell".to_owned(),
+            generation: 0,
+            revision,
+            retention: bcode_session_view_models::ToolPresentationRetention::RetainLatest,
+            schema: "bcode.tool.request.shell.run".to_owned(),
+            schema_version: 1,
+            artifact: None,
+            payload: serde_json::json!({"command": {"secret": secret}}),
+        });
+        let item = transcript_fixture_item(
+            "malformed-primary-presentation",
+            true,
+            TranscriptViewItemKind::ToolInvocation {
+                tool: Box::new(tool),
+            },
+        );
+        let rendered = container_text_all(&transcript_item(&item));
+        assert!(rendered.contains("shell.run"));
+        assert!(rendered.contains("cargo test"));
+        assert!(!rendered.contains(secret));
+        assert!(rendered.len() < 2_048);
+    }
 }
 
 #[test]

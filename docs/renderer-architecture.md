@@ -190,8 +190,11 @@ updated with synthetic fixtures.
 A new renderer consumes bounded `SessionViewSnapshot` values and `SessionViewPatch` updates by stable
 item identity and revision. It must render canonical tool name, lifecycle, timing, bounded arguments,
 typed result or result text, and safe artifact metadata even when it implements no plugin-specific
-adapter. Presentation schemas are optional enhancement hooks; renderer code must not parse another
-renderer's rows/DOM, replay event logs, infer lifecycle from payloads, or depend on TUI state.
+adapter. Presentation schemas are optional enhancement hooks; therefore every tool invocation,
+including dynamic-plugin invocations, must retain a meaningful bounded canonical fallback and must
+not rely on its opaque presentation payload as the only useful transcript result. Renderer code must
+not parse another renderer's rows/DOM, replay event logs, infer lifecycle from payloads, or depend on
+TUI state.
 Renderer-native actions map through `SessionViewAction`/`PresentationContext` equivalents, while
 viewport, layout, interaction mechanics, and resource delivery remain owned by that renderer.
 

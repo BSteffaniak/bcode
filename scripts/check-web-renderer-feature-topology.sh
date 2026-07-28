@@ -62,7 +62,14 @@ active_manifest_paths = {Path(package["manifest_path"]).resolve() for package in
 if any(root_path in path.parents for path in active_manifest_paths):
     raise SystemExit("an active HyperChad package resolves through a local repository path")
 
-patch_tables = [key for key in root if key.startswith("patch")]
+def has_active_patch(value):
+    if isinstance(value, dict):
+        return any(has_active_patch(child) for child in value.values())
+    return value is not None
+
+patch_tables = [
+    key for key, value in root.items() if key.startswith("patch") and has_active_patch(value)
+]
 if patch_tables:
     raise SystemExit(f"active root Cargo patch tables are not allowed: {patch_tables}")
 

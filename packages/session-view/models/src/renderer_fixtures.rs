@@ -12,6 +12,8 @@ pub struct RendererTranscriptFixture {
     #[serde(default)]
     pub forbidden: Vec<String>,
     pub item: super::TranscriptViewItem,
+    #[serde(default)]
+    pub revisions: Vec<super::TranscriptViewItem>,
 }
 
 pub fn renderer_tool_presentation_fixtures() -> Vec<RendererTranscriptFixture> {

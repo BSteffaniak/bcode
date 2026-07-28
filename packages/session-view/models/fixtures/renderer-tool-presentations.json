@@ -45,6 +45,82 @@
         }
       }
     },
+    "revisions": [
+      {
+        "id": "tool:fixture-shell",
+        "revision": 4,
+        "sequence": 1,
+        "timestamp_ms": 1700000000000,
+        "streaming": true,
+        "kind": {
+          "type": "tool_invocation",
+          "tool": {
+            "tool_call_id": "fixture-shell",
+            "producer_plugin_id": "bcode.shell",
+            "tool_name": "shell.run",
+            "arguments_json": "{\"command\":\"cargo test\",\"cwd\":\"/tmp/project\"}",
+            "working_directory": "/tmp/project",
+            "status": "waiting",
+            "result_text": null,
+            "is_error": null,
+            "result": null,
+            "presentation": {
+              "producer_id": "bcode.shell",
+              "generation": 0,
+              "revision": 3,
+              "retention": "retain_latest",
+              "schema": "bcode.shell.run",
+              "schema_version": 1,
+              "payload": {"phase": "waiting", "command": "cargo test"}
+            },
+            "timing": {
+              "started_at_ms": 1700000000000,
+              "finished_at_ms": null,
+              "timeout_ms": 120000,
+              "timed_out": null,
+              "duration_ms": null
+            }
+          }
+        }
+      },
+      {
+        "id": "tool:fixture-shell",
+        "revision": 5,
+        "sequence": 1,
+        "timestamp_ms": 1700000000000,
+        "streaming": false,
+        "kind": {
+          "type": "tool_invocation",
+          "tool": {
+            "tool_call_id": "fixture-shell",
+            "producer_plugin_id": "bcode.shell",
+            "tool_name": "shell.run",
+            "arguments_json": "{\"command\":\"cargo test\",\"cwd\":\"/tmp/project\"}",
+            "working_directory": "/tmp/project",
+            "status": "finished",
+            "result_text": "tests passed",
+            "is_error": false,
+            "result": {"type": "text", "text": "tests passed"},
+            "presentation": {
+              "producer_id": "bcode.shell",
+              "generation": 0,
+              "revision": 4,
+              "retention": "retain_latest",
+              "schema": "bcode.shell.run",
+              "schema_version": 1,
+              "payload": {"phase": "finished", "command": "cargo test"}
+            },
+            "timing": {
+              "started_at_ms": 1700000000000,
+              "finished_at_ms": 1700000002500,
+              "timeout_ms": 120000,
+              "timed_out": false,
+              "duration_ms": 2500
+            }
+          }
+        }
+      }
+    ],
     "forbidden": []
   },
   {
@@ -467,6 +543,259 @@
             "payload": {
               "secret": "opaque-artifact-result-fallback-secret"
             }
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "document",
+    "expected": [
+      "document.extract",
+      "/tmp/fixture.pdf"
+    ],
+    "forbidden": [],
+    "item": {
+      "id": "tool:fixture-document",
+      "revision": 2,
+      "sequence": 14,
+      "timestamp_ms": 1700000003000,
+      "streaming": true,
+      "kind": {
+        "type": "tool_invocation",
+        "tool": {
+          "tool_call_id": "fixture-document",
+          "producer_plugin_id": "bcode.document",
+          "tool_name": "document.extract",
+          "arguments_json": "{\"path\":\"/tmp/fixture.pdf\"}",
+          "working_directory": "/tmp/project",
+          "status": "running",
+          "result_text": null,
+          "is_error": null,
+          "result": null,
+          "presentation": {
+            "producer_id": "bcode.document",
+            "generation": 0,
+            "revision": 1,
+            "retention": "retain_latest",
+            "schema": "bcode.document.request",
+            "schema_version": 1,
+            "payload": {
+              "arguments": {
+                "operation": "extract",
+                "path": "/tmp/fixture.pdf"
+              }
+            }
+          },
+          "timing": {
+            "started_at_ms": 1700000003000,
+            "finished_at_ms": null,
+            "timeout_ms": null,
+            "timed_out": null,
+            "duration_ms": null
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "ocr",
+    "expected": [
+      "ocr.extract",
+      "/tmp/fixture.png"
+    ],
+    "forbidden": [],
+    "item": {
+      "id": "tool:fixture-ocr",
+      "revision": 2,
+      "sequence": 15,
+      "timestamp_ms": 1700000003100,
+      "streaming": true,
+      "kind": {
+        "type": "tool_invocation",
+        "tool": {
+          "tool_call_id": "fixture-ocr",
+          "producer_plugin_id": "bcode.ocr",
+          "tool_name": "ocr.extract",
+          "arguments_json": "{\"path\":\"/tmp/fixture.png\"}",
+          "working_directory": "/tmp/project",
+          "status": "running",
+          "result_text": null,
+          "is_error": null,
+          "result": null,
+          "presentation": {
+            "producer_id": "bcode.ocr",
+            "generation": 0,
+            "revision": 1,
+            "retention": "retain_latest",
+            "schema": "bcode.ocr.request",
+            "schema_version": 1,
+            "payload": {
+              "arguments": {
+                "operation": "extract",
+                "path": "/tmp/fixture.png"
+              }
+            }
+          },
+          "timing": {
+            "started_at_ms": 1700000003100,
+            "finished_at_ms": null,
+            "timeout_ms": null,
+            "timed_out": null,
+            "duration_ms": null
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "web-search",
+    "expected": [
+      "web.search",
+      "fixture query"
+    ],
+    "forbidden": [],
+    "item": {
+      "id": "tool:fixture-web-search",
+      "revision": 2,
+      "sequence": 16,
+      "timestamp_ms": 1700000003200,
+      "streaming": true,
+      "kind": {
+        "type": "tool_invocation",
+        "tool": {
+          "tool_call_id": "fixture-web-search",
+          "producer_plugin_id": "bcode.web-search",
+          "tool_name": "web.search",
+          "arguments_json": "{\"query\":\"fixture query\",\"max_results\":5}",
+          "working_directory": "/tmp/project",
+          "status": "running",
+          "result_text": null,
+          "is_error": null,
+          "result": null,
+          "presentation": {
+            "producer_id": "bcode.web-search",
+            "generation": 0,
+            "revision": 1,
+            "retention": "retain_latest",
+            "schema": "bcode.web-search.search_request",
+            "schema_version": 1,
+            "payload": {
+              "arguments": {
+                "query": "fixture query",
+                "max_results": 5
+              }
+            }
+          },
+          "timing": {
+            "started_at_ms": 1700000003200,
+            "finished_at_ms": null,
+            "timeout_ms": null,
+            "timed_out": null,
+            "duration_ms": null
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "git",
+    "expected": [
+      "git.clone",
+      "repository.git"
+    ],
+    "forbidden": [],
+    "item": {
+      "id": "tool:fixture-git",
+      "revision": 2,
+      "sequence": 17,
+      "timestamp_ms": 1700000003300,
+      "streaming": true,
+      "kind": {
+        "type": "tool_invocation",
+        "tool": {
+          "tool_call_id": "fixture-git",
+          "producer_plugin_id": "bcode.git",
+          "tool_name": "git.clone",
+          "arguments_json": "{\"url\":\"https://example.com/repository.git\",\"destination\":\"/tmp/repository\"}",
+          "working_directory": "/tmp/project",
+          "status": "running",
+          "result_text": null,
+          "is_error": null,
+          "result": null,
+          "presentation": {
+            "producer_id": "bcode.git",
+            "generation": 0,
+            "revision": 1,
+            "retention": "retain_latest",
+            "schema": "bcode.git.clone_request",
+            "schema_version": 1,
+            "payload": {
+              "arguments": {
+                "url": "https://example.com/repository.git",
+                "destination": "/tmp/repository",
+                "ref": "main"
+              }
+            }
+          },
+          "timing": {
+            "started_at_ms": 1700000003300,
+            "finished_at_ms": null,
+            "timeout_ms": null,
+            "timed_out": null,
+            "duration_ms": null
+          }
+        }
+      }
+    }
+  },
+  {
+    "name": "worktree",
+    "expected": [
+      "worktree.create",
+      "/tmp/worktree"
+    ],
+    "forbidden": [],
+    "item": {
+      "id": "tool:fixture-worktree",
+      "revision": 2,
+      "sequence": 18,
+      "timestamp_ms": 1700000003400,
+      "streaming": true,
+      "kind": {
+        "type": "tool_invocation",
+        "tool": {
+          "tool_call_id": "fixture-worktree",
+          "producer_plugin_id": "bcode.worktree",
+          "tool_name": "worktree.create",
+          "arguments_json": "{\"name\":\"fixture\",\"path\":\"/tmp/worktree\",\"branch\":\"fixture\"}",
+          "working_directory": "/tmp/project",
+          "status": "running",
+          "result_text": null,
+          "is_error": null,
+          "result": null,
+          "presentation": {
+            "producer_id": "bcode.worktree",
+            "generation": 0,
+            "revision": 1,
+            "retention": "retain_latest",
+            "schema": "bcode.worktree.request",
+            "schema_version": 1,
+            "payload": {
+              "arguments": {
+                "operation": "create",
+                "name": "fixture",
+                "path": "/tmp/worktree",
+                "branch": "fixture"
+              }
+            }
+          },
+          "timing": {
+            "started_at_ms": 1700000003400,
+            "finished_at_ms": null,
+            "timeout_ms": null,
+            "timed_out": null,
+            "duration_ms": null
           }
         }
       }

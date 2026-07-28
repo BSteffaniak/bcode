@@ -2202,6 +2202,25 @@ fn shared_tool_presentation_fixtures_render_semantic_content_in_tui() {
                 fixture.name
             );
         }
+        for revision in &fixture.revisions {
+            let terminal = super::transcript::terminal_item_from_shared(revision);
+            let rows =
+                transcript_item_rows(&[terminal], 0, 100, None, TuiDiffViewerConfig::default());
+            let revised = visible_rows_snapshot(&rows);
+            let bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool } =
+                &revision.kind
+            else {
+                unreachable!("shared fixture revisions are tool invocations");
+            };
+            assert!(revised.contains(tool.tool_name.as_deref().unwrap_or("Tool")));
+            for forbidden in &fixture.forbidden {
+                assert!(
+                    !revised.contains(forbidden),
+                    "{} exposed {forbidden:?}",
+                    fixture.name
+                );
+            }
+        }
         let bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool } =
             &fixture.item.kind
         else {
@@ -2255,6 +2274,52 @@ fn unsupported_tool_presentation_uses_semantic_fallback_without_opaque_payload()
     assert!(rendered.contains("fixture"));
     assert!(!rendered.contains(secret));
     assert!(!rendered.contains("example.unsupported"));
+}
+
+#[cfg(test)]
+#[test]
+fn repeated_malformed_presentations_keep_bounded_semantic_fallback() {
+    let secret = "opaque-malformed-presentation-secret";
+    for revision in 1..=256 {
+        let shared = bcode_session_view_models::TranscriptViewItem {
+            id: bcode_session_view_models::TranscriptViewItemId::tool("call-malformed"),
+            revision,
+            sequence: Some(1),
+            timestamp_ms: Some(1),
+            streaming: true,
+            kind: bcode_session_view_models::TranscriptViewItemKind::ToolInvocation {
+                tool: Box::new(bcode_session_view_models::ToolInvocationView {
+                    tool_call_id: "call-malformed".to_owned(),
+                    producer_plugin_id: Some("bcode.shell".to_owned()),
+                    tool_name: Some("shell.run".to_owned()),
+                    arguments_json: Some(r#"{"command":"cargo test"}"#.to_owned()),
+                    working_directory: None,
+                    status: bcode_session_view_models::ToolInvocationViewStatus::Running,
+                    result_text: None,
+                    is_error: None,
+                    result: None,
+                    presentation: Some(bcode_session_view_models::ToolPresentationView {
+                        producer_id: "bcode.shell".to_owned(),
+                        generation: 0,
+                        revision,
+                        retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                        schema: "bcode.tool.request.shell.run".to_owned(),
+                        schema_version: 1,
+                        artifact: None,
+                        payload: serde_json::json!({"command": {"secret": secret}}),
+                    }),
+                    timing: bcode_session_view_models::ToolTimingView::default(),
+                }),
+            },
+        };
+        let terminal = super::transcript::terminal_item_from_shared(&shared);
+        let rows = transcript_item_rows(&[terminal], 0, 80, None, TuiDiffViewerConfig::default());
+        let rendered = visible_rows_snapshot(&rows);
+        assert!(rendered.contains("shell.run"));
+        assert!(rendered.contains("cargo test"));
+        assert!(!rendered.contains(secret));
+        assert!(rendered.len() < 1_024);
+    }
 }
 
 #[cfg(test)]

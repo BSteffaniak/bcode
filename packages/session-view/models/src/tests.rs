@@ -4,7 +4,7 @@ use proptest::prelude::*;
 #[test]
 fn renderer_tool_presentation_fixtures_round_trip_with_stable_primary_identity() {
     let fixtures = super::renderer_fixtures::renderer_tool_presentation_fixtures();
-    assert_eq!(fixtures.len(), 9);
+    assert_eq!(fixtures.len(), 14);
     for fixture in fixtures {
         let TranscriptViewItemKind::ToolInvocation { tool } = &fixture.item.kind else {
             panic!("{} must be a tool invocation fixture", fixture.name);
@@ -25,10 +25,65 @@ fn renderer_tool_presentation_fixtures_round_trip_with_stable_primary_identity()
         for forbidden in &fixture.forbidden {
             assert!(!forbidden.is_empty(), "{}", fixture.name);
         }
+        let mut previous = &fixture.item;
+        for revision in &fixture.revisions {
+            assert_eq!(revision.id, fixture.item.id, "{}", fixture.name);
+            assert!(revision.revision > previous.revision, "{}", fixture.name);
+            let TranscriptViewItemKind::ToolInvocation { tool: revised_tool } = &revision.kind
+            else {
+                panic!("{} revision must be a tool invocation", fixture.name);
+            };
+            assert_eq!(
+                revised_tool.tool_call_id, tool.tool_call_id,
+                "{}",
+                fixture.name
+            );
+            previous = revision;
+        }
         let encoded = serde_json::to_vec(&fixture.item).expect("encode fixture item");
         let decoded: TranscriptViewItem =
             serde_json::from_slice(&encoded).expect("decode fixture item");
         assert_eq!(decoded, fixture.item);
+    }
+}
+
+#[test]
+fn renderer_lifecycle_fixture_converges_through_incremental_patches() {
+    let fixture = super::renderer_fixtures::renderer_tool_presentation_fixtures()
+        .into_iter()
+        .find(|fixture| !fixture.revisions.is_empty())
+        .expect("renderer lifecycle fixture");
+    let mut snapshot = SessionViewSnapshot::empty();
+    snapshot.revision = fixture.item.revision;
+    snapshot.transcript =
+        transcript_document_from_vec(fixture.item.revision, vec![fixture.item.clone()]);
+    snapshot.tools.insert(
+        "fixture-shell".to_owned(),
+        match &fixture.item.kind {
+            TranscriptViewItemKind::ToolInvocation { tool } => (**tool).clone(),
+            _ => panic!("lifecycle fixture must be a tool invocation"),
+        },
+    );
+
+    for item in fixture.revisions {
+        let mut next = snapshot.clone();
+        next.revision = item.revision;
+        next.transcript.revision = item.revision;
+        next.transcript.items[0] = item.clone();
+        let TranscriptViewItemKind::ToolInvocation { tool } = &item.kind else {
+            panic!("lifecycle revision must be a tool invocation");
+        };
+        next.tools
+            .insert(tool.tool_call_id.clone(), (**tool).clone());
+        let patch = SessionViewPatch::between_snapshots(&snapshot, &next);
+        assert!(patch.reset.is_none());
+        assert_eq!(patch.transcript.len(), 1);
+        snapshot
+            .apply_patch(&patch)
+            .expect("lifecycle patch applies");
+        assert_eq!(snapshot, next);
+        assert_eq!(snapshot.transcript.items.len(), 1);
+        assert_eq!(snapshot.transcript.items[0].id, fixture.item.id);
     }
 }
 
@@ -871,6 +926,7 @@ fn repeated_large_item_replacement_is_constant_cardinality_and_patch_bounded() {
     let mut current = SessionViewSnapshot::empty();
     current.revision = 1;
     current.transcript = transcript_document(1, [transcript_item("shell-call", 1, &large_payload)]);
+    let mut maximum_patch_bytes = 0_usize;
 
     for revision in 2..=128 {
         let mut next = current.clone();
@@ -878,12 +934,205 @@ fn repeated_large_item_replacement_is_constant_cardinality_and_patch_bounded() {
         next.transcript.revision = revision;
         next.transcript.items[0].revision = revision;
         next.transcript.items[0].kind = TranscriptViewItemKind::SystemMessage {
-            message: ChatMessageView::plain(format!("artifact revision {revision}")),
+            message: ChatMessageView::plain(format!(
+                "artifact revision {revision}: {}",
+                "y".repeat(256 * 1024)
+            )),
         };
         let patch = SessionViewPatch::between_snapshots(&current, &next);
         assert!(patch.reset.is_none());
         assert_eq!(patch.transcript.len(), 1);
+        let patch_bytes = serde_json::to_vec(&patch)
+            .expect("replacement patch serializes")
+            .len();
+        maximum_patch_bytes = maximum_patch_bytes.max(patch_bytes);
+        assert!(
+            patch_bytes < 270 * 1024,
+            "bounded replacement patch was {patch_bytes} bytes"
+        );
         current.apply_patch(&patch).expect("replacement applies");
+        assert_eq!(current.transcript.items.len(), 1);
+        assert_eq!(current, next);
+    }
+    assert!(maximum_patch_bytes > 256 * 1024);
+}
+
+#[test]
+fn interleaved_primary_replacements_scale_with_changed_item_not_transcript_length() {
+    let mut current = SessionViewSnapshot::empty();
+    current.revision = 1;
+    let mut items = (0..2_000)
+        .map(|index| {
+            transcript_item(
+                &format!("history-{index}"),
+                u64::try_from(index).expect("index") + 1,
+                "bounded history",
+            )
+        })
+        .collect::<Vec<_>>();
+    items.insert(300, transcript_item("assistant", 3_001, "assistant"));
+    items.insert(700, transcript_item("reasoning", 3_002, "reasoning"));
+    items.insert(1_100, transcript_item("permission", 3_003, "permission"));
+    items.insert(
+        1_500,
+        transcript_item("supplemental", 3_004, "supplemental"),
+    );
+    items.push(transcript_item_with_revision(
+        "primary", 3_005, 1, "running",
+    ));
+    current.transcript = transcript_document_from_vec(1, items);
+
+    for revision in 2..=64 {
+        let mut next = current.clone();
+        next.revision = revision;
+        next.transcript.revision = revision;
+        let primary = next
+            .transcript
+            .items
+            .iter_mut()
+            .find(|item| item.id == TranscriptViewItemId::new("primary"))
+            .expect("primary item");
+        primary.revision = revision;
+        primary.kind = TranscriptViewItemKind::SystemMessage {
+            message: ChatMessageView::plain(format!("revision {revision}")),
+        };
+        let patch = SessionViewPatch::between_snapshots(&current, &next);
+        assert!(patch.reset.is_none());
+        assert_eq!(patch.transcript.len(), 1);
+        assert!(matches!(
+            &patch.transcript[0],
+            TranscriptViewPatchOp::Replace { item }
+                if item.id == TranscriptViewItemId::new("primary")
+        ));
+        let patch_bytes = serde_json::to_vec(&patch).expect("patch serializes").len();
+        assert!(
+            patch_bytes < 1_024,
+            "replacement patch was {patch_bytes} bytes"
+        );
+        current.apply_patch(&patch).expect("replacement applies");
+        assert_eq!(current, next);
+        assert_eq!(current.transcript.items.len(), 2_005);
+    }
+}
+
+#[test]
+fn independent_primary_replacements_do_not_mutate_other_invocations() {
+    let mut current = SessionViewSnapshot::empty();
+    current.revision = 1;
+    current.transcript = transcript_document_from_vec(
+        1,
+        (0..256)
+            .map(|index| {
+                transcript_item(
+                    &format!("tool-{index}"),
+                    u64::try_from(index).expect("index") + 1,
+                    "running",
+                )
+            })
+            .collect(),
+    );
+
+    for (offset, index) in (0..256).cycle().take(1_024).enumerate() {
+        let revision = u64::try_from(offset).expect("offset") + 2;
+        let mut next = current.clone();
+        next.revision = revision;
+        next.transcript.revision = revision;
+        let id = TranscriptViewItemId::new(format!("tool-{index}"));
+        let changed = next
+            .transcript
+            .items
+            .iter_mut()
+            .find(|item| item.id == id)
+            .expect("changed invocation");
+        changed.revision = revision;
+        changed.kind = TranscriptViewItemKind::SystemMessage {
+            message: ChatMessageView::plain(format!("revision {revision}")),
+        };
+        let patch = SessionViewPatch::between_snapshots(&current, &next);
+        assert_eq!(patch.transcript.len(), 1);
+        assert!(matches!(
+            &patch.transcript[0],
+            TranscriptViewPatchOp::Replace { item } if item.id == id
+        ));
+        current
+            .apply_patch(&patch)
+            .expect("independent replacement applies");
+        assert_eq!(current, next);
+        assert_eq!(current.transcript.items.len(), 256);
+    }
+}
+
+#[test]
+fn growing_vim_artifact_metadata_replaces_one_bounded_primary_item() {
+    let mut current = SessionViewSnapshot::empty();
+    current.revision = 1;
+    let tool_call_id = "vim-call";
+    let make_item = |revision| TranscriptViewItem {
+        id: TranscriptViewItemId::tool(tool_call_id),
+        revision,
+        sequence: Some(1),
+        timestamp_ms: Some(1),
+        streaming: revision < 128,
+        kind: TranscriptViewItemKind::ToolInvocation {
+            tool: Box::new(ToolInvocationView {
+                tool_call_id: tool_call_id.to_owned(),
+                producer_plugin_id: Some("bcode.vim-edit".to_owned()),
+                tool_name: Some("vim_edit.apply".to_owned()),
+                arguments_json: Some(r#"{"path":"/tmp/fixture.rs"}"#.to_owned()),
+                working_directory: None,
+                status: if revision < 128 {
+                    ToolInvocationViewStatus::Running
+                } else {
+                    ToolInvocationViewStatus::Finished
+                },
+                result_text: None,
+                is_error: (revision == 128).then_some(false),
+                result: None,
+                presentation: Some(ToolPresentationView {
+                    producer_id: "bcode.vim-edit".to_owned(),
+                    generation: 0,
+                    revision,
+                    retention: ToolPresentationRetention::RetainLatest,
+                    schema: "bcode.vim-edit.playback".to_owned(),
+                    schema_version: 1,
+                    artifact: Some(bcode_session_models::ToolContributionArtifact {
+                        artifact_id: "vim-artifact".to_owned(),
+                        reference_key: "playback".to_owned(),
+                        content_type: Some("application/json".to_owned()),
+                        storage_uri: "artifact://vim/playback".to_owned(),
+                        committed_bytes: revision * 4_096,
+                        revision,
+                        finalized: revision == 128,
+                        availability: Some(if revision == 128 {
+                            "complete".to_owned()
+                        } else {
+                            "active".to_owned()
+                        }),
+                    }),
+                    payload: serde_json::json!({
+                        "path": "/tmp/fixture.rs",
+                        "step_index": revision,
+                        "step_total": 128
+                    }),
+                }),
+                timing: ToolTimingView::default(),
+            }),
+        },
+    };
+    current.transcript = transcript_document_from_vec(1, vec![make_item(1)]);
+
+    for revision in 2..=128 {
+        let mut next = current.clone();
+        next.revision = revision;
+        next.transcript.revision = revision;
+        next.transcript.items[0] = make_item(revision);
+        let patch = SessionViewPatch::between_snapshots(&current, &next);
+        assert!(patch.reset.is_none());
+        assert_eq!(patch.transcript.len(), 1);
+        assert!(serde_json::to_vec(&patch).expect("patch serializes").len() < 2_048);
+        current
+            .apply_patch(&patch)
+            .expect("artifact revision applies");
         assert_eq!(current.transcript.items.len(), 1);
         assert_eq!(current, next);
     }

@@ -481,6 +481,43 @@ mod tests {
         PluginTuiPresentation::new(host)
     }
 
+    fn deliver_shell_recording_commit(
+        presentation: &PluginTuiPresentation,
+        commit: &bcode_shell_plugin::recording::ShellRecordingCommit,
+        previous_bytes: u64,
+        revision: u64,
+    ) -> u64 {
+        let mut bytes = std::fs::read(&commit.path).expect("recording prefix");
+        bytes.truncate(usize::try_from(commit.committed_bytes).expect("committed length"));
+        bytes.drain(..usize::try_from(previous_bytes).expect("offset"));
+        assert!(
+            presentation
+                .deliver_artifact_chunk(&PluginTuiArtifactChunk {
+                    tool_call_id: "shell-call".to_owned(),
+                    artifact_id: "shell-artifact".to_owned(),
+                    reference_key: "shell_recording".to_owned(),
+                    producer_plugin_id: "bcode.shell".to_owned(),
+                    schema: "bcode.shell.run".to_owned(),
+                    schema_version: 1,
+                    content_type: Some(
+                        "application/x-bcode-shell-recording; version=3".to_owned(),
+                    ),
+                    offset: previous_bytes,
+                    total_bytes: commit.committed_bytes,
+                    revision,
+                    finalized: commit.finalized,
+                    bytes,
+                })
+                .expect("deliver growing artifact chunk")
+        );
+        assert_eq!(presentation.visual_revision("shell-call"), revision);
+        assert_eq!(
+            presentation.drain_dirty_visuals(),
+            BTreeSet::from(["shell-call".to_owned()])
+        );
+        commit.committed_bytes
+    }
+
     #[test]
     fn dirty_visual_drain_is_bounded_and_retains_overflow_for_next_tick() {
         let presentation = test_presentation();
@@ -716,6 +753,84 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("github.com/bmorphism/bcode"));
         assert!(rendered.contains("main"));
+    }
+
+    #[test]
+    fn growing_shell_artifact_advances_only_owner_revision() {
+        let presentation = test_presentation();
+        let producer = "bcode.shell";
+        let schema = "bcode.shell.run";
+        let reference_key = "shell_recording";
+        let content_type = "application/x-bcode-shell-recording; version=3";
+        assert!(presentation.accepts_artifact_reference(
+            producer,
+            schema,
+            1,
+            reference_key,
+            Some(content_type),
+        ));
+        let directory = tempfile::tempdir().expect("recording temp dir");
+        let path = directory.path().join("growing.bcsr");
+        let (commit_sender, commit_receiver) = std::sync::mpsc::channel();
+        let observer: bcode_shell_plugin::recording::ShellRecordingCommitObserver =
+            Arc::new(move |commit| {
+                let _ = commit_sender.send(commit);
+            });
+        let mut writer =
+            bcode_shell_plugin::recording::AsyncShellRecordingWriter::create_with_observer(
+                &path,
+                80,
+                24,
+                Some(observer),
+            )
+            .expect("recording writer");
+        let mut previous_bytes = deliver_shell_recording_commit(
+            &presentation,
+            &commit_receiver
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("initial recording commit"),
+            0,
+            1,
+        );
+        let mut delivered_revisions = 1_u64;
+        for revision in 1..=32 {
+            writer
+                .write_output_with(
+                    revision,
+                    format!("raw-{revision}\n").as_bytes(),
+                    Some(format!("rendered-{revision}\r\n").as_bytes()),
+                    || {},
+                )
+                .expect("recording output");
+            delivered_revisions = delivered_revisions.saturating_add(1);
+            previous_bytes = deliver_shell_recording_commit(
+                &presentation,
+                &commit_receiver
+                    .recv_timeout(std::time::Duration::from_secs(1))
+                    .expect("growing recording commit"),
+                previous_bytes,
+                delivered_revisions,
+            );
+        }
+        writer
+            .finish(33, Some(0), None, false, false)
+            .expect("finish recording");
+        delivered_revisions = delivered_revisions.saturating_add(1);
+        let final_commit = commit_receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("final recording commit");
+        assert!(final_commit.finalized);
+        let _final_bytes = deliver_shell_recording_commit(
+            &presentation,
+            &final_commit,
+            previous_bytes,
+            delivered_revisions,
+        );
+        assert_eq!(presentation.visual_revision("other-call"), 0);
+        assert_eq!(
+            presentation.drain_timings().len(),
+            usize::try_from(delivered_revisions).expect("revisions")
+        );
     }
 
     #[test]

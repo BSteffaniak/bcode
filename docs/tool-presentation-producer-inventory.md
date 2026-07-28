@@ -50,5 +50,6 @@ Audit rules:
 * HyperChad tests require its native registries to cover the current manifest schema inventory; TUI routing is validated by plugin manifest and registry tests.
 * Read-only filesystem results may use canonical typed results as the durable semantic source; a native request presentation does not require duplicate durable output.
 * Unknown dynamic-plugin schemas intentionally use canonical fallback until that renderer has an optional native adapter. Raw opaque payloads are not fallback content.
+* Every plugin invocation must provide meaningful bounded canonical fallback through its tool name, lifecycle, retained arguments, terminal text or typed result, and safe artifact metadata. A presentation payload may enrich those fields but cannot be the only meaningful transcript result; a plugin that returns intentionally sparse canonical state is contract-incompatible because bundled and dynamic adapters remain optional.
 * `ToolContributionPlaced` and placement-based projection remain historical/supplemental compatibility only.
 * Legacy placement decode has no date-based removal target. Removal requires an explicit supported-history migration or version cutoff plus coordinated persisted-decoder, projection, fixture, documentation, and guard updates.
