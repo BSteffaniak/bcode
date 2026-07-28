@@ -6921,6 +6921,25 @@ async fn run_new_session_tui(worktree: Option<String>) -> Result<(), CliError> {
     Ok(())
 }
 
+async fn session_owner_client(session_id: SessionId) -> Result<BcodeClient, CliError> {
+    let record = session_owner_record(session_id).await?;
+    let endpoint = record.endpoint.to_ipc_endpoint().ok_or_else(|| {
+        CliError::InvalidArguments(format!(
+            "daemon {} has no supported IPC endpoint",
+            record.instance_id
+        ))
+    })?;
+    let client =
+        BcodeClient::new(endpoint).with_daemon_availability(DaemonAvailability::RequireRunning);
+    let status = client.server_status().await?;
+    if !daemon_status_matches(&record, &status.daemon) {
+        return Err(CliError::InvalidArguments(format!(
+            "refusing session read because daemon identity changed for session {session_id}"
+        )));
+    }
+    Ok(client)
+}
+
 async fn create_session(name: Option<String>) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
     let session = client.create_session(name).await?;
@@ -6988,7 +7007,8 @@ async fn session_history(
     let cursor = before
         .or(after)
         .map(|sequence| SessionHistoryCursor { sequence });
-    let page = BcodeClient::default_endpoint()
+    let page = session_owner_client(session_id)
+        .await?
         .session_history_page(
             session_id,
             SessionHistoryQuery {
@@ -7027,7 +7047,8 @@ async fn session_around(
     after: usize,
     json: bool,
 ) -> Result<(), CliError> {
-    let window = BcodeClient::default_endpoint()
+    let window = session_owner_client(session_id)
+        .await?
         .session_history_around(
             session_id,
             SessionHistoryAroundQuery {
@@ -7072,7 +7093,8 @@ async fn session_inspect(
     let cursor = before
         .or(after)
         .map(|sequence| SessionHistoryCursor { sequence });
-    let page = BcodeClient::default_endpoint()
+    let page = session_owner_client(session_id)
+        .await?
         .session_inspection(
             session_id,
             SessionInspectionQuery {
@@ -7109,7 +7131,8 @@ async fn session_export(
     session_id: SessionId,
     format: SessionExportFormat,
 ) -> Result<(), CliError> {
-    let events = BcodeClient::default_endpoint()
+    let events = session_owner_client(session_id)
+        .await?
         .session_history(session_id)
         .await?;
     match format {
@@ -7138,7 +7161,7 @@ async fn session_timeline(session_id: SessionId) -> Result<(), CliError> {
 }
 
 async fn paged_session_history(session_id: SessionId) -> Result<PagedSessionHistory, CliError> {
-    let client = BcodeClient::default_endpoint();
+    let client = session_owner_client(session_id).await?;
     let mut cursor = Some(SessionHistoryCursor { sequence: 0 });
     let mut history = PagedSessionHistory::default();
     while let Some(page_cursor) = cursor {
@@ -9611,6 +9634,48 @@ mod web_command_tests {
                     ..
                 }
             })
+        ));
+    }
+
+    #[test]
+    fn session_read_owner_identity_requires_exact_daemon_match() {
+        let record = bcode_daemon_lifecycle::DaemonRecord {
+            schema_version: bcode_daemon_lifecycle::DAEMON_RECORD_SCHEMA_VERSION,
+            namespace: "owner".to_owned(),
+            protocol_version: 15,
+            build_fingerprint: "build".to_owned(),
+            executable_digest: Some("digest".to_owned()),
+            endpoint: bcode_daemon_lifecycle::DaemonEndpointRecord::UnixSocket {
+                path: PathBuf::from("/tmp/owner.sock"),
+            },
+            storage_writer_epoch: Some(5),
+            pid: Some(42),
+            instance_id: "instance".to_owned(),
+            log_path: PathBuf::from("/tmp/owner.log"),
+            executable_path: Some(PathBuf::from("/tmp/bcode")),
+            started_at_unix_ms: 1,
+            last_seen_unix_ms: 1,
+        };
+        let matching = bcode_ipc::DaemonStatus {
+            namespace: "owner".to_owned(),
+            protocol_version: 15,
+            build_fingerprint: "build".to_owned(),
+            executable_digest: Some("digest".to_owned()),
+            storage_writer_epoch: Some(5),
+            session_event_schema_version: Some(
+                bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            ),
+            pid: Some(42),
+            instance_id: "instance".to_owned(),
+            started_at_unix_ms: 1,
+        };
+        assert!(daemon_status_matches(&record, &matching));
+        assert!(!daemon_status_matches(
+            &record,
+            &bcode_ipc::DaemonStatus {
+                instance_id: "replacement".to_owned(),
+                ..matching
+            }
         ));
     }
 

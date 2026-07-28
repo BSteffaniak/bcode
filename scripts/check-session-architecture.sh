@@ -758,12 +758,18 @@ if ! rg -q 'let tx = db\.db\.begin_transaction\(\)\.await' packages/session/src/
 fi
 
 if ! sed -n '/async fn session_export(/,/^}/p' packages/cli/src/lib.rs \
-    | grep -q 'BcodeClient::default_endpoint' \
+    | grep -q 'session_owner_client' \
   || ! sed -n '/async fn session_export(/,/^}/p' packages/cli/src/lib.rs \
     | grep -q 'session_history(session_id)' \
+  || ! rg -q 'async fn session_owner_client' packages/cli/src/lib.rs \
+  || ! sed -n '/async fn session_owner_client/,/^}/p' packages/cli/src/lib.rs | grep -q 'session_owner_record' \
+  || ! sed -n '/async fn session_owner_client/,/^}/p' packages/cli/src/lib.rs | grep -q 'daemon_status_matches' \
+  || ! sed -n '/async fn session_history(/,/^}/p' packages/cli/src/lib.rs | grep -q 'session_owner_client' \
+  || ! sed -n '/async fn session_around(/,/^}/p' packages/cli/src/lib.rs | grep -q 'session_owner_client' \
+  || ! sed -n '/async fn session_inspect(/,/^}/p' packages/cli/src/lib.rs | grep -q 'session_owner_client' \
   || rg -q 'session_export_events_from_root|explicit_export_reads_legacy_stream_history_without_migration|ToolInvocationStreamEvent|ToolOutputStream' \
     packages/cli/src packages/session/src --glob '*.rs'; then
-  echo "Session export violation: export must use the daemon-owned strict canonical history boundary and must not restore legacy stream decoding." >&2
+  echo "Session investigation violation: normal session reads and export must route to the verified owning daemon, while export remains explicit complete history and legacy stream decoding stays prohibited." >&2
   violations=1
 fi
 
