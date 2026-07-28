@@ -136,9 +136,86 @@ Current supported operations cannot yet:
 * report federated provider coverage, freshness, exclusions, or partial failures because the search
   contract/coordinator does not yet exist.
 
-## Baseline measurement status
+## Baseline measurements
 
-Lock failure timing above is recorded. Representative small/medium/large measurements for listing,
-paging, complete export, and eventual indexed/deep search remain pending. Those measurements require
-a controlled corpus and current binaries that include the new bounded CLI contracts; they should not
-be fabricated from the installed older binary.
+Release-development measurements captured on 2026-07-28 with the ignored deterministic benchmark:
+
+```sh
+cargo test -p bcode_session benchmark_session_investigation_reads_across_store_sizes \
+  --lib -- --ignored --nocapture
+```
+
+The generated current-format stores use synthetic alternating user/assistant messages. Listing
+measures the catalog call, paging requests the latest 100 canonical events, export decodes complete
+canonical history, and selected-export search writes JSONL then runs fixed-string `rg -c` over that
+explicit export. Results are development-host reference points, not universal deadlines:
+
+| Profile | Events | List | Latest page (100) | Complete export | Export bytes | Selected-export `rg` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Small | 100 | 88 µs | 3.696 ms | 1.909 ms | 25,978 B | 14.188 ms |
+| Medium | 5,000 | 33 µs | 37.651 ms | 101.654 ms | 1,324,229 B | 499.206 ms |
+| Large | 50,000 | 72 µs | 305.283 ms | 1,268.794 ms | 13,391,732 B | 5,699.566 ms |
+
+The benchmark's first run showed the same scaling shape; the table records the final run after the
+selected-export search was changed to invoke `rg` over actual generated JSONL.
+
+These results confirm:
+
+* catalog listing is independent of event count in this controlled already-derived setup;
+* current canonical paging still grows materially with total event count despite a 100-event result
+  bound, so indexed/sidecar-backed bounded access remains important;
+* complete export and grep are appropriately explicit, but unsuitable as ordinary cross-session
+  search paths;
+* no indexed/deep provider numbers exist yet and none should be inferred from export scanning.
+
+## Representative benchmark corpus
+
+Performance and correctness work uses deterministic corpus classes rather than arbitrary personal
+sessions:
+
+* **Small:** 100 canonical events for command overhead and correctness smoke tests.
+* **Medium:** 5,000 canonical events for routine long-session behavior.
+* **Large:** 50,000 canonical events for bounded-read scaling and explicit-export cost.
+* **Transcript mix:** titles plus alternating user/assistant/system content, repeated terms, phrases,
+  Unicode, empty/short messages, and very long lines.
+* **Reasoning mix:** finalized structured reasoning activities and legacy finalized reasoning text,
+  with transport deltas present as explicit exclusions.
+* **Terminal mix:** SGR/CSI styling, OSC titles and hyperlinks, CRLF/lone-CR progress replacement,
+  backspaces, tabs, control bytes, invalid UTF-8 boundaries, huge lines, repeated build output, and
+  errors at the beginning, middle, and end.
+* **Tool mix:** shell commands, bounded stdout/stderr, JSON arguments/results, failed and cancelled
+  lifecycle events, generic plugin results, artifacts/references, permission decisions, and runtime
+  work.
+* **Sensitivity mix:** token/password-like strings, credential-bearing command examples, private
+  paths, and provider errors used only to verify projection exclusion/redaction and secret-safe
+  diagnostics.
+* **Durability mix:** current, future-version, malformed, sequence-inconsistent, stale-projection,
+  repair-required, and provider-index-corrupt states.
+
+Generated fixtures must remain deterministic and synthetic. Personal canonical sessions may provide
+separate diagnostic evidence but are not checked in or treated as reproducible benchmark inputs.
+Search-provider acceptance must report results by corpus class and content policy, including source
+bytes, normalized bytes, indexed bytes, exclusions, truncation, freshness, and query completeness.
+
+## Initial acceptance budgets
+
+Use these as implementation acceptance targets until release hardware measurements justify an
+explicit revision:
+
+* catalog/session listing: p95 at most 25 ms for 50,000-event sessions, without canonical replay;
+* bounded latest/around/inspection read: p95 at most 100 ms for a 100-event result from a
+  50,000-event session;
+* ordinary indexed transcript query: p95 at most 100 ms for a 20-hit response over 100,000 events;
+* incremental search freshness: p95 at most 2 seconds after canonical append when an enabled local
+  provider is healthy;
+* daemon startup overhead: at most 25 ms p95 with search disabled and no provider worker/index open;
+* ordinary query coordinator memory: at most 64 MiB incremental RSS excluding provider-owned
+  configured writer caches;
+* default derived search storage: at most 50% of indexed normalized source bytes and at most 2 GiB,
+  whichever limit is reached first;
+* deep compressed-output search: no universal latency promise initially, but it must be cancellable,
+  deadline-bounded, and report incomplete coverage rather than block ordinary results.
+
+The 50,000-event page baseline currently exceeds the 100 ms target. That is recorded as a known gap,
+not relaxed into the budget. Provider index/corpus amplification must be measured separately before a
+backend is accepted.

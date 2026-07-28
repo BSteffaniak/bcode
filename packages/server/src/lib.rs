@@ -27056,6 +27056,56 @@ mod tests {
         }));
     }
 
+    #[test]
+    fn session_read_errors_have_explicit_public_classifications() {
+        let missing = session_error_response(&bcode_session::SessionError::NotFound(
+            bcode_session_models::SessionId::new(),
+        ));
+        assert_eq!(missing.code, "session_not_found");
+
+        let stale =
+            session_db_error_response(&bcode_session::db::SessionDbError::ProjectionStale {
+                projection: "transcript",
+                checkpoint: None,
+                expected: 9,
+            });
+        assert_eq!(stale.code, "projection_stale");
+
+        let future = session_db_error_response(&bcode_session::db::SessionDbError::PersistedEvent(
+            bcode_session::persisted::PersistedSessionEventError::UnsupportedSchemaVersion {
+                actual: CURRENT_SESSION_EVENT_SCHEMA_VERSION.saturating_add(1),
+                current: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            },
+        ));
+        assert_eq!(future.code, "session_format_incompatible");
+
+        let ambiguous = ErrorResponse::new(
+            "session_incompatible_active_client",
+            "session is active for another compatibility namespace",
+        );
+        assert_eq!(ambiguous.code, "session_incompatible_active_client");
+
+        let repair = session_db_error_response(
+            &bcode_session::db::SessionDbError::InvalidCanonicalSequence {
+                expected: 3,
+                actual: 4,
+            },
+        );
+        assert_eq!(repair.code, "session_repair_required");
+    }
+
+    #[test]
+    fn session_read_limit_error_is_explicit_and_bounded() {
+        let response = session_db_error_response(
+            &bcode_session::db::SessionDbError::HistoryReadLimitExceeded {
+                requested: bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS + 1,
+                maximum: bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS,
+            },
+        );
+        assert_eq!(response.code, "session_history_limit_exceeded");
+        assert!(response.message.contains("1000"));
+    }
+
     #[tokio::test]
     async fn invalid_request_payload_returns_error_without_closing_connection() {
         let session_root = tempfile::tempdir().expect("session root");

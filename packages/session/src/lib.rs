@@ -2645,6 +2645,75 @@ mod tests {
     const CURRENT_SESSION_PREPARE_P95_BUDGET_MS: u128 = 25;
 
     #[tokio::test]
+    async fn normal_investigation_reads_are_byte_for_byte_non_mutating() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("investigation immutability".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should create");
+        manager
+            .append_event(
+                session.id,
+                SessionEventKind::PermissionResolved {
+                    permission_id: "permission-1".to_owned(),
+                    approved: true,
+                },
+            )
+            .await
+            .expect("append investigation event");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = session_database_files(&root, session.id);
+
+        let page = manager
+            .session_history_page(
+                session.id,
+                SessionHistoryQuery {
+                    cursor: None,
+                    limit: 10,
+                    direction: bcode_session_models::SessionHistoryDirection::Forward,
+                },
+            )
+            .await
+            .expect("history page");
+        assert_eq!(page.events.len(), 2);
+        manager
+            .session_history_around(
+                session.id,
+                bcode_session_models::SessionHistoryAroundQuery {
+                    sequence: 1,
+                    before: 1,
+                    after: 1,
+                },
+            )
+            .await
+            .expect("history around");
+        manager
+            .session_inspection_page(
+                session.id,
+                bcode_session_models::SessionInspectionQuery {
+                    category: bcode_session_models::SessionInspectionCategory::Permissions,
+                    cursor: None,
+                    limit: 10,
+                    direction: bcode_session_models::SessionHistoryDirection::Forward,
+                },
+            )
+            .await
+            .expect("inspection page");
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let after = session_database_files(&root, session.id);
+        assert_eq!(
+            after, before,
+            "normal investigation reads must not mutate DB or sidecars"
+        );
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn session_health_is_byte_for_byte_non_mutating() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");
@@ -4683,6 +4752,91 @@ mod tests {
             "current-session preparation p95 {p95_us} us exceeds budget"
         );
         std::fs::remove_dir_all(root).expect("benchmark cleanup");
+    }
+
+    #[tokio::test]
+    #[ignore = "manual release acceptance for session investigation read baselines"]
+    async fn benchmark_session_investigation_reads_across_store_sizes() {
+        use std::time::Instant;
+
+        for profile in [
+            MigrationBenchmarkProfile::Small,
+            MigrationBenchmarkProfile::Medium,
+            MigrationBenchmarkProfile::Large,
+        ] {
+            let root = unique_temp_dir();
+            let session_id = generate_current_migration_benchmark_store(&root, profile).await;
+            let manager = SessionManager::persistent(&root).expect("benchmark manager");
+
+            let list_started = Instant::now();
+            let _ = manager.list_sessions(&test_working_directory()).await;
+            let list_us = list_started.elapsed().as_micros();
+
+            let page_started = Instant::now();
+            let page = manager
+                .session_history_page(
+                    session_id,
+                    SessionHistoryQuery {
+                        cursor: None,
+                        limit: 100,
+                        direction: bcode_session_models::SessionHistoryDirection::Backward,
+                    },
+                )
+                .await
+                .expect("bounded benchmark page");
+            let page_us = page_started.elapsed().as_micros();
+
+            let export_started = Instant::now();
+            let history = manager
+                .session_history(session_id)
+                .await
+                .expect("complete benchmark history");
+            let export_us = export_started.elapsed().as_micros();
+            let export_bytes = history.iter().fold(0usize, |bytes, event| {
+                bytes.saturating_add(
+                    serde_json::to_vec(event)
+                        .expect("encode benchmark event")
+                        .len(),
+                )
+            });
+
+            let search_started = Instant::now();
+            let export_path = root.join("selected-session-export.jsonl");
+            let mut export_file = std::fs::File::create(&export_path).expect("create export file");
+            for event in &history {
+                serde_json::to_writer(&mut export_file, event).expect("write export event");
+                export_file.write_all(b"\n").expect("write export newline");
+            }
+            export_file.flush().expect("flush export file");
+            let search_output = std::process::Command::new("rg")
+                .args(["-F", "-c", "synthetic assistant message"])
+                .arg(&export_path)
+                .output()
+                .expect("run selected-export search");
+            assert!(search_output.status.success(), "selected-export search");
+            let search_hits = String::from_utf8(search_output.stdout)
+                .expect("rg count is UTF-8")
+                .trim()
+                .parse::<usize>()
+                .expect("rg count is numeric");
+            let search_us = search_started.elapsed().as_micros();
+
+            eprintln!(
+                "session_investigation_baseline profile={} events={} list_us={} page_us={} page_events={} export_us={} export_bytes={} selected_export_rg_us={} search_hits={}",
+                profile.name(),
+                profile.event_count(),
+                list_us,
+                page_us,
+                page.events.len(),
+                export_us,
+                export_bytes,
+                search_us,
+                search_hits,
+            );
+            assert_eq!(history.len(), profile.event_count());
+            assert!(page.events.len() <= 100);
+            std::fs::remove_dir_all(root).expect("benchmark cleanup");
+        }
     }
 
     #[tokio::test]

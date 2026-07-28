@@ -27,6 +27,32 @@ Normal investigation reads are non-mutating. They do not migrate, repair, rebuil
 silently reinterpret unsupported canonical state. Missing, damaged, incompatible, and stale state is
 reported explicitly according to the session persistence architecture.
 
+## Public read semantics
+
+Bounded history and inspection contracts use canonical event sequence ordering. Forward reads return
+ascending sequences; backward reads select from newest to oldest but return the selected page in
+chronological ascending order for presentation. Cursors are inclusive canonical sequence locators.
+`next_cursor`, when present, identifies the first canonical candidate not returned by the current
+page. Reissuing the same immutable canonical query is safe and deterministic. Session events are
+append-only, so a retry may observe a newer tail but cannot change the identity or meaning of an
+already committed sequence.
+
+Read requests are side-effect free and therefore safe to retry or deliver more than once. Responses
+do not acknowledge durable progress and cursors do not imply reconnect-safe retention beyond
+canonical session history. A request has one terminal response: success or a normalized error.
+Late/stale process-local updates cannot reopen that response. Missing sessions, incompatible active
+ownership, future/unknown formats, stale projections, exceeded bounds, and repair-required damage
+have distinct public error classifications.
+
+A normal history page or around window returns at most
+`MAX_SESSION_HISTORY_READ_EVENTS` events. Structured inspection returns at most
+`MAX_SESSION_INSPECTION_EVENTS` matches and decodes at most
+`MAX_SESSION_HISTORY_READ_EVENTS` prefiltered canonical candidates per page. Persisted durable event
+payloads are bounded at append boundaries by event-kind-specific rules; generic durable
+contributions are capped at 64 KiB. IPC framing and client request timeouts provide additional
+transport bounds. Complete selected-session export is explicitly exempt from normal-read event-count
+bounds and must never be reused as ordinary search hydration.
+
 ## Search ownership
 
 Session search is a session-domain capability implemented through versioned typed plugin services.
