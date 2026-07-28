@@ -88,6 +88,128 @@ fn renderer_lifecycle_fixture_converges_through_incremental_patches() {
 }
 
 #[test]
+fn shared_fixture_inventory_covers_every_producer_family_and_edge_class() {
+    let producer_families = [
+        "shell",
+        "filesystem",
+        "vim-edit",
+        "document",
+        "ocr",
+        "web-search",
+        "git",
+        "worktree",
+    ];
+    let fixtures = super::renderer_fixtures::renderer_tool_presentation_fixtures();
+    let required_edge_fixtures = [
+        "requested-no-presentation",
+        "waiting-fallback",
+        "failed-text-result",
+        "cancelled-without-result",
+        "timed-out-json-result",
+        "artifact-result-fallback",
+    ];
+    for required in required_edge_fixtures {
+        assert!(
+            fixtures.iter().any(|fixture| fixture.name == required),
+            "missing renderer edge fixture {required}"
+        );
+    }
+    assert!(
+        fixtures.iter().any(|fixture| !fixture.revisions.is_empty()),
+        "at least one producer fixture must exercise presentation replacement"
+    );
+    for name in producer_families {
+        let fixture = fixtures
+            .iter()
+            .find(|fixture| fixture.name == name)
+            .unwrap_or_else(|| panic!("missing {name} producer fixture"));
+        for (index, status) in [
+            ToolInvocationViewStatus::Requested,
+            ToolInvocationViewStatus::Running,
+            ToolInvocationViewStatus::Waiting,
+            ToolInvocationViewStatus::Finished,
+            ToolInvocationViewStatus::Failed,
+            ToolInvocationViewStatus::Cancelled,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut variant = fixture.item.clone();
+            variant.revision = variant
+                .revision
+                .saturating_add(u64::try_from(index).expect("lifecycle index") + 1);
+            variant.streaming = matches!(
+                status,
+                ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+            );
+            let TranscriptViewItemKind::ToolInvocation { tool } = &mut variant.kind else {
+                panic!("{name} fixture must be a tool invocation");
+            };
+            tool.status = status;
+            tool.presentation = None;
+            tool.is_error = matches!(status, ToolInvocationViewStatus::Failed).then_some(true);
+            tool.result_text = matches!(
+                status,
+                ToolInvocationViewStatus::Finished | ToolInvocationViewStatus::Failed
+            )
+            .then(|| format!("{name} terminal result"));
+            assert_eq!(variant.id, fixture.item.id, "{name} {status:?}");
+            let encoded = serde_json::to_vec(&variant).expect("encode lifecycle variant");
+            let decoded: TranscriptViewItem =
+                serde_json::from_slice(&encoded).expect("decode lifecycle variant");
+            assert_eq!(decoded, variant);
+        }
+    }
+}
+
+#[test]
+fn tool_presentation_update_scope_reports_accept_reject_and_closure_counts() {
+    let update = |generation, revision| ToolPresentationUpdate {
+        invocation_id: "call-metrics".to_owned(),
+        producer_id: "test.plugin".to_owned(),
+        generation,
+        revision,
+        identity: ToolPresentationIdentity::Primary,
+        retention: ToolPresentationRetention::RetainLatest,
+        schema: "test.presentation".to_owned(),
+        schema_version: 1,
+        artifact: None,
+        payload: serde_json::json!({"revision": revision}),
+    };
+    let mut scope = ToolPresentationUpdateScope::default();
+    let mut accepted = 0_u64;
+    let mut stale = 0_u64;
+    let mut oversized = 0_u64;
+    let mut closed = 0_u64;
+    for revision in 1..=128 {
+        match scope.accept(&update(0, revision), 4_096) {
+            Ok(()) => accepted = accepted.saturating_add(1),
+            Err(error) => panic!("monotonic update rejected: {error:?}"),
+        }
+    }
+    if matches!(
+        scope.accept(&update(0, 128), 4_096),
+        Err(ToolPresentationUpdateError::StaleRevision)
+    ) {
+        stale = stale.saturating_add(1);
+    }
+    if matches!(
+        scope.accept(&update(0, 129), 1),
+        Err(ToolPresentationUpdateError::TooLarge { .. })
+    ) {
+        oversized = oversized.saturating_add(1);
+    }
+    scope.close();
+    if matches!(
+        scope.accept(&update(0, 129), 4_096),
+        Err(ToolPresentationUpdateError::Closed)
+    ) {
+        closed = closed.saturating_add(1);
+    }
+    assert_eq!((accepted, stale, oversized, closed), (128, 1, 1, 1));
+}
+
+#[test]
 fn tool_presentation_update_scope_enforces_identity_generation_revision_bounds_and_closure() {
     let update = |generation, revision, identity| ToolPresentationUpdate {
         invocation_id: "call-1".to_owned(),
@@ -1136,6 +1258,126 @@ fn growing_vim_artifact_metadata_replaces_one_bounded_primary_item() {
         assert_eq!(current.transcript.items.len(), 1);
         assert_eq!(current, next);
     }
+}
+
+#[test]
+#[ignore = "manual deterministic renderer patch performance baseline"]
+#[allow(clippy::too_many_lines)] // Keep the fixed measurement scenario and emitted record together.
+fn renderer_patch_clone_reset_latency_and_memory_baseline_report() {
+    let shell = super::renderer_fixtures::renderer_tool_presentation_fixtures()
+        .into_iter()
+        .find(|fixture| fixture.name == "shell")
+        .expect("shell fixture");
+    let mut active = SessionViewSnapshot::empty();
+    active.revision = shell.item.revision;
+    let mut items = (0..2_000)
+        .map(|index| {
+            transcript_item(
+                &format!("history-{index}"),
+                u64::try_from(index).expect("index") + 1,
+                "bounded history",
+            )
+        })
+        .collect::<Vec<_>>();
+    items.push(shell.item.clone());
+    active.transcript = transcript_document_from_vec(active.revision, items);
+    let TranscriptViewItemKind::ToolInvocation { tool } = &shell.item.kind else {
+        panic!("shell fixture must be a tool invocation");
+    };
+    active
+        .tools
+        .insert(tool.tool_call_id.clone(), (**tool).clone());
+
+    let clone_started = std::time::Instant::now();
+    let clones = (0..100).map(|_| active.clone()).collect::<Vec<_>>();
+    let clone_us = u64::try_from(clone_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let snapshot_bytes = serde_json::to_vec(&active)
+        .expect("active snapshot serializes")
+        .len();
+    let copied_snapshot_bytes = snapshot_bytes.saturating_mul(clones.len());
+
+    let final_item = shell
+        .revisions
+        .last()
+        .expect("terminal shell revision")
+        .clone();
+    let mut closed = active.clone();
+    closed.revision = final_item.revision;
+    closed.transcript.revision = final_item.revision;
+    *closed
+        .transcript
+        .items
+        .last_mut()
+        .expect("active shell item") = final_item.clone();
+    let TranscriptViewItemKind::ToolInvocation { tool } = &final_item.kind else {
+        panic!("terminal shell fixture must be a tool invocation");
+    };
+    closed
+        .tools
+        .insert(tool.tool_call_id.clone(), (**tool).clone());
+    let closure_started = std::time::Instant::now();
+    let closure_patch = SessionViewPatch::between_snapshots(&active, &closed);
+    let closure_patch_us = u64::try_from(closure_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let mut closure_applied = active.clone();
+    closure_applied
+        .apply_patch(&closure_patch)
+        .expect("closure patch applies");
+    assert_eq!(closure_applied, closed);
+
+    let reconnect_started = std::time::Instant::now();
+    let mut reconnected = active.clone();
+    reconnected
+        .apply_patch(&closure_patch)
+        .expect("reconnect patch applies");
+    let reconnect_us = u64::try_from(reconnect_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+    assert_eq!(reconnected, closed);
+
+    let mut title_reset = closed.clone();
+    title_reset.revision = title_reset.revision.saturating_add(1);
+    title_reset.transcript.revision = title_reset.revision;
+    title_reset.title = Some("renamed".to_owned());
+    let title_patch = SessionViewPatch::between_snapshots(&closed, &title_reset);
+    assert!(title_patch.reset.is_some());
+
+    let mut window_reset = closed.transcript.clone();
+    window_reset.revision = window_reset.revision.saturating_add(1);
+    window_reset.has_older_history = true;
+    let window_patch = SessionViewPatch::transcript_between(
+        closed.transcript.revision,
+        window_reset.revision,
+        None,
+        &closed.transcript,
+        &window_reset,
+    );
+    assert!(matches!(
+        window_patch.transcript.as_slice(),
+        [TranscriptViewPatchOp::Reset { .. }]
+    ));
+
+    let closed_bytes = serde_json::to_vec(&closed)
+        .expect("closed snapshot serializes")
+        .len();
+    println!(
+        "BCODE_PERF_CASE {}",
+        serde_json::json!({
+            "domain": "renderer_patch_clone_reset",
+            "transcript_items": active.transcript.items.len(),
+            "snapshot_clones": clones.len(),
+            "snapshot_bytes": snapshot_bytes,
+            "copied_snapshot_bytes": copied_snapshot_bytes,
+            "clone_us": clone_us,
+            "full_reset_count": 1,
+            "full_reset_causes": ["non_transcript_state_change"],
+            "transcript_reset_count": 1,
+            "transcript_reset_causes": ["bounded_window_metadata_change"],
+            "closure_patch_operations": closure_patch.transcript.len(),
+            "closure_patch_bytes": serde_json::to_vec(&closure_patch).expect("patch serializes").len(),
+            "closure_patch_us": closure_patch_us,
+            "reconnect_convergence_us": reconnect_us,
+            "active_snapshot_bytes": snapshot_bytes,
+            "closed_snapshot_bytes": closed_bytes,
+        })
+    );
 }
 
 #[test]

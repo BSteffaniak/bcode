@@ -46,6 +46,8 @@ pub enum TranscriptItemKind {
         working_directory: Option<std::path::PathBuf>,
         /// Whether host-owned lifecycle state is active or waiting.
         active: bool,
+        /// Authoritative shared lifecycle status, when projected from `SessionView`.
+        status: Option<ToolInvocationViewStatus>,
         /// Generic timing metadata for the tool invocation.
         timing: ToolTiming,
     },
@@ -507,6 +509,7 @@ pub fn tool_request_item(
             tool_name: tool_name.to_owned(),
             working_directory,
             active: false,
+            status: None,
             timing: ToolTiming::default(),
         },
     )
@@ -948,6 +951,9 @@ fn terminal_tool_item_from_shared(tool: &ToolInvocationView) -> TranscriptItem {
         tool.arguments_json.as_deref().unwrap_or("{}"),
         tool.working_directory.clone(),
     );
+    if let TranscriptItemKind::ToolRequest { status, .. } = &mut item.kind {
+        *status = Some(tool.status);
+    }
     item = apply_shared_tool_timing(item, tool);
     if matches!(
         tool.status,

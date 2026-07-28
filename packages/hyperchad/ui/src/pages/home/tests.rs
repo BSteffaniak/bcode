@@ -2151,6 +2151,22 @@ fn rich_adapter_state_matrix_covers_empty_truncated_optional_error_and_fallbacks
     );
     assert!(truncated.contains("truncated"));
 
+    let fallback = ToolArtifactView::from(ToolArtifact {
+        artifact_id: "unknown".to_owned(),
+        producer_plugin_id: "unknown.plugin".to_owned(),
+        schema: "unknown.schema".to_owned(),
+        schema_version: 1,
+        tool_call_id: None,
+        title: None,
+        metadata: serde_json::json!({"summary": "fallback details"}),
+        refs: Vec::new(),
+    });
+    let fallback = format!(
+        "{:?}",
+        render_tool_result(&ToolResultView::Artifact { artifact: fallback })
+    );
+    assert!(fallback.contains("artifact details"));
+
     for status in [
         ToolInvocationViewStatus::Requested,
         ToolInvocationViewStatus::Running,
@@ -2234,6 +2250,67 @@ fn shared_tool_presentation_fixtures_render_semantic_content_in_hyperchad() {
             "{} missing status {status:?}: {rendered}",
             fixture.name
         );
+    }
+}
+
+#[test]
+fn every_producer_family_renders_canonical_lifecycle_fallback_in_hyperchad() {
+    let producer_families = [
+        "shell",
+        "filesystem",
+        "vim-edit",
+        "document",
+        "ocr",
+        "web-search",
+        "git",
+        "worktree",
+    ];
+    let fixtures = crate::renderer_fixtures::renderer_tool_presentation_fixtures();
+    for name in producer_families {
+        let fixture = fixtures
+            .iter()
+            .find(|fixture| fixture.name == name)
+            .unwrap_or_else(|| panic!("missing {name} producer fixture"));
+        for status in [
+            ToolInvocationViewStatus::Requested,
+            ToolInvocationViewStatus::Running,
+            ToolInvocationViewStatus::Waiting,
+            ToolInvocationViewStatus::Finished,
+            ToolInvocationViewStatus::Failed,
+            ToolInvocationViewStatus::Cancelled,
+        ] {
+            let mut variant = fixture.item.clone();
+            variant.streaming = matches!(
+                status,
+                ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+            );
+            let TranscriptViewItemKind::ToolInvocation { tool } = &mut variant.kind else {
+                panic!("{name} fixture must be a tool invocation");
+            };
+            tool.status = status;
+            tool.presentation = None;
+            tool.result_text = matches!(
+                status,
+                ToolInvocationViewStatus::Finished | ToolInvocationViewStatus::Failed
+            )
+            .then(|| format!("{name} terminal result"));
+            tool.is_error = matches!(status, ToolInvocationViewStatus::Failed).then_some(true);
+            let tool_name = tool.tool_name.clone();
+            let result_text = tool.result_text.clone();
+            let rendered = container_text_all(&transcript_item(&variant));
+            assert!(rendered.contains(tool_name.as_deref().unwrap_or("Tool")));
+            assert!(rendered.contains(match status {
+                ToolInvocationViewStatus::Requested => "requested",
+                ToolInvocationViewStatus::Running => "running",
+                ToolInvocationViewStatus::Waiting => "waiting",
+                ToolInvocationViewStatus::Finished => "finished",
+                ToolInvocationViewStatus::Failed => "failed",
+                ToolInvocationViewStatus::Cancelled => "cancelled",
+            }));
+            if let Some(result) = &result_text {
+                assert!(rendered.contains(result));
+            }
+        }
     }
 }
 

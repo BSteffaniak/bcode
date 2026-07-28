@@ -1583,10 +1583,12 @@ fn push_transcript_item_rows(
             working_directory: _,
             timing: _,
             active: _,
+            status,
         } => {
             let context = ToolRequestRenderContext {
                 tool_call_id,
                 tool_name,
+                status: *status,
             };
             push_tool_request_rows(rows, item, &context, width);
         }
@@ -1906,6 +1908,49 @@ fn push_markdown_block_with_streaming(
     }
 
     rows.push(Line::default());
+}
+
+#[cfg(test)]
+#[test]
+#[ignore = "manual deterministic renderer parsing and layout baseline"]
+fn markdown_and_json_layout_work_per_revision_baseline_report() {
+    let markdown = "## Heading\n\n- one\n- two\n\n```rust\nfn main() {}\n```\n".repeat(64);
+    let json = serde_json::json!({
+        "items": (0..256).map(|index| serde_json::json!({"index": index, "value": "x".repeat(64)})).collect::<Vec<_>>()
+    })
+    .to_string();
+    for (kind, body, format) in [
+        ("markdown", markdown, TextFormat::Markdown),
+        ("json", json, TextFormat::Json),
+    ] {
+        let started = Instant::now();
+        let mut emitted_rows = 0_usize;
+        let revisions = 100_usize;
+        for revision in 0..revisions {
+            let mut rows = Vec::new();
+            push_formatted_block(
+                &mut rows,
+                kind,
+                &format!("revision {revision}\n{body}"),
+                format,
+                Color::Green,
+                false,
+                100,
+            );
+            emitted_rows = emitted_rows.saturating_add(rows.len());
+        }
+        println!(
+            "BCODE_PERF_CASE {}",
+            serde_json::json!({
+                "domain": "renderer_parse_layout",
+                "format": kind,
+                "revisions": revisions,
+                "input_bytes_per_revision": body.len(),
+                "emitted_rows": emitted_rows,
+                "parse_layout_us": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            })
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2232,6 +2277,79 @@ fn shared_tool_presentation_fixtures_render_semantic_content_in_tui() {
 
 #[cfg(test)]
 #[test]
+fn every_producer_family_renders_canonical_lifecycle_fallback_in_tui() {
+    let producer_families = [
+        "shell",
+        "filesystem",
+        "vim-edit",
+        "document",
+        "ocr",
+        "web-search",
+        "git",
+        "worktree",
+    ];
+    let fixtures = crate::renderer_fixtures::renderer_tool_presentation_fixtures();
+    for name in producer_families {
+        let fixture = fixtures
+            .iter()
+            .find(|fixture| fixture.name == name)
+            .unwrap_or_else(|| panic!("missing {name} producer fixture"));
+        for status in [
+            bcode_session_view_models::ToolInvocationViewStatus::Requested,
+            bcode_session_view_models::ToolInvocationViewStatus::Running,
+            bcode_session_view_models::ToolInvocationViewStatus::Waiting,
+            bcode_session_view_models::ToolInvocationViewStatus::Finished,
+            bcode_session_view_models::ToolInvocationViewStatus::Failed,
+            bcode_session_view_models::ToolInvocationViewStatus::Cancelled,
+        ] {
+            let mut variant = fixture.item.clone();
+            variant.streaming = matches!(
+                status,
+                bcode_session_view_models::ToolInvocationViewStatus::Running
+                    | bcode_session_view_models::ToolInvocationViewStatus::Waiting
+            );
+            let bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool } =
+                &mut variant.kind
+            else {
+                panic!("{name} fixture must be a tool invocation");
+            };
+            tool.status = status;
+            tool.presentation = None;
+            tool.result_text = matches!(
+                status,
+                bcode_session_view_models::ToolInvocationViewStatus::Finished
+                    | bcode_session_view_models::ToolInvocationViewStatus::Failed
+            )
+            .then(|| format!("{name} terminal result"));
+            tool.is_error = matches!(
+                status,
+                bcode_session_view_models::ToolInvocationViewStatus::Failed
+            )
+            .then_some(true);
+            let tool_name = tool.tool_name.clone();
+            let result_text = tool.result_text.clone();
+            let terminal = super::transcript::terminal_item_from_shared(&variant);
+            let rows =
+                transcript_item_rows(&[terminal], 0, 100, None, TuiDiffViewerConfig::default());
+            let rendered = visible_rows_snapshot(&rows);
+            assert!(rendered.contains(tool_name.as_deref().unwrap_or("Tool")));
+            let lifecycle_fragment = match status {
+                bcode_session_view_models::ToolInvocationViewStatus::Finished => "ok",
+                other => tool_status_label(other),
+            };
+            assert!(
+                rendered.contains(lifecycle_fragment),
+                "{name} {status:?} missing {lifecycle_fragment:?}: {rendered}"
+            );
+            if let Some(result) = &result_text {
+                assert!(rendered.contains(result));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
 fn unsupported_tool_presentation_uses_semantic_fallback_without_opaque_payload() {
     let secret = "opaque-presentation-secret";
     let shared = bcode_session_view_models::TranscriptViewItem {
@@ -2518,6 +2636,7 @@ fn push_reasoning_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) 
 struct ToolRequestRenderContext<'a> {
     tool_call_id: &'a str,
     tool_name: &'a str,
+    status: Option<bcode_session_view_models::ToolInvocationViewStatus>,
 }
 
 fn push_tool_request_rows(
@@ -2526,9 +2645,19 @@ fn push_tool_request_rows(
     context: &ToolRequestRenderContext<'_>,
     width: u16,
 ) {
+    let title = context.status.map_or_else(
+        || format!("Tool · {}", context.tool_name),
+        |status| {
+            format!(
+                "Tool · {} · {}",
+                context.tool_name,
+                tool_status_label(status)
+            )
+        },
+    );
     push_tool_block_header(
         rows,
-        &format!("Tool · {}", context.tool_name),
+        &title,
         item.tool_timing(),
         item.tool_is_active(),
         false,

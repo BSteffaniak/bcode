@@ -53,6 +53,21 @@ if actual != expected:
             print(f"  manifests: {actual.get(plugin_id)}", file=sys.stderr)
     raise SystemExit(1)
 
+producer_ids = {
+    "bcode.document",
+    "bcode.filesystem",
+    "bcode.git",
+    "bcode.ocr",
+    "bcode.shell",
+    "bcode.vim-edit",
+    "bcode.web-search",
+    "bcode.worktree",
+}
+for plugin_id in producer_ids:
+    schemas = actual[plugin_id][0]
+    if not schemas:
+        raise SystemExit(f"{plugin_id}: transcript producer must declare visual schemas")
+
 import re
 
 publisher = re.compile(

@@ -566,4 +566,33 @@ mod tests {
         assert!(text.contains("1:6"));
         assert!(text.contains("step"));
     }
+
+    #[test]
+    #[ignore = "manual deterministic Vim diff parsing and layout baseline"]
+    fn diff_layout_work_per_revision_baseline_report() {
+        use std::fmt::Write as _;
+
+        let diff = (0..256).fold(String::new(), |mut output, index| {
+            let _ = writeln!(output, "-{index}: old value\n+{index}: new value");
+            output
+        });
+        let revisions = 100_usize;
+        let started = std::time::Instant::now();
+        let mut emitted_rows = 0_usize;
+        for revision in 0..revisions {
+            let rows = diff_rows(&format!("@@ revision {revision} @@\n{diff}"), 100);
+            emitted_rows = emitted_rows.saturating_add(rows.len());
+        }
+        println!(
+            "BCODE_PERF_CASE {}",
+            serde_json::json!({
+                "domain": "renderer_parse_layout",
+                "format": "diff",
+                "revisions": revisions,
+                "input_bytes_per_revision": diff.len(),
+                "emitted_rows": emitted_rows,
+                "parse_layout_us": u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            })
+        );
+    }
 }

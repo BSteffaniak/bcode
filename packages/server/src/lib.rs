@@ -41002,7 +41002,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let mut pending = PendingLiveEventBuffer::default();
         let mut produced_events = 0_u64;
         let mut serialized_bytes = 0_u64;
+        let mut accepted_updates = 0_u64;
+        let rejected_updates = 0_u64;
         let mut coalesced_updates = 0_u64;
+        let pass_through_updates = 0_u64;
         let mut latencies_ns = Vec::new();
         let started = Instant::now();
         for event in events {
@@ -41020,6 +41023,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             latencies_ns.push(u64::try_from(push_started.elapsed().as_nanos()).unwrap_or(u64::MAX));
             match result {
                 BufferLiveEventResult::Buffered { superseded } => {
+                    accepted_updates = accepted_updates.saturating_add(1);
                     coalesced_updates = coalesced_updates.saturating_add(u64::from(superseded));
                 }
                 BufferLiveEventResult::PassThrough(_) => {
@@ -41041,8 +41045,12 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 "domain": "pending_live_fanout",
                 "workload": name,
                 "produced_events": produced_events,
+                "accepted_updates": accepted_updates,
+                "rejected_updates": rejected_updates,
+                "pass_through_updates": pass_through_updates,
                 "serialized_bytes": serialized_bytes,
                 "retained_events": pending.len(),
+                "flushed_updates": pending.len(),
                 "pending_bytes": pending.encoded_bytes(),
                 "coalesced_updates": coalesced_updates,
                 "push_latency_ns_p50": percentile(50),
