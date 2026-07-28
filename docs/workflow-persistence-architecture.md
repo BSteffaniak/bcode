@@ -55,6 +55,14 @@ skill model policy is applied to the turn-local provider/model selection, while 
 selection fails closed. Read-only workflow agents require read-only tool capability and reject skills
 that declare tool access.
 
+## Plugin-owned blocks and templates
+
+Workflow blocks, template declarations, typed transform/state-envelope guidance, mutation approval,
+and repair-required behavior are documented in
+[`workflow-plugins-and-templates.md`](workflow-plugins-and-templates.md). Template discovery is
+manifest-driven and non-executing; template start revalidates requirements and configuration before
+persisting the exact compiled definition.
+
 ## Durable mutation approval requests
 
 Mutating plugin-block approval uses `WorkflowMutationGrantScope` version 1. Its immutable identity

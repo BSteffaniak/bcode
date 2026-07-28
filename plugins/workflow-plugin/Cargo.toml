@@ -23,6 +23,7 @@ bcode_workflow_store = { workspace = true }
 bmux_keyboard        = { workspace = true }
 bmux_tui             = { workspace = true }
 clap                 = { workspace = true, features = ["derive", "std"] }
+jsonschema           = { workspace = true }
 serde                = { workspace = true, features = ["derive", "std"] }
 serde_json           = { workspace = true }
 tokio                = { workspace = true }

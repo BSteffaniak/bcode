@@ -2713,6 +2713,7 @@ dependencies = [
  "bmux_keyboard",
  "bmux_tui",
  "clap",
+ "jsonschema",
  "serde",
  "serde_json",
  "tokio",

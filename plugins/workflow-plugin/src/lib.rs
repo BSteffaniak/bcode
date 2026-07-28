@@ -240,8 +240,10 @@ pub(crate) async fn execute_command(
                 options.insert("session_id".to_string(), serde_json::json!(session_id));
             }
             if let Some(configuration) = request.args.get("configuration") {
-                let configuration = serde_json::from_str(configuration)
-                    .map_err(|error| format!("invalid template configuration JSON: {error}"))?;
+                let configuration = validate_template_configuration(
+                    &template.template.configuration_schema.schema,
+                    configuration,
+                )?;
                 options.insert("configuration".to_string(), configuration);
             }
             format!(
@@ -253,8 +255,27 @@ pub(crate) async fn execute_command(
             let owner_plugin_id = required_arg(&request, "owner_plugin_id")?;
             let template_id = required_arg(&request, "template_id")?;
             let template_version = parse_arg::<u32>(&request, "template_version")?;
-            let configuration = serde_json::from_str(&required_arg(&request, "configuration")?)
-                .map_err(|error| format!("invalid template configuration JSON: {error}"))?;
+            let described = client
+                .describe_workflow_template(
+                    owner_plugin_id.clone(),
+                    template_id.clone(),
+                    template_version,
+                )
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "workflow template not found or disabled".to_string())?;
+            if !described.diagnostics.is_empty() {
+                return Err(described
+                    .diagnostics
+                    .iter()
+                    .map(|diagnostic| diagnostic.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; "));
+            }
+            let configuration = validate_template_configuration(
+                &described.template.configuration_schema.schema,
+                &required_arg(&request, "configuration")?,
+            )?;
             let parent_session_id = parse_arg(&request, "session_id")?;
             let started = client
                 .start_workflow_template(bcode_ipc::WorkflowTemplateStartRequest {
@@ -478,6 +499,23 @@ fn parse_arguments(arguments: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+fn validate_template_configuration(
+    schema: &serde_json::Value,
+    configuration: &str,
+) -> Result<serde_json::Value, String> {
+    if configuration.len() > 1_048_576 {
+        return Err("template configuration exceeds 1048576 bytes".to_string());
+    }
+    let configuration = serde_json::from_str(configuration)
+        .map_err(|error| format!("invalid template configuration JSON: {error}"))?;
+    let validator = jsonschema::validator_for(schema)
+        .map_err(|error| format!("invalid template configuration schema: {error}"))?;
+    if let Err(error) = validator.validate(&configuration) {
+        return Err(format!("template configuration is invalid: {error}"));
+    }
+    Ok(configuration)
+}
+
 fn required_arg(request: &InvokeCommandRequest, name: &str) -> Result<String, String> {
     request
         .args
@@ -572,6 +610,33 @@ mod tests {
                 ("run_id".to_string(), "run-1".to_string()),
             ])
         );
+    }
+
+    #[test]
+    fn template_configuration_is_locally_schema_validated_and_bounded() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["prompt", "max_iterations"],
+            "properties": {
+                "prompt": {"type": "string", "minLength": 1},
+                "max_iterations": {"type": "integer", "minimum": 1, "maximum": 100}
+            }
+        });
+        assert_eq!(
+            validate_template_configuration(
+                &schema,
+                r#"{"prompt":"implement","max_iterations":3}"#
+            )
+            .expect("valid")["max_iterations"],
+            3
+        );
+        assert!(
+            validate_template_configuration(&schema, r#"{"prompt":"","max_iterations":0}"#)
+                .is_err()
+        );
+        assert!(validate_template_configuration(&schema, "not-json").is_err());
+        assert!(validate_template_configuration(&schema, &"x".repeat(1_048_577)).is_err());
     }
 
     #[test]
