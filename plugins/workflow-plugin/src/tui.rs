@@ -381,10 +381,16 @@ fn surface_lines(options: &serde_json::Value, selected_approval: usize) -> Vec<S
     append_mutation_approvals(&mut lines, options, selected_approval);
     append_named_rows(&mut lines, options, "attempts", "Attempts", |value| {
         format!(
-            "  {} #{} · {}",
+            "  {} #{} · {} · {} · receipt={} · dispatch={}",
             text(value, "node_id"),
             number(value, "attempt"),
-            text(value, "status")
+            text(value, "status"),
+            text(value, "side_effect"),
+            value
+                .get("has_receipt")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            text(value, "dispatch_identity")
         )
     });
     append_named_rows(&mut lines, options, "decisions", "Decisions", |value| {
@@ -426,10 +432,11 @@ fn surface_lines(options: &serde_json::Value, selected_approval: usize) -> Vec<S
         "Outputs/artifacts",
         |value| {
             format!(
-                "  {} · {} · {}",
+                "  {} · {} · {} · checksum {}",
                 text(value, "node_id"),
                 text(value, "schema_id"),
-                text(value, "artifact_reference")
+                text(value, "artifact_reference"),
+                short_checksum(text(value, "checksum_sha256"))
             )
         },
     );
@@ -443,10 +450,34 @@ fn surface_lines(options: &serde_json::Value, selected_approval: usize) -> Vec<S
     append_named_rows(&mut lines, options, "events", "Events", |value| {
         format!(
             "  {} · {}",
-            number(value, "sequence"),
+            number(value, "event_seq"),
             text(value, "event_type")
         )
     });
+    if let Some(doctor) = options.get("doctor") {
+        lines.push(format!(
+            "Doctor · truncated={} · {} issue(s)",
+            doctor
+                .get("truncated")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            doctor
+                .get("issues")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len)
+        ));
+        append_named_rows(&mut lines, doctor, "issues", "Doctor issues", |value| {
+            format!("  {} · {}", text(value, "issue"), compact_json(Some(value)))
+        });
+    }
+    if let Some(repair) = options.get("repair") {
+        lines.push(format!(
+            "Repair · {} · attempt={} · run={}",
+            text(repair, "dispatch_identity"),
+            text(repair, "attempt_status"),
+            text(repair, "run_status")
+        ));
+    }
     if options.get("retry").is_some() {
         lines.push("Exact failed node retry admitted".to_string());
     }
