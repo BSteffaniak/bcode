@@ -3530,7 +3530,7 @@ fn process_responses_stream_line(
         "response.function_call_arguments.done" => {
             process_responses_function_arguments_done(&event, tool_calls);
         }
-        "response.completed" | "response.done" | "response.incomplete" => {
+        "response.completed" | "response.done" => {
             if let Some(usage) = openai_usage_from_responses_event(&event) {
                 let exact_input = (!processor.uses_previous_response)
                     .then(|| usage.prompt_tokens.or(usage.input_tokens))
@@ -3574,37 +3574,105 @@ fn process_responses_stream_line(
             }
             return Ok(outcome);
         }
+        "response.incomplete" => {
+            return Err(responses_incomplete_error(&event));
+        }
         "response.failed" | "error" => {
-            let message = event
-                .get("error")
-                .and_then(|error| error.get("message"))
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| event.get("message").and_then(serde_json::Value::as_str))
-                .unwrap_or("OpenAI Responses stream failed");
-            let code = event
-                .get("error")
-                .and_then(|error| error.get("code").or_else(|| error.get("type")))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("responses_stream_failed");
-            let status = event
-                .get("status")
-                .or_else(|| event.get("status_code"))
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|status| u16::try_from(status).ok())
-                .unwrap_or(400);
-            let mut error = provider_error(
-                code,
-                category_from_openai_error(status, code, None, message),
-                message,
-            );
-            if error.category == ProviderErrorCategory::RateLimit {
-                error.retry = retry_hint_from_json_value(&event).map(Box::new);
-            }
-            return Err(error);
+            return Err(responses_failed_error(&event));
         }
         _ => {}
     }
     Ok(StreamOutcome::Cancelled)
+}
+
+fn responses_failed_error(event: &serde_json::Value) -> ProviderError {
+    let response = event.get("response");
+    let detail = event
+        .get("error")
+        .or_else(|| response.and_then(|response| response.get("error")));
+    let message = detail
+        .and_then(|error| error.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| event.get("message").and_then(serde_json::Value::as_str))
+        .unwrap_or("OpenAI Responses stream failed");
+    let code = detail
+        .and_then(|error| error.get("code").or_else(|| error.get("type")))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("responses_stream_failed");
+    let error_type = detail
+        .and_then(|error| error.get("type"))
+        .and_then(serde_json::Value::as_str);
+    let status = event
+        .get("status")
+        .or_else(|| event.get("status_code"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|status| u16::try_from(status).ok())
+        .unwrap_or(400);
+    let mut error = provider_error(
+        code,
+        category_from_openai_error(status, code, error_type, message),
+        message,
+    );
+    error.request_id = response
+        .and_then(|response| response.get("id"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .map(String::into_boxed_str);
+    error
+        .diagnostic_context
+        .insert("terminal_status".to_string(), "failed".to_string());
+    if let Some(error_type) = error_type {
+        error
+            .diagnostic_context
+            .insert("error_type".to_string(), error_type.to_string());
+    }
+    error.sources.push(ProviderErrorSource {
+        source: "openai_responses_stream".to_string(),
+        code: Some(code.to_string()),
+        message: Some(message.to_string()),
+    });
+    if error.category == ProviderErrorCategory::RateLimit
+        || error.category == ProviderErrorCategory::Overloaded
+    {
+        error.retry = retry_hint_from_json_value(event).map(Box::new);
+    }
+    error
+}
+
+fn responses_incomplete_error(event: &serde_json::Value) -> ProviderError {
+    let response = event.get("response").unwrap_or(event);
+    let reason = response
+        .get("incomplete_details")
+        .and_then(|details| details.get("reason"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|reason| !reason.trim().is_empty())
+        .unwrap_or("response_incomplete");
+    let message = format!("OpenAI Responses API returned an incomplete response ({reason})");
+    let mut error = provider_error(
+        reason,
+        category_from_openai_error(400, reason, None, &message),
+        message,
+    );
+    error.retryable = false;
+    error.request_id = response
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .map(String::into_boxed_str);
+    error
+        .diagnostic_context
+        .insert("terminal_status".to_string(), "incomplete".to_string());
+    error
+        .diagnostic_context
+        .insert("incomplete_reason".to_string(), reason.to_string());
+    error.sources.push(ProviderErrorSource {
+        source: "openai_responses_stream".to_string(),
+        code: Some(reason.to_string()),
+        message: None,
+    });
+    error
 }
 
 fn reasoning_output_index(
@@ -4237,15 +4305,17 @@ fn parse_tool_arguments(
     if arguments.trim().is_empty() {
         return Ok(serde_json::Value::Object(serde_json::Map::new()));
     }
-    serde_json::from_str(arguments).map_err(|error| {
-        provider_error(
+    serde_json::from_str(arguments).map_err(|decode_error| {
+        let mut error = provider_error(
             "tool_arguments_decode_failed",
             ProviderErrorCategory::ProviderInternal,
             format!(
-                "failed to decode arguments for tool call {call_id} ({tool_name}): {error}; received {} bytes",
+                "failed to decode arguments for tool call {call_id} ({tool_name}): {decode_error}; received {} bytes",
                 arguments.len()
             ),
-        )
+        );
+        error.retryable = false;
+        error
     })
 }
 
@@ -10403,6 +10473,64 @@ mod tests {
             OPENAI_CODEX_API_ENDPOINT,
             true,
         ));
+    }
+
+    #[test]
+    fn responses_incomplete_preserves_terminal_cause_before_tool_decoding() {
+        let turn = TurnState::default();
+        let mut tool_calls = BTreeMap::from([(
+            0,
+            ToolCallAccumulator {
+                id: Some("call_partial".to_string()),
+                name: Some("filesystem_write".to_string()),
+                arguments: r#"{"path":"unterminated"#.to_string(),
+                started: true,
+            },
+        )]);
+        let mut reasoning_items = BTreeMap::new();
+        let mut saw_tool_call = true;
+        let name_map = BTreeMap::new();
+        let processor = test_responses_stream_processor(&turn, &name_map);
+
+        let error = process_responses_stream_line(
+            r#"data: {"type":"response.incomplete","response":{"id":"resp_incomplete","incomplete_details":{"reason":"provider_compaction_failed"}}}"#,
+            &processor,
+            &mut tool_calls,
+            &mut reasoning_items,
+            &mut saw_tool_call,
+        )
+        .expect_err("incomplete response should preserve its terminal cause");
+
+        assert_eq!(error.code, "provider_compaction_failed");
+        assert_eq!(error.category, ProviderErrorCategory::InvalidRequest);
+        assert!(!error.retryable);
+        assert_eq!(error.request_id.as_deref(), Some("resp_incomplete"));
+        assert_eq!(
+            error
+                .diagnostic_context
+                .get("terminal_status")
+                .map(String::as_str),
+            Some("incomplete")
+        );
+        assert!(
+            !turn
+                .drain()
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::ToolCallFinished { .. }))
+        );
+    }
+
+    #[test]
+    fn unknown_incomplete_response_is_not_assumed_transient() {
+        let error = responses_incomplete_error(&serde_json::json!({
+            "type": "response.incomplete",
+            "response": {}
+        }));
+
+        assert_eq!(error.code, "response_incomplete");
+        assert_eq!(error.category, ProviderErrorCategory::InvalidRequest);
+        assert!(!error.retryable);
+        assert_eq!(error.sources[0].source, "openai_responses_stream");
     }
 
     #[test]

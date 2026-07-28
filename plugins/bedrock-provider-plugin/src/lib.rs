@@ -810,14 +810,16 @@ impl StreamAccumulator {
                 serde_json::Value::Object(serde_json::Map::new())
             } else {
                 serde_json::from_str(&accumulator.arguments).map_err(|error| {
-                    provider_error(
+                    let mut error = provider_error(
                         "tool_arguments_decode_failed",
                         ProviderErrorCategory::ProviderInternal,
                         format!(
                             "failed to decode arguments for tool call {id} ({name}): {error}; received {} bytes",
                             accumulator.arguments.len()
                         ),
-                    )
+                    );
+                    error.retryable = false;
+                    error
                 })?
             };
             turn.push(ProviderTurnEvent::ToolCallFinished {

@@ -31107,6 +31107,12 @@ library = "test"
         assert!(is_tool_arguments_decode_provider_error(&error));
         assert!(should_retry_after_malformed_tool_arguments(&error, false));
         assert!(!should_retry_after_malformed_tool_arguments(&error, true));
+        let state = test_server_state(SessionManager::default());
+        let selection = SessionModelSelection::default();
+        assert!(
+            matching_provider_retry_policy(&state, &error, &selection, &[], &[]).is_none(),
+            "a non-retryable decode error must not match the generic transient policy"
+        );
     }
 
     #[test]
