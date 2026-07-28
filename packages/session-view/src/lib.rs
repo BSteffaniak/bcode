@@ -6236,6 +6236,75 @@ mod tests {
     }
 
     #[test]
+    fn bounded_history_reset_then_active_update_preserves_one_primary_item() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        let update = |revision| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::ToolPresentationUpdated {
+                update: bcode_tool::ToolPresentationUpdate {
+                    invocation_id: "call-active".to_owned(),
+                    producer_id: "test.plugin".to_owned(),
+                    generation: 0,
+                    revision,
+                    identity: bcode_tool::ToolPresentationIdentity::Primary,
+                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    schema: "test.presentation".to_owned(),
+                    schema_version: 1,
+                    artifact: None,
+                    payload: serde_json::json!({"revision": revision}),
+                },
+            },
+        };
+        view.apply_live_event(&update(1));
+        view.set_history_window_metadata(Some(10), Some(10), true, false);
+        view.rebuild_history_window(&[
+            event(
+                session_id,
+                9,
+                SessionEventKind::ToolCallRequested {
+                    tool_call_id: "call-active".to_owned(),
+                    producer_plugin_id: Some("test.plugin".to_owned()),
+                    tool_name: "test.tool".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                },
+            ),
+            event(
+                session_id,
+                10,
+                SessionEventKind::AssistantMessage {
+                    text: "bounded history".to_owned(),
+                },
+            ),
+        ]);
+        view.set_history_window_metadata(Some(10), Some(10), true, false);
+        view.apply_live_event(&update(2));
+
+        let snapshot = view.snapshot();
+        let primary_id = TranscriptViewItemId::tool("call-active");
+        assert_eq!(
+            snapshot
+                .transcript
+                .items
+                .iter()
+                .filter(|item| item.id == primary_id)
+                .count(),
+            1
+        );
+        assert!(snapshot.transcript.has_older_history);
+        assert!(snapshot.transcript.items.iter().any(|item| {
+            matches!(
+                &item.kind,
+                TranscriptViewItemKind::ToolInvocation { tool }
+                    if tool.presentation.as_ref().is_some_and(|presentation|
+                        presentation.revision == 2
+                            && presentation.payload == serde_json::json!({"revision": 2}))
+            )
+        }));
+    }
+
+    #[test]
     fn history_window_rebuild_retains_authoritative_runtime_state() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
