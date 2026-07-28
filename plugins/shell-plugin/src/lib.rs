@@ -373,11 +373,30 @@ fn execute_workflow_command_plan(
     })
 }
 
+fn workflow_environment_name_is_sensitive(name: &str) -> bool {
+    let normalized = name.to_ascii_uppercase();
+    [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "API_KEY",
+        "PRIVATE_KEY",
+        "ACCESS_KEY",
+        "AUTH",
+        "CREDENTIAL",
+        "COOKIE",
+    ]
+    .iter()
+    .any(|marker| normalized.contains(marker))
+}
+
 fn validate_workflow_environment(
     environment: &contracts::ShellWorkflowEnvironment,
 ) -> Result<(), String> {
     if environment.set.iter().any(|(name, value)| {
         name.is_empty()
+            || workflow_environment_name_is_sensitive(name)
             || name.contains(['=', '\0'])
             || value.contains('\0')
             || name.len() > 256
@@ -2126,6 +2145,35 @@ mod tests {
         cancellation: bcode_plugin_sdk::ServiceCancellation,
     ) -> NativeServiceContext {
         workflow_context_with_bridge(invocation, cancellation, ServiceBridge::default())
+    }
+
+    #[test]
+    fn workflow_command_plan_rejects_persisted_secret_environment_values() {
+        let workspace = tempfile::tempdir().expect("workspace");
+        let (invocation, mut plan) = workflow_command_plan(
+            workspace.path(),
+            vec![contracts::ShellWorkflowCommand {
+                argv: vec!["true".to_string()],
+                timeout_ms: 1_000,
+                continue_on_nonzero: false,
+            }],
+        );
+        plan.environment
+            .set
+            .insert("API_TOKEN".to_string(), "secret-value".to_string());
+        assert!(
+            execute_workflow_command_plan(
+                &workflow_context(
+                    &invocation,
+                    bcode_plugin_sdk::ServiceCancellation::new(Arc::new(
+                        std::sync::atomic::AtomicBool::new(false),
+                    )),
+                ),
+                &invocation,
+                &plan,
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]

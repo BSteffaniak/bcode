@@ -47,6 +47,8 @@ pub struct ShellWorkflowCommand {
 #[serde(deny_unknown_fields)]
 pub struct ShellWorkflowEnvironment {
     pub inherit: bool,
+    /// Explicit non-secret environment values. Secret-bearing names are rejected; workflows must
+    /// use owner/runtime secret injection that is not persisted in the command plan.
     pub set: std::collections::BTreeMap<String, String>,
 }
 

@@ -11,6 +11,12 @@ timeouts, environment entries, and retained output previews. The result preserve
 index and reports ordinary nonzero exits as typed result data rather than transport failures.
 Oversized output is represented by typed artifact references.
 
+Explicit `environment.set` values are persisted as part of exact approval/dispatch identity and must
+therefore be non-secret. Names containing common secret-bearing markers (`TOKEN`, `SECRET`,
+`PASSWORD`, `API_KEY`, `PRIVATE_KEY`, `ACCESS_KEY`, `AUTH`, `CREDENTIAL`, or `COOKIE`) are
+rejected. Secrets must enter through an owner/runtime secret-injection facility that does not
+serialize them into the workflow plan, intent, trace, or output.
+
 The block is declared mutating because arbitrary commands can modify the workspace. It therefore
 requires an exact workflow grant, uses repair-required reconciliation for ambiguous accepted work,
 and claims repository write access. The owner resolves workspace-relative cwd against the canonical
