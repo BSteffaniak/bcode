@@ -27,9 +27,15 @@ struct WorkflowCli {
     /// Repository path used to derive the immutable workspace snapshot identity.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// JSON workflow input for `run`, or JSON gate value for `provide-input`.
+    /// JSON workflow input for `run`, JSON template configuration, or gate value.
     #[arg(long)]
     input: Option<String>,
+    /// Exact template owner plugin for template describe/start.
+    #[arg(long)]
+    owner: Option<String>,
+    /// Exact owner-local template ID for template describe/start.
+    #[arg(long)]
+    template: Option<String>,
     /// Exact waiting node identity for `provide-input`.
     #[arg(long)]
     node: Option<String>,
@@ -73,10 +79,10 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
             args.insert(key.to_string(), id);
         }
         if let Some(version) = cli.version {
-            let key = if cli.action == "register" {
-                "version"
-            } else {
-                "definition_version"
+            let key = match cli.action.as_str() {
+                "register" => "version",
+                "template-describe" | "template-start" => "template_version",
+                _ => "definition_version",
             };
             args.insert(key.to_string(), version.to_string());
         }
@@ -86,12 +92,18 @@ fn invoke(matches: clap::ArgMatches) -> StaticCliFuture {
             args.insert("definition".to_string(), definition);
         }
         if let Some(input) = cli.input {
-            let key = if cli.action == "provide-input" {
-                "value"
-            } else {
-                "input"
+            let key = match cli.action.as_str() {
+                "provide-input" => "value",
+                "template-describe" | "template-start" => "configuration",
+                _ => "input",
             };
             args.insert(key.to_string(), input);
+        }
+        if let Some(owner) = cli.owner {
+            args.insert("owner_plugin_id".to_string(), owner);
+        }
+        if let Some(template) = cli.template {
+            args.insert("template_id".to_string(), template);
         }
         if let Some(node) = cli.node {
             args.insert("node_id".to_string(), node);

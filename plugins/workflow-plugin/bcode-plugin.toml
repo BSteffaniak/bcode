@@ -16,6 +16,168 @@ description  = "Active workflow status for a session"
 interface_id = "bcode.session-status/v1"
 name         = "Workflow Session Status"
 
+[[workflow_templates]]
+contribution_version  = 1
+description           = "Implement a bounded task, run an exact verification command plan, and optionally create one approved Git commit."
+required_capabilities = ["workflow-production/v1", "workflow-block/v1"]
+required_plugins      = ["bcode.shell", "bcode.git"]
+template_id           = "implementation-verification-commit"
+template_version      = 1
+title                 = "Implementation verification commit"
+
+[workflow_templates.configuration_schema]
+type_name = "bcode.workflow.implementation-verification-commit-config/v1"
+[workflow_templates.configuration_schema.schema]
+additionalProperties = false
+required = [
+    "version",
+    "implementation_prompt",
+    "stop_condition",
+    "iteration_limit",
+    "command_plan",
+    "command_timeout_ms",
+    "verification_policy",
+    "commit_behavior",
+    "commit_message_skill",
+]
+type = "object"
+
+[workflow_templates.configuration_schema.schema.properties.version]
+const = 1
+
+[workflow_templates.configuration_schema.schema.properties.implementation_prompt]
+maxLength = 65536
+minLength = 1
+type      = "string"
+
+[workflow_templates.configuration_schema.schema.properties.stop_condition]
+additionalProperties = false
+required             = ["path", "equals"]
+type                 = "object"
+
+[workflow_templates.configuration_schema.schema.properties.stop_condition.properties.path]
+maxLength = 512
+minLength = 1
+type      = "string"
+
+[workflow_templates.configuration_schema.schema.properties.stop_condition.properties.equals]
+
+[workflow_templates.configuration_schema.schema.properties.iteration_limit]
+maximum = 100
+minimum = 1
+type    = "integer"
+
+[workflow_templates.configuration_schema.schema.properties.command_plan]
+additionalProperties = false
+required             = ["version", "cwd", "commands", "environment", "output"]
+type                 = "object"
+
+[workflow_templates.configuration_schema.schema.properties.command_plan.properties.version]
+const = 1
+
+[workflow_templates.configuration_schema.schema.properties.command_plan.properties.cwd]
+maxLength = 1024
+minLength = 1
+type      = "string"
+
+[workflow_templates.configuration_schema.schema.properties.command_plan.properties.commands]
+maxItems = 64
+minItems = 1
+type     = "array"
+
+[workflow_templates.configuration_schema.schema.properties.command_plan.properties.commands.items]
+additionalProperties = false
+required             = ["argv", "continue_on_nonzero"]
+type                 = "object"
+
+[workflow_templates.configuration_schema.schema.properties.command_plan.properties.commands.items.properties.argv]
+maxItems = 256
+minItems = 1
+type     = "array"
+
+[workflow_templates.configuration_schema.schema.properties.command_plan.properties.commands.items.properties.argv.items]
+maxLength = 65536
+type      = "string"
+
+[workflow_templates.configuration_schema.schema.properties.command_plan.properties.commands.items.properties.continue_on_nonzero]
+type = "boolean"
+
+[workflow_templates.configuration_schema.schema.properties.command_plan.properties.environment]
+additionalProperties = false
+required             = ["inherit", "set"]
+type                 = "object"
+
+[workflow_templates.configuration_schema.schema.properties.command_plan.properties.environment.properties.inherit]
+type = "boolean"
+
+[workflow_templates.configuration_schema.schema.properties.command_plan.properties.environment.properties.set]
+additionalProperties = { type = "string", maxLength = 65536 }
+maxProperties        = 128
+type                 = "object"
+
+[workflow_templates.configuration_schema.schema.properties.command_plan.properties.output]
+additionalProperties = false
+required             = ["preview_bytes", "artifact_spill"]
+type                 = "object"
+
+[workflow_templates.configuration_schema.schema.properties.command_plan.properties.output.properties.preview_bytes]
+maximum = 65536
+minimum = 0
+type    = "integer"
+
+[workflow_templates.configuration_schema.schema.properties.command_plan.properties.output.properties.artifact_spill]
+type = "boolean"
+
+[workflow_templates.configuration_schema.schema.properties.command_timeout_ms]
+maximum = 300000
+minimum = 1
+type    = "integer"
+
+[workflow_templates.configuration_schema.schema.properties.verification_policy]
+enum = ["require_pass", "allow_failure", "skip"]
+
+[workflow_templates.configuration_schema.schema.properties.commit_behavior]
+enum = ["required", "if_changes", "disabled"]
+
+[workflow_templates.configuration_schema.schema.properties.commit_message_skill]
+maxLength = 256
+type      = ["string", "null"]
+
+[workflow_templates.definition]
+edges          = []
+entries        = ["configuration"]
+exits          = ["configuration"]
+name           = "implementation-verification-commit"
+schema_version = 1
+
+[workflow_templates.definition.input]
+schema    = { type = "object" }
+type_name = "bcode.workflow.implementation-verification-commit-config/v1"
+
+[workflow_templates.definition.output]
+schema    = { type = "object" }
+type_name = "bcode.workflow.implementation-verification-commit-config/v1"
+
+[workflow_templates.definition.nodes.configuration]
+configuration = { version = 1 }
+id            = "configuration"
+kind          = "input"
+name          = "Validated reference workflow configuration"
+resources     = []
+
+[workflow_templates.definition.nodes.configuration.input]
+schema    = { type = "object" }
+type_name = "bcode.workflow.implementation-verification-commit-config/v1"
+
+[workflow_templates.definition.nodes.configuration.output]
+schema    = { type = "object" }
+type_name = "bcode.workflow.implementation-verification-commit-config/v1"
+
+[workflow_templates.presentation]
+category = "automation"
+icon     = "workflow"
+risk     = "shell and Git mutations require exact approval"
+
 [[tui_surfaces]]
 description = "Configure and preview a plugin-owned workflow template before start"
 kind        = "workflow.author"

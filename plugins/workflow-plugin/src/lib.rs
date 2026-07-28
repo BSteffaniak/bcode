@@ -490,13 +490,46 @@ async fn active_session_status(
 }
 
 fn parse_arguments(arguments: &str) -> BTreeMap<String, String> {
-    arguments
-        .split_whitespace()
-        .filter_map(|argument| {
-            let (key, value) = argument.split_once('=')?;
-            (!key.is_empty() && !value.is_empty()).then(|| (key.to_string(), value.to_string()))
-        })
-        .collect()
+    let mut parsed = BTreeMap::new();
+    let bytes = arguments.as_bytes();
+    let mut start = 0;
+    let mut depth = 0_u32;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => quoted = true,
+            b'{' | b'[' => depth = depth.saturating_add(1),
+            b'}' | b']' => depth = depth.saturating_sub(1),
+            byte if byte.is_ascii_whitespace() && depth == 0 => {
+                insert_argument(&mut parsed, &arguments[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    insert_argument(&mut parsed, &arguments[start..]);
+    parsed
+}
+
+fn insert_argument(parsed: &mut BTreeMap<String, String>, argument: &str) {
+    let argument = argument.trim();
+    if let Some((key, value)) = argument.split_once('=')
+        && !key.is_empty()
+        && !value.is_empty()
+    {
+        parsed.insert(key.to_string(), value.to_string());
+    }
 }
 
 fn validate_template_configuration(
@@ -575,6 +608,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn manifest_contributes_bounded_reference_template_configuration() {
+        let manifest: bcode_plugin::PluginManifest =
+            toml::from_str(include_str!("../bcode-plugin.toml")).expect("manifest");
+        let template = manifest
+            .workflow_templates
+            .iter()
+            .find(|template| template.template_id == "implementation-verification-commit")
+            .expect("reference template");
+        template.validate().expect("template validates");
+        assert_eq!(template.template_version, 1);
+        let required = template.configuration_schema.schema["required"]
+            .as_array()
+            .expect("required fields");
+        for field in [
+            "implementation_prompt",
+            "stop_condition",
+            "iteration_limit",
+            "command_plan",
+            "command_timeout_ms",
+            "verification_policy",
+            "commit_behavior",
+            "commit_message_skill",
+        ] {
+            assert!(required.iter().any(|value| value == field));
+        }
+        assert_eq!(template.required_plugins, ["bcode.shell", "bcode.git"]);
+    }
+
+    #[test]
     fn commands_cover_supported_lifecycle_surface() {
         let ids = command_contributions()
             .into_iter()
@@ -608,6 +670,23 @@ mod tests {
             BTreeMap::from([
                 ("definition_version".to_string(), "2".to_string()),
                 ("run_id".to_string(), "run-1".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn slash_arguments_preserve_structured_json_with_spaces() {
+        assert_eq!(
+            parse_arguments(
+                r#"template_id=reference configuration={"prompt":"implement safely", "commands":[["cargo","test"]]} session_id=session-1"#
+            ),
+            BTreeMap::from([
+                (
+                    "configuration".to_string(),
+                    r#"{"prompt":"implement safely", "commands":[["cargo","test"]]}"#.to_string(),
+                ),
+                ("session_id".to_string(), "session-1".to_string()),
+                ("template_id".to_string(), "reference".to_string()),
             ])
         );
     }
