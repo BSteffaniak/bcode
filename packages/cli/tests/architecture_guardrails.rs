@@ -162,6 +162,14 @@ const DENIED_NORMALIZED_TOOL_NAME_NEEDLES: &[&str] = &[
     "documentExtract",
 ];
 
+const EXA_PROVIDER_IMPLEMENTATION_NEEDLES: &[&str] = &[
+    "EXA_API_KEY",
+    "api.exa.ai",
+    "ExaSearchRequest",
+    "ExaSearchResponse",
+    "ExaSearchOptions",
+];
+
 const DENIED_PLUGIN_ID_NEEDLES: &[&str] = &[
     "bcode.filesystem",
     "bcode.shell",
@@ -196,6 +204,22 @@ struct BoundaryOffender {
     needle: &'static str,
     category: &'static str,
     line: String,
+}
+
+#[test]
+fn exa_provider_implementation_remains_plugin_owned() {
+    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut offenders = Vec::new();
+    collect_literal_offenders(
+        &workspace_root.join("packages"),
+        EXA_PROVIDER_IMPLEMENTATION_NEEDLES,
+        &mut offenders,
+    );
+    assert!(
+        offenders.is_empty(),
+        "Exa provider implementation leaked into generic packages:\n{}",
+        offenders.join("\n")
+    );
 }
 
 #[test]
@@ -314,8 +338,24 @@ fn tui_runtime_never_writes_diagnostics_directly_to_the_terminal() {
 
     let cli = std::fs::read_to_string(workspace_root.join("packages/cli/src/lib.rs"))
         .expect("CLI source should be readable");
+    let tracing_setup = cli
+        .split_once("fn init_tracing() {")
+        .map(|(_, setup)| setup)
+        .expect("tracing setup should exist");
+    let foreground_branch = tracing_setup
+        .split_once("    if foreground_server {")
+        .and_then(|(_, branches)| branches.split_once("} else {").map(|parts| parts.0))
+        .expect("tracing setup should retain an explicit foreground-server branch");
+    let tui_branch = tracing_setup
+        .split_once("    if foreground_server {")
+        .and_then(|(_, branches)| branches.split_once("} else {").map(|parts| parts.1))
+        .expect("tracing setup should retain a non-foreground TUI branch");
     assert!(
-        !cli.contains("with_writer(std::io::stderr)"),
+        foreground_branch.contains("with_writer(std::io::stderr)"),
+        "foreground server diagnostics should remain terminal-visible"
+    );
+    assert!(
+        !tui_branch.contains("with_writer(std::io::stderr)"),
         "the shared TUI tracing subscriber must not write to stderr"
     );
 }

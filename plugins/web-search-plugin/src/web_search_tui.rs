@@ -61,6 +61,11 @@ fn search_request_rows(payload: &Value) -> Vec<Line> {
     push_kv(&mut rows, "region", text(arguments, "region"));
     push_kv(&mut rows, "safe search", text(arguments, "safe_search"));
     push_kv(&mut rows, "max results", number(arguments, "max_results"));
+    push_kv(
+        &mut rows,
+        "provider options",
+        compact_json(arguments, "provider_options"),
+    );
     rows
 }
 
@@ -280,6 +285,13 @@ where
 
 fn text<'a>(payload: &'a Value, key: &str) -> Option<&'a str> {
     payload.get(key).and_then(Value::as_str)
+}
+
+fn compact_json(payload: &Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .filter(|value| !value.is_null())
+        .and_then(|value| serde_json::to_string(value).ok())
 }
 
 fn number(payload: &Value, key: &str) -> Option<String> {

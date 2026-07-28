@@ -5,6 +5,9 @@
 #[cfg(feature = "static-bundled")]
 mod web_search_tui;
 
+#[path = "providers/exa.rs"]
+pub(crate) mod exa;
+
 use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
 use bcode_tool::{
@@ -423,6 +426,8 @@ struct SearchRequest {
     safe_search: Option<String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    provider_options: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -561,24 +566,6 @@ struct TavilyResult {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct ExaSearchResponse {
-    #[serde(default)]
-    results: Vec<ExaResult>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ExaResult {
-    #[serde(default)]
-    title: Option<String>,
-    #[serde(default)]
-    url: String,
-    #[serde(default)]
-    text: Option<String>,
-    #[serde(default)]
-    published_date: Option<String>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 struct SerperSearchResponse {
     #[serde(default)]
     organic: Vec<SerperResult>,
@@ -690,6 +677,11 @@ async fn search_async(
 ) -> Result<SearchResponse, WebError> {
     validate_non_empty("query", &request.query)?;
     let provider = search_provider(request.provider.as_deref(), &config)?;
+    if request.provider_options.is_some() && provider != "exa" {
+        return Err(WebError::InvalidRequest(
+            "provider_options are currently supported only when provider is exa".to_string(),
+        ));
+    }
     if let Some(progress) = &progress {
         progress.emit(format!("search: provider selected: {provider}"));
     }
@@ -970,39 +962,29 @@ async fn search_exa(
     let api_key = provider_key(&config.providers.exa, &["EXA_API_KEY"])?;
     let max_results = max_results(&request, config);
     let client = client(request.timeout_ms.or(config.timeout_ms))?;
-    let body = json!({
-        "query": scoped_query(&request),
-        "numResults": max_results,
-        "contents": { "text": { "maxCharacters": 500 } }
-    });
-    let text = checked_text(
-        client
-            .post("https://api.exa.ai/search")
-            .header("Accept", "application/json")
-            .header("x-api-key", api_key)
-            .json(&body)
-            .send()
-            .await?,
+    let results = exa::search(
+        &client,
+        &api_key,
+        exa::SearchInput {
+            query: &request.query,
+            max_results,
+            site: request.site.as_deref(),
+            freshness: request.freshness.as_deref(),
+            region: request.region.as_deref(),
+            safe_search: request.safe_search.as_deref(),
+            provider_options: request.provider_options,
+        },
     )
-    .await?;
-    let decoded = serde_json::from_str::<ExaSearchResponse>(&text)?;
-    let results = decoded
-        .results
-        .into_iter()
-        .filter(|result| !result.url.is_empty())
-        .take(max_results)
-        .map(|result| SearchResult {
-            title: result
-                .title
-                .map_or_else(String::new, |title| html_text(&title)),
-            url: result.url,
-            snippet: result
-                .text
-                .map_or_else(String::new, |text| html_text(&text)),
-            published: result.published_date,
-            source: Some("exa".to_string()),
-        })
-        .collect();
+    .await?
+    .into_iter()
+    .map(|result| SearchResult {
+        title: result.title,
+        url: result.url,
+        snippet: result.snippet,
+        published: result.published,
+        source: Some("exa".to_string()),
+    })
+    .collect();
     Ok(search_response(request.query, "exa", results))
 }
 
@@ -1734,11 +1716,31 @@ fn search_tool_definition() -> ToolDefinition {
                 "query": { "type": "string" },
                 "provider": { "type": "string", "description": "Optional provider override: auto, model_native, brave, tavily, exa, perplexity, gemini, serper, serpapi, or duckduckgo_html" },
                 "max_results": { "type": "integer", "minimum": 1, "maximum": 20 },
-                "site": { "type": "string", "description": "Optional domain to restrict results with a site: query" },
-                "freshness": { "type": "string", "description": "Provider-specific freshness filter such as day, week, month, or year" },
-                "region": { "type": "string", "description": "Provider-specific country/region code" },
+                "site": { "type": "string", "description": "Optional domain restriction; provider adapters translate this to native filtering when supported" },
+                "freshness": { "type": "string", "description": "Provider freshness filter; Exa accepts day, week, month, or year" },
+                "region": { "type": "string", "description": "Provider-specific country/region code; Exa accepts a two-letter country code" },
                 "safe_search": { "type": "string", "description": "Provider-specific safe-search setting" },
-                "timeout_ms": { "type": "integer", "minimum": 1 }
+                "timeout_ms": { "type": "integer", "minimum": 1 },
+                "provider_options": {
+                    "type": "object",
+                    "description": "Exa-only options: search_type, category, include_domains, exclude_domains, publication/crawl date ranges, include_text, exclude_text, content, max_characters, and max_age_hours. Unknown fields are rejected by the Exa adapter.",
+                    "properties": {
+                        "search_type": { "type": "string", "enum": ["auto", "fast", "instant", "deep-lite", "deep", "deep-reasoning"] },
+                        "category": { "type": "string", "enum": ["company", "people", "publication", "news", "personal_site", "financial_report"] },
+                        "include_domains": { "type": "array", "maxItems": 1200, "items": { "type": "string" } },
+                        "exclude_domains": { "type": "array", "maxItems": 1200, "items": { "type": "string" } },
+                        "start_published_date": { "type": "string" },
+                        "end_published_date": { "type": "string" },
+                        "start_crawl_date": { "type": "string" },
+                        "end_crawl_date": { "type": "string" },
+                        "include_text": { "type": "array", "maxItems": 1, "items": { "type": "string" } },
+                        "exclude_text": { "type": "array", "maxItems": 1, "items": { "type": "string" } },
+                        "content": { "type": "string", "enum": ["highlights", "text", "summary"] },
+                        "max_characters": { "type": "integer", "minimum": 1, "maximum": 20000 },
+                        "max_age_hours": { "type": "integer", "minimum": -1 }
+                    },
+                    "additionalProperties": false
+                }
             }
         }),
     }
@@ -1877,12 +1879,20 @@ fn is_youtube_url(lower_url: &str) -> bool {
 fn status_response(config: &WebSearchConfig) -> WebStatusResponse {
     let provider = search_provider(None, config).ok();
     let configured = configured_search_providers(config);
+    let available = provider
+        .as_deref()
+        .is_some_and(|provider| search_provider_available(provider, config));
     let quality = provider
         .as_deref()
+        .filter(|_| available)
         .map_or("unavailable", provider_quality)
         .to_string();
     let mut recommended = Vec::new();
-    if matches!(provider.as_deref(), Some("duckduckgo_html") | None) {
+    if let Some(provider) = provider.as_deref().filter(|_| !available) {
+        recommended.push(format!(
+            "The selected {provider} search provider is missing required credentials or host capability."
+        ));
+    } else if matches!(provider.as_deref(), Some("duckduckgo_html") | None) {
         recommended.push(
             "Configure Brave, Tavily, Exa, Perplexity, Gemini, Serper, SerpAPI, or model-native search for more stable results."
                 .to_string(),
@@ -1891,7 +1901,7 @@ fn status_response(config: &WebSearchConfig) -> WebStatusResponse {
     let fallbacks = fetch_fallbacks(config);
     WebStatusResponse {
         search: SearchStatus {
-            available: provider.is_some(),
+            available,
             provider,
             quality,
             configured_providers: configured,
@@ -1911,6 +1921,35 @@ fn status_response(config: &WebSearchConfig) -> WebStatusResponse {
                 .map(ToString::to_string)
                 .collect(),
         },
+    }
+}
+
+fn search_provider_available(provider: &str, config: &WebSearchConfig) -> bool {
+    match provider {
+        "brave" => provider_key(
+            &config.providers.brave,
+            &["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"],
+        )
+        .is_ok(),
+        "tavily" => provider_key(&config.providers.tavily, &["TAVILY_API_KEY"]).is_ok(),
+        "exa" => provider_key(&config.providers.exa, &["EXA_API_KEY"]).is_ok(),
+        "perplexity" | "pplx" => provider_key(
+            &config.providers.perplexity,
+            &["PERPLEXITY_API_KEY", "PPLX_API_KEY"],
+        )
+        .is_ok(),
+        "gemini" | "google_gemini" => provider_key(
+            &config.providers.gemini,
+            &["GEMINI_API_KEY", "GOOGLE_API_KEY"],
+        )
+        .is_ok(),
+        "serper" => provider_key(&config.providers.serper, &["SERPER_API_KEY"]).is_ok(),
+        "serpapi" | "serp_api" => {
+            provider_key(&config.providers.serpapi, &["SERPAPI_API_KEY"]).is_ok()
+        }
+        "model_native" => config.model_native_available,
+        "duckduckgo_html" => config.allow_best_effort_no_key,
+        _ => false,
     }
 }
 
@@ -2051,6 +2090,30 @@ fn scoped_query(request: &SearchRequest) -> String {
     query
 }
 
+fn explicit_search_provider(provider: &str) -> Result<String, WebError> {
+    const SUPPORTED: &[&str] = &[
+        "brave",
+        "tavily",
+        "exa",
+        "perplexity",
+        "pplx",
+        "gemini",
+        "google_gemini",
+        "serper",
+        "serpapi",
+        "serp_api",
+        "model_native",
+        "duckduckgo_html",
+    ];
+    if SUPPORTED.contains(&provider) {
+        Ok(provider.to_string())
+    } else {
+        Err(WebError::InvalidRequest(format!(
+            "unsupported web search provider: {provider}"
+        )))
+    }
+}
+
 fn search_provider(explicit: Option<&str>, config: &WebSearchConfig) -> Result<String, WebError> {
     let provider = explicit
         .map(str::to_string)
@@ -2060,7 +2123,7 @@ fn search_provider(explicit: Option<&str>, config: &WebSearchConfig) -> Result<S
         .trim()
         .to_ascii_lowercase();
     if provider != "auto" {
-        return Ok(provider);
+        return explicit_search_provider(&provider);
     }
     if config
         .providers
@@ -2784,6 +2847,83 @@ mod tests {
     }
 
     #[test]
+    fn explicit_provider_names_are_validated() {
+        assert_eq!(
+            search_provider(Some("exa"), &WebSearchConfig::default()).expect("exa"),
+            "exa"
+        );
+        assert!(search_provider(Some("unknown-provider"), &WebSearchConfig::default()).is_err());
+    }
+
+    #[test]
+    fn auto_provider_prefers_configured_exa() {
+        let config = WebSearchConfig {
+            providers: WebSearchProviderConfig {
+                exa: ProviderConfig {
+                    api_key: Some(SecretRef::Value {
+                        value: "test-only".to_string(),
+                    }),
+                },
+                ..WebSearchProviderConfig::default()
+            },
+            ..WebSearchConfig::default()
+        };
+        assert_eq!(search_provider(None, &config).expect("exa"), "exa");
+        let status = status_response(&config);
+        assert_eq!(status.search.provider.as_deref(), Some("exa"));
+        assert!(
+            status
+                .search
+                .configured_providers
+                .contains(&"exa".to_string())
+        );
+    }
+
+    #[test]
+    fn status_reports_configured_exa_without_exposing_key() {
+        let config = WebSearchConfig {
+            provider: Some("exa".to_string()),
+            providers: WebSearchProviderConfig {
+                exa: ProviderConfig {
+                    api_key: Some(SecretRef::Value {
+                        value: "status-test-secret".to_string(),
+                    }),
+                },
+                ..WebSearchProviderConfig::default()
+            },
+            ..WebSearchConfig::default()
+        };
+        let status = status_response(&config);
+        assert_eq!(status.search.provider.as_deref(), Some("exa"));
+        assert!(status.search.available);
+        assert_eq!(status.search.quality, "configured_api");
+        let encoded = serde_json::to_string(&status).expect("status encodes");
+        assert!(!encoded.contains("status-test-secret"));
+    }
+
+    #[test]
+    fn status_reports_explicit_exa_missing_key_without_claiming_availability() {
+        let config = WebSearchConfig {
+            provider: Some("exa".to_string()),
+            ..WebSearchConfig::default()
+        };
+        let status = status_response(&config);
+        assert_eq!(status.search.provider.as_deref(), Some("exa"));
+        assert!(!status.search.available);
+        assert_eq!(status.search.quality, "unavailable");
+        assert!(
+            status
+                .search
+                .configured_providers
+                .iter()
+                .all(|provider| provider != "exa")
+        );
+        assert!(status.search.recommended.iter().any(|message| {
+            message.contains("exa") && message.contains("missing required credentials")
+        }));
+    }
+
+    #[test]
     fn auto_provider_prefers_perplexity_when_keyed() {
         let config = WebSearchConfig {
             allow_best_effort_no_key: true,
@@ -2866,6 +3006,7 @@ mod tests {
                 region: None,
                 safe_search: None,
                 timeout_ms: None,
+                provider_options: None,
             },
             &bridge,
             "call-native",
