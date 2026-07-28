@@ -869,6 +869,8 @@ pub struct TextStreamViewState {
 pub enum TextStreamViewStatus {
     /// All accepted operations are contiguous and current.
     Healthy,
+    /// The retained checkpoint is contiguous but omits an earlier prefix.
+    Incomplete,
     /// A gap or conflicting duplicate requires authoritative resync.
     Degraded,
     /// The stream reached an absorbing terminal state.

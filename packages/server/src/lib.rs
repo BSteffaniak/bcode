@@ -12143,6 +12143,7 @@ struct ModelPollOutcome {
     pending_provider_response_id: Option<String>,
     pending_tool_calls: Vec<bcode_model::ToolCall>,
     reasoning_activities: BTreeMap<String, ReasoningActivityAccumulator>,
+    reasoning_text_streams: BTreeMap<(String, String), (u64, usize)>,
     saw_reasoning_evidence: bool,
 }
 
@@ -14858,16 +14859,7 @@ async fn handle_provider_turn_event(
                     )
                 })
                 .apply(&event);
-            let _ = state
-                .sessions
-                .publish_live_event(
-                    session_id,
-                    SessionLiveEventKind::AssistantReasoningActivity {
-                        turn_id: turn_id.to_owned(),
-                        event,
-                    },
-                )
-                .await;
+            publish_reasoning_activity_live(state, session_id, turn_id, outcome, &event).await;
             if state.observability.debug_enabled() {
                 append_provider_event_trace(state, session_id, turn_id, "reasoning_activity", None)
                     .await;
@@ -14880,6 +14872,96 @@ async fn handle_provider_turn_event(
             }
         }
     }
+}
+
+async fn publish_reasoning_activity_live(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    outcome: &mut ModelPollOutcome,
+    event: &bcode_session_models::ReasoningActivityEvent,
+) {
+    use bcode_session_models::{ReasoningActivityEvent, TextStreamOperation, TextStreamUpdate};
+    let stream_event = match event {
+        ReasoningActivityEvent::PartDelta {
+            activity_id,
+            activity_order,
+            part_id,
+            kind,
+            role,
+            part_order,
+            text,
+        } => {
+            let (revision, offset) = outcome
+                .reasoning_text_streams
+                .entry((activity_id.clone(), part_id.clone()))
+                .or_insert((0, 0));
+            *revision = revision.saturating_add(1);
+            let update = TextStreamUpdate {
+                generation: 0,
+                first_revision: *revision,
+                revision: *revision,
+                operation: TextStreamOperation::Append {
+                    expected_offset: *offset,
+                    text: text.clone(),
+                },
+            };
+            *offset = offset.saturating_add(text.len());
+            SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                turn_id: turn_id.to_owned(),
+                activity_id: activity_id.clone(),
+                activity_order: *activity_order,
+                part_id: part_id.clone(),
+                kind: *kind,
+                role: *role,
+                part_order: *part_order,
+                update,
+            }
+        }
+        ReasoningActivityEvent::PartCompleted {
+            activity_id,
+            activity_order,
+            part_id,
+            kind,
+            role,
+            part_order,
+            text,
+        } => {
+            let (revision, _) = outcome
+                .reasoning_text_streams
+                .entry((activity_id.clone(), part_id.clone()))
+                .or_insert((0, 0));
+            *revision = revision.saturating_add(1);
+            SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                turn_id: turn_id.to_owned(),
+                activity_id: activity_id.clone(),
+                activity_order: *activity_order,
+                part_id: part_id.clone(),
+                kind: *kind,
+                role: *role,
+                part_order: *part_order,
+                update: TextStreamUpdate {
+                    generation: 0,
+                    first_revision: *revision,
+                    revision: *revision,
+                    operation: TextStreamOperation::Checkpoint {
+                        start_offset: 0,
+                        text: text.clone(),
+                        total_bytes: text.len(),
+                        truncated: false,
+                    },
+                },
+            }
+        }
+        _ => SessionLiveEventKind::AssistantReasoningActivity {
+            turn_id: turn_id.to_owned(),
+            event: event.clone(),
+        },
+    };
+    let _ = state
+        .sessions
+        .publish_live_event(session_id, stream_event)
+        .await;
 }
 
 async fn handle_provider_usage_event(

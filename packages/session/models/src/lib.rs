@@ -1590,10 +1590,30 @@ pub enum SessionLiveEventKind {
         /// Contiguous text appended to the segment.
         text: String,
     },
+    /// Ordered readable text update for one structured reasoning part.
+    AssistantReasoningTextStreamUpdated {
+        /// Application model turn that owns the activity.
+        turn_id: String,
+        /// Stable reasoning activity identifier scoped to `turn_id`.
+        activity_id: String,
+        /// Stable activity order within the turn.
+        activity_order: u32,
+        /// Stable readable part identifier scoped to `activity_id`.
+        part_id: String,
+        /// Portable reasoning content kind.
+        kind: ReasoningContentKind,
+        /// Portable semantic role.
+        role: ReasoningContentRole,
+        /// Stable part order within the activity.
+        part_order: u32,
+        /// Generation/revision/offset-validated stream operation.
+        update: TextStreamUpdate,
+    },
     /// Coalesced provider-exposed reasoning text produced by an active model turn.
     ///
     /// Legacy compatibility adapter: the text has no representation kind, part identity, or
-    /// lifecycle. New producers must emit [`Self::AssistantReasoningActivity`].
+    /// lifecycle. New producers must emit [`Self::AssistantReasoningActivity`] or
+    /// [`Self::AssistantReasoningTextStreamUpdated`].
     AssistantReasoningDelta { turn_id: String, text: String },
     /// Provider-neutral reasoning activity operation produced by an active model turn.
     AssistantReasoningActivity {

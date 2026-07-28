@@ -1564,6 +1564,27 @@ impl SessionView {
                     text,
                 );
             }
+            SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                turn_id,
+                activity_id,
+                activity_order,
+                part_id,
+                kind,
+                role,
+                part_order,
+                update,
+            } => {
+                self.apply_ordered_reasoning_update(
+                    turn_id,
+                    activity_id,
+                    *activity_order,
+                    part_id,
+                    *kind,
+                    *role,
+                    *part_order,
+                    update,
+                );
+            }
             SessionLiveEventKind::AssistantReasoningDelta { turn_id, text } => {
                 self.snapshot.thinking = ThinkingViewState {
                     visible: self.snapshot.thinking.visible,
@@ -2791,8 +2812,10 @@ impl SessionView {
                 expected_offset,
                 text,
             } => {
-                if state.status != TextStreamViewStatus::Healthy
-                    || state.accepted_bytes != *expected_offset
+                if !matches!(
+                    state.status,
+                    TextStreamViewStatus::Healthy | TextStreamViewStatus::Incomplete
+                ) || state.accepted_bytes != *expected_offset
                 {
                     state.status = TextStreamViewStatus::Degraded;
                     self.bump_revision();
@@ -2823,7 +2846,11 @@ impl SessionView {
                 state.revision = update.revision;
                 state.accepted_bytes = *total_bytes;
                 state.truncated = *truncated || *start_offset != 0;
-                state.status = TextStreamViewStatus::Healthy;
+                state.status = if state.truncated {
+                    TextStreamViewStatus::Incomplete
+                } else {
+                    TextStreamViewStatus::Healthy
+                };
                 self.last_text_stream_updates
                     .insert(id.clone(), update.clone());
                 self.replace_streaming_message_by_id(id, text);
@@ -8065,18 +8092,28 @@ mod tests {
             view.snapshot().text_streams[&id].status,
             TextStreamViewStatus::Healthy
         );
-
         view.apply_live_event(&update(
             6,
+            bcode_session_models::TextStreamOperation::Checkpoint {
+                start_offset: 8,
+                text: "suffix".to_owned(),
+                total_bytes: 14,
+                truncated: true,
+            },
+        ));
+        assert_eq!(
+            view.snapshot().text_streams[&id].status,
+            TextStreamViewStatus::Incomplete
+        );
+
+        view.apply_live_event(&update(
+            7,
             bcode_session_models::TextStreamOperation::Terminal {
                 status: bcode_session_models::TextStreamTerminalStatus::Cancelled,
             },
         ));
-        view.apply_live_event(&append(7, 13, "late"));
-        assert_eq!(
-            transcript_item_text(view.snapshot(), &id),
-            Some("authoritative")
-        );
+        view.apply_live_event(&append(8, 14, "late"));
+        assert_eq!(transcript_item_text(view.snapshot(), &id), Some("suffix"));
         assert_eq!(
             view.snapshot().text_streams[&id].status,
             TextStreamViewStatus::Terminal(
