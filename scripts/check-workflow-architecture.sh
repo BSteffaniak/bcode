@@ -81,4 +81,28 @@ rm -f /tmp/bcode-workflow-agent-runtime-violations
 }
 rm -f /tmp/bcode-workflow-domain-policy-violations
 
+if rg -n 'std::process::Command|tokio::process::Command|git2::' \
+  packages/workflow packages/workflow-store --glob '*.rs' \
+  >/tmp/bcode-workflow-external-owner-violations 2>/dev/null; then
+  echo "Workflow domain-isolation violation: generic workflow packages must not execute shell or Git operations." >&2
+  cat /tmp/bcode-workflow-external-owner-violations >&2
+  violations=1
+fi
+rm -f /tmp/bcode-workflow-external-owner-violations
+
+if ! rg -q 'WorkflowTemplateContribution' packages/plugin/src/lib.rs \
+  || ! rg -q 'WORKFLOW_TEMPLATE_CONTRIBUTION_VERSION' packages/plugin/src/lib.rs \
+  || ! rg -q 'template\.validate\(\)' packages/plugin/src/lib.rs; then
+  echo "Workflow template contract violation: manifest templates must remain versioned and discovery-validated." >&2
+  violations=1
+fi
+
+if ! rg -q 'explicit_grant_required = true' plugins/shell-plugin/bcode-plugin.toml \
+  || ! rg -q 'reconciliation[[:space:]]*=[[:space:]]*"repair_required"' plugins/shell-plugin/bcode-plugin.toml \
+  || ! rg -q 'explicit_grant_required = true' plugins/git-plugin/bcode-plugin.toml \
+  || ! rg -q 'reconciliation[[:space:]]*=[[:space:]]*"repair_required"' plugins/git-plugin/bcode-plugin.toml; then
+  echo "Workflow mutation contract violation: mutating shell/Git blocks require exact grants and safe reconciliation." >&2
+  violations=1
+fi
+
 exit "$violations"

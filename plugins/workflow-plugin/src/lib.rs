@@ -283,6 +283,7 @@ pub(crate) async fn execute_command(
                     template_id,
                     template_version,
                     run_id: request.args.get("run_id").cloned(),
+                    workspace_snapshot: request.args.get("workspace_snapshot").cloned(),
                     parent_session_id,
                     configuration,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),

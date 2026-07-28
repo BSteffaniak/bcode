@@ -1313,6 +1313,23 @@ if ! grep -F 'TranscriptViewItemKind::ToolRequestDraft' packages/tui/src/transcr
   violations=1
 fi
 
+if {
+  awk '/^#\[cfg\(test\)\]/{exit} {print}' packages/workflow/src/lib.rs
+  awk '/^#\[cfg\(test\)\]/{exit} {print}' packages/workflow-store/src/lib.rs
+  find packages/agent-runtime/src packages/tool/src -name '*.rs' -type f -exec cat {} +
+} | rg -n 'implementation-verification-commit|shell\.command-plan|git\.(prepare|compose-commit|commit-status|commit)' \
+  >/tmp/bcode-reference-template-domain-leakage.txt; then
+  echo "Runtime architecture violation: reference-template shell/Git policy leaked into generic runtime packages." >&2
+  cat /tmp/bcode-reference-template-domain-leakage.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'template_id           = "implementation-verification-commit"' plugins/workflow-plugin/bcode-plugin.toml >/dev/null \
+  || ! grep -F 'required_plugins      = ["bcode.shell", "bcode.git"]' plugins/workflow-plugin/bcode-plugin.toml >/dev/null; then
+  echo "Runtime architecture violation: reference-template identity/requirements must remain workflow-plugin owned." >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi

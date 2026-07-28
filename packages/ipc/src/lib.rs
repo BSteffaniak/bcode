@@ -1189,6 +1189,10 @@ pub struct WorkflowTemplateStartRequest {
     pub template_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// Optional immutable workspace snapshot override. Empty/absent derives the canonical parent
+    /// session working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_snapshot: Option<String>,
     pub parent_session_id: bcode_session_models::SessionId,
     pub configuration: serde_json::Value,
     #[serde(default)]
@@ -1243,6 +1247,10 @@ pub struct WorkflowStartRequest {
     pub definition: bcode_workflow::WorkflowDefinition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// Optional immutable workspace snapshot override. Empty/absent derives the canonical parent
+    /// session working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_snapshot: Option<String>,
     pub parent_session_id: bcode_session_models::SessionId,
     pub input: serde_json::Value,
     pub binding: bcode_workflow_store::WorkflowRunBinding,
@@ -2370,6 +2378,7 @@ mod tests {
                 .expect("identity"),
                 definition: definition.clone(),
                 run_id: Some("bound-review-run".to_string()),
+                workspace_snapshot: None,
                 parent_session_id: SessionId::new(),
                 input: serde_json::json!(1),
                 binding: bcode_workflow_store::WorkflowRunBinding {

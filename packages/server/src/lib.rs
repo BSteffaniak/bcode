@@ -11103,17 +11103,19 @@ async fn handle_start_workflow_template(
         ))
         .into());
     }
+    let binding_kind = description.identity.kind.clone();
     let started = start_workflow(
         state,
         bcode_ipc::WorkflowStartRequest {
             identity: description.identity,
             definition: template.definition.clone(),
             run_id: request.run_id,
+            workspace_snapshot: request.workspace_snapshot,
             parent_session_id: request.parent_session_id,
             input: request.configuration,
             binding: bcode_workflow_store::WorkflowRunBinding {
                 owner_plugin_id: request.owner_plugin_id,
-                workflow_kind: request.template_id,
+                workflow_kind: binding_kind,
                 scope_key: request.template_version.to_string(),
                 display_label: Some(template.title.clone()),
                 single_active: false,
@@ -11190,7 +11192,7 @@ async fn start_workflow(
             definition_id: request.identity.definition_id,
             definition_version: request.identity.definition_version,
             run_id: request.run_id,
-            workspace_snapshot: String::new(),
+            workspace_snapshot: request.workspace_snapshot.unwrap_or_default(),
             parent_session_id: request.parent_session_id,
             binding: Some(request.binding),
             input: Some(request.input),
@@ -41107,6 +41109,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 identity,
                 definition,
                 run_id: Some("shared-loop-run".to_string()),
+                workspace_snapshot: None,
                 parent_session_id: parent.id,
                 input: serde_json::json!({"condition_met": false, "iteration": 1}),
                 binding: bcode_workflow_store::WorkflowRunBinding {
@@ -41355,6 +41358,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 identity,
                 definition,
                 run_id: Some("shared-loop-repeat".to_string()),
+                workspace_snapshot: None,
                 parent_session_id: parent.id,
                 input: serde_json::json!({
                     "implementation_prompt": "implement",
@@ -41564,6 +41568,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 identity,
                 definition: definition.clone(),
                 run_id: Some("repeat-driver-run".to_string()),
+                workspace_snapshot: None,
                 parent_session_id: session.id,
                 input: serde_json::json!({"condition_met": false}),
                 binding: bcode_workflow_store::WorkflowRunBinding {
@@ -42864,6 +42869,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             identity,
             definition: workflow.definition().clone(),
             run_id: Some("bound-stable-run".to_string()),
+            workspace_snapshot: Some("/repo".to_string()),
             parent_session_id: session.id,
             input: serde_json::json!(1),
             binding: bcode_workflow_store::WorkflowRunBinding {

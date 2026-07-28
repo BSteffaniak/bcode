@@ -396,6 +396,10 @@ mod tests {
         .expect("host");
         assert!(!host.plugin_ids().iter().any(|id| id == "bcode.workflow"));
         assert!(
+            host.registry().workflow_templates().is_empty(),
+            "disabled workflow plugin must contribute no templates"
+        );
+        assert!(
             host.registered_command_contributions(&bcode_command::CommandSurface::Palette)
                 .iter()
                 .all(|command| !command.id.starts_with("workflow"))
