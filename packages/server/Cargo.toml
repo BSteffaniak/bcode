@@ -32,6 +32,7 @@ bcode_session_import = { workspace = true }
 bcode_session_migration = { workspace = true }
 bcode_session_migration_target = { workspace = true }
 bcode_session_models = { workspace = true }
+bcode_session_search = { workspace = true }
 bcode_settings = { workspace = true }
 bcode_skill = { workspace = true }
 bcode_skill_models = { workspace = true }

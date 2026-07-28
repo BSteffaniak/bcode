@@ -33,6 +33,7 @@ use context_compaction::{
 use context_compaction::{candidate_requires_proactive_compaction, compaction_event_is_progress};
 pub mod session_catalog;
 mod session_import;
+pub mod session_search;
 
 use bcode_agent_profile::{
     AGENT_PROFILE_INTERFACE_ID, AgentContextRequest, AgentContextResponse, AgentDecision,

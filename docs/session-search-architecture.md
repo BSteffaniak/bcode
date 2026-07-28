@@ -53,6 +53,31 @@ contributions are capped at 64 KiB. IPC framing and client request timeouts prov
 transport bounds. Complete selected-session export is explicitly exempt from normal-read event-count
 bounds and must never be reused as ordinary search hydration.
 
+## Backend-neutral contract
+
+The shared Rust contract is implemented in `packages/session-search` and exposed to plugins as:
+
+```text
+bcode.session_search/v1
+```
+
+Query operations are `search`, `capabilities`, and `status`. Maintenance operations are
+`apply_batch`, `remove_session`, and `purge`. The contract defines bounded boolean text queries,
+explicit terms/phrase/prefix/regex/fuzzy modes, structured session filters, deterministic portable
+sort/cursor envelopes, canonical event locators, provider-local ranks/scores, capability negotiation,
+coverage/freshness/status, normalized errors, and idempotent ingestion batches.
+
+Regex and fuzzy semantics are requested explicitly and may only be routed to providers advertising
+the corresponding capability. Unsupported behavior is returned as `unsupported_query`; it is never
+silently approximated. Provider scores are opaque and only comparable within one provider response.
+Cursors carry provider identity and query fingerprint but keep backend pagination state opaque.
+
+The contract crate depends on portable session models and serialization only. It contains no
+Tantivy, SQL, daemon, renderer, or generic plugin-host implementation types. The server's initial
+session-search adapter is a real caller: it discovers service registrations, requests typed
+capabilities/status, validates provider identity and response bounds, and invokes one exact provider.
+Federated routing remains a subsequent application-layer phase.
+
 ## Search ownership
 
 Session search is a session-domain capability implemented through versioned typed plugin services.

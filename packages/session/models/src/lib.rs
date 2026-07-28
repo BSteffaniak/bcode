@@ -800,7 +800,7 @@ pub struct SessionHistoryWindow {
 pub const MAX_SESSION_INSPECTION_EVENTS: usize = 200;
 
 /// High-value semantic event category for bounded session investigation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionInspectionCategory {
     /// Failed terminal tool invocation records and lifecycle events.
