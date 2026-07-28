@@ -591,6 +591,59 @@ fn terminal_session_open_snapshot(
     }
 }
 
+async fn current_storage_open_snapshot(
+    db: &db::SessionDb,
+    session_id: SessionId,
+) -> SessionOpenOperationSnapshot {
+    let compatibility_status = match db.session_compatibility_status().await {
+        Ok(status) => status,
+        Err(error) => {
+            return terminal_session_open_snapshot(
+                session_id,
+                SessionOpenTerminalOutcome::RepairRequired {
+                    reason: error.to_string(),
+                },
+                "Session compatibility projection requires repair".to_owned(),
+            );
+        }
+    };
+    let (outcome, message) = match compatibility_status {
+        db::SessionCompatibilityStatus::Compatible { .. } => {
+            return ready_session_open_snapshot(session_id);
+        }
+        db::SessionCompatibilityStatus::Degraded { issue_count, .. } => (
+            SessionOpenTerminalOutcome::DegradedReadOnly { issue_count },
+            format!("Session history contains {issue_count} unsupported event(s) and is read-only"),
+        ),
+        db::SessionCompatibilityStatus::Missing => (
+            SessionOpenTerminalOutcome::RepairRequired {
+                reason: "session compatibility projection is missing".to_owned(),
+            },
+            "Session compatibility projection is missing".to_owned(),
+        ),
+        db::SessionCompatibilityStatus::Stale {
+            checkpoint,
+            expected,
+        } => (
+            SessionOpenTerminalOutcome::RepairRequired {
+                reason: format!(
+                    "session compatibility projection is stale: checkpoint {checkpoint}, expected {expected}"
+                ),
+            },
+            "Session compatibility projection is stale".to_owned(),
+        ),
+        db::SessionCompatibilityStatus::Incompatible { actual, expected } => (
+            SessionOpenTerminalOutcome::RepairRequired {
+                reason: format!(
+                    "session compatibility projection schema {actual} is incompatible with expected schema {expected}"
+                ),
+            },
+            "Session compatibility projection is incompatible".to_owned(),
+        ),
+    };
+    terminal_session_open_snapshot(session_id, outcome, message)
+}
+
 fn ready_session_open_snapshot(session_id: SessionId) -> SessionOpenOperationSnapshot {
     terminal_session_open_snapshot(
         session_id,
@@ -1663,43 +1716,7 @@ impl SessionManager {
             compatibility,
             db::SessionStorageCompatibility::Current { .. }
         ) {
-            let (outcome, message) = match db.session_compatibility_status().await? {
-                db::SessionCompatibilityStatus::Compatible { .. } => {
-                    return Ok(ready_session_open_snapshot(session_id));
-                }
-                db::SessionCompatibilityStatus::Degraded { issue_count, .. } => (
-                    SessionOpenTerminalOutcome::DegradedReadOnly { issue_count },
-                    format!(
-                        "Session history contains {issue_count} unsupported event(s) and is read-only"
-                    ),
-                ),
-                db::SessionCompatibilityStatus::Missing => (
-                    SessionOpenTerminalOutcome::RepairRequired {
-                        reason: "session compatibility projection is missing".to_owned(),
-                    },
-                    "Session compatibility projection is missing".to_owned(),
-                ),
-                db::SessionCompatibilityStatus::Stale {
-                    checkpoint,
-                    expected,
-                } => (
-                    SessionOpenTerminalOutcome::RepairRequired {
-                        reason: format!(
-                            "session compatibility projection is stale: checkpoint {checkpoint}, expected {expected}"
-                        ),
-                    },
-                    "Session compatibility projection is stale".to_owned(),
-                ),
-                db::SessionCompatibilityStatus::Incompatible { actual, expected } => (
-                    SessionOpenTerminalOutcome::RepairRequired {
-                        reason: format!(
-                            "session compatibility projection schema {actual} is incompatible with expected schema {expected}"
-                        ),
-                    },
-                    "Session compatibility projection is incompatible".to_owned(),
-                ),
-            };
-            return Ok(terminal_session_open_snapshot(session_id, outcome, message));
+            return Ok(current_storage_open_snapshot(&db, session_id).await);
         }
         let db::SessionStorageCompatibility::KnownLegacy { writer_epoch } = compatibility else {
             unreachable!("current compatibility returned above")
@@ -7008,6 +7025,44 @@ mod tests {
             .await
             .expect("future writer epoch after classification");
         assert_eq!(durable_epoch, 99);
+        std::fs::remove_dir_all(root).expect("temp dir cleanup");
+    }
+
+    #[tokio::test]
+    async fn corrupt_compatibility_projection_prepares_repair_required_without_mutation() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager");
+        let session = manager
+            .create_session(Some("corrupt".to_owned()), test_working_directory())
+            .await
+            .expect("current session");
+        let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+            .await
+            .expect("session DB");
+        db.database()
+            .update("session_compatibility_state")
+            .value("last_event_seq", "not-a-sequence")
+            .where_eq("projection_id", switchy::database::DatabaseValue::Int32(1))
+            .execute(db.database())
+            .await
+            .expect("corrupt checkpoint");
+        drop(db);
+
+        let snapshot = manager
+            .prepare_session_open(session.id)
+            .await
+            .expect("classify corrupt projection");
+
+        assert!(matches!(
+            snapshot.outcome,
+            Some(SessionOpenTerminalOutcome::RepairRequired { ref reason })
+                if reason.contains("last_event_seq")
+        ));
+        assert_eq!(manager.active_session_migration_count().await, 0);
+        let db = db::SessionDb::open_existing_turso_in_root(session.id, &root)
+            .await
+            .expect("reopen unchanged session DB");
+        assert!(db.session_compatibility_status().await.is_err());
         std::fs::remove_dir_all(root).expect("temp dir cleanup");
     }
 
