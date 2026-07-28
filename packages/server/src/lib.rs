@@ -40749,18 +40749,42 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .reconcile_receipt_backed_attempts_async(&observer, 10, 4)
             .await
             .expect("reconcile");
+        let current_head = git(&["rev-parse", "HEAD"]);
+        assert_ne!(current_head, head);
+        let store =
+            bcode_workflow_store::WorkflowStore::open_at_path(&path).expect("verification store");
         assert_eq!(
-            state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            store
                 .run_summary("git-commit-run")
                 .expect("summary")
                 .expect("run")
                 .status,
             bcode_workflow_store::RunStatus::Completed
         );
-        assert_ne!(git(&["rev-parse", "HEAD"]), head);
+        let outputs = store
+            .output_summaries("git-commit-run", 10)
+            .expect("outputs");
+        assert_eq!(outputs.len(), 1);
+        assert!(
+            store
+                .event_history("git-commit-run", None, 100)
+                .expect("events")
+                .iter()
+                .any(|event| event.event_type == "output_validated")
+        );
+        drop(store);
+        assert_eq!(git(&["rev-list", "--count", "HEAD"]), "2");
+        assert!(
+            bcode_workflow_store::WorkflowStore::open_at_path(&path)
+                .expect("repeat dispatch store")
+                .dispatch_pending_activations(&owner, 10, 5)
+                .await
+                .expect("repeat dispatch")
+                .admitted
+                .is_empty()
+        );
+        assert_eq!(git(&["rev-parse", "HEAD"]), current_head);
+        assert_eq!(git(&["rev-list", "--count", "HEAD"]), "2");
     }
 
     #[tokio::test]

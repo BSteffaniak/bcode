@@ -1243,6 +1243,15 @@ mod tests {
         assert!(
             commit_repository(&CommitRequest {
                 repo_path: directory.path().to_path_buf(),
+                expected_head: response.commit_hash.clone(),
+                message: "empty".to_string(),
+                paths: Vec::new(),
+            })
+            .is_err()
+        );
+        assert!(
+            commit_repository(&CommitRequest {
+                repo_path: directory.path().to_path_buf(),
                 expected_head: response.commit_hash,
                 message: "escape".to_string(),
                 paths: vec![PathBuf::from("../outside")],
