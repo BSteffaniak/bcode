@@ -177,16 +177,47 @@ fn terminal_workflow_control_message(
 }
 
 fn format_workflow_status(run: &bcode_workflow_store::WorkflowRunSummary) -> String {
+    if run.status == bcode_workflow_store::RunStatus::RepairRequired {
+        return format!(
+            "loop workflow {} · repair required because recovery could not prove the previous operation outcome · definition {} v{}",
+            run.run_id, run.definition_id, run.definition_version
+        );
+    }
+    let status = if run.cancellation_requested_at_ms.is_some()
+        && matches!(
+            run.status,
+            bcode_workflow_store::RunStatus::Running | bcode_workflow_store::RunStatus::Paused
+        ) {
+        "Cancelling".to_owned()
+    } else {
+        format!("{:?}", run.status)
+    };
     format!(
-        "loop workflow {} · status {:?} · definition {} v{}",
-        run.run_id, run.status, run.definition_id, run.definition_version
+        "loop workflow {} · status {status} · definition {} v{}",
+        run.run_id, run.definition_id, run.definition_version
     )
 }
 
 fn format_plugin_workflow_status(run: &bcode_plugin_sdk::tui::PluginWorkflowSummary) -> String {
+    if run.status == bcode_plugin_sdk::tui::PluginWorkflowStatus::RepairRequired {
+        return format!(
+            "loop workflow {} · repair required because recovery could not prove the previous operation outcome · definition {} v{}",
+            run.run_id, run.definition_id, run.definition_version
+        );
+    }
+    let status = if run.cancellation_requested
+        && matches!(
+            run.status,
+            bcode_plugin_sdk::tui::PluginWorkflowStatus::Running
+                | bcode_plugin_sdk::tui::PluginWorkflowStatus::Paused
+        ) {
+        "Cancelling".to_owned()
+    } else {
+        format!("{:?}", run.status)
+    };
     format!(
-        "loop workflow {} · status {:?} · definition {} v{}",
-        run.run_id, run.status, run.definition_id, run.definition_version
+        "loop workflow {} · status {status} · definition {} v{}",
+        run.run_id, run.definition_id, run.definition_version
     )
 }
 
@@ -1005,6 +1036,51 @@ mod tests {
         assert_eq!(
             terminal_workflow_control_message(&run).as_deref(),
             Some("loop workflow is already completed; start a new loop to run it again")
+        );
+    }
+
+    #[test]
+    fn cancellation_requested_status_is_presented_as_cancelling() {
+        let run = bcode_workflow_store::WorkflowRunSummary {
+            run_id: "run-1".to_string(),
+            definition_id: "definition".to_string(),
+            definition_version: 1,
+            workspace_snapshot: "snapshot".to_string(),
+            parent_session_id: None,
+            binding: Some(bcode_workflow_store::WorkflowRunBinding {
+                owner_plugin_id: PLUGIN_ID.to_string(),
+                workflow_kind: WORKFLOW_KIND.to_string(),
+                scope_key: "session".to_string(),
+                display_label: None,
+                single_active: true,
+            }),
+            status: bcode_workflow_store::RunStatus::Running,
+            cancellation_requested_at_ms: Some(3),
+            created_at_ms: 1,
+            updated_at_ms: 3,
+        };
+
+        assert!(format_workflow_status(&run).contains("status Cancelling"));
+    }
+
+    #[test]
+    fn repair_required_status_explains_ambiguous_recovery() {
+        let run = bcode_workflow_store::WorkflowRunSummary {
+            run_id: "run-1".to_string(),
+            definition_id: "definition".to_string(),
+            definition_version: 1,
+            workspace_snapshot: "snapshot".to_string(),
+            parent_session_id: None,
+            binding: None,
+            status: bcode_workflow_store::RunStatus::RepairRequired,
+            cancellation_requested_at_ms: Some(3),
+            created_at_ms: 1,
+            updated_at_ms: 3,
+        };
+
+        assert!(
+            format_workflow_status(&run)
+                .contains("repair required because recovery could not prove")
         );
     }
 

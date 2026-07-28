@@ -117,6 +117,9 @@ pub struct PluginWorkflowSummary {
     pub definition_id: String,
     pub definition_version: u32,
     pub status: PluginWorkflowStatus,
+    /// Whether durable cancellation has been requested but the run is not yet terminal.
+    #[serde(default)]
+    pub cancellation_requested: bool,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }

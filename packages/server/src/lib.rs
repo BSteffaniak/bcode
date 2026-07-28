@@ -11277,7 +11277,7 @@ async fn handle_inspect_associated_workflow_run(
 }
 
 async fn control_associated_workflow_run(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     key: bcode_workflow_store::WorkflowRunBindingKey,
     action: bcode_ipc::WorkflowRunControlAction,
 ) -> Result<(Option<bcode_workflow_store::WorkflowRunSummary>, bool), ServerError> {
@@ -11293,11 +11293,9 @@ async fn control_associated_workflow_run(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .pause_run(&run.run_id, current_unix_millis())?,
-            bcode_ipc::WorkflowRunControlAction::Resume => state
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .resume_run(&run.run_id, current_unix_millis())?,
+            bcode_ipc::WorkflowRunControlAction::Resume => {
+                resume_workflow_run(state, &run.run_id).await?
+            }
             bcode_ipc::WorkflowRunControlAction::Cancel => {
                 let (recorded, attempts) = {
                     let mut store = state
@@ -11327,7 +11325,7 @@ async fn control_associated_workflow_run(
 
 async fn handle_control_associated_workflow_run(
     request_id: u64,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     key: bcode_ipc::WorkflowRunBindingLookup,
     action: bcode_ipc::WorkflowRunControlAction,
@@ -11367,7 +11365,7 @@ async fn handle_list_workflow_runs(
 
 async fn handle_cancel_workflow_run(
     request_id: u64,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     run_id: String,
 ) -> Result<(), ServerError> {
@@ -11411,21 +11409,27 @@ async fn handle_pause_workflow_run(
 
 async fn handle_resume_workflow_run(
     request_id: u64,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     run_id: String,
 ) -> Result<(), ServerError> {
-    let changed = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .resume_run(&run_id, current_unix_millis())?;
+    let changed = resume_workflow_run(state, &run_id).await?;
     send_response(
         writer,
         request_id,
         Response::Ok(ResponsePayload::WorkflowRunResumed { changed }),
     )
     .await
+}
+
+async fn resume_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<bool, ServerError> {
+    let changed = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .resume_run(run_id, current_unix_millis())?;
+    drive_workflow_run(state, run_id).await?;
+    Ok(changed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -22777,6 +22781,9 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
         }
         Err(error) => tracing::warn!("failed to open workflow store at startup: {error}"),
     }
+    if let Err(error) = continue_pending_workflow_runs(state).await {
+        tracing::warn!("failed to continue pending workflow runs at startup: {error}");
+    }
     let active_attempts = state
         .workflow_store
         .lock()
@@ -22822,16 +22829,42 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
             .and_then(serde_json::Value::as_str)
             .and_then(|value| SessionId::from_str(value).ok())
             .unwrap_or(parent_session_id);
+        let Some(cancellation) = state
+            .session_current_turn(session_id)
+            .await
+            .filter(|turn| {
+                attempt
+                    .receipt
+                    .get("turn_id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|turn_id| turn.turn_id == turn_id)
+            })
+            .map(|turn| turn.cancel_state)
+        else {
+            continue;
+        };
         register_workflow_node_runtime_work(
             state,
             session_id,
             &run_work_id,
             &attempt.dispatch_identity,
             format!("workflow node {}", attempt.node_id),
-            CancellationHandle::WorkflowNode(Arc::new(TurnCancelState::default())),
+            CancellationHandle::WorkflowNode(cancellation),
         )
         .await;
     }
+}
+
+async fn continue_pending_workflow_runs(state: &Arc<ServerState>) -> Result<(), ServerError> {
+    let run_ids = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .resumable_pending_run_ids(1_000)?;
+    for run_id in run_ids {
+        drive_workflow_run(state, &run_id).await?;
+    }
+    Ok(())
 }
 
 async fn register_workflow_runtime_work(
@@ -22921,14 +22954,33 @@ async fn propagate_persisted_workflow_cancellation(
 ) -> Result<Vec<String>, WorkflowStoreError> {
     let mut signalled = Vec::new();
     for attempt in attempts {
-        signal_workflow_attempt_cancellation(state, &attempt).await?;
-        let changed = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .mark_cancellation_signalled(&attempt.dispatch_identity, current_unix_millis())?;
-        if changed {
-            signalled.push(attempt.dispatch_identity);
+        match signal_workflow_attempt_cancellation(state, &attempt).await {
+            Ok(()) => {
+                let changed = state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .mark_cancellation_signalled(
+                        &attempt.dispatch_identity,
+                        current_unix_millis(),
+                    )?;
+                if changed {
+                    signalled.push(attempt.dispatch_identity);
+                }
+            }
+            Err(WorkflowStoreError::InvalidData(message))
+                if message.starts_with("active runtime work not found for workflow dispatch:") =>
+            {
+                state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .settle_orphaned_attempt_cancellation(
+                        &attempt.dispatch_identity,
+                        current_unix_millis(),
+                    )?;
+            }
+            Err(error) => return Err(error),
         }
     }
     Ok(signalled)
@@ -40275,7 +40327,33 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         predicate,
                         max_iterations: 3,
                     },
-                    transform: None,
+                    transform: Some(bcode_workflow::WorkflowTransform {
+                        version: bcode_workflow::WORKFLOW_TRANSFORM_VERSION,
+                        expression: bcode_workflow::WorkflowTransformExpression::Merge {
+                            objects: vec![
+                                bcode_workflow::WorkflowTransformExpression::Input {
+                                    source: "current".to_string(),
+                                    path: String::new(),
+                                },
+                                bcode_workflow::WorkflowTransformExpression::Object {
+                                    fields: BTreeMap::from([(
+                                        "iteration".to_string(),
+                                        bcode_workflow::WorkflowTransformExpression::Increment {
+                                            value: Box::new(
+                                                bcode_workflow::WorkflowTransformExpression::Input {
+                                                    source: "current".to_string(),
+                                                    path: "iteration".to_string(),
+                                                },
+                                            ),
+                                            by: 1,
+                                        },
+                                    )]),
+                                },
+                            ],
+                            conflict: bcode_workflow::TransformMergeConflict::KeepLast,
+                        },
+                        output: schema.clone(),
+                    }),
                 },
             ],
         };
@@ -40510,6 +40588,119 @@ event_symbol = "bcode_plugin_handle_event_v1"
         })
         .await
         .expect("repeat successor dispatched");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn orphaned_workflow_cancellation_does_not_require_runtime_registration() {
+        let sessions = SessionManager::default();
+        let parent = sessions
+            .create_session(
+                Some("orphaned cancellation".to_string()),
+                PathBuf::from("."),
+            )
+            .await
+            .expect("parent");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("store");
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "u32".to_string(),
+            schema: serde_json::json!({"type": "integer", "minimum": 0}),
+        };
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: 1,
+            name: "orphaned-cancellation".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([(
+                "agent".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "agent".to_string(),
+                    name: "agent".to_string(),
+                    kind: bcode_workflow::NodeKind::Agent,
+                    input: schema.clone(),
+                    output: schema,
+                    resources: Vec::new(),
+                    configuration: serde_json::json!({}),
+                },
+            )]),
+            entries: vec!["agent".to_string()],
+            exits: vec!["agent".to_string()],
+            edges: Vec::new(),
+        };
+        store
+            .persist_definition("orphaned-cancellation", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "orphaned-cancellation-run".to_string(),
+                definition_id: "orphaned-cancellation".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: Some(parent.id.to_string()),
+                binding: None,
+                input: Some(serde_json::json!(1)),
+                created_at_ms: 1,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let pending = store
+            .pending_activations(1)
+            .expect("pending")
+            .pop()
+            .expect("activation");
+        let prepared = store
+            .prepare_pending_activation(
+                &pending.run_id,
+                &pending.node_id,
+                &pending.activation_id,
+                bcode_workflow_store::DispatchSideEffect::ReadOnly,
+                serde_json::json!({"owner": "test"}),
+                2,
+            )
+            .expect("prepare")
+            .expect("prepared");
+        store
+            .persist_dispatch_receipt(&bcode_workflow_store::DispatchReceipt {
+                run_id: prepared.activation.run_id,
+                node_id: prepared.activation.node_id,
+                activation_id: prepared.activation.activation_id,
+                attempt: prepared.attempt,
+                dispatch_identity: prepared.dispatch_identity.clone(),
+                receipt: serde_json::json!({
+                    "session_id": parent.id,
+                    "turn_id": "missing-turn",
+                    "output_schema_id": "u32",
+                }),
+                admitted_at_ms: 3,
+            })
+            .expect("receipt");
+        store
+            .request_cancellation("orphaned-cancellation-run", 4)
+            .expect("cancellation");
+        let attempts = store
+            .active_attempt_cancellations("orphaned-cancellation-run", 10)
+            .expect("attempts");
+        let state = test_server_state_with_fake_provider_and_workflow_store(sessions, store);
+
+        let signalled = propagate_persisted_workflow_cancellation(&state, attempts)
+            .await
+            .expect("orphaned cancellation settles");
+
+        assert!(signalled.is_empty());
+        assert_eq!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .run_summary("orphaned-cancellation-run")
+                .expect("summary")
+                .expect("run")
+                .status,
+            bcode_workflow_store::RunStatus::Cancelled
+        );
     }
 
     #[tokio::test]
@@ -41007,6 +41198,259 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn direct_resume_drives_pending_activation() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(
+                Some("direct resume pending".to_string()),
+                PathBuf::from("."),
+            )
+            .await
+            .expect("session");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("workflow store");
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "boolean".to_string(),
+            schema: serde_json::json!({"type": "boolean"}),
+        };
+        store
+            .persist_definition(
+                "direct-resume-pending",
+                1,
+                &bcode_workflow::WorkflowDefinition {
+                    schema_version: 1,
+                    name: "direct-resume-pending".to_string(),
+                    input: schema.clone(),
+                    output: schema.clone(),
+                    nodes: BTreeMap::from([(
+                        "wait".to_string(),
+                        bcode_workflow::NodeDefinition {
+                            id: "wait".to_string(),
+                            name: "wait".to_string(),
+                            kind: bcode_workflow::NodeKind::Input,
+                            input: schema.clone(),
+                            output: schema,
+                            resources: Vec::new(),
+                            configuration: serde_json::json!({}),
+                        },
+                    )]),
+                    entries: vec!["wait".to_string()],
+                    exits: vec!["wait".to_string()],
+                    edges: Vec::new(),
+                },
+            )
+            .expect("definition");
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "direct-resume-pending-run".to_string(),
+                definition_id: "direct-resume-pending".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: Some(session.id.to_string()),
+                binding: None,
+                input: Some(serde_json::json!(true)),
+                created_at_ms: 1,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        store
+            .pause_run("direct-resume-pending-run", 2)
+            .expect("pause");
+        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+            sessions, store,
+        ));
+
+        assert!(
+            resume_workflow_run(&state, "direct-resume-pending-run")
+                .await
+                .expect("resume")
+        );
+        assert!(
+            !resume_workflow_run(&state, "direct-resume-pending-run")
+                .await
+                .expect("idempotent resume")
+        );
+        assert_eq!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .waiting_activations("direct-resume-pending-run", 10)
+                .expect("waits")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn associated_resume_drives_pending_activation() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("resume pending".to_string()), PathBuf::from("."))
+            .await
+            .expect("session");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("workflow store");
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "boolean".to_string(),
+            schema: serde_json::json!({"type": "boolean"}),
+        };
+        let definition = bcode_workflow::WorkflowDefinition {
+            schema_version: 1,
+            name: "resume-pending".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            nodes: BTreeMap::from([(
+                "wait".to_string(),
+                bcode_workflow::NodeDefinition {
+                    id: "wait".to_string(),
+                    name: "wait".to_string(),
+                    kind: bcode_workflow::NodeKind::Input,
+                    input: schema.clone(),
+                    output: schema,
+                    resources: Vec::new(),
+                    configuration: serde_json::json!({}),
+                },
+            )]),
+            entries: vec!["wait".to_string()],
+            exits: vec!["wait".to_string()],
+            edges: Vec::new(),
+        };
+        let key = bcode_workflow_store::WorkflowRunBindingKey {
+            owner_plugin_id: "bcode.loop".to_string(),
+            workflow_kind: "bcode.loop".to_string(),
+            scope_key: session.id.to_string(),
+        };
+        store
+            .persist_definition("resume-pending", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "resume-pending-run".to_string(),
+                definition_id: "resume-pending".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: Some(session.id.to_string()),
+                binding: Some(bcode_workflow_store::WorkflowRunBinding {
+                    owner_plugin_id: key.owner_plugin_id.clone(),
+                    workflow_kind: key.workflow_kind.clone(),
+                    scope_key: key.scope_key.clone(),
+                    display_label: None,
+                    single_active: true,
+                }),
+                input: Some(serde_json::json!(true)),
+                created_at_ms: 1,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        store.pause_run("resume-pending-run", 2).expect("pause");
+        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+            sessions, store,
+        ));
+
+        let (_, changed) = control_associated_workflow_run(
+            &state,
+            key,
+            bcode_ipc::WorkflowRunControlAction::Resume,
+        )
+        .await
+        .expect("resume");
+
+        assert!(changed);
+        assert_eq!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .waiting_activations("resume-pending-run", 10)
+                .expect("waits")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_restore_drives_running_pending_activation() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("restore pending".to_string()), PathBuf::from("."))
+            .await
+            .expect("session");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let mut store =
+            bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+                .expect("workflow store");
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "boolean".to_string(),
+            schema: serde_json::json!({"type": "boolean"}),
+        };
+        store
+            .persist_definition(
+                "restore-pending",
+                1,
+                &bcode_workflow::WorkflowDefinition {
+                    schema_version: 1,
+                    name: "restore-pending".to_string(),
+                    input: schema.clone(),
+                    output: schema.clone(),
+                    nodes: BTreeMap::from([(
+                        "wait".to_string(),
+                        bcode_workflow::NodeDefinition {
+                            id: "wait".to_string(),
+                            name: "wait".to_string(),
+                            kind: bcode_workflow::NodeKind::Input,
+                            input: schema.clone(),
+                            output: schema,
+                            resources: Vec::new(),
+                            configuration: serde_json::json!({}),
+                        },
+                    )]),
+                    entries: vec!["wait".to_string()],
+                    exits: vec!["wait".to_string()],
+                    edges: Vec::new(),
+                },
+            )
+            .expect("definition");
+        store
+            .create_run(&bcode_workflow_store::NewWorkflowRun {
+                run_id: "restore-pending-run".to_string(),
+                definition_id: "restore-pending".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: Some(session.id.to_string()),
+                binding: None,
+                input: Some(serde_json::json!(true)),
+                created_at_ms: 1,
+                limits: bcode_workflow_store::WorkflowRunLimits::default(),
+            })
+            .expect("run");
+        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+            sessions, store,
+        ));
+
+        restore_workflow_runtime_work(&state).await;
+        restore_workflow_runtime_work(&state).await;
+
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            store
+                .waiting_activations("restore-pending-run", 10)
+                .expect("waits")
+                .len(),
+            1
+        );
+        assert!(store.pending_activations(10).expect("pending").is_empty());
+        drop(store);
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn associated_workflow_controls_status_pause_resume_and_stop() {
         let sessions = SessionManager::default();
@@ -41017,7 +41461,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let workflow_root = tempfile::tempdir().expect("workflow root");
         let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
             .expect("workflow store");
-        let state = test_server_state_with_fake_provider_and_workflow_store(sessions, store);
+        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+            sessions, store,
+        ));
         let schema = bcode_workflow::ValueSchema {
             type_name: "boolean".to_string(),
             schema: serde_json::json!({"type": "boolean"}),

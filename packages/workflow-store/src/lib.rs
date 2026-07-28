@@ -3329,6 +3329,107 @@ impl WorkflowStore {
             .collect()
     }
 
+    /// Settle cancellation for an attempt whose process-local owner is absent.
+    ///
+    /// Receipt-less/read-only attempts can be cancelled without external ambiguity. Any mutating
+    /// attempt instead becomes repair-required because its external outcome cannot be proven after
+    /// owner loss.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attempt is missing, cancellation was not requested, or the
+    /// durable transition fails.
+    pub fn settle_orphaned_attempt_cancellation(
+        &mut self,
+        dispatch_identity: &str,
+        settled_at_ms: u64,
+    ) -> Result<RunStatus, WorkflowStoreError> {
+        validate_id("dispatch_identity", dispatch_identity)?;
+        let transaction = self.connection.transaction()?;
+        let (run_id, node_id, activation_id, status, side_effect) = transaction.query_row(
+            "SELECT run_id, node_id, activation_id, status, side_effect \
+                 FROM workflow_attempts WHERE dispatch_identity = ?1",
+            [dispatch_identity],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            },
+        )?;
+        require_cancellation_requested(&transaction, &run_id)?;
+        if !matches!(
+            status.as_str(),
+            "prepared" | "admitted" | "running" | "cancelling"
+        ) {
+            let run_status = transaction.query_row(
+                "SELECT status FROM workflow_runs WHERE run_id = ?1",
+                [&run_id],
+                |row| row.get::<_, String>(0),
+            )?;
+            return parse_run_status(&run_status);
+        }
+        if parse_side_effect(&side_effect)? == DispatchSideEffect::Mutating {
+            transaction.execute(
+                "UPDATE workflow_attempts SET status = 'repair_required', terminal_at_ms = ?2 \
+                 WHERE dispatch_identity = ?1",
+                (dispatch_identity, settled_at_ms),
+            )?;
+            transaction.execute(
+                "UPDATE workflow_runs SET status = 'repair_required', updated_at_ms = ?2 \
+                 WHERE run_id = ?1",
+                (&run_id, settled_at_ms),
+            )?;
+            append_event(
+                &transaction,
+                &run_id,
+                "attempt_repair_required",
+                &serde_json::json!({
+                    "dispatch_identity": dispatch_identity,
+                    "reason": "cancellation_owner_unavailable",
+                })
+                .to_string(),
+                settled_at_ms,
+            )?;
+            transaction.commit()?;
+            return Ok(RunStatus::RepairRequired);
+        }
+        transaction.execute(
+            "UPDATE workflow_attempts SET status = 'cancelled', terminal_at_ms = ?2 \
+             WHERE dispatch_identity = ?1",
+            (dispatch_identity, settled_at_ms),
+        )?;
+        transaction.execute(
+            "UPDATE workflow_activations SET status = 'cancelled' \
+             WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 \
+               AND status IN ('pending', 'running') AND output_id IS NULL",
+            (&run_id, &node_id, &activation_id),
+        )?;
+        append_event(
+            &transaction,
+            &run_id,
+            "attempt_cancelled",
+            &serde_json::json!({
+                "dispatch_identity": dispatch_identity,
+                "reason": "cancellation_owner_unavailable",
+            })
+            .to_string(),
+            settled_at_ms,
+        )?;
+        finalize_run_cancellation_if_settled(&transaction, &run_id, settled_at_ms)?;
+        let run_status = transaction.query_row(
+            "SELECT status FROM workflow_runs WHERE run_id = ?1",
+            [&run_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        let run_status = parse_run_status(&run_status)?;
+        transaction.commit()?;
+        Ok(run_status)
+    }
+
     /// Mark one successfully signalled active attempt as cancelling.
     ///
     /// This is the durable second half of host-side two-phase cancellation propagation. Calling it
@@ -3573,6 +3674,38 @@ impl WorkflowStore {
             .optional()?
             .map(parse_run_summary)
             .transpose()
+    }
+
+    /// Return bounded run IDs whose pending activations are safe to continue after startup.
+    ///
+    /// Eligible runs are running without cancellation intent, active attempts, or unresolved
+    /// input/approval waits. The query is projection-backed and does not replay workflow events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the limit is invalid or the bounded query fails.
+    pub fn resumable_pending_run_ids(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<String>, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT DISTINCT activation.run_id FROM workflow_activations activation \
+             JOIN workflow_runs run ON run.run_id = activation.run_id \
+             WHERE activation.status = 'pending' AND run.status = 'running' \
+               AND run.cancellation_requested_at_ms IS NULL \
+               AND NOT EXISTS(SELECT 1 FROM workflow_attempts attempt \
+                 WHERE attempt.run_id = run.run_id \
+                   AND attempt.status IN ('prepared', 'admitted', 'running', 'cancelling')) \
+               AND NOT EXISTS(SELECT 1 FROM workflow_activations waiting \
+                 WHERE waiting.run_id = run.run_id \
+                   AND waiting.status IN ('waiting_input', 'waiting_approval')) \
+             ORDER BY activation.run_id LIMIT ?1",
+        )?;
+        statement
+            .query_map([limit], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(WorkflowStoreError::from)
     }
 
     /// Return bounded durable input/approval waits ordered deterministically.
@@ -7660,6 +7793,100 @@ mod tests {
     }
 
     #[test]
+    fn orphaned_read_only_attempt_cancellation_finalizes_run() {
+        let (_temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::ReadOnly);
+        store.request_cancellation("run-1", 20).expect("intent");
+
+        let status = store
+            .settle_orphaned_attempt_cancellation(&identity, 21)
+            .expect("settle orphaned read-only attempt");
+
+        assert_eq!(status, RunStatus::Cancelled);
+        assert_eq!(
+            store.attempt_history("run-1", None, 10).expect("attempts")[0].status,
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn terminal_orphan_cancellation_releases_single_active_binding() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        let first = NewWorkflowRun {
+            binding: Some(WorkflowRunBinding {
+                owner_plugin_id: "bcode.test".to_string(),
+                workflow_kind: "test.workflow".to_string(),
+                scope_key: "session-1".to_string(),
+                display_label: None,
+                single_active: true,
+            }),
+            ..new_run()
+        };
+        store.create_run(&first).expect("first run");
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::ReadOnly);
+        store.request_cancellation("run-1", 20).expect("cancel");
+        assert_eq!(
+            store
+                .settle_orphaned_attempt_cancellation(&identity, 21)
+                .expect("settle orphan"),
+            RunStatus::Cancelled
+        );
+
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "run-2".to_string(),
+                created_at_ms: 22,
+                ..first
+            })
+            .expect("replacement after orphan cancellation");
+    }
+
+    #[test]
+    fn orphaned_receipt_less_mutation_requires_repair() {
+        let (_temp, mut store) = initialized_store();
+        let identity = store
+            .prepare_attempt(&PreparedAttempt {
+                run_id: "run-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id: activation_id(),
+                attempt: 1,
+                side_effect: DispatchSideEffect::Mutating,
+                intent: serde_json::json!({"operation": "mutate"}),
+                prepared_at_ms: 12,
+            })
+            .expect("prepare");
+        store.request_cancellation("run-1", 20).expect("intent");
+
+        assert_eq!(
+            store
+                .settle_orphaned_attempt_cancellation(&identity, 21)
+                .expect("classify orphaned mutation"),
+            RunStatus::RepairRequired
+        );
+    }
+
+    #[test]
+    fn orphaned_receipt_backed_mutation_requires_repair() {
+        let (_temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        store.request_cancellation("run-1", 20).expect("intent");
+
+        let status = store
+            .settle_orphaned_attempt_cancellation(&identity, 21)
+            .expect("classify orphaned mutation");
+
+        assert_eq!(status, RunStatus::RepairRequired);
+        assert_eq!(
+            store.attempt_history("run-1", None, 10).expect("attempts")[0].status,
+            "repair_required"
+        );
+    }
+
+    #[test]
     fn cancelled_attempt_finalizes_run_after_owner_settles() {
         let (_temp, mut store) = initialized_store();
         let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::ReadOnly);
@@ -9772,6 +9999,64 @@ mod tests {
             )
             .expect("status");
         assert_eq!(status, "completed");
+    }
+
+    #[test]
+    fn resumable_pending_runs_exclude_paused_cancelled_repair_and_active_work() {
+        let (temp, mut store) = initialized_store();
+        assert_eq!(
+            store.resumable_pending_run_ids(10).expect("resumable"),
+            ["run-1"]
+        );
+
+        store.pause_run("run-1", 20).expect("pause");
+        assert!(
+            store
+                .resumable_pending_run_ids(10)
+                .expect("paused")
+                .is_empty()
+        );
+        store.resume_run("run-1", 21).expect("resume");
+        let prepared = store
+            .prepare_attempt(&PreparedAttempt {
+                run_id: "run-1".to_string(),
+                node_id: "review".to_string(),
+                activation_id: activation_id(),
+                attempt: 1,
+                side_effect: DispatchSideEffect::ReadOnly,
+                intent: serde_json::json!({}),
+                prepared_at_ms: 22,
+            })
+            .expect("prepare");
+        assert!(
+            store
+                .resumable_pending_run_ids(10)
+                .expect("active attempt")
+                .is_empty()
+        );
+        store.request_cancellation("run-1", 23).expect("cancel");
+        store
+            .settle_orphaned_attempt_cancellation(&prepared, 24)
+            .expect("settle");
+        assert!(
+            store
+                .resumable_pending_run_ids(10)
+                .expect("cancelled")
+                .is_empty()
+        );
+
+        let mut repair = initialized_store_at(temp.path().join("repair").as_path());
+        let identity = prepare_receipt_backed_attempt(&mut repair, DispatchSideEffect::Mutating);
+        repair.request_cancellation("run-1", 20).expect("cancel");
+        repair
+            .settle_orphaned_attempt_cancellation(&identity, 21)
+            .expect("repair required");
+        assert!(
+            repair
+                .resumable_pending_run_ids(10)
+                .expect("repair")
+                .is_empty()
+        );
     }
 
     #[test]

@@ -217,6 +217,7 @@ fn workflow_summary(run: bcode_workflow_store::WorkflowRunSummary) -> PluginWork
         definition_id: run.definition_id,
         definition_version: run.definition_version,
         status: workflow_status(run.status),
+        cancellation_requested: run.cancellation_requested_at_ms.is_some(),
         created_at_ms: run.created_at_ms,
         updated_at_ms: run.updated_at_ms,
     }
