@@ -282,6 +282,18 @@ pub enum Request {
         session_id: SessionId,
         work_id: WorkId,
     },
+    /// List bounded plugin-owned workflow templates and requirement diagnostics.
+    ListWorkflowTemplates {
+        limit: usize,
+    },
+    /// Describe one exact loaded plugin-owned workflow template.
+    DescribeWorkflowTemplate {
+        owner_plugin_id: String,
+        template_id: String,
+        template_version: u32,
+    },
+    /// Register and start one exact loaded template with validated configuration.
+    StartWorkflowTemplate(WorkflowTemplateStartRequest),
     /// Register one immutable, structurally validated workflow definition.
     RegisterWorkflowDefinition(WorkflowDefinitionRegistrationRequest),
     /// Register an exact definition and start its bound durable run through one retry-safe request.
@@ -1151,6 +1163,38 @@ pub struct RalphRunStatusResponse {
     pub interrupted_runs: Vec<RalphRunSummary>,
 }
 
+/// One unavailable workflow template requirement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowTemplateDiagnostic {
+    pub code: String,
+    pub requirement: String,
+    pub message: String,
+}
+
+/// Portable template catalog entry with explicit availability diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowTemplateDescription {
+    pub owner_plugin_id: String,
+    pub template: bcode_plugin::WorkflowTemplateContribution,
+    pub identity: bcode_workflow::WorkflowDefinitionIdentity,
+    #[serde(default)]
+    pub diagnostics: Vec<WorkflowTemplateDiagnostic>,
+}
+
+/// Typed request to start one exact plugin-owned template.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowTemplateStartRequest {
+    pub owner_plugin_id: String,
+    pub template_id: String,
+    pub template_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub parent_session_id: bcode_session_models::SessionId,
+    pub configuration: serde_json::Value,
+    #[serde(default)]
+    pub limits: bcode_workflow_store::WorkflowRunLimits,
+}
+
 /// Request to durably register one compiled workflow definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowDefinitionRegistrationRequest {
@@ -1405,6 +1449,13 @@ pub enum ResponsePayload {
     RuntimeWorkCancellationRequested {
         cancelled: bool,
     },
+    WorkflowTemplateList {
+        templates: Vec<WorkflowTemplateDescription>,
+    },
+    WorkflowTemplateDescription {
+        template: Option<Box<WorkflowTemplateDescription>>,
+    },
+    WorkflowTemplateStarted(WorkflowRunStartResponse),
     WorkflowDefinitionRegistered {
         definition: bcode_workflow_store::StoredWorkflowDefinition,
     },

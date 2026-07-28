@@ -3313,6 +3313,9 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::RuntimeWorkHistory { .. } => "runtime_work_history",
         Request::ListRuntimeWork { .. } => "list_runtime_work",
         Request::CancelRuntimeWork { .. } => "cancel_runtime_work",
+        Request::ListWorkflowTemplates { .. } => "list_workflow_templates",
+        Request::DescribeWorkflowTemplate { .. } => "describe_workflow_template",
+        Request::StartWorkflowTemplate(_) => "start_workflow_template",
         Request::RegisterWorkflowDefinition(_) => "register_workflow_definition",
         Request::StartWorkflow(_) => "start_workflow",
         Request::StartWorkflowRun(_) => "start_workflow_run",
@@ -3749,6 +3752,27 @@ async fn handle_request_inner(
         } => {
             handle_cancel_runtime_work(request_id, client_id, state, writer, session_id, work_id)
                 .await
+        }
+        Request::ListWorkflowTemplates { limit } => {
+            handle_list_workflow_templates(request_id, state, writer, limit).await
+        }
+        Request::DescribeWorkflowTemplate {
+            owner_plugin_id,
+            template_id,
+            template_version,
+        } => {
+            handle_describe_workflow_template(
+                request_id,
+                state,
+                writer,
+                owner_plugin_id,
+                template_id,
+                template_version,
+            )
+            .await
+        }
+        Request::StartWorkflowTemplate(request) => {
+            handle_start_workflow_template(request_id, state, writer, request).await
         }
         Request::RegisterWorkflowDefinition(request) => {
             handle_register_workflow_definition(request_id, state, writer, request).await
@@ -10906,6 +10930,204 @@ fn register_workflow_definition(
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .persist_definition(&request.definition_id, request.version, &request.definition)
         .map_err(ServerError::from)
+}
+
+fn workflow_template_description(
+    state: &ServerState,
+    owner_plugin_id: &str,
+    template: &bcode_plugin::WorkflowTemplateContribution,
+) -> Result<bcode_ipc::WorkflowTemplateDescription, ServerError> {
+    let loaded_plugins = state
+        .plugins
+        .registry()
+        .manifests()
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let loaded_skills = state.skills.as_ref().map_or_else(BTreeSet::new, |skills| {
+        skills
+            .list()
+            .skills
+            .into_iter()
+            .map(|skill| skill.id.to_string())
+            .collect()
+    });
+    let capabilities = bcode_workflow::WorkflowProductionCapabilities::current();
+    let mut diagnostics = Vec::new();
+    for requirement in &template.required_plugins {
+        if !loaded_plugins.contains(requirement) {
+            diagnostics.push(bcode_ipc::WorkflowTemplateDiagnostic {
+                code: "missing_plugin".to_string(),
+                requirement: requirement.clone(),
+                message: format!("required plugin '{requirement}' is not loaded"),
+            });
+        }
+    }
+    for requirement in &template.required_skills {
+        if !loaded_skills.contains(requirement) {
+            diagnostics.push(bcode_ipc::WorkflowTemplateDiagnostic {
+                code: "missing_skill".to_string(),
+                requirement: requirement.clone(),
+                message: format!("required skill '{requirement}' is unavailable"),
+            });
+        }
+    }
+    let supported_capabilities = BTreeSet::from([
+        format!("workflow-production/v{}", capabilities.capability_version),
+        format!(
+            "workflow-block/v{}",
+            capabilities.workflow_block_interface_version
+        ),
+    ]);
+    for requirement in &template.required_capabilities {
+        if !supported_capabilities.contains(requirement) {
+            diagnostics.push(bcode_ipc::WorkflowTemplateDiagnostic {
+                code: "unsupported_capability".to_string(),
+                requirement: requirement.clone(),
+                message: format!("required capability '{requirement}' is unsupported"),
+            });
+        }
+    }
+    Ok(bcode_ipc::WorkflowTemplateDescription {
+        owner_plugin_id: owner_plugin_id.to_string(),
+        identity: template
+            .definition_identity(owner_plugin_id)
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?,
+        template: template.clone(),
+        diagnostics,
+    })
+}
+
+fn find_workflow_template<'a>(
+    state: &'a ServerState,
+    owner_plugin_id: &str,
+    template_id: &str,
+    template_version: u32,
+) -> Option<&'a bcode_plugin::WorkflowTemplateContribution> {
+    state
+        .plugins
+        .registry()
+        .workflow_templates()
+        .into_iter()
+        .find(|(owner, template)| {
+            *owner == owner_plugin_id
+                && template.template_id == template_id
+                && template.template_version == template_version
+        })
+        .map(|(_, template)| template)
+}
+
+async fn handle_list_workflow_templates(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    limit: usize,
+) -> Result<(), ServerError> {
+    if limit == 0 || limit > 1_000 {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow template limit must be in 1..=1000".to_string(),
+        )
+        .into());
+    }
+    let templates = state
+        .plugins
+        .registry()
+        .workflow_templates()
+        .into_iter()
+        .take(limit)
+        .map(|(owner, template)| workflow_template_description(state, owner, template))
+        .collect::<Result<Vec<_>, _>>()?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowTemplateList { templates }),
+    )
+    .await
+}
+
+async fn handle_describe_workflow_template(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    owner_plugin_id: String,
+    template_id: String,
+    template_version: u32,
+) -> Result<(), ServerError> {
+    let template = find_workflow_template(state, &owner_plugin_id, &template_id, template_version)
+        .map(|template| workflow_template_description(state, &owner_plugin_id, template))
+        .transpose()?
+        .map(Box::new);
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowTemplateDescription { template }),
+    )
+    .await
+}
+
+async fn handle_start_workflow_template(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::WorkflowTemplateStartRequest,
+) -> Result<(), ServerError> {
+    let template = find_workflow_template(
+        state,
+        &request.owner_plugin_id,
+        &request.template_id,
+        request.template_version,
+    )
+    .ok_or_else(|| {
+        WorkflowStoreError::InvalidData("workflow template not found or disabled".to_string())
+    })?;
+    let description = workflow_template_description(state, &request.owner_plugin_id, template)?;
+    if !description.diagnostics.is_empty() {
+        return Err(ServerError::WorkflowCapabilityUnavailable(
+            description
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
+    let validator =
+        jsonschema::validator_for(&template.configuration_schema.schema).map_err(|error| {
+            WorkflowStoreError::InvalidData(format!(
+                "invalid template configuration schema: {error}"
+            ))
+        })?;
+    if let Err(error) = validator.validate(&request.configuration) {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "template configuration is invalid: {error}"
+        ))
+        .into());
+    }
+    let started = start_workflow(
+        state,
+        bcode_ipc::WorkflowStartRequest {
+            identity: description.identity,
+            definition: template.definition.clone(),
+            run_id: request.run_id,
+            parent_session_id: request.parent_session_id,
+            input: request.configuration,
+            binding: bcode_workflow_store::WorkflowRunBinding {
+                owner_plugin_id: request.owner_plugin_id,
+                workflow_kind: request.template_id,
+                scope_key: request.template_version.to_string(),
+                display_label: Some(template.title.clone()),
+                single_active: false,
+            },
+            limits: request.limits,
+        },
+    )
+    .await?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowTemplateStarted(started)),
+    )
+    .await
 }
 
 async fn handle_register_workflow_definition(

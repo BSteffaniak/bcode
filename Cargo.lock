@@ -2298,6 +2298,7 @@ dependencies = [
  "bcode_worktree_models",
  "futures 0.3.33",
  "hyperchad",
+ "jsonschema",
  "png",
  "serde",
  "serde_json",

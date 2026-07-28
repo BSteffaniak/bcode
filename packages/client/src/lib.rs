@@ -1884,6 +1884,69 @@ impl BcodeClient {
         }
     }
 
+    /// List bounded plugin-owned workflow templates with availability diagnostics.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the bound.
+    pub async fn list_workflow_templates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<bcode_ipc::WorkflowTemplateDescription>, ClientError> {
+        match self
+            .send_request(Request::ListWorkflowTemplates { limit })
+            .await?
+        {
+            ResponsePayload::WorkflowTemplateList { templates } => Ok(templates),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Describe one exact loaded plugin-owned workflow template.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the identity.
+    pub async fn describe_workflow_template(
+        &self,
+        owner_plugin_id: String,
+        template_id: String,
+        template_version: u32,
+    ) -> Result<Option<bcode_ipc::WorkflowTemplateDescription>, ClientError> {
+        match self
+            .send_request(Request::DescribeWorkflowTemplate {
+                owner_plugin_id,
+                template_id,
+                template_version,
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowTemplateDescription { template } => {
+                Ok(template.map(|template| *template))
+            }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Start one exact loaded plugin-owned workflow template.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when requirements are unavailable, configuration is invalid, or the
+    /// daemon cannot register and start the exact compiled definition.
+    pub async fn start_workflow_template(
+        &self,
+        request: bcode_ipc::WorkflowTemplateStartRequest,
+    ) -> Result<bcode_ipc::WorkflowRunStartResponse, ClientError> {
+        match self
+            .send_request(Request::StartWorkflowTemplate(request))
+            .await?
+        {
+            ResponsePayload::WorkflowTemplateStarted(response) => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Durably register one structurally validated compiled workflow definition.
     ///
     /// Re-registering byte-identical content is idempotent. Reusing an exact identity/version for
