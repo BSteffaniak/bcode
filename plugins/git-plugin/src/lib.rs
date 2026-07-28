@@ -1261,6 +1261,71 @@ mod tests {
     }
 
     #[test]
+    fn typed_commit_rejects_failing_hook_without_advancing_head() {
+        let directory = tempfile::tempdir().expect("repo");
+        for args in [
+            &["init"][..],
+            &["config", "user.email", "bcode@example.invalid"][..],
+            &["config", "user.name", "Bcode Test"][..],
+        ] {
+            run_git(
+                Command::new("git").current_dir(directory.path()).args(args),
+                "setup",
+            )
+            .expect("setup");
+        }
+        std::fs::write(directory.path().join("tracked.txt"), "before\n").expect("file");
+        run_git(
+            Command::new("git")
+                .current_dir(directory.path())
+                .args(["add", "tracked.txt"]),
+            "add",
+        )
+        .expect("add");
+        run_git(
+            Command::new("git")
+                .current_dir(directory.path())
+                .args(["commit", "-m", "initial"]),
+            "initial commit",
+        )
+        .expect("initial commit");
+        let head = git_stdout(directory.path(), ["rev-parse", "HEAD"]).expect("head");
+        std::fs::write(directory.path().join("tracked.txt"), "after\n").expect("change");
+        let hooks = directory.path().join("hooks");
+        std::fs::create_dir(&hooks).expect("hooks");
+        let hook = hooks.join("pre-commit");
+        std::fs::write(&hook, "#!/bin/sh\nexit 1\n").expect("hook");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+                .expect("permissions");
+        }
+        run_git(
+            Command::new("git").current_dir(directory.path()).args([
+                "config",
+                "core.hooksPath",
+                "hooks",
+            ]),
+            "hooks path",
+        )
+        .expect("hooks path");
+        assert!(
+            commit_repository(&CommitRequest {
+                repo_path: directory.path().to_path_buf(),
+                expected_head: head.clone(),
+                message: "blocked by hook".to_string(),
+                paths: vec![PathBuf::from("tracked.txt")],
+            })
+            .is_err()
+        );
+        assert_eq!(
+            git_stdout(directory.path(), ["rev-parse", "HEAD"]).expect("head after failure"),
+            head
+        );
+    }
+
+    #[test]
     fn compose_commit_preserves_prepared_head_paths_and_no_changes_policy() {
         let preparation = PrepareResponse {
             repository_root: PathBuf::from("/repo"),

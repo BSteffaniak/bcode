@@ -2015,7 +2015,8 @@ pub struct WorkflowProductionCapabilities {
     pub node_kinds: BTreeMap<NodeKind, WorkflowCapabilitySupport>,
     /// Durable support classification for every serialized edge kind.
     pub edge_kinds: BTreeMap<WorkflowEdgeKind, WorkflowCapabilitySupport>,
-    /// Supported two-branch join policies.
+    /// Durable two-branch join policies. Wait-all is fully supported; fail-fast is rejected until
+    /// sibling cancellation intent and terminal outcomes are durable.
     pub parallel_join_policies: BTreeSet<ParallelFailurePolicy>,
     /// Durable support classification for automatic retry scheduling.
     pub automatic_retry: WorkflowCapabilitySupport,

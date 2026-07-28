@@ -8492,8 +8492,10 @@ mod tests {
             }
         }
 
-        let (_temp, mut store) = initialized_store();
+        let (temp, mut store) = initialized_store();
         let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        drop(store);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
         let summary = store
             .reconcile_receipt_backed_attempts(&Observer, 10, 20)
             .expect("reconcile");
@@ -8505,6 +8507,55 @@ mod tests {
                 .expect("run")
                 .status,
             RunStatus::RepairRequired
+        );
+    }
+
+    #[test]
+    fn terminal_output_survives_restart_without_duplicate_materialization() {
+        let (temp, mut store) = initialized_store();
+        let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::ReadOnly);
+        let output = ValidatedOutput {
+            output_id: "restart-output".to_string(),
+            run_id: "run-1".to_string(),
+            node_id: "review".to_string(),
+            activation_id: activation_id(),
+            schema_id: "u32".to_string(),
+            schema_version: 1,
+            value: serde_json::json!(7),
+            artifact_reference: None,
+            created_at_ms: 20,
+        };
+        store
+            .apply_attempt_observation(&identity, AttemptObservation::Succeeded { output }, 20)
+            .expect("success");
+        drop(store);
+        let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        assert_eq!(
+            reopened
+                .output_summaries("run-1", 10)
+                .expect("outputs")
+                .len(),
+            1
+        );
+        assert_eq!(
+            reopened
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .status,
+            RunStatus::Completed
+        );
+        assert!(
+            reopened
+                .apply_attempt_observation(&identity, AttemptObservation::Unknown, 21,)
+                .is_err()
+        );
+        assert_eq!(
+            reopened
+                .output_summaries("run-1", 10)
+                .expect("outputs")
+                .len(),
+            1
         );
     }
 
@@ -10403,6 +10454,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn wait_all_parallel_failure_persists_only_after_all_members_settle() {
         struct FailedObserver;
         impl AttemptStatusObserver for FailedObserver {
@@ -10469,8 +10521,20 @@ mod tests {
             RunStatus::Running
         );
         drop(store);
-
         let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert!(
+            reopened
+                .decision("parallel-failure-run:join:0:parallel-wait-all")
+                .expect("decision before settlement")
+                .is_none()
+        );
+        assert_eq!(
+            reopened
+                .attempt_history("parallel-failure-run", None, 10)
+                .expect("attempts")
+                .len(),
+            1
+        );
         reopened
             .persist_validated_output(&ValidatedOutput {
                 output_id: "right-output".to_string(),
