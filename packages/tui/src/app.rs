@@ -2637,7 +2637,8 @@ impl BmuxApp {
                 self.push_live_assistant_delta(text, application);
                 self.maybe_request_assistant_stream_anchor(should_anchor);
             }
-            SessionEventKind::AssistantMessage { .. } => {
+            SessionEventKind::AssistantMessage { .. }
+            | SessionEventKind::AssistantResponseSegment { .. } => {
                 self.upsert_required_latest_shared_message_item(
                     "Assistant",
                     false,
@@ -4436,6 +4437,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
         SessionEventKind::UserMessage { .. }
         | SessionEventKind::AssistantDelta { .. }
         | SessionEventKind::AssistantMessage { .. }
+        | SessionEventKind::AssistantResponseSegment { .. }
         | SessionEventKind::SystemMessage { .. }
         | SessionEventKind::ToolCallRequested { .. }
         | SessionEventKind::ToolInvocationResultRecorded { .. }

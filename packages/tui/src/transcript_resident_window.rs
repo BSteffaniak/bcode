@@ -189,7 +189,10 @@ mod tests {
     fn assistant(sequence: u64) -> SessionEvent {
         event(
             sequence,
-            SessionEventKind::AssistantMessage {
+            SessionEventKind::AssistantResponseSegment {
+                turn_id: "turn-1".to_owned(),
+                segment_id: format!("segment-{sequence}"),
+                segment_order: u32::try_from(sequence).expect("test sequence fits"),
                 text: format!("assistant {sequence}"),
             },
         )

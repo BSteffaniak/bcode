@@ -1509,12 +1509,14 @@ pub fn conversational_units(
         }
         let starts_user_unit = matches!(event.kind, SessionEventKind::UserMessage { .. })
             && pending_tool_calls.is_empty();
-        let starts_orphan_assistant_unit =
-            matches!(event.kind, SessionEventKind::AssistantMessage { .. })
-                && pending_tool_calls.is_empty()
-                && units
-                    .last()
-                    .is_some_and(|unit| !unit.begins_with_user && !unit.events.is_empty());
+        let starts_orphan_assistant_unit = matches!(
+            event.kind,
+            SessionEventKind::AssistantMessage { .. }
+                | SessionEventKind::AssistantResponseSegment { .. }
+        ) && pending_tool_calls.is_empty()
+            && units
+                .last()
+                .is_some_and(|unit| !unit.begins_with_user && !unit.events.is_empty());
         let starts_unit = starts_turn_boundary
             || starts_user_unit
             || starts_orphan_assistant_unit
@@ -1708,7 +1710,8 @@ pub fn session_event_compaction_line(
             event.sequence,
             truncate_text(text, COMPACTION_MAX_EVENT_CONTENT_CHARS)
         )),
-        SessionEventKind::AssistantMessage { text } => Some(format!(
+        SessionEventKind::AssistantMessage { text }
+        | SessionEventKind::AssistantResponseSegment { text, .. } => Some(format!(
             "#{} assistant:\n{}",
             event.sequence,
             truncate_text(text, COMPACTION_MAX_EVENT_CONTENT_CHARS)
@@ -1765,6 +1768,34 @@ mod generic_result_tests {
             provenance: None,
             kind,
         }
+    }
+
+    #[test]
+    fn completed_assistant_segment_is_included_in_compaction_units_and_summary_input() {
+        let events = vec![
+            event(
+                1,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "question".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            ),
+            event(
+                2,
+                SessionEventKind::AssistantResponseSegment {
+                    turn_id: "turn-1".to_owned(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
+                    text: "answer".to_owned(),
+                },
+            ),
+        ];
+
+        let units = conversational_units(&events, 1_000);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].summary_input.len(), 2);
+        assert!(units[0].summary_input[1].contains("answer"));
     }
 
     #[test]

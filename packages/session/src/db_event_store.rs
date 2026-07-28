@@ -13,6 +13,7 @@ pub const fn event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::UserMessage { .. } => "user_message",
         SessionEventKind::AssistantDelta { .. } => "assistant_delta",
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
+        SessionEventKind::AssistantResponseSegment { .. } => "assistant_response_segment",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",

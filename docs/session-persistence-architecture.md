@@ -32,11 +32,15 @@ finalized artifact metadata, trace blobs, workflow state, crash reports, or stru
 Daemon restart intentionally discards this state.
 
 The durable boundary begins with complete semantic facts: a validated tool request, required
-permission request/resolution, lifecycle facts that remain meaningful after reload, and the terminal
-result or finalized artifact. Session append validation rejects transient contributions and any new
-durable contribution with `Progress` placement. Persistence decoding retains historical durable or
-unplaced contributions for compatibility, but those decoded paths are not writable extension
-points.
+permission request/resolution, lifecycle facts that remain meaningful after reload, a complete
+assistant response segment, and the terminal result or finalized artifact. A complete assistant
+segment persists its application turn ID, stable turn-local segment ID/order, and complete text so
+live finalization, bounded replay, and fresh replay use the same semantic identity. Append,
+revision, offset, checkpoint, truncation-window, and live tombstone state remain replaceable
+progress and never cross this durable boundary. Session append validation rejects transient
+contributions and any new durable contribution with `Progress` placement. Persistence decoding
+retains historical durable or unplaced contributions for compatibility, but those decoded paths
+are not writable extension points.
 
 ```text
 provider/plugin intermediate update
@@ -45,14 +49,15 @@ provider/plugin intermediate update
   -> SessionView transient projection
   -> renderer-native presentation
 
-complete request / permission / terminal result
+complete assistant segment / request / permission / terminal result
   -> SessionEvent append
   -> canonical session.db history and durable projections
 ```
 
 Reconnect may restore only the current bounded active checkpoint. It does not replay missed live
-deltas. Completing provider argument assembly does not retire a result-targeted request preview: the
-bounded preview remains active through permission and execution so reconnect can restore it. The
+deltas. Daemon restart therefore discards incomplete assistant/reasoning text rather than promoting
+it to a durable message; only already-committed complete assistant segments survive. Completing
+provider argument assembly does not retire a result-targeted request preview: the bounded preview remains active through permission and execution so reconnect can restore it. The
 server first persists and publishes the complete `ToolInvocationResultRecorded` semantic fact, then
 retires the live preview. Cancellation, failure, timeout, retry/supersession, or host-owned teardown
 that cannot produce a canonical result removes active state directly. Daemon restart intentionally

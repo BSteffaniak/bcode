@@ -12713,6 +12713,7 @@ async fn run_model_turn(
         state,
         session_id,
         trigger_event,
+        &turn_id,
         runtime_context,
         Arc::clone(&cancel_state),
         command_context,
@@ -12762,6 +12763,7 @@ async fn run_model_turn_inner(
     state: &ServerState,
     session_id: SessionId,
     trigger_event: &bcode_session_models::SessionEvent,
+    turn_id: &str,
     runtime_context: Option<ClientRuntimeContext>,
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
@@ -12801,6 +12803,7 @@ async fn run_model_turn_inner(
         }
     };
     let mut round = 0_u32;
+    let mut next_assistant_segment_order = 0_u32;
     let mut recovery = ModelTurnRecoveryState::default();
     let mut last_proactive_compaction_boundary = None;
     let mut last_proactive_attempt_boundary = None;
@@ -12997,6 +13000,8 @@ async fn run_model_turn_inner(
         let outcome = match Box::pin(run_model_turn_round(
             state,
             session_id,
+            turn_id,
+            &mut next_assistant_segment_order,
             provider_plugin_id.as_deref(),
             &request,
             &context_projection,
@@ -13849,6 +13854,8 @@ async fn active_plugin_scope_for_tool_call(
 async fn run_model_turn_round(
     state: &ServerState,
     session_id: SessionId,
+    turn_id: &str,
+    next_assistant_segment_order: &mut u32,
     provider_plugin_id: Option<&str>,
     request: &ModelTurnRequest,
     context_projection: &bcode_session_models::RequestContextObservation,
@@ -13958,6 +13965,8 @@ async fn run_model_turn_round(
     let (assistant_text, mut outcome) = poll_model_turn_events(
         state,
         session_id,
+        turn_id,
+        next_assistant_segment_order,
         provider_plugin_id,
         &start.provider_turn_id,
         &request.turn_id,
@@ -14005,7 +14014,6 @@ async fn run_model_turn_round(
 
     if !assistant_text.is_empty() && !cancel_state.is_cancelled() {
         outcome.assistant_output = Some(assistant_text.clone());
-        append_assistant_message_event(state, session_id, assistant_text).await;
     }
     if cancel_state.is_cancelled() && outcome.completion.is_none() {
         outcome.stop_reason = Some(bcode_model::StopReason::Cancelled);
@@ -14014,7 +14022,17 @@ async fn run_model_turn_round(
             "model turn cancelled",
         ));
     }
-    persist_reasoning_activities(state, session_id, &request.turn_id, &mut outcome).await;
+    persist_reasoning_activities(state, session_id, turn_id, &mut outcome).await;
+    if !assistant_text.is_empty() && !cancel_state.is_cancelled() {
+        append_assistant_response_segment_event(
+            state,
+            session_id,
+            turn_id,
+            next_assistant_segment_order,
+            assistant_text,
+        )
+        .await;
+    }
     drop(marker_commit);
 
     service_runtime_priority_commands(state, session_id, command_context).await;
@@ -14151,13 +14169,16 @@ async fn append_model_provider_round_finished_trace(
 async fn poll_model_turn_events(
     state: &ServerState,
     session_id: SessionId,
+    turn_id: &str,
+    next_assistant_segment_order: &mut u32,
     provider_plugin_id: Option<&str>,
     provider_turn_id: &str,
-    turn_id: &str,
+    provider_request_id: &str,
     cancel_state: Arc<TurnCancelState>,
     command_context: &mut RuntimeCommandContext<'_>,
 ) -> (String, ModelPollOutcome) {
-    let mut stream = ModelStreamAccumulator::new(session_id, turn_id, Arc::clone(&cancel_state));
+    let mut stream =
+        ModelStreamAccumulator::new(session_id, provider_request_id, Arc::clone(&cancel_state));
     let mut outcome = ModelPollOutcome::default();
     let mut stream_progress = ModelStreamProgress::default();
     let mut idle_for = Duration::ZERO;
@@ -14246,6 +14267,7 @@ async fn poll_model_turn_events(
                 session_id,
                 provider_turn_id,
                 turn_id,
+                next_assistant_segment_order,
                 event,
                 &mut stream,
                 &mut outcome,
@@ -14449,6 +14471,7 @@ async fn handle_provider_turn_event(
     session_id: SessionId,
     provider_turn_id: &str,
     turn_id: &str,
+    next_assistant_segment_order: &mut u32,
     event: ProviderTurnEvent,
     stream: &mut ModelStreamAccumulator,
     outcome: &mut ModelPollOutcome,
@@ -14531,8 +14554,15 @@ async fn handle_provider_turn_event(
                     .await;
                 }
             }
-            handle_provider_tool_call_finished_event(state, session_id, turn_id, &call, stream)
-                .await;
+            handle_provider_tool_call_finished_event(
+                state,
+                session_id,
+                turn_id,
+                next_assistant_segment_order,
+                &call,
+                stream,
+            )
+            .await;
             persist_completed_reasoning_activities(state, session_id, turn_id, outcome).await;
             outcome.pending_tool_calls.push(call);
             stream_progress.finish_tool_call(&call_id);
@@ -14946,6 +14976,7 @@ async fn handle_provider_tool_call_finished_event(
     state: &ServerState,
     session_id: SessionId,
     turn_id: &str,
+    next_assistant_segment_order: &mut u32,
     call: &bcode_model::ToolCall,
     stream: &mut ModelStreamAccumulator,
 ) {
@@ -14977,7 +15008,14 @@ async fn handle_provider_tool_call_finished_event(
             .await
             .is_some_and(|cancel_state| !cancel_state.is_cancelled())
     {
-        append_assistant_message_event(state, session_id, assistant_text).await;
+        append_assistant_response_segment_event(
+            state,
+            session_id,
+            turn_id,
+            next_assistant_segment_order,
+            assistant_text,
+        )
+        .await;
     }
 }
 
@@ -21020,7 +21058,8 @@ fn non_tool_session_event_to_model_message(
             role: MessageRole::User,
             content: vec![ContentBlock::Text { text: text.clone() }],
         }),
-        SessionEventKind::AssistantMessage { text } => Some(ModelMessage {
+        SessionEventKind::AssistantMessage { text }
+        | SessionEventKind::AssistantResponseSegment { text, .. } => Some(ModelMessage {
             role: MessageRole::Assistant,
             content: vec![ContentBlock::Text { text: text.clone() }],
         }),
@@ -21262,14 +21301,31 @@ async fn persist_reasoning_activities(
     }
 }
 
-async fn append_assistant_message_event(state: &ServerState, session_id: SessionId, text: String) {
+async fn append_assistant_response_segment_event(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    next_segment_order: &mut u32,
+    text: String,
+) {
+    let segment_order = *next_segment_order;
+    let segment_id = format!("segment-{segment_order}");
     match state
         .sessions
-        .append_assistant_message(session_id, text)
+        .append_assistant_response_segment(
+            session_id,
+            turn_id.to_owned(),
+            segment_id,
+            segment_order,
+            text,
+        )
         .await
     {
-        Ok(event) => publish_session_event(state, &event).await,
-        Err(error) => tracing::warn!("failed to append assistant message: {error}"),
+        Ok(event) => {
+            *next_segment_order = next_segment_order.saturating_add(1);
+            publish_session_event(state, &event).await;
+        }
+        Err(error) => tracing::warn!("failed to append assistant response segment: {error}"),
     }
 }
 
@@ -21693,6 +21749,11 @@ fn workflow_attempt_observation_from_completion(
                 )
             })?;
             let output: serde_json::Value = serde_json::from_str(&output)?;
+            #[cfg(test)]
+            eprintln!(
+                "workflow completion node={} input={:?} output={output}",
+                request.activation.node_id, request.activation.input
+            );
             if let Err(message) =
                 validate_loop_evaluation_evidence(&request.activation.node_id, &output)
             {
@@ -21771,6 +21832,25 @@ fn workflow_turn_output(
     history: &[bcode_session_models::SessionEvent],
     turn_id: &str,
 ) -> Option<String> {
+    let correlated = history
+        .iter()
+        .filter_map(|event| match &event.kind {
+            SessionEventKind::AssistantResponseSegment {
+                turn_id: event_turn_id,
+                segment_order,
+                text,
+                ..
+            } if event_turn_id == turn_id => Some((*segment_order, event.sequence, text)),
+            _ => None,
+        })
+        .max_by_key(|(segment_order, sequence, _)| (*segment_order, *sequence))
+        .map(|(_, _, text)| text.clone());
+    if correlated.is_some() {
+        #[cfg(test)]
+        eprintln!("workflow_turn_output correlated turn={turn_id} output={correlated:?}");
+        return correlated;
+    }
+
     let terminal_index = history.iter().rposition(|event| {
         matches!(
             &event.kind,
@@ -23539,6 +23619,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::UserMessage { .. } => "user_message",
         SessionEventKind::AssistantDelta { .. } => "assistant_delta",
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
+        SessionEventKind::AssistantResponseSegment { .. } => "assistant_response_segment",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",
@@ -24249,7 +24330,8 @@ fn compact_attach_history(
                 pending_assistant_deltas.push(event);
             }
             SessionEventKind::AssistantDelta { .. } => pending_assistant_deltas.push(event),
-            SessionEventKind::AssistantMessage { .. } => {
+            SessionEventKind::AssistantMessage { .. }
+            | SessionEventKind::AssistantResponseSegment { .. } => {
                 pending_assistant_deltas.clear();
                 compacted.push(event);
             }
@@ -29549,6 +29631,16 @@ library = "test"
     }
 
     #[test]
+    fn assistant_segment_identity_and_order_advance_only_after_commit() {
+        let mut next_order = 0_u32;
+        let first_id = format!("segment-{next_order}");
+        assert_eq!(first_id, "segment-0");
+        next_order = next_order.saturating_add(1);
+        let second_id = format!("segment-{next_order}");
+        assert_eq!(second_id, "segment-1");
+    }
+
+    #[test]
     fn reasoning_activity_accumulator_preserves_part_boundaries_and_replacement() {
         let mut streamed = ReasoningActivityAccumulator::new("reasoning-stream".to_owned(), 0);
         for text in ["Draft ", "continued"] {
@@ -32505,6 +32597,61 @@ library = "test"
         ] {
             assert!(!encoded.contains(marker), "model context leaked {marker}");
         }
+    }
+
+    #[test]
+    fn completed_assistant_segment_is_model_visible_and_workflow_addressable() {
+        let session_id = SessionId::new();
+        let turn_id = "turn-1".to_owned();
+        let history = vec![
+            bcode_session_models::SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 1,
+                timestamp_ms: 1,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ModelTurnStarted {
+                    turn_id: turn_id.clone(),
+                },
+            },
+            bcode_session_models::SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 2,
+                timestamp_ms: 2,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::AssistantResponseSegment {
+                    turn_id: turn_id.clone(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
+                    text: "durable answer".to_owned(),
+                },
+            },
+            bcode_session_models::SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: 3,
+                timestamp_ms: 3,
+                session_id,
+                provenance: None,
+                kind: SessionEventKind::ModelTurnFinished {
+                    turn_id: turn_id.clone(),
+                    outcome: ModelTurnOutcome::Completed,
+                    message: None,
+                },
+            },
+        ];
+
+        let message = non_tool_session_event_to_model_message(&history[1])
+            .expect("completed segment belongs in model context");
+        assert_eq!(message.role, MessageRole::Assistant);
+        assert!(matches!(
+            message.content.as_slice(),
+            [ContentBlock::Text { text }] if text == "durable answer"
+        ));
+        assert_eq!(
+            workflow_turn_output(&history, &turn_id).as_deref(),
+            Some("durable answer")
+        );
     }
 
     #[test]
@@ -40205,7 +40352,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert_eq!(
             history
                 .iter()
-                .filter(|event| matches!(event.kind, SessionEventKind::AssistantMessage { .. }))
+                .filter(|event| {
+                    matches!(
+                        event.kind,
+                        SessionEventKind::AssistantMessage { .. }
+                            | SessionEventKind::AssistantResponseSegment { .. }
+                    )
+                })
                 .count(),
             2
         );
@@ -40420,7 +40573,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let outputs = history
             .iter()
             .filter_map(|event| match &event.kind {
-                SessionEventKind::AssistantMessage { text } => Some(text.as_str()),
+                SessionEventKind::AssistantMessage { text }
+                | SessionEventKind::AssistantResponseSegment { text, .. } => Some(text.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -43875,6 +44029,29 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionEventKind::TraceEvent { trace }
                 if matches!(&trace.payload, SessionTracePayload::ContextCompaction { reason, .. } if reason == "context_window_unknown")
         )));
+        let turn_id = format!("{}-{}", session_id, trigger_event.sequence);
+        let segments = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::AssistantResponseSegment {
+                    turn_id: event_turn_id,
+                    segment_id,
+                    segment_order,
+                    text,
+                } if event_turn_id == &turn_id => {
+                    Some((segment_id.as_str(), *segment_order, text.as_str()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(segments.len(), 1, "history: {history:#?}");
+        assert_eq!(segments[0].0, "segment-0");
+        assert_eq!(segments[0].1, 0);
+        assert!(!segments[0].2.is_empty());
+        assert!(!history.iter().any(|event| {
+            event.sequence > trigger_event.sequence
+                && matches!(event.kind, SessionEventKind::AssistantMessage { .. })
+        }));
     }
 
     #[tokio::test]
@@ -44124,6 +44301,9 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .await
             .expect("append trigger event");
         let mut state = test_server_state_with_fake_provider(sessions);
+        state.system_prompt.sections.repository_context = false;
+        state.system_prompt.sections.repository_invariants = false;
+        state.system_prompt.sections.dynamic_repository_context = false;
         state.auto_compaction.mode = bcode_config::CompactionMode::Proactive;
         state.auto_compaction.backend = bcode_config::CompactionBackend::Local;
         state.auto_compaction.proactive_threshold_percent = 90;

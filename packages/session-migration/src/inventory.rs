@@ -1425,7 +1425,8 @@ impl ReleasedEventVariantDescriptor {
 
 fn released_event_schema_range(kind: &str) -> (u16, u16) {
     match kind {
-        "assistant_reasoning_activity" => (40, 40),
+        "assistant_reasoning_activity" => (41, 41),
+        "assistant_response_segment" => (41, 41),
         "agent_changed" => (3, 39),
         "assistant_reasoning_delta"
         | "assistant_reasoning_message"
@@ -1509,6 +1510,10 @@ pub const RELEASED_EVENT_VARIANTS: &[ReleasedEventVariantDescriptor] = &[
     },
     ReleasedEventVariantDescriptor {
         kind: "assistant_reasoning_message",
+        treatment: ReleasedEventTreatment::CurrentEquivalent,
+    },
+    ReleasedEventVariantDescriptor {
+        kind: "assistant_response_segment",
         treatment: ReleasedEventTreatment::CurrentEquivalent,
     },
     ReleasedEventVariantDescriptor {
@@ -2161,8 +2166,8 @@ pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4];
 
 /// Released historical event schemas currently evidenced by Git history.
 ///
-/// Schemas 33, 34, and 36 were never declared. Schema 40 is the current format and therefore is
-/// not historical migration input.
+/// Schemas 33, 34, and 36 were never declared. Schemas 40 and 41 are unreleased/current
+/// development formats and therefore are not historical migration input.
 pub const RELEASED_HISTORICAL_EVENT_SCHEMAS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
     27, 28, 29, 30, 31, 32, 35, 37, 38, 39,
@@ -2312,7 +2317,7 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].kind < pair[1].kind)
         );
-        assert_eq!(RELEASED_EVENT_VARIANTS.len(), 60);
+        assert_eq!(RELEASED_EVENT_VARIANTS.len(), 61);
         let explicit = RELEASED_EVENT_VARIANTS
             .iter()
             .filter(|variant| variant.treatment == ReleasedEventTreatment::ExplicitConversion)
@@ -2637,7 +2642,7 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0] < pair[1])
         );
-        for unreleased in [33, 34, 36, CURRENT_EVENT_SCHEMA] {
+        for unreleased in [33, 34, 36, 40] {
             assert!(!is_released_historical_event_schema(unreleased));
         }
         for released in RELEASED_HISTORICAL_EVENT_SCHEMAS {

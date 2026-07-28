@@ -144,6 +144,31 @@ impl SessionManager {
             .await
     }
 
+    /// Append a complete assistant response segment with stable turn-local identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_assistant_response_segment(
+        &self,
+        session_id: SessionId,
+        turn_id: String,
+        segment_id: String,
+        segment_order: u32,
+        text: String,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::AssistantResponseSegment {
+                turn_id,
+                segment_id,
+                segment_order,
+                text,
+            },
+        )
+        .await
+    }
+
     /// Append one complete terminal provider-reported reasoning activity.
     ///
     /// # Errors

@@ -7352,6 +7352,7 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::UserMessage { .. } => "user_message",
         SessionEventKind::AssistantDelta { .. } => "assistant_delta",
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
+        SessionEventKind::AssistantResponseSegment { .. } => "assistant_response_segment",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",
@@ -7794,6 +7795,17 @@ fn print_non_trace_session_event(event: &SessionEvent) {
         SessionEventKind::AssistantMessage { text } => {
             println!("#{} assistant: {text}", event.sequence);
         }
+        SessionEventKind::AssistantResponseSegment {
+            turn_id,
+            segment_id,
+            segment_order,
+            text,
+        } => {
+            println!(
+                "#{} assistant {turn_id}/{segment_id} order={segment_order}: {text}",
+                event.sequence
+            );
+        }
         SessionEventKind::ToolCallRequested {
             tool_call_id,
             tool_name,
@@ -8099,6 +8111,15 @@ fn print_timeline_event(event: &SessionEvent, first_trace_time: Option<u64>) {
         SessionEventKind::AssistantMessage { text } => {
             println!("{prefix} assistant: {}", one_line(text));
         }
+        SessionEventKind::AssistantResponseSegment {
+            turn_id,
+            segment_id,
+            segment_order,
+            text,
+        } => println!(
+            "{prefix} assistant {turn_id}/{segment_id} order={segment_order}: {}",
+            one_line(text)
+        ),
         SessionEventKind::ToolCallRequested {
             tool_call_id,
             tool_name,

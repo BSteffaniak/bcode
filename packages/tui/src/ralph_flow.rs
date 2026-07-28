@@ -1061,7 +1061,8 @@ async fn setup_source_context(
             bcode_session_models::SessionEventKind::UserMessage { text, .. } => {
                 Some(format!("User: {text}"))
             }
-            bcode_session_models::SessionEventKind::AssistantMessage { text, .. } => {
+            bcode_session_models::SessionEventKind::AssistantMessage { text, .. }
+            | bcode_session_models::SessionEventKind::AssistantResponseSegment { text, .. } => {
                 Some(format!("Assistant: {text}"))
             }
             _ => None,

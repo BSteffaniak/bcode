@@ -715,6 +715,22 @@ impl SessionView {
                     text,
                 );
             }
+            SessionEventKind::AssistantResponseSegment {
+                turn_id,
+                segment_id,
+                text,
+                ..
+            } => {
+                self.finish_or_push_message(
+                    TranscriptViewItemId::new(format!(
+                        "assistant-turn:{turn_id}:segment:{segment_id}"
+                    )),
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    StreamingMessageKind::Assistant,
+                    text,
+                );
+            }
             SessionEventKind::AssistantReasoningDelta { text } => {
                 self.snapshot.thinking = ThinkingViewState {
                     visible: self.snapshot.thinking.visible,
@@ -7758,7 +7774,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_stream_keeps_live_identity_when_durable_message_finishes_it() {
+    fn assistant_stream_keeps_live_identity_when_durable_segment_finishes_it() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
         view.apply_live_event(&SessionLiveEvent {
@@ -7781,7 +7797,10 @@ mod tests {
         view.apply_event(&event(
             session_id,
             2,
-            SessionEventKind::AssistantMessage {
+            SessionEventKind::AssistantResponseSegment {
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
                 text: "durable answer".to_owned(),
             },
         ));
@@ -7796,6 +7815,50 @@ mod tests {
             TranscriptViewItemKind::AssistantMessage { message }
                 if message.text == "durable answer"
         ));
+    }
+
+    #[test]
+    fn durable_assistant_segments_replay_with_stable_distinct_identities() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        for (sequence, segment_order, text) in [(4, 0, "before tool"), (9, 1, "after tool")] {
+            view.apply_event(&event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantResponseSegment {
+                    turn_id: "turn-1".to_owned(),
+                    segment_id: format!("segment-{segment_order}"),
+                    segment_order,
+                    text: text.to_owned(),
+                },
+            ));
+        }
+
+        let items = &view.snapshot().transcript.items;
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].id.get(), "assistant-turn:turn-1:segment:segment-0");
+        assert_eq!(items[1].id.get(), "assistant-turn:turn-1:segment:segment-1");
+        assert_ne!(items[0].id, items[1].id);
+    }
+
+    #[test]
+    fn bounded_replay_segment_identity_needs_no_earlier_turn_context() {
+        let session_id = SessionId::new();
+        let mut view = SessionView::new();
+        view.apply_event(&event(
+            session_id,
+            9,
+            SessionEventKind::AssistantResponseSegment {
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-1".to_owned(),
+                segment_order: 1,
+                text: "bounded later segment".to_owned(),
+            },
+        ));
+
+        let item = &view.snapshot().transcript.items[0];
+        assert_eq!(item.id.get(), "assistant-turn:turn-1:segment:segment-1");
+        assert_eq!(item.sequence, Some(9));
     }
 
     #[test]

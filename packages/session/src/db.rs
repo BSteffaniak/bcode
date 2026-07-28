@@ -3479,7 +3479,8 @@ async fn project_event(
             insert_transcript_item(db, event, "user", "message", "complete", Some(text.clone()))
                 .await?;
         }
-        SessionEventKind::AssistantMessage { text } => {
+        SessionEventKind::AssistantMessage { text }
+        | SessionEventKind::AssistantResponseSegment { text, .. } => {
             insert_transcript_item(
                 db,
                 event,
@@ -5695,11 +5696,16 @@ mod tests {
             (
                 "future-schema-v40.json",
                 include_str!("../fixtures/migrations/future-schema-v40.json"),
-                ExpectedHistory::Sequences(&[0]),
+                ExpectedHistory::PersistedEventError,
             ),
             (
                 "future-schema-v41.json",
                 include_str!("../fixtures/migrations/future-schema-v41.json"),
+                ExpectedHistory::Sequences(&[0]),
+            ),
+            (
+                "future-schema-v42.json",
+                include_str!("../fixtures/migrations/future-schema-v42.json"),
                 ExpectedHistory::PersistedEventError,
             ),
             (

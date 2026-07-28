@@ -375,6 +375,9 @@ impl TranscriptProjectionBuilder {
             SessionEventKind::AssistantMessage { text } => {
                 self.finish_stream(TranscriptProjectionItemKind::AssistantMessage, event, text);
             }
+            SessionEventKind::AssistantResponseSegment { text, .. } => {
+                self.finish_stream(TranscriptProjectionItemKind::AssistantMessage, event, text);
+            }
             SessionEventKind::AssistantReasoningDelta { text } => {
                 self.push_stream_delta(TranscriptProjectionItemKind::Reasoning, event, text);
             }

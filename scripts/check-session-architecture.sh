@@ -103,7 +103,7 @@ done
 
 for fixture in \
   packages/session/fixtures/migrations/unknown-future-event-kind-v39.json \
-  packages/session/fixtures/migrations/future-schema-v41.json \
+  packages/session/fixtures/migrations/future-schema-v42.json \
   packages/session/fixtures/migrations/malformed-json-v39.json \
   packages/session/fixtures/migrations/mismatched-session-id-v39.json \
   packages/session/fixtures/migrations/sequence-gap-v39.jsonl; do
@@ -115,7 +115,7 @@ done
 
 if find packages/session/fixtures/migrations -maxdepth 1 -type f \
     \( -name '*-v[0-9]*.json' -o -name '*-v[0-9]*.jsonl' \) \
-    | grep -Ev -- '-v(39|40|41)\.jsonl?$' >/tmp/bcode-old-session-fixture-names.txt \
+    | grep -Ev -- '-v(39|40|41|42)\.jsonl?$' >/tmp/bcode-old-session-fixture-names.txt \
   || ! python3 - <<'PY'
 from pathlib import Path
 import re
@@ -127,7 +127,7 @@ for pattern in ("*.json", "*.jsonl"):
             if not line.strip():
                 continue
             match = re.search(r'"schema_version"\s*:\s*(\d+)', line)
-            if match is None or int(match.group(1)) not in {39, 40, 41}:
+            if match is None or int(match.group(1)) not in {39, 40, 41, 42}:
                 invalid.append(f"{path}:{line_number}")
 if invalid:
     print("\n".join(invalid))
@@ -218,7 +218,7 @@ if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5' packages/session/mode
   || ! rg -q 'RELEASED_EVENT_VARIANTS' packages/session-migration/src/inventory.rs \
   || ! rg -q 'released_event_schema_ranges_match_all_ref_inventory_boundaries' packages/session-migration/src/inventory.rs \
   || ! rg -q 'released_event_variant_treatments_are_sorted_unique_and_total' packages/session-migration/src/inventory.rs \
-  || ! rg -q 'RELEASED_EVENT_VARIANTS.len\(\), 60' packages/session-migration/src/inventory.rs \
+  || ! rg -q 'RELEASED_EVENT_VARIANTS.len\(\), 61' packages/session-migration/src/inventory.rs \
   || ! rg -q 'inventoried_retired_families_materialize_as_inert_current_history' packages/session-migration/src/execution.rs \
   || ! rg -q 'every inventoried retired variant must be an explicit reviewed decision' packages/session-migration/src/inventory.rs \
   || ! rg -q 'RELEASED_MIGRATION_IDS' packages/session-migration/src/inventory.rs \

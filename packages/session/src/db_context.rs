@@ -14,6 +14,7 @@ pub const fn context_history_role(kind: &SessionEventKind) -> ContextHistoryRole
     match kind {
         SessionEventKind::UserMessage { .. }
         | SessionEventKind::AssistantMessage { .. }
+        | SessionEventKind::AssistantResponseSegment { .. }
         | SessionEventKind::ToolCallRequested { .. }
         | SessionEventKind::ToolInvocationResultRecorded { .. }
         | SessionEventKind::SystemMessage { .. }
@@ -32,6 +33,7 @@ pub const fn context_history_role_from_name(event_type: &str) -> ContextHistoryR
     match event_type.as_bytes() {
         b"user_message"
         | b"assistant_message"
+        | b"assistant_response_segment"
         | b"tool_call_requested"
         | b"tool_invocation_result_recorded"
         | b"system_message"
@@ -109,6 +111,7 @@ pub const fn model_context_event_kind_name(kind: &SessionEventKind) -> &'static 
     match kind {
         SessionEventKind::UserMessage { .. } => "user_message",
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
+        SessionEventKind::AssistantResponseSegment { .. } => "assistant_response_segment",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
         SessionEventKind::ToolInvocationResultRecorded { .. } => "tool_invocation_result_recorded",
         SessionEventKind::SystemMessage { .. } => "system_message",
@@ -130,6 +133,7 @@ mod tests {
     fn names_preserve_structural_and_excluded_roles() {
         assert!(is_model_context_event_type("model_turn_started"));
         assert!(is_model_context_event_type("model_turn_finished"));
+        assert!(is_model_context_event_type("assistant_response_segment"));
         assert!(!is_model_context_event_type("request_context_observed"));
     }
 }

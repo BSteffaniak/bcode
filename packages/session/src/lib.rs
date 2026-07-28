@@ -169,6 +169,7 @@ fn record_session_event_domain_metrics(metrics: &MetricsRegistry, event: &Sessio
         event.kind,
         SessionEventKind::UserMessage { .. }
             | SessionEventKind::AssistantMessage { .. }
+            | SessionEventKind::AssistantResponseSegment { .. }
             | SessionEventKind::ToolCallRequested { .. }
             | SessionEventKind::ToolInvocationResultRecorded { .. }
             | SessionEventKind::SystemMessage { .. }
@@ -5026,6 +5027,10 @@ mod tests {
             (
                 "future-schema-v41.json",
                 include_str!("../fixtures/migrations/future-schema-v41.json"),
+            ),
+            (
+                "future-schema-v42.json",
+                include_str!("../fixtures/migrations/future-schema-v42.json"),
             ),
             (
                 "malformed-json-v39.json",

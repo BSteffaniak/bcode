@@ -413,6 +413,12 @@ enum PersistedSessionEventKind {
         turn_id: String,
         activity: bcode_session_models::ReasoningActivity,
     },
+    AssistantResponseSegment {
+        turn_id: String,
+        segment_id: String,
+        segment_order: u32,
+        text: String,
+    },
 }
 
 impl From<&SessionEventKind> for PersistedSessionEventKind {
@@ -689,6 +695,17 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                     activity: activity.clone(),
                 }
             }
+            SessionEventKind::AssistantResponseSegment {
+                turn_id,
+                segment_id,
+                segment_order,
+                text,
+            } => Self::AssistantResponseSegment {
+                turn_id: turn_id.clone(),
+                segment_id: segment_id.clone(),
+                segment_order: *segment_order,
+                text: text.clone(),
+            },
             SessionEventKind::WorkingDirectoryChanged {
                 old_working_directory,
                 new_working_directory,
@@ -1097,6 +1114,17 @@ impl PersistedSessionEventKind {
             Self::AssistantReasoningActivity { turn_id, activity } => {
                 SessionEventKind::AssistantReasoningActivity { turn_id, activity }
             }
+            Self::AssistantResponseSegment {
+                turn_id,
+                segment_id,
+                segment_order,
+                text,
+            } => SessionEventKind::AssistantResponseSegment {
+                turn_id,
+                segment_id,
+                segment_order,
+                text,
+            },
         }
     }
 }
@@ -1105,6 +1133,28 @@ impl PersistedSessionEventKind {
 mod tests {
     use super::*;
     use bcode_session_models::ToolInvocationResult;
+
+    #[test]
+    fn completed_assistant_segment_round_trips_through_persistence() {
+        let event = SessionEvent {
+            schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 7,
+            timestamp_ms: 11,
+            session_id: SessionId::new(),
+            provenance: None,
+            kind: SessionEventKind::AssistantResponseSegment {
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-2".to_owned(),
+                segment_order: 2,
+                text: "complete answer".to_owned(),
+            },
+        };
+
+        let encoded = encode_session_event(&event).expect("encode assistant segment");
+        let decoded = decode_session_event(&encoded).expect("decode assistant segment");
+
+        assert_eq!(decoded, event);
+    }
 
     #[test]
     fn structured_reasoning_activity_round_trips_through_persistence() {

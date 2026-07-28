@@ -262,7 +262,7 @@ fn tool_invocation_projection_mut<'a>(
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 40;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 41;
 
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
@@ -2412,6 +2412,17 @@ pub enum SessionEventKind {
         turn_id: String,
         /// Complete terminal reasoning activity.
         activity: ReasoningActivity,
+    },
+    /// Complete durable assistant response segment with stable turn-local identity.
+    AssistantResponseSegment {
+        /// Application model turn that owns the segment.
+        turn_id: String,
+        /// Stable segment identifier scoped to `turn_id`.
+        segment_id: String,
+        /// Zero-based semantic order of the segment within the turn.
+        segment_order: u32,
+        /// Complete visible assistant text.
+        text: String,
     },
 }
 

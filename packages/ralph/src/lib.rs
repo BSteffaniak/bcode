@@ -2968,6 +2968,9 @@ impl ContextPackEvent {
         let (kind, text) = match &event.kind {
             SessionEventKind::UserMessage { text, .. } => ("user_message", text.as_str()),
             SessionEventKind::AssistantMessage { text } => ("assistant_message", text.as_str()),
+            SessionEventKind::AssistantResponseSegment { text, .. } => {
+                ("assistant_response_segment", text.as_str())
+            }
             SessionEventKind::SystemMessage { text } => ("system_message", text.as_str()),
             SessionEventKind::ContextCompacted { summary, .. } => {
                 ("context_compacted", summary.as_str())
