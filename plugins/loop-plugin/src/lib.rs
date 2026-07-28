@@ -1131,6 +1131,27 @@ mod tests {
         assert_eq!(request.input["implementation_prompt"], "implement");
         assert_eq!(request.input["max_iterations"], 2);
         assert_eq!(request.binding.scope_key, session_id.to_string());
+
+        let ipc_request = bcode_ipc::Request::StartWorkflow(bcode_ipc::WorkflowStartRequest {
+            identity: request.identity,
+            definition: request.definition,
+            run_id: request.run_id,
+            parent_session_id: request.parent_session_id,
+            input: request.input,
+            binding: bcode_workflow_store::WorkflowRunBinding {
+                owner_plugin_id: request.binding.owner_plugin_id,
+                workflow_kind: request.binding.workflow_kind,
+                scope_key: request.binding.scope_key,
+                display_label: request.binding.display_label,
+                single_active: request.binding.single_active,
+            },
+            limits: bcode_workflow_store::WorkflowRunLimits::default(),
+        });
+        let encoded = bcode_ipc::encode_request(&ipc_request).expect("encode loop start request");
+        assert_eq!(
+            bcode_ipc::decode_request(&encoded).expect("decode loop start request"),
+            ipc_request
+        );
     }
 
     #[tokio::test]

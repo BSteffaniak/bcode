@@ -2595,7 +2595,26 @@ async fn handle_registered_client(
             continue;
         }
 
-        let request = decode_request(&envelope.payload)?;
+        let request = match decode_request(&envelope.payload) {
+            Ok(request) => request,
+            Err(error) => {
+                tracing::warn!(
+                    request_id = envelope.request_id,
+                    %error,
+                    "client request payload could not be decoded"
+                );
+                send_response(
+                    &writer,
+                    envelope.request_id,
+                    Response::Err(ErrorResponse::new(
+                        "invalid_request_payload",
+                        "request payload could not be decoded",
+                    )),
+                )
+                .await?;
+                continue;
+            }
+        };
         let result = Box::pin(handle_request(
             request,
             envelope.request_id,
@@ -23899,6 +23918,62 @@ mod tests {
     use std::sync::Mutex as TestMutex;
     use switchy::database::DatabaseValue;
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[tokio::test]
+    async fn invalid_request_payload_returns_error_without_closing_connection() {
+        let session_root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(session_root.path()).expect("sessions");
+        let state = Arc::new(test_server_state(sessions));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("client connection");
+            handle_client(stream, server_state)
+                .await
+                .expect("handle client");
+        });
+
+        let stream = LocalIpcStream::connect(&endpoint)
+            .await
+            .expect("connect client");
+        let (mut reader, mut writer) = tokio::io::split(stream);
+        bcode_ipc::send_envelope(
+            &mut writer,
+            &bcode_ipc::Envelope::new(41, EnvelopeKind::Request, vec![u8::MAX]),
+        )
+        .await
+        .expect("send invalid request");
+        let response = recv_envelope(&mut reader)
+            .await
+            .expect("receive error response");
+        assert_eq!(response.request_id, 41);
+        assert_eq!(response.kind, EnvelopeKind::Response);
+        assert_eq!(
+            bcode_ipc::decode_response(&response.payload).expect("decode error response"),
+            Response::Err(ErrorResponse::new(
+                "invalid_request_payload",
+                "request payload could not be decoded"
+            ))
+        );
+
+        bcode_ipc::send_envelope(
+            &mut writer,
+            &bcode_ipc::request_envelope(42, &Request::Ping).expect("ping envelope"),
+        )
+        .await
+        .expect("send ping");
+        let response = recv_envelope(&mut reader).await.expect("receive pong");
+        assert_eq!(response.request_id, 42);
+        assert_eq!(
+            bcode_ipc::decode_response(&response.payload).expect("decode pong"),
+            Response::Ok(ResponsePayload::Pong)
+        );
+        drop(writer);
+        drop(reader);
+        server.await.expect("server task");
+    }
 
     #[test]
     fn completed_tool_batch_survives_cancellation_race() {

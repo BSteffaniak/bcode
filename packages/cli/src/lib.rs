@@ -605,13 +605,38 @@ async fn handle_permission_command(command: PermissionCommand) -> Result<(), Cli
     Ok(())
 }
 
+fn foreground_server_requested_from<I, S>(arguments: I, inherited_endpoint: bool) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let mut previous_was_server = false;
+    for argument in arguments {
+        if previous_was_server && argument.as_ref() == "run" {
+            return !inherited_endpoint;
+        }
+        previous_was_server = argument.as_ref() == "server";
+    }
+    false
+}
+
+fn foreground_server_requested() -> bool {
+    foreground_server_requested_from(
+        std::env::args_os(),
+        std::env::var_os(bcode_ipc::BCODE_IPC_ENDPOINT_NAMESPACE_ENV).is_some(),
+    )
+}
+
 fn init_tracing() {
+    let foreground_server = foreground_server_requested();
     let filter = std::env::var("BCODE_LOG")
         .or_else(|_| std::env::var("RUST_LOG"))
         .ok()
         .unwrap_or_else(|| {
             if std::env::var_os("BCODE_STARTUP_TRACE").is_some() {
                 "bcode_server::startup=debug,bcode_plugin::startup=debug".to_string()
+            } else if foreground_server {
+                "info".to_string()
             } else {
                 "off".to_string()
             }
@@ -620,27 +645,36 @@ fn init_tracing() {
         Ok(filter) => (filter, None),
         Err(error) => (tracing_subscriber::EnvFilter::new("off"), Some(error)),
     };
-    let log_path = bcode_daemon_lifecycle::default_daemon_log_path();
-    let log_parent_ready = log_path
-        .parent()
-        .is_none_or(|parent| fs::create_dir_all(parent).is_ok());
-    let writer_path = log_path;
-    let subscriber = tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .with_ansi(false)
-        .with_writer(move || -> Box<dyn std::io::Write> {
-            if log_parent_ready
-                && let Ok(file) = fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(&writer_path)
-            {
-                return Box::new(file);
-            }
-            Box::new(std::io::sink())
-        })
-        .finish();
-    let _ = subscriber.try_init();
+    if foreground_server {
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_ansi(std::io::stderr().is_terminal())
+            .with_writer(std::io::stderr)
+            .finish();
+        let _ = subscriber.try_init();
+    } else {
+        let log_path = bcode_daemon_lifecycle::default_daemon_log_path();
+        let log_parent_ready = log_path
+            .parent()
+            .is_none_or(|parent| fs::create_dir_all(parent).is_ok());
+        let writer_path = log_path;
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_ansi(false)
+            .with_writer(move || -> Box<dyn std::io::Write> {
+                if log_parent_ready
+                    && let Ok(file) = fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&writer_path)
+                {
+                    return Box::new(file);
+                }
+                Box::new(std::io::sink())
+            })
+            .finish();
+        let _ = subscriber.try_init();
+    }
     if let Some(error) = invalid_filter {
         tracing::warn!(%error, "invalid log filter; logging disabled");
     }
@@ -8250,6 +8284,26 @@ mod web_command_tests {
             Some(Commands::Server {
                 command: ServerCommand::Stop { force: true }
             })
+        ));
+    }
+
+    #[test]
+    fn foreground_server_logging_requires_direct_server_run() {
+        assert!(foreground_server_requested_from(
+            ["bcode", "server", "run"],
+            false
+        ));
+        assert!(!foreground_server_requested_from(
+            ["bcode", "server", "run"],
+            true
+        ));
+        assert!(!foreground_server_requested_from(
+            ["bcode", "run", "server"],
+            false
+        ));
+        assert!(!foreground_server_requested_from(
+            ["bcode", "server", "start"],
+            false
         ));
     }
 
