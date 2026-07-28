@@ -3260,6 +3260,7 @@ mod tests {
                 segment_order: 0,
                 update: bcode_session_models::TextStreamUpdate {
                     generation: 0,
+                    first_revision: revision,
                     revision,
                     operation: bcode_session_models::TextStreamOperation::Append {
                         expected_offset,
