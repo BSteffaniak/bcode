@@ -287,6 +287,7 @@ pub(crate) async fn execute_command(
                 &described.template.configuration_schema.schema,
                 &required_arg(&request, "configuration")?,
             )?;
+            let limits = reference_template_run_limits(&template_id, &configuration)?;
             let parent_session_id = parse_arg(&request, "session_id")?;
             let started = client
                 .start_workflow_template(bcode_ipc::WorkflowTemplateStartRequest {
@@ -297,7 +298,7 @@ pub(crate) async fn execute_command(
                     workspace_snapshot: request.args.get("workspace_snapshot").cloned(),
                     parent_session_id,
                     configuration,
-                    limits: bcode_workflow_store::WorkflowRunLimits::default(),
+                    limits,
                 })
                 .await
                 .map_err(|error| error.to_string())?;
@@ -527,6 +528,27 @@ async fn active_session_status(
         priority: 40,
         metadata: BTreeMap::from([("runs".to_string(), serde_json::json!(active))]),
     }))
+}
+
+fn reference_template_run_limits(
+    template_id: &str,
+    configuration: &serde_json::Value,
+) -> Result<bcode_workflow_store::WorkflowRunLimits, String> {
+    let mut limits = bcode_workflow_store::WorkflowRunLimits::default();
+    if template_id != "implementation-verification-commit" {
+        return Ok(limits);
+    }
+    let iteration_limit = configuration
+        .get("iteration_limit")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "reference template iteration_limit is required".to_string())?;
+    limits.cycle_cap = u32::try_from(iteration_limit)
+        .map_err(|_| "reference template iteration_limit exceeds u32".to_string())?;
+    limits.node_execution_cap = limits
+        .cycle_cap
+        .checked_mul(16)
+        .ok_or_else(|| "reference template node execution limit overflow".to_string())?;
+    Ok(limits)
 }
 
 fn parse_arguments(arguments: &str) -> BTreeMap<String, String> {
@@ -890,6 +912,53 @@ mod tests {
                 .exits
                 .contains(&"commit_result".to_string())
         );
+        let repeat = &template.definition.nodes["verification_repeat"];
+        assert_eq!(repeat.kind, bcode_workflow::NodeKind::Repeat);
+        assert_eq!(repeat.configuration["max_iterations"], 100);
+        let back = template
+            .definition
+            .edges
+            .iter()
+            .find(|edge| edge.from == "verification_repeat" && edge.to == "implementation")
+            .expect("verification repeat back edge");
+        assert!(matches!(
+            &back.kind,
+            bcode_workflow::EdgeKind::Back {
+                max_iterations: 100,
+                ..
+            }
+        ));
+        assert!(back.transform.is_some());
+        for node_id in [
+            "implementation",
+            "evaluation",
+            "verification",
+            "verification_decision",
+            "verified",
+            "verification_failed",
+            "verification_repeat",
+            "git_prepare",
+            "git_compose",
+            "commit_decision",
+            "git_commit",
+            "commit_result",
+            "no_changes",
+        ] {
+            assert!(template.definition.nodes.contains_key(node_id), "{node_id}");
+        }
+        assert_eq!(
+            template
+                .definition
+                .exits
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                "commit_result".to_string(),
+                "no_changes".to_string(),
+                "verification_repeat".to_string(),
+            ])
+        );
         let required = template.configuration_schema.schema["required"]
             .as_array()
             .expect("required fields");
@@ -962,6 +1031,29 @@ mod tests {
                 ("session_id".to_string(), "session-1".to_string()),
                 ("template_id".to_string(), "reference".to_string()),
             ])
+        );
+    }
+
+    #[test]
+    fn reference_template_maps_iteration_limit_into_persisted_run_limits() {
+        let limits = reference_template_run_limits(
+            "implementation-verification-commit",
+            &serde_json::json!({"iteration_limit": 7}),
+        )
+        .expect("limits");
+        assert_eq!(limits.cycle_cap, 7);
+        assert_eq!(limits.node_execution_cap, 112);
+        assert!(
+            reference_template_run_limits(
+                "implementation-verification-commit",
+                &serde_json::json!({})
+            )
+            .is_err()
+        );
+        assert_eq!(
+            reference_template_run_limits("another-template", &serde_json::json!({}))
+                .expect("default"),
+            bcode_workflow_store::WorkflowRunLimits::default()
         );
     }
 

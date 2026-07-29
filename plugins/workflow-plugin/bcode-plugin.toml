@@ -198,9 +198,11 @@ edges = [
     ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, message = { type = "string" }, paths = { type = "array", minItems = 1, uniqueItems = true, items = { type = "string" } } } } } } },
     { from = "commit_decision", to = "no_changes", kind = { kind = "conditional", predicate = { operation = "equals", version = 1, path = "status", value = "ready" }, expected = false } },
     { from = "git_commit", to = "commit_result", kind = { kind = "direct" } },
+    { from = "verification_failed", to = "verification_repeat", kind = { kind = "direct" } },
+    { from = "verification_repeat", to = "implementation", kind = { kind = "back", predicate = { operation = "equals", version = 1, path = "passed", value = false }, max_iterations = 100 }, transform = { version = 1, expression = { operation = "input", source = "state", path = "" }, output = { type_name = "bcode.workflow.implementation-verification-commit-config/v1", schema = { type = "object" } } } },
 ]
 entries = ["implementation"]
-exits = ["commit_result", "no_changes", "verification_failed"]
+exits = ["commit_result", "no_changes", "verification_repeat"]
 name = "implementation-verification-commit"
 schema_version = 1
 
@@ -561,6 +563,90 @@ schema = { type = "object", additionalProperties = false, required = [
     "status",
 ], properties = { path = { type = "string" }, status = { type = "string" } } } } } }
 type_name = "bcode.git.prepare-result/v1"
+
+[workflow_templates.definition.nodes.verification_repeat]
+id        = "verification_repeat"
+kind      = "repeat"
+name      = "Repeat after failed verification"
+resources = []
+
+[workflow_templates.definition.nodes.verification_repeat.configuration]
+iteration_state   = "explicit_back_edge_transform"
+max_iterations    = 100
+predicate         = { operation = "equals", version = 1, path = "passed", value = false }
+predicate_version = 1
+
+[workflow_templates.definition.nodes.verification_repeat.input]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "passed",
+    "commands",
+    "artifacts",
+], properties = { version = { const = 1 }, passed = { type = "boolean" }, commands = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
+    "index",
+    "status",
+    "exit_code",
+    "signal",
+    "duration_ms",
+    "stdout_preview",
+    "stderr_preview",
+    "stdout_truncated",
+    "stderr_truncated",
+], properties = { index = { type = "integer", minimum = 0 }, status = { type = "string", enum = [
+    "exited",
+    "spawn_failed",
+    "timed_out",
+    "cancelled",
+] }, exit_code = { type = [
+    "integer",
+    "null",
+] }, signal = { type = [
+    "integer",
+    "null",
+] }, duration_ms = { type = "integer", minimum = 0 }, stdout_preview = { type = "string", maxLength = 65536 }, stderr_preview = { type = "string", maxLength = 65536 }, stdout_truncated = { type = "boolean" }, stderr_truncated = { type = "boolean" } } } }, artifacts = { type = "array", items = { type = "object", required = [
+    "artifact_id",
+    "schema",
+    "schema_version",
+    "content_type",
+    "reference_key",
+] } } } }
+type_name = "bcode.shell.command-plan-result/v1"
+
+[workflow_templates.definition.nodes.verification_repeat.output]
+schema = { type = "object", additionalProperties = false, required = [
+    "version",
+    "passed",
+    "commands",
+    "artifacts",
+], properties = { version = { const = 1 }, passed = { type = "boolean" }, commands = { type = "array", maxItems = 64, items = { type = "object", additionalProperties = false, required = [
+    "index",
+    "status",
+    "exit_code",
+    "signal",
+    "duration_ms",
+    "stdout_preview",
+    "stderr_preview",
+    "stdout_truncated",
+    "stderr_truncated",
+], properties = { index = { type = "integer", minimum = 0 }, status = { type = "string", enum = [
+    "exited",
+    "spawn_failed",
+    "timed_out",
+    "cancelled",
+] }, exit_code = { type = [
+    "integer",
+    "null",
+] }, signal = { type = [
+    "integer",
+    "null",
+] }, duration_ms = { type = "integer", minimum = 0 }, stdout_preview = { type = "string", maxLength = 65536 }, stderr_preview = { type = "string", maxLength = 65536 }, stdout_truncated = { type = "boolean" }, stderr_truncated = { type = "boolean" } } } }, artifacts = { type = "array", items = { type = "object", required = [
+    "artifact_id",
+    "schema",
+    "schema_version",
+    "content_type",
+    "reference_key",
+] } } } }
+type_name = "bcode.shell.command-plan-result/v1"
 
 [workflow_templates.definition.nodes.verification_decision]
 id        = "verification_decision"
