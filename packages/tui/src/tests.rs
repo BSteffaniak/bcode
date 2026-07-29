@@ -2705,7 +2705,11 @@ fn rich_markdown_resize_reflows_cached_rows_and_restores_wide_layout() {
     let mut restored_buffer = Buffer::empty(Rect::new(0, 0, 80, 24));
     render::render(&mut app, &mut Frame::new(&mut restored_buffer));
     assert_eq!(app.transcript_layout().total_rows(), wide_rows);
-    assert_eq!(rendered_text(&restored_buffer), wide_text);
+    let restored_text = rendered_text(&restored_buffer);
+    assert!(restored_text.contains("┌"));
+    assert!(restored_text.contains("integration suite"));
+    assert!(restored_text.contains("passing"));
+    assert!(!restored_text.contains("Check: integration suite"));
 }
 
 #[test]

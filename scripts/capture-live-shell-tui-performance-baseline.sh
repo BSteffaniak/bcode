@@ -29,7 +29,7 @@ run_probe() {
     run_probe bcode_tui plugin_tui::tests::targeted_visual_update_transcript_baseline_report
     run_probe bcode_tui render::markdown_and_json_layout_work_per_revision_baseline_report
     run_probe bcode_tui telemetry::tests::telemetry_enabled_disabled_overhead_baseline_report
-    run_probe bcode_server tests::artifact_update_publisher_baseline_report
+    run_probe bcode_server tests::transient_streaming_fixed_workload_baseline_report
 } >"${output}"
 
 python3 - "${output}" <<'PY'
@@ -48,7 +48,7 @@ transcript = [
 frames = [record for record in records if record.get("domain") == "renderer_parse_layout"]
 telemetry = [record for record in records if record.get("domain") == "telemetry_overhead"]
 publisher = [
-    record for record in records if record.get("domain") == "server_artifact_publisher"
+    record for record in records if record.get("domain") == "pending_live_fanout"
 ]
 if len(shell) != 9:
     raise SystemExit(f"expected 9 shell matrix cases, found {len(shell)}")
@@ -72,8 +72,11 @@ if len(frames) != 2 or {record["format"] for record in frames} != {"markdown", "
     raise SystemExit("renderer parse/layout baseline is incomplete")
 if {record["enabled"] for record in telemetry} != {False, True}:
     raise SystemExit("telemetry enabled/disabled control is incomplete")
-if len(publisher) != 3 or any(record["published_updates"] != 1 for record in publisher):
-    raise SystemExit("server artifact publisher baseline is incomplete")
+if len(publisher) != 5 or any(
+    record["rejected_updates"] != 0 or record["pass_through_updates"] != 0
+    for record in publisher
+):
+    raise SystemExit("server pending fan-out baseline is incomplete")
 expected_volumes = {64 * 1024, 1024 * 1024, 8 * 1024 * 1024}
 expected_chunks = {17, 4 * 1024, 16 * 1024}
 if {record["output_bytes"] for record in shell} != expected_volumes:

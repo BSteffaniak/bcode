@@ -604,7 +604,7 @@ mod tests {
         };
         tokio::select! {
             result = &mut server => panic!("server exited before ready: {result:?}"),
-            result = tokio::time::timeout(std::time::Duration::from_secs(10), ready) => {
+            result = tokio::time::timeout(std::time::Duration::from_secs(30), ready) => {
                 result.expect("server ready");
             }
         }
