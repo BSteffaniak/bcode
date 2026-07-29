@@ -1304,6 +1304,54 @@ fn snapshots_lists_at_width_30() {
 }
 
 #[test]
+fn streaming_projection_preserves_safety_and_converges_when_syntax_completes() {
+    let unsafe_prefix = "[secret](javascript:alert(1)";
+    let unsafe_visible = rendered_lines_text(
+        &render_markdown(
+            unsafe_prefix,
+            &MarkdownRenderOptions::new(80)
+                .with_streaming(true)
+                .with_link_destination_fallbacks(true),
+        )
+        .lines,
+    );
+    assert!(unsafe_visible.contains("secret"));
+    assert!(!unsafe_visible.contains("javascript"));
+    assert!(!unsafe_visible.contains("alert(1)"));
+
+    let complete = "Before [guide](https://example.com) after";
+    let streaming = render_markdown(
+        complete,
+        &MarkdownRenderOptions::new(80).with_streaming(true),
+    );
+    let finalized = render_markdown(complete, &MarkdownRenderOptions::new(80));
+    assert_eq!(streaming.lines, finalized.lines);
+    assert_eq!(streaming.contributions, finalized.contributions);
+
+    let incomplete_cases = [
+        ("Text with **unfinished", "**unfinished"),
+        ("Text with `unfinished", "`unfinished"),
+        (
+            "[unfinished](https://example.com",
+            "[unfinished](https://example.com",
+        ),
+        ("```rust\nfn main() {", "fn main() {"),
+        ("<details><summary>Retry</summary>Body", "Retry"),
+        ("| Name | Value |\n| --- | --- |\n| partial |", "partial"),
+        ("- first\n- unfinished", "unfinished"),
+    ];
+    for (source, expected) in incomplete_cases {
+        let visible = rendered_lines_text(
+            &render_markdown(source, &MarkdownRenderOptions::new(80).with_streaming(true)).lines,
+        );
+        assert!(
+            visible.contains(expected),
+            "incomplete projection lost fallback {expected:?}: {visible:?}"
+        );
+    }
+}
+
+#[test]
 fn arbitrary_streaming_prefixes_keep_incomplete_source_content_visible() {
     const CASES: &[(&str, &[&str])] = &[
         (

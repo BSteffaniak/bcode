@@ -878,7 +878,8 @@ pub fn render_markdown(markdown: &str, options: &MarkdownRenderOptions) -> Markd
         &projection_options,
     );
     let projected_markdown = if options.streaming {
-        project_incomplete_details_fallback(&projection.markdown)
+        let details_projection = project_incomplete_details_fallback(&projection.markdown);
+        Cow::Owned(project_incomplete_unsafe_destination_fallback(&details_projection).into_owned())
     } else {
         Cow::Borrowed(projection.markdown.as_ref())
     };
@@ -1450,6 +1451,49 @@ fn project_semantic_fallbacks<'a>(
     ProjectedMarkdown {
         markdown: Cow::Owned(projected),
         contributions: projected_contributions,
+    }
+}
+
+fn project_incomplete_unsafe_destination_fallback(markdown: &str) -> Cow<'_, str> {
+    let mut output = markdown.to_owned();
+    let mut search_end = output.len();
+    let mut changed = false;
+    while let Some(separator) = output[..search_end].rfind("](") {
+        let destination_start = separator + 2;
+        let destination_end = output[destination_start..]
+            .find([')', '\n', '\r'])
+            .map_or(output.len(), |offset| destination_start + offset);
+        if output[destination_start..destination_end].contains(')') {
+            search_end = separator;
+            continue;
+        }
+        let destination = output[destination_start..destination_end].trim();
+        if destination.is_empty()
+            || !matches!(
+                resolve_markdown_destination(destination, None),
+                MarkdownDestination::Inert { .. }
+            )
+        {
+            search_end = separator;
+            continue;
+        }
+        let Some(label_start) = output[..separator].rfind('[') else {
+            search_end = separator;
+            continue;
+        };
+        let replacement_start = label_start
+            .checked_sub(1)
+            .filter(|index| output.as_bytes()[*index] == b'!')
+            .unwrap_or(label_start);
+        let label = output[label_start + 1..separator].to_owned();
+        output.replace_range(replacement_start..destination_end, &label);
+        search_end = replacement_start;
+        changed = true;
+    }
+    if changed {
+        Cow::Owned(output)
+    } else {
+        Cow::Borrowed(markdown)
     }
 }
 

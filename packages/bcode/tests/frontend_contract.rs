@@ -6,6 +6,69 @@ use bcode::{
     TokenUsage, ToolCall, ToolResult,
 };
 
+#[test]
+fn ordered_stream_delivery_is_versioned_and_independent_from_frontend_sequence() {
+    let session_id = SessionId::new();
+    let mut snapshot = FrontendSessionSnapshot::new(session_id, &[]);
+    let mut cursor = FrontendEventCursor::new(session_id, "turn-1", 0);
+    let started = cursor
+        .project(&AgentEvent::TurnStarted)
+        .expect("turn start");
+    snapshot.apply_event(&started).expect("turn starts");
+
+    let update = bcode_session_models::TextStreamUpdate {
+        generation: 3,
+        first_revision: 7,
+        revision: 9,
+        operation: bcode_session_models::TextStreamOperation::Checkpoint {
+            start_offset: 4,
+            text: "answer".to_owned(),
+            total_bytes: 10,
+            truncated: true,
+        },
+    };
+    let envelope = bcode::FrontendEventEnvelope {
+        schema_version: bcode::FRONTEND_CONTRACT_SCHEMA_VERSION,
+        session_id,
+        turn_id: "turn-1".to_owned(),
+        sequence: 1,
+        event: bcode::FrontendEvent::TextStreamUpdated {
+            segment_id: "segment-0".to_owned(),
+            segment_order: 0,
+            update: update.clone(),
+        },
+    };
+    snapshot
+        .apply_event(&envelope)
+        .expect("stream update applies");
+    assert_eq!(snapshot.next_sequence, 2);
+    assert_eq!(
+        snapshot
+            .active_turn
+            .as_ref()
+            .expect("active turn")
+            .text_streams["segment-0"],
+        update
+    );
+
+    let encoded = serde_json::to_vec(&envelope).expect("serialize envelope");
+    let decoded: bcode::FrontendEventEnvelope =
+        serde_json::from_slice(&encoded).expect("deserialize envelope");
+    assert_eq!(decoded, envelope);
+
+    for version in [
+        bcode::FRONTEND_CONTRACT_SCHEMA_VERSION.saturating_sub(1),
+        bcode::FRONTEND_CONTRACT_SCHEMA_VERSION.saturating_add(1),
+    ] {
+        let mut wrong = envelope.clone();
+        wrong.schema_version = version;
+        assert_eq!(
+            FrontendSessionSnapshot::new(session_id, &[]).apply_event(&wrong),
+            Err(FrontendSnapshotError::UnsupportedVersion(version))
+        );
+    }
+}
+
 fn transcript() -> Vec<ModelMessage> {
     vec![ModelMessage {
         role: MessageRole::Assistant,

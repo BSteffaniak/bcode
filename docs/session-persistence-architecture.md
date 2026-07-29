@@ -24,13 +24,18 @@ tests, imports, and isolated stores, but all production default paths use the sa
 
 ## Live-only progress boundary
 
-Intermediate provider argument fragments, request previews, execution frames, and replaceable progress
-are not session facts. They use `SessionLiveEvent` and are retained only in bounded in-memory
-registries while the owning turn or invocation is active. They never receive a durable event
-sequence and must not be written to `session.db`, projection indexes, catalogs, manifests,
-finalized artifact metadata, trace blobs, workflow state, crash reports, or structured log fields.
-Daemon restart intentionally discards this state.
+Intermediate provider argument fragments, request previews, execution frames, replaceable progress,
+and ordered assistant/reasoning text appends, checkpoints, revisions, and terminal tombstones are not
+session facts. They use `SessionLiveEvent` and are retained only in bounded in-memory registries while
+the owning turn or invocation is active. They never receive a durable event sequence and must not be
+written to `session.db`, projection indexes, catalogs, manifests, finalized artifact metadata, trace
+blobs, workflow state, crash reports, or structured log fields. Daemon restart intentionally discards
+this state; attach within the same live process may hydrate bounded checkpoints, but those checkpoints
+are state transfer only and do not imply durable or reconnect-safe resume.
 
+Completed assistant response segments and completed structured reasoning activities cross the durable
+boundary as correlated semantic facts. Their durable events finalize or replace matching live items
+without promoting partial live text, guessing missing bytes, or persisting intermediate operations.
 The durable boundary begins with complete semantic facts: a validated tool request, required
 permission request/resolution, lifecycle facts that remain meaningful after reload, a complete
 assistant response segment, and the terminal result or finalized artifact. A complete assistant

@@ -6,6 +6,12 @@ current value, and invocation closure preserves the last accepted retained value
 
 ## Primary update contract
 
+The primary presentation path is now shared across `SessionView`, the TUI terminal adapter, and the
+portable HyperChad frontend. Renderer-specific adapters enhance the same invocation-owned semantic
+item; neither renderer owns a parallel request/progress/result transcript lifecycle. Historical
+`ToolContributionEnvelope` placement remains a supported decoding/projection interface, not a new
+producer API, until an explicit supported-history cutoff removes it.
+
 Each invocation owns one stable primary transcript item. The host supplies an invocation-scoped
 presentation handle so plugins do not construct transcript IDs or coordinate request, progress,
 result, promotion, and removal objects.

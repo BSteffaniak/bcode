@@ -6,12 +6,16 @@ serialize the same `FrontendEventEnvelope` and `FrontendSessionSnapshot` JSON va
 
 ## Versioning and correlation
 
-`FRONTEND_CONTRACT_SCHEMA_VERSION` versions both event envelopes and snapshots. Every envelope has a
-session ID, application/runtime turn ID, and monotonic per-turn sequence. `FrontendEventCursor`
-projects normalized runtime events and allocates sequences; omitted internal events consume no
-sequence.
+`FRONTEND_CONTRACT_SCHEMA_VERSION` versions both event envelopes and snapshots. Schema version 2
+adds portable ordered assistant-segment and structured-reasoning-part stream operations. Every
+envelope has a session ID, application/runtime turn ID, and monotonic per-turn delivery sequence.
+`FrontendEventCursor` projects normalized runtime events and allocates delivery sequences; omitted
+internal events consume no sequence.
 
-`FrontendSessionSnapshot::apply_event` requires contiguous delivery, accepts byte-equivalent
+Ordered stream payloads carry their own generation, revision span, accepted byte offset, checkpoint,
+and terminal state. These integrity coordinates are independent from the envelope delivery sequence:
+the envelope orders frontend delivery, while the stream update validates one semantic text stream.
+`FrontendSessionSnapshot::apply_event` requires contiguous envelope delivery, accepts byte-equivalent
 redelivery idempotently, rejects conflicting duplicate sequences, rejects mixed sessions/active
 turns, and allows a new turn only after the previous turn is terminal and the next event is
 `TurnStarted`. Snapshots retain payload fingerprints only to validate duplicate delivery; they do

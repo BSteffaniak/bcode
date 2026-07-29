@@ -4731,7 +4731,7 @@ impl BcodeBuilder {
 }
 
 /// Current renderer-neutral frontend event/snapshot schema version.
-pub const FRONTEND_CONTRACT_SCHEMA_VERSION: u32 = 1;
+pub const FRONTEND_CONTRACT_SCHEMA_VERSION: u32 = 2;
 
 /// Provider/plugin-independent transcript content for frontend snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4806,6 +4806,18 @@ pub enum FrontendEvent {
     TurnStarted,
     /// Visible assistant text delta.
     TextDelta(String),
+    /// Ordered assistant text stream operation.
+    ///
+    /// Stream generation, revision, and byte offset are independent from the enclosing frontend
+    /// delivery `sequence`.
+    TextStreamUpdated {
+        /// Stable assistant segment identifier scoped to the owning turn.
+        segment_id: String,
+        /// Semantic segment order within the turn.
+        segment_order: u32,
+        /// Generation-scoped ordered text operation.
+        update: bcode_session_models::TextStreamUpdate,
+    },
     /// Legacy visible reasoning delta.
     ///
     /// This compatibility projection loses representation kind, part identity, order, and
@@ -4813,6 +4825,23 @@ pub enum FrontendEvent {
     ReasoningDelta(String),
     /// Provider-neutral reasoning activity operation.
     ReasoningActivity(bcode_session_models::ReasoningActivityEvent),
+    /// Ordered readable text operation for one structured reasoning part.
+    ReasoningTextStreamUpdated {
+        /// Stable activity identifier scoped to the owning turn.
+        activity_id: String,
+        /// Stable activity order within the turn.
+        activity_order: u32,
+        /// Stable readable part identifier scoped to the activity.
+        part_id: String,
+        /// Portable reasoning representation kind.
+        kind: bcode_session_models::ReasoningContentKind,
+        /// Portable semantic role.
+        role: bcode_session_models::ReasoningContentRole,
+        /// Stable part order within the activity.
+        part_order: u32,
+        /// Generation-scoped ordered text operation.
+        update: bcode_session_models::TextStreamUpdate,
+    },
     /// Tool call began.
     ToolCallStarted {
         /// Provider call ID.
@@ -4997,6 +5026,9 @@ pub struct FrontendTurnSnapshot {
     pub status: FrontendTurnStatus,
     /// Concatenated visible assistant text.
     pub text: String,
+    /// Ordered assistant segment stream states keyed by stable segment identity.
+    #[serde(default)]
+    pub text_streams: BTreeMap<String, bcode_session_models::TextStreamUpdate>,
     /// Concatenated compatibility projection of visible reasoning text.
     ///
     /// Distinct structured parts are separated by blank lines. This field is lossy; use
@@ -5005,6 +5037,9 @@ pub struct FrontendTurnSnapshot {
     /// Provider-neutral reasoning operations in provider order.
     #[serde(default)]
     pub reasoning_events: Vec<ReasoningActivityEvent>,
+    /// Ordered structured-reasoning part stream states keyed by `activity_id/part_id`.
+    #[serde(default)]
+    pub reasoning_text_streams: BTreeMap<String, bcode_session_models::TextStreamUpdate>,
     /// Latest cumulative provider usage.
     pub usage: Option<TokenUsage>,
     /// Provider-confirmed exact input context for the request.
@@ -5091,8 +5126,10 @@ impl FrontendTurnSnapshot {
             turn_id,
             status: FrontendTurnStatus::Active,
             text: String::new(),
+            text_streams: BTreeMap::new(),
             reasoning: String::new(),
             reasoning_events: Vec::new(),
+            reasoning_text_streams: BTreeMap::new(),
             usage: None,
             exact_request_input_tokens: None,
             stop_reason: None,
@@ -5112,10 +5149,24 @@ impl FrontendTurnSnapshot {
             | FrontendEvent::RetryScheduled { .. }
             | FrontendEvent::ContextCompacted => {}
             FrontendEvent::TextDelta(text) => self.text.push_str(text),
+            FrontendEvent::TextStreamUpdated {
+                segment_id, update, ..
+            } => {
+                self.text_streams.insert(segment_id.clone(), update.clone());
+            }
             FrontendEvent::ReasoningDelta(text) => self.reasoning.push_str(text),
             FrontendEvent::ReasoningActivity(event) => {
                 self.reasoning_events.push(event.clone());
                 self.reasoning = project_reasoning_text(&self.reasoning_events);
+            }
+            FrontendEvent::ReasoningTextStreamUpdated {
+                activity_id,
+                part_id,
+                update,
+                ..
+            } => {
+                self.reasoning_text_streams
+                    .insert(format!("{activity_id}/{part_id}"), update.clone());
             }
             FrontendEvent::ToolCallFinished(call) => self.tool_calls.push(call.clone()),
             FrontendEvent::ToolResult(result) => self.tool_results.push(result.clone()),

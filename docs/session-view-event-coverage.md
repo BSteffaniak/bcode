@@ -11,11 +11,16 @@ Status meanings:
 
 ## Updateable tool transcript migration
 
-The coverage statuses below describe the currently implemented event projection. The target
-composition is one stable primary transcript item per invocation, updated by monotonic revision and
-closed without a separate final presentation object. Existing request/progress/result placement rows
-remain compatibility coverage until all producers and renderers migrate; they are not the target
-extension contract.
+The coverage statuses below describe the implemented shared projection. `SessionView` is now the sole
+semantic transcript authority consumed by the TUI and portable HyperChad frontend. The TUI adapts
+shared items through one stable-ID/revision terminal boundary; raw durable/live event handling is
+limited to terminal interaction, status, and activity side effects and cannot construct canonical
+transcript rows.
+
+The target composition for tools is one stable primary transcript item per invocation, updated by
+monotonic revision and closed without a separate final presentation object. Existing
+request/progress/result placement rows remain supported-history compatibility coverage until an
+explicit version cutoff; they are not the target extension contract.
 
 Required migration invariants:
 

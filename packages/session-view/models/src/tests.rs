@@ -2,6 +2,46 @@ use super::*;
 use proptest::prelude::*;
 
 #[test]
+fn snapshot_patch_application_rejects_unknown_schema_versions() {
+    let mut snapshot = SessionViewSnapshot::empty();
+    let mut patch = SessionViewPatch::empty(snapshot.revision, snapshot.revision);
+    patch.schema_version = SessionViewPatch::SCHEMA_VERSION.saturating_add(1);
+    assert_eq!(
+        snapshot.apply_patch(&patch),
+        Err(TranscriptViewPatchError::UnsupportedPatchSchemaVersion {
+            actual: SessionViewPatch::SCHEMA_VERSION.saturating_add(1),
+            expected: SessionViewPatch::SCHEMA_VERSION,
+        })
+    );
+
+    let mut snapshot = SessionViewSnapshot::empty();
+    snapshot.schema_version = SessionViewSnapshot::SCHEMA_VERSION.saturating_add(1);
+    assert_eq!(
+        snapshot.apply_patch(&SessionViewPatch::empty(
+            snapshot.revision,
+            snapshot.revision,
+        )),
+        Err(TranscriptViewPatchError::UnsupportedSnapshotSchemaVersion {
+            actual: SessionViewSnapshot::SCHEMA_VERSION.saturating_add(1),
+            expected: SessionViewSnapshot::SCHEMA_VERSION,
+        })
+    );
+
+    let mut snapshot = SessionViewSnapshot::empty();
+    let mut reset = SessionViewSnapshot::empty();
+    reset.schema_version = SessionViewSnapshot::SCHEMA_VERSION.saturating_add(1);
+    let mut patch = SessionViewPatch::empty(snapshot.revision, reset.revision);
+    patch.reset = Some(Box::new(reset));
+    assert_eq!(
+        snapshot.apply_patch(&patch),
+        Err(TranscriptViewPatchError::UnsupportedSnapshotSchemaVersion {
+            actual: SessionViewSnapshot::SCHEMA_VERSION.saturating_add(1),
+            expected: SessionViewSnapshot::SCHEMA_VERSION,
+        })
+    );
+}
+
+#[test]
 fn renderer_tool_presentation_fixtures_round_trip_with_stable_primary_identity() {
     let fixtures = super::renderer_fixtures::renderer_tool_presentation_fixtures();
     assert_eq!(fixtures.len(), 14);

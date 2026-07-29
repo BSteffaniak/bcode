@@ -1343,6 +1343,20 @@ if ! grep -F 'struct SessionViewTerminalAdapter' packages/tui/src/app.rs >/dev/n
   violations=1
 fi
 
+if ! grep -F 'UnsupportedSnapshotSchemaVersion' packages/session-view/models/src/lib.rs >/dev/null \
+  || ! grep -F 'UnsupportedPatchSchemaVersion' packages/session-view/models/src/lib.rs >/dev/null \
+  || ! grep -F 'snapshot_patch_application_rejects_unknown_schema_versions' packages/session-view/models/src/tests.rs >/dev/null; then
+  echo "Runtime architecture violation: renderer-neutral SessionView schema rejection or its coverage was removed." >&2
+  violations=1
+fi
+
+if ! grep -F '`SessionView` is the sole semantic transcript authority' docs/renderer-architecture.md >/dev/null \
+  || ! grep -F 'Canonical transcript content crosses the single `SessionViewTerminalAdapter` boundary' docs/renderer-architecture.md >/dev/null \
+  || ! grep -F 'raw durable/live event handling is' docs/session-view-event-coverage.md >/dev/null; then
+  echo "Runtime architecture violation: single-authority renderer documentation drifted from the guarded implementation boundary." >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi

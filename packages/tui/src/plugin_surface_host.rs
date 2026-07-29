@@ -61,6 +61,7 @@ fn workflow_start_request(
         identity: request.identity,
         definition: request.definition,
         run_id: request.run_id,
+        workspace_snapshot: None,
         parent_session_id: request.parent_session_id,
         input: request.input,
         binding: bcode_workflow_store::WorkflowRunBinding {

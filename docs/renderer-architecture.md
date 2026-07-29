@@ -10,11 +10,14 @@ The target boundary is active for tool transcript semantics in both established 
 * `packages/session-view` projects bounded history and renderer-relevant live events and executes daemon-backed semantic actions.
 * `packages/hyperchad` consumes this layer as Bcode's HyperChad application host; selected Cargo features choose the concrete HyperChad backend.
 * `packages/hyperchad/ui` owns portable HyperChad presentation built from canonical HyperChad templates, routes, forms, actions, and renderer APIs.
-* `packages/tui` retains a `SessionView` projection and reconciles authoritative shared transcript items by stable `TranscriptViewItemId` and revision into terminal-native rows. Assistant and reasoning streams preserve terminal render identity across incremental replacement and durable finalization even when usage, permission, supplemental, or tool rows are interleaved. Terminal viewport, scroll anchoring, hit testing, wrapping, diff layout, animation, and plugin visual/artifact adapter state remain TUI-owned.
+* `packages/tui` retains a `SessionView` projection and adapts its transcript through one `SessionViewTerminalAdapter`, keyed by stable `TranscriptViewItemId` and revision, into terminal-native rows. `SessionView` is the sole semantic transcript authority: durable and live events are applied there once, while the TUI consumes the resulting document and does not construct assistant, reasoning, tool, permission, usage, compaction, skill, interaction, or system rows from raw events. Assistant and reasoning streams preserve terminal render identity across incremental replacement and durable finalization even when usage, permission, supplemental, or tool rows are interleaved. Terminal viewport, scroll anchoring, hit testing, wrapping, diff layout, animation, and plugin visual/artifact adapter state remain TUI-owned.
 
 The TUI may retain renderer-local interaction and layout state, but shared transcript lifecycle,
-identity, ordering, retention, and fallback semantics come from `SessionView`; it must not create a
-parallel event-derived tool transcript authority. Remaining TUI migration is parity-driven removal
+identity, ordering, retention, fallback semantics, and stream integrity come from `SessionView`.
+Terminal-local notices created by TUI commands remain presentation state and are not canonical
+session transcript facts. The TUI must not create a parallel event-derived transcript authority.
+Remaining work is product-parity validation and removal of superseded compatibility interfaces, not
+another transcript reconciliation layer.
 of proven duplicate adapter/projection helpers, not a different semantic contract.
 
 ## Shared renderer contract
@@ -34,7 +37,7 @@ Renderers must not depend on TUI frame, key, mouse, or BMUX drawing types. They 
 
 `packages/session-view` owns generic projection from bounded daemon/session state into `SessionViewSnapshot` and generic execution of daemon-backed `SessionViewAction` values. It must remain domain-focused rather than becoming a miscellaneous application-state crate.
 
-`packages/tui` owns terminal layout, terminal-event mapping, viewport and anchoring behavior, frame rendering, and terminal-specific polish. Terminal-specific plugin surfaces remain TUI-only. During migration it also temporarily retains legacy projection logic that should move behind the shared semantic boundary after parity is demonstrated.
+`packages/tui` owns terminal layout, terminal-event mapping, viewport and anchoring behavior, frame rendering, and terminal-specific polish. Terminal-specific plugin surfaces remain TUI-only. Canonical transcript content crosses the single `SessionViewTerminalAdapter` boundary; raw event handling may update terminal interaction/status state but cannot create or finalize shared semantic rows.
 
 `packages/hyperchad` owns the HyperChad application host, daemon connection, bounded snapshot hydration, session selection, semantic action mapping, and selected-backend integration. Backend selection flows from consuming package features into `bcode_hyperchad` and then into HyperChad.
 

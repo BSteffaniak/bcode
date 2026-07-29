@@ -8493,6 +8493,110 @@ mod tests {
     }
 
     #[test]
+    fn historical_assistant_and_reasoning_replay_matches_bounded_rebuild() {
+        let session_id = SessionId::new();
+        let events = vec![
+            event(
+                session_id,
+                1,
+                SessionEventKind::AssistantDelta {
+                    text: "legacy answer ".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::AssistantMessage {
+                    text: "legacy answer complete".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                3,
+                SessionEventKind::AssistantReasoningDelta {
+                    text: "legacy thought ".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                4,
+                SessionEventKind::AssistantReasoningMessage {
+                    text: "legacy thought complete".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                5,
+                SessionEventKind::AssistantReasoningActivity {
+                    turn_id: "turn-1".to_owned(),
+                    activity: bcode_session_models::ReasoningActivity {
+                        activity_id: "reasoning-1".to_owned(),
+                        order: 0,
+                        status: bcode_session_models::ReasoningActivityStatus::Completed,
+                        parts: vec![bcode_session_models::ReasoningPart {
+                            part_id: "summary-0".to_owned(),
+                            kind: bcode_session_models::ReasoningContentKind::Summary,
+                            role: bcode_session_models::ReasoningContentRole::Milestone,
+                            order: 0,
+                            text: "structured thought".to_owned(),
+                        }],
+                        opaque: false,
+                    },
+                },
+            ),
+            event(
+                session_id,
+                6,
+                SessionEventKind::AssistantResponseSegment {
+                    turn_id: "turn-1".to_owned(),
+                    segment_id: "segment-1".to_owned(),
+                    segment_order: 1,
+                    text: "structured answer".to_owned(),
+                },
+            ),
+        ];
+
+        let fresh = build_session_view_snapshot(&events);
+        let mut rebuilt = SessionView::new();
+        rebuilt.apply_history(&events);
+        rebuilt.rebuild_history_window(&events);
+        let rebuilt = rebuilt.into_snapshot();
+        let projection = |snapshot: &SessionViewSnapshot| {
+            snapshot
+                .transcript
+                .items
+                .iter()
+                .map(|item| {
+                    (
+                        item.id.clone(),
+                        item.sequence,
+                        item.streaming,
+                        item.kind.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(projection(&fresh), projection(&rebuilt));
+        assert_eq!(
+            fresh
+                .transcript
+                .items
+                .iter()
+                .map(|item| item.id.get())
+                .collect::<Vec<_>>(),
+            [
+                "event:1",
+                "event:3",
+                "reasoning-turn:turn-1:reasoning-1",
+                "assistant-turn:turn-1:segment:segment-1",
+            ]
+        );
+        assert_reasoning_text(&fresh.transcript.items[1], "legacy thought complete", false);
+        assert_reasoning_text(&fresh.transcript.items[2], "structured thought", false);
+    }
+
+    #[test]
     fn durable_assistant_segments_replay_with_stable_distinct_identities() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();

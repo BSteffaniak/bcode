@@ -3060,6 +3060,109 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordered_live_text_operations_never_enter_history_and_restart_drops_state() {
+        let root = unique_temp_dir();
+        let session_id = {
+            let manager = SessionManager::persistent(&root).expect("manager should create");
+            let session = manager
+                .create_session(Some("live streams".to_owned()), test_working_directory())
+                .await
+                .expect("session should create");
+            let durable_before = manager
+                .session_history(session.id)
+                .await
+                .expect("history before live updates");
+            let assistant =
+                |revision, operation| SessionLiveEventKind::AssistantTextStreamUpdated {
+                    turn_id: "turn-1".to_owned(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
+                    update: bcode_session_models::TextStreamUpdate {
+                        generation: 0,
+                        first_revision: revision,
+                        revision,
+                        operation,
+                    },
+                };
+            for event in [
+                assistant(
+                    1,
+                    bcode_session_models::TextStreamOperation::Append {
+                        expected_offset: 0,
+                        text: "partial".to_owned(),
+                    },
+                ),
+                assistant(
+                    2,
+                    bcode_session_models::TextStreamOperation::Checkpoint {
+                        start_offset: 0,
+                        text: "partial".to_owned(),
+                        total_bytes: 7,
+                        truncated: false,
+                    },
+                ),
+                SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                    turn_id: "turn-1".to_owned(),
+                    activity_id: "activity-0".to_owned(),
+                    activity_order: 0,
+                    part_id: "part-0".to_owned(),
+                    kind: bcode_session_models::ReasoningContentKind::Summary,
+                    role: bcode_session_models::ReasoningContentRole::Milestone,
+                    part_order: 0,
+                    update: bcode_session_models::TextStreamUpdate {
+                        generation: 0,
+                        first_revision: 1,
+                        revision: 1,
+                        operation: bcode_session_models::TextStreamOperation::Append {
+                            expected_offset: 0,
+                            text: "thought".to_owned(),
+                        },
+                    },
+                },
+                assistant(
+                    3,
+                    bcode_session_models::TextStreamOperation::Terminal {
+                        status: bcode_session_models::TextStreamTerminalStatus::Cancelled,
+                    },
+                ),
+            ] {
+                let _ = manager.publish_live_event(session.id, event).await;
+            }
+
+            assert_eq!(
+                manager
+                    .session_history(session.id)
+                    .await
+                    .expect("history after live updates"),
+                durable_before
+            );
+            let attachment = manager
+                .attach_session(session.id, ClientId::new())
+                .await
+                .expect("active session should attach");
+            assert_eq!(attachment.live_checkpoints.len(), 1);
+            assert!(matches!(
+                attachment.live_checkpoints[0].kind,
+                SessionLiveEventKind::AssistantReasoningTextStreamUpdated { .. }
+            ));
+            session.id
+        };
+
+        let restarted = SessionManager::persistent(&root).expect("manager should restart");
+        let attachment = restarted
+            .attach_session(session_id, ClientId::new())
+            .await
+            .expect("restarted session should attach");
+        assert!(attachment.live_checkpoints.is_empty());
+        assert!(!attachment.history.iter().any(|event| matches!(
+            event.kind,
+            SessionEventKind::AssistantDelta { .. }
+                | SessionEventKind::AssistantReasoningDelta { .. }
+        )));
+        std::fs::remove_dir_all(root).expect("temp session dir should be removed");
+    }
+
+    #[tokio::test]
     async fn live_assistant_text_delta_is_not_persisted() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should create");

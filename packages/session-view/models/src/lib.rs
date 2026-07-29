@@ -299,12 +299,25 @@ impl SessionViewSnapshot {
     ///
     /// # Errors
     ///
-    /// Returns an error when the snapshot or transcript revision does not match the patch base, or
-    /// when a transcript operation references a missing or duplicate item.
+    /// Returns an error when the snapshot, patch, or reset snapshot uses an unsupported schema
+    /// version; when the snapshot or transcript revision does not match the patch base; or when a
+    /// transcript operation references a missing or duplicate item.
     pub fn apply_patch(
         &mut self,
         patch: &SessionViewPatch,
     ) -> Result<(), TranscriptViewPatchError> {
+        if self.schema_version != Self::SCHEMA_VERSION {
+            return Err(TranscriptViewPatchError::UnsupportedSnapshotSchemaVersion {
+                actual: self.schema_version,
+                expected: Self::SCHEMA_VERSION,
+            });
+        }
+        if patch.schema_version != SessionViewPatch::SCHEMA_VERSION {
+            return Err(TranscriptViewPatchError::UnsupportedPatchSchemaVersion {
+                actual: patch.schema_version,
+                expected: SessionViewPatch::SCHEMA_VERSION,
+            });
+        }
         if self.revision != patch.base_revision {
             return Err(TranscriptViewPatchError::RevisionMismatch {
                 expected: patch.base_revision,
@@ -312,6 +325,12 @@ impl SessionViewSnapshot {
             });
         }
         if let Some(reset) = &patch.reset {
+            if reset.schema_version != Self::SCHEMA_VERSION {
+                return Err(TranscriptViewPatchError::UnsupportedSnapshotSchemaVersion {
+                    actual: reset.schema_version,
+                    expected: Self::SCHEMA_VERSION,
+                });
+            }
             if reset.revision != patch.revision {
                 return Err(TranscriptViewPatchError::ResetRevisionMismatch {
                     expected: patch.revision,
@@ -482,6 +501,20 @@ impl SessionViewPatch {
 /// Error applying transcript patch operations to a bounded transcript document.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptViewPatchError {
+    /// The current or reset snapshot schema is unsupported.
+    UnsupportedSnapshotSchemaVersion {
+        /// Schema version carried by the snapshot.
+        actual: u16,
+        /// Schema version supported by this build.
+        expected: u16,
+    },
+    /// The patch schema is unsupported.
+    UnsupportedPatchSchemaVersion {
+        /// Schema version carried by the patch.
+        actual: u16,
+        /// Schema version supported by this build.
+        expected: u16,
+    },
     /// The document revision did not match the patch base revision.
     RevisionMismatch {
         /// Revision required by the patch.
