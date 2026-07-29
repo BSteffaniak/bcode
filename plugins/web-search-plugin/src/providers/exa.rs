@@ -203,7 +203,10 @@ async fn search_at_endpoint(
     let response_body = read_bounded_body(response, limit).await?;
     if !status.is_success() {
         let message = match status.as_u16() {
-            401 | 403 => "Exa authentication failed; verify EXA_API_KEY".to_string(),
+            401 | 403 => {
+                "Exa authentication failed; run `bcode auth login exa` or verify the configured credential"
+                    .to_string()
+            }
             429 => "Exa rate limit or quota was exceeded; retry after the provider limit resets"
                 .to_string(),
             code if code >= 500 => "Exa is temporarily unavailable".to_string(),
@@ -903,6 +906,9 @@ mod tests {
                 .expect_err("error response");
             let message = error.to_string();
             assert!(message.contains(expected));
+            if status.starts_with("401") {
+                assert!(message.contains("bcode auth login exa"));
+            }
             assert!(!message.contains("reflected-secret"));
             assert!(!message.contains("test-key"));
         }

@@ -614,6 +614,23 @@ mod tests {
         assert!(!registration.requires_daemon);
     }
 
+    #[cfg(feature = "static-bundled-web-search-plugin")]
+    #[test]
+    fn web_search_bundle_registers_exa_auth_provider() {
+        let static_plugins = super::static_bundled_plugins();
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &static_plugins,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .expect("static plugin manifests parse");
+        let mut host = bcode_plugin::PluginHost::load_static_plugins_best_effort(&selected);
+        let provider = host.auth_provider("exa").expect("Exa auth provider");
+        assert_eq!(provider.plugin_id, "bcode.web-search");
+        assert_eq!(provider.contribution.methods.len(), 1);
+        assert_eq!(provider.contribution.methods[0].method_id(), "api_key");
+        host.deactivate_all().expect("deactivate static plugins");
+    }
+
     #[cfg(feature = "static-bundled-filesystem-plugin")]
     #[test]
     fn filesystem_bundle_provides_tui_file_change_visual_adapter() {

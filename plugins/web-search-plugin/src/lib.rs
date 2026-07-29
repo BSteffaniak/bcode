@@ -10,6 +10,10 @@ pub(crate) mod exa;
 
 use bcode_model_provider_runtime::ProviderRuntime;
 use bcode_plugin_sdk::prelude::*;
+use bcode_provider_auth_models::{
+    AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION, AuthMethodContribution, AuthProviderContribution,
+    AuthSecretField, AuthSecretValidation,
+};
 use bcode_tool::{
     ListToolsRequest, OP_INVOKE_TOOL, OP_LIST_TOOLS, TOOL_SERVICE_INTERFACE_ID, ToolArtifact,
     ToolDefinition, ToolInvocationLifecycleEvent, ToolInvocationLifecycleStage,
@@ -31,6 +35,10 @@ const DEFAULT_FETCH_MAX_BYTES: usize = 256 * 1024;
 const MAX_FETCH_BYTES: usize = 2 * 1024 * 1024;
 const USER_AGENT: &str = concat!("Bcode/", env!("CARGO_PKG_VERSION"));
 const WEB_SEARCH_PLUGIN_ID: &str = "bcode.web-search";
+const EXA_PROVIDER_ID: &str = "exa";
+const EXA_CREDENTIAL_ID: &str = "api_key";
+const EXA_STORAGE_KEY: &str = "EXA_API_KEY";
+const EXA_CANONICAL_SECRET_ID: &str = "bcode.web-search/exa/api_key";
 const WEB_SEARCH_REQUEST_SCHEMA: &str = "bcode.web-search.search_request";
 const WEB_FETCH_REQUEST_SCHEMA: &str = "bcode.web-search.fetch_request";
 const WEB_STATUS_REQUEST_SCHEMA: &str = "bcode.web-search.status_request";
@@ -96,6 +104,12 @@ impl Default for WebSearchPlugin {
 }
 
 impl RustPlugin for WebSearchPlugin {
+    fn register_auth_providers(&mut self, registrar: AuthRegistrar) -> Result<(), PluginError> {
+        registrar
+            .register(&exa_auth_provider_contribution())
+            .map_err(|error| PluginError::failed(format!("failed to register Exa auth: {error}")))
+    }
+
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         match context.request.interface_id.as_str() {
             TOOL_SERVICE_INTERFACE_ID => self.invoke_tool_service(&context),
@@ -104,6 +118,31 @@ impl RustPlugin for WebSearchPlugin {
                 "unsupported web search plugin service interface",
             ),
         }
+    }
+}
+
+fn exa_auth_provider_contribution() -> AuthProviderContribution {
+    AuthProviderContribution {
+        schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+        provider_id: EXA_PROVIDER_ID.to_owned(),
+        display_name: "Exa".to_owned(),
+        methods: vec![AuthMethodContribution::SecretFields {
+            method_id: "api_key".to_owned(),
+            display_name: "API key".to_owned(),
+            fields: vec![AuthSecretField {
+                credential_id: EXA_CREDENTIAL_ID.to_owned(),
+                storage_key: EXA_STORAGE_KEY.to_owned(),
+                prompt: "Exa API key".to_owned(),
+                optional: false,
+                validation: AuthSecretValidation {
+                    min_bytes: Some(1),
+                    max_bytes: Some(512),
+                    required_prefix: None,
+                },
+            }],
+            supports_verification: false,
+            supports_revocation: false,
+        }],
     }
 }
 
@@ -193,12 +232,14 @@ impl WebSearchPlugin {
             Ok(runtime) => runtime,
             Err(error) => return tool_error(format!("web runtime unavailable: {error}")),
         };
+        let credentials = ProviderCredentials::new(config);
         let progress = ProgressReporter::new(events, invocation.tool_call_id.clone());
         progress.emit(format!("search: query {}", request.query));
         match runtime.block_on(run_cancellable(
             search_async(
                 request,
                 plugin_config,
+                credentials,
                 Some(progress),
                 bridge,
                 invocation.tool_call_id.clone(),
@@ -271,8 +312,9 @@ fn invoke_status(config: &bcode_plugin_sdk::PluginConfigContext) -> ToolInvocati
         Ok(config) => config,
         Err(error) => return tool_error(error.to_string()),
     };
+    let credentials = ProviderCredentials::new(config);
     json_tool_response_with_artifact(
-        &status_response(&plugin_config),
+        &status_response(&plugin_config, &credentials),
         "web-status",
         "status",
         WEB_STATUS_SCHEMA,
@@ -396,16 +438,65 @@ struct ProviderConfig {
 enum SecretRef {
     Env { name: String },
     Sshenv,
-    Value { value: String },
 }
 
 impl SecretRef {
-    fn resolve(&self) -> Option<String> {
-        match self {
-            Self::Env { name } => env_value(&[name.as_str()]),
-            Self::Sshenv => None,
-            Self::Value { value } => Some(value.clone()),
+    fn resolve_legacy(&self) -> Option<String> {
+        if let Self::Env { name } = self {
+            return env_value(&[name.as_str()]);
         }
+        None
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialSource {
+    ExplicitReference,
+    IntegratedAuth,
+    EnvironmentFallback,
+}
+
+impl CredentialSource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitReference => "explicit_reference",
+            Self::IntegratedAuth => "integrated_auth",
+            Self::EnvironmentFallback => "environment_fallback",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ProviderCredentials {
+    secrets: std::collections::BTreeMap<String, String>,
+}
+
+impl ProviderCredentials {
+    fn new(config: &bcode_plugin_sdk::PluginConfigContext) -> Self {
+        Self {
+            secrets: config.secrets.clone(),
+        }
+    }
+
+    fn exa(&self, config: &ProviderConfig) -> Option<(&str, CredentialSource)> {
+        if let Some(value) = self.secrets.get(EXA_CANONICAL_SECRET_ID) {
+            let source = match config.api_key.as_ref() {
+                Some(SecretRef::Env { name }) if env_value(&[name.as_str()]).is_some() => {
+                    CredentialSource::ExplicitReference
+                }
+                Some(SecretRef::Sshenv) => CredentialSource::ExplicitReference,
+                _ => CredentialSource::IntegratedAuth,
+            };
+            return Some((value, source));
+        }
+        env_value(&[EXA_STORAGE_KEY]).map(|_| ("", CredentialSource::EnvironmentFallback))
+    }
+
+    fn exa_key(&self, _config: &ProviderConfig) -> Result<String, WebError> {
+        if let Some(value) = self.secrets.get(EXA_CANONICAL_SECRET_ID) {
+            return Ok(value.clone());
+        }
+        env_value(&[EXA_STORAGE_KEY]).ok_or(WebError::MissingProvider)
     }
 }
 
@@ -501,6 +592,8 @@ struct SearchStatus {
     available: bool,
     provider: Option<String>,
     quality: String,
+    credential_source: Option<String>,
+    credential_owner: Option<String>,
     configured_providers: Vec<String>,
     recommended: Vec<String>,
 }
@@ -670,13 +763,14 @@ enum WebError {
 async fn search_async(
     request: SearchRequest,
     config: WebSearchConfig,
+    credentials: ProviderCredentials,
     progress: Option<ProgressReporter>,
     bridge: ServiceBridge,
     invocation_id: String,
     preparation_descriptor: serde_json::Value,
 ) -> Result<SearchResponse, WebError> {
     validate_non_empty("query", &request.query)?;
-    let provider = search_provider(request.provider.as_deref(), &config)?;
+    let provider = search_provider(request.provider.as_deref(), &config, &credentials)?;
     if request.provider_options.is_some() && provider != "exa" {
         return Err(WebError::InvalidRequest(
             "provider_options are currently supported only when provider is exa".to_string(),
@@ -688,7 +782,7 @@ async fn search_async(
     let response = match provider.as_str() {
         "brave" => search_brave(request, &config).await,
         "tavily" => search_tavily(request, &config).await,
-        "exa" => search_exa(request, &config).await,
+        "exa" => search_exa(request, &config, &credentials).await,
         "perplexity" | "pplx" => search_perplexity(request, &config).await,
         "gemini" | "google_gemini" => search_gemini(request, &config).await,
         "serper" => search_serper(request, &config).await,
@@ -958,8 +1052,9 @@ async fn search_tavily(
 async fn search_exa(
     request: SearchRequest,
     config: &WebSearchConfig,
+    credentials: &ProviderCredentials,
 ) -> Result<SearchResponse, WebError> {
-    let api_key = provider_key(&config.providers.exa, &["EXA_API_KEY"])?;
+    let api_key = credentials.exa_key(&config.providers.exa)?;
     let max_results = max_results(&request, config);
     let client = client(request.timeout_ms.or(config.timeout_ms))?;
     let results = exa::search(
@@ -1664,8 +1759,9 @@ fn web_tool_definitions(config: &bcode_plugin_sdk::PluginConfigContext) -> Vec<T
     let plugin_config = config
         .typed_or_default::<WebSearchConfig>()
         .unwrap_or_else(|_| WebSearchConfig::default());
+    let credentials = ProviderCredentials::new(config);
     let mut tools = Vec::new();
-    if search_provider(None, &plugin_config).is_ok() {
+    if search_provider(None, &plugin_config, &credentials).is_ok() {
         tools.push(search_tool_definition());
     }
     tools.push(fetch_tool_definition());
@@ -1876,19 +1972,31 @@ fn is_youtube_url(lower_url: &str) -> bool {
     lower_url.contains("youtube.com/watch") || lower_url.contains("youtu.be/")
 }
 
-fn status_response(config: &WebSearchConfig) -> WebStatusResponse {
-    let provider = search_provider(None, config).ok();
-    let configured = configured_search_providers(config);
+fn status_response(
+    config: &WebSearchConfig,
+    credentials: &ProviderCredentials,
+) -> WebStatusResponse {
+    let provider = search_provider(None, config, credentials).ok();
+    let configured = configured_search_providers(config, credentials);
     let available = provider
         .as_deref()
-        .is_some_and(|provider| search_provider_available(provider, config));
+        .is_some_and(|provider| search_provider_available(provider, config, credentials));
+    let credential = provider
+        .as_deref()
+        .filter(|provider| *provider == EXA_PROVIDER_ID)
+        .and_then(|_| credentials.exa(&config.providers.exa));
     let quality = provider
         .as_deref()
         .filter(|_| available)
         .map_or("unavailable", provider_quality)
         .to_string();
     let mut recommended = Vec::new();
-    if let Some(provider) = provider.as_deref().filter(|_| !available) {
+    if matches!(provider.as_deref(), Some(EXA_PROVIDER_ID)) && !available {
+        recommended.push(
+            "Run `bcode auth login exa`, configure an explicit environment reference, or set EXA_API_KEY."
+                .to_owned(),
+        );
+    } else if let Some(provider) = provider.as_deref().filter(|_| !available) {
         recommended.push(format!(
             "The selected {provider} search provider is missing required credentials or host capability."
         ));
@@ -1904,6 +2012,8 @@ fn status_response(config: &WebSearchConfig) -> WebStatusResponse {
             available,
             provider,
             quality,
+            credential_source: credential.map(|(_, source)| source.as_str().to_owned()),
+            credential_owner: credential.map(|_| WEB_SEARCH_PLUGIN_ID.to_owned()),
             configured_providers: configured,
             recommended,
         },
@@ -1924,7 +2034,11 @@ fn status_response(config: &WebSearchConfig) -> WebStatusResponse {
     }
 }
 
-fn search_provider_available(provider: &str, config: &WebSearchConfig) -> bool {
+fn search_provider_available(
+    provider: &str,
+    config: &WebSearchConfig,
+    credentials: &ProviderCredentials,
+) -> bool {
     match provider {
         "brave" => provider_key(
             &config.providers.brave,
@@ -1932,7 +2046,7 @@ fn search_provider_available(provider: &str, config: &WebSearchConfig) -> bool {
         )
         .is_ok(),
         "tavily" => provider_key(&config.providers.tavily, &["TAVILY_API_KEY"]).is_ok(),
-        "exa" => provider_key(&config.providers.exa, &["EXA_API_KEY"]).is_ok(),
+        "exa" => credentials.exa(&config.providers.exa).is_some(),
         "perplexity" | "pplx" => provider_key(
             &config.providers.perplexity,
             &["PERPLEXITY_API_KEY", "PPLX_API_KEY"],
@@ -1961,14 +2075,17 @@ fn provider_quality(provider: &str) -> &'static str {
     }
 }
 
-fn configured_search_providers(config: &WebSearchConfig) -> Vec<String> {
+fn configured_search_providers(
+    config: &WebSearchConfig,
+    credentials: &ProviderCredentials,
+) -> Vec<String> {
     let mut providers = Vec::new();
     if config
         .providers
         .brave
         .api_key
         .as_ref()
-        .and_then(SecretRef::resolve)
+        .and_then(SecretRef::resolve_legacy)
         .is_some()
         || env_value(&["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"]).is_some()
     {
@@ -1979,21 +2096,13 @@ fn configured_search_providers(config: &WebSearchConfig) -> Vec<String> {
         .tavily
         .api_key
         .as_ref()
-        .and_then(SecretRef::resolve)
+        .and_then(SecretRef::resolve_legacy)
         .is_some()
         || env_value(&["TAVILY_API_KEY"]).is_some()
     {
         providers.push("tavily".to_string());
     }
-    if config
-        .providers
-        .exa
-        .api_key
-        .as_ref()
-        .and_then(SecretRef::resolve)
-        .is_some()
-        || env_value(&["EXA_API_KEY"]).is_some()
-    {
+    if credentials.exa(&config.providers.exa).is_some() {
         providers.push("exa".to_string());
     }
     if config
@@ -2001,7 +2110,7 @@ fn configured_search_providers(config: &WebSearchConfig) -> Vec<String> {
         .perplexity
         .api_key
         .as_ref()
-        .and_then(SecretRef::resolve)
+        .and_then(SecretRef::resolve_legacy)
         .is_some()
         || env_value(&["PERPLEXITY_API_KEY", "PPLX_API_KEY"]).is_some()
     {
@@ -2012,7 +2121,7 @@ fn configured_search_providers(config: &WebSearchConfig) -> Vec<String> {
         .gemini
         .api_key
         .as_ref()
-        .and_then(SecretRef::resolve)
+        .and_then(SecretRef::resolve_legacy)
         .is_some()
         || env_value(&["GEMINI_API_KEY", "GOOGLE_API_KEY"]).is_some()
     {
@@ -2023,7 +2132,7 @@ fn configured_search_providers(config: &WebSearchConfig) -> Vec<String> {
         .serper
         .api_key
         .as_ref()
-        .and_then(SecretRef::resolve)
+        .and_then(SecretRef::resolve_legacy)
         .is_some()
         || env_value(&["SERPER_API_KEY"]).is_some()
     {
@@ -2034,7 +2143,7 @@ fn configured_search_providers(config: &WebSearchConfig) -> Vec<String> {
         .serpapi
         .api_key
         .as_ref()
-        .and_then(SecretRef::resolve)
+        .and_then(SecretRef::resolve_legacy)
         .is_some()
         || env_value(&["SERPAPI_API_KEY"]).is_some()
     {
@@ -2114,7 +2223,11 @@ fn explicit_search_provider(provider: &str) -> Result<String, WebError> {
     }
 }
 
-fn search_provider(explicit: Option<&str>, config: &WebSearchConfig) -> Result<String, WebError> {
+fn search_provider(
+    explicit: Option<&str>,
+    config: &WebSearchConfig,
+    credentials: &ProviderCredentials,
+) -> Result<String, WebError> {
     let provider = explicit
         .map(str::to_string)
         .or_else(|| config.provider.clone())
@@ -2130,7 +2243,7 @@ fn search_provider(explicit: Option<&str>, config: &WebSearchConfig) -> Result<S
         .brave
         .api_key
         .as_ref()
-        .and_then(SecretRef::resolve)
+        .and_then(SecretRef::resolve_legacy)
         .is_some()
         || env_value(&["BCODE_WEB_SEARCH_API_KEY", "BRAVE_SEARCH_API_KEY"]).is_some()
     {
@@ -2141,21 +2254,13 @@ fn search_provider(explicit: Option<&str>, config: &WebSearchConfig) -> Result<S
         .tavily
         .api_key
         .as_ref()
-        .and_then(SecretRef::resolve)
+        .and_then(SecretRef::resolve_legacy)
         .is_some()
         || env_value(&["TAVILY_API_KEY"]).is_some()
     {
         return Ok("tavily".to_string());
     }
-    if config
-        .providers
-        .exa
-        .api_key
-        .as_ref()
-        .and_then(SecretRef::resolve)
-        .is_some()
-        || env_value(&["EXA_API_KEY"]).is_some()
-    {
+    if credentials.exa(&config.providers.exa).is_some() {
         return Ok("exa".to_string());
     }
     if config
@@ -2163,7 +2268,7 @@ fn search_provider(explicit: Option<&str>, config: &WebSearchConfig) -> Result<S
         .perplexity
         .api_key
         .as_ref()
-        .and_then(SecretRef::resolve)
+        .and_then(SecretRef::resolve_legacy)
         .is_some()
         || env_value(&["PERPLEXITY_API_KEY", "PPLX_API_KEY"]).is_some()
     {
@@ -2174,7 +2279,7 @@ fn search_provider(explicit: Option<&str>, config: &WebSearchConfig) -> Result<S
         .gemini
         .api_key
         .as_ref()
-        .and_then(SecretRef::resolve)
+        .and_then(SecretRef::resolve_legacy)
         .is_some()
         || env_value(&["GEMINI_API_KEY", "GOOGLE_API_KEY"]).is_some()
     {
@@ -2185,7 +2290,7 @@ fn search_provider(explicit: Option<&str>, config: &WebSearchConfig) -> Result<S
         .serper
         .api_key
         .as_ref()
-        .and_then(SecretRef::resolve)
+        .and_then(SecretRef::resolve_legacy)
         .is_some()
         || env_value(&["SERPER_API_KEY"]).is_some()
     {
@@ -2196,7 +2301,7 @@ fn search_provider(explicit: Option<&str>, config: &WebSearchConfig) -> Result<S
         .serpapi
         .api_key
         .as_ref()
-        .and_then(SecretRef::resolve)
+        .and_then(SecretRef::resolve_legacy)
         .is_some()
         || env_value(&["SERPAPI_API_KEY"]).is_some()
     {
@@ -2241,7 +2346,7 @@ fn provider_key(config: &ProviderConfig, names: &[&str]) -> Result<String, WebEr
     config
         .api_key
         .as_ref()
-        .and_then(SecretRef::resolve)
+        .and_then(SecretRef::resolve_legacy)
         .or_else(|| env_value(names))
         .ok_or(WebError::MissingProvider)
 }
@@ -2640,6 +2745,198 @@ bcode_plugin_sdk::export_plugin!(WebSearchPlugin, include_str!("../bcode-plugin.
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static AUTH_REGISTRATIONS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+    static EXA_ENV: Mutex<()> = Mutex::new(());
+
+    struct ExaEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ExaEnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let lock = EXA_ENV.lock().expect("Exa environment lock");
+            let previous = std::env::var_os(EXA_STORAGE_KEY);
+            unsafe {
+                if let Some(value) = value {
+                    std::env::set_var(EXA_STORAGE_KEY, value);
+                } else {
+                    std::env::remove_var(EXA_STORAGE_KEY);
+                }
+            }
+            Self {
+                _lock: lock,
+                previous,
+            }
+        }
+    }
+
+    impl Drop for ExaEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                if let Some(previous) = &self.previous {
+                    std::env::set_var(EXA_STORAGE_KEY, previous);
+                } else {
+                    std::env::remove_var(EXA_STORAGE_KEY);
+                }
+            }
+        }
+    }
+
+    extern "C" fn collect_auth_registration(
+        payload: *const u8,
+        payload_len: usize,
+        _user_data: *mut std::ffi::c_void,
+    ) {
+        let payload = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+        AUTH_REGISTRATIONS
+            .lock()
+            .expect("auth registration collector")
+            .push(payload.to_vec());
+    }
+
+    fn plugin_context_with_exa(secret: Option<&str>) -> bcode_plugin_sdk::PluginConfigContext {
+        let mut context = bcode_plugin_sdk::PluginConfigContext::default();
+        if let Some(secret) = secret {
+            context
+                .secrets
+                .insert(EXA_CANONICAL_SECRET_ID.to_owned(), secret.to_owned());
+        }
+        context
+    }
+
+    #[test]
+    fn plugin_registers_exa_dynamically() {
+        AUTH_REGISTRATIONS
+            .lock()
+            .expect("auth registration collector")
+            .clear();
+        let mut plugin = WebSearchPlugin::default();
+        plugin
+            .register_auth_providers(AuthRegistrar::new(
+                Some(collect_auth_registration),
+                std::ptr::null_mut(),
+            ))
+            .expect("Exa registration succeeds");
+        let registrations = AUTH_REGISTRATIONS
+            .lock()
+            .expect("auth registration collector");
+        assert_eq!(registrations.len(), 1);
+        let contribution: AuthProviderContribution =
+            serde_json::from_slice(&registrations[0]).expect("registration decodes");
+        drop(registrations);
+        assert_eq!(contribution, exa_auth_provider_contribution());
+    }
+
+    #[test]
+    fn auth_contribution_declares_exa_api_key_contract() {
+        let contribution = exa_auth_provider_contribution();
+        contribution.validate().expect("valid Exa contribution");
+        assert_eq!(contribution.provider_id, EXA_PROVIDER_ID);
+        assert_eq!(contribution.methods.len(), 1);
+        let AuthMethodContribution::SecretFields {
+            method_id,
+            fields,
+            supports_verification,
+            supports_revocation,
+            ..
+        } = &contribution.methods[0]
+        else {
+            panic!("Exa must use generic secret-field enrollment");
+        };
+        assert_eq!(method_id, "api_key");
+        assert!(!supports_verification);
+        assert!(!supports_revocation);
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].credential_id, EXA_CREDENTIAL_ID);
+        assert_eq!(fields[0].storage_key, EXA_STORAGE_KEY);
+    }
+
+    #[test]
+    fn integrated_exa_credential_has_canonical_owner_and_redacted_status() {
+        let config = WebSearchConfig {
+            provider: Some(EXA_PROVIDER_ID.to_owned()),
+            ..WebSearchConfig::default()
+        };
+        let context = plugin_context_with_exa(Some("integrated-test-secret"));
+        let credentials = ProviderCredentials::new(&context);
+        assert_eq!(
+            credentials.exa_key(&config.providers.exa).expect("Exa key"),
+            "integrated-test-secret"
+        );
+        let status = status_response(&config, &credentials);
+        assert!(status.search.available);
+        assert_eq!(
+            status.search.credential_source.as_deref(),
+            Some("integrated_auth")
+        );
+        assert_eq!(
+            status.search.credential_owner.as_deref(),
+            Some(WEB_SEARCH_PLUGIN_ID)
+        );
+        let encoded = serde_json::to_string(&status).expect("status encodes");
+        assert!(!encoded.contains("integrated-test-secret"));
+    }
+
+    #[test]
+    fn explicit_reference_is_reported_without_exposing_value() {
+        let _env = ExaEnvGuard::set(None);
+        unsafe {
+            std::env::set_var(
+                "BCODE_TEST_EXA_EXPLICIT_REFERENCE",
+                "explicit-reference-secret",
+            );
+        }
+        let config = WebSearchConfig {
+            provider: Some(EXA_PROVIDER_ID.to_owned()),
+            providers: WebSearchProviderConfig {
+                exa: ProviderConfig {
+                    api_key: Some(SecretRef::Env {
+                        name: "BCODE_TEST_EXA_EXPLICIT_REFERENCE".to_owned(),
+                    }),
+                },
+                ..WebSearchProviderConfig::default()
+            },
+            ..WebSearchConfig::default()
+        };
+        let context = plugin_context_with_exa(Some("explicit-reference-secret"));
+        let credentials = ProviderCredentials::new(&context);
+        let status = status_response(&config, &credentials);
+        unsafe {
+            std::env::remove_var("BCODE_TEST_EXA_EXPLICIT_REFERENCE");
+        }
+        assert!(status.search.available);
+        assert_eq!(
+            status.search.credential_source.as_deref(),
+            Some("explicit_reference")
+        );
+        assert!(
+            !serde_json::to_string(&status)
+                .expect("status encodes")
+                .contains("explicit-reference-secret")
+        );
+    }
+
+    #[test]
+    fn conventional_exa_environment_fallback_is_available_and_redacted() {
+        let _env = ExaEnvGuard::set(Some("environment-fallback-secret"));
+        let config = WebSearchConfig {
+            provider: Some(EXA_PROVIDER_ID.to_owned()),
+            ..WebSearchConfig::default()
+        };
+        let context = plugin_context_with_exa(None);
+        let credentials = ProviderCredentials::new(&context);
+        let status = status_response(&config, &credentials);
+        assert!(status.search.available);
+        assert_eq!(
+            status.search.credential_source.as_deref(),
+            Some("environment_fallback")
+        );
+        let encoded = serde_json::to_string(&status).expect("status encodes");
+        assert!(!encoded.contains("environment-fallback-secret"));
+    }
 
     #[test]
     fn web_tools_emit_mapped_request_contributions() {
@@ -2832,44 +3129,57 @@ mod tests {
 
     #[test]
     fn auto_provider_uses_best_effort_fallback_by_default() {
-        let provider = search_provider(None, &WebSearchConfig::default())
+        let _env = ExaEnvGuard::set(None);
+        let context = plugin_context_with_exa(None);
+        let credentials = ProviderCredentials::new(&context);
+        let provider = search_provider(None, &WebSearchConfig::default(), &credentials)
             .expect("best-effort fallback should resolve");
         assert_eq!(provider, "duckduckgo_html");
     }
 
     #[test]
     fn auto_provider_can_disable_best_effort_fallback() {
+        let _env = ExaEnvGuard::set(None);
         let config = WebSearchConfig {
             allow_best_effort_no_key: false,
             ..WebSearchConfig::default()
         };
-        assert!(search_provider(None, &config).is_err());
+        let context = plugin_context_with_exa(None);
+        let credentials = ProviderCredentials::new(&context);
+        assert!(search_provider(None, &config, &credentials).is_err());
     }
 
     #[test]
     fn explicit_provider_names_are_validated() {
         assert_eq!(
-            search_provider(Some("exa"), &WebSearchConfig::default()).expect("exa"),
+            search_provider(
+                Some("exa"),
+                &WebSearchConfig::default(),
+                &ProviderCredentials::new(&plugin_context_with_exa(None)),
+            )
+            .expect("exa"),
             "exa"
         );
-        assert!(search_provider(Some("unknown-provider"), &WebSearchConfig::default()).is_err());
+        assert!(
+            search_provider(
+                Some("unknown-provider"),
+                &WebSearchConfig::default(),
+                &ProviderCredentials::new(&plugin_context_with_exa(None)),
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn auto_provider_prefers_configured_exa() {
-        let config = WebSearchConfig {
-            providers: WebSearchProviderConfig {
-                exa: ProviderConfig {
-                    api_key: Some(SecretRef::Value {
-                        value: "test-only".to_string(),
-                    }),
-                },
-                ..WebSearchProviderConfig::default()
-            },
-            ..WebSearchConfig::default()
-        };
-        assert_eq!(search_provider(None, &config).expect("exa"), "exa");
-        let status = status_response(&config);
+        let config = WebSearchConfig::default();
+        let context = plugin_context_with_exa(Some("test-only"));
+        let credentials = ProviderCredentials::new(&context);
+        assert_eq!(
+            search_provider(None, &config, &credentials).expect("exa"),
+            "exa"
+        );
+        let status = status_response(&config, &credentials);
         assert_eq!(status.search.provider.as_deref(), Some("exa"));
         assert!(
             status
@@ -2883,17 +3193,11 @@ mod tests {
     fn status_reports_configured_exa_without_exposing_key() {
         let config = WebSearchConfig {
             provider: Some("exa".to_string()),
-            providers: WebSearchProviderConfig {
-                exa: ProviderConfig {
-                    api_key: Some(SecretRef::Value {
-                        value: "status-test-secret".to_string(),
-                    }),
-                },
-                ..WebSearchProviderConfig::default()
-            },
             ..WebSearchConfig::default()
         };
-        let status = status_response(&config);
+        let context = plugin_context_with_exa(Some("status-test-secret"));
+        let credentials = ProviderCredentials::new(&context);
+        let status = status_response(&config, &credentials);
         assert_eq!(status.search.provider.as_deref(), Some("exa"));
         assert!(status.search.available);
         assert_eq!(status.search.quality, "configured_api");
@@ -2907,7 +3211,9 @@ mod tests {
             provider: Some("exa".to_string()),
             ..WebSearchConfig::default()
         };
-        let status = status_response(&config);
+        let context = plugin_context_with_exa(None);
+        let credentials = ProviderCredentials::new(&context);
+        let status = status_response(&config, &credentials);
         assert_eq!(status.search.provider.as_deref(), Some("exa"));
         assert!(!status.search.available);
         assert_eq!(status.search.quality, "unavailable");
@@ -2918,26 +3224,25 @@ mod tests {
                 .iter()
                 .all(|provider| provider != "exa")
         );
-        assert!(status.search.recommended.iter().any(|message| {
-            message.contains("exa") && message.contains("missing required credentials")
-        }));
+        assert!(
+            status
+                .search
+                .recommended
+                .iter()
+                .any(|message| { message.contains("bcode auth login exa") })
+        );
     }
 
     #[test]
-    fn auto_provider_prefers_perplexity_when_keyed() {
-        let config = WebSearchConfig {
-            allow_best_effort_no_key: true,
-            providers: WebSearchProviderConfig {
-                perplexity: ProviderConfig {
-                    api_key: Some(SecretRef::Value {
-                        value: "pplx-test".to_string(),
-                    }),
-                },
-                ..WebSearchProviderConfig::default()
-            },
-            ..WebSearchConfig::default()
-        };
-        let provider = search_provider(None, &config).expect("perplexity provider");
+    fn explicit_perplexity_provider_is_accepted_without_credentials() {
+        let context = plugin_context_with_exa(None);
+        let credentials = ProviderCredentials::new(&context);
+        let provider = search_provider(
+            Some("perplexity"),
+            &WebSearchConfig::default(),
+            &credentials,
+        )
+        .expect("perplexity provider");
         assert_eq!(provider, "perplexity");
     }
 
@@ -2956,7 +3261,11 @@ mod tests {
 
     #[test]
     fn status_reports_default_search_and_fetch_capabilities() {
-        let status = status_response(&WebSearchConfig::default());
+        let context = plugin_context_with_exa(None);
+        let status = status_response(
+            &WebSearchConfig::default(),
+            &ProviderCredentials::new(&context),
+        );
         assert!(status.search.available);
         assert_eq!(status.search.provider.as_deref(), Some("duckduckgo_html"));
         assert_eq!(status.search.quality, "best_effort");

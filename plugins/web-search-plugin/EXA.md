@@ -3,16 +3,35 @@
 Exa support is owned by the bundled `bcode.web-search` plugin. Bcode's generic tool and
 runtime packages do not interpret Exa requests or responses.
 
-## Configure the API key
+## Configure authentication
 
-Keep the key outside the repository:
+The preferred integrated flow uses Bcode's generic plugin-auth CLI:
+
+```sh
+bcode auth providers          # includes exa when bcode.web-search is enabled
+bcode auth login exa          # securely prompts for and stores the key
+bcode auth status exa
+```
+
+This requires neither an exported key nor an `sshenv run` wrapper. The web-search plugin
+registers Exa dynamically, while Bcode owns enrollment, secure storage, ownership checks,
+and invocation-scoped secret delivery.
+
+To force Exa instead of automatic provider selection, configure:
+
+```toml
+[web_search]
+provider = "exa"
+```
+
+Environment-based compatibility remains available. Keep the key outside the repository:
 
 ```sh
 export EXA_API_KEY="..."
 export BCODE_WEB_SEARCH_PROVIDER="exa" # optional; forces Exa over earlier auto providers
 ```
 
-Or reference the environment from Bcode configuration:
+Or reference the environment explicitly from Bcode configuration:
 
 ```toml
 [web_search]
@@ -23,8 +42,9 @@ backend = "env"
 name = "EXA_API_KEY"
 ```
 
-Run `web.status` to confirm Exa is selected. Status output reports availability but never
-the key value.
+Credential precedence is explicit configured reference, selected integrated auth profile,
+then conventional `EXA_API_KEY` fallback. Run `web.status` to confirm Exa is selected.
+Status reports availability, credential source, and owner, but never the key value.
 
 ## Searches
 
@@ -95,8 +115,9 @@ counts low on a free plan and request those modes only when needed.
 
 ## Live smoke testing
 
-Normal tests never call Exa. To smoke-test manually, provide the key through the
-environment, rebuild `bcode_web_search_plugin`, check `web.status`, and make one low-result
-explicit Exa search. Never put the key in command arguments, fixtures, snapshots, or logs.
-Authentication failures identify `EXA_API_KEY`; quota failures report the limit without
-including provider response secrets.
+Normal tests never call Exa. To smoke-test manually, enroll through `bcode auth login exa`
+(or explicitly provide `EXA_API_KEY` for compatibility), rebuild `bcode_web_search_plugin`,
+check `bcode auth status exa` and `web.status`, and make one low-result explicit Exa search.
+Never put the key in command arguments, fixtures, snapshots, or logs. Authentication failures
+identify the missing credential; quota failures report the limit without including provider
+response secrets.
