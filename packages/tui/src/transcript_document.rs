@@ -1,11 +1,27 @@
 //! Revision-tracked transcript document for TUI projection invalidation.
 
 use super::transcript::TranscriptItem;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// Scope of one shared transcript adaptation.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TranscriptDocumentDamage {
+    /// No terminal item changed.
+    #[default]
+    None,
+    /// Existing items changed in place.
+    Items(BTreeSet<bcode_session_view_models::TranscriptViewItemId>),
+    /// Item membership or ordering changed.
+    Structural,
+    /// The source index was inconsistent and required a full reset.
+    FullReset,
+}
 
 /// Transcript items plus a collection-level revision.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TranscriptDocument {
     items: Vec<TranscriptItem>,
+    source_indices: BTreeMap<bcode_session_view_models::TranscriptViewItemId, usize>,
     revision: u64,
 }
 
@@ -27,6 +43,31 @@ impl TranscriptDocument {
     #[must_use]
     pub const fn len(&self) -> usize {
         self.items.len()
+    }
+
+    /// Return the terminal index for a shared source item.
+    #[must_use]
+    pub fn source_index(
+        &self,
+        id: &bcode_session_view_models::TranscriptViewItemId,
+    ) -> Option<usize> {
+        self.source_indices.get(id).copied()
+    }
+
+    /// Return whether the maintained source index matches current items.
+    #[must_use]
+    pub fn source_index_is_consistent(&self) -> bool {
+        self.items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| item.source_view_item_id().map(|id| (id, index)))
+            .all(|(id, index)| self.source_indices.get(id) == Some(&index))
+            && self.source_indices.len()
+                == self
+                    .items
+                    .iter()
+                    .filter(|item| item.source_view_item_id().is_some())
+                    .count()
     }
 
     /// Return an item by index.
@@ -66,19 +107,26 @@ impl TranscriptDocument {
             .source_view_item_id()
             .expect("shared transcript item must carry source identity")
             .clone();
-        if let Some(index) = self
-            .items
-            .iter()
-            .position(|existing| existing.source_view_item_id() == Some(&source_id))
-        {
+        if let Some(index) = self.source_indices.get(&source_id).copied() {
+            if self
+                .items
+                .get(index)
+                .and_then(TranscriptItem::source_view_item_id)
+                != Some(&source_id)
+            {
+                self.rebuild_source_indices();
+                return self.upsert_shared_item(item);
+            }
             if self.items[index].replace_from_shared(item) {
                 self.bump_revision();
             }
             return index;
         }
         self.items.push(item);
+        let index = self.items.len().saturating_sub(1);
+        self.source_indices.insert(source_id, index);
         self.bump_revision();
-        self.items.len().saturating_sub(1)
+        index
     }
 
     /// Reorder shared items to canonical source order while preserving local-only items.
@@ -109,6 +157,7 @@ impl TranscriptDocument {
             .cloned()
             .collect::<Vec<_>>();
         if before != after {
+            self.rebuild_source_indices();
             self.bump_revision();
         }
     }
@@ -122,7 +171,12 @@ impl TranscriptDocument {
 
     /// Push a transcript item and bump the collection revision.
     pub fn push(&mut self, item: TranscriptItem) {
+        let source_id = item.source_view_item_id().cloned();
         self.items.push(item);
+        if let Some(id) = source_id {
+            self.source_indices
+                .insert(id, self.items.len().saturating_sub(1));
+        }
         self.bump_revision();
     }
 
@@ -131,6 +185,7 @@ impl TranscriptDocument {
         let before = self.items.len();
         self.items.retain(|item| predicate(item));
         if self.items.len() != before {
+            self.rebuild_source_indices();
             self.bump_revision();
         }
     }
@@ -138,6 +193,7 @@ impl TranscriptDocument {
     /// Replace all transcript items and bump the collection revision.
     pub fn replace(&mut self, items: Vec<TranscriptItem>) {
         self.items = items;
+        self.rebuild_source_indices();
         self.bump_revision();
     }
 
@@ -151,6 +207,24 @@ impl TranscriptDocument {
         update(&mut self.items[index]);
         self.bump_revision();
         Some(index)
+    }
+
+    #[cfg(test)]
+    pub fn corrupt_source_index_for_test(
+        &mut self,
+        id: bcode_session_view_models::TranscriptViewItemId,
+        index: usize,
+    ) {
+        self.source_indices.insert(id, index);
+    }
+
+    fn rebuild_source_indices(&mut self) {
+        self.source_indices = self
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| item.source_view_item_id().cloned().map(|id| (id, index)))
+            .collect();
     }
 
     const fn bump_revision(&mut self) {

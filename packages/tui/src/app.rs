@@ -36,7 +36,7 @@ use super::pending_submissions::PendingSubmissions;
 use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
 use super::transcript::{TranscriptItem, TranscriptItemKind, terminal_item_from_shared};
-use super::transcript_document::TranscriptDocument;
+use super::transcript_document::{TranscriptDocument, TranscriptDocumentDamage};
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
 use super::transcript_resident_window::{TranscriptResidentWindow, TranscriptWindowPolicy};
 use super::transcript_viewport::TranscriptViewport;
@@ -234,29 +234,48 @@ impl SessionViewTerminalAdapter {
         &mut self,
         source: &bcode_session_view_models::TranscriptViewDocument,
         target: &mut TranscriptDocument,
-    ) {
+    ) -> TranscriptDocumentDamage {
+        if !target.source_index_is_consistent() {
+            target.replace(source.items.iter().map(terminal_item_from_shared).collect());
+            self.item_revisions = source
+                .items
+                .iter()
+                .map(|item| (item.id.clone(), item.revision))
+                .collect();
+            self.document_revision = Some(source.revision);
+            return TranscriptDocumentDamage::FullReset;
+        }
         let source_items = source.items.iter();
         let ordered_source_ids = source_items
             .clone()
             .map(|item| item.id.clone())
             .collect::<Vec<_>>();
         let source_ids = ordered_source_ids.iter().cloned().collect::<BTreeSet<_>>();
+        let previous_ids = self.item_revisions.keys().cloned().collect::<BTreeSet<_>>();
+        let structural = source_ids != previous_ids;
+        let mut changed = BTreeSet::new();
         target.retain(|item| {
             item.source_view_item_id()
                 .is_none_or(|id| source_ids.contains(id))
         });
         self.item_revisions.retain(|id, _| source_ids.contains(id));
         for item in source_items {
-            let target_has_item = target
-                .iter()
-                .any(|existing| existing.source_view_item_id() == Some(&item.id));
+            let target_has_item = target.source_index(&item.id).is_some();
             if !target_has_item || self.item_revisions.get(&item.id) != Some(&item.revision) {
                 target.upsert_shared_item(terminal_item_from_shared(item));
                 self.item_revisions.insert(item.id.clone(), item.revision);
+                changed.insert(item.id.clone());
             }
         }
         target.reorder_shared_items(&ordered_source_ids);
         self.document_revision = Some(source.revision);
+        if structural {
+            TranscriptDocumentDamage::Structural
+        } else if changed.is_empty() {
+            TranscriptDocumentDamage::None
+        } else {
+            TranscriptDocumentDamage::Items(changed)
+        }
     }
 }
 
@@ -3143,11 +3162,11 @@ impl BmuxApp {
         }
     }
 
-    fn apply_session_view_terminal_adapter(&mut self) {
+    fn apply_session_view_terminal_adapter(&mut self) -> TranscriptDocumentDamage {
         self.session_view_terminal_adapter.apply(
             &self.session_view.snapshot().transcript,
             &mut self.transcript,
-        );
+        )
     }
 
     fn shared_terminal_item(&self, sequence: u64) -> Option<TranscriptItem> {
@@ -4695,6 +4714,40 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn adapter_reports_item_damage_and_escalates_index_mismatch_to_full_reset() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let live = |text: &str| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::AssistantTextDelta {
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                text: text.to_owned(),
+            },
+        };
+        app.session_view.apply_live_event(&live("first"));
+        assert_eq!(
+            app.apply_session_view_terminal_adapter(),
+            TranscriptDocumentDamage::Structural
+        );
+        app.session_view.apply_live_event(&live(" second"));
+        assert!(matches!(
+            app.apply_session_view_terminal_adapter(),
+            TranscriptDocumentDamage::Items(ids) if ids.len() == 1
+        ));
+        let id = bcode_session_view_models::TranscriptViewItemId::new(
+            "assistant-turn:turn-1:segment:segment-0",
+        );
+        app.transcript.corrupt_source_index_for_test(id, usize::MAX);
+        assert_eq!(
+            app.apply_session_view_terminal_adapter(),
+            TranscriptDocumentDamage::FullReset
+        );
+        assert!(app.transcript.source_index_is_consistent());
     }
 
     #[test]
