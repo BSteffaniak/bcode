@@ -13,6 +13,9 @@ jobs:
   windows:
     name: Windows workspace
     runs-on: windows-latest
+    timeout-minutes: 180
+    env:
+      CARGO_TERM_COLOR: always
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -99,9 +102,10 @@ jobs:
         with:
           name: bcode-windows-ci-diagnostics-${{ github.run_id }}
           path: |
-            target/dist/
-            target/debug/build/bcode_tesseract_sys-*/out/bundled-runtimes/
-            target/x86_64-pc-windows-msvc/release/build/bcode_tesseract_sys-*/out/bundled-runtimes/
+            target/dist/*.sha256
+            target/dist/staging/*/bcode-runtimes/tesseract/manifest.json
+            target/debug/build/bcode_tesseract_sys-*/out/bundled-runtimes/*/tessdata/*.traineddata
+            target/x86_64-pc-windows-msvc/release/build/bcode_tesseract_sys-*/out/bundled-runtimes/*/tessdata/*.traineddata
           if-no-files-found: ignore
 
       - name: Upload Windows CI artifact
