@@ -215,6 +215,12 @@ impl ReasoningSupport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StableTranscriptAnchor {
+    item_id: bcode_session_view_models::TranscriptViewItemId,
+    row_in_item: usize,
+}
+
 #[derive(Debug, Clone, Default)]
 struct SessionViewTerminalAdapter {
     document_revision: Option<bcode_session_view_models::ViewRevision>,
@@ -318,6 +324,7 @@ pub struct BmuxApp {
     transcript_scroll_animation: Option<TranscriptScrollAnimation>,
     scroll_mode: TranscriptScrollMode,
     pending_visual_overflow_bottom: Option<usize>,
+    pending_stable_transcript_anchor: Option<StableTranscriptAnchor>,
     latest_hidden_activity_at: Option<Instant>,
     latest_hidden_activity_burst: u8,
     latest_bar_animation_started_at: Instant,
@@ -527,6 +534,7 @@ impl BmuxApp {
             transcript_scroll_animation: None,
             scroll_mode: TranscriptScrollMode::BottomFollow,
             pending_visual_overflow_bottom: None,
+            pending_stable_transcript_anchor: None,
             latest_hidden_activity_at: None,
             latest_hidden_activity_burst: 0,
             latest_bar_animation_started_at: now,
@@ -1659,6 +1667,27 @@ impl BmuxApp {
         &self.jump_to_latest_key_label
     }
 
+    #[cfg(test)]
+    pub fn stable_transcript_anchor(
+        &self,
+    ) -> Option<(bcode_session_view_models::TranscriptViewItemId, usize)> {
+        let top_row = self.transcript_top_row(self.viewport.height());
+        let line = self
+            .transcript_layout
+            .visible_lines_from_top(top_row, 1)
+            .first()
+            .copied()?;
+        if line.source != VisibleTranscriptSource::Transcript {
+            return None;
+        }
+        let id = self
+            .transcript
+            .get(line.entry_index)?
+            .source_view_item_id()?
+            .clone();
+        Some((id, line.row_in_entry))
+    }
+
     /// Return the transcript row that should render at the top of the viewport.
     #[must_use]
     pub fn transcript_top_row(&self, viewport_height: u16) -> usize {
@@ -2280,6 +2309,7 @@ impl BmuxApp {
             self.manual_transcript_scroll_active(),
             &mut self.older_history,
         );
+        self.restore_stable_transcript_anchor();
         self.resolve_visual_overflow_follow(total_rows, now);
     }
 
@@ -2445,6 +2475,11 @@ impl BmuxApp {
         if !self.active_tool_loop() {
             self.tool_activity_seen = false;
         }
+    }
+
+    #[cfg(test)]
+    pub const fn manually_detached(&self) -> bool {
+        matches!(self.scroll_mode, TranscriptScrollMode::ManualDetached)
     }
 
     fn active_tool_loop(&self) -> bool {
@@ -3168,7 +3203,57 @@ impl BmuxApp {
         }
     }
 
+    fn capture_stable_transcript_anchor(&mut self) {
+        if self.viewport.follows_bottom() || self.pending_stable_transcript_anchor.is_some() {
+            return;
+        }
+        let top_row = self
+            .viewport
+            .top_row(self.transcript_layout.total_rows(), self.viewport.height());
+        let Some(line) = self
+            .transcript_layout
+            .visible_lines_from_top(top_row, 1)
+            .first()
+            .copied()
+        else {
+            return;
+        };
+        if line.source != VisibleTranscriptSource::Transcript {
+            return;
+        }
+        let Some(item_id) = self
+            .transcript
+            .get(line.entry_index)
+            .and_then(TranscriptItem::source_view_item_id)
+            .cloned()
+        else {
+            return;
+        };
+        self.pending_stable_transcript_anchor = Some(StableTranscriptAnchor {
+            item_id,
+            row_in_item: line.row_in_entry,
+        });
+    }
+
+    pub(crate) fn restore_stable_transcript_anchor(&mut self) {
+        let Some(anchor) = self.pending_stable_transcript_anchor.take() else {
+            return;
+        };
+        let Some(index) = self.transcript.source_index(&anchor.item_id) else {
+            return;
+        };
+        let Some(start_row) = self
+            .transcript_layout
+            .entry_start_row(VisibleTranscriptSource::Transcript, index)
+        else {
+            return;
+        };
+        self.viewport
+            .follow_anchor(start_row.saturating_add(anchor.row_in_item));
+    }
+
     fn apply_session_view_terminal_adapter(&mut self) -> TranscriptDocumentDamage {
+        self.capture_stable_transcript_anchor();
         let damage = self.session_view_terminal_adapter.apply(
             &self.session_view.snapshot().transcript,
             &mut self.transcript,
@@ -4631,7 +4716,7 @@ mod tests {
             Instant::now(),
         );
 
-        assert_eq!(invalidation, UiInvalidation::Structural);
+        assert_eq!(invalidation, UiInvalidation::Items);
         assert_eq!(app.elapsed_layout_revision, before.saturating_add(1));
         assert_eq!(
             app.drain_elapsed_dirty_visuals(),

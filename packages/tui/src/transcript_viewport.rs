@@ -24,6 +24,12 @@ pub struct TranscriptViewport {
 }
 
 impl TranscriptViewport {
+    /// Return whether the viewport follows the newest transcript rows.
+    #[must_use]
+    pub const fn follows_bottom(&self) -> bool {
+        matches!(self.mode, TranscriptViewportMode::FollowBottom)
+    }
+
     /// Return the number of transcript rows hidden below the viewport.
     #[must_use]
     pub const fn offset(&self) -> usize {
