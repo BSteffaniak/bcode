@@ -28,7 +28,6 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<SessionEventSubscription, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
         let handle = self.session_handle(session_id).await?;
         let (session, events, live_events) = handle.subscribe_events().await?;
         Ok(SessionEventSubscription {

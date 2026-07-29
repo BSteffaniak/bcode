@@ -6910,7 +6910,9 @@ async fn session_owner_record(
     }
 }
 
-fn session_ownership_blocker_label(blocker: bcode_ipc::SessionOwnershipBlocker) -> &'static str {
+const fn session_ownership_blocker_label(
+    blocker: bcode_ipc::SessionOwnershipBlocker,
+) -> &'static str {
     match blocker {
         bcode_ipc::SessionOwnershipBlocker::AttachedClient => "attached client",
         bcode_ipc::SessionOwnershipBlocker::PendingAttach => "pending attach",

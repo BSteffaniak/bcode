@@ -35445,6 +35445,7 @@ library = "test"
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn explicit_ownership_release_reports_every_blocker_category() {
         let root = tempfile::tempdir().expect("session root");
         let sessions = SessionManager::persistent(root.path()).expect("persistent sessions");
@@ -35773,6 +35774,104 @@ library = "test"
         })
         .await
         .expect("dropping queued runtime should release guards");
+    }
+
+    #[tokio::test]
+    async fn queue_send_failure_drops_command_ownership_and_releases_session() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("sessions");
+        let session = sessions
+            .create_session(
+                Some("queue send failure".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let state = Arc::new(test_server_state(sessions.clone()));
+        let (followup_commands, followup_receiver) = mpsc::channel(1);
+        drop(followup_receiver);
+        let (steering_commands, _steering_receiver) = mpsc::channel(1);
+        let (cancel_commands, _cancel_receiver) = mpsc::channel(1);
+        state.session_runtimes.lock().await.insert(
+            session.id,
+            SessionRuntimeHandle {
+                followup_commands,
+                steering_commands,
+                cancel_commands,
+                queued_followups: Arc::new(AtomicUsize::new(0)),
+                queued_steering: Arc::new(AtomicUsize::new(0)),
+                phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+                current_turn: Arc::new(Mutex::new(None)),
+            },
+        );
+        let ownership = sessions
+            .acquire_session_ownership(
+                session.id,
+                bcode_session::SessionOwnershipKind::QueuedCommand,
+            )
+            .await
+            .expect("queued ownership");
+        let (response, _completion) = oneshot::channel();
+
+        assert!(
+            enqueue_followup_command(
+                &state,
+                session.id,
+                FollowupCommand::CompactSession {
+                    client_id: ClientId::new(),
+                    selection: SessionModelSelection::default(),
+                    response,
+                    ownership,
+                },
+            )
+            .await
+            .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sessions.session_is_owned(session.id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed queue send should release command ownership");
+    }
+
+    #[tokio::test]
+    async fn queue_drain_drops_command_ownership_and_releases_session() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("sessions");
+        let session = sessions
+            .create_session(Some("queue drain".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let ownership = sessions
+            .acquire_session_ownership(
+                session.id,
+                bcode_session::SessionOwnershipKind::QueuedCommand,
+            )
+            .await
+            .expect("queued ownership");
+        let (sender, mut receiver) = mpsc::channel(1);
+        let (response, _completion) = oneshot::channel();
+        sender
+            .send(FollowupCommand::CompactSession {
+                client_id: ClientId::new(),
+                selection: SessionModelSelection::default(),
+                response,
+                ownership,
+            })
+            .await
+            .expect("queue command");
+        drop(sender);
+
+        assert_eq!(drain_followup_commands(&mut receiver), 1);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sessions.session_is_owned(session.id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("drained queue should release command ownership");
     }
 
     #[tokio::test]

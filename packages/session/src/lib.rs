@@ -5270,6 +5270,151 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn bounded_reads_and_subscriptions_do_not_reacquire_released_ownership() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("lease-neutral reads".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should create");
+        manager
+            .append_user_message(session.id, ClientId::new(), "first".to_owned())
+            .await
+            .expect("first message");
+        manager
+            .append_user_message(session.id, ClientId::new(), "second".to_owned())
+            .await
+            .expect("second message");
+        manager
+            .set_session_composer_draft(session.id, "draft".to_owned())
+            .await
+            .expect("draft");
+        let release = manager
+            .release_session_ownership(session.id)
+            .await
+            .expect("release ownership");
+        assert!(matches!(
+            release,
+            crate::SessionOwnershipRelease::Released
+                | crate::SessionOwnershipRelease::AlreadyUnowned
+        ));
+        assert!(!manager.session_is_owned(session.id).await);
+
+        let page = manager
+            .session_history_page(
+                session.id,
+                SessionHistoryQuery {
+                    cursor: None,
+                    limit: 1,
+                    direction: bcode_session_models::SessionHistoryDirection::Backward,
+                },
+            )
+            .await
+            .expect("bounded history page");
+        assert_eq!(page.events.len(), 1);
+        assert!(!manager.session_is_owned(session.id).await);
+
+        let window = manager
+            .session_projection_window(
+                session.id,
+                ProjectionWindowRequest {
+                    projection: bcode_session_models::SessionProjectionKind::Transcript,
+                    anchor: bcode_session_models::ProjectionWindowAnchor::Latest,
+                    direction: bcode_session_models::ProjectionWindowDirection::Backward,
+                    target: bcode_session_models::ProjectionWindowTarget {
+                        min_items: Some(1),
+                        min_estimated_rows: None,
+                        min_bytes: None,
+                        width_columns: Some(80),
+                    },
+                    limits: bcode_session_models::ProjectionWindowLimits {
+                        max_items: 2,
+                        max_events_scanned: 8,
+                        max_bytes: 4096,
+                    },
+                },
+            )
+            .await
+            .expect("projection window");
+        assert!(!window.transcript_items.is_empty());
+        assert!(!manager.session_is_owned(session.id).await);
+
+        let range = manager
+            .session_events_range(session.id, 0, u64::MAX, 2)
+            .await
+            .expect("bounded event range");
+        assert_eq!(range.len(), 2);
+        assert!(!manager.session_is_owned(session.id).await);
+
+        let input_history = manager
+            .session_input_history(session.id)
+            .await
+            .expect("input history");
+        assert_eq!(
+            input_history
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert!(!manager.session_is_owned(session.id).await);
+
+        assert_eq!(
+            manager
+                .session_composer_draft(session.id)
+                .await
+                .expect("composer draft")
+                .as_deref(),
+            Some("draft")
+        );
+        assert!(!manager.session_is_owned(session.id).await);
+
+        let subscription = manager
+            .subscribe_session_events(session.id)
+            .await
+            .expect("event subscription");
+        assert_eq!(subscription.session.id, session.id);
+        assert!(!manager.session_is_owned(session.id).await);
+        drop(subscription);
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn failed_attach_releases_newly_acquired_ownership() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("failed attach ownership".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should create");
+        assert!(!manager.session_is_owned(session.id).await);
+        std::fs::remove_file(db::session_db_path(&root, session.id))
+            .expect("remove persistent database to force attach failure");
+
+        assert!(matches!(
+            manager
+                .attach_session_recent(session.id, ClientId::new(), 8)
+                .await
+                .expect_err("attach should fail after database removal"),
+            SessionError::NotFound(id) if id == session.id
+        ));
+        assert!(!manager.session_is_owned(session.id).await);
+        assert!(
+            crate::lease::active_session_owners(&root, session.id)
+                .expect("owner scan")
+                .is_empty()
+        );
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn concurrent_quiescent_release_and_guard_acquire_are_serialized() {
         let root = unique_temp_dir();
         let manager = std::sync::Arc::new(SessionManager::persistent(&root).expect("manager"));

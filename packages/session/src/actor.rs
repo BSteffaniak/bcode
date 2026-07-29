@@ -698,7 +698,12 @@ impl SessionActor {
                 queued_at,
                 reply,
             } => {
-                let _ = reply.send(self.attach(client_id, mode, queued_at).await);
+                let result = self.attach(client_id, mode, queued_at).await;
+                if result.is_err() && self.state.clients.is_empty() && !self.has_ownership_guards()
+                {
+                    let _ = self.release_idle_resources();
+                }
+                let _ = reply.send(result);
             }
             SessionCommand::SetComposerDraft {
                 text,
