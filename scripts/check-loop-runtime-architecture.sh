@@ -1330,6 +1330,19 @@ if ! grep -F 'template_id           = "implementation-verification-commit"' plug
   violations=1
 fi
 
+if rg -n 'push_live_(assistant|reasoning)_delta|sync_shared_tool_items|push_required_shared_terminal_item|authoritative_transcript' \
+  packages/tui/src/app.rs >/tmp/bcode-tui-transcript-authority-bypass.txt; then
+  echo "Runtime architecture violation: TUI raw-event transcript authority or reconciliation helpers were reintroduced." >&2
+  cat /tmp/bcode-tui-transcript-authority-bypass.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'struct SessionViewTerminalAdapter' packages/tui/src/app.rs >/dev/null \
+  || ! grep -F 'terminal_item_from_shared(item)' packages/tui/src/app.rs >/dev/null; then
+  echo "Runtime architecture violation: the single SessionView-to-terminal adapter boundary was removed." >&2
+  violations=1
+fi
+
 if (( violations != 0 )); then
   exit 1
 fi

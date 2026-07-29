@@ -9,11 +9,12 @@ use bcode_config::{
     TuiThinkingConfig,
 };
 use bcode_plugin_sdk::path::display;
+#[cfg(test)]
+use bcode_session_models::{ModelTurnOutcome, RuntimeWorkStatus};
 use bcode_session_models::{
-    ModelTurnOutcome, ProviderStreamEvent, RuntimeWorkStatus, SessionEvent, SessionEventKind,
-    SessionHistoryCursor, SessionId, SessionInputHistoryEntry, SessionLiveEvent,
-    SessionLiveEventKind, SessionTraceEvent, SessionTracePayload, SessionTracePhase,
-    ToolInvocationResult,
+    ProviderStreamEvent, SessionEvent, SessionEventKind, SessionHistoryCursor, SessionId,
+    SessionInputHistoryEntry, SessionLiveEvent, SessionLiveEventKind, SessionTraceEvent,
+    SessionTracePayload, SessionTracePhase, ToolInvocationResult,
 };
 use bmux_text_edit::{SelectionMode, TextEditBuffer, TextMotion};
 use bmux_tui::event::MouseEvent;
@@ -234,22 +235,14 @@ impl SessionViewTerminalAdapter {
         source: &bcode_session_view_models::TranscriptViewDocument,
         target: &mut TranscriptDocument,
     ) {
-        let source_items = source.items.iter().filter(|item| {
-            matches!(
-                item.kind,
-                bcode_session_view_models::TranscriptViewItemKind::AssistantMessage { .. }
-                    | bcode_session_view_models::TranscriptViewItemKind::ReasoningMessage { .. }
-                    | bcode_session_view_models::TranscriptViewItemKind::ReasoningActivity { .. }
-            )
-        });
+        let source_items = source.items.iter();
         let source_ids = source_items
             .clone()
             .map(|item| item.id.clone())
             .collect::<BTreeSet<_>>();
-        let managed_ids = self.item_revisions.keys().cloned().collect::<BTreeSet<_>>();
         target.retain(|item| {
             item.source_view_item_id()
-                .is_none_or(|id| !managed_ids.contains(id) || source_ids.contains(id))
+                .is_none_or(|id| source_ids.contains(id))
         });
         self.item_revisions.retain(|id, _| source_ids.contains(id));
         for item in source_items {
@@ -2466,6 +2459,7 @@ impl BmuxApp {
             self.session_view.apply_event(event);
             self.apply_session_event(event, SessionEventApplication::Replay);
         }
+        self.apply_session_view_terminal_adapter();
         self.trim_resident_transcript_window_if_needed();
     }
 
@@ -2480,6 +2474,7 @@ impl BmuxApp {
             self.session_view.apply_event(event);
             self.apply_session_event(event, SessionEventApplication::Replay);
         }
+        self.apply_session_view_terminal_adapter();
     }
 
     fn trim_resident_transcript_window_if_needed(&mut self) {
@@ -2698,12 +2693,6 @@ impl BmuxApp {
                 }
                 self.finish_assistant_stream_anchor();
             }
-            SessionEventKind::SystemMessage { .. } => {
-                self.push_required_shared_terminal_item(event.sequence, "system message");
-            }
-            SessionEventKind::PluginStatusNote { .. } => {
-                self.push_required_shared_terminal_item(event.sequence, "plugin status note");
-            }
             SessionEventKind::ToolCallRequested {
                 tool_call_id,
                 tool_name,
@@ -2722,7 +2711,6 @@ impl BmuxApp {
                 );
             }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
-                self.sync_shared_tool_items(&record.invocation_id);
                 if application.live_activity() {
                     self.set_activity(ActivityState::PreparingFollowUpRequest);
                 }
@@ -2778,40 +2766,21 @@ impl BmuxApp {
             }
             SessionEventKind::ModelTurnFinished { .. } => {
                 self.finish_shared_model_turn(application);
-                if matches!(
-                    self.session_view.snapshot().runtime.last_turn_outcome,
-                    Some(ModelTurnOutcome::Error)
-                ) {
-                    self.push_required_shared_terminal_item(event.sequence, "failed model turn");
-                }
             }
             SessionEventKind::ModelUsage { turn_id, usage } => {
                 self.push_model_usage(event.sequence, turn_id, usage, application);
-            }
-            SessionEventKind::ContextCompacted { .. } => {
-                self.push_required_shared_terminal_item(event.sequence, "context compaction");
-            }
-            SessionEventKind::ProviderContextCompacted { .. } => {
-                self.push_required_shared_terminal_item(
-                    event.sequence,
-                    "provider context compaction",
-                );
             }
             SessionEventKind::WorkingDirectoryChanged {
                 old_working_directory,
                 new_working_directory: _,
             } => self.apply_working_directory_changed(event.sequence, old_working_directory),
             SessionEventKind::SessionRenamed { .. } => self.apply_shared_session_renamed(),
-            SessionEventKind::SkillInvoked { .. } => {
-                self.push_required_shared_terminal_item(event.sequence, "skill invocation");
-            }
             SessionEventKind::SkillSuggested {
-                skill_id, reason, ..
+                skill_id,
+                reason: _,
+                ..
             } => {
                 self.status = format!("suggested skill: {skill_id}");
-                if reason.is_some() {
-                    self.push_required_shared_terminal_item(event.sequence, "skill suggestion");
-                }
             }
             SessionEventKind::SkillActivated { skill_id, .. } => {
                 self.apply_shared_skill_activated(skill_id);
@@ -2828,14 +2797,6 @@ impl BmuxApp {
                 let suffix = if *truncated { " truncated" } else { "" };
                 self.status =
                     format!("loaded skill context: {skill_id} ({bytes_loaded} bytes{suffix})");
-                self.push_required_shared_terminal_item(event.sequence, "loaded skill context");
-            }
-            SessionEventKind::SkillInvocationFailed { .. } => {
-                self.push_required_shared_terminal_item(event.sequence, "failed skill invocation");
-            }
-            SessionEventKind::AssistantReasoningDelta { .. }
-            | SessionEventKind::AssistantReasoningActivity { .. } => {
-                self.apply_session_view_terminal_adapter();
             }
             SessionEventKind::AssistantReasoningMessage { .. } => {
                 self.apply_session_view_terminal_adapter();
@@ -2852,7 +2813,6 @@ impl BmuxApp {
                 self.apply_trace_event(trace);
             }
             SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
-                self.sync_shared_tool_items(&lifecycle.invocation_id);
                 if lifecycle.stage == bcode_session_models::ToolInvocationLifecycleStage::Started
                     && let Some(context) = self
                         .tool_call_contexts
@@ -2887,24 +2847,7 @@ impl BmuxApp {
                 }
                 let shared_work = self.shared_runtime_work_item(&work_id.0);
                 let status = shared_work.as_ref().map_or(*status, |work| work.status);
-                if work_id.0.starts_with("ralph:")
-                    && matches!(
-                        status,
-                        RuntimeWorkStatus::Failed
-                            | RuntimeWorkStatus::TimedOut
-                            | RuntimeWorkStatus::Cancelled
-                    )
-                {
-                    let message = shared_work
-                        .as_ref()
-                        .and_then(|work| work.message.as_deref())
-                        .or(message.as_deref())
-                        .unwrap_or("no details recorded");
-                    self.push_system_message(&format!("Ralph work {status:?}: {message}"));
-                }
-            }
-            SessionEventKind::RalphLifecycle { .. } => {
-                self.push_required_shared_terminal_item(event.sequence, "Ralph lifecycle");
+                let _ = (shared_work, status, message);
             }
             _ => {}
         }
@@ -3201,14 +3144,7 @@ impl BmuxApp {
             );
             return;
         }
-        self.push_required_shared_terminal_item(sequence, "user message");
-    }
-
-    fn push_required_shared_terminal_item(&mut self, sequence: u64, event_kind: &str) {
-        let item = self.shared_terminal_item(sequence).unwrap_or_else(|| {
-            panic!("shared session view must project {event_kind} event sequence {sequence}")
-        });
-        self.transcript.upsert_shared_item(item);
+        self.apply_session_view_terminal_adapter();
     }
 
     fn apply_session_view_terminal_adapter(&mut self) {
@@ -3264,31 +3200,6 @@ impl BmuxApp {
             .find(|item| item.role == role && item.streaming)
     }
 
-    fn sync_shared_tool_items(&mut self, invocation_id: &str) {
-        let items = self
-            .session_view
-            .snapshot()
-            .transcript
-            .items
-            .iter()
-            .map(terminal_item_from_shared)
-            .filter(|item| item.visual_invocation_id() == Some(invocation_id))
-            .collect::<Vec<_>>();
-        let source_ids = items
-            .iter()
-            .filter_map(|item| item.source_view_item_id().cloned())
-            .collect::<BTreeSet<_>>();
-        self.transcript.retain(|item| {
-            item.visual_invocation_id() != Some(invocation_id)
-                || item
-                    .source_view_item_id()
-                    .is_some_and(|id| source_ids.contains(id))
-        });
-        for item in items {
-            self.transcript.upsert_shared_item(item);
-        }
-    }
-
     fn shared_runtime_work_item(
         &self,
         work_id: &str,
@@ -3309,17 +3220,11 @@ impl BmuxApp {
             })
     }
 
-    fn push_system_message(&mut self, text: &str) {
-        self.transcript
-            .push(TranscriptItem::new("System", text.to_owned()));
-    }
-
     fn apply_working_directory_changed(
         &mut self,
-        event_sequence: u64,
+        _event_sequence: u64,
         old_working_directory: &std::path::Path,
     ) {
-        self.push_required_shared_terminal_item(event_sequence, "working-directory change");
         if let Some(new_working_directory) = self.working_directory() {
             self.status = format!(
                 "working directory: {}",
@@ -3399,7 +3304,6 @@ impl BmuxApp {
         );
         self.tool_call_contexts
             .insert(tool_call_id.to_owned(), projected_context.clone());
-        self.sync_shared_tool_items(tool_call_id);
         self.set_activity(ActivityState::RunningTool {
             name: projected_context.tool_name,
         });
@@ -3409,7 +3313,6 @@ impl BmuxApp {
 
     fn push_permission_request(&mut self, input: PermissionRequestInput<'_>) {
         let shared_permission = self.shared_permission_view(input.permission_id).cloned();
-        self.push_required_shared_terminal_item(input.event_sequence, "permission request");
         if input.application.live_activity() {
             let tool_name = shared_permission
                 .as_ref()
@@ -3476,29 +3379,6 @@ impl BmuxApp {
             self.finish_tool_request_streaming(&tool_call_id);
         }
         status.clone_into(&mut self.status);
-        let item = self
-            .shared_permission_result_item(permission_id)
-            .unwrap_or_else(|| {
-                panic!("shared session view must project resolved permission {permission_id}")
-            });
-        self.transcript.upsert_shared_item(item);
-    }
-
-    fn shared_permission_result_item(&self, permission_id: &str) -> Option<TranscriptItem> {
-        self.session_view
-            .snapshot()
-            .transcript
-            .items
-            .iter()
-            .rev()
-            .find(|item| {
-                matches!(
-                    &item.kind,
-                    bcode_session_view_models::TranscriptViewItemKind::Permission { permission }
-                        if permission.permission_id == permission_id && permission.resolved
-                )
-            })
-            .map(terminal_item_from_shared)
     }
 
     fn set_file_activity(&mut self, tool_name: &str) {
@@ -3553,7 +3433,6 @@ impl BmuxApp {
         _semantic_result: Option<&ToolInvocationResult>,
         application: SessionEventApplication,
     ) {
-        self.sync_shared_tool_items(tool_call_id);
         self.update_tool_result_status(tool_call_id, is_error, application);
         self.finish_tool_request_streaming(tool_call_id);
     }
@@ -3618,7 +3497,7 @@ impl BmuxApp {
 
     fn push_model_usage(
         &mut self,
-        event_sequence: u64,
+        _event_sequence: u64,
         turn_id: &str,
         usage: &bcode_session_models::SessionTokenUsage,
         application: SessionEventApplication,
@@ -3645,7 +3524,6 @@ impl BmuxApp {
         {
             self.status = format!("tokens: {tokens}");
         }
-        self.push_required_shared_terminal_item(event_sequence, "model usage");
     }
 
     fn apply_shared_model_turn_started(&mut self) {
@@ -5132,9 +5010,9 @@ mod tests {
             .expect("shared runtime work item");
         assert_eq!(shared.status, RuntimeWorkStatus::Failed);
         assert_eq!(shared.message.as_deref(), Some("boom"));
-        let terminal = app.transcript().iter().last().expect("ralph notice");
-        assert_eq!(terminal.role(), "System");
-        assert_eq!(terminal.text(), "Ralph work Failed: boom");
+        let terminal = app.transcript().iter().last().expect("ralph work");
+        assert_eq!(terminal.role(), "Runtime work");
+        assert!(terminal.text().contains("boom"));
     }
 
     #[test]

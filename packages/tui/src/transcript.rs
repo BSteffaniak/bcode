@@ -151,6 +151,7 @@ pub struct TranscriptItem {
 }
 
 impl TranscriptItem {
+    #[cfg(test)]
     pub fn new(role: &'static str, text: String) -> Self {
         Self::with_identity(
             role,
