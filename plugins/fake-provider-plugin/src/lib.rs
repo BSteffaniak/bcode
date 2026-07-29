@@ -18,9 +18,10 @@ use bcode_model::{
     ValidateConfigResponse,
 };
 use bcode_plugin_sdk::prelude::*;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
 static FAKE_COMPACTION_STARTED: AtomicBool = AtomicBool::new(false);
@@ -30,6 +31,51 @@ static FAKE_COMPACTION_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 static FAKE_COMPACTION_SUMMARY_SIGNALS: LazyLock<Mutex<BTreeSet<String>>> =
     LazyLock::new(|| Mutex::new(BTreeSet::new()));
+static FAKE_SCRIPT_GATES: LazyLock<(Mutex<BTreeSet<String>>, Condvar)> =
+    LazyLock::new(|| (Mutex::new(BTreeSet::new()), Condvar::new()));
+
+const FAKE_EVENT_SCRIPT_SETTING: &str = "fake_event_script";
+
+/// One deterministic fake-provider event script.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FakeProviderEventScript {
+    /// Ordered provider events and release controls.
+    pub steps: Vec<FakeProviderEventScriptStep>,
+}
+
+/// One event in a deterministic fake-provider script.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FakeProviderEventScriptStep {
+    /// Optional process-local gate that must be released before this event is emitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<String>,
+    /// Optional deterministic delay after gate release.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u64>,
+    /// Provider-neutral event emitted by this step.
+    pub event: ProviderTurnEvent,
+}
+
+/// Release one process-local fake-provider script gate.
+#[cfg(feature = "static-bundled")]
+pub fn release_fake_event_script_gate(gate: &str) {
+    let (gates, ready) = &*FAKE_SCRIPT_GATES;
+    if let Ok(mut gates) = gates.lock() {
+        gates.insert(gate.to_owned());
+        ready.notify_all();
+    }
+}
+
+/// Reset every process-local fake-provider script gate.
+#[cfg(feature = "static-bundled")]
+pub fn reset_fake_event_script_gates() {
+    let (gates, _) = &*FAKE_SCRIPT_GATES;
+    if let Ok(mut gates) = gates.lock() {
+        gates.clear();
+    }
+}
 static FAKE_MANAGED_COMPACTION_EMITTED: AtomicBool = AtomicBool::new(false);
 static FAKE_LAST_PARALLEL_TOOL_POLICY: AtomicBool = AtomicBool::new(false);
 
@@ -285,6 +331,10 @@ impl FakeProviderPlugin {
         if let Some(error) = validate_fake_parallel_tool_policy(&request) {
             return error;
         }
+        let event_script = match fake_event_script(&request) {
+            Ok(script) => script,
+            Err(message) => return ServiceResponse::error("invalid_fake_event_script", message),
+        };
         let is_compaction_request = request
             .metadata
             .get("bcode_request_kind")
@@ -336,7 +386,9 @@ impl FakeProviderPlugin {
             .is_some_and(|value| value == "true");
         state.turns.insert(provider_turn_id.clone(), turn.clone());
         drop(state);
-        if emit_overflow {
+        if let Some(script) = event_script {
+            run_fake_event_script(turn, script);
+        } else if emit_overflow {
             turn.push(ProviderTurnEvent::Error {
                 error: ProviderError {
                     code: "context_length_exceeded".to_string(),
@@ -423,6 +475,80 @@ impl FakeProviderPlugin {
         }
         json_response(&AckResponse::default())
     }
+}
+
+fn fake_event_script(
+    request: &ModelTurnRequest,
+) -> Result<Option<FakeProviderEventScript>, String> {
+    let Some(encoded) = request
+        .provider_context
+        .settings
+        .get(FAKE_EVENT_SCRIPT_SETTING)
+    else {
+        return Ok(None);
+    };
+    let script = serde_json::from_str::<FakeProviderEventScript>(encoded)
+        .map_err(|error| error.to_string())?;
+    if script.steps.is_empty() {
+        return Err("fake event script must contain at least one step".to_owned());
+    }
+    if script.steps.len() > 1_024 {
+        return Err("fake event script exceeds 1024 steps".to_owned());
+    }
+    if script
+        .steps
+        .iter()
+        .any(|step| step.gate.as_ref().is_some_and(String::is_empty))
+    {
+        return Err("fake event script gates must not be empty".to_owned());
+    }
+    Ok(Some(script))
+}
+
+fn run_fake_event_script(turn: FakeTurn, script: FakeProviderEventScript) {
+    let controlled = script
+        .steps
+        .iter()
+        .any(|step| step.gate.is_some() || step.delay_ms.is_some_and(|delay| delay > 0));
+    if controlled {
+        std::thread::spawn(move || emit_fake_event_script(&turn, script));
+    } else {
+        emit_fake_event_script(&turn, script);
+    }
+}
+
+fn emit_fake_event_script(turn: &FakeTurn, script: FakeProviderEventScript) {
+    for step in script.steps {
+        if let Some(gate) = step.gate.as_deref()
+            && !wait_for_fake_event_script_gate(turn, gate)
+        {
+            return;
+        }
+        if let Some(delay_ms) = step.delay_ms.filter(|delay| *delay > 0) {
+            std::thread::sleep(Duration::from_millis(delay_ms));
+        }
+        if turn.is_cancelled() {
+            return;
+        }
+        turn.push(step.event);
+    }
+}
+
+fn wait_for_fake_event_script_gate(turn: &FakeTurn, gate: &str) -> bool {
+    let (gates, ready) = &*FAKE_SCRIPT_GATES;
+    let Ok(mut gates) = gates.lock() else {
+        return false;
+    };
+    while !gates.contains(gate) {
+        if turn.is_cancelled() {
+            return false;
+        }
+        let Ok((next, _)) = ready.wait_timeout(gates, Duration::from_millis(10)) else {
+            return false;
+        };
+        gates = next;
+    }
+    true
 }
 
 fn finish_fake_text_response(
@@ -1402,6 +1528,121 @@ mod tests {
     use bcode_model::{
         CapabilitySupport, ModelParameterKey, RequestedModelFeature, StructuredOutputMode,
     };
+
+    fn drain_script_until(
+        turn: &FakeTurn,
+        predicate: impl Fn(&[ProviderTurnEvent]) -> bool,
+    ) -> Vec<ProviderTurnEvent> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut events = Vec::new();
+        while std::time::Instant::now() < deadline {
+            events.extend(turn.drain());
+            if predicate(&events) {
+                return events;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("fake event script did not reach expected state: {events:?}");
+    }
+
+    #[test]
+    fn fake_event_script_gates_arbitrary_provider_events_in_declared_order() {
+        let gate = "fake-event-script-test-tool";
+        let (gates, ready) = &*FAKE_SCRIPT_GATES;
+        gates.lock().expect("script gates").remove(gate);
+        let reasoning = ProviderTurnEvent::ReasoningActivity {
+            event: bcode_session_models::ReasoningActivityEvent::PartDelta {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 0,
+                part_id: "summary-0".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: "reasoning".to_owned(),
+            },
+        };
+        let tool = ToolCall {
+            id: "call-1".to_owned(),
+            name: "filesystem.write".to_owned(),
+            arguments: serde_json::json!({"path": "src/lib.rs", "contents": "hello"}),
+        };
+        let expected_after_gate = vec![
+            reasoning.clone(),
+            ProviderTurnEvent::ToolCallStarted {
+                call_id: tool.id.clone(),
+                name: tool.name.clone(),
+            },
+            ProviderTurnEvent::ToolCallDelta {
+                call_id: tool.id.clone(),
+                delta: r#"{"path":"src/lib.rs""#.to_owned(),
+            },
+            ProviderTurnEvent::ToolCallFinished { call: tool },
+            ProviderTurnEvent::Usage {
+                usage: TokenUsage::default(),
+            },
+            ProviderTurnEvent::TurnFinished {
+                stop_reason: StopReason::ToolCall,
+            },
+        ];
+        let mut steps = vec![FakeProviderEventScriptStep {
+            gate: None,
+            delay_ms: None,
+            event: ProviderTurnEvent::TextDelta {
+                text: "before gate".to_owned(),
+            },
+        }];
+        steps.extend(
+            expected_after_gate
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(index, event)| FakeProviderEventScriptStep {
+                    gate: (index == 0).then(|| gate.to_owned()),
+                    delay_ms: None,
+                    event,
+                }),
+        );
+        let turn = FakeTurn::default();
+        run_fake_event_script(turn.clone(), FakeProviderEventScript { steps });
+
+        let before_gate = drain_script_until(&turn, |events| !events.is_empty());
+        assert_eq!(
+            before_gate,
+            [ProviderTurnEvent::TextDelta {
+                text: "before gate".to_owned()
+            }]
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        assert!(turn.drain().is_empty(), "gated events escaped early");
+
+        gates.lock().expect("script gates").insert(gate.to_owned());
+        ready.notify_all();
+        let after_gate = drain_script_until(&turn, |events| {
+            events
+                .last()
+                .is_some_and(|event| matches!(event, ProviderTurnEvent::TurnFinished { .. }))
+        });
+        assert_eq!(after_gate, expected_after_gate);
+        gates.lock().expect("script gates").remove(gate);
+    }
+
+    #[test]
+    fn fake_event_script_json_round_trips_gate_delay_and_provider_event() {
+        let script = FakeProviderEventScript {
+            steps: vec![FakeProviderEventScriptStep {
+                gate: Some("release".to_owned()),
+                delay_ms: Some(25),
+                event: ProviderTurnEvent::ToolCallDelta {
+                    call_id: "call-1".to_owned(),
+                    delta: "partial arguments".to_owned(),
+                },
+            }],
+        };
+        let encoded = serde_json::to_string(&script).expect("encode script");
+        let decoded: FakeProviderEventScript =
+            serde_json::from_str(&encoded).expect("decode script");
+        assert_eq!(decoded, script);
+    }
 
     #[test]
     fn fake_reasoning_fixture_drives_every_neutral_signal_and_terminal_state() {
