@@ -2702,7 +2702,7 @@ impl BmuxApp {
             } => {
                 self.record_shared_active_tool_requested(tool_call_id);
                 self.tool_activity_seen = true;
-                self.push_tool_request(
+                self.apply_tool_request_side_effects(
                     (event.sequence, event.timestamp_ms),
                     tool_call_id,
                     tool_name,
@@ -4205,10 +4205,7 @@ fn context_window_percentage(input_tokens: u32, context_window: u32) -> u32 {
 }
 
 const fn event_breaks_sticky_entry_anchor(event: &SessionEvent) -> bool {
-    matches!(
-        &event.kind,
-        SessionEventKind::ToolCallRequested { .. } | SessionEventKind::PermissionRequested { .. }
-    )
+    matches!(&event.kind, SessionEventKind::PermissionRequested { .. })
 }
 
 fn referenced_tool_call_ids(items: &[TranscriptItem]) -> BTreeSet<String> {

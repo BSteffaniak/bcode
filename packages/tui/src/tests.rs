@@ -3763,7 +3763,7 @@ fn tool_activity_after_assistant_preamble_resumes_following_latest_rows() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
-    assert_eq!(output_line_y(&buffer, "Bcode …"), Some(1));
+    let anchored_scroll_offset = app.scroll_offset();
 
     app.absorb_session_event(&event(
         session_id,
@@ -3781,7 +3781,7 @@ fn tool_activity_after_assistant_preamble_resumes_following_latest_rows() {
     render::render(&mut app, &mut frame);
 
     assert!(rendered_text(&buffer).contains("shell.run"));
-    assert_eq!(output_line_y(&buffer, "Bcode …"), Some(1));
+    assert_eq!(app.scroll_offset(), anchored_scroll_offset);
 }
 
 #[test]

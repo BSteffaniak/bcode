@@ -2671,7 +2671,7 @@ fn push_tool_request_rows(
         muted_style(),
         muted_style(),
     );
-    if !item.text().is_empty() {
+    if !item.text().is_empty() && !tool_request_arguments_are_sensitive(context.tool_name) {
         push_labeled_text_preview(
             rows,
             "arguments",
@@ -2681,6 +2681,11 @@ fn push_tool_request_rows(
         );
     }
     rows.push(Line::default());
+}
+
+fn tool_request_arguments_are_sensitive(tool_name: &str) -> bool {
+    let normalized = tool_name.replace('_', ".");
+    normalized.ends_with(".write") || normalized.ends_with(".edit")
 }
 
 fn canonical_plugin_visual_render_mode(
