@@ -1989,6 +1989,26 @@ impl WorkflowStore {
         }
     }
 
+    /// Load the request timestamp for one exact mutation approval without mutating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity or database failure.
+    pub fn mutation_approval_requested_at(
+        &self,
+        approval_id: &str,
+    ) -> Result<Option<u64>, WorkflowStoreError> {
+        validate_id("approval_id", approval_id)?;
+        self.connection
+            .query_row(
+                "SELECT requested_at_ms FROM workflow_mutation_approvals WHERE approval_id = ?1",
+                [approval_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(WorkflowStoreError::from)
+    }
+
     /// Load bounded pending mutation approval requests for one run.
     ///
     /// # Errors

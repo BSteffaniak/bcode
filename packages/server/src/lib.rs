@@ -11748,6 +11748,19 @@ async fn handle_doctor_workflow_run(
     .await
 }
 
+const fn workflow_repair_resolution_label(
+    resolution: &bcode_workflow_store::RepairResolution,
+) -> &'static str {
+    match resolution {
+        bcode_workflow_store::RepairResolution::ConfirmSucceeded { .. } => "confirm_succeeded",
+        bcode_workflow_store::RepairResolution::ConfirmFailed { .. } => "confirm_failed",
+        bcode_workflow_store::RepairResolution::ConfirmCancelled { .. } => "confirm_cancelled",
+        bcode_workflow_store::RepairResolution::AbandonForExplicitRetry { .. } => {
+            "abandon_for_explicit_retry"
+        }
+    }
+}
+
 async fn handle_repair_workflow_attempt(
     request_id: u64,
     state: &ServerState,
@@ -11755,11 +11768,20 @@ async fn handle_repair_workflow_attempt(
     dispatch_identity: String,
     resolution: bcode_workflow_store::RepairResolution,
 ) -> Result<(), ServerError> {
+    let started_at = std::time::Instant::now();
     let result = state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .repair_attempt(&dispatch_identity, &resolution, current_unix_millis())?;
+    state.metrics.record_histogram_with_labels(
+        "workflow.reconciliation.duration_ms",
+        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        BTreeMap::from([(
+            "resolution".to_string(),
+            workflow_repair_resolution_label(&resolution).to_string(),
+        )]),
+    );
     send_response(
         writer,
         request_id,
@@ -11777,6 +11799,7 @@ async fn handle_retry_workflow_node(
     activation_id: String,
     failed_attempt: u32,
 ) -> Result<(), ServerError> {
+    let started_at = std::time::Instant::now();
     let result = state
         .workflow_store
         .lock()
@@ -11788,6 +11811,10 @@ async fn handle_retry_workflow_node(
             failed_attempt,
             current_unix_millis(),
         )?;
+    state.metrics.record_histogram(
+        "workflow.retry.admission.duration_ms",
+        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
     drive_workflow_run(state, &run_id).await?;
     send_response(
         writer,
@@ -11827,6 +11854,7 @@ async fn handle_provide_workflow_input(
     activation_id: String,
     value: serde_json::Value,
 ) -> Result<(), ServerError> {
+    let started_at = std::time::Instant::now();
     let result = state
         .workflow_store
         .lock()
@@ -11838,6 +11866,10 @@ async fn handle_provide_workflow_input(
             value,
             current_unix_millis(),
         )?;
+    state.metrics.record_histogram(
+        "workflow.input.wait_resolution.duration_ms",
+        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
     send_response(
         writer,
         request_id,
@@ -11856,6 +11888,7 @@ async fn handle_resolve_workflow_approval(
     activation_id: String,
     approved: bool,
 ) -> Result<(), ServerError> {
+    let started_at = std::time::Instant::now();
     let result = state
         .workflow_store
         .lock()
@@ -11867,6 +11900,14 @@ async fn handle_resolve_workflow_approval(
             approved,
             current_unix_millis(),
         )?;
+    state.metrics.record_histogram_with_labels(
+        "workflow.approval.resolution.duration_ms",
+        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        BTreeMap::from([(
+            "decision".to_string(),
+            if approved { "approve" } else { "deny" }.to_string(),
+        )]),
+    );
     send_response(
         writer,
         request_id,
@@ -11895,6 +11936,15 @@ async fn handle_list_workflow_mutation_approvals(
     .await
 }
 
+const fn workflow_mutation_approval_decision_label(
+    decision: bcode_workflow_store::WorkflowMutationApprovalDecision,
+) -> &'static str {
+    match decision {
+        bcode_workflow_store::WorkflowMutationApprovalDecision::Approve => "approve",
+        bcode_workflow_store::WorkflowMutationApprovalDecision::Deny => "deny",
+    }
+}
+
 async fn handle_resolve_workflow_mutation_approval(
     request_id: u64,
     state: &ServerState,
@@ -11902,11 +11952,39 @@ async fn handle_resolve_workflow_mutation_approval(
     approval_id: String,
     decision: bcode_workflow_store::WorkflowMutationApprovalDecision,
 ) -> Result<(), ServerError> {
+    let started_at = std::time::Instant::now();
+    let resolved_at_ms = current_unix_millis();
+    let requested_at_ms = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .mutation_approval_requested_at(&approval_id)?;
     let result = state
         .workflow_store
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .resolve_mutation_approval(&approval_id, decision, current_unix_millis())?;
+        .resolve_mutation_approval(&approval_id, decision, resolved_at_ms)?;
+    state.metrics.record_histogram_with_labels(
+        "workflow.approval.wait.duration_ms",
+        requested_at_ms.map_or(0, |requested_at_ms| {
+            resolved_at_ms.saturating_sub(requested_at_ms)
+        }),
+        BTreeMap::from([
+            (
+                "decision".to_string(),
+                workflow_mutation_approval_decision_label(decision).to_string(),
+            ),
+            ("status".to_string(), result.status.clone()),
+        ]),
+    );
+    state.metrics.record_histogram_with_labels(
+        "workflow.approval.resolution.duration_ms",
+        u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
+        BTreeMap::from([(
+            "decision".to_string(),
+            workflow_mutation_approval_decision_label(decision).to_string(),
+        )]),
+    );
     send_response(
         writer,
         request_id,

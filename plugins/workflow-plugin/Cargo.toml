@@ -29,8 +29,9 @@ serde_json           = { workspace = true }
 tokio                = { workspace = true }
 
 [dev-dependencies]
-bcode_plugin = { workspace = true }
-toml         = { workspace = true }
+bcode_plugin   = { workspace = true }
+bcode_workflow = { workspace = true }
+toml           = { workspace = true }
 
 [features]
 default          = []

@@ -658,6 +658,22 @@ mod tests {
             .expect("reference template");
         template.validate().expect("template validates");
         assert_eq!(template.template_version, 1);
+        let implementation = &template.definition.nodes["implementation"];
+        assert_eq!(implementation.kind, bcode_workflow::NodeKind::Agent);
+        let configuration: bcode_workflow::WorkflowAgentConfiguration =
+            serde_json::from_value(implementation.configuration.clone())
+                .expect("typed implementation agent configuration");
+        configuration
+            .validate()
+            .expect("implementation agent validates");
+        assert_eq!(
+            configuration.execution_target,
+            bcode_workflow::AgentExecutionTarget::SharedParentSequential
+        );
+        assert_eq!(
+            configuration.tool_capability,
+            bcode_workflow::WorkflowToolCapability::Mutating
+        );
         let required = template.configuration_schema.schema["required"]
             .as_array()
             .expect("required fields");

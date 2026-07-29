@@ -145,8 +145,8 @@ type      = ["string", "null"]
 
 [workflow_templates.definition]
 edges          = []
-entries        = ["configuration"]
-exits          = ["configuration"]
+entries        = ["implementation"]
+exits          = ["implementation"]
 name           = "implementation-verification-commit"
 schema_version = 1
 
@@ -170,6 +170,39 @@ schema    = { type = "object" }
 type_name = "bcode.workflow.implementation-verification-commit-config/v1"
 
 [workflow_templates.definition.nodes.configuration.output]
+schema    = { type = "object" }
+type_name = "bcode.workflow.implementation-verification-commit-config/v1"
+
+[workflow_templates.definition.nodes.implementation]
+id        = "implementation"
+kind      = "agent"
+name      = "Implement requested work"
+resources = [{ resource = "repository", access = "write" }]
+
+[workflow_templates.definition.nodes.implementation.configuration]
+agent_profile    = "build"
+execution_target = "shared_parent_sequential"
+prompt_mode      = "json_input"
+read_only        = false
+skills           = []
+system_prompt    = "Implement the requested bounded work. Preserve the typed workflow envelope and return strict structured output."
+timeout_ms       = 3600000
+tool_allowlist   = []
+tool_capability  = "mutating"
+version          = 1
+
+[workflow_templates.definition.nodes.implementation.configuration.structured_output]
+strict = true
+
+[workflow_templates.definition.nodes.implementation.configuration.structured_output.schema]
+schema    = { type = "object" }
+type_name = "bcode.workflow.implementation-verification-commit-config/v1"
+
+[workflow_templates.definition.nodes.implementation.input]
+schema    = { type = "object" }
+type_name = "bcode.workflow.implementation-verification-commit-config/v1"
+
+[workflow_templates.definition.nodes.implementation.output]
 schema    = { type = "object" }
 type_name = "bcode.workflow.implementation-verification-commit-config/v1"
 
