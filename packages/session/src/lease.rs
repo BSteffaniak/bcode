@@ -545,7 +545,7 @@ pub enum SessionOwnerLiveness {
 }
 
 fn classify_owner_liveness(path: &Path, owner: &SessionLeaseOwner) -> SessionOwnerLiveness {
-    if owner.schema_version >= 3 {
+    if owner.schema_version == 3 {
         match OpenOptions::new().read(true).write(true).open(path) {
             Ok(file) => match try_lock_file_exclusive(&file) {
                 Ok(true) => {
@@ -558,10 +558,12 @@ fn classify_owner_liveness(path: &Path, owner: &SessionLeaseOwner) -> SessionOwn
             Err(error) if error.kind() == io::ErrorKind::NotFound => SessionOwnerLiveness::Stale,
             Err(_) => SessionOwnerLiveness::Unverifiable,
         }
-    } else if process_is_alive(owner.pid) {
+    } else if owner.schema_version == 2 && process_is_alive(owner.pid) {
         SessionOwnerLiveness::Live
-    } else {
+    } else if owner.schema_version == 2 {
         SessionOwnerLiveness::Stale
+    } else {
+        SessionOwnerLiveness::Unverifiable
     }
 }
 
@@ -1160,7 +1162,92 @@ mod tests {
             .expect("new epoch may claim after runtime lease release");
     }
 
-    #[cfg(unix)]
+    #[test]
+    fn live_schema_v3_owner_is_not_pruned_across_processes() {
+        use std::process::{Command, Stdio};
+        use std::time::{Duration, Instant};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let ready = temp_dir.path().join("hold-lease-ready");
+        let acquired = temp_dir.path().join("hold-lease-acquired");
+        let mut child = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "lease::tests::subprocess_lock_helper",
+                "--nocapture",
+            ])
+            .env("BCODE_SESSION_LOCK_TEST_ACTION", "hold-lease")
+            .env("BCODE_SESSION_LOCK_TEST_ROOT", temp_dir.path())
+            .env("BCODE_SESSION_LOCK_TEST_ID", session_id.to_string())
+            .env("BCODE_SESSION_LOCK_TEST_READY", &ready)
+            .env("BCODE_SESSION_LOCK_TEST_ACQUIRED", &acquired)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn owner child");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !acquired.exists() {
+            assert!(Instant::now() < deadline, "child did not acquire lease");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let owners = active_session_owners(temp_dir.path(), session_id).expect("owner scan");
+        assert_eq!(owners.len(), 1);
+        assert_eq!(owners[0].schema_version, 3);
+        assert!(matches!(
+            acquire_session_lease(temp_dir.path(), session_id, &context("other", 7)),
+            Err(SessionLeaseError::OwnedByOtherDaemon { .. })
+        ));
+        fs::remove_file(&ready).expect("release child");
+        assert!(child.wait().expect("wait child").success());
+        acquire_session_lease(temp_dir.path(), session_id, &context("next", 7))
+            .expect("next owner after child release");
+    }
+
+    #[test]
+    fn unknown_owner_schema_is_unverifiable_and_fails_closed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let access_dir = session_owner_dir(temp_dir.path(), session_id);
+        fs::create_dir_all(&access_dir).expect("owner dir");
+        let mut owner = SessionLeaseOwner::new(session_id, &context("future", 5));
+        owner.schema_version = 99;
+        let owner_path = access_dir.join(format!("{}.json", owner.lease_token));
+        fs::write(
+            &owner_path,
+            serde_json::to_vec_pretty(&owner).expect("serialize owner"),
+        )
+        .expect("write owner");
+        assert_eq!(
+            classify_owner_liveness(&owner_path, &owner),
+            SessionOwnerLiveness::Unverifiable
+        );
+        assert!(matches!(
+            acquire_session_lease(temp_dir.path(), session_id, &context("next", 5)),
+            Err(SessionLeaseError::OwnedByOtherDaemon { .. })
+        ));
+        assert!(owner_path.exists());
+    }
+
+    #[test]
+    fn malformed_owner_metadata_fails_closed_during_mutating_prune() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let access_dir = session_owner_dir(temp_dir.path(), session_id);
+        fs::create_dir_all(&access_dir).expect("owner dir");
+        let malformed = access_dir.join("malformed.json");
+        fs::write(&malformed, b"not-json").expect("malformed metadata");
+        assert!(matches!(
+            acquire_session_lease(temp_dir.path(), session_id, &context("next", 7)),
+            Err(SessionLeaseError::UnverifiableOwnerMetadata { path }) if path == malformed
+        ));
+        assert!(
+            malformed.exists(),
+            "unverifiable metadata must not be pruned"
+        );
+    }
+
     #[test]
     fn subprocess_lock_helper() {
         let Ok(action) = std::env::var("BCODE_SESSION_LOCK_TEST_ACTION") else {
@@ -1181,6 +1268,14 @@ mod tests {
                 let _guard = acquire_session_lease(&root, session_id, &context("subprocess", 7))
                     .expect("acquire subprocess lease");
                 fs::write(acquired, b"acquired").expect("write acquired marker");
+            }
+            "hold-lease" => {
+                let _guard = acquire_session_lease(&root, session_id, &context("subprocess", 7))
+                    .expect("acquire subprocess lease");
+                fs::write(acquired, b"acquired").expect("write acquired marker");
+                while ready.exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
             }
             "write" => {
                 let _guard = acquire_session_write_lock(&root, session_id)
