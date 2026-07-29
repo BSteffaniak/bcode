@@ -648,6 +648,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn manifest_contributes_bounded_reference_template_configuration() {
         let manifest: bcode_plugin::PluginManifest =
             toml::from_str(include_str!("../bcode-plugin.toml")).expect("manifest");
@@ -673,6 +674,67 @@ mod tests {
         assert_eq!(
             configuration.tool_capability,
             bcode_workflow::WorkflowToolCapability::Mutating
+        );
+        let evaluation = &template.definition.nodes["evaluation"];
+        assert_eq!(evaluation.kind, bcode_workflow::NodeKind::Agent);
+        let evaluation_configuration: bcode_workflow::WorkflowAgentConfiguration =
+            serde_json::from_value(evaluation.configuration.clone())
+                .expect("typed evaluation agent configuration");
+        evaluation_configuration
+            .validate()
+            .expect("evaluation agent validates");
+        assert!(evaluation_configuration.read_only);
+        assert_eq!(
+            evaluation_configuration.tool_capability,
+            bcode_workflow::WorkflowToolCapability::ReadOnly
+        );
+        assert!(template.definition.edges.iter().any(|edge| {
+            edge.from == "implementation"
+                && edge.to == "evaluation"
+                && edge.kind == bcode_workflow::EdgeKind::Direct
+        }));
+        let verification = &template.definition.nodes["verification"];
+        assert_eq!(verification.kind, bcode_workflow::NodeKind::PluginBlock);
+        let verification_block: bcode_workflow::WorkflowBlockDefinition =
+            serde_json::from_value(verification.configuration.clone())
+                .expect("typed shell block configuration");
+        verification_block
+            .validate()
+            .expect("shell block validates");
+        assert_eq!(verification_block.plugin_id, "bcode.shell");
+        assert_eq!(verification_block.block_id, "shell.command-plan");
+        assert!(verification_block.authorization.explicit_grant_required);
+        let verification_edge = template
+            .definition
+            .edges
+            .iter()
+            .find(|edge| edge.from == "evaluation" && edge.to == "verification")
+            .expect("verification edge");
+        let verification_transform = verification_edge
+            .transform
+            .as_ref()
+            .expect("command-plan projection");
+        let state = serde_json::json!({
+            "command_plan": {
+                "version": 1,
+                "cwd": ".",
+                "commands": [{
+                    "argv": ["cargo", "test"],
+                    "timeout_ms": 300_000,
+                    "continue_on_nonzero": false
+                }],
+                "environment": {"inherit": true, "set": {}},
+                "output": {"preview_bytes": 4096, "artifact_spill": true}
+            }
+        });
+        assert_eq!(
+            verification_transform
+                .evaluate(&[bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_STATE,
+                    value: &state,
+                }])
+                .expect("command plan projection"),
+            state["command_plan"]
         );
         let required = template.configuration_schema.schema["required"]
             .as_array()

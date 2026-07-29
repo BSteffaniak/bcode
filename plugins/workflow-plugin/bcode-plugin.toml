@@ -144,10 +144,13 @@ maxLength = 256
 type      = ["string", "null"]
 
 [workflow_templates.definition]
-edges          = []
-entries        = ["implementation"]
-exits          = ["implementation"]
-name           = "implementation-verification-commit"
+edges = [
+    { from = "implementation", to = "evaluation", kind = { kind = "direct" } },
+    { from = "evaluation", to = "verification", kind = { kind = "direct" }, transform = { version = 1, expression = { operation = "input", source = "state", path = "command_plan" }, output = { type_name = "bcode.shell.command-plan/v1", schema = { type = "object" } } } },
+]
+entries = ["implementation"]
+exits = ["verification"]
+name = "implementation-verification-commit"
 schema_version = 1
 
 [workflow_templates.definition.input]
@@ -170,6 +173,79 @@ schema    = { type = "object" }
 type_name = "bcode.workflow.implementation-verification-commit-config/v1"
 
 [workflow_templates.definition.nodes.configuration.output]
+schema    = { type = "object" }
+type_name = "bcode.workflow.implementation-verification-commit-config/v1"
+
+[workflow_templates.definition.nodes.verification]
+id        = "verification"
+kind      = "plugin_block"
+name      = "Run verification command plan"
+resources = [{ resource = "repository", access = "write" }]
+
+[workflow_templates.definition.nodes.verification.configuration]
+block_id               = "shell.command-plan"
+block_version          = 1
+cancellation_supported = true
+effect                 = "mutating"
+operation              = "shell.command-plan"
+plugin_id              = "bcode.shell"
+reconciliation         = "repair_required"
+timeout_ms             = 300000
+
+[workflow_templates.definition.nodes.verification.configuration.authorization]
+capability              = "mutating"
+explicit_grant_required = true
+
+[workflow_templates.definition.nodes.verification.configuration.input]
+schema    = { type = "object" }
+type_name = "bcode.shell.command-plan/v1"
+
+[workflow_templates.definition.nodes.verification.configuration.output]
+schema    = { type = "object" }
+type_name = "bcode.shell.command-plan-result/v1"
+
+[[workflow_templates.definition.nodes.verification.configuration.resources]]
+access   = "write"
+resource = "repository"
+
+[workflow_templates.definition.nodes.verification.input]
+schema    = { type = "object" }
+type_name = "bcode.shell.command-plan/v1"
+
+[workflow_templates.definition.nodes.verification.output]
+schema    = { type = "object" }
+type_name = "bcode.shell.command-plan-result/v1"
+
+[workflow_templates.definition.nodes.evaluation]
+id        = "evaluation"
+kind      = "agent"
+name      = "Evaluate stop condition"
+resources = [{ resource = "repository", access = "read" }]
+
+[workflow_templates.definition.nodes.evaluation.configuration]
+agent_profile    = "plan"
+execution_target = "shared_parent_sequential"
+prompt_mode      = "json_input"
+read_only        = true
+skills           = []
+system_prompt    = "Optionally evaluate the configured stop condition without mutation. Preserve the typed workflow envelope and return strict structured output."
+timeout_ms       = 120000
+tool_allowlist   = []
+tool_capability  = "read_only"
+version          = 1
+
+[workflow_templates.definition.nodes.evaluation.configuration.structured_output]
+strict = true
+
+[workflow_templates.definition.nodes.evaluation.configuration.structured_output.schema]
+schema    = { type = "object" }
+type_name = "bcode.workflow.implementation-verification-commit-config/v1"
+
+[workflow_templates.definition.nodes.evaluation.input]
+schema    = { type = "object" }
+type_name = "bcode.workflow.implementation-verification-commit-config/v1"
+
+[workflow_templates.definition.nodes.evaluation.output]
 schema    = { type = "object" }
 type_name = "bcode.workflow.implementation-verification-commit-config/v1"
 
