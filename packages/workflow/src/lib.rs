@@ -2018,8 +2018,7 @@ pub struct WorkflowProductionCapabilities {
     pub node_kinds: BTreeMap<NodeKind, WorkflowCapabilitySupport>,
     /// Durable support classification for every serialized edge kind.
     pub edge_kinds: BTreeMap<WorkflowEdgeKind, WorkflowCapabilitySupport>,
-    /// Durable two-branch join policies. Wait-all is fully supported; fail-fast is rejected until
-    /// sibling cancellation intent and terminal outcomes are durable.
+    /// Durable two-branch join policies.
     pub parallel_join_policies: BTreeSet<ParallelFailurePolicy>,
     /// Durable support classification for automatic retry scheduling.
     pub automatic_retry: WorkflowCapabilitySupport,
@@ -2074,7 +2073,10 @@ impl WorkflowProductionCapabilities {
             workflow_block_interface_version: WORKFLOW_BLOCK_INTERFACE_VERSION,
             node_kinds,
             edge_kinds,
-            parallel_join_policies: BTreeSet::from([ParallelFailurePolicy::WaitAll]),
+            parallel_join_policies: BTreeSet::from([
+                ParallelFailurePolicy::WaitAll,
+                ParallelFailurePolicy::FailFast,
+            ]),
             automatic_retry: WorkflowCapabilitySupport::Unsupported,
             fan_out: WorkflowCapabilitySupport::Unsupported,
             transforms: WorkflowCapabilitySupport::Supported,
@@ -5041,7 +5043,10 @@ mod tests {
         );
         assert_eq!(
             capabilities.parallel_join_policies,
-            BTreeSet::from([ParallelFailurePolicy::WaitAll])
+            BTreeSet::from([
+                ParallelFailurePolicy::WaitAll,
+                ParallelFailurePolicy::FailFast,
+            ])
         );
         assert_eq!(
             capabilities.automatic_retry,
@@ -5718,8 +5723,12 @@ mod tests {
                 transform: None,
             }],
         };
+        let mut capabilities = WorkflowProductionCapabilities::current();
+        capabilities
+            .parallel_join_policies
+            .remove(&ParallelFailurePolicy::FailFast);
         let admission = definition
-            .production_admission(&WorkflowProductionCapabilities::current())
+            .production_admission(&capabilities)
             .expect("structurally valid definition");
         assert!(admission.diagnostics.iter().any(|item| {
             item.code == "unsupported_agent_configuration_version"

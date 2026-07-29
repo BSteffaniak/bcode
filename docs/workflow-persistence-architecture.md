@@ -29,11 +29,10 @@ the broader in-process SDK capability surface.
 
 Current durable support is:
 
-* supported: `Agent`, `Branch`, `Repeat`, wait-all `Parallel`, `PluginBlock`, `Input`, and
+* supported: `Agent`, `Branch`, `Repeat`, wait-all/fail-fast `Parallel`, `PluginBlock`, `Input`, and
   `Approval`;
 * in-process-only: closure-backed `Task`;
-* rejected pending complete durable behavior: `Retry`, retry edges, `FanOut`, and fail-fast
-  parallel.
+* rejected pending complete durable behavior: `Retry`, retry edges, and `FanOut`.
 
 Versioned bounded declarative edge transforms are supported for direct, conditional, repeat, and
 canonical parallel join materialization.
@@ -176,9 +175,15 @@ and restart-safe partial completion are implemented.
 
 For supported wait-all joins, a failed member does not terminate the run while another member is
 non-terminal. Once all declared members are terminal, the store persists one generation-scoped
-ordered member-outcome decision and fails the run if any member failed or was cancelled. This
-settlement is restart-safe because it derives entirely from persisted activations. Fail-fast remains
-rejected until sibling cancellation intent and terminal outcomes are durably recorded.
+ordered member-outcome decision and fails the run if any member failed or was cancelled.
+
+For fail-fast joins, the first persisted failure atomically records a generation-scoped decision,
+marks active sibling attempts with durable attempt-local cancellation intent, cancels siblings that
+have not dispatched, and fails the run. Only after commit does the server signal exact runtime
+owners. Successful signaling advances each attempt to `cancelling`; unsignalled intents remain
+bounded and discoverable for startup retry. Each owner then reports the sibling's authoritative
+terminal outcome through the normal attempt observation path. Both policies derive behavior from
+persisted definition, activations, attempts, decisions, and events rather than ephemeral task order.
 
 Canonical parallel joins declare non-empty, disjoint `left_exits` and `right_exits` sets whose
 members have direct edges to the join. Durable materialization always serializes the tuple as

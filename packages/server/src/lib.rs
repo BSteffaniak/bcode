@@ -24210,10 +24210,23 @@ async fn dispatch_workflow_agent_turn(
                     drop(store);
                     if let Err(error) = reconciled {
                         tracing::warn!("failed to persist completed workflow agent turn: {error}");
-                    } else if let Err(error) =
-                        drive_workflow_run(&state_for_completion, &request_run_id).await
-                    {
-                        tracing::warn!("failed to continue workflow after completion: {error}");
+                    } else {
+                        if let Ok(summary) = &reconciled
+                            && let Err(error) = propagate_fail_fast_sibling_cancellation(
+                                &state_for_completion,
+                                summary.sibling_cancellations.clone(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "failed to propagate fail-fast sibling cancellation: {error}"
+                            );
+                        }
+                        if let Err(error) =
+                            drive_workflow_run(&state_for_completion, &request_run_id).await
+                        {
+                            tracing::warn!("failed to continue workflow after completion: {error}");
+                        }
                     }
                 }
                 (Ok(_), Err(error)) | (Err(error), _) => {
@@ -24305,7 +24318,13 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
                                 .map(|attempt| attempt.run_id.clone())
                         })
                         .collect::<BTreeSet<_>>();
+                    let sibling_cancellations = summary.sibling_cancellations;
                     drop(store);
+                    if let Err(error) =
+                        propagate_fail_fast_sibling_cancellation(state, sibling_cancellations).await
+                    {
+                        tracing::warn!("failed to restore fail-fast sibling cancellation: {error}");
+                    }
                     for run_id in resumable_runs {
                         if let Err(error) = drive_workflow_run(state, &run_id).await {
                             tracing::warn!(
@@ -24324,6 +24343,21 @@ async fn restore_workflow_runtime_work(state: &Arc<ServerState>) {
     }
     if let Err(error) = continue_pending_workflow_runs(state).await {
         tracing::warn!("failed to continue pending workflow runs at startup: {error}");
+    }
+    let pending_sibling_cancellations = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pending_sibling_cancellations(1_000);
+    match pending_sibling_cancellations {
+        Ok(attempts) => {
+            if let Err(error) = propagate_fail_fast_sibling_cancellation(state, attempts).await {
+                tracing::warn!("failed to resume fail-fast sibling cancellation: {error}");
+            }
+        }
+        Err(error) => {
+            tracing::warn!("failed to discover fail-fast sibling cancellation: {error}");
+        }
     }
     let active_attempts = state
         .workflow_store
@@ -24487,6 +24521,40 @@ async fn signal_workflow_attempt_cancellation(
         .await;
     }
     Ok(())
+}
+
+async fn propagate_fail_fast_sibling_cancellation(
+    state: &ServerState,
+    attempts: Vec<bcode_workflow_store::ActiveAttemptCancellation>,
+) -> Result<Vec<String>, WorkflowStoreError> {
+    let mut signalled = Vec::new();
+    for attempt in attempts {
+        match signal_workflow_attempt_cancellation(state, &attempt).await {
+            Ok(()) => {
+                let changed = state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .mark_sibling_cancellation_signalled(
+                        &attempt.dispatch_identity,
+                        current_unix_millis(),
+                    )?;
+                if changed {
+                    signalled.push(attempt.dispatch_identity);
+                }
+            }
+            Err(WorkflowStoreError::InvalidData(message))
+                if message.starts_with("active runtime work not found for workflow dispatch:") =>
+            {
+                tracing::warn!(
+                    dispatch_identity = attempt.dispatch_identity,
+                    "fail-fast sibling cancellation remains durable for startup retry"
+                );
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(signalled)
 }
 
 async fn propagate_persisted_workflow_cancellation(
@@ -28726,9 +28794,13 @@ library = "test"
             None,
         );
         let append_steering = async {
-            while !bcode_fake_provider_plugin::fake_compaction_summary_signal_started(&signal) {
-                tokio::task::yield_now().await;
-            }
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !bcode_fake_provider_plugin::fake_compaction_summary_signal_started(&signal) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("compaction summary should start before steering");
             steering_tx
                 .send(SteeringCommand {
                     client_id: ClientId::new(),
@@ -40257,27 +40329,6 @@ library = "test"
                 transform: None,
             }],
         };
-        let fail_fast = bcode_workflow::WorkflowDefinition {
-            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
-            name: "fail-fast".to_string(),
-            input: schema.clone(),
-            output: schema.clone(),
-            nodes: BTreeMap::from([(
-                "parallel".to_string(),
-                node(
-                    "parallel",
-                    bcode_workflow::NodeKind::Parallel,
-                    serde_json::json!({
-                        "failure_policy": "fail_fast",
-                        "left_exits": [],
-                        "right_exits": []
-                    }),
-                ),
-            )]),
-            entries: vec!["parallel".to_string()],
-            exits: vec!["parallel".to_string()],
-            edges: Vec::new(),
-        };
         let invalid_agent = bcode_workflow::WorkflowDefinition {
             schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
             name: "invalid-agent".to_string(),
@@ -40339,7 +40390,6 @@ library = "test"
         };
         for (definition_id, definition) in [
             ("retry-edge", retry_edge),
-            ("fail-fast", fail_fast),
             ("invalid-agent", invalid_agent),
             ("incompatible-edge", incompatible_edge),
         ] {

@@ -2,10 +2,12 @@
 
 The host validates every compiled definition against [`WorkflowProductionCapabilities`] before
 persistence or start. This production contract is intentionally narrower than the in-process SDK
-surface. The current production host accepts `Agent`, `Branch`, `Repeat`, wait-all `Parallel`,
-`PluginBlock`, `Input`, and `Approval`. Closure-backed `Task` is explicitly in-process-only;
-`Retry`, `FanOut`, retry edges, and fail-fast parallel joins are rejected until their complete
-durable implementations ship. Explicit operator retry of a terminal failed activation remains a
+surface. The current production host accepts `Agent`, `Branch`, `Repeat`, wait-all and fail-fast
+`Parallel`, `PluginBlock`, `Input`, and `Approval`. Closure-backed `Task` is explicitly
+in-process-only; `Retry`, `FanOut`, and retry edges are rejected until their complete durable
+implementations ship. Fail-fast persists a generation-scoped decision and exact sibling
+cancellation intents before signaling runtime owners; unsignalled intents survive restart and
+terminal sibling outcomes return through ordinary attempt observation. Explicit operator retry of a terminal failed activation remains a
 separate bounded store operation; ambiguous mutation requires explicit repair before any later
 attempt and is never automatic retry. Deterministic branch and repeat predicates use the explicit version 1
 contract and are bounded and validated during production admission. Versioned bounded edge

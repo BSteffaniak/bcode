@@ -536,6 +536,8 @@ pub struct ReceiptReconciliationSummary {
     pub running: Vec<String>,
     pub succeeded: Vec<String>,
     pub failed: Vec<String>,
+    /// Active sibling attempts whose cancellation intent committed during fail-fast settlement.
+    pub sibling_cancellations: Vec<ActiveAttemptCancellation>,
     pub paused: Vec<String>,
     pub cancelled: Vec<String>,
     pub repair_required: Vec<String>,
@@ -3923,30 +3925,29 @@ impl WorkflowStore {
              ORDER BY prepared_at_ms, dispatch_identity LIMIT ?2",
         )?;
         statement
-            .query_map((run_id, limit), |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, u32>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, Option<String>>(5)?,
-                ))
-            })?
-            .map(|row| {
-                let (run_id, node_id, activation_id, attempt, dispatch_identity, receipt_json) =
-                    row?;
-                Ok(ActiveAttemptCancellation {
-                    run_id,
-                    node_id,
-                    activation_id,
-                    attempt,
-                    dispatch_identity,
-                    receipt: receipt_json
-                        .map(|receipt| serde_json::from_str(&receipt))
-                        .transpose()?,
-                })
-            })
+            .query_map((run_id, limit), active_attempt_cancellation_row)?
+            .map(|row| active_attempt_cancellation(row?))
+            .collect()
+    }
+
+    /// Return bounded fail-fast sibling cancellation intents that still need owner signaling.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the bound is invalid, receipt data is malformed, or the query fails.
+    pub fn pending_sibling_cancellations(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ActiveAttemptCancellation>, WorkflowStoreError> {
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, receipt_json \
+             FROM workflow_attempts WHERE status = 'sibling_cancelling' \
+             ORDER BY prepared_at_ms, dispatch_identity LIMIT ?1",
+        )?;
+        statement
+            .query_map([limit], active_attempt_cancellation_row)?
+            .map(|row| active_attempt_cancellation(row?))
             .collect()
     }
 
@@ -3984,7 +3985,7 @@ impl WorkflowStore {
         require_cancellation_requested(&transaction, &run_id)?;
         if !matches!(
             status.as_str(),
-            "prepared" | "admitted" | "running" | "cancelling"
+            "prepared" | "admitted" | "running" | "cancelling" | "sibling_cancelling"
         ) {
             let run_status = transaction.query_row(
                 "SELECT status FROM workflow_runs WHERE run_id = ?1",
@@ -4065,6 +4066,28 @@ impl WorkflowStore {
         dispatch_identity: &str,
         signalled_at_ms: u64,
     ) -> Result<bool, WorkflowStoreError> {
+        self.mark_cancellation_signalled_with_requirement(dispatch_identity, signalled_at_ms, true)
+    }
+
+    /// Mark a fail-fast sibling attempt as signalled after its durable attempt-local intent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed/missing attempt identity or database failure.
+    pub fn mark_sibling_cancellation_signalled(
+        &mut self,
+        dispatch_identity: &str,
+        signalled_at_ms: u64,
+    ) -> Result<bool, WorkflowStoreError> {
+        self.mark_cancellation_signalled_with_requirement(dispatch_identity, signalled_at_ms, false)
+    }
+
+    fn mark_cancellation_signalled_with_requirement(
+        &mut self,
+        dispatch_identity: &str,
+        signalled_at_ms: u64,
+        require_run_cancellation: bool,
+    ) -> Result<bool, WorkflowStoreError> {
         validate_id("dispatch_identity", dispatch_identity)?;
         let transaction = self.connection.transaction()?;
         let run_id = transaction
@@ -4079,12 +4102,22 @@ impl WorkflowStore {
                     "workflow attempt not found: {dispatch_identity}"
                 ))
             })?;
-        require_cancellation_requested(&transaction, &run_id)?;
-        let changed = transaction.execute(
-            "UPDATE workflow_attempts SET status = 'cancelling' \
-             WHERE dispatch_identity = ?1 AND status IN ('prepared', 'admitted', 'running')",
-            [dispatch_identity],
-        )?;
+        if require_run_cancellation {
+            require_cancellation_requested(&transaction, &run_id)?;
+        }
+        let changed = if require_run_cancellation {
+            transaction.execute(
+                "UPDATE workflow_attempts SET status = 'cancelling' \
+                 WHERE dispatch_identity = ?1 AND status IN ('prepared', 'admitted', 'running')",
+                [dispatch_identity],
+            )?
+        } else {
+            transaction.execute(
+                "UPDATE workflow_attempts SET status = 'cancelling' \
+                 WHERE dispatch_identity = ?1 AND status = 'sibling_cancelling'",
+                [dispatch_identity],
+            )?
+        };
         if changed == 1 {
             append_event(
                 &transaction,
@@ -4350,7 +4383,7 @@ impl WorkflowStore {
                AND run.cancellation_requested_at_ms IS NULL \
                AND NOT EXISTS(SELECT 1 FROM workflow_attempts attempt \
                  WHERE attempt.run_id = run.run_id \
-                   AND attempt.status IN ('prepared', 'admitted', 'running', 'cancelling')) \
+                   AND attempt.status IN ('prepared', 'admitted', 'running', 'cancelling', 'sibling_cancelling')) \
                AND NOT EXISTS(SELECT 1 FROM workflow_activations waiting \
                  WHERE waiting.run_id = run.run_id \
                    AND waiting.status IN ('waiting_input', 'waiting_approval')) \
@@ -4764,13 +4797,14 @@ where
         output.created_at_ms,
     )?;
     let (activated, completed_is_exit) = materialize_direct_successors(transaction, output, fault)?;
-    let parallel_failure = settle_wait_all_parallel_failure(
+    let parallel_failure = settle_parallel_failure(
         transaction,
         &output.run_id,
         &output.node_id,
+        false,
         output.created_at_ms,
     )?
-    .unwrap_or(false);
+    .is_some_and(|settlement| settlement.run_failed);
     fault.after_boundary(WorkflowOutputBoundary::SuccessorsMaterialized, output)?;
     let active_count: u64 = transaction.query_row(
         "SELECT COUNT(*) FROM workflow_activations WHERE run_id = ?1 \
@@ -5287,7 +5321,7 @@ fn receipt_backed_attempt(
         .query_row(
             "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, side_effect, \
              receipt_json FROM workflow_attempts WHERE dispatch_identity = ?1 \
-             AND status IN ('admitted', 'running', 'cancelling') AND receipt_json IS NOT NULL",
+             AND status IN ('admitted', 'running', 'cancelling', 'sibling_cancelling') AND receipt_json IS NOT NULL",
             [dispatch_identity],
             attempt_reconciliation_row,
         )
@@ -5309,6 +5343,53 @@ fn receipt_backed_attempts(
         .query_map([limit], attempt_reconciliation_row)?
         .map(|row| attempt_reconciliation_request(row?))
         .collect()
+}
+
+fn active_attempt_cancellation_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<(String, String, String, u32, String, Option<String>)> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
+fn active_attempt_cancellation(
+    row: (String, String, String, u32, String, Option<String>),
+) -> Result<ActiveAttemptCancellation, WorkflowStoreError> {
+    let (run_id, node_id, activation_id, attempt, dispatch_identity, receipt_json) = row;
+    Ok(ActiveAttemptCancellation {
+        run_id,
+        node_id,
+        activation_id,
+        attempt,
+        dispatch_identity,
+        receipt: receipt_json
+            .map(|receipt| serde_json::from_str(&receipt))
+            .transpose()?,
+    })
+}
+
+fn sibling_cancellation_requested_for_attempt(
+    connection: &Connection,
+    dispatch_identity: &str,
+) -> Result<bool, WorkflowStoreError> {
+    connection
+        .query_row(
+            "SELECT attempt.status = 'sibling_cancelling' \
+                    OR (attempt.status = 'cancelling' \
+                        AND run.cancellation_requested_at_ms IS NULL) \
+             FROM workflow_attempts attempt \
+             JOIN workflow_runs run ON run.run_id = attempt.run_id \
+             WHERE attempt.dispatch_identity = ?1",
+            [dispatch_identity],
+            |row| row.get(0),
+        )
+        .map_err(WorkflowStoreError::from)
 }
 
 fn cancellation_requested_for_run(
@@ -5341,12 +5422,20 @@ fn parallel_member_ids(
     Ok(left.into_iter().chain(right).collect())
 }
 
-fn settle_wait_all_parallel_failure(
+#[derive(Debug)]
+struct ParallelFailureSettlement {
+    run_failed: bool,
+    sibling_cancellations: Vec<ActiveAttemptCancellation>,
+}
+
+#[allow(clippy::too_many_lines)]
+fn settle_parallel_failure(
     transaction: &Transaction<'_>,
     run_id: &str,
     member_node_id: &str,
+    member_failed: bool,
     settled_at_ms: u64,
-) -> Result<Option<bool>, WorkflowStoreError> {
+) -> Result<Option<ParallelFailureSettlement>, WorkflowStoreError> {
     let (definition_json, generation): (String, u64) = transaction.query_row(
         "SELECT definition.definition_json, activation.dependency_generation \
          FROM workflow_runs run \
@@ -5374,15 +5463,10 @@ fn settle_wait_all_parallel_failure(
                 .cloned()
                 .unwrap_or_else(|| serde_json::json!("wait_all")),
         )?;
-        if policy != bcode_workflow::ParallelFailurePolicy::WaitAll {
-            return Err(WorkflowStoreError::InvalidData(format!(
-                "unsupported durable parallel failure policy for {}: {policy:?}",
-                join.id
-            )));
-        }
         let mut outcomes = Vec::with_capacity(members.len());
         let mut all_terminal = true;
         let mut has_failure = false;
+        let mut sibling_cancellations = Vec::new();
         for member in members {
             let status: Option<String> = transaction
                 .query_row(
@@ -5399,24 +5483,94 @@ fn settle_wait_all_parallel_failure(
             has_failure |= status
                 .as_deref()
                 .is_some_and(|status| matches!(status, "failed" | "cancelled"));
+            if policy == bcode_workflow::ParallelFailurePolicy::FailFast
+                && member != member_node_id
+                && !terminal
+            {
+                transaction.execute(
+                    "UPDATE workflow_activations SET status = 'cancelled' \
+                     WHERE run_id = ?1 AND node_id = ?2 AND dependency_generation = ?3 \
+                       AND status IN ('pending', 'waiting_input', 'waiting_approval', \
+                                      'waiting_mutation_approval') AND output_id IS NULL",
+                    (run_id, &member, generation),
+                )?;
+                let attempt = transaction
+                    .query_row(
+                        "SELECT attempt.run_id, attempt.node_id, attempt.activation_id, \
+                         attempt.attempt, attempt.dispatch_identity, attempt.receipt_json \
+                         FROM workflow_attempts attempt \
+                         JOIN workflow_activations activation \
+                           ON activation.run_id = attempt.run_id \
+                          AND activation.node_id = attempt.node_id \
+                          AND activation.activation_id = attempt.activation_id \
+                         WHERE attempt.run_id = ?1 AND attempt.node_id = ?2 \
+                           AND activation.dependency_generation = ?3 \
+                           AND attempt.status IN ('prepared', 'admitted', 'running', 'cancelling', 'sibling_cancelling')",
+                        (run_id, &member, generation),
+                        active_attempt_cancellation_row,
+                    )
+                    .optional()?
+                    .map(active_attempt_cancellation)
+                    .transpose()?;
+                if let Some(attempt) = attempt {
+                    transaction.execute(
+                        "UPDATE workflow_attempts SET status = 'sibling_cancelling' \
+                         WHERE dispatch_identity = ?1 \
+                           AND status IN ('prepared', 'admitted', 'running')",
+                        [&attempt.dispatch_identity],
+                    )?;
+                    append_event(
+                        transaction,
+                        run_id,
+                        "parallel_sibling_cancellation_requested",
+                        &serde_json::json!({
+                            "join_node_id": join.id,
+                            "failed_node_id": member_node_id,
+                            "sibling_node_id": member,
+                            "dispatch_identity": attempt.dispatch_identity,
+                            "generation": generation,
+                        })
+                        .to_string(),
+                        settled_at_ms,
+                    )?;
+                    sibling_cancellations.push(attempt);
+                }
+            }
             outcomes.push(serde_json::json!({"node_id": member, "status": status}));
         }
-        if all_terminal && has_failure {
+        let should_fail = match policy {
+            bcode_workflow::ParallelFailurePolicy::WaitAll => all_terminal && has_failure,
+            bcode_workflow::ParallelFailurePolicy::FailFast => member_failed,
+        };
+        if should_fail {
+            let (decision_type, decision_suffix) = match policy {
+                bcode_workflow::ParallelFailurePolicy::WaitAll => {
+                    ("parallel_wait_all", "parallel-wait-all")
+                }
+                bcode_workflow::ParallelFailurePolicy::FailFast => {
+                    ("parallel_fail_fast", "parallel-fail-fast")
+                }
+            };
             let value = serde_json::json!({
                 "policy": policy,
                 "generation": generation,
                 "members": outcomes,
                 "outcome": "failed",
+                "sibling_cancellations": sibling_cancellations
+                    .iter()
+                    .map(|attempt| attempt.dispatch_identity.as_str())
+                    .collect::<Vec<_>>(),
             });
             transaction.execute(
                 "INSERT INTO workflow_decisions \
                  (decision_id, run_id, node_id, decision_type, value_json, created_at_ms) \
-                 VALUES (?1, ?2, ?3, 'parallel_wait_all', ?4, ?5) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
                  ON CONFLICT(decision_id) DO NOTHING",
                 (
-                    format!("{run_id}:{}:{generation}:parallel-wait-all", join.id),
+                    format!("{run_id}:{}:{generation}:{decision_suffix}", join.id),
                     run_id,
                     &join.id,
+                    decision_type,
                     serde_json::to_string(&value)?,
                     settled_at_ms,
                 ),
@@ -5433,9 +5587,15 @@ fn settle_wait_all_parallel_failure(
                 &serde_json::json!({"join_node_id": join.id, "decision": value}).to_string(),
                 settled_at_ms,
             )?;
-            return Ok(Some(true));
+            return Ok(Some(ParallelFailureSettlement {
+                run_failed: true,
+                sibling_cancellations,
+            }));
         }
-        return Ok(Some(false));
+        return Ok(Some(ParallelFailureSettlement {
+            run_failed: false,
+            sibling_cancellations: Vec::new(),
+        }));
     }
     Ok(None)
 }
@@ -5448,7 +5608,9 @@ fn apply_attempt_observation(
     reconciled_at_ms: u64,
     summary: &mut ReceiptReconciliationSummary,
 ) -> Result<(), WorkflowStoreError> {
-    if cancellation_requested_for_run(transaction, &request.run_id)? {
+    if cancellation_requested_for_run(transaction, &request.run_id)?
+        || sibling_cancellation_requested_for_attempt(transaction, &request.dispatch_identity)?
+    {
         observation = AttemptObservation::Cancelled;
     }
     match observation {
@@ -5480,12 +5642,18 @@ fn apply_attempt_observation(
                     request.dispatch_identity
                 )));
             }
-            let parallel_state = settle_wait_all_parallel_failure(
+            let parallel_state = settle_parallel_failure(
                 transaction,
                 &request.run_id,
                 &request.node_id,
+                true,
                 reconciled_at_ms,
             )?;
+            if let Some(parallel_state) = &parallel_state {
+                summary
+                    .sibling_cancellations
+                    .extend(parallel_state.sibling_cancellations.clone());
+            }
             if parallel_state.is_none() {
                 transaction.execute(
                     "UPDATE workflow_runs SET status = 'failed', updated_at_ms = ?2 \
@@ -5618,7 +5786,7 @@ fn transition_attempt(
 ) -> Result<(), WorkflowStoreError> {
     let changed = transaction.execute(
         "UPDATE workflow_attempts SET status = ?2, terminal_at_ms = COALESCE(?3, terminal_at_ms) \
-         WHERE dispatch_identity = ?1 AND status IN ('admitted', 'running', 'cancelling')",
+         WHERE dispatch_identity = ?1 AND status IN ('admitted', 'running', 'cancelling', 'sibling_cancelling')",
         (&request.dispatch_identity, status, terminal_at_ms),
     )?;
     if changed != 1 {
@@ -5778,7 +5946,7 @@ fn enforce_attempt_limits(
     }
     let active_count: u32 = connection.query_row(
         "SELECT COUNT(*) FROM workflow_attempts WHERE run_id = ?1 \
-         AND status IN ('prepared', 'admitted', 'running', 'cancelling')",
+         AND status IN ('prepared', 'admitted', 'running', 'cancelling', 'sibling_cancelling')",
         [&attempt.run_id],
         |row| row.get(0),
     )?;
@@ -6130,7 +6298,7 @@ fn finalize_run_cancellation_if_settled(
 ) -> Result<bool, WorkflowStoreError> {
     let active_attempts: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM workflow_attempts WHERE run_id = ?1 \
-         AND status IN ('prepared', 'admitted', 'running', 'cancelling'))",
+         AND status IN ('prepared', 'admitted', 'running', 'cancelling', 'sibling_cancelling'))",
         [run_id],
         |row| row.get(0),
     )?;
@@ -6994,6 +7162,18 @@ mod tests {
             bcode_workflow::ValueSchema::of::<(u32, u32)>()
         );
         workflow.definition().clone()
+    }
+
+    fn parallel_join_definition_with_policy(
+        policy: bcode_workflow::ParallelFailurePolicy,
+    ) -> WorkflowDefinition {
+        let mut definition = parallel_join_definition();
+        definition
+            .nodes
+            .get_mut("join")
+            .expect("join")
+            .configuration["failure_policy"] = serde_json::to_value(policy).expect("policy");
+        definition
     }
 
     fn parallel_join_transform_definition() -> WorkflowDefinition {
@@ -10818,6 +10998,172 @@ mod tests {
                 .expect("run")
                 .status,
             RunStatus::Failed
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fail_fast_parallel_failure_persists_sibling_cancellation_before_signalling() {
+        let temp = tempfile::tempdir().expect("temp");
+        let definition =
+            parallel_join_definition_with_policy(bcode_workflow::ParallelFailurePolicy::FailFast);
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("parallel-fail-fast", 1, &definition)
+            .expect("definition");
+        let run_id = "parallel-fail-fast-run";
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: run_id.to_string(),
+                definition_id: "parallel-fail-fast".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                binding: None,
+                input: Some(serde_json::json!(1)),
+                created_at_ms: 1,
+                limits: WorkflowRunLimits {
+                    concurrency_cap: 2,
+                    ..WorkflowRunLimits::default()
+                },
+            })
+            .expect("run");
+        let prepare = |store: &mut WorkflowStore, node_id: &str, now| {
+            let prepared = store
+                .prepare_pending_activation(
+                    run_id,
+                    node_id,
+                    &activation_identity(run_id, node_id, 0),
+                    DispatchSideEffect::ReadOnly,
+                    serde_json::json!({"branch": node_id}),
+                    now,
+                )
+                .expect("prepare")
+                .expect("prepared");
+            store
+                .persist_dispatch_receipt(&DispatchReceipt {
+                    run_id: run_id.to_string(),
+                    node_id: node_id.to_string(),
+                    activation_id: prepared.activation.activation_id,
+                    attempt: prepared.attempt,
+                    dispatch_identity: prepared.dispatch_identity.clone(),
+                    receipt: serde_json::json!({"accepted": true}),
+                    admitted_at_ms: now + 1,
+                })
+                .expect("receipt");
+            prepared.dispatch_identity
+        };
+        let left_identity = prepare(&mut store, "left", 2);
+        let right_identity = prepare(&mut store, "right", 4);
+
+        let summary = store
+            .apply_attempt_observation(
+                &left_identity,
+                AttemptObservation::Failed {
+                    message: "left failed".to_string(),
+                },
+                6,
+            )
+            .expect("fail-fast settlement");
+        assert_eq!(summary.failed, vec![left_identity]);
+        assert_eq!(summary.sibling_cancellations.len(), 1);
+        assert_eq!(
+            summary.sibling_cancellations[0].dispatch_identity,
+            right_identity
+        );
+        assert_eq!(
+            store.run_summary(run_id).expect("run").expect("run").status,
+            RunStatus::Failed
+        );
+        assert_eq!(
+            store
+                .attempt_history(run_id, None, 10)
+                .expect("attempts")
+                .into_iter()
+                .find(|attempt| attempt.dispatch_identity == right_identity)
+                .expect("right attempt")
+                .status,
+            "sibling_cancelling"
+        );
+        let decision = store
+            .decision(&format!("{run_id}:join:0:parallel-fail-fast"))
+            .expect("decision")
+            .expect("decision");
+        assert_eq!(decision.value["policy"], "fail_fast");
+        assert_eq!(
+            decision.value["sibling_cancellations"],
+            serde_json::json!([right_identity])
+        );
+        assert!(
+            store
+                .event_history(run_id, None, 100)
+                .expect("events")
+                .iter()
+                .any(|event| event.event_type == "parallel_sibling_cancellation_requested")
+        );
+        assert_eq!(
+            store
+                .pending_sibling_cancellations(10)
+                .expect("pending siblings")
+                .into_iter()
+                .map(|attempt| attempt.dispatch_identity)
+                .collect::<Vec<_>>(),
+            vec![right_identity.clone()]
+        );
+        drop(store);
+        let mut reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(
+            reopened
+                .pending_sibling_cancellations(10)
+                .expect("pending siblings after reopen")[0]
+                .dispatch_identity,
+            right_identity
+        );
+        assert!(
+            reopened
+                .mark_sibling_cancellation_signalled(&right_identity, 7)
+                .expect("mark signalled")
+        );
+        assert!(
+            reopened
+                .pending_sibling_cancellations(10)
+                .expect("settled pending siblings")
+                .is_empty()
+        );
+        assert_eq!(
+            reopened
+                .attempt_history(run_id, None, 10)
+                .expect("attempts")
+                .into_iter()
+                .find(|attempt| attempt.dispatch_identity == right_identity)
+                .expect("right attempt")
+                .status,
+            "cancelling"
+        );
+        assert!(
+            reopened
+                .apply_attempt_observation(&right_identity, AttemptObservation::Running, 8)
+                .expect("late sibling observation")
+                .cancelled
+                .contains(&right_identity)
+        );
+        assert_eq!(
+            reopened
+                .attempt_history(run_id, None, 10)
+                .expect("attempts")
+                .into_iter()
+                .find(|attempt| attempt.dispatch_identity == right_identity)
+                .expect("right attempt")
+                .status,
+            "cancelled"
+        );
+        assert_eq!(
+            reopened
+                .decision(&format!("{run_id}:join:0:parallel-fail-fast"))
+                .expect("decision")
+                .expect("decision")
+                .value["sibling_cancellations"],
+            serde_json::json!([right_identity])
         );
     }
 
