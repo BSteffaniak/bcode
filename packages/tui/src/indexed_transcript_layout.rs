@@ -308,6 +308,22 @@ impl IndexedTranscriptLayout {
         (scanned, changed, rows_regenerated)
     }
 
+    /// Synchronize only selected transcript entry indexes.
+    pub fn sync_transcript_entries<S, R>(
+        &mut self,
+        indexes: &BTreeSet<usize>,
+        signature: S,
+        rows: R,
+    ) -> (usize, usize, usize)
+    where
+        S: Fn(usize) -> TranscriptLayoutSignature,
+        R: FnMut(usize) -> Vec<Line>,
+    {
+        let scanned = indexes.len();
+        let (changed, rows_regenerated) = self.transcript.sync_entries(indexes, signature, rows);
+        (scanned, changed, rows_regenerated)
+    }
+
     pub fn total_rows(&self) -> usize {
         self.history
             .total_rows()

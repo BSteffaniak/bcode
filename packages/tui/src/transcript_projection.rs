@@ -62,6 +62,7 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
     let started = Instant::now();
     let elapsed_dirty_visuals =
         app.drain_elapsed_dirty_visuals_bounded(MAX_DIRTY_VISUALS_PER_LAYOUT_SYNC);
+    let transcript_dirty_items = app.drain_transcript_dirty_items();
     let mut transcript_layout = std::mem::take(app.transcript_layout_mut());
     let input = TranscriptLayoutInput::from_app(app, width);
     let fingerprint = input.fingerprint();
@@ -69,6 +70,26 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
     if transcript_layout.is_current(&fingerprint) {
         transcript_layout
             .record_cache_hit(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+        *app.transcript_layout_mut() = transcript_layout;
+        return;
+    }
+    if !transcript_dirty_items.is_empty()
+        && transcript_layout.structure_is_current(&structural_fingerprint)
+    {
+        transcript_layout.sync_transcript_entries(
+            fingerprint,
+            &transcript_dirty_items,
+            |index| transcript_item_signature(&input.transcript[index], &input),
+            |index| {
+                render::transcript_item_rows(
+                    input.transcript,
+                    index,
+                    input.width,
+                    input.plugin_host,
+                    input.diff_viewer_config,
+                )
+            },
+        );
         *app.transcript_layout_mut() = transcript_layout;
         return;
     }

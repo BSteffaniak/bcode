@@ -172,6 +172,35 @@ impl TranscriptLayoutCache {
         stats
     }
 
+    /// Synchronize only transcript entries identified by stable source damage.
+    pub fn sync_transcript_entries<S, R>(
+        &mut self,
+        fingerprint: TranscriptLayoutFingerprint,
+        indexes: &BTreeSet<usize>,
+        signature: S,
+        rows: R,
+    ) -> TranscriptLayoutSyncStats
+    where
+        S: Fn(usize) -> TranscriptLayoutSignature,
+        R: FnMut(usize) -> Vec<Line>,
+    {
+        let started = Instant::now();
+        let (entries_scanned, signatures_changed, rows_regenerated) = self
+            .entries
+            .sync_transcript_entries(indexes, signature, rows);
+        self.fingerprint = Some(fingerprint);
+        let stats = TranscriptLayoutSyncStats {
+            invalidation: TranscriptLayoutInvalidation::Incremental,
+            entries_scanned,
+            signatures_changed,
+            entries_rebuilt: signatures_changed,
+            rows_regenerated,
+            duration_micros: u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+        };
+        self.sync_stats.push(stats);
+        stats
+    }
+
     /// Record one cache-hit synchronization attempt.
     pub fn record_cache_hit(&mut self, duration_micros: u64) {
         self.sync_stats

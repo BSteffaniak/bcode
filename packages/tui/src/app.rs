@@ -312,6 +312,7 @@ pub struct BmuxApp {
     transcript_markdown_cache: crate::transcript_markdown_cache::TranscriptMarkdownCache,
     elapsed_layout_revision: u64,
     elapsed_dirty_visuals: BTreeSet<String>,
+    transcript_dirty_items: BTreeSet<usize>,
     viewport: TranscriptViewport,
     manual_transcript_scroll_until: Option<Instant>,
     transcript_scroll_animation: Option<TranscriptScrollAnimation>,
@@ -520,6 +521,7 @@ impl BmuxApp {
                 crate::transcript_markdown_cache::TranscriptMarkdownCache::default(),
             elapsed_layout_revision: 0,
             elapsed_dirty_visuals: BTreeSet::new(),
+            transcript_dirty_items: BTreeSet::new(),
             viewport: TranscriptViewport::default(),
             manual_transcript_scroll_until: None,
             transcript_scroll_animation: None,
@@ -1363,6 +1365,10 @@ impl BmuxApp {
     }
 
     /// Drain at most `limit` transcript invocation identifiers whose elapsed-time label changed.
+    pub fn drain_transcript_dirty_items(&mut self) -> BTreeSet<usize> {
+        std::mem::take(&mut self.transcript_dirty_items)
+    }
+
     pub fn drain_elapsed_dirty_visuals_bounded(&mut self, limit: usize) -> BTreeSet<String> {
         let mut drained = BTreeSet::new();
         for _ in 0..limit {
@@ -3163,10 +3169,15 @@ impl BmuxApp {
     }
 
     fn apply_session_view_terminal_adapter(&mut self) -> TranscriptDocumentDamage {
-        self.session_view_terminal_adapter.apply(
+        let damage = self.session_view_terminal_adapter.apply(
             &self.session_view.snapshot().transcript,
             &mut self.transcript,
-        )
+        );
+        if let TranscriptDocumentDamage::Items(ids) = &damage {
+            self.transcript_dirty_items
+                .extend(ids.iter().filter_map(|id| self.transcript.source_index(id)));
+        }
+        damage
     }
 
     fn shared_terminal_item(&self, sequence: u64) -> Option<TranscriptItem> {
