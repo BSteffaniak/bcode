@@ -6412,17 +6412,26 @@ async fn release_session_owner(session_id: SessionId) -> Result<(), CliError> {
     })?;
     let client =
         BcodeClient::new(endpoint).with_daemon_availability(DaemonAvailability::RequireRunning);
-    if client.release_session_database(session_id).await? {
-        println!(
-            "released session database from daemon {}",
-            record.instance_id
-        );
-        Ok(())
-    } else {
-        Err(CliError::InvalidArguments(format!(
-            "daemon {} refused release because the session has active work",
-            record.instance_id
-        )))
+    match client.release_session_ownership(session_id).await? {
+        bcode_ipc::SessionOwnershipReleaseOutcome::Released
+        | bcode_ipc::SessionOwnershipReleaseOutcome::AlreadyUnowned => {
+            println!(
+                "released session ownership from daemon {}",
+                record.instance_id
+            );
+            Ok(())
+        }
+        bcode_ipc::SessionOwnershipReleaseOutcome::Blocked { blockers } => {
+            let blockers = blockers
+                .into_iter()
+                .map(|blocker| format!("{blocker:?}").to_lowercase())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(CliError::InvalidArguments(format!(
+                "daemon {} refused ownership release; blockers: {blockers}",
+                record.instance_id
+            )))
+        }
     }
 }
 

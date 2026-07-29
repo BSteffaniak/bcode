@@ -1050,24 +1050,24 @@ impl BcodeClient {
         self.server_stop_with_mode(ServerStopMode::IfIdle).await
     }
 
-    /// Ask the connected daemon to close one session database without detaching clients.
+    /// Ask the connected daemon to release one quiescent session's runtime ownership.
     ///
     /// # Errors
     ///
     /// Returns an error when the daemon cannot be reached, rejects the request, or returns an
     /// unexpected response.
-    pub async fn release_session_database(
+    pub async fn release_session_ownership(
         &self,
         session_id: bcode_session_models::SessionId,
-    ) -> Result<bool, ClientError> {
+    ) -> Result<bcode_ipc::SessionOwnershipReleaseOutcome, ClientError> {
         match self
-            .send_request(Request::ReleaseSessionDatabase { session_id })
+            .send_request(Request::ReleaseSessionOwnership { session_id })
             .await?
         {
-            ResponsePayload::SessionDatabaseReleased {
+            ResponsePayload::SessionOwnershipReleased {
                 session_id: released_session_id,
-                released,
-            } if released_session_id == session_id => Ok(released),
+                outcome,
+            } if released_session_id == session_id => Ok(outcome),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

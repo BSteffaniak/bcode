@@ -81,7 +81,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 17;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 18;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -588,8 +588,8 @@ pub enum Request {
         /// Validated-at-ingress metric observations.
         batch: bcode_metrics::ClientMetricBatch,
     },
-    /// Ask this daemon to close one session database while retaining attached clients.
-    ReleaseSessionDatabase {
+    /// Ask this daemon to release runtime ownership when the session is quiescent.
+    ReleaseSessionOwnership {
         session_id: SessionId,
     },
 }
@@ -1598,9 +1598,33 @@ pub enum ResponsePayload {
     SessionOpenPrepared {
         snapshot: SessionOpenOperationSnapshot,
     },
-    SessionDatabaseReleased {
+    SessionOwnershipReleased {
         session_id: SessionId,
-        released: bool,
+        outcome: SessionOwnershipReleaseOutcome,
+    },
+}
+
+/// Stable reasons runtime ownership cannot currently be released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOwnershipBlocker {
+    AttachedClient,
+    PendingAttach,
+    QueuedCommand,
+    ActiveRuntime,
+    RuntimeWork,
+    PluginInvocation,
+    Migration,
+}
+
+/// Typed outcome of an explicit session ownership release request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionOwnershipReleaseOutcome {
+    Released,
+    AlreadyUnowned,
+    Blocked {
+        blockers: Vec<SessionOwnershipBlocker>,
     },
 }
 
@@ -2914,6 +2938,32 @@ mod tests {
         assert_eq!(envelope.kind, EnvelopeKind::Response);
         assert_eq!(
             decode_response(&envelope.payload).expect("response should decode"),
+            response
+        );
+    }
+
+    #[test]
+    fn session_ownership_release_payloads_round_trip() {
+        let session_id = SessionId::new();
+        let request = Request::ReleaseSessionOwnership { session_id };
+        let encoded = encode_request(&request).expect("request should encode");
+        assert_eq!(
+            decode_request(&encoded).expect("request should decode"),
+            request
+        );
+
+        let response = Response::Ok(ResponsePayload::SessionOwnershipReleased {
+            session_id,
+            outcome: SessionOwnershipReleaseOutcome::Blocked {
+                blockers: vec![
+                    SessionOwnershipBlocker::AttachedClient,
+                    SessionOwnershipBlocker::RuntimeWork,
+                ],
+            },
+        });
+        let encoded = encode_response(&response).expect("response should encode");
+        assert_eq!(
+            decode_response(&encoded).expect("response should decode"),
             response
         );
     }

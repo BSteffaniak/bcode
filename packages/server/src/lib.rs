@@ -1599,33 +1599,6 @@ impl ServerState {
         }
     }
 
-    async fn release_session_database_if_inactive(
-        &self,
-        session_id: SessionId,
-    ) -> Result<bool, ServerError> {
-        if self.session_has_active_turn(session_id).await
-            || session_has_active_plugin_invocations(self, session_id)
-        {
-            return Ok(false);
-        }
-        if !self
-            .runtime_work
-            .active_for_session(session_id)
-            .await
-            .is_empty()
-        {
-            return Ok(false);
-        }
-        if self.session_migrations.active_count().await > 0 {
-            return Ok(false);
-        }
-        clear_session_live_state(self, session_id);
-        Ok(self
-            .sessions
-            .release_session_database_resources(session_id)
-            .await?)
-    }
-
     async fn register_client_forwarder(&self, client_id: ClientId, handle: JoinHandle<()>) {
         self.client_forwarders
             .lock()
@@ -3251,7 +3224,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::SessionHistoryPage { session_id, .. }
         | Request::PrepareSessionOpen { session_id }
         | Request::WaitSessionOpenProgress { session_id, .. }
-        | Request::ReleaseSessionDatabase { session_id }
+        | Request::ReleaseSessionOwnership { session_id }
         | Request::AttachSession { session_id }
         | Request::AttachSessionRecent { session_id, .. }
         | Request::SendUserMessage { session_id, .. }
@@ -3293,7 +3266,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::ServerStatus { .. } => "server_status",
         Request::ModelCatalogDiagnostics => "model_catalog_diagnostics",
         Request::ServerStop { .. } => "server_stop",
-        Request::ReleaseSessionDatabase { .. } => "release_session_database",
+        Request::ReleaseSessionOwnership { .. } => "release_session_ownership",
         Request::CreateSession { .. } => "create_session",
         Request::ListSessions { .. } => "list_sessions",
         Request::RenameSession { .. } => "rename_session",
@@ -3470,8 +3443,8 @@ async fn handle_request_inner(
             handle_model_catalog_diagnostics(request_id, state, writer).await
         }
         Request::ServerStop { mode } => handle_server_stop(request_id, state, writer, mode).await,
-        Request::ReleaseSessionDatabase { session_id } => {
-            handle_release_session_database(request_id, state, writer, session_id).await
+        Request::ReleaseSessionOwnership { session_id } => {
+            handle_release_session_ownership(request_id, state, writer, session_id).await
         }
         Request::SetComposerDraft { scope, text } => {
             handle_set_composer_draft(request_id, state, writer, scope, text).await
@@ -4354,21 +4327,136 @@ fn active_migration_shutdown_blocker(active_migrations: usize) -> Option<String>
     })
 }
 
-async fn handle_release_session_database(
+#[allow(clippy::too_many_lines)]
+async fn explicit_session_ownership_release_outcome(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Result<bcode_ipc::SessionOwnershipReleaseOutcome, ServerError> {
+    use bcode_ipc::{SessionOwnershipBlocker, SessionOwnershipReleaseOutcome};
+
+    let mut blockers = BTreeSet::new();
+    if state
+        .attached_client_sessions
+        .lock()
+        .await
+        .values()
+        .any(|attached_session_id| *attached_session_id == session_id)
+    {
+        blockers.insert(SessionOwnershipBlocker::AttachedClient);
+    }
+    if state
+        .active_session_namespaces
+        .lock()
+        .await
+        .get(&session_id)
+        .is_some_and(|namespace| namespace.pending_attaches > 0)
+    {
+        blockers.insert(SessionOwnershipBlocker::PendingAttach);
+    }
+    let runtime = state
+        .session_runtimes
+        .lock()
+        .await
+        .get(&session_id)
+        .cloned();
+    if let Some(runtime) = runtime {
+        if runtime.queued_followups.load(Ordering::Acquire) > 0
+            || runtime.queued_steering.load(Ordering::Acquire) > 0
+        {
+            blockers.insert(SessionOwnershipBlocker::QueuedCommand);
+        }
+        if runtime.phase.lock().await.has_active_work()
+            || runtime.current_turn.lock().await.is_some()
+        {
+            blockers.insert(SessionOwnershipBlocker::ActiveRuntime);
+        }
+    }
+    if !state
+        .runtime_work
+        .active_for_session(session_id)
+        .await
+        .is_empty()
+    {
+        blockers.insert(SessionOwnershipBlocker::RuntimeWork);
+    }
+    if session_has_active_plugin_invocations(state, session_id) {
+        blockers.insert(SessionOwnershipBlocker::PluginInvocation);
+    }
+    if state.session_migrations.active_count().await > 0 {
+        blockers.insert(SessionOwnershipBlocker::Migration);
+    }
+    let actor_snapshot = state
+        .sessions
+        .session_ownership_snapshot(session_id)
+        .await?;
+    if actor_snapshot.attached_clients > 0 {
+        blockers.insert(SessionOwnershipBlocker::AttachedClient);
+    }
+    for kind in actor_snapshot.guards.keys() {
+        blockers.insert(match kind {
+            bcode_session::SessionOwnershipKind::QueuedCommand => {
+                SessionOwnershipBlocker::QueuedCommand
+            }
+            bcode_session::SessionOwnershipKind::RuntimeWork => {
+                SessionOwnershipBlocker::RuntimeWork
+            }
+            bcode_session::SessionOwnershipKind::PluginInvocation => {
+                SessionOwnershipBlocker::PluginInvocation
+            }
+        });
+    }
+    let outcome = if blockers.is_empty() {
+        match state.sessions.release_session_ownership(session_id).await? {
+            bcode_session::SessionOwnershipRelease::Released => {
+                SessionOwnershipReleaseOutcome::Released
+            }
+            bcode_session::SessionOwnershipRelease::AlreadyUnowned => {
+                SessionOwnershipReleaseOutcome::AlreadyUnowned
+            }
+            bcode_session::SessionOwnershipRelease::Blocked(snapshot) => {
+                let mut blockers = BTreeSet::new();
+                if snapshot.attached_clients > 0 {
+                    blockers.insert(SessionOwnershipBlocker::AttachedClient);
+                }
+                for kind in snapshot.guards.keys() {
+                    blockers.insert(match kind {
+                        bcode_session::SessionOwnershipKind::QueuedCommand => {
+                            SessionOwnershipBlocker::QueuedCommand
+                        }
+                        bcode_session::SessionOwnershipKind::RuntimeWork => {
+                            SessionOwnershipBlocker::RuntimeWork
+                        }
+                        bcode_session::SessionOwnershipKind::PluginInvocation => {
+                            SessionOwnershipBlocker::PluginInvocation
+                        }
+                    });
+                }
+                SessionOwnershipReleaseOutcome::Blocked {
+                    blockers: blockers.into_iter().collect(),
+                }
+            }
+        }
+    } else {
+        SessionOwnershipReleaseOutcome::Blocked {
+            blockers: blockers.into_iter().collect(),
+        }
+    };
+    Ok(outcome)
+}
+
+async fn handle_release_session_ownership(
     request_id: u64,
     state: &ServerState,
     writer: &SharedWriter,
     session_id: SessionId,
 ) -> Result<(), ServerError> {
-    let released = state
-        .release_session_database_if_inactive(session_id)
-        .await?;
+    let outcome = explicit_session_ownership_release_outcome(state, session_id).await?;
     send_response(
         writer,
         request_id,
-        Response::Ok(ResponsePayload::SessionDatabaseReleased {
+        Response::Ok(ResponsePayload::SessionOwnershipReleased {
             session_id,
-            released,
+            outcome,
         }),
     )
     .await
@@ -25900,6 +25988,134 @@ mod tests {
     use switchy::database::DatabaseValue;
     use tracing_subscriber::fmt::MakeWriter;
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn final_real_ipc_disconnect_releases_owner_for_next_daemon() {
+        let session_root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent_with_metrics_and_lease_owner(
+            session_root.path(),
+            MetricsRegistry::default(),
+            SessionLeaseOwnerContext {
+                daemon_instance_id: Some("ipc-owner-one".to_owned()),
+                build_fingerprint: Some("ipc-owner-one-build".to_owned()),
+                ..SessionLeaseOwnerContext::default()
+            },
+        )
+        .expect("sessions");
+        let session = sessions
+            .create_session(Some("disconnect".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let state = Arc::new(test_server_state(sessions.clone()));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("client connection");
+            handle_client(stream, server_state)
+                .await
+                .expect("handle client");
+        });
+
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut connection = client.connect("disconnect-test").await.expect("connect");
+        connection
+            .attach_session_recent(session.id, 8)
+            .await
+            .expect("attach");
+        assert!(sessions.session_is_owned(session.id).await);
+        drop(connection);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .expect("EOF cleanup should complete")
+            .expect("server task");
+        assert!(state.attached_client_sessions.lock().await.is_empty());
+        assert!(!sessions.session_is_owned(session.id).await);
+        assert!(
+            bcode_session::lease::active_session_owners(session_root.path(), session.id)
+                .expect("owner scan")
+                .is_empty()
+        );
+
+        let next = SessionManager::persistent_with_metrics_and_lease_owner(
+            session_root.path(),
+            MetricsRegistry::default(),
+            SessionLeaseOwnerContext {
+                daemon_instance_id: Some("ipc-owner-two".to_owned()),
+                build_fingerprint: Some("ipc-owner-two-build".to_owned()),
+                ..SessionLeaseOwnerContext::default()
+            },
+        )
+        .expect("next manager");
+        let guard = next
+            .acquire_session_ownership(session.id, bcode_session::SessionOwnershipKind::RuntimeWork)
+            .await
+            .expect("next daemon should acquire");
+        assert!(next.session_is_owned(session.id).await);
+        drop(guard);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_typed_release_reports_attached_blocker_then_success() {
+        let session_root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(session_root.path()).expect("sessions");
+        let session = sessions
+            .create_session(Some("client release".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let state = Arc::new(test_server_state(sessions.clone()));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut attached = client
+            .connect("attached-release-test")
+            .await
+            .expect("connect");
+        attached
+            .attach_session_recent(session.id, 8)
+            .await
+            .expect("attach");
+        assert_eq!(
+            client
+                .release_session_ownership(session.id)
+                .await
+                .expect("blocked response"),
+            bcode_ipc::SessionOwnershipReleaseOutcome::Blocked {
+                blockers: vec![bcode_ipc::SessionOwnershipBlocker::AttachedClient],
+            }
+        );
+        drop(attached);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while sessions.session_is_owned(session.id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnect cleanup");
+        assert_eq!(
+            client
+                .release_session_ownership(session.id)
+                .await
+                .expect("released response"),
+            bcode_ipc::SessionOwnershipReleaseOutcome::AlreadyUnowned
+        );
+        server.abort();
+    }
+
     #[tokio::test]
     async fn invalid_request_payload_returns_error_without_closing_connection() {
         let session_root = tempfile::tempdir().expect("session root");
@@ -34549,6 +34765,92 @@ library = "test"
 
     fn test_server_state(sessions: SessionManager) -> ServerState {
         test_server_state_with_ralph_store(sessions, bcode_ralph::RalphStateStore::default())
+    }
+
+    #[tokio::test]
+    async fn explicit_ownership_release_reports_success_and_actor_blockers() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("persistent sessions");
+        let session = sessions
+            .create_session(
+                Some("explicit release".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let state = test_server_state(sessions.clone());
+
+        let first = explicit_session_ownership_release_outcome(&state, session.id)
+            .await
+            .expect("first release");
+        assert_eq!(
+            first,
+            bcode_ipc::SessionOwnershipReleaseOutcome::AlreadyUnowned
+        );
+
+        let guard = sessions
+            .acquire_session_ownership(session.id, bcode_session::SessionOwnershipKind::RuntimeWork)
+            .await
+            .expect("runtime guard");
+        let blocked = explicit_session_ownership_release_outcome(&state, session.id)
+            .await
+            .expect("blocked release");
+        assert_eq!(
+            blocked,
+            bcode_ipc::SessionOwnershipReleaseOutcome::Blocked {
+                blockers: vec![bcode_ipc::SessionOwnershipBlocker::RuntimeWork],
+            }
+        );
+        assert!(sessions.session_is_owned(session.id).await);
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sessions.session_is_owned(session.id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("guard drop should release");
+    }
+
+    #[tokio::test]
+    async fn explicit_ownership_release_reports_attached_client_without_detaching() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("persistent sessions");
+        let session = sessions
+            .create_session(
+                Some("attached blocker".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let client_id = ClientId::new();
+        sessions
+            .attach_session_recent(session.id, client_id, 8)
+            .await
+            .expect("attach");
+        let state = test_server_state(sessions.clone());
+        let blocked = explicit_session_ownership_release_outcome(&state, session.id)
+            .await
+            .expect("blocked release");
+        assert_eq!(
+            blocked,
+            bcode_ipc::SessionOwnershipReleaseOutcome::Blocked {
+                blockers: vec![bcode_ipc::SessionOwnershipBlocker::AttachedClient],
+            }
+        );
+        assert_eq!(
+            sessions
+                .session_summary(session.id)
+                .await
+                .expect("summary")
+                .client_count,
+            1
+        );
+        assert!(sessions.session_is_owned(session.id).await);
+        sessions
+            .detach_session(session.id, client_id)
+            .await
+            .expect("detach");
     }
 
     #[tokio::test]
