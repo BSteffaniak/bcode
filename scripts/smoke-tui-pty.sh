@@ -26,7 +26,7 @@ esac
 
 cd "${root}"
 
-cargo build --quiet -p bcode --features app -p bcode_fake_provider_plugin
+cargo build --quiet -p bcode --features distribution -p bcode_fake_provider_plugin
 
 case "$(uname -s)" in
     Darwin)

@@ -18,7 +18,7 @@ trap cleanup EXIT
 
 cd "${root}"
 
-cargo build --quiet -p bcode --features app
+cargo build --quiet -p bcode --features distribution
 
 cargo build --quiet -p bcode_fake_provider_plugin -p bcode_filesystem_plugin
 

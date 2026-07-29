@@ -24,7 +24,7 @@ Supported v1 targets:
 Artifacts are written to `target/dist/` with adjacent `sha256` files. macOS and Windows
 artifacts are `.zip` archives; Linux artifacts are `.tar.gz` archives. Every archive contains
 `bcode` and the process-isolated `bcode-mermaid-worker` (with `.exe` suffixes on Windows), plus
-the bundled Tesseract runtime tree required by the default application build. Windows source
+the bundled Tesseract runtime tree selected by the `distribution` feature. Windows source
 builds use the MSVC Rust target and require Visual Studio Build Tools with C++ support and CMake.
 Windows x64 CI currently uses GitHub's `windows-latest` image. The minimum supported end-user
 version is Windows 10, version 1809, because Bcode's terminal shell integration depends on ConPTY.
@@ -37,7 +37,7 @@ From a Developer PowerShell with the MSVC C++ tools available:
 ```powershell
 rustup target add x86_64-pc-windows-msvc
 cargo build --release --package bcode --bin bcode --bin bcode-mermaid-worker `
-  --features app --target x86_64-pc-windows-msvc
+  --features distribution --target x86_64-pc-windows-msvc
 cargo xtask release --target x86_64-pc-windows-msvc --version v0.1.0
 cargo xtask verify-release --target x86_64-pc-windows-msvc --version v0.1.0
 ```

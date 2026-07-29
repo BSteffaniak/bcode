@@ -4,11 +4,13 @@
 
 #[tokio::main]
 async fn main() {
-    if let Err(error) = Box::pin(bcode_cli::run_with_static_bundled(
-        bcode_bundled_plugins::static_bundled_plugins(),
-    ))
-    .await
-    {
+    #[cfg(feature = "static-bundled-plugins")]
+    let result =
+        bcode_cli::run_with_static_bundled(bcode_bundled_plugins::static_bundled_plugins()).await;
+    #[cfg(not(feature = "static-bundled-plugins"))]
+    let result = bcode_cli::run().await;
+
+    if let Err(error) = result {
         eprintln!("error: {error}");
         std::process::exit(1);
     }

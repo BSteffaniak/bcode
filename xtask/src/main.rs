@@ -1121,7 +1121,7 @@ fn build_bcode_release(target: &str) -> Result<()> {
             .arg("--bin")
             .arg(MERMAID_WORKER_BINARY_NAME)
             .arg("--features")
-            .arg("app")
+            .arg("distribution")
             .arg("--target")
             .arg(target),
     )

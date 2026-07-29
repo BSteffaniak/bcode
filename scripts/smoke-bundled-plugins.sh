@@ -23,7 +23,7 @@ trap cleanup EXIT
 
 cd "${root}"
 
-cargo build --quiet -p bcode --features app
+cargo build --quiet -p bcode --features distribution
 rm -rf \
     "${fs_plugin_dir}" \
     "${shell_plugin_dir}" \

@@ -28,7 +28,7 @@ trap cleanup EXIT
 
 cd "${root}"
 
-cargo build --quiet -p bcode --features app
+cargo build --quiet -p bcode --features distribution
 
 "${root}/target/debug/bcode" server run >"$workdir/server.log" 2>&1 &
 server_pid="$!"

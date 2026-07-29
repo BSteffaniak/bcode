@@ -18,7 +18,7 @@ required-features = ["app"]
 [[bin]]
 name              = "bcode-mermaid-worker"
 path              = "../mermaid-render/src/bin/worker.rs"
-required-features = ["app"]
+required-features = ["mermaid-renderer"]
 
 [[example]]
 name              = "embedded_fake_provider"
@@ -82,14 +82,7 @@ tracing-subscriber    = { workspace = true }
 trybuild              = { workspace = true }
 
 [features]
-app = [
-    "config",
-    "cli",
-    "web-renderer",
-    "static-bundled-plugins",
-    "bundled-ocr-tesseract",
-    "dep:bcode_mermaid_render",
-]
+app = ["cli"]
 bundled-ocr-tesseract = ["bundled-ocr-tesseract-default"]
 bundled-ocr-tesseract-all = [
     "bundled-ocr-tesseract-v5-3-4",
@@ -115,9 +108,18 @@ cli = ["dep:bcode_cli"]
 config = ["dep:bcode_config", "dep:bcode_provider_auth"]
 daemon-client = ["dep:bcode_client"]
 default = []
+distribution = [
+    "app",
+    "bundled-ocr-tesseract",
+    "config",
+    "mermaid-renderer",
+    "static-bundled-plugins",
+    "web-renderer",
+]
 embedded-plugins = ["dep:bcode_plugin"]
 evaluation = ["dep:bcode_eval"]
 fail-on-warnings = []
+mermaid-renderer = ["dep:bcode_mermaid_render"]
 metrics = ["dep:bcode_metrics", "dep:tracing-subscriber"]
 openai-compatible-provider = ["dep:bcode_openai_compatible_provider_plugin"]
 opentelemetry = ["dep:tracing-opentelemetry"]
