@@ -261,7 +261,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         } => handle_web_command(bind, port, allow_non_loopback).await?,
         Commands::Plugin { command } => handle_plugin_command(command).await?,
         Commands::Model { command } => handle_model_command(command).await?,
-        Commands::Auth { command } => handle_auth_command(command)?,
+        Commands::Auth { command } => handle_auth_command(command).await?,
         Commands::Login { command } => handle_login_command(command).await?,
         Commands::Permission { command } => handle_permission_command(command).await?,
         Commands::RuntimeWork { command } => handle_runtime_work_command(command).await?,
@@ -1029,7 +1029,15 @@ enum ModelCommand {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
-    Status,
+    /// List authentication providers registered by enabled plugins.
+    Providers,
+    Status {
+        /// Optional provider ID. Omit to retain legacy all-profile status.
+        provider: Option<String>,
+        /// Explicit auth profile.
+        #[arg(long)]
+        profile: Option<String>,
+    },
     Profile {
         #[command(subcommand)]
         command: AuthProfileCommand,
@@ -1051,12 +1059,29 @@ enum AuthCommand {
         command: AuthUsageCommand,
     },
     Login {
+        /// Optional provider ID. Omit to retain active-profile enrollment compatibility.
+        provider: Option<String>,
         #[arg(long)]
         profile: Option<String>,
         #[arg(long)]
         vault: Option<PathBuf>,
         #[arg(long)]
         recipient_key: Option<String>,
+        /// Explicit provider-local authentication method ID.
+        #[arg(long)]
+        method: Option<String>,
+        /// Explicitly ask a supporting provider to verify enrolled credentials.
+        #[arg(long)]
+        verify: bool,
+    },
+    /// Delete locally stored credentials for one dynamically registered provider.
+    Logout {
+        provider: String,
+        #[arg(long)]
+        profile: Option<String>,
+        /// Explicitly ask a supporting provider to revoke credentials remotely first.
+        #[arg(long)]
+        revoke: bool,
     },
 }
 
@@ -1538,9 +1563,13 @@ async fn handle_model_command(command: ModelCommand) -> Result<(), CliError> {
     Ok(())
 }
 
-fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
+async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
     match command {
-        AuthCommand::Status => auth_status(),
+        AuthCommand::Providers => auth_providers(),
+        AuthCommand::Status { provider, profile } => provider
+            .map_or_else(auth_status, |provider| {
+                auth_provider_status(&provider, profile.as_deref())
+            }),
         AuthCommand::Profile { command } => match command {
             AuthProfileCommand::List => auth_profile_list(),
             AuthProfileCommand::Show { profile } => auth_profile_show(&profile),
@@ -1559,10 +1588,32 @@ fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
         AuthCommand::Resets { command } => handle_auth_resets_command(command),
         AuthCommand::Usage { command } => handle_auth_usage_command(command),
         AuthCommand::Login {
+            provider,
             profile,
             vault,
             recipient_key,
-        } => auth_login(profile, vault, recipient_key),
+            method,
+            verify,
+        } => {
+            if let Some(provider) = provider {
+                auth_provider_login(
+                    &provider,
+                    profile.as_deref(),
+                    vault,
+                    recipient_key.as_deref(),
+                    method.as_deref(),
+                    verify,
+                )
+                .await
+            } else {
+                auth_login(profile, vault, recipient_key)
+            }
+        }
+        AuthCommand::Logout {
+            provider,
+            profile,
+            revoke,
+        } => auth_provider_logout(&provider, profile.as_deref(), revoke).await,
     }
 }
 
@@ -3307,6 +3358,459 @@ fn auth_pool_profile_vault(config: &bcode_config::BcodeConfig, profile: &str) ->
         .find(|summary| summary.profile == profile)
         .and_then(|summary| summary.vault)
         .map(|vault| display_from_current_dir(&vault).to_string())
+}
+
+fn auth_providers() -> Result<(), CliError> {
+    let mut host = load_cli_plugin_host()?;
+    for provider in host.auth_provider_registry().providers() {
+        println!(
+            "{}\t{}\t{}\t{}",
+            provider.contribution.provider_id,
+            provider.contribution.display_name,
+            provider.plugin_id,
+            provider
+                .contribution
+                .methods
+                .iter()
+                .map(bcode_provider_auth_models::AuthMethodContribution::method_id)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+    }
+    host.deactivate_all()?;
+    Ok(())
+}
+
+fn registered_auth_provider(
+    host: &bcode_plugin::PluginHost,
+    provider_id: &str,
+) -> Result<bcode_plugin::RegisteredAuthProvider, CliError> {
+    host.auth_provider(provider_id).cloned().ok_or_else(|| {
+        CliError::LoginProfile(format!(
+            "Authentication provider '{provider_id}' is not registered by an enabled plugin. Run `bcode auth providers`."
+        ))
+    })
+}
+
+fn selected_auth_method<'a>(
+    provider: &'a bcode_plugin::RegisteredAuthProvider,
+    requested_method: Option<&str>,
+) -> Result<&'a bcode_provider_auth_models::AuthMethodContribution, CliError> {
+    if let Some(method_id) = requested_method {
+        return provider
+            .contribution
+            .methods
+            .iter()
+            .find(|method| method.method_id() == method_id)
+            .ok_or_else(|| {
+                CliError::LoginProfile(format!(
+                    "Authentication method '{method_id}' is not registered for provider '{}'.",
+                    provider.contribution.provider_id
+                ))
+            });
+    }
+    if provider.contribution.methods.len() == 1 {
+        return Ok(&provider.contribution.methods[0]);
+    }
+    Err(CliError::LoginProfile(format!(
+        "Provider '{}' has multiple authentication methods; pass --method with one of: {}",
+        provider.contribution.provider_id,
+        provider
+            .contribution
+            .methods
+            .iter()
+            .map(bcode_provider_auth_models::AuthMethodContribution::method_id)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
+}
+
+fn resolve_or_prepare_auth_profile(
+    provider: &bcode_plugin::RegisteredAuthProvider,
+    method: &bcode_provider_auth_models::AuthMethodContribution,
+    explicit_profile: Option<&str>,
+    explicit_vault: Option<PathBuf>,
+    recipient_key: Option<&str>,
+) -> Result<(bcode_provider_auth::ResolvedAuthProfile, bool), CliError> {
+    let config = bcode_config::load_config()?;
+    let runtime = bcode_config::load_runtime_auth_subscriptions();
+    match bcode_provider_auth::resolve_auth_provider_profile(
+        &config,
+        &provider.contribution.provider_id,
+        &provider.plugin_id,
+        explicit_profile,
+        &runtime,
+    ) {
+        Ok(mut resolved) => {
+            if let Some(vault) = explicit_vault {
+                resolved
+                    .profile
+                    .settings
+                    .insert("vault".to_owned(), vault.display().to_string());
+            }
+            if let Some(recipient_key) = recipient_key {
+                resolved
+                    .profile
+                    .settings
+                    .insert("recipient_key".to_owned(), recipient_key.to_owned());
+            }
+            Ok((resolved, false))
+        }
+        Err(bcode_provider_auth::AuthProfileResolutionError::MissingProfile { .. }) => {
+            let profile_name = explicit_profile
+                .unwrap_or(&provider.contribution.provider_id)
+                .to_owned();
+            let vault = explicit_vault.unwrap_or_else(bcode_config::default_auth_vault_path);
+            let mut settings = BTreeMap::from([
+                ("profile".to_owned(), profile_name.clone()),
+                ("vault".to_owned(), vault.display().to_string()),
+            ]);
+            if let Some(recipient_key) = recipient_key {
+                settings.insert("recipient_key".to_owned(), recipient_key.to_owned());
+            }
+            let map = match method {
+                bcode_provider_auth_models::AuthMethodContribution::SecretFields {
+                    fields, ..
+                } => fields
+                    .iter()
+                    .map(|field| {
+                        (
+                            field.credential_id.clone(),
+                            bcode_config::AuthCredentialMapping {
+                                env: None,
+                                key: Some(field.storage_key.clone()),
+                            },
+                        )
+                    })
+                    .collect(),
+                bcode_provider_auth_models::AuthMethodContribution::Interactive { .. } => {
+                    BTreeMap::new()
+                }
+            };
+            Ok((
+                bcode_provider_auth::ResolvedAuthProfile {
+                    profile_name,
+                    provider_id: provider.contribution.provider_id.clone(),
+                    owner_plugin_id: provider.plugin_id.clone(),
+                    profile: bcode_config::AuthProfileConfig {
+                        backend: "sshenv".to_owned(),
+                        provider_id: Some(provider.contribution.provider_id.clone()),
+                        owner_plugin_id: Some(provider.plugin_id.clone()),
+                        scheme: Some(method.method_id().to_owned()),
+                        map,
+                        settings,
+                    },
+                    source: bcode_provider_auth::AuthProfileSource::Runtime,
+                },
+                true,
+            ))
+        }
+        Err(error) => Err(CliError::LoginProfile(error.to_string())),
+    }
+}
+
+fn persist_prepared_runtime_profile(
+    resolved: &bcode_provider_auth::ResolvedAuthProfile,
+) -> Result<(), CliError> {
+    let storage_profile = resolved
+        .profile
+        .settings
+        .get("profile")
+        .cloned()
+        .unwrap_or_else(|| resolved.profile_name.clone());
+    let vault = resolved
+        .profile
+        .settings
+        .get("vault")
+        .map_or_else(bcode_config::default_auth_vault_path, PathBuf::from);
+    bcode_config::register_runtime_auth_profile(
+        &resolved.profile_name,
+        bcode_config::RuntimeAuthProfile {
+            provider_id: resolved.provider_id.clone(),
+            owner_plugin_id: resolved.owner_plugin_id.clone(),
+            backend: resolved.profile.backend.clone(),
+            scheme: resolved.profile.scheme.clone().unwrap_or_default(),
+            storage_profile,
+            vault,
+            map: resolved.profile.map.clone(),
+        },
+    )?;
+    Ok(())
+}
+
+async fn auth_provider_login(
+    provider_id: &str,
+    explicit_profile: Option<&str>,
+    explicit_vault: Option<PathBuf>,
+    recipient_key: Option<&str>,
+    requested_method: Option<&str>,
+    verify: bool,
+) -> Result<(), CliError> {
+    let mut host = load_cli_plugin_host()?;
+    let provider = registered_auth_provider(&host, provider_id)?;
+    let method = selected_auth_method(&provider, requested_method)?;
+    let (resolved, persist_runtime) = resolve_or_prepare_auth_profile(
+        &provider,
+        method,
+        explicit_profile,
+        explicit_vault,
+        recipient_key,
+    )?;
+    match method {
+        bcode_provider_auth_models::AuthMethodContribution::SecretFields {
+            fields,
+            supports_verification,
+            ..
+        } => {
+            if verify && !supports_verification {
+                return Err(CliError::LoginProfile(format!(
+                    "Provider '{provider_id}' does not support credential verification."
+                )));
+            }
+            let mut credentials = BTreeMap::new();
+            for field in fields {
+                let value = rpassword::prompt_password(format!("{}: ", field.prompt))?;
+                if value.is_empty() && field.optional {
+                    continue;
+                }
+                field
+                    .validation
+                    .validate_secret(&value)
+                    .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+                credentials.insert(field.credential_id.clone(), value);
+            }
+            bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
+                &resolved,
+                provider_id,
+                &provider.plugin_id,
+                method,
+            )
+            .map_err(|error| CliError::LoginProfile(error.to_string()))?
+            .upsert(credentials)
+            .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+            if verify {
+                run_auth_interactive_flow(&host, &provider, method, &resolved, true, false).await?;
+            }
+        }
+        bcode_provider_auth_models::AuthMethodContribution::Interactive { .. } => {
+            run_auth_interactive_flow(&host, &provider, method, &resolved, verify, false).await?;
+        }
+    }
+    if persist_runtime {
+        persist_prepared_runtime_profile(&resolved)?;
+    }
+    println!(
+        "Authentication saved for provider '{provider_id}' in profile '{}'.",
+        resolved.profile_name
+    );
+    host.deactivate_all()?;
+    Ok(())
+}
+
+async fn auth_provider_logout(
+    provider_id: &str,
+    explicit_profile: Option<&str>,
+    revoke: bool,
+) -> Result<(), CliError> {
+    let mut host = load_cli_plugin_host()?;
+    let provider = registered_auth_provider(&host, provider_id)?;
+    let method = selected_auth_method(&provider, None)?;
+    let (resolved, _) =
+        resolve_or_prepare_auth_profile(&provider, method, explicit_profile, None, None)?;
+    if revoke {
+        let supports = match method {
+            bcode_provider_auth_models::AuthMethodContribution::SecretFields {
+                supports_revocation,
+                ..
+            }
+            | bcode_provider_auth_models::AuthMethodContribution::Interactive {
+                supports_revocation,
+                ..
+            } => *supports_revocation,
+        };
+        if !supports {
+            return Err(CliError::LoginProfile(format!(
+                "Provider '{provider_id}' does not support remote revocation."
+            )));
+        }
+        run_auth_interactive_flow(&host, &provider, method, &resolved, false, true).await?;
+    }
+    if matches!(
+        method,
+        bcode_provider_auth_models::AuthMethodContribution::SecretFields { .. }
+    ) {
+        bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
+            &resolved,
+            provider_id,
+            &provider.plugin_id,
+            method,
+        )
+        .map_err(|error| CliError::LoginProfile(error.to_string()))?
+        .delete()
+        .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+    }
+    println!("Local authentication removed for provider '{provider_id}'.");
+    host.deactivate_all()?;
+    Ok(())
+}
+
+fn auth_provider_status(provider_id: &str, explicit_profile: Option<&str>) -> Result<(), CliError> {
+    let mut host = load_cli_plugin_host()?;
+    let provider = registered_auth_provider(&host, provider_id)?;
+    let method = selected_auth_method(&provider, None)?;
+    let (resolved, _) =
+        resolve_or_prepare_auth_profile(&provider, method, explicit_profile, None, None)?;
+    println!("Provider: {}", provider.contribution.display_name);
+    println!("Plugin: {}", provider.plugin_id);
+    println!("Profile: {}", resolved.profile_name);
+    if matches!(
+        method,
+        bcode_provider_auth_models::AuthMethodContribution::SecretFields { .. }
+    ) {
+        let status = bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
+            &resolved,
+            provider_id,
+            &provider.plugin_id,
+            method,
+        )
+        .map_err(|error| CliError::LoginProfile(error.to_string()))?
+        .inspect()
+        .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+        println!(
+            "Available: {}",
+            status.profile_exists && !status.present_credentials.is_empty()
+        );
+        for diagnostic in status.diagnostics {
+            println!("Diagnostic [{}]: {}", diagnostic.code, diagnostic.message);
+            if let Some(remediation) = diagnostic.remediation {
+                println!("  remediation: {remediation}");
+            }
+        }
+    }
+    host.deactivate_all()?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn run_auth_interactive_flow(
+    host: &bcode_plugin::PluginHost,
+    provider: &bcode_plugin::RegisteredAuthProvider,
+    method: &bcode_provider_auth_models::AuthMethodContribution,
+    resolved: &bcode_provider_auth::ResolvedAuthProfile,
+    verify: bool,
+    revoke: bool,
+) -> Result<(), CliError> {
+    let bcode_provider_auth_models::AuthMethodContribution::Interactive { operation, .. } = method
+    else {
+        if verify || revoke {
+            return Err(CliError::LoginProfile(
+                "This provider method does not define an interactive verification/revocation flow."
+                    .to_owned(),
+            ));
+        }
+        return Ok(());
+    };
+    let mut request = bcode_provider_auth_models::AuthFlowRequest {
+        schema_version: bcode_provider_auth_models::AUTH_FLOW_SCHEMA_VERSION,
+        provider_id: provider.contribution.provider_id.clone(),
+        method_id: method.method_id().to_owned(),
+        profile: resolved.profile_name.clone(),
+        operation: bcode_provider_auth_models::AuthFlowOperation::Begin,
+        state: None,
+        input: None,
+        verify,
+        revoke,
+    };
+    loop {
+        request
+            .validate()
+            .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+        let response = host
+            .invoke_service_json::<_, bcode_provider_auth_models::AuthFlowResponse>(
+                &provider.plugin_id,
+                bcode_provider_auth_models::AUTH_INTERFACE_ID,
+                operation,
+                &request,
+            )
+            .map_err(plugin_service_call_error)?;
+        response
+            .validate()
+            .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+        let mut input = None;
+        for effect in &response.effects {
+            match effect {
+                bcode_provider_auth_models::AuthFlowEffect::OpenBrowser { url } => {
+                    println!("Open in browser: {url}");
+                }
+                bcode_provider_auth_models::AuthFlowEffect::DisplayDeviceCode {
+                    verification_url,
+                    user_code,
+                    ..
+                } => println!("Open {verification_url} and enter code {user_code}"),
+                bcode_provider_auth_models::AuthFlowEffect::Prompt {
+                    prompt_id,
+                    message,
+                    choices,
+                } => {
+                    println!("{message}");
+                    if !choices.is_empty() {
+                        println!("Choices: {}", choices.join(", "));
+                    }
+                    let value = read_stdin_line()?;
+                    input = Some(bcode_provider_auth_models::AuthFlowInput {
+                        prompt_id: prompt_id.clone(),
+                        value,
+                    });
+                }
+                bcode_provider_auth_models::AuthFlowEffect::Wait { millis } => {
+                    tokio::time::sleep(Duration::from_millis(*millis)).await;
+                }
+                bcode_provider_auth_models::AuthFlowEffect::Message { message } => {
+                    println!("{message}");
+                }
+            }
+        }
+        for diagnostic in &response.diagnostics {
+            println!("Diagnostic [{}]: {}", diagnostic.code, diagnostic.message);
+        }
+        match response.status {
+            bcode_provider_auth_models::AuthFlowStatus::Pending => {
+                request.operation = bcode_provider_auth_models::AuthFlowOperation::Continue;
+                request.state = response.state;
+                request.input = input;
+            }
+            bcode_provider_auth_models::AuthFlowStatus::Succeeded => {
+                if !response.credentials.is_empty() {
+                    bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
+                        resolved,
+                        &provider.contribution.provider_id,
+                        &provider.plugin_id,
+                        method,
+                    )
+                    .map_err(|error| CliError::LoginProfile(error.to_string()))?
+                    .upsert(response.credentials)
+                    .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+                }
+                return Ok(());
+            }
+            bcode_provider_auth_models::AuthFlowStatus::Failed => {
+                return Err(CliError::LoginProfile(
+                    "Provider authentication flow failed.".to_owned(),
+                ));
+            }
+            bcode_provider_auth_models::AuthFlowStatus::Cancelled => {
+                return Err(CliError::LoginProfile(
+                    "Provider authentication flow was cancelled.".to_owned(),
+                ));
+            }
+        }
+    }
+}
+
+fn read_stdin_line() -> Result<String, CliError> {
+    let mut value = String::new();
+    std::io::stdin().read_line(&mut value)?;
+    Ok(value.trim().to_owned())
 }
 
 fn auth_pool_reset_cooldown(pool_name: &str, profile: Option<&str>) {
@@ -8451,6 +8955,106 @@ fn print_model_usage_event(
         usage.cache_write_input_tokens,
         usage.reasoning_tokens,
     );
+}
+
+#[cfg(test)]
+mod auth_cli_tests {
+    use super::*;
+
+    fn registered_provider(
+        methods: Vec<bcode_provider_auth_models::AuthMethodContribution>,
+    ) -> bcode_plugin::RegisteredAuthProvider {
+        bcode_plugin::RegisteredAuthProvider {
+            plugin_id: "bcode.test".to_owned(),
+            contribution: bcode_provider_auth_models::AuthProviderContribution {
+                schema_version:
+                    bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+                provider_id: "test".to_owned(),
+                display_name: "Test".to_owned(),
+                methods,
+            },
+        }
+    }
+
+    fn interactive(method_id: &str) -> bcode_provider_auth_models::AuthMethodContribution {
+        bcode_provider_auth_models::AuthMethodContribution::Interactive {
+            method_id: method_id.to_owned(),
+            display_name: method_id.to_owned(),
+            operation: "flow".to_owned(),
+            supports_revocation: false,
+        }
+    }
+
+    #[test]
+    fn method_selection_requires_explicit_choice_for_ambiguous_provider() {
+        let provider = registered_provider(vec![interactive("browser"), interactive("device")]);
+        assert!(selected_auth_method(&provider, None).is_err());
+        assert_eq!(
+            selected_auth_method(&provider, Some("device"))
+                .expect("selected method")
+                .method_id(),
+            "device"
+        );
+        assert!(selected_auth_method(&provider, Some("missing")).is_err());
+    }
+
+    #[test]
+    fn cli_shape_keeps_provider_optional_for_login_and_status() {
+        use clap::{CommandFactory as _, FromArgMatches as _};
+        let matches = Cli::command()
+            .try_get_matches_from(["bcode", "auth", "login", "--profile", "legacy"])
+            .expect("provider-less login parses");
+        let cli = Cli::from_arg_matches(&matches).expect("provider-less login decodes");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth {
+                command: AuthCommand::Login {
+                    provider: None,
+                    profile: Some(profile),
+                    ..
+                }
+            }) if profile == "legacy"
+        ));
+
+        let matches = Cli::command()
+            .try_get_matches_from(["bcode", "auth", "status", "test", "--profile", "work"])
+            .expect("provider status parses");
+        let cli = Cli::from_arg_matches(&matches).expect("provider status decodes");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth {
+                command: AuthCommand::Status {
+                    provider: Some(provider),
+                    profile: Some(profile),
+                }
+            }) if provider == "test" && profile == "work"
+        ));
+    }
+
+    #[test]
+    fn bounded_flow_contract_rejects_timeout_and_terminal_reopen_shapes() {
+        let pending = bcode_provider_auth_models::AuthFlowResponse {
+            schema_version: bcode_provider_auth_models::AUTH_FLOW_SCHEMA_VERSION,
+            status: bcode_provider_auth_models::AuthFlowStatus::Pending,
+            state: Some("state".to_owned()),
+            effects: vec![bcode_provider_auth_models::AuthFlowEffect::Wait {
+                millis: bcode_provider_auth_models::MAX_AUTH_WAIT_MILLIS + 1,
+            }],
+            credentials: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        };
+        assert!(pending.validate().is_err());
+
+        let cancelled = bcode_provider_auth_models::AuthFlowResponse {
+            schema_version: bcode_provider_auth_models::AUTH_FLOW_SCHEMA_VERSION,
+            status: bcode_provider_auth_models::AuthFlowStatus::Cancelled,
+            state: Some("stale".to_owned()),
+            effects: Vec::new(),
+            credentials: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        };
+        assert!(cancelled.validate().is_err());
+    }
 }
 
 #[cfg(test)]

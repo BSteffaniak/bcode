@@ -1482,6 +1482,7 @@ dependencies = [
  "bcode_plugin",
  "bcode_plugin_sdk",
  "bcode_provider_auth",
+ "bcode_provider_auth_models",
  "bcode_server",
  "bcode_session",
  "bcode_session_import",
@@ -1596,6 +1597,7 @@ dependencies = [
  "hyperchad_docs_config_derive",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.19",
  "toml 1.1.3+spec-1.1.0",
 ]

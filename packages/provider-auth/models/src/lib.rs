@@ -13,6 +13,10 @@ use std::fmt::{Display, Formatter};
 
 /// Current schema version for authentication provider contributions.
 pub const AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION: u16 = 1;
+/// Plugin service interface for normalized interactive authentication flows.
+pub const AUTH_INTERFACE_ID: &str = "bcode.auth/v1";
+/// Operation used to begin, continue, or cancel an interactive authentication flow.
+pub const OP_AUTH_FLOW: &str = "flow";
 /// Current schema version for interactive authentication flow messages.
 pub const AUTH_FLOW_SCHEMA_VERSION: u16 = 1;
 /// Maximum UTF-8 bytes in an identifier.

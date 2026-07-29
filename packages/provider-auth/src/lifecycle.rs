@@ -482,6 +482,44 @@ mod tests {
     }
 
     #[test]
+    fn required_local_file_device_seal_is_applied_and_reported() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let vault = temp.path().join("vault");
+        let mut resolved = resolved(&vault);
+        resolved
+            .profile
+            .settings
+            .insert("device_seal".to_owned(), "required".to_owned());
+        resolved
+            .profile
+            .settings
+            .insert("device_seal_backend".to_owned(), "local-file".to_owned());
+        resolved
+            .profile
+            .settings
+            .insert("device_seal_strict".to_owned(), "true".to_owned());
+        let method = method();
+        let lifecycle = AuthVaultLifecycle::new(&resolved, "exa", "bcode.web-search", &method)
+            .expect("lifecycle");
+
+        lifecycle
+            .upsert(BTreeMap::from([(
+                "api_key".to_owned(),
+                "secret".to_owned(),
+            )]))
+            .expect("sealed upsert");
+        let status = crate::security::inspect_auth_vault_security(
+            &vault,
+            "exa",
+            crate::security::AuthDeviceSealPolicy::Required,
+        );
+
+        assert!(status.profile_exists);
+        assert!(status.profile_device_sealed);
+        assert_eq!(status.device_seal_backend.as_deref(), Some("local-file"));
+    }
+
+    #[test]
     fn damaged_vault_fails_without_resetting_or_mutating_it() {
         let temp = tempfile::tempdir().expect("tempdir");
         let vault = temp.path().join("vault");

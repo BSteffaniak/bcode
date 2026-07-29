@@ -25,6 +25,9 @@ serde_json                   = { workspace = true }
 thiserror                    = { workspace = true }
 toml                         = { workspace = true, features = ["display"] }
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [features]
 default          = []
 fail-on-warnings = []

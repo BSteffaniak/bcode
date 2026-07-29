@@ -6181,7 +6181,8 @@ mod tests {
         InvariantSelectorTimeoutPolicy, InvariantsConfig, NestedFieldDoc, TuiAccentTransitionCurve,
         TuiMouseConfig, TuiRenderConfig, default_config_paths_from, default_permissions_state_path,
         load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
-        merge_config_values, plugin_selection_with_default_plugin_ids,
+        load_runtime_auth_subscriptions, merge_config_values,
+        plugin_selection_with_default_plugin_ids, register_runtime_auth_profile,
         upsert_agent_permission_rule,
     };
     use bcode_agent_policy_models::Action;
@@ -6190,6 +6191,82 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn runtime_auth_profile_persistence_is_non_secret_and_does_not_mutate_declarative_config() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_path = temp.path().join("auth-runtime.json");
+        let declarative_path = temp.path().join("bcode.toml");
+        let declarative = r#"
+[auth.profiles.exa]
+backend = "sshenv"
+provider_id = "exa"
+owner_plugin_id = "bcode.web-search"
+scheme = "api_key"
+"#;
+        std::fs::write(&declarative_path, declarative).expect("write declarative config");
+        unsafe {
+            std::env::set_var("BCODE_AUTH_SUBSCRIPTIONS", &runtime_path);
+        }
+        let profile = super::RuntimeAuthProfile {
+            provider_id: "exa".to_owned(),
+            owner_plugin_id: "bcode.web-search".to_owned(),
+            backend: "sshenv".to_owned(),
+            scheme: "api_key".to_owned(),
+            storage_profile: "exa".to_owned(),
+            vault: temp.path().join("vault"),
+            map: BTreeMap::from([(
+                "api_key".to_owned(),
+                super::AuthCredentialMapping {
+                    env: None,
+                    key: Some("EXA_API_KEY".to_owned()),
+                },
+            )]),
+        };
+        register_runtime_auth_profile("exa", profile).expect("persist runtime profile");
+        let loaded = load_runtime_auth_subscriptions();
+        unsafe {
+            std::env::remove_var("BCODE_AUTH_SUBSCRIPTIONS");
+        }
+
+        assert_eq!(loaded.bindings["exa"].profile, "exa");
+        assert_eq!(loaded.profiles["exa"].owner_plugin_id, "bcode.web-search");
+        let runtime_json = std::fs::read_to_string(&runtime_path).expect("runtime JSON");
+        assert!(!runtime_json.contains("secret-value"));
+        assert_eq!(
+            std::fs::read_to_string(&declarative_path).expect("declarative config"),
+            declarative
+        );
+    }
+
+    #[test]
+    fn runtime_auth_profile_persistence_rejects_owner_conflicts_without_mutation() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_path = temp.path().join("auth-runtime.json");
+        unsafe {
+            std::env::set_var("BCODE_AUTH_SUBSCRIPTIONS", &runtime_path);
+        }
+        let profile = super::RuntimeAuthProfile {
+            provider_id: "exa".to_owned(),
+            owner_plugin_id: "bcode.web-search".to_owned(),
+            backend: "sshenv".to_owned(),
+            scheme: "api_key".to_owned(),
+            storage_profile: "exa".to_owned(),
+            vault: temp.path().join("vault"),
+            map: BTreeMap::new(),
+        };
+        register_runtime_auth_profile("exa", profile.clone()).expect("initial persistence");
+        let before = std::fs::read(&runtime_path).expect("runtime before");
+        let mut conflicting = profile;
+        conflicting.owner_plugin_id = "bcode.other".to_owned();
+        assert!(register_runtime_auth_profile("exa", conflicting).is_err());
+        unsafe {
+            std::env::remove_var("BCODE_AUTH_SUBSCRIPTIONS");
+        }
+        assert_eq!(std::fs::read(&runtime_path).expect("runtime after"), before);
+    }
 
     #[test]
     fn thinking_defaults_to_all_and_preserves_explicit_legacy_modes() {
