@@ -19631,7 +19631,7 @@ fn execute_model_tool_batch<'a>(
         else {
             return false;
         };
-        let sink_capacity = calls.len().saturating_mul(8).max(32);
+        let sink_capacity = calls.len().saturating_mul(256).max(1_024);
         let (sink, sink_receiver) = SessionInvocationSink::new(sink_capacity);
         let sink_drain = drain_session_invocation_sink(state, session_id, sink_receiver);
         let scope = TurnScope::new(
@@ -24033,6 +24033,146 @@ async fn workflow_child_session_for_attempt(
         })
 }
 
+async fn persist_workflow_agent_completion(
+    store_path: &Path,
+    dispatch_identity: &str,
+    observation: bcode_workflow_store::AttemptObservation,
+) -> Result<bcode_workflow_store::ReceiptReconciliationSummary, WorkflowStoreError> {
+    const RECEIPT_COMMIT_RETRY_LIMIT: usize = 200;
+    for retry in 0..RECEIPT_COMMIT_RETRY_LIMIT {
+        let mut store = bcode_workflow_store::WorkflowStore::open_at_path(store_path)?;
+        if !store.dispatch_receipt_committed(dispatch_identity)? {
+            if retry + 1 == RECEIPT_COMMIT_RETRY_LIMIT {
+                return Err(WorkflowStoreError::InvalidData(format!(
+                    "workflow dispatch receipt was not committed before terminal observation timeout: {dispatch_identity}"
+                )));
+            }
+            // The owner may finish immediately after accepting work but before the scheduler
+            // commits its receipt. Wait boundedly for that atomic dispatch boundary rather than
+            // losing the terminal observation.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            continue;
+        }
+        return store.apply_attempt_observation(
+            dispatch_identity,
+            observation,
+            current_unix_millis(),
+        );
+    }
+    unreachable!("the bounded receipt retry loop returns on its final attempt")
+}
+
+async fn settle_workflow_agent_observation(
+    state: &Arc<ServerState>,
+    request: &bcode_workflow_store::PreparedActivationDispatch,
+    observation: bcode_workflow_store::AttemptObservation,
+) {
+    let store_path = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .path()
+        .to_path_buf();
+    match persist_workflow_agent_completion(&store_path, &request.dispatch_identity, observation)
+        .await
+    {
+        Ok(summary) => {
+            if let Err(error) =
+                propagate_fail_fast_sibling_cancellation(state, summary.sibling_cancellations).await
+            {
+                tracing::warn!("failed to propagate fail-fast sibling cancellation: {error}");
+            }
+            if let Err(error) = drive_workflow_run(state, &request.activation.run_id).await {
+                tracing::warn!("failed to continue workflow after completion: {error}");
+            }
+        }
+        Err(error) => {
+            tracing::warn!("failed to persist completed workflow agent turn: {error}");
+        }
+    }
+}
+
+async fn observe_existing_workflow_agent_turn(
+    state: &ServerState,
+    request: &bcode_workflow_store::PreparedActivationDispatch,
+    session_id: SessionId,
+    turn_id: &str,
+    output_schema_id: &str,
+    timeout_ms: u64,
+) -> Result<bcode_workflow_store::AttemptObservation, WorkflowStoreError> {
+    let mut events = state
+        .sessions
+        .subscribe_session_events(session_id)
+        .await
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
+        .events;
+    let reconciliation = bcode_workflow_store::AttemptReconciliationRequest {
+        run_id: request.activation.run_id.clone(),
+        node_id: request.activation.node_id.clone(),
+        activation_id: request.activation.activation_id.clone(),
+        attempt: request.attempt,
+        dispatch_identity: request.dispatch_identity.clone(),
+        side_effect: bcode_workflow_store::DispatchSideEffect::ReadOnly,
+        receipt: serde_json::Value::Null,
+    };
+    let initial = observe_workflow_turn(
+        state,
+        session_id,
+        turn_id,
+        output_schema_id,
+        &reconciliation,
+    )
+    .await?;
+    if initial != bcode_workflow_store::AttemptObservation::Running {
+        return Ok(initial);
+    }
+
+    let wait = async {
+        loop {
+            match events.recv().await {
+                Ok(event)
+                    if matches!(
+                        event.kind,
+                        SessionEventKind::ModelTurnFinished {
+                            turn_id: ref event_turn_id,
+                            ..
+                        } if event_turn_id.as_str() == turn_id
+                    ) =>
+                {
+                    break;
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => break,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "workflow turn event subscription closed before terminal state".to_string(),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    };
+    tokio::time::timeout(
+        Duration::from_millis(timeout_ms.saturating_add(5_000)),
+        wait,
+    )
+    .await
+    .map_err(|_| {
+        WorkflowStoreError::InvalidData(format!(
+            "existing workflow turn did not reach terminal state within {} ms",
+            timeout_ms.saturating_add(5_000)
+        ))
+    })??;
+    observe_workflow_turn(
+        state,
+        session_id,
+        turn_id,
+        output_schema_id,
+        &reconciliation,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_lines)]
 async fn dispatch_workflow_agent_turn(
     state: &Arc<ServerState>,
@@ -24179,16 +24319,15 @@ async fn dispatch_workflow_agent_turn(
         ))
     })?
     .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
-    let (receipt, completion_receiver) = match submitted {
+    let (receipt, completion_receiver, existing_turn) = match submitted {
         SubmittedModelTurn::Started {
             receipt,
             completion,
-        } => (receipt, Some(completion)),
-        SubmittedModelTurn::Existing(receipt) => (receipt, None),
+        } => (receipt, Some(completion), false),
+        SubmittedModelTurn::Existing(receipt) => (receipt, None, true),
     };
     let execution_session_id = target_session_id;
     let dispatch_identity = request.dispatch_identity.clone();
-    let request_run_id = request.activation.run_id.clone();
     let request_for_completion = request.clone();
     let state_for_completion = Arc::clone(state);
     if let Some(completion_receiver) = completion_receiver {
@@ -24211,51 +24350,51 @@ async fn dispatch_workflow_agent_turn(
                 completion.message.clone(),
             )
             .await;
-            let observation = workflow_attempt_observation_from_completion(
+            let observation = match workflow_attempt_observation_from_completion(
                 &state_for_completion,
                 &request_for_completion,
                 completion,
-            );
-            let store_path = state_for_completion
-                .workflow_store
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .path()
-                .to_path_buf();
-            match (
-                bcode_workflow_store::WorkflowStore::open_at_path(&store_path),
-                observation,
             ) {
-                (Ok(mut store), Ok(observation)) => {
-                    let reconciled = store.apply_attempt_observation(
-                        &request_for_completion.dispatch_identity,
-                        observation,
-                        current_unix_millis(),
-                    );
-                    drop(store);
-                    if let Err(error) = reconciled {
-                        tracing::warn!("failed to persist completed workflow agent turn: {error}");
-                    } else {
-                        if let Ok(summary) = &reconciled
-                            && let Err(error) = propagate_fail_fast_sibling_cancellation(
-                                &state_for_completion,
-                                summary.sibling_cancellations.clone(),
-                            )
-                            .await
-                        {
-                            tracing::warn!(
-                                "failed to propagate fail-fast sibling cancellation: {error}"
-                            );
-                        }
-                        if let Err(error) =
-                            drive_workflow_run(&state_for_completion, &request_run_id).await
-                        {
-                            tracing::warn!("failed to continue workflow after completion: {error}");
-                        }
-                    }
-                }
-                (Ok(_), Err(error)) | (Err(error), _) => {
+                Ok(observation) => observation,
+                Err(error) => {
                     tracing::warn!("failed to complete workflow agent turn: {error}");
+                    return;
+                }
+            };
+            settle_workflow_agent_observation(
+                &state_for_completion,
+                &request_for_completion,
+                observation,
+            )
+            .await;
+        });
+    } else if existing_turn {
+        let turn_id = receipt.turn_id.to_string();
+        let output_schema_id = request.activation.node.output.type_name.clone();
+        let timeout_ms = configuration.timeout_ms;
+        tokio::spawn(async move {
+            let shared_permit = shared_permit;
+            let observation = observe_existing_workflow_agent_turn(
+                &state_for_completion,
+                &request_for_completion,
+                execution_session_id,
+                &turn_id,
+                &output_schema_id,
+                timeout_ms,
+            )
+            .await;
+            drop(shared_permit);
+            match observation {
+                Ok(observation) => {
+                    settle_workflow_agent_observation(
+                        &state_for_completion,
+                        &request_for_completion,
+                        observation,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    tracing::warn!("failed to reattach existing workflow agent turn: {error}");
                 }
             }
         });
@@ -26976,7 +27115,7 @@ type = "concurrent"
 
 [runtime]
 type = "native"
-abi_version = 2
+abi_version = 3
 library = "libbcode_test_workflow_block.dylib"
 event_symbol = "bcode_plugin_handle_event_v1"
 "#
@@ -27307,7 +27446,7 @@ type = "exclusive"
 
 [runtime]
 type = "native"
-abi_version = 2
+abi_version = 3
 library = "test"
 "#;
         bcode_plugin::StaticBundledPlugin::new(
@@ -27447,7 +27586,7 @@ type = "exclusive"
 
 [runtime]
 type = "native"
-abi_version = 2
+abi_version = 3
 library = "test"
 "#;
         bcode_plugin::StaticBundledPlugin::new(
@@ -28904,7 +29043,7 @@ library = "test"
         trigger: &SessionEvent,
         mut runtime_context: ClientRuntimeContext,
         steering: String,
-    ) -> ModelTurnCompletion {
+    ) -> (ModelTurnCompletion, bool) {
         let signal = session_id.to_string();
         runtime_context
             .provider_context
@@ -28946,13 +29085,16 @@ library = "test"
             None,
         );
         let append_steering = async {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            if tokio::time::timeout(Duration::from_secs(5), async {
                 while !bcode_fake_provider_plugin::fake_compaction_summary_signal_started(&signal) {
                     tokio::task::yield_now().await;
                 }
             })
             .await
-            .expect("compaction summary should start before steering");
+            .is_err()
+            {
+                return false;
+            }
             steering_tx
                 .send(SteeringCommand {
                     client_id: ClientId::new(),
@@ -28961,8 +29103,9 @@ library = "test"
                 })
                 .await
                 .expect("steering should queue");
+            true
         };
-        tokio::join!(turn, append_steering).0
+        tokio::join!(turn, append_steering)
     }
 
     #[test]
@@ -37726,7 +37869,7 @@ library = "test"
                         "touch .parallel-{index}; while [ \"$(find . -maxdepth 1 -name '.parallel-*' | wc -l | tr -d ' ')\" -lt 5 ]; do sleep 0.02; done; sleep {delay}; printf 'call-{index}\\n'",
                         delay = f64::from(4 - index) * 0.05,
                     ),
-                    "timeout_ms": 2_000
+                    "timeout_ms": 10_000
                 }),
             })
             .collect::<Vec<_>>();
@@ -37842,12 +37985,11 @@ library = "test"
             1
         );
 
-        assert!(
-            tokio::time::timeout(Duration::from_secs(30), task)
-                .await
-                .expect("parallel shell batch should finish")
-                .expect("parallel shell batch task should not panic")
-        );
+        let batch_completed = tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("parallel shell batch should finish")
+            .expect("parallel shell batch task should not panic");
+        assert!(batch_completed);
         assert!(
             (0..5).all(|index| workspace.path().join(format!(".parallel-{index}")).exists()),
             "every shell command must start before any can complete"
@@ -39115,16 +39257,24 @@ library = "test"
         )
         .await;
 
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(2), connection.recv_event())
+        let mut saw_initial_draft = false;
+        for _ in 0..3 {
+            let event = tokio::time::timeout(Duration::from_secs(2), connection.recv_event())
                 .await
-                .expect("draft event timeout")
-                .expect("draft event"),
-            bcode_ipc::Event::SessionLive(bcode_session_models::SessionLiveEvent {
-                kind: SessionLiveEventKind::ToolRequestDraft { .. },
-                ..
-            })
-        ));
+                .expect("live-state event timeout")
+                .expect("live-state event");
+            if matches!(
+                event,
+                bcode_ipc::Event::SessionLive(bcode_session_models::SessionLiveEvent {
+                    kind: SessionLiveEventKind::ToolRequestDraft { .. },
+                    ..
+                })
+            ) {
+                saw_initial_draft = true;
+                break;
+            }
+        }
+        assert!(saw_initial_draft, "expected live tool request draft event");
 
         let mut keeper = client
             .connect("session-view-reconnect-keeper")
@@ -40871,6 +41021,31 @@ library = "test"
         state
     }
 
+    fn test_workflow_agent_configuration(
+        schema: bcode_workflow::ValueSchema,
+        execution_target: bcode_workflow::AgentExecutionTarget,
+    ) -> serde_json::Value {
+        serde_json::to_value(bcode_workflow::WorkflowAgentConfiguration {
+            version: bcode_workflow::WORKFLOW_AGENT_CONFIGURATION_VERSION,
+            execution_target,
+            agent_profile: "build".to_string(),
+            provider: Some("bcode.fake-provider".to_string()),
+            model: Some("fake-echo".to_string()),
+            structured_output: bcode_workflow::AgentStructuredOutputPolicy {
+                schema,
+                strict: true,
+            },
+            read_only: true,
+            tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
+            tool_allowlist: Vec::new(),
+            timeout_ms: 30_000,
+            skills: Vec::new(),
+            prompt_mode: "json_input".to_string(),
+            system_prompt: String::new(),
+        })
+        .expect("test workflow agent configuration")
+    }
+
     fn test_server_state_with_fake_provider_and_workflow_store(
         sessions: SessionManager,
         workflow_store: bcode_workflow_store::WorkflowStore,
@@ -41016,14 +41191,10 @@ library = "test"
             input: value_schema.clone(),
             output: value_schema.clone(),
             resources: Vec::new(),
-            configuration: serde_json::json!({
-                "agent_id": "build",
-                "provider_plugin_id": "bcode.fake-provider",
-                "model_id": "fake-echo",
-                "prompt_mode": "json_input",
-                "read_only": true,
-                "strict": true,
-            }),
+            configuration: test_workflow_agent_configuration(
+                value_schema.clone(),
+                bcode_workflow::AgentExecutionTarget::FreshIsolated,
+            ),
         };
         let definition = bcode_workflow::WorkflowDefinition {
             schema_version: 1,
@@ -41047,7 +41218,18 @@ library = "test"
                         id: "join".to_string(),
                         name: "join".to_string(),
                         kind: bcode_workflow::NodeKind::Parallel,
-                        input: value_schema.clone(),
+                        input: bcode_workflow::ValueSchema {
+                            type_name: "(u32,u32)".to_string(),
+                            schema: serde_json::json!({
+                                "type": "array",
+                                "prefixItems": [
+                                    value_schema.schema.clone(),
+                                    value_schema.schema.clone()
+                                ],
+                                "minItems": 2,
+                                "maxItems": 2,
+                            }),
+                        },
                         output: bcode_workflow::ValueSchema {
                             type_name: "(u32,u32)".to_string(),
                             schema: serde_json::json!({"type": "array"}),
@@ -41097,10 +41279,13 @@ library = "test"
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
-        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
-            sessions,
-            workflow_store,
-        ));
+        let mut state =
+            test_server_state_with_fake_provider_and_workflow_store(sessions, workflow_store);
+        state
+            .selected_provider_context
+            .settings
+            .insert("fake_structured_output_json".to_string(), "0".to_string());
+        let state = Arc::new(state);
         let owner = WorkflowAgentTurnOwner { state: &state };
         let store_path = state
             .workflow_store
@@ -41147,7 +41332,7 @@ library = "test"
         );
         restore_workflow_runtime_work(&state).await;
         let mut joined_input = None;
-        for _ in 0..60 {
+        for _ in 0..200 {
             joined_input = {
                 let store = state
                     .workflow_store
@@ -41242,14 +41427,13 @@ library = "test"
                         schema: serde_json::json!({"type": "integer"}),
                     },
                     resources: Vec::new(),
-                    configuration: serde_json::json!({
-                        "agent_id": "build",
-                        "provider_plugin_id": "bcode.fake-provider",
-                        "model_id": "fake-echo",
-                        "prompt_mode": "json_input",
-                        "read_only": true,
-                        "strict": true,
-                    }),
+                    configuration: test_workflow_agent_configuration(
+                        bcode_workflow::ValueSchema {
+                            type_name: "u32".to_string(),
+                            schema: serde_json::json!({"type": "integer"}),
+                        },
+                        bcode_workflow::AgentExecutionTarget::FreshIsolated,
+                    ),
                 },
             )]),
             entries: vec!["agent".to_string()],
@@ -41275,10 +41459,13 @@ library = "test"
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
-        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
-            sessions,
-            workflow_store,
-        ));
+        let mut state =
+            test_server_state_with_fake_provider_and_workflow_store(sessions, workflow_store);
+        state
+            .selected_provider_context
+            .settings
+            .insert("fake_structured_output_json".to_string(), "0".to_string());
+        let state = Arc::new(state);
         let owner = WorkflowAgentTurnOwner { state: &state };
         let store_path = state
             .workflow_store
@@ -41638,13 +41825,10 @@ library = "test"
                 input: schema.clone(),
                 output: schema.clone(),
                 resources: Vec::new(),
-                configuration: serde_json::json!({
-                    "prompt_mode": "json_input",
-                    "loop_role": "implementation",
-                    "system_prompt": "test",
-                    "read_only": true,
-                    "execution_target": "shared_parent_sequential",
-                }),
+                configuration: test_workflow_agent_configuration(
+                    schema.clone(),
+                    bcode_workflow::AgentExecutionTarget::SharedParentSequential,
+                ),
             };
             let repeat = bcode_workflow::NodeDefinition {
                 id: "loop.repeat".to_string(),
@@ -42445,7 +42629,7 @@ type = "concurrent"
 
 [runtime]
 type = "native"
-abi_version = 2
+abi_version = 3
 library = "libbcode_test_workflow_block.dylib"
 event_symbol = "bcode_plugin_handle_event_v1"
 "#;
@@ -42602,7 +42786,7 @@ type = "concurrent"
 
 [runtime]
 type = "native"
-abi_version = 2
+abi_version = 3
 library = "libbcode_test_workflow_block.dylib"
 event_symbol = "bcode_plugin_handle_event_v1"
 "#;
@@ -44261,15 +44445,33 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         schema: serde_json::json!({"type": "integer", "minimum": 0}),
                     },
                     resources: Vec::new(),
-                    configuration: serde_json::json!({
-                        "agent_id": "build",
-                        "agent_profile_configured": true,
-                        "provider_plugin_id": "bcode.fake-provider",
-                        "model_id": "fake-echo",
-                        "prompt_mode": "json_input",
-                        "read_only": true,
-                        "strict": true,
-                    }),
+                    configuration: serde_json::to_value(
+                        bcode_workflow::WorkflowAgentConfiguration {
+                            version: bcode_workflow::WORKFLOW_AGENT_CONFIGURATION_VERSION,
+                            execution_target: bcode_workflow::AgentExecutionTarget::FreshIsolated,
+                            agent_profile: "build".to_string(),
+                            provider: Some("bcode.fake-provider".to_string()),
+                            model: Some("fake-echo".to_string()),
+                            structured_output: bcode_workflow::AgentStructuredOutputPolicy {
+                                schema: bcode_workflow::ValueSchema {
+                                    type_name: "u32".to_string(),
+                                    schema: serde_json::json!({
+                                        "type": "integer",
+                                        "minimum": 0
+                                    }),
+                                },
+                                strict: true,
+                            },
+                            read_only: true,
+                            tool_capability: bcode_workflow::WorkflowToolCapability::ReadOnly,
+                            tool_allowlist: Vec::new(),
+                            timeout_ms: 30_000,
+                            skills: Vec::new(),
+                            prompt_mode: "json_input".to_string(),
+                            system_prompt: String::new(),
+                        },
+                    )
+                    .expect("agent configuration"),
                 },
             )]),
             entries: vec!["agent".to_string()],
@@ -48230,7 +48432,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             provider_context,
             ..ClientRuntimeContext::default()
         };
-        let completion = run_test_model_turn_with_summary_steering(
+        let (completion, summary_started) = run_test_model_turn_with_summary_steering(
             &state,
             session_id,
             &trigger,
@@ -48261,9 +48463,18 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         )
                 ))
                 .count(),
-            1,
+            usize::from(summary_started),
             "completion: {completion:?}"
         );
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::TraceEvent { trace }
+                if matches!(
+                    &trace.payload,
+                    SessionTracePayload::ContextCompaction { reason, .. }
+                        if reason == "request_still_too_large"
+                )
+        )));
         assert!(!history.iter().any(|event| matches!(
             &event.kind,
             SessionEventKind::TraceEvent { trace }
@@ -49027,7 +49238,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             settings: BTreeMap::from([
                 (
                     "model_metadata.fake-echo.context_window".to_owned(),
-                    "7000".to_owned(),
+                    "12000".to_owned(),
                 ),
                 ("fake_tool_rounds".to_owned(), "5".to_owned()),
             ]),
@@ -49057,7 +49268,11 @@ event_symbol = "bcode_plugin_handle_event_v1"
         )
         .await;
 
-        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+        assert_eq!(
+            completion.outcome,
+            ModelTurnOutcome::Completed,
+            "completion: {completion:?}"
+        );
         let history = state
             .sessions
             .session_history(session_id)

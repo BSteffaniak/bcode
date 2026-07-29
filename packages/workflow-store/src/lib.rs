@@ -2955,6 +2955,26 @@ impl WorkflowStore {
         receipt_backed_attempts(&self.connection, bounded_limit(limit)?)
     }
 
+    /// Report whether the exact prepared attempt has a committed owner receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the dispatch identity is malformed or the query fails.
+    pub fn dispatch_receipt_committed(
+        &self,
+        dispatch_identity: &str,
+    ) -> Result<bool, WorkflowStoreError> {
+        validate_id("dispatch_identity", dispatch_identity)?;
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_attempts \
+                 WHERE dispatch_identity = ?1 AND receipt_json IS NOT NULL)",
+                [dispatch_identity],
+                |row| row.get(0),
+            )
+            .map_err(WorkflowStoreError::from)
+    }
+
     /// Persist one exact owner observation for a receipt-backed attempt.
     ///
     /// # Errors
