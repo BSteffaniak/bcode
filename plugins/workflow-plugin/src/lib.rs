@@ -804,7 +804,7 @@ mod tests {
             .definition
             .edges
             .iter()
-            .find(|edge| edge.from == "verified" && edge.to == "git_prepare")
+            .find(|edge| edge.from == "commit_policy" && edge.to == "git_prepare")
             .and_then(|edge| edge.transform.as_ref())
             .expect("Git prepare request transform");
         assert_eq!(
@@ -935,6 +935,9 @@ mod tests {
             "verification",
             "verification_decision",
             "verified",
+            "commit_policy",
+            "commit_disabled",
+            "commit_disabled_repeat",
             "verification_failed",
             "verification_repeat",
             "git_prepare",
@@ -955,6 +958,7 @@ mod tests {
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([
                 "commit_result".to_string(),
+                "commit_disabled_repeat".to_string(),
                 "no_changes".to_string(),
                 "verification_repeat".to_string(),
             ])
