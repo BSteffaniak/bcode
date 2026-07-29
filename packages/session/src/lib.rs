@@ -749,14 +749,38 @@ impl SessionManager {
     }
 
     async fn session_handle(&self, session_id: SessionId) -> Result<SessionHandle, SessionError> {
-        self.ensure_session_loaded(session_id).await?;
+        let cached = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached {
+            return Ok(handle);
+        }
+        self.load_session_summary_actor(session_id).await
+    }
+
+    async fn load_session_summary_actor(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionHandle, SessionError> {
+        let gate = self.session_load_gate(session_id).await;
+        let _guard = gate.lock().await;
+        let cached = self.inner.lock().await.sessions.get(&session_id).cloned();
+        if let Some(handle) = cached {
+            return Ok(handle);
+        }
+        let Some(store) = &self.store else {
+            return Err(SessionError::NotFound(session_id));
+        };
+        let state = store
+            .load_catalog()
+            .await?
+            .remove(&session_id)
+            .ok_or(SessionError::NotFound(session_id))?;
+        let handle = SessionHandle::new(state, Some(store.clone()), None);
         self.inner
             .lock()
             .await
             .sessions
-            .get(&session_id)
-            .cloned()
-            .ok_or(SessionError::NotFound(session_id))
+            .insert(session_id, handle.clone());
+        Ok(handle)
     }
 
     async fn session_load_gate(&self, session_id: SessionId) -> Arc<Mutex<()>> {
@@ -2019,8 +2043,12 @@ impl SessionManager {
         &self,
         session_id: SessionId,
     ) -> Result<SessionRuntimeSelection, SessionError> {
+        self.ensure_session_loaded(session_id).await?;
         let handle = self.session_handle(session_id).await?;
-        handle.current_runtime_selection().await
+        let selection = handle.current_runtime_selection().await?;
+        self.release_persistent_idle_session_resources(session_id)
+            .await;
+        Ok(selection)
     }
 
     /// Return the latest session-specific model selection if one has been set.
@@ -5176,6 +5204,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn summary_and_working_directory_reads_do_not_reacquire_released_ownership() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("read-only".to_owned()), test_working_directory())
+            .await
+            .expect("session should create");
+        assert!(!manager.session_is_owned(session.id).await);
+
+        let summary = manager
+            .session_summary(session.id)
+            .await
+            .expect("summary should remain cached");
+        assert_eq!(summary.id, session.id);
+        let working_directory = manager
+            .session_working_directory(session.id)
+            .await
+            .expect("working directory should remain cached");
+        assert_eq!(working_directory, session.working_directory);
+        assert!(!manager.session_is_owned(session.id).await);
+        assert!(
+            crate::lease::active_session_owners(&root, session.id)
+                .expect("owner scan")
+                .is_empty()
+        );
+
+        let restored = SessionManager::persistent(&root).expect("restored manager");
+        restored
+            .wait_catalog_loaded()
+            .await
+            .expect("catalog should load");
+        let restored_summary = restored
+            .session_summary(session.id)
+            .await
+            .expect("catalog summary");
+        assert_eq!(restored_summary.id, session.id);
+        assert!(!restored.session_is_owned(session.id).await);
+        assert!(
+            crate::lease::active_session_owners(&root, session.id)
+                .expect("owner scan")
+                .is_empty()
+        );
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn concurrent_quiescent_release_and_guard_acquire_are_serialized() {
+        let root = unique_temp_dir();
+        let manager = std::sync::Arc::new(SessionManager::persistent(&root).expect("manager"));
+        let session = manager
+            .create_session(Some("release race".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(3));
+        let release_manager = std::sync::Arc::clone(&manager);
+        let release_barrier = std::sync::Arc::clone(&barrier);
+        let release = tokio::spawn(async move {
+            release_barrier.wait().await;
+            release_manager.release_session_ownership(session.id).await
+        });
+        let acquire_manager = std::sync::Arc::clone(&manager);
+        let acquire_barrier = std::sync::Arc::clone(&barrier);
+        let acquire = tokio::spawn(async move {
+            acquire_barrier.wait().await;
+            acquire_manager
+                .acquire_session_ownership(session.id, crate::SessionOwnershipKind::RuntimeWork)
+                .await
+        });
+        barrier.wait().await;
+        let release_result = release
+            .await
+            .expect("release task")
+            .expect("release result");
+        let guard = acquire.await.expect("acquire task").expect("guard");
+        assert!(matches!(
+            release_result,
+            crate::SessionOwnershipRelease::Released | crate::SessionOwnershipRelease::Blocked(_)
+        ));
+        assert!(manager.session_is_owned(session.id).await);
+        assert_eq!(
+            manager
+                .session_ownership_snapshot(session.id)
+                .await
+                .expect("snapshot")
+                .guards
+                .get(&crate::SessionOwnershipKind::RuntimeWork),
+            Some(&1)
+        );
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while manager.session_is_owned(session.id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("guard drop should release");
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn final_detach_releases_runtime_ownership_and_next_daemon_can_acquire() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent_with_metrics_and_lease_owner(
@@ -5290,6 +5418,10 @@ mod tests {
                 .create_session(Some("lease release".to_string()), test_working_directory())
                 .await
                 .expect("session should create");
+            let _guard = manager
+                .acquire_session_ownership(session.id, crate::SessionOwnershipKind::RuntimeWork)
+                .await
+                .expect("loaded ownership");
             assert!(manager.session_is_owned(session.id).await);
             session.id
         };
@@ -6182,6 +6314,10 @@ mod tests {
             .create_session(Some("catalog-only".to_owned()), test_working_directory())
             .await
             .expect("session should create");
+        let _writer_guard = writer
+            .acquire_session_ownership(session.id, crate::SessionOwnershipKind::RuntimeWork)
+            .await
+            .expect("writer ownership");
         assert_eq!(
             lease::active_session_owners(&root, session.id)
                 .expect("owners should be readable")

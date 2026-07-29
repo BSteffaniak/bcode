@@ -8316,6 +8316,7 @@ async fn enqueue_user_message_command(
     Err(bcode_session::SessionError::NotFound(session_id).into())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn enqueue_steering_message_command(
     state: &Arc<ServerState>,
     handle: &SessionRuntimeHandle,
