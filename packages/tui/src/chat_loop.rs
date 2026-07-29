@@ -1882,7 +1882,7 @@ fn draw_chat_frame<W: Write>(
     let prepare_ms = elapsed_millis(prepare_started);
     let theme = render::TuiTheme::for_app(&chat.app);
     let draw_started = Instant::now();
-    terminal.draw(|frame| {
+    let draw_stats = terminal.draw(|frame| {
         if let Some(layout) = layout {
             render::render_prepared(&mut chat.app, frame, layout);
         }
@@ -1962,6 +1962,15 @@ fn draw_chat_frame<W: Write>(
             surface.render(surface_area, frame);
         }
     })?;
+    loop_state.telemetry.record_histogram(
+        "tui.frame.changed_cells",
+        u64::try_from(draw_stats.changed_cells).unwrap_or(u64::MAX),
+    );
+    if draw_stats.full_repaint {
+        loop_state
+            .telemetry
+            .add_counter("tui.frame.full_repaint_total", 1);
+    }
     loop_state
         .markdown_image_compositor
         .apply_delta(terminal.image_delta());

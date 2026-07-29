@@ -28,3 +28,9 @@ complete. Semantic text remains unchanged in `SessionView`.
 * Reloaded TUI configuration applies the new cadence without changing semantic event processing.
 
 Semantic events continue to update application state immediately. The cadence limits terminal draws only; it does not delay cancellation, permission handling, execution state, checkpoint validation, or artifact decoding.
+
+BMUX `Terminal` retains the previous frame and reports `DrawStats` from its ANSI cell-diff flush.
+Bcode records `tui.frame.changed_cells` and `tui.frame.full_repaint_total`; repeated same-size draws
+therefore use BMUX's retained-buffer changed-cell transport, while resize or explicit backend reset
+may repaint fully. Custom dirty-region transport is not justified unless production telemetry shows
+changed-cell amplification beyond the existing item-scoped layout and BMUX cell diff.

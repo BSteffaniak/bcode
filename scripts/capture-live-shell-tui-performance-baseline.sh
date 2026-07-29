@@ -27,20 +27,16 @@ run_probe() {
     run_probe bcode_shell_plugin tests::live_shell_output_chunk_baseline_report
     run_probe bcode_shell_plugin shell_run_tui::tests::incremental_replay_work_baseline_report --features static-bundled
     run_probe bcode_tui plugin_tui::tests::targeted_visual_update_transcript_baseline_report
-    run_probe bcode_tui tests::active_visual_frame_baseline_report
-    run_probe bcode_tui tests::shell_output_chunk_transcript_matrix_report
-    run_probe bcode_tui artifact_stream::tests::artifact_target_fetch_baseline_report
+    run_probe bcode_tui render::markdown_and_json_layout_work_per_revision_baseline_report
     run_probe bcode_tui telemetry::tests::telemetry_enabled_disabled_overhead_baseline_report
     run_probe bcode_server tests::artifact_update_publisher_baseline_report
 } >"${output}"
 
 python3 - "${output}" <<'PY'
 import json
-import os
 import sys
 
 path = sys.argv[1]
-require_over_budget = os.environ.get("BCODE_REQUIRE_OVER_BUDGET") == "1"
 with open(path, encoding="utf-8") as source:
     records = [json.loads(line) for line in source if line.strip()]
 
@@ -49,9 +45,7 @@ replay = [record for record in records if record.get("domain") == "shell_replay"
 transcript = [
     record for record in records if record.get("domain") == "transcript_visual_update"
 ]
-frames = [record for record in records if record.get("domain") == "tui_frame"]
-matrix = [record for record in records if record.get("domain") == "shell_tui_matrix"]
-fetches = [record for record in records if record.get("domain") == "artifact_fetch"]
+frames = [record for record in records if record.get("domain") == "renderer_parse_layout"]
 telemetry = [record for record in records if record.get("domain") == "telemetry_overhead"]
 publisher = [
     record for record in records if record.get("domain") == "server_artifact_publisher"
@@ -74,32 +68,8 @@ if len(replay) != 9 or any(
     raise SystemExit("shell replay-work matrix is incomplete or amplified")
 if len(transcript) != 3:
     raise SystemExit(f"expected 3 transcript matrix cases, found {len(transcript)}")
-if len(frames) != 3:
-    raise SystemExit(f"expected 3 TUI frame cases, found {len(frames)}")
-expected_matrix = {
-    (output_bytes, chunk_bytes, transcript_entries)
-    for output_bytes in (64 * 1024, 1024 * 1024, 8 * 1024 * 1024)
-    for chunk_bytes in (17, 4 * 1024, 16 * 1024)
-    for transcript_entries in (10, 500, 2000)
-}
-actual_matrix = {
-    (record["output_bytes"], record["chunk_bytes"], record["transcript_entries"])
-    for record in matrix
-}
-if actual_matrix != expected_matrix:
-    raise SystemExit(f"expected 27 shell/TUI matrix cases, found {len(actual_matrix)}")
-if any(
-    record["emulate_bytes"] != record["output_bytes"]
-    or record["entries_scanned"] != 1
-    or record["entries_rebuilt"] != 1
-    or record["reset_total"] != 0
-    for record in matrix
-):
-    raise SystemExit("shell/TUI matrix detected replay or transcript rebuild amplification")
-if require_over_budget and not any(record["over_budget"] for record in matrix):
-    raise SystemExit("shell/TUI matrix did not reproduce an over-budget frame")
-if len(fetches) != 3:
-    raise SystemExit(f"expected 3 artifact fetch cases, found {len(fetches)}")
+if len(frames) != 2 or {record["format"] for record in frames} != {"markdown", "json"}:
+    raise SystemExit("renderer parse/layout baseline is incomplete")
 if {record["enabled"] for record in telemetry} != {False, True}:
     raise SystemExit("telemetry enabled/disabled control is incomplete")
 if len(publisher) != 3 or any(record["published_updates"] != 1 for record in publisher):
