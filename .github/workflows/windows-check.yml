@@ -34,6 +34,7 @@ jobs:
         run: |
           cargo test --package bcode_ipc default_windows_endpoint_is_a_namespaced_named_pipe
           cargo test --package bcode_shell_plugin windows_shell_plan_uses_cmd_contract
+          cargo test --package bcode_shell_plugin terminal_mode_executes_cmd_through_native_pty
           cargo test --package bcode_provider_auth windows_dpapi_device_seal_round_trips_for_current_user
 
       - name: Build and verify Windows release artifact

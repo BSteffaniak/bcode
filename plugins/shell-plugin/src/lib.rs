@@ -3489,6 +3489,49 @@ mod tests {
         assert_eq!(rows, 24);
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn terminal_mode_executes_cmd_through_native_pty() {
+        let environment = isolated_config_environment("windows-terminal");
+        let response = run_terminal_shell_command_with_environment(
+            ServiceEventEmitter::default(),
+            &bcode_plugin_sdk::ServiceCancellation::default(),
+            bcode_plugin_sdk::TransientProgressLimits::default(),
+            "test-windows-terminal-semantic",
+            &ShellRunArguments {
+                command: "echo semantic windows terminal".to_string(),
+                cwd: None,
+                timeout_ms: Some(5_000),
+                columns: Some(80),
+                rows: Some(24),
+                format_commands: None,
+            },
+            json!({}),
+            TerminalRunPaths {
+                session_cwd: None,
+                artifact_dir: None,
+                input_bridge: None,
+            },
+            &environment,
+        );
+
+        assert!(!response.is_error, "{}", response.output);
+        let ShellRunResult::Terminal {
+            exit_code,
+            timed_out,
+            cancelled,
+            output_tail,
+            ..
+        } = shell_result_from_artifact(&response).expect("expected shell artifact")
+        else {
+            panic!("expected semantic terminal shell result");
+        };
+        assert_eq!(exit_code, Some(0));
+        assert!(!timed_out);
+        assert!(!cancelled);
+        assert!(output_tail.contains("semantic windows terminal"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn terminal_mode_preserves_ansi_output() {

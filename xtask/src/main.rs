@@ -26,6 +26,7 @@ const DEV_CODESIGN_KEYCHAIN_RELATIVE_DIR: &str = "Library/Application Support/bc
 const DEV_CODESIGN_KEYCHAIN_NAME: &str = "bcode-dev-signing.keychain-db";
 const DEV_CODESIGN_PASSWORD_FILE: &str = "password";
 const DEV_CODESIGN_P12_PASSWORD: &str = "bcode-dev-signing";
+const WINDOWS_TIMESTAMP_URL: &str = "http://timestamp.digicert.com";
 
 #[derive(Debug)]
 struct XtaskError(String);
@@ -1142,6 +1143,9 @@ fn release(options: &Options) -> Result<()> {
     } else if target_kind == TargetKind::Linux {
         strip_binary(&binary);
         strip_binary(&mermaid_worker);
+    } else if target_kind == TargetKind::Windows {
+        sign_windows_release_binary_if_configured(&binary)?;
+        sign_windows_release_binary_if_configured(&mermaid_worker)?;
     }
 
     let staging_dir = staging_dir(options);
@@ -1186,6 +1190,9 @@ fn verify_release(options: &Options) -> Result<()> {
         let mermaid_worker = built_mermaid_worker(&options.target, target_kind);
         ensure_file(&mermaid_worker)?;
         verify_macos_signature(&mermaid_worker)?;
+    } else if target_kind == TargetKind::Windows && windows_signing_configured() {
+        verify_windows_signature(&built_binary(&options.target, target_kind))?;
+        verify_windows_signature(&built_mermaid_worker(&options.target, target_kind))?;
     }
     if options.target == host_target() {
         smoke_test_release_archive(&archive, target_kind)?;
@@ -1679,6 +1686,61 @@ fn sign_macos_dev_binary(binary: &Path, identity: &str, keychain: Option<&Path>)
     run_command(&mut command)
 }
 
+fn windows_signing_configured() -> bool {
+    windows_signing_configured_from(
+        env::var_os("WINDOWS_CODESIGN_CERTIFICATE_PFX").is_some(),
+        env::var_os("WINDOWS_CODESIGN_CERTIFICATE_PASSWORD").is_some(),
+    )
+}
+
+const fn windows_signing_configured_from(certificate: bool, password: bool) -> bool {
+    certificate && password
+}
+
+fn sign_windows_release_binary_if_configured(binary: &Path) -> Result<()> {
+    let Some(certificate) = env::var_os("WINDOWS_CODESIGN_CERTIFICATE_PFX") else {
+        println!(
+            "WINDOWS_CODESIGN_CERTIFICATE_PFX not set; leaving {} unsigned",
+            binary.display()
+        );
+        return Ok(());
+    };
+    let password = env::var("WINDOWS_CODESIGN_CERTIFICATE_PASSWORD").map_err(|_| {
+        format_error(
+            "WINDOWS_CODESIGN_CERTIFICATE_PASSWORD is required when Windows signing is configured",
+        )
+    })?;
+    run_sensitive_command(
+        Command::new("signtool")
+            .arg("sign")
+            .arg("/fd")
+            .arg("SHA256")
+            .arg("/td")
+            .arg("SHA256")
+            .arg("/tr")
+            .arg(WINDOWS_TIMESTAMP_URL)
+            .arg("/f")
+            .arg(certificate)
+            .arg("/p")
+            .arg(password)
+            .arg(binary),
+        "signtool sign /fd SHA256 /td SHA256 /tr <timestamp-url> /f <certificate> /p <redacted> <binary>",
+    )?;
+    verify_windows_signature(binary)
+}
+
+fn verify_windows_signature(binary: &Path) -> Result<()> {
+    ensure_file(binary)?;
+    run_command(
+        Command::new("signtool")
+            .arg("verify")
+            .arg("/pa")
+            .arg("/all")
+            .arg("/v")
+            .arg(binary),
+    )
+}
+
 fn sign_macos_release_binary(binary: &Path) -> Result<()> {
     let identity = env::var("APPLE_CODESIGN_IDENTITY").map_err(|_| {
         format_error("APPLE_CODESIGN_IDENTITY is required for macOS release signing")
@@ -1914,27 +1976,44 @@ fn smoke_test_release_archive(archive: &Path, target_kind: TargetKind) -> Result
             .unwrap_or("archive")
     ));
     recreate_dir(&extraction)?;
+    let result = smoke_test_release_archive_in(archive, target_kind, &extraction);
+    let cleanup = fs::remove_dir_all(&extraction);
+    match (result, cleanup) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error.into()),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn smoke_test_release_archive_in(
+    archive: &Path,
+    target_kind: TargetKind,
+    extraction: &Path,
+) -> Result<()> {
     if target_kind == TargetKind::Linux {
         run_command(
             Command::new("tar")
                 .arg("-xzf")
                 .arg(archive)
                 .arg("-C")
-                .arg(&extraction),
+                .arg(extraction),
         )?;
     } else {
         let mut zip = zip::ZipArchive::new(File::open(archive)?)?;
-        extract_zip_confined(&mut zip, &extraction)?;
+        extract_zip_confined(&mut zip, extraction)?;
     }
     let binary = extraction.join(binary_file_name(target_kind));
     ensure_file(&binary)?;
     run_command(Command::new(&binary).arg("--version"))?;
     smoke_test_mermaid_worker(&extraction.join(mermaid_worker_file_name(target_kind)))?;
-    smoke_test_extracted_tesseract(&extraction)?;
+    smoke_test_extracted_tesseract(extraction)?;
     if target_kind == TargetKind::Windows {
-        smoke_test_windows_daemon(&binary, &extraction)?;
+        smoke_test_windows_daemon(&binary, extraction)?;
+        if windows_signing_configured() {
+            verify_windows_signature(&binary)?;
+            verify_windows_signature(&extraction.join(mermaid_worker_file_name(target_kind)))?;
+        }
     }
-    fs::remove_dir_all(&extraction)?;
     Ok(())
 }
 
@@ -1955,11 +2034,28 @@ fn smoke_test_extracted_tesseract(extraction: &Path) -> Result<()> {
     )
 }
 
+fn smoke_test_windows_shell_contract() -> Result<()> {
+    let output = Command::new("cmd")
+        .args(["/C", "echo bcode-windows-shell-smoke"])
+        .output()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if output.status.success() && stdout.contains("bcode-windows-shell-smoke") {
+        Ok(())
+    } else {
+        Err(format_error(format!(
+            "Windows shell smoke test failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )))
+    }
+}
+
 fn smoke_test_windows_daemon(binary: &Path, extraction: &Path) -> Result<()> {
     let smoke_root = extraction.join("windows smoke 状态");
     fs::create_dir_all(&smoke_root)?;
     let config = smoke_root.join("config.toml");
     fs::write(&config, "")?;
+    smoke_test_windows_shell_contract()?;
     let isolated_environment = |command: &mut Command| {
         command
             .env("BCODE_CONFIG", &config)
@@ -1972,21 +2068,32 @@ fn smoke_test_windows_daemon(binary: &Path, extraction: &Path) -> Result<()> {
     isolated_environment(&mut start);
     run_command(&mut start)?;
 
-    let mut status = Command::new(binary);
-    status.args(["server", "status", "--verbose"]);
-    isolated_environment(&mut status);
-    if let Err(error) = run_command(&mut status) {
-        let mut stop = Command::new(binary);
-        stop.args(["server", "stop", "--force"]);
-        isolated_environment(&mut stop);
-        let _ = stop.status();
-        return Err(error);
-    }
-
+    let result = smoke_test_running_windows_daemon(binary, &isolated_environment);
     let mut stop = Command::new(binary);
     stop.args(["server", "stop"]);
     isolated_environment(&mut stop);
-    run_command(&mut stop)
+    let stop_result = run_command(&mut stop);
+    match (result, stop_result) {
+        (Err(error), _) => {
+            let mut force_stop = Command::new(binary);
+            force_stop.args(["server", "stop", "--force"]);
+            isolated_environment(&mut force_stop);
+            let _ = force_stop.status();
+            Err(error)
+        }
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn smoke_test_running_windows_daemon(
+    binary: &Path,
+    isolated_environment: &impl Fn(&mut Command),
+) -> Result<()> {
+    let mut status = Command::new(binary);
+    status.args(["server", "status", "--verbose"]);
+    isolated_environment(&mut status);
+    run_command(&mut status)
 }
 
 fn extract_zip_confined<R: io::Read + io::Seek>(
@@ -2360,6 +2467,14 @@ mod tests {
     }
 
     #[test]
+    fn windows_signing_requires_both_certificate_and_password() {
+        assert!(!windows_signing_configured_from(false, false));
+        assert!(!windows_signing_configured_from(true, false));
+        assert!(!windows_signing_configured_from(false, true));
+        assert!(windows_signing_configured_from(true, true));
+    }
+
+    #[test]
     fn zip_entry_names_are_safe_and_portable() {
         assert_eq!(
             zip_entry_name(Path::new("bcode-runtimes/tesseract/manifest.json")).expect("safe path"),
@@ -2393,6 +2508,37 @@ mod tests {
         let incomplete = temp.path().join("incomplete.zip");
         create_zip_archive(&incomplete, &staging).expect("create incomplete archive");
         assert!(verify_archive_contents(&incomplete, TargetKind::Windows).is_err());
+    }
+
+    #[test]
+    fn zip_extraction_rejects_parent_traversal() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let archive_path = temp.path().join("unsafe.zip");
+        let mut writer = zip::ZipWriter::new(File::create(&archive_path).expect("archive"));
+        writer
+            .start_file("../escape.exe", zip::write::SimpleFileOptions::default())
+            .expect("unsafe entry");
+        writer.write_all(b"escape").expect("entry bytes");
+        writer.finish().expect("finish archive");
+        let mut archive = zip::ZipArchive::new(File::open(&archive_path).expect("open archive"))
+            .expect("ZIP archive");
+        let destination = temp.path().join("extract");
+        fs::create_dir_all(&destination).expect("destination");
+        assert!(extract_zip_confined(&mut archive, &destination).is_err());
+        assert!(!temp.path().join("escape.exe").exists());
+    }
+
+    #[test]
+    fn failed_release_smoke_removes_extraction_directory() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let archive = temp.path().join("invalid.zip");
+        let staging = temp.path().join("staging");
+        fs::create_dir_all(&staging).expect("staging");
+        fs::write(staging.join("not-bcode"), b"invalid").expect("invalid artifact");
+        create_zip_archive(&archive, &staging).expect("archive");
+        let extraction = archive.with_extension("zip.verify");
+        assert!(smoke_test_release_archive(&archive, TargetKind::Windows).is_err());
+        assert!(!extraction.exists());
     }
 
     #[test]

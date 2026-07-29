@@ -131,8 +131,14 @@ Required for macOS jobs:
 Linux and Windows jobs do not perform platform binary signing in v1. They build, package,
 checksum, and verify artifacts. Windows provider secrets use current-user DPAPI, and Windows shell
 tool commands currently execute with `cmd.exe /C`; commands written for POSIX shells may need to be
-adapted. Public Windows artifacts should be treated as unsigned until an Authenticode signing policy
-and workflow are documented here.
+adapted. Public Windows artifacts are unsigned when no signing certificate is configured. For signed public
+releases, configure `WINDOWS_CODESIGN_CERTIFICATE_PFX` and
+`WINDOWS_CODESIGN_CERTIFICATE_PASSWORD`; release automation signs and RFC 3161 timestamps both
+executables with SHA-256 before packaging, verifies both signatures before packaging, and verifies
+them again after extraction. Store the PFX as an Actions secret encoded or supplied in the format
+expected by the runner secret policy; rotate or revoke it through the certificate authority and
+replace the repository secrets. Local development remains unsigned unless these variables are set.
+A valid Authenticode signature does not guarantee Microsoft Defender SmartScreen reputation.
 
 ## Release workflow
 

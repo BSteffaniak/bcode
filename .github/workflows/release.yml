@@ -84,6 +84,8 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          WINDOWS_CODESIGN_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE_PFX }}
+          WINDOWS_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_CERTIFICATE_PASSWORD }}
         run: cargo xtask release --target ${{ matrix.target }} --version ${{ inputs.version }}
 
       - name: Verify release artifact
