@@ -11343,6 +11343,7 @@ fn register_workflow_definition(
 
 fn compile_workflow_template(
     template: &bcode_plugin::WorkflowTemplateContribution,
+    configuration: &serde_json::Value,
 ) -> Result<bcode_workflow::WorkflowDefinition, ServerError> {
     let mut definition = template.definition.clone();
     let uses_configuration_envelope =
@@ -11388,10 +11389,90 @@ fn compile_workflow_template(
             ))
         })?;
     }
+    apply_workflow_template_compilation_bindings(&mut definition, template, configuration)?;
     definition
         .validate()
         .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
     Ok(definition)
+}
+
+fn apply_workflow_template_compilation_bindings(
+    definition: &mut bcode_workflow::WorkflowDefinition,
+    template: &bcode_plugin::WorkflowTemplateContribution,
+    configuration: &serde_json::Value,
+) -> Result<(), ServerError> {
+    for binding in &template.compilation_bindings {
+        let value = binding
+            .configuration_path
+            .split('.')
+            .try_fold(configuration, |current, part| current.get(part));
+        let skill_id = match value {
+            None | Some(serde_json::Value::Null) => None,
+            Some(serde_json::Value::String(value)) if !value.trim().is_empty() => {
+                Some(value.clone())
+            }
+            Some(_) => {
+                return Err(WorkflowStoreError::InvalidData(format!(
+                    "template compilation binding '{}' must resolve to a non-empty skill ID or null",
+                    binding.configuration_path
+                ))
+                .into());
+            }
+        };
+        let node = definition.nodes.get_mut(&binding.node_id).ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!(
+                "template compilation binding references missing node '{}'",
+                binding.node_id
+            ))
+        })?;
+        let mut agent = serde_json::from_value::<bcode_workflow::WorkflowAgentConfiguration>(
+            node.configuration.clone(),
+        )
+        .map_err(|error| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow template bound agent configuration is invalid: {error}"
+            ))
+        })?;
+        agent.skills = skill_id
+            .as_ref()
+            .map(|skill_id| {
+                vec![bcode_workflow::AgentSkillSelection {
+                    skill_id: skill_id.clone(),
+                    mode: binding.skill_mode,
+                }]
+            })
+            .unwrap_or_default();
+        agent.validate().map_err(|error| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow template bound agent configuration is invalid: {error}"
+            ))
+        })?;
+        node.configuration = serde_json::to_value(agent).map_err(|error| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow template bound agent configuration cannot be serialized: {error}"
+            ))
+        })?;
+        if skill_id.is_none() {
+            let fallback = binding.absent_fallback_edge.clone().ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "template compilation binding '{}' has no fallback for null configuration",
+                    binding.configuration_path
+                ))
+            })?;
+            definition
+                .edges
+                .retain(|edge| edge.from != binding.node_id && edge.to != binding.node_id);
+            definition.nodes.remove(&binding.node_id);
+            definition
+                .entries
+                .retain(|node_id| node_id != &binding.node_id);
+            definition
+                .exits
+                .retain(|node_id| node_id != &binding.node_id);
+            definition.edges.push(fallback);
+        }
+    }
+    Ok(())
 }
 
 fn workflow_template_description(
@@ -11566,7 +11647,7 @@ async fn handle_start_workflow_template(
         .into());
     }
     let binding_kind = description.identity.kind.clone();
-    let definition = compile_workflow_template(template)?;
+    let definition = compile_workflow_template(template, &request.configuration)?;
     let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
         description.identity.kind,
         &definition,
@@ -26532,7 +26613,22 @@ mod tests {
             .iter()
             .find(|template| template.template_id == "implementation-verification-commit")
             .expect("reference template");
-        let definition = compile_workflow_template(template).expect("compile");
+        let configuration = serde_json::json!({
+            "commit_message_skill": "commit-message"
+        });
+        let definition = compile_workflow_template(template, &configuration).expect("compile");
+        let bound_commit_message =
+            serde_json::from_value::<bcode_workflow::WorkflowAgentConfiguration>(
+                definition.nodes["commit_message"].configuration.clone(),
+            )
+            .expect("bound commit-message agent");
+        assert_eq!(
+            bound_commit_message.skills,
+            vec![bcode_workflow::AgentSkillSelection {
+                skill_id: "commit-message".to_string(),
+                mode: bcode_workflow::AgentSkillActivationMode::Required,
+            }]
+        );
         assert_eq!(definition.input, template.configuration_schema);
         assert_eq!(definition.output, template.configuration_schema);
         let implementation = &definition.nodes["implementation"];
@@ -26567,6 +26663,17 @@ mod tests {
                 .definition_identity("bcode.workflow")
                 .expect("manifest identity")
         );
+
+        let fallback =
+            compile_workflow_template(template, &serde_json::json!({"commit_message_skill": null}))
+                .expect("fallback compile");
+        assert!(!fallback.nodes.contains_key("commit_message"));
+        assert!(fallback.edges.iter().any(|edge| {
+            edge.from == "git_prepare"
+                && edge.to == "git_compose"
+                && edge.kind == bcode_workflow::EdgeKind::Direct
+                && edge.transform.is_some()
+        }));
     }
 
     #[tokio::test]

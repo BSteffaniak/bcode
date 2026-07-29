@@ -265,6 +265,41 @@ pub const WORKFLOW_TEMPLATE_CONTRIBUTION_VERSION: u32 = 1;
 /// Maximum serialized bytes accepted for one declarative workflow template definition.
 pub const MAX_WORKFLOW_TEMPLATE_DEFINITION_BYTES: usize = 1_048_576;
 
+/// One generic configuration binding applied to an exact template definition before start.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowTemplateCompilationBinding {
+    /// Dotted path below the validated configuration value.
+    pub configuration_path: String,
+    /// Target agent node whose exact skill selection is replaced.
+    pub node_id: String,
+    /// Direct fallback edge compiled when the configured skill is absent/null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub absent_fallback_edge: Option<bcode_workflow::EdgeDefinition>,
+    /// Activation mode assigned when the optional configured skill is present.
+    pub skill_mode: bcode_workflow::AgentSkillActivationMode,
+}
+
+impl WorkflowTemplateCompilationBinding {
+    fn validate(&self) -> Result<(), String> {
+        if self.configuration_path.trim().is_empty()
+            || self.configuration_path.len() > 512
+            || self.node_id.trim().is_empty()
+            || self.node_id.len() > 256
+            || self.configuration_path.split('.').any(|part| {
+                part.is_empty()
+                    || part.len() > 128
+                    || !part
+                        .chars()
+                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            })
+        {
+            return Err("template compilation binding identity or path is invalid".to_string());
+        }
+        Ok(())
+    }
+}
+
 /// One stable plugin-owned workflow template contribution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -281,6 +316,9 @@ pub struct WorkflowTemplateContribution {
     pub description: String,
     /// Typed configuration schema validated before definition compilation.
     pub configuration_schema: bcode_workflow::ValueSchema,
+    /// Generic bounded bindings applied from validated configuration before exact identity is derived.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compilation_bindings: Vec<WorkflowTemplateCompilationBinding>,
     /// Exact declarative compiled definition for this template version.
     pub definition: bcode_workflow::WorkflowDefinition,
     /// Plugin IDs required by the compiled definition.
@@ -295,6 +333,64 @@ pub struct WorkflowTemplateContribution {
     /// Renderer-neutral bounded presentation metadata.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub presentation: BTreeMap<String, String>,
+}
+
+fn validate_template_compilation_bindings(
+    template: &WorkflowTemplateContribution,
+) -> Result<(), String> {
+    if template.compilation_bindings.len() > 32 {
+        return Err("template compilation binding count exceeds 32".to_string());
+    }
+    let mut binding_targets = BTreeSet::new();
+    let mut fallback_edges = BTreeSet::new();
+    for binding in &template.compilation_bindings {
+        binding.validate()?;
+        if !binding_targets.insert((
+            binding.configuration_path.as_str(),
+            binding.node_id.as_str(),
+        )) {
+            return Err("template compilation bindings must be unique".to_string());
+        }
+        let Some(node) = template.definition.nodes.get(&binding.node_id) else {
+            return Err(format!(
+                "template compilation binding references missing node '{}'",
+                binding.node_id
+            ));
+        };
+        if node.kind != bcode_workflow::NodeKind::Agent {
+            return Err(format!(
+                "template compilation binding target '{}' is not an agent node",
+                binding.node_id
+            ));
+        }
+        let Some(edge) = &binding.absent_fallback_edge else {
+            continue;
+        };
+        if !fallback_edges.insert((edge.from.as_str(), edge.to.as_str())) {
+            return Err("template compilation fallback edges must be unique".to_string());
+        }
+        if edge.from == binding.node_id
+            || edge.to == binding.node_id
+            || !template.definition.nodes.contains_key(&edge.from)
+            || !template.definition.nodes.contains_key(&edge.to)
+            || edge.kind != bcode_workflow::EdgeKind::Direct
+        {
+            return Err(format!(
+                "template compilation fallback for '{}' must be a direct bypass edge between existing nodes",
+                binding.node_id
+            ));
+        }
+        if let Some(transform) = &edge.transform {
+            transform.validate().map_err(|error| error.to_string())?;
+            if transform.output != template.definition.nodes[&edge.to].input {
+                return Err(format!(
+                    "template compilation fallback output does not match target '{}' input",
+                    edge.to
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 impl WorkflowTemplateContribution {
@@ -330,6 +426,7 @@ impl WorkflowTemplateContribution {
                 "template display metadata is empty or oversized".to_string(),
             ));
         }
+        validate_template_compilation_bindings(self).map_err(&invalid)?;
         if self.configuration_schema.type_name.trim().is_empty()
             || self.configuration_schema.type_name.len() > 256
             || !self.configuration_schema.schema.is_object()
@@ -5699,8 +5796,8 @@ library = "libexample_plugin.dylib"
         let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
         let task_plugin = Arc::clone(&plugin);
         let task_cancellation = cancellation.clone();
-        let started = Arc::new(AtomicBool::new(false));
-        let task_started = Arc::clone(&started);
+        let started = std::sync::mpsc::sync_channel(1);
+        let (started_tx, started_rx) = started;
         let (woke_tx, woke_rx) = std::sync::mpsc::sync_channel(1);
         let task = std::thread::spawn(move || {
             task_plugin.invoke_service_with_bridge(
@@ -5709,7 +5806,7 @@ library = "libexample_plugin.dylib"
                 Vec::new(),
                 |_| {},
                 |_, callback_cancellation| {
-                    task_started.store(true, Ordering::SeqCst);
+                    let _ = started_tx.send(());
                     if callback_cancellation.wait_cancelled(Duration::from_secs(5)) {
                         let _ = woke_tx.send(());
                         Err("cancelled".to_string())
@@ -5720,14 +5817,9 @@ library = "libexample_plugin.dylib"
                 &task_cancellation,
             )
         });
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !started.load(Ordering::SeqCst) {
-            assert!(
-                Instant::now() < deadline,
-                "ABI bridge callback did not start"
-            );
-            std::thread::yield_now();
-        }
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("ABI bridge callback did not start");
 
         cancellation.cancel();
         woke_rx
@@ -7111,6 +7203,7 @@ library = "libexample_plugin.dylib"
             title: "Example".to_string(),
             description: "A declarative example workflow.".to_string(),
             configuration_schema: definition.input.clone(),
+            compilation_bindings: Vec::new(),
             definition,
             required_plugins: Vec::new(),
             required_skills: Vec::new(),
@@ -7131,6 +7224,21 @@ library = "libexample_plugin.dylib"
                 .definition_id
                 .starts_with("bcode.example/example@1@")
         );
+
+        let mut binding = WorkflowTemplateCompilationBinding {
+            configuration_path: "commit_message_skill".to_string(),
+            node_id: "transform".to_string(),
+            skill_mode: bcode_workflow::AgentSkillActivationMode::Required,
+            absent_fallback_edge: None,
+        };
+        let mut non_agent = template.clone();
+        non_agent.compilation_bindings.push(binding.clone());
+        assert!(non_agent.validate().is_err());
+
+        binding.node_id = "missing".to_string();
+        let mut missing = template.clone();
+        missing.compilation_bindings.push(binding);
+        assert!(missing.validate().is_err());
 
         let mut changed = template;
         changed.definition.name = "changed-topology-policy".to_string();

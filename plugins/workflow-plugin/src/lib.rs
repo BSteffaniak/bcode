@@ -828,33 +828,53 @@ mod tests {
             .find(|block| block.block_id == "git.compose-commit")
             .expect("declared Git compose block");
         assert_eq!(&git_compose_block, declared_compose);
+        let commit_message = &template.definition.nodes["commit_message"];
+        assert_eq!(commit_message.kind, bcode_workflow::NodeKind::Agent);
+        let commit_message_agent: bcode_workflow::WorkflowAgentConfiguration =
+            serde_json::from_value(commit_message.configuration.clone())
+                .expect("typed commit-message agent");
+        assert!(commit_message_agent.read_only);
+        assert_eq!(
+            commit_message_agent.tool_capability,
+            bcode_workflow::WorkflowToolCapability::ReadOnly
+        );
+        assert!(commit_message_agent.skills.is_empty());
+        assert_eq!(template.compilation_bindings.len(), 1);
+        let skill_binding = &template.compilation_bindings[0];
+        assert_eq!(skill_binding.configuration_path, "commit_message_skill");
+        assert_eq!(skill_binding.node_id, "commit_message");
+        assert_eq!(
+            skill_binding.skill_mode,
+            bcode_workflow::AgentSkillActivationMode::Required
+        );
         let compose_transform = template
             .definition
             .edges
             .iter()
-            .find(|edge| edge.from == "git_prepare" && edge.to == "git_compose")
+            .find(|edge| edge.from == "commit_message" && edge.to == "git_compose")
             .and_then(|edge| edge.transform.as_ref())
-            .expect("Git compose request transform");
+            .expect("skill-backed Git compose request transform");
         let preparation = serde_json::json!({
+            "version": 1,
             "repository_root": "/repo",
-            "head": "abc",
-            "changed_paths": [{"path": "src/lib.rs", "status": "modified"}]
+            "expected_head": "abc",
+            "paths": [{"path": "src/lib.rs", "status": "modified"}],
+            "title": "Implement workflows",
+            "description": "Add durable workflow support"
         });
-        let compose_state = serde_json::json!({"implementation_prompt": "Implement workflows"});
         let composed = compose_transform
-            .evaluate(&[
-                bcode_workflow::WorkflowTransformInput {
-                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
-                    value: &preparation,
-                },
-                bcode_workflow::WorkflowTransformInput {
-                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_STATE,
-                    value: &compose_state,
-                },
-            ])
+            .evaluate(&[bcode_workflow::WorkflowTransformInput {
+                name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                value: &preparation,
+            }])
             .expect("compose request");
-        assert_eq!(composed["preparation"], preparation);
-        assert_eq!(composed["message"]["description"], "Implement workflows");
+        assert_eq!(composed["preparation"]["repository_root"], "/repo");
+        assert_eq!(composed["preparation"]["head"], "abc");
+        assert_eq!(composed["message"]["title"], "Implement workflows");
+        assert_eq!(
+            composed["message"]["description"],
+            "Add durable workflow support"
+        );
         assert_eq!(composed["no_changes"], "no_op");
         let git_commit = &template.definition.nodes["git_commit"];
         assert_eq!(git_commit.kind, bcode_workflow::NodeKind::PluginBlock);
@@ -942,6 +962,7 @@ mod tests {
             "verification_failed",
             "verification_repeat",
             "git_prepare",
+            "commit_message",
             "git_compose",
             "commit_decision",
             "git_commit",
