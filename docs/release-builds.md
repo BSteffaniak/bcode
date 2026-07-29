@@ -5,6 +5,19 @@ Bcode release artifacts are produced by the repository `xtask` release automatio
 
 ## Local commands
 
+`build` defaults to the slim `app` feature set. `release` and `dev-release` default to the complete
+`distribution` feature set. Passing `--features` replaces that default composition; the required
+`app` feature is always added automatically. Feature lists are comma-separated and may be repeated.
+
+```sh
+cargo xtask build
+cargo xtask build --features web-renderer,static-bundled-shell-plugin
+cargo xtask dev-release --features web-renderer
+cargo xtask release --features static-bundled-plugins,bundled-ocr-tesseract
+```
+
+Canonical distribution commands:
+
 ```sh
 cargo xtask release --target aarch64-apple-darwin --version v0.1.0
 cargo xtask release --target x86_64-unknown-linux-gnu --version v0.1.0

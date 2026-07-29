@@ -4,7 +4,7 @@
 
 //! Bcode release automation tasks.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsStr;
 use std::fmt;
@@ -55,6 +55,7 @@ impl From<zip::result::ZipError> for XtaskError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CommandName {
+    Build,
     Release,
     VerifyRelease,
     DevSign,
@@ -86,12 +87,14 @@ struct Options {
     skip_notarize: bool,
     generated_write_mode: GeneratedWriteMode,
     prune_tesseract_policy: bool,
+    features: Option<Vec<String>>,
 }
 
 impl Options {
     fn parse() -> Result<Self> {
         let mut args = env::args().skip(1);
         let command = match args.next().as_deref() {
+            Some("build") => CommandName::Build,
             Some("release") => CommandName::Release,
             Some("verify-release") => CommandName::VerifyRelease,
             Some("dev-sign") => CommandName::DevSign,
@@ -118,6 +121,7 @@ impl Options {
         let mut skip_notarize = env_flag("BCODE_SKIP_NOTARIZE");
         let mut generated_write_mode = GeneratedWriteMode::Write;
         let mut prune_tesseract_policy = false;
+        let mut features = None;
 
         while let Some(arg) = args.next() {
             match arg.as_str() {
@@ -130,6 +134,12 @@ impl Options {
                 "--identity" => {
                     dev_identity = require_value(&mut args, "--identity")?;
                     allow_create_dev_identity = false;
+                }
+                "--features" => {
+                    let value = require_value(&mut args, "--features")?;
+                    features
+                        .get_or_insert_with(Vec::new)
+                        .extend(parse_features(&value)?);
                 }
                 "--skip-notarize" => skip_notarize = true,
                 "--check" => generated_write_mode = GeneratedWriteMode::Check,
@@ -151,6 +161,7 @@ impl Options {
             skip_notarize,
             generated_write_mode,
             prune_tesseract_policy,
+            features,
         })
     }
 
@@ -166,6 +177,7 @@ impl Options {
             skip_notarize: false,
             generated_write_mode: GeneratedWriteMode::Write,
             prune_tesseract_policy: false,
+            features: None,
         }
     }
 }
@@ -180,6 +192,7 @@ fn main() {
 fn run() -> Result<()> {
     let options = Options::parse()?;
     match options.command {
+        CommandName::Build => build(&options),
         CommandName::Release => release(&options),
         CommandName::VerifyRelease => verify_release(&options),
         CommandName::DevSign => dev_sign(&options),
@@ -1109,56 +1122,124 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn build_bcode_release(target: &str) -> Result<()> {
-    run_command(
-        Command::new("cargo")
-            .arg("build")
-            .arg("--release")
-            .arg("--package")
-            .arg(PACKAGE_NAME)
-            .arg("--bin")
-            .arg(BINARY_NAME)
-            .arg("--bin")
-            .arg(MERMAID_WORKER_BINARY_NAME)
-            .arg("--features")
-            .arg("distribution")
-            .arg("--target")
-            .arg(target),
-    )
+fn parse_features(value: &str) -> Result<Vec<String>> {
+    let features = value
+        .split(',')
+        .map(str::trim)
+        .filter(|feature| !feature.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    if features.is_empty() {
+        Err(format_error("--features requires at least one feature"))
+    } else {
+        Ok(features)
+    }
+}
+
+fn selected_features(options: &Options, default_distribution: bool) -> Vec<String> {
+    let mut features = options.features.clone().unwrap_or_else(|| {
+        vec![if default_distribution {
+            "distribution".to_owned()
+        } else {
+            "app".to_owned()
+        }]
+    });
+    features.push("app".to_owned());
+    features
+        .into_iter()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn features_enable_mermaid_worker(features: &[String]) -> bool {
+    features
+        .iter()
+        .any(|feature| matches!(feature.as_str(), "distribution" | "mermaid-renderer"))
+}
+
+fn features_enable_bundled_tesseract(features: &[String]) -> bool {
+    features.iter().any(|feature| {
+        feature == "distribution"
+            || feature == "bundled-ocr-tesseract"
+            || feature.starts_with("bundled-ocr-tesseract-")
+    })
+}
+
+fn build_bcode_release(target: &str, features: &[String]) -> Result<()> {
+    let mut command = Command::new("cargo");
+    command
+        .arg("build")
+        .arg("--release")
+        .arg("--package")
+        .arg(PACKAGE_NAME)
+        .arg("--bin")
+        .arg(BINARY_NAME);
+    if features_enable_mermaid_worker(features) {
+        command.arg("--bin").arg(MERMAID_WORKER_BINARY_NAME);
+    }
+    command
+        .arg("--no-default-features")
+        .arg("--features")
+        .arg(features.join(","))
+        .arg("--target")
+        .arg(target);
+    run_command(&mut command)
+}
+
+fn build(options: &Options) -> Result<()> {
+    let features = selected_features(options, false);
+    build_bcode_release(&options.target, &features)
 }
 
 fn release(options: &Options) -> Result<()> {
+    let features = selected_features(options, true);
+    let include_mermaid_worker = features_enable_mermaid_worker(&features);
+    let include_tesseract = features_enable_bundled_tesseract(&features);
     let target_kind = TargetKind::parse(&options.target)?;
-    build_bcode_release(&options.target)?;
+    build_bcode_release(&options.target, &features)?;
 
     let binary = built_binary(&options.target, target_kind);
-    let mermaid_worker = built_mermaid_worker(&options.target, target_kind);
     ensure_file(&binary)?;
-    ensure_file(&mermaid_worker)?;
+    let mermaid_worker =
+        include_mermaid_worker.then(|| built_mermaid_worker(&options.target, target_kind));
+    if let Some(worker) = &mermaid_worker {
+        ensure_file(worker)?;
+    }
     if target_kind == TargetKind::Macos {
         sign_macos_release_binary(&binary)?;
         verify_macos_signature(&binary)?;
-        sign_macos_release_binary(&mermaid_worker)?;
-        verify_macos_signature(&mermaid_worker)?;
+        if let Some(worker) = &mermaid_worker {
+            sign_macos_release_binary(worker)?;
+            verify_macos_signature(worker)?;
+        }
     } else if target_kind == TargetKind::Linux {
         strip_binary(&binary);
-        strip_binary(&mermaid_worker);
+        if let Some(worker) = &mermaid_worker {
+            strip_binary(worker);
+        }
     } else if target_kind == TargetKind::Windows {
         sign_windows_release_binary_if_configured(&binary)?;
-        sign_windows_release_binary_if_configured(&mermaid_worker)?;
+        if let Some(worker) = &mermaid_worker {
+            sign_windows_release_binary_if_configured(worker)?;
+        }
     }
 
     let staging_dir = staging_dir(options);
     recreate_dir(&staging_dir)?;
     let staged_binary = staging_dir.join(binary_file_name(target_kind));
     copy_release_binary(&binary, &staged_binary)?;
-    let staged_mermaid_worker = staging_dir.join(mermaid_worker_file_name(target_kind));
-    copy_release_binary(&mermaid_worker, &staged_mermaid_worker)?;
-    let runtime_source = latest_bundled_runtime_root(&options.target)?;
-    let runtime_destination = staging_dir.join("bcode-runtimes").join("tesseract");
-    recreate_dir(&runtime_destination)?;
-    copy_dir_recursive(&runtime_source, &runtime_destination)?;
-    write_runtime_manifest(&runtime_destination)?;
+    if let Some(worker) = &mermaid_worker {
+        let staged_worker = staging_dir.join(mermaid_worker_file_name(target_kind));
+        copy_release_binary(worker, &staged_worker)?;
+    }
+    if include_tesseract {
+        let runtime_source = latest_bundled_runtime_root(&options.target)?;
+        let runtime_destination = staging_dir.join("bcode-runtimes").join("tesseract");
+        recreate_dir(&runtime_destination)?;
+        copy_dir_recursive(&runtime_source, &runtime_destination)?;
+        write_runtime_manifest(&runtime_destination)?;
+    }
 
     let archive = archive_path(options, target_kind);
     if archive.exists() {
@@ -1176,26 +1257,43 @@ fn release(options: &Options) -> Result<()> {
 }
 
 fn verify_release(options: &Options) -> Result<()> {
+    let features = selected_features(options, true);
+    let include_mermaid_worker = features_enable_mermaid_worker(&features);
+    let include_tesseract = features_enable_bundled_tesseract(&features);
     let target_kind = TargetKind::parse(&options.target)?;
     let archive = archive_path(options, target_kind);
     ensure_file(&archive)?;
     ensure_file(&checksum_path(&archive))?;
     verify_checksum(&archive)?;
-    verify_archive_contents(&archive, target_kind)?;
+    verify_archive_contents(
+        &archive,
+        target_kind,
+        include_mermaid_worker,
+        include_tesseract,
+    )?;
 
     if target_kind == TargetKind::Macos {
         let binary = built_binary(&options.target, target_kind);
         ensure_file(&binary)?;
         verify_macos_signature(&binary)?;
-        let mermaid_worker = built_mermaid_worker(&options.target, target_kind);
-        ensure_file(&mermaid_worker)?;
-        verify_macos_signature(&mermaid_worker)?;
+        if include_mermaid_worker {
+            let mermaid_worker = built_mermaid_worker(&options.target, target_kind);
+            ensure_file(&mermaid_worker)?;
+            verify_macos_signature(&mermaid_worker)?;
+        }
     } else if target_kind == TargetKind::Windows && windows_signing_requested() {
         verify_windows_signature(&built_binary(&options.target, target_kind))?;
-        verify_windows_signature(&built_mermaid_worker(&options.target, target_kind))?;
+        if include_mermaid_worker {
+            verify_windows_signature(&built_mermaid_worker(&options.target, target_kind))?;
+        }
     }
     if options.target == host_target() {
-        smoke_test_release_archive(&archive, target_kind)?;
+        smoke_test_release_archive(
+            &archive,
+            target_kind,
+            include_mermaid_worker,
+            include_tesseract,
+        )?;
     } else {
         println!(
             "skipping extracted artifact execution for non-host target {} on {}",
@@ -1209,8 +1307,9 @@ fn verify_release(options: &Options) -> Result<()> {
 }
 
 fn dev_release(options: &Options) -> Result<()> {
+    let features = selected_features(options, true);
     let target_kind = TargetKind::parse(&options.target)?;
-    build_bcode_release(&options.target)?;
+    build_bcode_release(&options.target, &features)?;
     let binary = built_binary(&options.target, target_kind);
     ensure_file(&binary)?;
 
@@ -1979,9 +2078,19 @@ fn verify_checksum(archive: &Path) -> Result<()> {
     }
 }
 
-fn verify_archive_contents(archive: &Path, target_kind: TargetKind) -> Result<()> {
+fn verify_archive_contents(
+    archive: &Path,
+    target_kind: TargetKind,
+    include_mermaid_worker: bool,
+    include_tesseract: bool,
+) -> Result<()> {
     if target_kind == TargetKind::Linux {
-        return verify_tar_archive_contents(archive, target_kind);
+        return verify_tar_archive_contents(
+            archive,
+            target_kind,
+            include_mermaid_worker,
+            include_tesseract,
+        );
     }
     let mut zip = zip::ZipArchive::new(File::open(archive)?)?;
     let mut entries = std::collections::BTreeSet::new();
@@ -1991,19 +2100,41 @@ fn verify_archive_contents(archive: &Path, target_kind: TargetKind) -> Result<()
             entries.insert(entry.name().to_owned());
         }
     }
-    verify_required_archive_entries(&entries, archive, target_kind)
+    verify_required_archive_entries(
+        &entries,
+        archive,
+        target_kind,
+        include_mermaid_worker,
+        include_tesseract,
+    )
 }
 
-fn verify_tar_archive_contents(archive: &Path, target_kind: TargetKind) -> Result<()> {
+fn verify_tar_archive_contents(
+    archive: &Path,
+    target_kind: TargetKind,
+    include_mermaid_worker: bool,
+    include_tesseract: bool,
+) -> Result<()> {
     let listing = command_output(Command::new("tar").arg("-tzf").arg(archive))?;
     let entries = listing
         .lines()
         .map(|entry| entry.trim_start_matches("./").to_owned())
         .collect::<std::collections::BTreeSet<_>>();
-    verify_required_archive_entries(&entries, archive, target_kind)
+    verify_required_archive_entries(
+        &entries,
+        archive,
+        target_kind,
+        include_mermaid_worker,
+        include_tesseract,
+    )
 }
 
-fn smoke_test_release_archive(archive: &Path, target_kind: TargetKind) -> Result<()> {
+fn smoke_test_release_archive(
+    archive: &Path,
+    target_kind: TargetKind,
+    include_mermaid_worker: bool,
+    include_tesseract: bool,
+) -> Result<()> {
     let extraction = archive.with_extension(format!(
         "{}.verify",
         archive
@@ -2012,7 +2143,13 @@ fn smoke_test_release_archive(archive: &Path, target_kind: TargetKind) -> Result
             .unwrap_or("archive")
     ));
     recreate_dir(&extraction)?;
-    let result = smoke_test_release_archive_in(archive, target_kind, &extraction);
+    let result = smoke_test_release_archive_in(
+        archive,
+        target_kind,
+        &extraction,
+        include_mermaid_worker,
+        include_tesseract,
+    );
     let cleanup = fs::remove_dir_all(&extraction);
     match (result, cleanup) {
         (Err(error), _) => Err(error),
@@ -2025,6 +2162,8 @@ fn smoke_test_release_archive_in(
     archive: &Path,
     target_kind: TargetKind,
     extraction: &Path,
+    include_mermaid_worker: bool,
+    include_tesseract: bool,
 ) -> Result<()> {
     if target_kind == TargetKind::Linux {
         run_command(
@@ -2041,13 +2180,19 @@ fn smoke_test_release_archive_in(
     let binary = extraction.join(binary_file_name(target_kind));
     ensure_file(&binary)?;
     run_command(Command::new(&binary).arg("--version"))?;
-    smoke_test_mermaid_worker(&extraction.join(mermaid_worker_file_name(target_kind)))?;
-    smoke_test_extracted_tesseract(extraction)?;
+    if include_mermaid_worker {
+        smoke_test_mermaid_worker(&extraction.join(mermaid_worker_file_name(target_kind)))?;
+    }
+    if include_tesseract {
+        smoke_test_extracted_tesseract(extraction)?;
+    }
     if target_kind == TargetKind::Windows {
         smoke_test_windows_daemon(&binary, extraction)?;
         if windows_signing_requested() {
             verify_windows_signature(&binary)?;
-            verify_windows_signature(&extraction.join(mermaid_worker_file_name(target_kind)))?;
+            if include_mermaid_worker {
+                verify_windows_signature(&extraction.join(mermaid_worker_file_name(target_kind)))?;
+            }
         }
     }
     Ok(())
@@ -2211,21 +2356,29 @@ fn smoke_test_mermaid_worker(worker: &Path) -> Result<()> {
 }
 
 fn verify_required_archive_entries(
-    entries: &std::collections::BTreeSet<String>,
+    entries: &BTreeSet<String>,
     archive: &Path,
     target_kind: TargetKind,
+    include_mermaid_worker: bool,
+    include_tesseract: bool,
 ) -> Result<()> {
-    for name in [
-        binary_file_name(target_kind),
-        mermaid_worker_file_name(target_kind),
-        "bcode-runtimes/tesseract/manifest.json",
-    ] {
+    let mut required = vec![binary_file_name(target_kind)];
+    if include_mermaid_worker {
+        required.push(mermaid_worker_file_name(target_kind));
+    }
+    if include_tesseract {
+        required.push("bcode-runtimes/tesseract/manifest.json");
+    }
+    for name in required {
         if !entries.contains(name) {
             return Err(format_error(format!(
                 "release archive {} is missing required entry `{name}`",
                 archive.display()
             )));
         }
+    }
+    if !include_tesseract {
+        return Ok(());
     }
     let runtime_prefix = "bcode-runtimes/tesseract/";
     if !entries.iter().any(|name| {
@@ -2457,9 +2610,10 @@ fn print_help() {
     println!(
         "Bcode release tasks\n\n\
          Usage:\n\
-           cargo xtask release --target <triple> --version <version>\n\
-           cargo xtask verify-release --target <triple> --version <version>\n\
-           cargo xtask dev-release [--target <triple>] [--identity <name>]\n\
+           cargo xtask build [--target <triple>] [--features <feature,...>]\n\
+           cargo xtask release --target <triple> --version <version> [--features <feature,...>]\n\
+           cargo xtask verify-release --target <triple> --version <version> [--features <feature,...>]\n\
+           cargo xtask dev-release [--target <triple>] [--features <feature,...>] [--identity <name>]\n\
            cargo xtask dev-sign --target <triple> [--binary <path>] [--identity <name>]\n\
            cargo xtask update-tesseract-catalog\n\
            cargo xtask discover-tesseract-upstream\n\
@@ -2482,6 +2636,47 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_release_features_replace_distribution_and_imply_app() {
+        let mut options = Options::help();
+        options.features = Some(vec![
+            "web-renderer".to_owned(),
+            "static-bundled-shell-plugin".to_owned(),
+        ]);
+        assert_eq!(
+            selected_features(&options, true),
+            vec![
+                "app".to_owned(),
+                "static-bundled-shell-plugin".to_owned(),
+                "web-renderer".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn release_and_build_feature_defaults_are_distinct() {
+        let options = Options::help();
+        assert_eq!(selected_features(&options, false), vec!["app".to_owned()]);
+        assert_eq!(
+            selected_features(&options, true),
+            vec!["app".to_owned(), "distribution".to_owned()]
+        );
+    }
+
+    #[test]
+    fn optional_release_assets_follow_selected_features() {
+        assert!(!features_enable_mermaid_worker(&["app".to_owned()]));
+        assert!(features_enable_mermaid_worker(&[
+            "mermaid-renderer".to_owned()
+        ]));
+        assert!(!features_enable_bundled_tesseract(&[
+            "static-bundled-plugins".to_owned()
+        ]));
+        assert!(features_enable_bundled_tesseract(&[
+            "bundled-ocr-tesseract-v5-5-2".to_owned()
+        ]));
+    }
 
     #[test]
     fn release_targets_are_exact_and_canonical() {
@@ -2562,12 +2757,13 @@ mod tests {
         fs::write(runtime.join("tessdata/eng.traineddata"), b"language").expect("language data");
         let archive = temp.path().join("release.zip");
         create_zip_archive(&archive, &staging).expect("create archive");
-        verify_archive_contents(&archive, TargetKind::Windows).expect("complete archive");
+        verify_archive_contents(&archive, TargetKind::Windows, true, true)
+            .expect("complete archive");
 
         fs::remove_file(staging.join("bcode-mermaid-worker.exe")).expect("remove worker");
         let incomplete = temp.path().join("incomplete.zip");
         create_zip_archive(&incomplete, &staging).expect("create incomplete archive");
-        assert!(verify_archive_contents(&incomplete, TargetKind::Windows).is_err());
+        assert!(verify_archive_contents(&incomplete, TargetKind::Windows, true, true).is_err());
     }
 
     #[test]
@@ -2598,7 +2794,9 @@ mod tests {
             verify_required_archive_entries(
                 &entries,
                 Path::new("release.zip"),
-                TargetKind::Windows
+                TargetKind::Windows,
+                true,
+                true,
             )
             .is_err()
         );
@@ -2631,7 +2829,7 @@ mod tests {
         fs::write(staging.join("not-bcode"), b"invalid").expect("invalid artifact");
         create_zip_archive(&archive, &staging).expect("archive");
         let extraction = archive.with_extension("zip.verify");
-        assert!(smoke_test_release_archive(&archive, TargetKind::Windows).is_err());
+        assert!(smoke_test_release_archive(&archive, TargetKind::Windows, true, true).is_err());
         assert!(!extraction.exists());
     }
 
