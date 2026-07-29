@@ -215,10 +215,32 @@ impl ReasoningSupport {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct StableTranscriptAnchor {
-    item_id: bcode_session_view_models::TranscriptViewItemId,
-    row_in_item: usize,
+pub(crate) struct TranscriptFrameObservation {
+    pub semantic_items: Vec<(
+        bcode_session_view_models::TranscriptViewItemId,
+        bcode_session_view_models::ViewRevision,
+    )>,
+    pub terminal_items: Vec<(
+        super::transcript::TranscriptItemId,
+        Option<bcode_session_view_models::TranscriptViewItemId>,
+        Option<bcode_session_view_models::ViewRevision>,
+    )>,
+    pub terminal_rows: Vec<(
+        Option<bcode_session_view_models::TranscriptViewItemId>,
+        usize,
+    )>,
+    pub damage: TranscriptDocumentDamage,
+    pub viewport_top: usize,
+    pub scroll_mode: &'static str,
+    pub anchor: Option<StableTranscriptAnchor>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StableTranscriptAnchor {
+    pub item_id: bcode_session_view_models::TranscriptViewItemId,
+    pub row_in_item: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -356,6 +378,8 @@ pub struct BmuxApp {
     markdown_footnote_rows: BTreeMap<String, usize>,
     pending_markdown_focus: Option<String>,
     markdown_fragment_rows: BTreeMap<String, usize>,
+    #[cfg(test)]
+    last_transcript_damage: TranscriptDocumentDamage,
 }
 
 /// Daemon connection state used to describe startup readiness in the status chrome.
@@ -566,6 +590,8 @@ impl BmuxApp {
             markdown_footnote_rows: BTreeMap::new(),
             pending_markdown_focus: None,
             markdown_fragment_rows: BTreeMap::new(),
+            #[cfg(test)]
+            last_transcript_damage: TranscriptDocumentDamage::None,
         };
         app.absorb_history(history);
         app
@@ -794,6 +820,76 @@ impl BmuxApp {
         viewport_height: u16,
     ) -> usize {
         self.viewport.top_row(total_rows, viewport_height)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn frame_observation(&self) -> TranscriptFrameObservation {
+        let total_rows = self.transcript_layout.total_rows();
+        let viewport_top = self.viewport.top_row(total_rows, self.viewport.height());
+        let anchor = self
+            .transcript_layout
+            .line_at_row(viewport_top)
+            .and_then(|line| {
+                (line.source == VisibleTranscriptSource::Transcript)
+                    .then(|| {
+                        self.transcript
+                            .items()
+                            .get(line.entry_index)?
+                            .source_view_item_id()
+                            .cloned()
+                            .map(|item_id| StableTranscriptAnchor {
+                                item_id,
+                                row_in_item: line.row_in_entry,
+                            })
+                    })
+                    .flatten()
+            });
+        TranscriptFrameObservation {
+            semantic_items: self
+                .session_view
+                .snapshot()
+                .transcript
+                .items
+                .iter()
+                .map(|item| (item.id.clone(), item.revision))
+                .collect(),
+            terminal_items: self
+                .transcript
+                .items()
+                .iter()
+                .map(|item| {
+                    (
+                        item.id(),
+                        item.source_view_item_id().cloned(),
+                        item.source_view_item_revision(),
+                    )
+                })
+                .collect(),
+            terminal_rows: (0..total_rows)
+                .filter_map(|row| self.transcript_layout.line_at_row(row))
+                .map(|line| {
+                    let item_id = (line.source == VisibleTranscriptSource::Transcript)
+                        .then(|| {
+                            self.transcript
+                                .items()
+                                .get(line.entry_index)?
+                                .source_view_item_id()
+                                .cloned()
+                        })
+                        .flatten();
+                    (item_id, line.row_in_entry)
+                })
+                .collect(),
+            damage: self.last_transcript_damage.clone(),
+            viewport_top,
+            scroll_mode: match self.scroll_mode {
+                TranscriptScrollMode::BottomFollow => "bottom_follow",
+                TranscriptScrollMode::TransitionToEntry { .. } => "transition_to_entry",
+                TranscriptScrollMode::AnchoredToEntry { .. } => "anchored_to_entry",
+                TranscriptScrollMode::ManualDetached => "manual_detached",
+            },
+            anchor,
+        }
     }
 
     fn preserve_transcript_anchor_for_disclosure(&mut self) {
@@ -3261,6 +3357,10 @@ impl BmuxApp {
         if let TranscriptDocumentDamage::Items(ids) = &damage {
             self.transcript_dirty_items
                 .extend(ids.iter().filter_map(|id| self.transcript.source_index(id)));
+        }
+        #[cfg(test)]
+        {
+            self.last_transcript_damage.clone_from(&damage);
         }
         damage
     }

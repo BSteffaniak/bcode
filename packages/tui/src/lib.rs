@@ -20,6 +20,8 @@ pub(crate) mod effects;
 pub mod eval_launcher;
 pub(crate) mod exit_state;
 pub(crate) mod filtered_list;
+#[cfg(test)]
+mod frame_sequence_harness;
 pub(crate) mod helpers;
 pub(crate) mod history_flow;
 pub(crate) mod indexed_transcript_layout;
