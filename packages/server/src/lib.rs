@@ -34950,6 +34950,82 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn prompt_admission_and_final_detach_keep_queued_command_owned() {
+        let workspace = tempfile::tempdir().expect("admission race workspace");
+        let sessions =
+            SessionManager::persistent(workspace.path().join("sessions")).expect("sessions");
+        let session = sessions
+            .create_session(Some("admission race".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let client_id = ClientId::new();
+        sessions
+            .attach_session_recent(session.id, client_id, 8)
+            .await
+            .expect("attach");
+        let state = Arc::new(test_server_state(sessions.clone()));
+        state.attach_client_session(client_id, session.id).await;
+        let (followup_commands, mut followup_receiver) = mpsc::channel(8);
+        let (steering_commands, _steering_receiver) = mpsc::channel(8);
+        let (cancel_commands, _cancel_receiver) = mpsc::channel(1);
+        let handle = SessionRuntimeHandle {
+            followup_commands,
+            steering_commands,
+            cancel_commands,
+            queued_followups: Arc::new(AtomicUsize::new(0)),
+            queued_steering: Arc::new(AtomicUsize::new(0)),
+            phase: Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+            current_turn: Arc::new(Mutex::new(None)),
+        };
+        state
+            .session_runtimes
+            .lock()
+            .await
+            .insert(session.id, handle.clone());
+        let admission_lock = turn_admission_lock(&state, session.id).await;
+        let held_admission = admission_lock.lock().await;
+        let admission_state = Arc::clone(&state);
+        let admission = tokio::spawn(async move {
+            enqueue_user_message_command(
+                &admission_state,
+                session.id,
+                client_id,
+                None,
+                "queued before detach".to_owned(),
+                bcode_ipc::PromptPlacement::FollowUp,
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        let detach_state = Arc::clone(&state);
+        let detach =
+            tokio::spawn(async move { detach_state.detach_client_session(client_id).await });
+        drop(held_admission);
+        admission
+            .await
+            .expect("admission task")
+            .expect("admission should queue");
+        detach
+            .await
+            .expect("detach task")
+            .expect("detach should complete");
+        assert!(sessions.session_is_owned(session.id).await);
+        assert_eq!(handle.queued_followups.load(Ordering::Acquire), 1);
+        let queued = followup_receiver.try_recv().expect("queued command");
+        assert!(matches!(queued, FollowupCommand::ExecuteTurn { .. }));
+        drop(queued);
+        handle.queued_followups.fetch_sub(1, Ordering::AcqRel);
+        state.release_session_resources_if_idle(session.id).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sessions.session_is_owned(session.id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping queued runtime should release guards");
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)]
     async fn queued_and_steered_message_admissions_cover_active_runtime_windows() {
         let workspace = tempfile::tempdir().expect("message admission workspace");
