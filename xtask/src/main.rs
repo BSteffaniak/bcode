@@ -1190,7 +1190,7 @@ fn verify_release(options: &Options) -> Result<()> {
         let mermaid_worker = built_mermaid_worker(&options.target, target_kind);
         ensure_file(&mermaid_worker)?;
         verify_macos_signature(&mermaid_worker)?;
-    } else if target_kind == TargetKind::Windows && windows_signing_configured() {
+    } else if target_kind == TargetKind::Windows && windows_signing_requested() {
         verify_windows_signature(&built_binary(&options.target, target_kind))?;
         verify_windows_signature(&built_mermaid_worker(&options.target, target_kind))?;
     }
@@ -1686,30 +1686,32 @@ fn sign_macos_dev_binary(binary: &Path, identity: &str, keychain: Option<&Path>)
     run_command(&mut command)
 }
 
-fn windows_signing_configured() -> bool {
-    windows_signing_configured_from(
-        env::var_os("WINDOWS_CODESIGN_CERTIFICATE_PFX").is_some(),
-        env::var_os("WINDOWS_CODESIGN_CERTIFICATE_PASSWORD").is_some(),
+fn windows_signing_requested() -> bool {
+    windows_signing_requested_from(
+        env::var_os("WINDOWS_CODESIGN_CERTIFICATE_PFX_PATH").is_some_and(|value| !value.is_empty()),
     )
 }
 
-const fn windows_signing_configured_from(certificate: bool, password: bool) -> bool {
-    certificate && password
+const fn windows_signing_requested_from(certificate_path: bool) -> bool {
+    certificate_path
 }
 
 fn sign_windows_release_binary_if_configured(binary: &Path) -> Result<()> {
-    let Some(certificate) = env::var_os("WINDOWS_CODESIGN_CERTIFICATE_PFX") else {
+    let Some(certificate) = env::var_os("WINDOWS_CODESIGN_CERTIFICATE_PFX_PATH") else {
         println!(
-            "WINDOWS_CODESIGN_CERTIFICATE_PFX not set; leaving {} unsigned",
+            "WINDOWS_CODESIGN_CERTIFICATE_PFX_PATH not set; leaving {} unsigned",
             binary.display()
         );
         return Ok(());
     };
-    let password = env::var("WINDOWS_CODESIGN_CERTIFICATE_PASSWORD").map_err(|_| {
-        format_error(
-            "WINDOWS_CODESIGN_CERTIFICATE_PASSWORD is required when Windows signing is configured",
-        )
-    })?;
+    let password = env::var("WINDOWS_CODESIGN_CERTIFICATE_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format_error(
+                "WINDOWS_CODESIGN_CERTIFICATE_PASSWORD is required when Windows signing is configured",
+            )
+        })?;
     run_sensitive_command(
         Command::new("signtool")
             .arg("sign")
@@ -1860,12 +1862,46 @@ fn create_zip_archive(archive: &Path, staging_dir: &Path) -> Result<()> {
 }
 
 fn archive_source_files(root: &Path) -> Result<Vec<PathBuf>> {
+    let canonical_root = root.canonicalize().map_err(|error| {
+        format_error(format!(
+            "failed to canonicalize release staging root {}: {error}",
+            root.display()
+        ))
+    })?;
     let mut files = Vec::new();
-    for entry in fs::read_dir(root)? {
+    collect_archive_source_files(root, &canonical_root, &mut files)?;
+    Ok(files)
+}
+
+fn collect_archive_source_files(
+    directory: &Path,
+    canonical_root: &Path,
+    files: &mut Vec<PathBuf>,
+) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
         let path = entry?.path();
-        if path.is_dir() {
-            files.extend(archive_source_files(&path)?);
-        } else if path.is_file() {
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(format_error(format!(
+                "release staging contains symbolic link {}",
+                path.display()
+            )));
+        }
+        let canonical = path.canonicalize().map_err(|error| {
+            format_error(format!(
+                "failed to canonicalize release staging entry {}: {error}",
+                path.display()
+            ))
+        })?;
+        if !canonical.starts_with(canonical_root) {
+            return Err(format_error(format!(
+                "release staging entry escapes its authorized root: {}",
+                path.display()
+            )));
+        }
+        if metadata.is_dir() {
+            collect_archive_source_files(&path, canonical_root, files)?;
+        } else if metadata.is_file() {
             files.push(path);
         } else {
             return Err(format_error(format!(
@@ -1874,7 +1910,7 @@ fn archive_source_files(root: &Path) -> Result<Vec<PathBuf>> {
             )));
         }
     }
-    Ok(files)
+    Ok(())
 }
 
 fn zip_entry_name(path: &Path) -> Result<String> {
@@ -2009,7 +2045,7 @@ fn smoke_test_release_archive_in(
     smoke_test_extracted_tesseract(extraction)?;
     if target_kind == TargetKind::Windows {
         smoke_test_windows_daemon(&binary, extraction)?;
-        if windows_signing_configured() {
+        if windows_signing_requested() {
             verify_windows_signature(&binary)?;
             verify_windows_signature(&extraction.join(mermaid_worker_file_name(target_kind)))?;
         }
@@ -2039,14 +2075,29 @@ fn smoke_test_windows_shell_contract() -> Result<()> {
         .args(["/C", "echo bcode-windows-shell-smoke"])
         .output()?;
     let stdout = String::from_utf8_lossy(&output.stdout);
-    if output.status.success() && stdout.contains("bcode-windows-shell-smoke") {
-        Ok(())
-    } else {
-        Err(format_error(format!(
+    if !output.status.success() || !stdout.contains("bcode-windows-shell-smoke") {
+        return Err(format_error(format!(
             "Windows shell smoke test failed with {}: {}",
             output.status,
             String::from_utf8_lossy(&output.stderr)
-        )))
+        )));
+    }
+    smoke_test_windows_child_termination()
+}
+
+fn smoke_test_windows_child_termination() -> Result<()> {
+    let mut child = Command::new("cmd")
+        .args(["/C", "ping -n 30 127.0.0.1 >NUL"])
+        .spawn()?;
+    std::thread::sleep(Duration::from_millis(100));
+    child.kill()?;
+    let status = child.wait()?;
+    if status.success() {
+        Err(format_error(
+            "Windows shell cancellation smoke process unexpectedly succeeded",
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -2467,11 +2518,9 @@ mod tests {
     }
 
     #[test]
-    fn windows_signing_requires_both_certificate_and_password() {
-        assert!(!windows_signing_configured_from(false, false));
-        assert!(!windows_signing_configured_from(true, false));
-        assert!(!windows_signing_configured_from(false, true));
-        assert!(windows_signing_configured_from(true, true));
+    fn windows_signing_requires_a_certificate_path() {
+        assert!(!windows_signing_requested_from(false));
+        assert!(windows_signing_requested_from(true));
     }
 
     #[test]
@@ -2508,6 +2557,21 @@ mod tests {
         let incomplete = temp.path().join("incomplete.zip");
         create_zip_archive(&incomplete, &staging).expect("create incomplete archive");
         assert!(verify_archive_contents(&incomplete, TargetKind::Windows).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_creation_rejects_staging_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("temp dir");
+        let staging = temp.path().join("staging");
+        fs::create_dir_all(&staging).expect("staging");
+        let outside = temp.path().join("outside.exe");
+        fs::write(&outside, b"outside").expect("outside file");
+        symlink(&outside, staging.join("bcode.exe")).expect("symlink");
+        let archive = temp.path().join("release.zip");
+        assert!(create_zip_archive(&archive, &staging).is_err());
     }
 
     #[test]

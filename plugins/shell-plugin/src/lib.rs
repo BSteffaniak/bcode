@@ -3054,6 +3054,46 @@ mod tests {
         assert!(response.output.contains("\"cancelled\":true"));
         assert!(!response.output.contains("\"timed_out\":true"));
     }
+    #[cfg(windows)]
+    #[test]
+    fn cancellation_terminates_windows_terminal_child_promptly() {
+        let environment = isolated_config_environment("windows-cancellation");
+        let cancellation = bcode_plugin_sdk::ServiceCancellation::default();
+        let cancel = cancellation.clone();
+        let cancel_thread = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            cancel.cancel();
+        });
+        let started = Instant::now();
+        let response = run_terminal_shell_command_with_environment(
+            ServiceEventEmitter::default(),
+            &cancellation,
+            bcode_plugin_sdk::TransientProgressLimits::default(),
+            "test-windows-cancellation",
+            &ShellRunArguments {
+                command: "ping -n 6 127.0.0.1 >NUL".to_string(),
+                cwd: None,
+                timeout_ms: Some(5_000),
+                columns: None,
+                rows: None,
+                format_commands: None,
+            },
+            json!({}),
+            TerminalRunPaths {
+                session_cwd: None,
+                artifact_dir: None,
+                input_bridge: None,
+            },
+            &environment,
+        );
+        cancel_thread.join().expect("cancellation thread");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(response.is_error);
+        assert!(response.output.contains("\"cancelled\":true"));
+        assert!(!response.output.contains("\"timed_out\":true"));
+    }
+
     #[test]
     fn limit_output_bytes_truncates_at_utf8_boundary() {
         let output = limit_output_bytes("abcé".as_bytes(), 4);

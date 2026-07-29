@@ -132,8 +132,10 @@ Linux and Windows jobs do not perform platform binary signing in v1. They build,
 checksum, and verify artifacts. Windows provider secrets use current-user DPAPI, and Windows shell
 tool commands currently execute with `cmd.exe /C`; commands written for POSIX shells may need to be
 adapted. Public Windows artifacts are unsigned when no signing certificate is configured. For signed public
-releases, configure `WINDOWS_CODESIGN_CERTIFICATE_PFX` and
-`WINDOWS_CODESIGN_CERTIFICATE_PASSWORD`; release automation signs and RFC 3161 timestamps both
+releases, configure `WINDOWS_CODESIGN_CERTIFICATE_PFX_BASE64` and
+`WINDOWS_CODESIGN_CERTIFICATE_PASSWORD` as GitHub Actions secrets. The workflow decodes the PFX to
+the runner's temporary directory and passes only its path to xtask through
+`WINDOWS_CODESIGN_CERTIFICATE_PFX_PATH`; release automation signs and RFC 3161 timestamps both
 executables with SHA-256 before packaging, verifies both signatures before packaging, and verifies
 them again after extraction. Store the PFX as an Actions secret encoded or supplied in the format
 expected by the runner secret policy; rotate or revoke it through the certificate authority and
