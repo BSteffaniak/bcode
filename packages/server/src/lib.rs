@@ -35159,6 +35159,124 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn explicit_ownership_release_reports_every_blocker_category() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("persistent sessions");
+        let session = sessions
+            .create_session(
+                Some("all release blockers".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let client_id = ClientId::new();
+        sessions
+            .attach_session_recent(session.id, client_id, 8)
+            .await
+            .expect("attach");
+        let state = test_server_state(sessions.clone());
+        state.attach_client_session(client_id, session.id).await;
+        state.active_session_namespaces.lock().await.insert(
+            session.id,
+            ActiveSessionNamespace {
+                namespace: "test-namespace".to_owned(),
+                pending_attaches: 1,
+            },
+        );
+        let (followup_commands, _followup_receiver) = mpsc::channel(1);
+        let (steering_commands, _steering_receiver) = mpsc::channel(1);
+        let (cancel_commands, _cancel_receiver) = mpsc::channel(1);
+        state.session_runtimes.lock().await.insert(
+            session.id,
+            SessionRuntimeHandle {
+                followup_commands,
+                steering_commands,
+                cancel_commands,
+                queued_followups: Arc::new(AtomicUsize::new(1)),
+                queued_steering: Arc::new(AtomicUsize::new(0)),
+                phase: Arc::new(Mutex::new(SessionRuntimePhase::ProviderActive)),
+                current_turn: Arc::new(Mutex::new(None)),
+            },
+        );
+        register_runtime_work(
+            &state,
+            session.id,
+            RuntimeWorkSpec::new(
+                WorkId::new("release-blocker-work"),
+                RuntimeWorkKind::PluginInvocation,
+                "release blocker".to_owned(),
+                CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+            ),
+        )
+        .await;
+        let plugin_ownership = sessions
+            .acquire_session_ownership(
+                session.id,
+                bcode_session::SessionOwnershipKind::PluginInvocation,
+            )
+            .await
+            .expect("plugin ownership");
+        let _plugin_registration = ActivePluginInvocationRegistration::register(
+            Arc::clone(&state.active_plugin_invocations),
+            Arc::clone(&state.active_artifacts),
+            session.id,
+            "release-blocker-plugin",
+            ActivePluginInvocation {
+                producer_plugin_id: "test.plugin".to_owned(),
+                inputs: mpsc::channel(1).0,
+            },
+            Some(plugin_ownership),
+        )
+        .expect("plugin registration");
+        let migration_blocker = Arc::new(tokio::sync::Notify::new());
+        let task_blocker = Arc::clone(&migration_blocker);
+        let _migration = state
+            .session_migrations
+            .operations()
+            .start_or_join(
+                bcode_session_models::SessionOpenOperationSnapshot {
+                    operation_id: bcode_session_models::SessionOpenOperationId::new(),
+                    revision: 1,
+                    session_id: session.id,
+                    source_writer_epoch: Some(1),
+                    target_writer_epoch: 2,
+                    progress: bcode_session_models::SessionMigrationProgress {
+                        stage: bcode_session_models::SessionMigrationStage::WaitingForOwnership,
+                        completed_units: None,
+                        total_units: None,
+                        unit: None,
+                        message: "blocked for test".to_owned(),
+                    },
+                    outcome: None,
+                    backup_path: None,
+                },
+                move |_| async move {
+                    task_blocker.notified().await;
+                    bcode_session_models::SessionOpenTerminalOutcome::Ready
+                },
+            )
+            .await;
+
+        assert_eq!(
+            explicit_session_ownership_release_outcome(&state, session.id)
+                .await
+                .expect("blocked release"),
+            bcode_ipc::SessionOwnershipReleaseOutcome::Blocked {
+                blockers: vec![
+                    bcode_ipc::SessionOwnershipBlocker::AttachedClient,
+                    bcode_ipc::SessionOwnershipBlocker::PendingAttach,
+                    bcode_ipc::SessionOwnershipBlocker::QueuedCommand,
+                    bcode_ipc::SessionOwnershipBlocker::ActiveRuntime,
+                    bcode_ipc::SessionOwnershipBlocker::RuntimeWork,
+                    bcode_ipc::SessionOwnershipBlocker::PluginInvocation,
+                    bcode_ipc::SessionOwnershipBlocker::Migration,
+                ],
+            }
+        );
+        migration_blocker.notify_one();
+    }
+
+    #[tokio::test]
     async fn explicit_ownership_release_reports_attached_client_without_detaching() {
         let root = tempfile::tempdir().expect("session root");
         let sessions = SessionManager::persistent(root.path()).expect("persistent sessions");

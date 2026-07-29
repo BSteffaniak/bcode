@@ -6910,6 +6910,40 @@ async fn session_owner_record(
     }
 }
 
+fn session_ownership_blocker_label(blocker: bcode_ipc::SessionOwnershipBlocker) -> &'static str {
+    match blocker {
+        bcode_ipc::SessionOwnershipBlocker::AttachedClient => "attached client",
+        bcode_ipc::SessionOwnershipBlocker::PendingAttach => "pending attach",
+        bcode_ipc::SessionOwnershipBlocker::QueuedCommand => "queued command",
+        bcode_ipc::SessionOwnershipBlocker::ActiveRuntime => "active runtime",
+        bcode_ipc::SessionOwnershipBlocker::RuntimeWork => "runtime work",
+        bcode_ipc::SessionOwnershipBlocker::PluginInvocation => "plugin invocation",
+        bcode_ipc::SessionOwnershipBlocker::Migration => "migration",
+    }
+}
+
+fn session_ownership_release_message(
+    instance_id: &str,
+    outcome: bcode_ipc::SessionOwnershipReleaseOutcome,
+) -> Result<String, CliError> {
+    match outcome {
+        bcode_ipc::SessionOwnershipReleaseOutcome::Released
+        | bcode_ipc::SessionOwnershipReleaseOutcome::AlreadyUnowned => Ok(format!(
+            "released session ownership from daemon {instance_id}"
+        )),
+        bcode_ipc::SessionOwnershipReleaseOutcome::Blocked { blockers } => {
+            let blockers = blockers
+                .into_iter()
+                .map(session_ownership_blocker_label)
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(CliError::InvalidArguments(format!(
+                "daemon {instance_id} refused ownership release; blockers: {blockers}"
+            )))
+        }
+    }
+}
+
 async fn release_session_owner(session_id: SessionId) -> Result<(), CliError> {
     let record = session_owner_record(session_id).await?;
     let endpoint = record.endpoint.to_ipc_endpoint().ok_or_else(|| {
@@ -6920,27 +6954,12 @@ async fn release_session_owner(session_id: SessionId) -> Result<(), CliError> {
     })?;
     let client =
         BcodeClient::new(endpoint).with_daemon_availability(DaemonAvailability::RequireRunning);
-    match client.release_session_ownership(session_id).await? {
-        bcode_ipc::SessionOwnershipReleaseOutcome::Released
-        | bcode_ipc::SessionOwnershipReleaseOutcome::AlreadyUnowned => {
-            println!(
-                "released session ownership from daemon {}",
-                record.instance_id
-            );
-            Ok(())
-        }
-        bcode_ipc::SessionOwnershipReleaseOutcome::Blocked { blockers } => {
-            let blockers = blockers
-                .into_iter()
-                .map(|blocker| format!("{blocker:?}").to_lowercase())
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(CliError::InvalidArguments(format!(
-                "daemon {} refused ownership release; blockers: {blockers}",
-                record.instance_id
-            )))
-        }
-    }
+    let message = session_ownership_release_message(
+        &record.instance_id,
+        client.release_session_ownership(session_id).await?,
+    )?;
+    println!("{message}");
+    Ok(())
 }
 
 async fn stop_session_owner(session_id: SessionId, force: bool) -> Result<(), CliError> {
@@ -9466,6 +9485,56 @@ mod web_command_tests {
                 ..matching
             }
         ));
+    }
+
+    #[test]
+    fn release_owner_command_parses_session_id() {
+        let session_id = SessionId::new();
+        let cli =
+            Cli::try_parse_from(["bcode", "session", "release-owner", &session_id.to_string()])
+                .expect("release-owner command should parse");
+        let Some(Commands::Session {
+            command: SessionCommand::ReleaseOwner { session_id: parsed },
+        }) = cli.command
+        else {
+            panic!("expected release-owner command");
+        };
+
+        assert_eq!(parsed, session_id);
+    }
+
+    #[test]
+    fn release_owner_messages_cover_success_and_all_blockers() {
+        for outcome in [
+            bcode_ipc::SessionOwnershipReleaseOutcome::Released,
+            bcode_ipc::SessionOwnershipReleaseOutcome::AlreadyUnowned,
+        ] {
+            assert_eq!(
+                session_ownership_release_message("daemon-1", outcome)
+                    .expect("successful release message"),
+                "released session ownership from daemon daemon-1"
+            );
+        }
+
+        let error = session_ownership_release_message(
+            "daemon-1",
+            bcode_ipc::SessionOwnershipReleaseOutcome::Blocked {
+                blockers: vec![
+                    bcode_ipc::SessionOwnershipBlocker::AttachedClient,
+                    bcode_ipc::SessionOwnershipBlocker::PendingAttach,
+                    bcode_ipc::SessionOwnershipBlocker::QueuedCommand,
+                    bcode_ipc::SessionOwnershipBlocker::ActiveRuntime,
+                    bcode_ipc::SessionOwnershipBlocker::RuntimeWork,
+                    bcode_ipc::SessionOwnershipBlocker::PluginInvocation,
+                    bcode_ipc::SessionOwnershipBlocker::Migration,
+                ],
+            },
+        )
+        .expect_err("blocked release should be an error");
+        assert_eq!(
+            error.to_string(),
+            "invalid arguments: daemon daemon-1 refused ownership release; blockers: attached client, pending attach, queued command, active runtime, runtime work, plugin invocation, migration"
+        );
     }
 
     #[cfg(not(feature = "web-renderer"))]
