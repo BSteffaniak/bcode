@@ -236,10 +236,11 @@ impl SessionViewTerminalAdapter {
         target: &mut TranscriptDocument,
     ) {
         let source_items = source.items.iter();
-        let source_ids = source_items
+        let ordered_source_ids = source_items
             .clone()
             .map(|item| item.id.clone())
-            .collect::<BTreeSet<_>>();
+            .collect::<Vec<_>>();
+        let source_ids = ordered_source_ids.iter().cloned().collect::<BTreeSet<_>>();
         target.retain(|item| {
             item.source_view_item_id()
                 .is_none_or(|id| source_ids.contains(id))
@@ -254,6 +255,7 @@ impl SessionViewTerminalAdapter {
                 self.item_revisions.insert(item.id.clone(), item.revision);
             }
         }
+        target.reorder_shared_items(&ordered_source_ids);
         self.document_revision = Some(source.revision);
     }
 }
@@ -2679,13 +2681,11 @@ impl BmuxApp {
                 );
             }
             SessionEventKind::AssistantDelta { text } => {
-                self.apply_session_view_terminal_adapter();
                 self.add_streaming_delta(text, application);
                 self.maybe_request_assistant_stream_anchor(should_anchor);
             }
             SessionEventKind::AssistantMessage { .. }
             | SessionEventKind::AssistantResponseSegment { .. } => {
-                self.apply_session_view_terminal_adapter();
                 if application.live_activity()
                     && matches!(self.activity, ActivityState::Streaming { .. })
                 {
@@ -2798,13 +2798,11 @@ impl BmuxApp {
                 self.status =
                     format!("loaded skill context: {skill_id} ({bytes_loaded} bytes{suffix})");
             }
-            SessionEventKind::AssistantReasoningMessage { .. } => {
-                self.apply_session_view_terminal_adapter();
+            SessionEventKind::AssistantReasoningMessage { .. }
                 if application.live_activity()
-                    && matches!(self.activity, ActivityState::Streaming { .. })
-                {
-                    self.set_activity(ActivityState::FinalizingModelTurn);
-                }
+                    && matches!(self.activity, ActivityState::Streaming { .. }) =>
+            {
+                self.set_activity(ActivityState::FinalizingModelTurn);
             }
             SessionEventKind::AgentChanged { .. } => {
                 self.apply_shared_agent_changed();
@@ -3142,9 +3140,7 @@ impl BmuxApp {
                 )
                 .with_event_metadata(sequence, timestamp_ms),
             );
-            return;
         }
-        self.apply_session_view_terminal_adapter();
     }
 
     fn apply_session_view_terminal_adapter(&mut self) {

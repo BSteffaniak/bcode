@@ -81,6 +81,38 @@ impl TranscriptDocument {
         self.items.len().saturating_sub(1)
     }
 
+    /// Reorder shared items to canonical source order while preserving local-only items.
+    pub fn reorder_shared_items(
+        &mut self,
+        ordered_source_ids: &[bcode_session_view_models::TranscriptViewItemId],
+    ) {
+        let positions = ordered_source_ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (id.clone(), index))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let before = self
+            .items
+            .iter()
+            .filter_map(TranscriptItem::source_view_item_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.items.sort_by_key(|item| {
+            item.source_view_item_id()
+                .and_then(|id| positions.get(id).copied())
+                .unwrap_or(usize::MAX)
+        });
+        let after = self
+            .items
+            .iter()
+            .filter_map(TranscriptItem::source_view_item_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        if before != after {
+            self.bump_revision();
+        }
+    }
+
     /// Finish streaming text for a role and bump the collection revision.
     #[cfg(test)]
     pub fn finish_streaming_item(&mut self, role: &'static str, text: &str) {
