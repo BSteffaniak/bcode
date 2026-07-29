@@ -472,7 +472,7 @@ async fn run_chat_loop<W: Write>(
                 let event_invalidation = if matches!(event, Event::Resize(_)) {
                     super::invalidation::UiInvalidation::Full
                 } else {
-                    super::invalidation::UiInvalidation::Layout
+                    super::invalidation::UiInvalidation::Structural
                 };
                 let mut context = ChatEventContext {
                     services: TuiServices {

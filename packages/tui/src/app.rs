@@ -2908,7 +2908,7 @@ impl BmuxApp {
                 invalidation.merge(UiInvalidation::Paint)
             } else if is_transcript_scroll_animation_invalidation(key) {
                 if self.handle_transcript_scroll_animation(now) {
-                    invalidation.merge(UiInvalidation::Layout)
+                    invalidation.merge(UiInvalidation::Structural)
                 } else {
                     invalidation
                 }
@@ -2926,7 +2926,7 @@ impl BmuxApp {
             } else if let Some(invocation_id) = tool_elapsed_invalidation_invocation_id(key) {
                 self.elapsed_layout_revision = self.elapsed_layout_revision.saturating_add(1);
                 self.elapsed_dirty_visuals.insert(invocation_id.to_owned());
-                invalidation.merge(UiInvalidation::Layout)
+                invalidation.merge(UiInvalidation::Items)
             } else {
                 invalidation
             }
@@ -3284,7 +3284,7 @@ impl BmuxApp {
         }
     }
 
-    fn push_tool_request(
+    fn apply_tool_request_side_effects(
         &mut self,
         _event_metadata: (u64, u64),
         tool_call_id: &str,
@@ -4601,7 +4601,7 @@ mod tests {
             Instant::now(),
         );
 
-        assert_eq!(invalidation, UiInvalidation::Layout);
+        assert_eq!(invalidation, UiInvalidation::Structural);
         assert_eq!(app.elapsed_layout_revision, before.saturating_add(1));
         assert_eq!(
             app.drain_elapsed_dirty_visuals(),
@@ -4695,6 +4695,26 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn compatible_shared_replacement_preserves_terminal_identity() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let live = |text: &str| bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::AssistantTextDelta {
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                text: text.to_owned(),
+            },
+        };
+        app.absorb_session_live_event(&live("first"));
+        let render_id = app.transcript()[0].id();
+        app.absorb_session_live_event(&live(" second"));
+        assert_eq!(app.transcript()[0].id(), render_id);
+        assert_eq!(app.transcript()[0].text(), "first second");
     }
 
     #[test]

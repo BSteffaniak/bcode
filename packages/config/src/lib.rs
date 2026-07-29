@@ -1866,6 +1866,10 @@ const fn default_worktree_setup_enabled() -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "tui")]
 pub struct TuiConfig {
+    /// Render scheduling configuration.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub render: TuiRenderConfig,
     /// Scoped keybindings keyed by key stroke. Values are action IDs.
     #[config_doc(nested)]
     #[serde(default)]
@@ -1890,6 +1894,37 @@ pub struct TuiConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub theme: TuiThemeConfig,
+}
+
+/// Terminal render scheduling configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "render")]
+pub struct TuiRenderConfig {
+    /// Maximum terminal draws per second. Zero disables cadence limiting.
+    #[serde(default = "default_tui_render_max_fps")]
+    pub max_fps: u16,
+}
+
+impl TuiRenderConfig {
+    /// Return the frame interval, or `None` when cadence limiting is disabled.
+    #[must_use]
+    pub fn frame_interval(self) -> Option<std::time::Duration> {
+        (self.max_fps != 0).then(|| {
+            std::time::Duration::from_secs_f64(1.0 / f64::from(self.max_fps.clamp(1, 240)))
+        })
+    }
+}
+
+impl Default for TuiRenderConfig {
+    fn default() -> Self {
+        Self {
+            max_fps: default_tui_render_max_fps(),
+        }
+    }
+}
+
+const fn default_tui_render_max_fps() -> u16 {
+    60
 }
 
 /// Terminal diff viewer rendering configuration.
@@ -6000,7 +6035,7 @@ mod tests {
         BcodeConfig, CompactionBackend, CompactionMode, ConfigDocSchema, ConfigEnvironmentSnapshot,
         ConfigError, ConfigLoadOverrides, ContextStrategyMode, FieldDoc, InvariantGuidanceMode,
         InvariantSelectorTimeoutPolicy, InvariantsConfig, NestedFieldDoc, TuiAccentTransitionCurve,
-        TuiMouseConfig, default_config_paths_from, default_permissions_state_path,
+        TuiMouseConfig, TuiRenderConfig, default_config_paths_from, default_permissions_state_path,
         load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
         merge_config_values, plugin_selection_with_default_plugin_ids,
         upsert_agent_permission_rule,
@@ -6425,6 +6460,24 @@ mod tests {
                 "unexpected default for {key}"
             );
         }
+    }
+
+    #[test]
+    fn tui_render_config_defaults_bounds_zero_and_round_trips() {
+        let default = TuiRenderConfig::default();
+        assert_eq!(default.max_fps, 60);
+        assert_eq!(
+            default.frame_interval(),
+            Some(std::time::Duration::from_secs_f64(1.0 / 60.0))
+        );
+        assert_eq!(TuiRenderConfig { max_fps: 0 }.frame_interval(), None);
+        assert_eq!(
+            TuiRenderConfig { max_fps: 500 }.frame_interval(),
+            Some(std::time::Duration::from_secs_f64(1.0 / 240.0))
+        );
+        let encoded = toml::to_string(&default).expect("render config serializes");
+        let decoded: TuiRenderConfig = toml::from_str(&encoded).expect("render config parses");
+        assert_eq!(decoded, default);
     }
 
     #[test]

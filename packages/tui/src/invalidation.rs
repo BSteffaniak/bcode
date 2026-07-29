@@ -74,16 +74,18 @@ impl InvalidationQueue {
     }
 }
 
-/// Rendering invalidation severity.
+/// Rendering invalidation severity and semantic damage level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum UiInvalidation {
     /// No render is required.
     None,
     /// Existing layout can be repainted.
     Paint,
-    /// Layout-dependent rendered content changed.
-    Layout,
-    /// Full terminal state changed, such as resize.
+    /// One or more stable transcript items changed.
+    Items,
+    /// Item ordering or membership changed.
+    Structural,
+    /// Full terminal state changed, such as resize or reset.
     Full,
 }
 
@@ -98,5 +100,22 @@ impl UiInvalidation {
     #[must_use]
     pub fn merge(self, other: Self) -> Self {
         self.max(other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn semantic_damage_merges_by_severity_and_item_identity() {
+        let mut damage = UiInvalidation::Paint;
+        damage = damage.merge(UiInvalidation::Items);
+        assert_eq!(damage, UiInvalidation::Items);
+        damage = damage.merge(UiInvalidation::Structural);
+        damage = damage.merge(UiInvalidation::Paint);
+        assert_eq!(damage, UiInvalidation::Structural);
+        damage = damage.merge(UiInvalidation::Full);
+        assert_eq!(damage, UiInvalidation::Full);
     }
 }

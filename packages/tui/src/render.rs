@@ -2684,8 +2684,12 @@ fn push_tool_request_rows(
 }
 
 fn tool_request_arguments_are_sensitive(tool_name: &str) -> bool {
-    let normalized = tool_name.replace('_', ".");
-    normalized.ends_with(".write") || normalized.ends_with(".edit")
+    let normalized = tool_name.replace('_', ".").to_ascii_lowercase();
+    ["write", "edit"].iter().any(|operation| {
+        normalized
+            .strip_suffix(operation)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+    })
 }
 
 fn canonical_plugin_visual_render_mode(
