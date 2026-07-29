@@ -41,7 +41,7 @@ use super::{
     timeline_dialog_render, timeline_flow,
 };
 
-const TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const DEFAULT_TARGET_FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const BCODE_EVENT_DRAIN_BUDGET: usize = 32;
 const ARTIFACT_COMPLETION_DRAIN_BUDGET: usize = 8;
 const DRAFT_SAVE_DEBOUNCE: Duration = Duration::from_millis(900);
@@ -277,6 +277,7 @@ impl DaemonConnectionMonitor {
 pub struct TuiRuntimeSettings {
     keymap: BmuxKeyMap,
     mouse_scroll_rows: usize,
+    frame_interval: Option<Duration>,
     metrics_enabled: bool,
     launch_working_directory: std::path::PathBuf,
 }
@@ -287,6 +288,7 @@ impl TuiRuntimeSettings {
         Self {
             keymap: BmuxKeyMap::from_config(&tui_config),
             mouse_scroll_rows: tui_config.mouse.effective_scroll_rows(),
+            frame_interval: tui_config.render.frame_interval(),
             metrics_enabled: false,
             launch_working_directory,
         }
@@ -295,6 +297,7 @@ impl TuiRuntimeSettings {
     pub fn apply_tui_config(&mut self, tui_config: &TuiConfig) {
         self.keymap = BmuxKeyMap::from_config(tui_config);
         self.mouse_scroll_rows = tui_config.mouse.effective_scroll_rows();
+        self.frame_interval = tui_config.render.frame_interval();
     }
 
     pub const fn set_metrics_enabled(&mut self, enabled: bool) {
@@ -384,8 +387,11 @@ async fn run_chat_loop<W: Write>(
     let mut invalidation_queue = InvalidationQueue::default();
     refresh_invalidation_queue(chat, &mut invalidation_queue);
     let mut needs_redraw = true;
+    let initial_frame_interval = settings
+        .frame_interval
+        .unwrap_or(DEFAULT_TARGET_FRAME_INTERVAL);
     let mut last_redraw = Instant::now()
-        .checked_sub(TARGET_FRAME_INTERVAL)
+        .checked_sub(initial_frame_interval)
         .unwrap_or_else(Instant::now);
 
     let mut startup_action = Some(startup_action);
@@ -422,10 +428,16 @@ async fn run_chat_loop<W: Write>(
             start_draft_save(chat, &mut draft_autosave);
         }
 
-        let redraw_at = next_redraw_at(last_redraw);
+        let redraw_at = next_redraw_at(last_redraw, settings.frame_interval);
         if needs_redraw && Instant::now() >= redraw_at {
             let schedule_delay = Instant::now().saturating_duration_since(redraw_at);
-            draw_chat_frame(terminal, chat, loop_state, schedule_delay)?;
+            draw_chat_frame(
+                terminal,
+                chat,
+                loop_state,
+                schedule_delay,
+                settings.frame_interval,
+            )?;
             if let Some(action) = startup_action.take()
                 && action == super::startup_action::StartupTuiAction::OpenRalphHome
             {
@@ -1589,10 +1601,40 @@ fn record_artifact_stream_stats(loop_state: &mut ChatLoopState) {
     );
 }
 
-fn next_redraw_at(last_redraw: Instant) -> Instant {
-    last_redraw
-        .checked_add(TARGET_FRAME_INTERVAL)
+fn next_redraw_at(last_redraw: Instant, frame_interval: Option<Duration>) -> Instant {
+    frame_interval
+        .and_then(|interval| last_redraw.checked_add(interval))
         .unwrap_or(last_redraw)
+}
+
+#[cfg(test)]
+mod render_cadence_tests {
+    use super::{TuiRuntimeSettings, next_redraw_at};
+    use bcode_config::{TuiConfig, TuiRenderConfig};
+    use std::path::PathBuf;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn configured_cadence_and_reload_drive_redraw_deadline() {
+        let mut settings = TuiRuntimeSettings::bootstrap(PathBuf::from("."));
+        let start = Instant::now();
+        assert_eq!(
+            next_redraw_at(start, settings.frame_interval),
+            start + Duration::from_secs_f64(1.0 / 60.0)
+        );
+        let mut config = TuiConfig {
+            render: TuiRenderConfig { max_fps: 20 },
+            ..TuiConfig::default()
+        };
+        settings.apply_tui_config(&config);
+        assert_eq!(
+            next_redraw_at(start, settings.frame_interval),
+            start + Duration::from_millis(50)
+        );
+        config.render.max_fps = 0;
+        settings.apply_tui_config(&config);
+        assert_eq!(next_redraw_at(start, settings.frame_interval), start);
+    }
 }
 
 fn markdown_destination_cache_source(
@@ -1744,6 +1786,7 @@ fn draw_chat_frame<W: Write>(
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
     schedule_delay: Duration,
+    frame_interval: Option<Duration>,
 ) -> Result<(), TuiError> {
     let frame_started = Instant::now();
     let prepare_started = frame_started;
@@ -1939,16 +1982,17 @@ fn draw_chat_frame<W: Write>(
     let draw_ms = elapsed_millis(draw_started);
     let total_ms = elapsed_millis(frame_started);
     loop_state.telemetry.add_counter("tui.frame.total", 1);
-    if total_ms >= u64::try_from(TARGET_FRAME_INTERVAL.as_millis()).unwrap_or(u64::MAX) {
+    let frame_budget_ms = frame_interval.map_or(u64::MAX, |interval| {
+        u64::try_from(interval.as_millis()).unwrap_or(u64::MAX)
+    });
+    if total_ms >= frame_budget_ms {
         loop_state
             .telemetry
             .add_counter("tui.frame.over_budget_total", 1);
     }
     let frame_index = loop_state.frame_index;
     loop_state.frame_index = loop_state.frame_index.wrapping_add(1);
-    if frame_index.is_multiple_of(16)
-        || total_ms >= u64::try_from(TARGET_FRAME_INTERVAL.as_millis()).unwrap_or(u64::MAX)
-    {
+    if frame_index.is_multiple_of(16) || total_ms >= frame_budget_ms {
         loop_state
             .telemetry
             .record_histogram("tui.frame.prepare_ms", prepare_ms);
