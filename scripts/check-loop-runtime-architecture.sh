@@ -1330,7 +1330,7 @@ if ! grep -F 'template_id           = "implementation-verification-commit"' plug
   violations=1
 fi
 
-if rg -n 'push_live_(assistant|reasoning)_delta|sync_shared_tool_items|push_required_shared_terminal_item|authoritative_transcript' \
+if rg -n 'push_live_(assistant|reasoning)_delta|sync_shared_tool_items|push_required_shared_terminal_item|authoritative_transcript|finish_tool_request_streaming' \
   packages/tui/src/app.rs >/tmp/bcode-tui-transcript-authority-bypass.txt; then
   echo "Runtime architecture violation: TUI raw-event transcript authority or reconciliation helpers were reintroduced." >&2
   cat /tmp/bcode-tui-transcript-authority-bypass.txt >&2

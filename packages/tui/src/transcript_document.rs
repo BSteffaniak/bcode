@@ -197,18 +197,6 @@ impl TranscriptDocument {
         self.bump_revision();
     }
 
-    /// Mutate the newest matching item and return its index.
-    pub fn mutate_rev_find(
-        &mut self,
-        predicate: impl Fn(&TranscriptItem) -> bool,
-        update: impl FnOnce(&mut TranscriptItem),
-    ) -> Option<usize> {
-        let index = self.items.iter().rposition(predicate)?;
-        update(&mut self.items[index]);
-        self.bump_revision();
-        Some(index)
-    }
-
     #[cfg(test)]
     pub fn corrupt_source_index_for_test(
         &mut self,

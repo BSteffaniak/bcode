@@ -3487,7 +3487,7 @@ impl BmuxApp {
             "permission denied"
         };
         if !approved && let Some(tool_call_id) = self.permission_tool_call_id(permission_id) {
-            self.finish_tool_request_streaming(&tool_call_id);
+            self.active_tool_calls.remove(&tool_call_id);
         }
         status.clone_into(&mut self.status);
     }
@@ -3545,7 +3545,6 @@ impl BmuxApp {
         application: SessionEventApplication,
     ) {
         self.update_tool_result_status(tool_call_id, is_error, application);
-        self.finish_tool_request_streaming(tool_call_id);
     }
 
     fn apply_tool_started(
@@ -3589,21 +3588,6 @@ impl BmuxApp {
                         _ => None,
                     })
             })
-    }
-
-    fn finish_tool_request_streaming(&mut self, tool_call_id: &str) {
-        self.transcript.mutate_rev_find(
-            |item| {
-                matches!(
-                    item.kind(),
-                    TranscriptItemKind::ToolRequest {
-                        tool_call_id: item_tool_call_id,
-                        ..
-                    } if item_tool_call_id == tool_call_id
-                )
-            },
-            TranscriptItem::finish_streaming,
-        );
     }
 
     fn push_model_usage(

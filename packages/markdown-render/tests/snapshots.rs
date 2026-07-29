@@ -1304,6 +1304,66 @@ fn snapshots_lists_at_width_30() {
 }
 
 #[test]
+fn arbitrary_streaming_prefixes_keep_incomplete_source_content_visible() {
+    const CASES: &[(&str, &[&str])] = &[
+        (
+            "Text with **unfinished emphasis** and [unfinished link](https://example.com).",
+            &[
+                "Text",
+                "unfinished",
+                "emphasis",
+                "and",
+                "unfinished",
+                "link",
+            ],
+        ),
+        (
+            "Before.\n\n```rust\nfn main() {\n    println!(\"hello\");\n}\n```",
+            &["Before", "rust", "fn", "main", "println", "hello"],
+        ),
+        (
+            "<details><summary>Retry policy</summary>Keep **important body** visible.</details>",
+            &["Retry", "policy", "Keep", "important", "body", "visible"],
+        ),
+        (
+            "| Name | Value |\n| --- | --- |\n| partial | visible |\n\n- first\n- unfinished item",
+            &[
+                "Name",
+                "Value",
+                "partial",
+                "visible",
+                "first",
+                "unfinished",
+                "item",
+            ],
+        ),
+    ];
+
+    for (source, expected_words) in CASES {
+        for prefix_end in source
+            .char_indices()
+            .map(|(index, character)| index + character.len_utf8())
+        {
+            let prefix = &source[..prefix_end];
+            let visible = rendered_lines_text(
+                &render_markdown(prefix, &MarkdownRenderOptions::new(40).with_streaming(true))
+                    .lines,
+            );
+            for word in expected_words
+                .iter()
+                .copied()
+                .filter(|word| prefix.contains(word))
+            {
+                assert!(
+                    visible.contains(word),
+                    "streaming prefix lost accepted content {word:?}:\nsource: {prefix:?}\nvisible: {visible:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn snapshots_partial_streaming_inputs_at_width_40() {
     let snapshot = [
         "== code ==",
