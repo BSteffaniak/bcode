@@ -138,8 +138,9 @@ the runner's temporary directory and passes only its path to xtask through
 `WINDOWS_CODESIGN_CERTIFICATE_PFX_PATH`; release automation signs and RFC 3161 timestamps both
 executables with SHA-256 before packaging, verifies both signatures before packaging, and verifies
 them again after extraction. Store the PFX as an Actions secret encoded or supplied in the format
-expected by the runner secret policy; rotate or revoke it through the certificate authority and
-replace the repository secrets. Local development remains unsigned unless these variables are set.
+expected by the runner secret policy; the workflow rejects incomplete certificate/password secret
+pairs and removes the temporary PFX in an `always()` cleanup step. Rotate or revoke it through the
+certificate authority and replace the repository secrets. Local development remains unsigned unless these variables are set.
 A valid Authenticode signature does not guarantee Microsoft Defender SmartScreen reputation.
 
 ## Release workflow

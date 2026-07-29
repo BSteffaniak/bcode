@@ -2239,6 +2239,16 @@ fn verify_required_archive_entries(
             archive.display()
         )));
     }
+    if target_kind == TargetKind::Windows
+        && !entries
+            .iter()
+            .any(|name| name.starts_with(runtime_prefix) && name.ends_with("/lib/leptonica.dll"))
+    {
+        return Err(format_error(format!(
+            "release archive {} contains no canonical bundled Leptonica runtime library",
+            archive.display()
+        )));
+    }
     if !entries
         .iter()
         .any(|name| name.starts_with(runtime_prefix) && name.ends_with("/tessdata/eng.traineddata"))
@@ -2548,6 +2558,7 @@ mod tests {
         )
         .expect("manifest");
         fs::write(runtime.join("lib/tesseract.dll"), b"runtime").expect("runtime DLL");
+        fs::write(runtime.join("lib/leptonica.dll"), b"runtime").expect("Leptonica DLL");
         fs::write(runtime.join("tessdata/eng.traineddata"), b"language").expect("language data");
         let archive = temp.path().join("release.zip");
         create_zip_archive(&archive, &staging).expect("create archive");
@@ -2572,6 +2583,25 @@ mod tests {
         symlink(&outside, staging.join("bcode.exe")).expect("symlink");
         let archive = temp.path().join("release.zip");
         assert!(create_zip_archive(&archive, &staging).is_err());
+    }
+
+    #[test]
+    fn windows_archive_requires_canonical_leptonica_dll() {
+        let entries = std::collections::BTreeSet::from([
+            "bcode.exe".to_owned(),
+            "bcode-mermaid-worker.exe".to_owned(),
+            "bcode-runtimes/tesseract/manifest.json".to_owned(),
+            "bcode-runtimes/tesseract/5.5.2/lib/tesseract.dll".to_owned(),
+            "bcode-runtimes/tesseract/5.5.2/tessdata/eng.traineddata".to_owned(),
+        ]);
+        assert!(
+            verify_required_archive_entries(
+                &entries,
+                Path::new("release.zip"),
+                TargetKind::Windows
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 name: Windows Check
 
 on:
+  workflow_dispatch:
   pull_request:
   push:
     branches: [master]
@@ -20,6 +21,19 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+
+      - name: Verify Windows native build tools
+        shell: pwsh
+        run: |
+          cmake --version
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (-not (Test-Path -LiteralPath $vswhere)) {
+            throw "Visual Studio Installer discovery tool was not found"
+          }
+          $installation = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ([string]::IsNullOrWhiteSpace($installation)) {
+            throw "Visual Studio C++ x64 build tools were not found"
+          }
 
       - name: Check workspace
         run: cargo check --workspace
@@ -78,3 +92,23 @@ jobs:
 
       - name: Smoke-test packaged Tesseract runtime
         run: cargo xtask smoke-test-tesseract --target x86_64-pc-windows-msvc
+
+      - name: Upload Windows CI diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bcode-windows-ci-diagnostics-${{ github.run_id }}
+          path: |
+            target/dist/
+            target/debug/build/bcode_tesseract_sys-*/out/bundled-runtimes/
+            target/x86_64-pc-windows-msvc/release/build/bcode_tesseract_sys-*/out/bundled-runtimes/
+          if-no-files-found: ignore
+
+      - name: Upload Windows CI artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bcode-windows-ci-${{ github.run_id }}
+          path: |
+            target/dist/bcode-ci-x86_64-pc-windows-msvc.*
+          if-no-files-found: ignore
