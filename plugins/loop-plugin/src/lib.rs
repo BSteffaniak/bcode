@@ -840,7 +840,20 @@ const fn event_click_in(event: &Event, area: Rect) -> bool {
     )
 }
 
-#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum ReferenceWorkflowOutcome {
+    Implementing,
+    VerificationFailed,
+    VerificationInfrastructureFailed,
+    CommitDisabled,
+    NoChanges,
+    ApprovalDenied,
+    Committed,
+    Completed,
+    IterationLimitExhausted,
+}
+
 const REFERENCE_WORKFLOW_STATE_VERSION: u32 = 1;
 
 #[allow(dead_code)]
@@ -856,7 +869,7 @@ struct ReferenceWorkflowState {
     verification_passed: Option<bool>,
     commit_enabled: bool,
     committed_head: Option<String>,
-    outcome: String,
+    outcome: ReferenceWorkflowOutcome,
 }
 
 #[allow(dead_code)]
@@ -870,8 +883,6 @@ impl ReferenceWorkflowState {
             || self.iteration == 0
             || self.iteration > self.iteration_limit
             || self.iteration_limit > u32::try_from(HARD_MAX_ITERATIONS).unwrap_or(u32::MAX)
-            || self.outcome.trim().is_empty()
-            || self.outcome.len() > 256
         {
             return Err("reference workflow state is invalid or unbounded".to_string());
         }
@@ -1411,7 +1422,7 @@ mod tests {
             verification_passed: None,
             commit_enabled: true,
             committed_head: None,
-            outcome: "implementing".to_string(),
+            outcome: ReferenceWorkflowOutcome::Implementing,
         };
         state.validate().expect("valid state");
         assert!(
@@ -1422,14 +1433,8 @@ mod tests {
             .validate()
             .is_err()
         );
-        assert!(
-            ReferenceWorkflowState {
-                outcome: String::new(),
-                ..state
-            }
-            .validate()
-            .is_err()
-        );
+        let encoded = serde_json::to_value(&state).expect("state serializes");
+        assert_eq!(encoded["outcome"], "implementing");
     }
 
     #[test]

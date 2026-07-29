@@ -10,6 +10,7 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 use bmux_tui::style::{Color, Style};
 use bmux_tui::text::Line;
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 pub const WORKFLOW_STATUS_SURFACE_KIND: &str = "workflow.status";
@@ -426,6 +427,7 @@ fn surface_lines(options: &serde_json::Value, selected_approval: usize) -> Vec<S
             )
         },
     );
+    append_git_head_diagnostics(&mut lines, options);
     append_named_rows(
         &mut lines,
         options,
@@ -582,6 +584,75 @@ fn append_runs(lines: &mut Vec<String>, runs: &[serde_json::Value]) {
     }
 }
 
+fn append_git_head_diagnostics(lines: &mut Vec<String>, options: &serde_json::Value) {
+    let mut seen = BTreeSet::new();
+    let mut diagnostics = Vec::new();
+    let mut collect = |value: &serde_json::Value| {
+        let Some(expected_head) = value
+            .get("expected_head")
+            .and_then(serde_json::Value::as_str)
+        else {
+            return;
+        };
+        let Some(actual_head) = value.get("actual_head").and_then(serde_json::Value::as_str) else {
+            return;
+        };
+        let outcome = value
+            .get("outcome")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let guidance = value
+            .get("guidance")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("-");
+        let diagnostic = format!(
+            "  expected {} · actual {} · {} · {}",
+            short_checksum(expected_head),
+            short_checksum(actual_head),
+            outcome,
+            guidance
+        );
+        if seen.insert(diagnostic.clone()) {
+            diagnostics.push(diagnostic);
+        }
+    };
+
+    if let Some(values) = options
+        .get("git_head_diagnostics")
+        .and_then(serde_json::Value::as_array)
+    {
+        for value in values {
+            collect(value);
+        }
+    }
+    if let Some(values) = options
+        .get("mutation_approvals")
+        .and_then(serde_json::Value::as_array)
+    {
+        for value in values {
+            let scope = value.get("scope").unwrap_or(value);
+            if let Some(summary) = scope.get("input_summary") {
+                collect(summary);
+            }
+        }
+    }
+    if let Some(doctor) = options.get("doctor")
+        && let Some(issues) = doctor.get("issues").and_then(serde_json::Value::as_array)
+    {
+        for issue in issues {
+            collect(issue);
+            if let Some(evidence) = issue.get("evidence") {
+                collect(evidence);
+            }
+        }
+    }
+
+    if !diagnostics.is_empty() {
+        lines.push(format!("Git HEAD diagnostics ({})", diagnostics.len()));
+        lines.extend(diagnostics);
+    }
+}
+
 fn append_mutation_approvals(
     lines: &mut Vec<String>,
     options: &serde_json::Value,
@@ -702,6 +773,12 @@ mod tests {
                         "reconciliation": "repair_required"
                     }
                 }],
+                "git_head_diagnostics": [{
+                    "expected_head": "aaaaaaaaaaaaaaaa",
+                    "actual_head": "bbbbbbbbbbbbbbbb",
+                    "outcome": "diverged",
+                    "guidance": "explicit repair is required"
+                }],
                 "attempts": [{"node_id": "review", "attempt": 1, "status": "succeeded"}],
                 "grants": [{"grant_id": "grant-1", "node_id": "review", "scope": {"capability": "read_only"}}],
                 "resource_leases": [{"node_id": "review", "mode": "read", "resource_key": "repo"}],
@@ -733,6 +810,9 @@ mod tests {
         );
         assert!(rendered.contains("reconciliation repair_required"));
         assert!(rendered.contains("ambiguous accepted execution requires explicit repair"));
+        assert!(rendered.contains("Git HEAD diagnostics (1)"));
+        assert!(rendered.contains("expected aaaaaaaaaaaa · actual bbbbbbbbbbbb · diverged"));
+        assert!(rendered.contains("explicit repair is required"));
         assert!(rendered.contains("Attempts (1)"));
         assert!(rendered.contains("Grants (1)"));
         assert!(rendered.contains("Resource leases (1)"));
