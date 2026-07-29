@@ -701,6 +701,16 @@ mod tests {
         verification_block
             .validate()
             .expect("shell block validates");
+        let shell_manifest: bcode_plugin::PluginManifest =
+            toml::from_str(include_str!("../../shell-plugin/bcode-plugin.toml"))
+                .expect("shell manifest");
+        let declared_shell = shell_manifest
+            .services
+            .iter()
+            .flat_map(|service| &service.workflow_blocks)
+            .find(|block| block.block_id == "shell.command-plan")
+            .expect("declared shell block");
+        assert_eq!(&verification_block, declared_shell);
         assert_eq!(verification_block.plugin_id, "bcode.shell");
         assert_eq!(verification_block.block_id, "shell.command-plan");
         assert!(verification_block.authorization.explicit_grant_required);
@@ -752,6 +762,16 @@ mod tests {
             serde_json::from_value(git_prepare.configuration.clone())
                 .expect("typed Git prepare block");
         git_prepare_block.validate().expect("Git prepare validates");
+        let git_manifest: bcode_plugin::PluginManifest =
+            toml::from_str(include_str!("../../git-plugin/bcode-plugin.toml"))
+                .expect("Git manifest");
+        let declared_prepare = git_manifest
+            .services
+            .iter()
+            .flat_map(|service| &service.workflow_blocks)
+            .find(|block| block.block_id == "git.prepare")
+            .expect("declared Git prepare block");
+        assert_eq!(&git_prepare_block, declared_prepare);
         assert_eq!(git_prepare_block.block_id, "git.prepare");
         assert_eq!(
             git_prepare_block.effect,
@@ -772,6 +792,88 @@ mod tests {
                 "exclude_prefixes": [],
                 "max_paths": 10_000
             })
+        );
+        let git_compose = &template.definition.nodes["git_compose"];
+        assert_eq!(git_compose.kind, bcode_workflow::NodeKind::PluginBlock);
+        let git_compose_block: bcode_workflow::WorkflowBlockDefinition =
+            serde_json::from_value(git_compose.configuration.clone())
+                .expect("typed Git compose block");
+        let declared_compose = git_manifest
+            .services
+            .iter()
+            .flat_map(|service| &service.workflow_blocks)
+            .find(|block| block.block_id == "git.compose-commit")
+            .expect("declared Git compose block");
+        assert_eq!(&git_compose_block, declared_compose);
+        let compose_transform = template
+            .definition
+            .edges
+            .iter()
+            .find(|edge| edge.from == "git_prepare" && edge.to == "git_compose")
+            .and_then(|edge| edge.transform.as_ref())
+            .expect("Git compose request transform");
+        let preparation = serde_json::json!({
+            "repository_root": "/repo",
+            "head": "abc",
+            "changed_paths": [{"path": "src/lib.rs", "status": "modified"}]
+        });
+        let compose_state = serde_json::json!({"implementation_prompt": "Implement workflows"});
+        let composed = compose_transform
+            .evaluate(&[
+                bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                    value: &preparation,
+                },
+                bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_STATE,
+                    value: &compose_state,
+                },
+            ])
+            .expect("compose request");
+        assert_eq!(composed["preparation"], preparation);
+        assert_eq!(composed["message"]["description"], "Implement workflows");
+        assert_eq!(composed["no_changes"], "no_op");
+        let git_commit = &template.definition.nodes["git_commit"];
+        assert_eq!(git_commit.kind, bcode_workflow::NodeKind::PluginBlock);
+        let git_commit_block: bcode_workflow::WorkflowBlockDefinition =
+            serde_json::from_value(git_commit.configuration.clone())
+                .expect("typed Git commit block");
+        let declared_commit = git_manifest
+            .services
+            .iter()
+            .flat_map(|service| &service.workflow_blocks)
+            .find(|block| block.block_id == "git.commit")
+            .expect("declared Git commit block");
+        assert_eq!(&git_commit_block, declared_commit);
+        assert!(git_commit_block.authorization.explicit_grant_required);
+        assert_eq!(
+            git_commit_block.reconciliation,
+            bcode_workflow::WorkflowBlockReconciliation::RepairRequired
+        );
+        let commit_transform = template
+            .definition
+            .edges
+            .iter()
+            .find(|edge| edge.from == "commit_decision" && edge.to == "git_commit")
+            .and_then(|edge| edge.transform.as_ref())
+            .expect("exact commit request projection");
+        let ready = serde_json::json!({
+            "status": "ready",
+            "request": {
+                "repo_path": "/repo",
+                "expected_head": "abc",
+                "message": "Implement workflows",
+                "paths": ["src/lib.rs"]
+            }
+        });
+        assert_eq!(
+            commit_transform
+                .evaluate(&[bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                    value: &ready,
+                }])
+                .expect("commit projection"),
+            ready["request"]
         );
         let required = template.configuration_schema.schema["required"]
             .as_array()
