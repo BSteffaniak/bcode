@@ -208,6 +208,8 @@ pub enum Request {
         runtime_context: Option<ClientRuntimeContext>,
         #[serde(default)]
         daemon_namespace: String,
+        #[serde(default)]
+        build_fingerprint: String,
     },
     Ping,
     ServerStatus {
@@ -3084,6 +3086,7 @@ mod tests {
         let request = Request::Hello {
             client_name: "test".to_string(),
             daemon_namespace: daemon_namespace(),
+            build_fingerprint: BUILD_FINGERPRINT.to_owned(),
             runtime_context: Some(ClientRuntimeContext {
                 working_directory: Some(PathBuf::from("/tmp/client")),
                 selected_provider_plugin_id: Some("bcode.openai-compatible".to_string()),

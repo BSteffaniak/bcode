@@ -3579,15 +3579,19 @@ async fn handle_request_inner(
             client_name,
             runtime_context,
             daemon_namespace,
+            build_fingerprint,
         } => {
             handle_hello(
                 request_id,
                 client_id,
                 state,
                 writer,
-                &client_name,
-                runtime_context,
-                daemon_namespace,
+                ClientHello {
+                    client_name,
+                    runtime_context,
+                    daemon_namespace,
+                    build_fingerprint,
+                },
             )
             .await
         }
@@ -4407,16 +4411,39 @@ fn client_name_supports_message_accepted(client_name: &str) -> bool {
         .any(|part| part.trim() == "cap=message_accepted")
 }
 
+struct ClientHello {
+    client_name: String,
+    runtime_context: Option<ClientRuntimeContext>,
+    daemon_namespace: String,
+    build_fingerprint: String,
+}
+
+fn validate_client_build_fingerprint(build_fingerprint: &str) -> Result<(), String> {
+    if build_fingerprint == bcode_ipc::BUILD_FINGERPRINT {
+        return Ok(());
+    }
+    Err(format!(
+        "client build fingerprint {build_fingerprint:?} does not match daemon build fingerprint {:?}",
+        bcode_ipc::BUILD_FINGERPRINT
+    ))
+}
+
 async fn handle_hello(
     request_id: u64,
     client_id: ClientId,
     state: &ServerState,
     writer: &SharedWriter,
-    client_name: &str,
-    runtime_context: Option<ClientRuntimeContext>,
-    daemon_namespace: String,
+    hello: ClientHello,
 ) -> Result<(), ServerError> {
-    if let Err(message) = validate_client_interaction_adapters(runtime_context.as_ref()) {
+    if let Err(message) = validate_client_build_fingerprint(&hello.build_fingerprint) {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new("incompatible_build", message)),
+        )
+        .await;
+    }
+    if let Err(message) = validate_client_interaction_adapters(hello.runtime_context.as_ref()) {
         return send_response(
             writer,
             request_id,
@@ -4424,14 +4451,14 @@ async fn handle_hello(
         )
         .await;
     }
-    if client_name_supports_message_accepted(client_name) {
+    if client_name_supports_message_accepted(&hello.client_name) {
         state.register_message_accepted_client(client_id).await;
     }
     state
-        .set_client_runtime_context(client_id, runtime_context)
+        .set_client_runtime_context(client_id, hello.runtime_context)
         .await;
     state
-        .set_client_session_namespace(client_id, daemon_namespace)
+        .set_client_session_namespace(client_id, hello.daemon_namespace)
         .await;
     send_response(
         writer,
@@ -26418,6 +26445,21 @@ mod tests {
 
         assert!(error.contains("missing-profile") || error.contains("sshenv"));
         assert!(!error.contains("phase-five-secret"));
+    }
+
+    #[test]
+    fn hello_requires_the_exact_daemon_build_fingerprint() {
+        validate_client_build_fingerprint(bcode_ipc::BUILD_FINGERPRINT)
+            .expect("matching build fingerprint");
+
+        let error = validate_client_build_fingerprint("different-build")
+            .expect_err("different build fingerprint must be rejected");
+        assert!(error.contains("different-build"));
+        assert!(error.contains(bcode_ipc::BUILD_FINGERPRINT));
+
+        let missing = validate_client_build_fingerprint("")
+            .expect_err("missing build fingerprint must be rejected");
+        assert!(missing.contains("client build fingerprint \"\""));
     }
 
     #[tokio::test]

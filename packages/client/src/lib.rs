@@ -2950,7 +2950,8 @@ impl BcodeClient {
     ///
     /// # Errors
     ///
-    /// Returns an error when the daemon cannot be reached or rejects the handshake.
+    /// Returns an error when the daemon cannot be reached, rejects the handshake, or reports a
+    /// different build fingerprint.
     pub async fn connect(&self, client_name: &str) -> Result<ClientConnection, ClientError> {
         let mut last_error = None;
         for _ in 0..3 {
@@ -3018,6 +3019,7 @@ impl BcodeClient {
                 client_name: format!("{client_name};cap=message_accepted"),
                 runtime_context: self.runtime_context.clone(),
                 daemon_namespace: bcode_ipc::daemon_namespace(),
+                build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
             })
             .await?
         {
