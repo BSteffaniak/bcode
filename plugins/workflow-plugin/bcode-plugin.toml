@@ -147,9 +147,15 @@ type      = ["string", "null"]
 edges = [
     { from = "implementation", to = "evaluation", kind = { kind = "direct" } },
     { from = "evaluation", to = "verification", kind = { kind = "direct" }, transform = { version = 1, expression = { operation = "input", source = "state", path = "command_plan" }, output = { type_name = "bcode.shell.command-plan/v1", schema = { type = "object" } } } },
+    { from = "verification", to = "verification_decision", kind = { kind = "direct" } },
+    { from = "verification_decision", to = "verified", kind = { kind = "conditional", predicate = { operation = "equals", version = 1, path = "passed", value = true }, expected = true } },
+    { from = "verification_decision", to = "verification_failed", kind = { kind = "conditional", predicate = { operation = "equals", version = 1, path = "passed", value = true }, expected = false } },
+    { from = "verified", to = "git_prepare", kind = { kind = "direct" }, transform = { version = 1, expression = { operation = "constant", value = { include_prefixes = [
+    ], exclude_prefixes = [
+    ], max_paths = 10000 } }, output = { type_name = "bcode.git.prepare-request/v1", schema = { type = "object" } } } },
 ]
 entries = ["implementation"]
-exits = ["verification"]
+exits = ["git_prepare", "verification_failed"]
 name = "implementation-verification-commit"
 schema_version = 1
 
@@ -175,6 +181,98 @@ type_name = "bcode.workflow.implementation-verification-commit-config/v1"
 [workflow_templates.definition.nodes.configuration.output]
 schema    = { type = "object" }
 type_name = "bcode.workflow.implementation-verification-commit-config/v1"
+
+[workflow_templates.definition.nodes.git_prepare]
+id        = "git_prepare"
+kind      = "plugin_block"
+name      = "Prepare bounded Git change set"
+resources = [{ resource = "repository", access = "read" }]
+
+[workflow_templates.definition.nodes.git_prepare.configuration]
+block_id               = "git.prepare"
+block_version          = 1
+cancellation_supported = true
+effect                 = "read_only"
+operation              = "git.prepare"
+plugin_id              = "bcode.git"
+reconciliation         = "idempotent_replay"
+timeout_ms             = 30000
+
+[workflow_templates.definition.nodes.git_prepare.configuration.authorization]
+capability              = "read_only"
+explicit_grant_required = false
+
+[workflow_templates.definition.nodes.git_prepare.configuration.input]
+schema    = { type = "object" }
+type_name = "bcode.git.prepare-request/v1"
+
+[workflow_templates.definition.nodes.git_prepare.configuration.output]
+schema    = { type = "object" }
+type_name = "bcode.git.prepare-result/v1"
+
+[[workflow_templates.definition.nodes.git_prepare.configuration.resources]]
+access   = "read"
+resource = "repository"
+
+[workflow_templates.definition.nodes.git_prepare.input]
+schema    = { type = "object" }
+type_name = "bcode.git.prepare-request/v1"
+
+[workflow_templates.definition.nodes.git_prepare.output]
+schema    = { type = "object" }
+type_name = "bcode.git.prepare-result/v1"
+
+[workflow_templates.definition.nodes.verification_decision]
+id        = "verification_decision"
+kind      = "branch"
+name      = "Branch on verification result"
+resources = []
+
+[workflow_templates.definition.nodes.verification_decision.configuration]
+false_entries     = ["verification_failed"]
+false_nodes       = ["verification_failed"]
+predicate         = { operation = "equals", version = 1, path = "passed", value = true }
+predicate_version = 1
+true_entries      = ["verified"]
+true_nodes        = ["verified"]
+
+[workflow_templates.definition.nodes.verification_decision.input]
+schema    = { type = "object" }
+type_name = "bcode.shell.command-plan-result/v1"
+
+[workflow_templates.definition.nodes.verification_decision.output]
+schema    = { type = "object" }
+type_name = "bcode.shell.command-plan-result/v1"
+
+[workflow_templates.definition.nodes.verified]
+configuration = { gate_version = 1 }
+id            = "verified"
+kind          = "input"
+name          = "Verification passed"
+resources     = []
+
+[workflow_templates.definition.nodes.verified.input]
+schema    = { type = "object" }
+type_name = "bcode.shell.command-plan-result/v1"
+
+[workflow_templates.definition.nodes.verified.output]
+schema    = { type = "object" }
+type_name = "bcode.shell.command-plan-result/v1"
+
+[workflow_templates.definition.nodes.verification_failed]
+configuration = { gate_version = 1 }
+id            = "verification_failed"
+kind          = "input"
+name          = "Verification failed"
+resources     = []
+
+[workflow_templates.definition.nodes.verification_failed.input]
+schema    = { type = "object" }
+type_name = "bcode.shell.command-plan-result/v1"
+
+[workflow_templates.definition.nodes.verification_failed.output]
+schema    = { type = "object" }
+type_name = "bcode.shell.command-plan-result/v1"
 
 [workflow_templates.definition.nodes.verification]
 id        = "verification"

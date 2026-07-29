@@ -736,6 +736,43 @@ mod tests {
                 .expect("command plan projection"),
             state["command_plan"]
         );
+        let branch = &template.definition.nodes["verification_decision"];
+        assert_eq!(branch.kind, bcode_workflow::NodeKind::Branch);
+        assert_eq!(branch.configuration["predicate"]["path"], "passed");
+        let passed = serde_json::json!({"passed": true});
+        let failed = serde_json::json!({"passed": false});
+        let predicate: bcode_workflow::PredicateExpression =
+            serde_json::from_value(branch.configuration["predicate"].clone())
+                .expect("verification predicate");
+        assert!(predicate.evaluate_value(&passed).expect("passed branch"));
+        assert!(!predicate.evaluate_value(&failed).expect("failed branch"));
+        let git_prepare = &template.definition.nodes["git_prepare"];
+        assert_eq!(git_prepare.kind, bcode_workflow::NodeKind::PluginBlock);
+        let git_prepare_block: bcode_workflow::WorkflowBlockDefinition =
+            serde_json::from_value(git_prepare.configuration.clone())
+                .expect("typed Git prepare block");
+        git_prepare_block.validate().expect("Git prepare validates");
+        assert_eq!(git_prepare_block.block_id, "git.prepare");
+        assert_eq!(
+            git_prepare_block.effect,
+            bcode_workflow::WorkflowBlockEffect::ReadOnly
+        );
+        assert!(!git_prepare_block.authorization.explicit_grant_required);
+        let prepare_transform = template
+            .definition
+            .edges
+            .iter()
+            .find(|edge| edge.from == "verified" && edge.to == "git_prepare")
+            .and_then(|edge| edge.transform.as_ref())
+            .expect("Git prepare request transform");
+        assert_eq!(
+            prepare_transform.evaluate(&[]).expect("prepare request"),
+            serde_json::json!({
+                "include_prefixes": [],
+                "exclude_prefixes": [],
+                "max_paths": 10_000
+            })
+        );
         let required = template.configuration_schema.schema["required"]
             .as_array()
             .expect("required fields");
