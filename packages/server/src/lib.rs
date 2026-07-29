@@ -11341,6 +11341,59 @@ fn register_workflow_definition(
         .map_err(ServerError::from)
 }
 
+fn compile_workflow_template(
+    template: &bcode_plugin::WorkflowTemplateContribution,
+) -> Result<bcode_workflow::WorkflowDefinition, ServerError> {
+    let mut definition = template.definition.clone();
+    let uses_configuration_envelope =
+        definition.input.type_name == template.configuration_schema.type_name;
+    if !uses_configuration_envelope {
+        return Ok(definition);
+    }
+    definition.input = template.configuration_schema.clone();
+    definition.output = template.configuration_schema.clone();
+    let entry_nodes = definition.entries.iter().cloned().collect::<BTreeSet<_>>();
+    for (node_id, node) in &mut definition.nodes {
+        if node.kind != bcode_workflow::NodeKind::Agent {
+            continue;
+        }
+        let original_input = node.input.clone();
+        let mut agent = serde_json::from_value::<bcode_workflow::WorkflowAgentConfiguration>(
+            node.configuration.clone(),
+        )
+        .map_err(|error| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow template entry agent configuration is invalid: {error}"
+            ))
+        })?;
+        if entry_nodes.contains(node_id) {
+            node.input = template.configuration_schema.clone();
+            for edge in definition
+                .edges
+                .iter_mut()
+                .filter(|edge| edge.to == *node_id)
+            {
+                if let Some(transform) = &mut edge.transform
+                    && transform.output == original_input
+                {
+                    transform.output = template.configuration_schema.clone();
+                }
+            }
+        }
+        node.output = template.configuration_schema.clone();
+        agent.structured_output.schema = template.configuration_schema.clone();
+        node.configuration = serde_json::to_value(agent).map_err(|error| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow template entry agent configuration cannot be serialized: {error}"
+            ))
+        })?;
+    }
+    definition
+        .validate()
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    Ok(definition)
+}
+
 fn workflow_template_description(
     state: &ServerState,
     owner_plugin_id: &str,
@@ -11513,11 +11566,17 @@ async fn handle_start_workflow_template(
         .into());
     }
     let binding_kind = description.identity.kind.clone();
+    let definition = compile_workflow_template(template)?;
+    let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+        description.identity.kind,
+        &definition,
+    )
+    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
     let started = start_workflow(
         state,
         bcode_ipc::WorkflowStartRequest {
-            identity: description.identity,
-            definition: template.definition.clone(),
+            identity,
+            definition,
             run_id: request.run_id,
             workspace_snapshot: request.workspace_snapshot,
             parent_session_id: request.parent_session_id,
@@ -26460,6 +26519,54 @@ mod tests {
         let missing = validate_client_build_fingerprint("")
             .expect_err("missing build fingerprint must be rejected");
         assert!(missing.contains("client build fingerprint \"\""));
+    }
+
+    #[test]
+    fn template_compilation_binds_configuration_envelope_to_agent_contracts() {
+        let manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
+            "../../../plugins/workflow-plugin/bcode-plugin.toml"
+        ))
+        .expect("workflow plugin manifest");
+        let template = manifest
+            .workflow_templates
+            .iter()
+            .find(|template| template.template_id == "implementation-verification-commit")
+            .expect("reference template");
+        let definition = compile_workflow_template(template).expect("compile");
+        assert_eq!(definition.input, template.configuration_schema);
+        assert_eq!(definition.output, template.configuration_schema);
+        let implementation = &definition.nodes["implementation"];
+        assert_eq!(implementation.input, template.configuration_schema);
+        let evaluation = &definition.nodes["evaluation"];
+        assert_eq!(
+            evaluation.input,
+            template.definition.nodes["evaluation"].input
+        );
+        for node_id in ["implementation", "evaluation"] {
+            let node = &definition.nodes[node_id];
+            assert_eq!(node.output, template.configuration_schema);
+            let agent = serde_json::from_value::<bcode_workflow::WorkflowAgentConfiguration>(
+                node.configuration.clone(),
+            )
+            .expect("agent contract");
+            assert_eq!(
+                agent.structured_output.schema,
+                template.configuration_schema
+            );
+        }
+        assert_ne!(
+            bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+                format!(
+                    "bcode.workflow/{}@{}",
+                    template.template_id, template.template_version
+                ),
+                &definition,
+            )
+            .expect("compiled identity"),
+            template
+                .definition_identity("bcode.workflow")
+                .expect("manifest identity")
+        );
     }
 
     #[tokio::test]

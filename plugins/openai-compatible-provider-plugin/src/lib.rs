@@ -4562,10 +4562,10 @@ fn strict_openai_schema(schema: &serde_json::Value) -> Result<serde_json::Value,
                     || object.contains_key("properties");
                 if is_object {
                     object.insert("additionalProperties".to_string(), serde_json::json!(false));
-                    if let Some(properties) = object
-                        .get("properties")
-                        .and_then(serde_json::Value::as_object)
-                    {
+                    let properties = object
+                        .entry("properties".to_string())
+                        .or_insert_with(|| serde_json::json!({}));
+                    if let Some(properties) = properties.as_object() {
                         let required = properties.keys().cloned().collect::<Vec<_>>();
                         object.insert("required".to_string(), serde_json::json!(required));
                     }
@@ -8115,6 +8115,23 @@ mod tests {
             schema["properties"]["nested"]["required"],
             serde_json::json!(["value"])
         );
+    }
+
+    #[test]
+    fn strict_empty_object_schema_includes_empty_properties_and_required() {
+        let settings = test_settings(test_api_key_auth(), OpenAiCompatibleDialect::ResponsesApi);
+        let mut request = test_request(Vec::new());
+        request.structured_output = Some(bcode_model::StructuredOutputRequest {
+            name: "ConformanceResult".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+            strict: true,
+        });
+
+        let body = build_responses_request(&settings, &request, "model").expect("request");
+        let schema = &body["text"]["format"]["schema"];
+        assert_eq!(schema["additionalProperties"], false);
+        assert_eq!(schema["properties"], serde_json::json!({}));
+        assert_eq!(schema["required"], serde_json::json!([]));
     }
 
     #[test]

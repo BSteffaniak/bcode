@@ -681,6 +681,7 @@ mod tests {
             .expect("reference template");
         template.validate().expect("template validates");
         assert_eq!(template.template_version, 1);
+        assert_eq!(template.definition.entries, vec!["implementation"]);
         let implementation = &template.definition.nodes["implementation"];
         assert_eq!(implementation.kind, bcode_workflow::NodeKind::Agent);
         let configuration: bcode_workflow::WorkflowAgentConfiguration =
