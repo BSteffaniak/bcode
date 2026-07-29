@@ -7362,6 +7362,7 @@ struct SessionDiagnosis {
     model_context_status: String,
     projections: Vec<SessionProjectionDiagnosis>,
     owner_observations: Vec<bcode_session::lease::SessionOwnerObservation>,
+    daemon_owner_classifications: Vec<SessionDaemonOwnerClassification>,
     active_owners: Vec<bcode_session::lease::SessionLeaseOwner>,
     recovery_guidance: Option<String>,
     event_count: usize,
@@ -7370,6 +7371,12 @@ struct SessionDiagnosis {
     last_sequence: Option<u64>,
     latest_events: Vec<SessionDiagnosisEvent>,
     latest_traces: Vec<SessionDiagnosisTrace>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SessionDaemonOwnerClassification {
+    daemon_instance_id: String,
+    classification: bcode_daemon_lifecycle::DaemonRecordClassification,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -7448,6 +7455,21 @@ async fn collect_session_diagnosis(
         })
         .map(|observation| observation.owner.clone())
         .collect::<Vec<_>>();
+    let classified_records =
+        bcode_daemon_lifecycle::classified_records(&bcode_config::default_state_dir()).await;
+    let daemon_owner_classifications = active_owners
+        .iter()
+        .filter_map(|owner| {
+            let daemon_instance_id = owner.daemon_instance_id.as_ref()?;
+            classified_records
+                .iter()
+                .find(|(_, record, _)| &record.instance_id == daemon_instance_id)
+                .map(|(_, _, classification)| SessionDaemonOwnerClassification {
+                    daemon_instance_id: daemon_instance_id.clone(),
+                    classification: *classification,
+                })
+        })
+        .collect::<Vec<_>>();
     let waiting_for_owner = migration_plan.is_some() && !active_owners.is_empty();
     let retained_backup =
         bcode_session_migration::latest_retained_migration_backup(root, session_id)?;
@@ -7505,6 +7527,7 @@ async fn collect_session_diagnosis(
             model_context_status,
             projections,
             owner_observations,
+            daemon_owner_classifications,
             active_owners,
             recovery_guidance,
         },
@@ -7793,6 +7816,7 @@ struct SessionStorageDiagnosis {
     model_context_status: String,
     projections: Vec<SessionProjectionDiagnosis>,
     owner_observations: Vec<bcode_session::lease::SessionOwnerObservation>,
+    daemon_owner_classifications: Vec<SessionDaemonOwnerClassification>,
     active_owners: Vec<bcode_session::lease::SessionLeaseOwner>,
     recovery_guidance: Option<String>,
 }
@@ -7853,6 +7877,7 @@ impl SessionDiagnosis {
             model_context_status: storage.model_context_status,
             projections: storage.projections,
             owner_observations: storage.owner_observations,
+            daemon_owner_classifications: storage.daemon_owner_classifications,
             active_owners: storage.active_owners,
             recovery_guidance: storage.recovery_guidance,
             event_count: history.len(),
@@ -7939,6 +7964,16 @@ fn print_session_diagnosis(diagnosis: &SessionDiagnosis) {
             owner.build_fingerprint,
             owner.storage_writer_epoch,
             owner.endpoint
+        );
+    }
+    println!(
+        "daemon owner classifications: {}",
+        diagnosis.daemon_owner_classifications.len()
+    );
+    for owner in &diagnosis.daemon_owner_classifications {
+        println!(
+            "  instance={} classification={:?}",
+            owner.daemon_instance_id, owner.classification
         );
     }
     if let Some(guidance) = &diagnosis.recovery_guidance {

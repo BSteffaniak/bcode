@@ -300,7 +300,8 @@ async fn probe_daemon_status(endpoint: &IpcEndpoint) -> Option<bcode_ipc::Daemon
 }
 
 /// Conservative classification of one daemon registry record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DaemonRecordClassification {
     /// Current-build daemon responded with the exact persisted identity.
     CurrentHealthy,
@@ -414,12 +415,20 @@ pub async fn classify_daemon_record(record: &DaemonRecord) -> DaemonRecordClassi
     } else {
         false
     };
-    classify_daemon_record_evidence(
+    let classification = classify_daemon_record_evidence(
         record,
         status.as_ref(),
         endpoint_reachable,
         process_identity_evidence(record),
-    )
+    );
+    tracing::debug!(
+        namespace = record.namespace,
+        instance_id = record.instance_id,
+        pid = record.pid,
+        classification = ?classification,
+        "classified daemon registry record"
+    );
+    classification
 }
 
 async fn live_record_matches_instance(record: &DaemonRecord) -> bool {

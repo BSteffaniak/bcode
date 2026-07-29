@@ -259,6 +259,23 @@ runtime lease. A later mutation or protected activity reacquires through the act
 runtime database or write lock. Explicit owner release uses this same serialized quiescence decision
 and reports stable blocker categories without cancelling work or detaching clients.
 
+## Ownership activity matrix
+
+| Activity | Ownership carrier | Terminal boundary |
+| --- | --- | --- |
+| Attached client | Actor client registration | Actor detach or rolled-back/cancelled attach reply |
+| Queued prompt, skill, or compaction | `QueuedCommand` guard in the queue item | Command terminal processing, send failure, queue drain, or runtime exit |
+| Active turn and nested permission/exchange work | Queue guard retained by the runtime command | Turn terminal persistence and invocation-sink flush |
+| Registered runtime/workflow work | `RuntimeWork` guard in the registry entry | Terminal durable runtime-work event and result persistence |
+| Plugin invocation and input route | `PluginInvocation` guard in the active registration | Registration drop after trailing canonical events |
+| Known-legacy migration | Exclusive maintenance coordinator, write guard, then handed-off runtime lease | Failed handoff drops maintenance; successful handoff is adopted and actor quiescence reevaluated |
+| Bounded history/projection/composer/input reads | None | Read completion |
+| Event/runtime-work subscriptions and attach forwarders | None beyond an actual attached client registration | Receiver/forwarder drop |
+| Background invariant selection | Bounded task/catalog snapshot only | Selector task completion or stale-task cancellation |
+
+No state envelope or snapshot in this matrix implies durable reconnect/resume. Durable resume would
+require an explicit retention, acknowledgement, replay, and conflict contract.
+
 ## Historical daemon record classification
 
 Daemon registry cleanup uses one conservative classification based on four independent facts:

@@ -4534,6 +4534,20 @@ async fn explicit_session_ownership_release_outcome(
     state: &ServerState,
     session_id: SessionId,
 ) -> Result<bcode_ipc::SessionOwnershipReleaseOutcome, ServerError> {
+    let started_at = Instant::now();
+    let outcome = explicit_session_ownership_release_outcome_inner(state, session_id).await?;
+    state.metrics.record_histogram(
+        "server.session_ownership.release_duration_ms",
+        elapsed_ms(started_at),
+    );
+    Ok(outcome)
+}
+
+#[allow(clippy::too_many_lines)]
+async fn explicit_session_ownership_release_outcome_inner(
+    state: &ServerState,
+    session_id: SessionId,
+) -> Result<bcode_ipc::SessionOwnershipReleaseOutcome, ServerError> {
     use bcode_ipc::{SessionOwnershipBlocker, SessionOwnershipReleaseOutcome};
 
     let mut blockers = BTreeSet::new();
@@ -8000,11 +8014,18 @@ fn server_session_error_response(error: &ServerError) -> ErrorResponse {
     }
 }
 
+const fn ownership_recovery_guidance() -> &'static str {
+    "ownership normally releases automatically after the final client disconnects and session work becomes quiescent; `bcode session release-owner <session-id>` requests non-destructive explicit release and reports blockers; `bcode session stop-owner <session-id>` requests verified graceful daemon shutdown; use `bcode session kill-owner <session-id>` only as a reviewed last resort after identity verification"
+}
+
 fn session_error_response(error: &bcode_session::SessionError) -> ErrorResponse {
     match error {
         bcode_session::SessionError::Lease(
             bcode_session::lease::SessionLeaseError::OwnedByOtherDaemon { .. },
-        ) => ErrorResponse::new("session_active_elsewhere", error.to_string()),
+        ) => ErrorResponse::new(
+            "session_active_elsewhere",
+            format!("{error}; {}", ownership_recovery_guidance()),
+        ),
         bcode_session::SessionError::ProjectionStale { .. } => {
             ErrorResponse::new("projection_stale", error.to_string())
         }
@@ -8045,9 +8066,7 @@ fn session_db_error_response(error: &bcode_session::db::SessionDbError) -> Error
         }
         _ if error.is_lock_error() => ErrorResponse::new(
             "session_database_locked",
-            format!(
-                "{error}; another Bcode instance owns this session database. Retry after its idle timeout, or use `bcode session release-owner <session-id>`; if needed, use `bcode session stop-owner <session-id>` or `bcode session kill-owner <session-id>`"
-            ),
+            format!("{error}; {}", ownership_recovery_guidance()),
         ),
         bcode_session::db::SessionDbError::ProjectionIncompatible { .. }
         | bcode_session::db::SessionDbError::ProjectionStale { .. }
@@ -27136,6 +27155,22 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[test]
+    fn ownership_guidance_distinguishes_automatic_and_escalating_actions() {
+        let guidance = ownership_recovery_guidance();
+        for expected in [
+            "releases automatically",
+            "release-owner",
+            "non-destructive",
+            "stop-owner",
+            "graceful",
+            "kill-owner",
+            "last resort",
+        ] {
+            assert!(guidance.contains(expected), "missing guidance: {expected}");
+        }
+    }
+
+    #[test]
     fn active_session_migration_blocks_idle_and_forced_shutdown() {
         assert_eq!(active_migration_shutdown_blocker(0), None);
         let blocker = active_migration_shutdown_blocker(2).expect("migration blocker");
@@ -35676,6 +35711,14 @@ library = "test"
                     bcode_ipc::SessionOwnershipBlocker::Migration,
                 ],
             }
+        );
+        assert!(
+            state
+                .metrics
+                .snapshot()
+                .histograms
+                .get("server.session_ownership.release_duration_ms")
+                .is_some_and(|histogram| histogram.count >= 1)
         );
         migration_blocker.notify_one();
     }

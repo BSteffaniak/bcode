@@ -19,6 +19,18 @@ if ! rg -q 'SessionOwnershipReleaseOutcome' packages/ipc/src/lib.rs \
   violations=1
 fi
 
+if ! rg -q 'DaemonRecordClassification' packages/daemon-lifecycle/src/lib.rs \
+  || ! rg -q 'classify_daemon_record\(' packages/daemon-lifecycle/src/lib.rs packages/cli/src/lib.rs \
+  || ! rg -q 'UnreachableStale' packages/daemon-lifecycle/src/lib.rs packages/cli/src/lib.rs \
+  || ! rg -q 'HistoricalProcessVerifiedProtocolUnsupported' packages/daemon-lifecycle/src/lib.rs packages/cli/src/lib.rs \
+  || ! grep -F 'daemon_control_policy_never_spawns_protocol_unsupported_or_ambiguous_records' packages/cli/src/lib.rs >/dev/null \
+  || ! grep -F 'current_process_identity_evidence_rejects_pid_reuse_and_accepts_exact_record' packages/daemon-lifecycle/src/lib.rs >/dev/null \
+  || ! grep -F '## Ownership activity matrix' docs/session-persistence-architecture.md >/dev/null \
+  || ! grep -F '## Historical daemon record classification' docs/session-persistence-architecture.md >/dev/null; then
+  echo "Session historical-daemon violation: conservative classification, control policy, fixtures, or architecture documentation was removed." >&2
+  violations=1
+fi
+
 if ! rg -q 'schema_version: 3' packages/session/src/lease.rs \
   || ! rg -q 'SessionOwnerLiveness' packages/session/src/lease.rs \
   || ! rg -q 'file.try_lock\(\)' packages/session/src/lease.rs \
