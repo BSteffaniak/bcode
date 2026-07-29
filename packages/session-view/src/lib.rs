@@ -8161,6 +8161,18 @@ mod tests {
                 text: "first".to_owned(),
             },
         ));
+        view.apply_live_event(&live(
+            "part-0",
+            2,
+            0,
+            0,
+            1,
+            1,
+            bcode_session_models::TextStreamOperation::Append {
+                expected_offset: 0,
+                text: "first".to_owned(),
+            },
+        ));
         let item = &view.snapshot().transcript.items[0];
         assert_eq!(
             item.id,
@@ -8174,6 +8186,25 @@ mod tests {
                     && activity.parts[0].text == "first"
                     && activity.parts[1].part_id == "part-1"
                     && activity.parts[1].text == "second"
+        ));
+
+        view.apply_live_event(&live(
+            "part-0",
+            2,
+            0,
+            0,
+            1,
+            1,
+            bcode_session_models::TextStreamOperation::Append {
+                expected_offset: 0,
+                text: "conflict".to_owned(),
+            },
+        ));
+        let stream_id =
+            TranscriptViewItemId::new("reasoning-stream:turn-1:activity:activity-1:part:part-0");
+        assert!(matches!(
+            view.snapshot().text_streams[&stream_id].status,
+            TextStreamViewStatus::Degraded
         ));
 
         view.apply_live_event(&live(
@@ -8245,6 +8276,18 @@ mod tests {
             bcode_session_models::TextStreamOperation::Append {
                 expected_offset: 7,
                 text: " ignored".to_owned(),
+            },
+        ));
+        view.apply_live_event(&live(
+            "part-0",
+            2,
+            0,
+            1,
+            1,
+            1,
+            bcode_session_models::TextStreamOperation::Append {
+                expected_offset: 0,
+                text: "new generation".to_owned(),
             },
         ));
         assert!(matches!(

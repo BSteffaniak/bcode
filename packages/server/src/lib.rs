@@ -3057,9 +3057,21 @@ async fn recover_abandoned_session_runtime_work(
             session_id,
             work.work_id,
             RuntimeWorkStatus::Failed,
-            Some(message),
+            Some(message.clone()),
         )
         .await;
+        if work.kind == RuntimeWorkKind::ModelTurn
+            && let Some(turn_id) = work.label.strip_prefix("model turn ")
+        {
+            append_model_turn_finished_event(
+                state,
+                session_id,
+                turn_id.to_owned(),
+                ModelTurnOutcome::Error,
+                Some(message),
+            )
+            .await;
+        }
     }
     Ok(())
 }
@@ -12750,7 +12762,6 @@ struct ModelStreamAccumulator {
     pending_text: String,
     pending_text_offset: usize,
     next_text_revision: u64,
-    pending_legacy_reasoning: String,
     last_flush: Instant,
     cancel_state: Arc<TurnCancelState>,
 }
@@ -12771,7 +12782,6 @@ impl ModelStreamAccumulator {
             pending_text: String::new(),
             pending_text_offset: 0,
             next_text_revision: 1,
-            pending_legacy_reasoning: String::new(),
             last_flush: Instant::now(),
             cancel_state,
         }
@@ -12785,16 +12795,8 @@ impl ModelStreamAccumulator {
         self.pending_text.push_str(text);
     }
 
-    fn push_legacy_reasoning(&mut self, text: &str) {
-        if self.cancel_state.is_cancelled() {
-            return;
-        }
-        self.pending_legacy_reasoning.push_str(text);
-    }
-
     fn should_flush(&self) -> bool {
-        (!self.pending_text.is_empty() || !self.pending_legacy_reasoning.is_empty())
-            && self.last_flush.elapsed() >= MODEL_STREAM_FLUSH_INTERVAL
+        !self.pending_text.is_empty() && self.last_flush.elapsed() >= MODEL_STREAM_FLUSH_INTERVAL
     }
 
     async fn flush_if_ready(&mut self, state: &ServerState) {
@@ -12807,7 +12809,6 @@ impl ModelStreamAccumulator {
         if self.cancel_state.is_cancelled() {
             self.assistant_text.clear();
             self.pending_text.clear();
-            self.pending_legacy_reasoning.clear();
             return;
         }
         let text = std::mem::take(&mut self.pending_text);
@@ -12836,19 +12837,6 @@ impl ModelStreamAccumulator {
                 .await;
             self.pending_text_offset = self.pending_text_offset.saturating_add(text_bytes);
             self.next_text_revision = revision.saturating_add(1);
-        }
-        let reasoning = std::mem::take(&mut self.pending_legacy_reasoning);
-        if !reasoning.is_empty() {
-            let _ = state
-                .sessions
-                .publish_live_event(
-                    self.session_id,
-                    SessionLiveEventKind::AssistantReasoningDelta {
-                        turn_id: self.turn_id.clone(),
-                        text: reasoning,
-                    },
-                )
-                .await;
         }
         self.last_flush = Instant::now();
     }
@@ -15088,6 +15076,7 @@ async fn handle_provider_turn_event(
                     .await;
                 }
             }
+            persist_completed_reasoning_activities(state, session_id, turn_id, outcome).await;
             handle_provider_tool_call_finished_event(
                 state,
                 session_id,
@@ -15097,7 +15086,6 @@ async fn handle_provider_turn_event(
                 stream,
             )
             .await;
-            persist_completed_reasoning_activities(state, session_id, turn_id, outcome).await;
             outcome.pending_tool_calls.push(call);
             stream_progress.finish_tool_call(&call_id);
         }
@@ -15287,8 +15275,23 @@ async fn handle_provider_turn_event(
         }
         ProviderTurnEvent::ReasoningDelta { text } => {
             outcome.saw_reasoning_evidence = true;
-            stream.push_legacy_reasoning(&text);
-            stream.flush_if_ready(state).await;
+            let activity_id = "legacy-reasoning".to_owned();
+            let activity_order = u32::MAX.saturating_sub(1);
+            let event = bcode_session_models::ReasoningActivityEvent::PartDelta {
+                activity_id: activity_id.clone(),
+                activity_order,
+                part_id: "legacy-summary".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Detail,
+                part_order: 0,
+                text,
+            };
+            outcome
+                .reasoning_activities
+                .entry(activity_id.clone())
+                .or_insert_with(|| ReasoningActivityAccumulator::new(activity_id, activity_order))
+                .apply(&event);
+            publish_reasoning_activity_live(state, session_id, turn_id, outcome, &event).await;
             if state.observability.debug_enabled() {
                 append_provider_event_trace(state, session_id, turn_id, "reasoning_delta", None)
                     .await;
@@ -21874,7 +21877,9 @@ async fn persist_completed_reasoning_activities(
     turn_id: &str,
     outcome: &mut ModelPollOutcome,
 ) {
-    for activity in take_completed_reasoning_activities(outcome) {
+    let mut completed = take_completed_reasoning_activities(outcome);
+    completed.sort_by_key(|activity| (activity.order, activity.activity_id.clone()));
+    for activity in completed {
         let activity = activity.finish(bcode_session_models::ReasoningActivityStatus::Completed);
         match state
             .sessions
@@ -30568,17 +30573,68 @@ library = "test"
     }
 
     #[test]
-    fn structured_reasoning_does_not_enter_legacy_batch_buffer() {
-        let mut stream = ModelStreamAccumulator::new(
+    fn assistant_stream_accumulator_has_no_legacy_reasoning_output_path() {
+        let stream = ModelStreamAccumulator::new(
             SessionId::new(),
             "turn-1",
             0,
             Arc::new(TurnCancelState::default()),
         );
-        stream.push_legacy_reasoning("legacy");
 
-        assert_eq!(stream.pending_legacy_reasoning, "legacy");
         assert!(stream.assistant_text.is_empty());
+        assert!(!stream.should_flush());
+    }
+
+    #[test]
+    fn completed_reasoning_is_taken_in_stable_order_before_tool_boundary_segment() {
+        let mut outcome = ModelPollOutcome::default();
+        for (activity_id, order, text) in [
+            ("reasoning-later", 1, "later"),
+            ("reasoning-first", 0, "first"),
+        ] {
+            let mut activity = ReasoningActivityAccumulator::new(activity_id.to_owned(), order);
+            activity.apply(
+                &bcode_session_models::ReasoningActivityEvent::PartCompleted {
+                    activity_id: activity_id.to_owned(),
+                    activity_order: order,
+                    part_id: "summary-0".to_owned(),
+                    kind: bcode_session_models::ReasoningContentKind::Summary,
+                    role: bcode_session_models::ReasoningContentRole::Milestone,
+                    part_order: 0,
+                    text: text.to_owned(),
+                },
+            );
+            activity.apply(&bcode_session_models::ReasoningActivityEvent::Finished {
+                activity_id: activity_id.to_owned(),
+                activity_order: order,
+                status: bcode_session_models::ReasoningActivityStatus::Completed,
+            });
+            outcome
+                .reasoning_activities
+                .insert(activity_id.to_owned(), activity);
+        }
+        outcome.reasoning_activities.insert(
+            "reasoning-active".to_owned(),
+            ReasoningActivityAccumulator::new("reasoning-active".to_owned(), 2),
+        );
+
+        let mut completed = take_completed_reasoning_activities(&mut outcome);
+        completed.sort_by_key(|activity| (activity.order, activity.activity_id.clone()));
+        assert_eq!(
+            completed
+                .iter()
+                .map(|activity| activity.activity_id.as_str())
+                .collect::<Vec<_>>(),
+            ["reasoning-first", "reasoning-later"]
+        );
+        assert_eq!(
+            outcome
+                .reasoning_activities
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["reasoning-active"]
+        );
     }
 
     #[test]
@@ -34306,6 +34362,102 @@ library = "test"
 
     fn test_server_state(sessions: SessionManager) -> ServerState {
         test_server_state_with_ralph_store(sessions, bcode_ralph::RalphStateStore::default())
+    }
+
+    #[tokio::test]
+    async fn abandoned_model_turn_recovery_is_bounded_idempotent_and_drops_partial_text() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("persistent session manager");
+        let session = sessions
+            .create_session(Some("recovery".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let work_id = WorkId::new("model_turn-recovery");
+        let turn_id = "turn-recovery";
+        sessions
+            .append_runtime_work_started(
+                session.id,
+                SessionEventKind::RuntimeWorkStarted {
+                    work_id: work_id.clone(),
+                    kind: RuntimeWorkKind::ModelTurn,
+                    label: format!("model turn {turn_id}"),
+                    tool_call_id: None,
+                    plugin_id: None,
+                    service_interface: None,
+                    operation: None,
+                    parent_work_id: None,
+                    started_at_ms: Some(1),
+                    cancellable: true,
+                },
+            )
+            .await
+            .expect("runtime work start");
+        sessions
+            .append_model_turn_started(session.id, turn_id.to_owned())
+            .await
+            .expect("turn start");
+        let _ = sessions
+            .publish_live_event(
+                session.id,
+                SessionLiveEventKind::AssistantTextStreamUpdated {
+                    turn_id: turn_id.to_owned(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
+                    update: bcode_session_models::TextStreamUpdate {
+                        generation: 0,
+                        first_revision: 1,
+                        revision: 1,
+                        operation: bcode_session_models::TextStreamOperation::Append {
+                            expected_offset: 0,
+                            text: "partial secret".to_owned(),
+                        },
+                    },
+                },
+            )
+            .await;
+        let state = test_server_state(sessions.clone());
+
+        recover_abandoned_session_runtime_work(&state, session.id)
+            .await
+            .expect("first recovery");
+        recover_abandoned_session_runtime_work(&state, session.id)
+            .await
+            .expect("repeated recovery");
+
+        let history = sessions.session_history(session.id).await.expect("history");
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::RuntimeWorkFinished { work_id: id, .. } if id == &work_id
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            history
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    SessionEventKind::ModelTurnFinished { turn_id: id, .. } if id == turn_id
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            !serde_json::to_string(&history)
+                .expect("history JSON")
+                .contains("partial secret")
+        );
+        assert!(
+            sessions
+                .attach_session(session.id, ClientId::new())
+                .await
+                .expect("attach after recovery")
+                .live_checkpoints
+                .is_empty()
+        );
     }
 
     #[tokio::test]
