@@ -694,104 +694,28 @@ const fn process_is_alive(_pid: u32) -> bool {
     true
 }
 
-#[cfg(unix)]
 fn lock_file_shared(file: &File) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    const LOCK_SH: i32 = 1;
-
-    // SAFETY: `file.as_raw_fd()` is a valid descriptor for the lifetime of this call, and flock
-    // does not retain the pointer or require additional invariants.
-    let result = unsafe { flock(file.as_raw_fd(), LOCK_SH) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    file.lock_shared()
 }
 
-#[cfg(not(unix))]
-fn lock_file_shared(_file: &File) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        SessionLeaseError::Unsupported.to_string(),
-    ))
-}
-
-#[cfg(unix)]
 fn try_lock_file_exclusive(file: &File) -> io::Result<bool> {
-    use std::os::fd::AsRawFd;
-
-    const LOCK_EX: i32 = 2;
-    const LOCK_NB: i32 = 4;
-    let result = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
-    if result == 0 {
-        return Ok(true);
-    }
-    let error = io::Error::last_os_error();
-    if matches!(error.kind(), io::ErrorKind::WouldBlock) {
-        Ok(false)
-    } else {
-        Err(error)
+    match file.try_lock() {
+        Ok(()) => Ok(true),
+        Err(fs::TryLockError::WouldBlock) => Ok(false),
+        Err(fs::TryLockError::Error(error)) => Err(error),
     }
 }
 
-#[cfg(not(unix))]
-fn try_lock_file_exclusive(_file: &File) -> io::Result<bool> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        SessionLeaseError::Unsupported.to_string(),
-    ))
-}
-
-#[cfg(unix)]
 fn lock_file_exclusive(file: &File) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    const LOCK_EX: i32 = 2;
-
-    // SAFETY: `file.as_raw_fd()` is a valid descriptor for the lifetime of this call, and flock
-    // does not retain the pointer or require additional invariants.
-    let result = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    file.lock()
 }
 
-#[cfg(not(unix))]
-fn lock_file_exclusive(_file: &File) -> io::Result<()> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        SessionLeaseError::Unsupported.to_string(),
-    ))
-}
-
-#[cfg(unix)]
 fn unlock_file(file: &File) -> io::Result<()> {
-    use std::os::fd::AsRawFd;
-
-    const LOCK_UN: i32 = 8;
-
-    // SAFETY: `file.as_raw_fd()` is a valid descriptor for the lifetime of this call, and flock
-    // does not retain the pointer or require additional invariants.
-    let result = unsafe { flock(file.as_raw_fd(), LOCK_UN) };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(unix))]
-fn unlock_file(_file: &File) -> io::Result<()> {
-    Ok(())
+    file.unlock()
 }
 
 #[cfg(unix)]
 unsafe extern "C" {
-    fn flock(fd: i32, operation: i32) -> i32;
     fn kill(pid: i32, sig: i32) -> i32;
 }
 

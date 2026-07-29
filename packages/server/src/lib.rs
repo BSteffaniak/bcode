@@ -4382,7 +4382,7 @@ async fn explicit_session_ownership_release_outcome(
     if session_has_active_plugin_invocations(state, session_id) {
         blockers.insert(SessionOwnershipBlocker::PluginInvocation);
     }
-    if state.session_migrations.active_count().await > 0 {
+    if state.session_migrations.is_active(session_id).await {
         blockers.insert(SessionOwnershipBlocker::Migration);
     }
     let actor_snapshot = state

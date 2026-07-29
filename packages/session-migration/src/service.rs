@@ -62,6 +62,11 @@ impl SessionMigrationService {
         self.operations.get(session_id, operation_id).await
     }
 
+    /// Return whether one session currently has a running migration operation.
+    pub async fn is_active(&self, session_id: SessionId) -> bool {
+        self.operations.is_active(session_id).await
+    }
+
     /// Count currently running migration operations.
     pub async fn active_count(&self) -> usize {
         self.operations.active_count().await
@@ -112,6 +117,7 @@ mod tests {
             .await;
 
         assert_eq!(service.active_count().await, 1);
+        assert!(service.is_active(session_id).await);
         let receiver = service
             .subscribe(session_id, operation_id)
             .await
@@ -124,5 +130,6 @@ mod tests {
             .await
             .expect("terminal operation");
         assert_eq!(service.active_count().await, 0);
+        assert!(!service.is_active(session_id).await);
     }
 }

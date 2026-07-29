@@ -278,6 +278,15 @@ impl SessionMigrationOperations {
             .cloned()
     }
 
+    /// Return whether one session currently has a running migration operation.
+    pub async fn is_active(&self, session_id: SessionId) -> bool {
+        self.entries
+            .lock()
+            .await
+            .get(&session_id)
+            .is_some_and(|operation| !operation.is_terminal())
+    }
+
     /// Count currently running operations.
     pub async fn active_count(&self) -> usize {
         self.entries
