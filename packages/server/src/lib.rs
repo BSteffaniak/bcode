@@ -2096,10 +2096,19 @@ fn resolve_plugin_configs(
             if raw.is_null() {
                 return None;
             }
+            let delivered = sanitize_plugin_config_value(&raw);
             let redacted = redact_plugin_config_value(&raw);
+            let plugin_id = manifest.id.clone();
+            let config = config.clone();
+            let resolver_source = raw;
+            let resolver: bcode_plugin::PluginSecretResolver =
+                std::sync::Arc::new(move |_interface_id, _operation, _delivered_config| {
+                    resolve_invocation_secrets(&plugin_id, &config, &resolver_source)
+                });
             Some((
                 manifest.id.clone(),
-                bcode_plugin::ResolvedPluginConfig::new(raw, redacted),
+                bcode_plugin::ResolvedPluginConfig::new(delivered, redacted)
+                    .with_secret_resolver(resolver),
             ))
         })
         .collect()
@@ -2121,46 +2130,199 @@ fn resolved_plugin_config_value(
     if let Some(plugin_value) = config.plugins.config.get(&manifest.id) {
         merge_json_values(&mut value, toml_value_to_json(plugin_value));
     }
-    resolve_plugin_config_secrets(value)
+    value
 }
 
-fn resolve_plugin_config_secrets(value: serde_json::Value) -> serde_json::Value {
+fn sanitize_plugin_config_value(value: &serde_json::Value) -> serde_json::Value {
     match value {
-        serde_json::Value::Object(map) => {
-            if let Some(resolved) = resolve_secret_ref(&map) {
-                return serde_json::Value::String(resolved);
-            }
-            serde_json::Value::Object(
-                map.into_iter()
-                    .map(|(key, value)| (key, resolve_plugin_config_secrets(value)))
-                    .collect(),
-            )
+        serde_json::Value::Object(map) if secret_ref_backend(map).is_some() => {
+            serde_json::Value::Object(map.clone())
         }
-        serde_json::Value::Array(values) => serde_json::Value::Array(
-            values
-                .into_iter()
-                .map(resolve_plugin_config_secrets)
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.iter()
+                .map(|(key, value)| (key.clone(), sanitize_plugin_config_value(value)))
                 .collect(),
         ),
-        value => value,
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(sanitize_plugin_config_value).collect())
+        }
+        value => value.clone(),
     }
 }
 
-fn resolve_secret_ref(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
-    let backend = map.get("backend")?.as_str()?;
-    match backend {
-        "env" => map
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .and_then(|name| std::env::var(name).ok())
-            .filter(|value| !value.trim().is_empty()),
-        "sshenv" => resolve_sshenv_secret_ref(map),
+fn canonical_plugin_secret_id(plugin_id: &str, provider_id: &str, credential_id: &str) -> String {
+    format!("{plugin_id}/{provider_id}/{credential_id}")
+}
+
+fn resolve_invocation_secrets(
+    plugin_id: &str,
+    config: &bcode_config::BcodeConfig,
+    value: &serde_json::Value,
+) -> Result<std::collections::BTreeMap<String, String>, String> {
+    let mut secrets = std::collections::BTreeMap::new();
+    collect_explicit_secret_refs(plugin_id, value, &mut Vec::new(), &mut secrets)?;
+    let runtime = bcode_config::load_runtime_auth_subscriptions();
+    for (provider_id, binding) in &config.auth.bindings {
+        if let Some(profile_name) = binding.profile.as_deref().or(Some(provider_id.as_str()))
+            && let Some(profile) = config.auth.profiles.get(profile_name)
+            && profile.owner_plugin_id.as_deref() == Some(plugin_id)
+        {
+            collect_profile_secrets(plugin_id, provider_id, profile_name, profile, &mut secrets)?;
+        }
+    }
+    for (provider_id, binding) in &runtime.bindings {
+        if binding.owner_plugin_id != plugin_id {
+            continue;
+        }
+        if config.auth.bindings.contains_key(provider_id)
+            || config.auth.profiles.contains_key(&binding.profile)
+        {
+            continue;
+        }
+        let Some(profile) = runtime.profiles.get(&binding.profile) else {
+            return Err(format!(
+                "runtime auth binding '{provider_id}' references missing profile '{}'",
+                binding.profile
+            ));
+        };
+        if profile.owner_plugin_id != plugin_id || profile.provider_id != *provider_id {
+            return Err(format!(
+                "runtime auth binding '{provider_id}' has inconsistent plugin/provider ownership"
+            ));
+        }
+        let config_profile = bcode_config::AuthProfileConfig {
+            backend: profile.backend.clone(),
+            provider_id: Some(profile.provider_id.clone()),
+            owner_plugin_id: Some(profile.owner_plugin_id.clone()),
+            scheme: Some(profile.scheme.clone()),
+            map: profile.map.clone(),
+            settings: std::collections::BTreeMap::from([
+                ("profile".to_owned(), profile.storage_profile.clone()),
+                ("vault".to_owned(), profile.vault.display().to_string()),
+            ]),
+        };
+        collect_profile_secrets(
+            plugin_id,
+            provider_id,
+            &binding.profile,
+            &config_profile,
+            &mut secrets,
+        )?;
+    }
+    Ok(secrets)
+}
+
+fn collect_profile_secrets(
+    plugin_id: &str,
+    provider_id: &str,
+    profile_name: &str,
+    profile: &bcode_config::AuthProfileConfig,
+    secrets: &mut std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    if profile.owner_plugin_id.as_deref() != Some(plugin_id)
+        || profile.provider_id.as_deref() != Some(provider_id)
+    {
+        return Err(format!(
+            "auth profile '{profile_name}' ownership does not match plugin/provider"
+        ));
+    }
+    let resolved = bcode_provider_auth::resolve_auth_profile(profile_name, profile);
+    for (credential_id, mapping) in &profile.map {
+        let source_key = mapping.env.as_ref().or(mapping.key.as_ref());
+        if let Some(source_key) = source_key
+            && let Ok(value) = std::env::var(source_key)
+            && !value.trim().is_empty()
+        {
+            secrets
+                .entry(canonical_plugin_secret_id(
+                    plugin_id,
+                    provider_id,
+                    credential_id,
+                ))
+                .or_insert(value);
+        }
+    }
+    for (credential_id, credential) in resolved.auth.credentials {
+        let id = canonical_plugin_secret_id(plugin_id, provider_id, &credential_id);
+        secrets.entry(id).or_insert(credential.value);
+    }
+    Ok(())
+}
+
+fn collect_explicit_secret_refs(
+    plugin_id: &str,
+    value: &serde_json::Value,
+    path: &mut Vec<String>,
+    secrets: &mut std::collections::BTreeMap<String, String>,
+) -> Result<(), String> {
+    match value {
+        serde_json::Value::Object(map) if secret_ref_backend(map).is_some() => {
+            let provider_id = path.iter().rev().nth(1).map_or("config", String::as_str);
+            let credential_id = path.last().map_or("secret", String::as_str);
+            if let Some(secret) = resolve_secret_ref(map)? {
+                secrets.insert(
+                    canonical_plugin_secret_id(plugin_id, provider_id, credential_id),
+                    secret,
+                );
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                path.push(key.clone());
+                collect_explicit_secret_refs(plugin_id, value, path, secrets)?;
+                path.pop();
+            }
+            Ok(())
+        }
+        serde_json::Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                path.push(index.to_string());
+                collect_explicit_secret_refs(plugin_id, value, path, secrets)?;
+                path.pop();
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn secret_ref_backend(map: &serde_json::Map<String, serde_json::Value>) -> Option<&str> {
+    match map.get("backend").and_then(serde_json::Value::as_str) {
+        Some("env" | "sshenv") => map.get("backend").and_then(serde_json::Value::as_str),
         _ => None,
     }
 }
 
-fn resolve_sshenv_secret_ref(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
-    let profile = map.get("profile")?.as_str()?;
+fn resolve_secret_ref(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Option<String>, String> {
+    let backend = map
+        .get("backend")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "secret reference has no backend".to_owned())?;
+    match backend {
+        "env" => {
+            let name = map
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "environment secret reference has no name".to_owned())?;
+            Ok(std::env::var(name)
+                .ok()
+                .filter(|value| !value.trim().is_empty()))
+        }
+        "sshenv" => resolve_sshenv_secret_ref(map).map(Some),
+        other => Err(format!("unsupported secret backend '{other}'")),
+    }
+}
+
+fn resolve_sshenv_secret_ref(
+    map: &serde_json::Map<String, serde_json::Value>,
+) -> Result<String, String> {
+    let profile = map
+        .get("profile")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "sshenv secret reference has no profile".to_owned())?;
     let key = map
         .get("key")
         .and_then(serde_json::Value::as_str)
@@ -2179,9 +2341,9 @@ fn resolve_sshenv_secret_ref(map: &serde_json::Map<String, serde_json::Value>) -
     );
     store
         .get_profile(profile)
-        .ok()
-        .flatten()
+        .map_err(|error| format!("failed to read sshenv profile '{profile}': {error}"))?
         .and_then(|profile_env| profile_env.get(key).map(|value| value.as_str().to_string()))
+        .ok_or_else(|| format!("sshenv profile '{profile}' has no credential '{key}'"))
 }
 
 fn toml_value_to_json(value: &toml::Value) -> serde_json::Value {
@@ -2699,10 +2861,17 @@ async fn apply_invariant_selector_result(
 
 fn redact_plugin_config_value(value: &serde_json::Value) -> serde_json::Value {
     match value {
+        serde_json::Value::Object(map) if secret_ref_backend(map).is_some() => {
+            // Secret references are non-secret configuration. Preserve them so status and
+            // remediation can explain the selected backend/profile without exposing a value.
+            serde_json::Value::Object(map.clone())
+        }
         serde_json::Value::Object(map) => serde_json::Value::Object(
             map.iter()
                 .map(|(key, value)| {
-                    if key.to_ascii_lowercase().contains("key")
+                    if value.as_object().and_then(secret_ref_backend).is_some() {
+                        (key.clone(), value.clone())
+                    } else if key.to_ascii_lowercase().contains("key")
                         || key.to_ascii_lowercase().contains("secret")
                         || key.to_ascii_lowercase().contains("token")
                     {
@@ -26119,6 +26288,136 @@ mod tests {
             bcode_ipc::SessionOwnershipReleaseOutcome::AlreadyUnowned
         );
         server.abort();
+    }
+
+    #[test]
+    fn plugin_secret_references_remain_non_secret_until_invocation() {
+        let secret = "phase-five-secret";
+        unsafe {
+            std::env::set_var("BCODE_PHASE_FIVE_SECRET", secret);
+        }
+        let raw = serde_json::json!({
+            "providers": {
+                "exa": {
+                    "api_key": {
+                        "backend": "env",
+                        "name": "BCODE_PHASE_FIVE_SECRET"
+                    }
+                }
+            }
+        });
+        let delivered = sanitize_plugin_config_value(&raw);
+        let redacted = redact_plugin_config_value(&raw);
+        let secrets = resolve_invocation_secrets(
+            "bcode.web-search",
+            &bcode_config::BcodeConfig::default(),
+            &raw,
+        )
+        .expect("resolve invocation secrets");
+        unsafe {
+            std::env::remove_var("BCODE_PHASE_FIVE_SECRET");
+        }
+
+        assert_eq!(delivered, raw);
+        assert_eq!(redacted, raw);
+        assert!(!delivered.to_string().contains(secret));
+        assert!(!redacted.to_string().contains(secret));
+        assert_eq!(
+            secrets
+                .get("bcode.web-search/exa/api_key")
+                .map(String::as_str),
+            Some(secret)
+        );
+    }
+
+    #[test]
+    fn invocation_secret_resolution_is_owner_scoped_and_live() {
+        let config = bcode_config::BcodeConfig {
+            auth: bcode_config::AuthConfig {
+                bindings: std::collections::BTreeMap::from([(
+                    "exa".to_owned(),
+                    bcode_config::AuthBindingConfig {
+                        profile: Some("exa".to_owned()),
+                    },
+                )]),
+                profiles: std::collections::BTreeMap::from([(
+                    "exa".to_owned(),
+                    bcode_config::AuthProfileConfig {
+                        backend: "env".to_owned(),
+                        provider_id: Some("exa".to_owned()),
+                        owner_plugin_id: Some("bcode.web-search".to_owned()),
+                        scheme: Some("api_key".to_owned()),
+                        map: std::collections::BTreeMap::from([(
+                            "api_key".to_owned(),
+                            bcode_config::AuthCredentialMapping {
+                                env: Some("BCODE_PHASE_FIVE_LIVE".to_owned()),
+                                key: None,
+                            },
+                        )]),
+                        settings: std::collections::BTreeMap::new(),
+                    },
+                )]),
+                ..bcode_config::AuthConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+        unsafe {
+            std::env::set_var("BCODE_PHASE_FIVE_LIVE", "first");
+        }
+        let first =
+            resolve_invocation_secrets("bcode.web-search", &config, &serde_json::Value::Null)
+                .expect("first resolution");
+        let unrelated =
+            resolve_invocation_secrets("bcode.unrelated", &config, &serde_json::Value::Null)
+                .expect("unrelated resolution");
+        unsafe {
+            std::env::set_var("BCODE_PHASE_FIVE_LIVE", "second");
+        }
+        let second =
+            resolve_invocation_secrets("bcode.web-search", &config, &serde_json::Value::Null)
+                .expect("second resolution");
+        unsafe {
+            std::env::remove_var("BCODE_PHASE_FIVE_LIVE");
+        }
+
+        assert_eq!(
+            first
+                .get("bcode.web-search/exa/api_key")
+                .map(String::as_str),
+            Some("first")
+        );
+        assert!(unrelated.is_empty());
+        assert_eq!(
+            second
+                .get("bcode.web-search/exa/api_key")
+                .map(String::as_str),
+            Some("second")
+        );
+    }
+
+    #[test]
+    fn secret_resolution_errors_are_non_secret_and_actionable() {
+        let raw = serde_json::json!({
+            "providers": {
+                "exa": {
+                    "api_key": {
+                        "backend": "sshenv",
+                        "profile": "missing-profile",
+                        "key": "EXA_API_KEY",
+                        "vault": "/definitely/missing/bcode-auth-vault"
+                    }
+                }
+            }
+        });
+        let error = resolve_invocation_secrets(
+            "bcode.web-search",
+            &bcode_config::BcodeConfig::default(),
+            &raw,
+        )
+        .expect_err("missing vault should fail");
+
+        assert!(error.contains("missing-profile") || error.contains("sshenv"));
+        assert!(!error.contains("phase-five-secret"));
     }
 
     #[tokio::test]

@@ -835,21 +835,76 @@ impl RegisteredPlugin {
     }
 }
 
+/// Invocation-time secret resolver owned by the host application.
+pub type PluginSecretResolver = Arc<
+    dyn Fn(&str, &str, &serde_json::Value) -> Result<BTreeMap<String, String>, String>
+        + Send
+        + Sync,
+>;
+
 /// Resolved per-plugin host configuration.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone)]
 pub struct ResolvedPluginConfig {
     pub config: serde_json::Value,
     pub redacted_config: serde_json::Value,
+    secret_resolver: Option<PluginSecretResolver>,
+}
+
+impl std::fmt::Debug for ResolvedPluginConfig {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ResolvedPluginConfig")
+            .field("config", &self.config)
+            .field("redacted_config", &self.redacted_config)
+            .field("has_secret_resolver", &self.secret_resolver.is_some())
+            .finish()
+    }
+}
+
+impl Default for ResolvedPluginConfig {
+    fn default() -> Self {
+        Self {
+            config: serde_json::Value::Null,
+            redacted_config: serde_json::Value::Null,
+            secret_resolver: None,
+        }
+    }
 }
 
 impl ResolvedPluginConfig {
-    /// Create a resolved plugin config from raw and redacted JSON values.
+    /// Create resolved plugin config without an invocation-time secret resolver.
     #[must_use]
     pub const fn new(config: serde_json::Value, redacted_config: serde_json::Value) -> Self {
         Self {
             config,
             redacted_config,
+            secret_resolver: None,
         }
+    }
+
+    /// Attach a host-owned invocation-time secret resolver.
+    #[must_use]
+    pub fn with_secret_resolver(mut self, resolver: PluginSecretResolver) -> Self {
+        self.secret_resolver = Some(resolver);
+        self
+    }
+
+    fn resolve_secrets(
+        &self,
+        interface_id: &str,
+        operation: &str,
+    ) -> Result<BTreeMap<String, String>, PluginLoadError> {
+        self.secret_resolver.as_ref().map_or_else(
+            || Ok(BTreeMap::new()),
+            |resolver| {
+                resolver(interface_id, operation, &self.config).map_err(|message| {
+                    PluginLoadError::SecretResolution {
+                        plugin_id: String::new(),
+                        message,
+                    }
+                })
+            },
+        )
     }
 }
 
@@ -1232,17 +1287,31 @@ impl LoadedPlugin {
         ) -> Result<ServiceBridgeResponse, String>,
         cancellation: &bcode_plugin_sdk::ServiceCancellation,
     ) -> Result<ServiceResponse, PluginLoadError> {
+        let interface_id = interface_id.into();
+        let operation = operation.into();
+        let secrets = self
+            .config
+            .resolve_secrets(&interface_id, &operation)
+            .map_err(|error| match error {
+                PluginLoadError::SecretResolution { message, .. } => {
+                    PluginLoadError::SecretResolution {
+                        plugin_id: self.manifest.id.clone(),
+                        message,
+                    }
+                }
+                other => other,
+            })?;
         let context = NativeServiceContext {
             plugin_id: self.manifest.id.clone(),
             request: ServiceRequest {
-                interface_id: interface_id.into(),
-                operation: operation.into(),
+                interface_id,
+                operation,
                 payload,
             },
             config: PluginConfigContext {
                 config: self.config.config.clone(),
                 redacted_config: self.config.redacted_config.clone(),
-                secrets: BTreeMap::new(),
+                secrets,
             },
             events: bcode_plugin_sdk::ServiceEventEmitter::default(),
             cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
@@ -1431,6 +1500,8 @@ pub enum PluginLoadError {
         plugin_id: String,
         source: AuthProviderRegistryError,
     },
+    #[error("plugin '{plugin_id}' secret resolution failed: {message}")]
+    SecretResolution { plugin_id: String, message: String },
     #[error("failed to load native library {path}: {source}")]
     LibraryLoad {
         path: PathBuf,

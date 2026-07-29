@@ -3773,37 +3773,38 @@ async fn run_auth_interactive_flow(
         for diagnostic in &response.diagnostics {
             println!("Diagnostic [{}]: {}", diagnostic.code, diagnostic.message);
         }
-        match response.status {
-            bcode_provider_auth_models::AuthFlowStatus::Pending => {
-                request.operation = bcode_provider_auth_models::AuthFlowOperation::Continue;
-                request.state = response.state;
-                request.input = input;
+        if auth_flow_terminal_result(response.status)?.is_some() {
+            if !response.credentials.is_empty() {
+                bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
+                    resolved,
+                    &provider.contribution.provider_id,
+                    &provider.plugin_id,
+                    method,
+                )
+                .map_err(|error| CliError::LoginProfile(error.to_string()))?
+                .upsert(response.credentials)
+                .map_err(|error| CliError::LoginProfile(error.to_string()))?;
             }
-            bcode_provider_auth_models::AuthFlowStatus::Succeeded => {
-                if !response.credentials.is_empty() {
-                    bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
-                        resolved,
-                        &provider.contribution.provider_id,
-                        &provider.plugin_id,
-                        method,
-                    )
-                    .map_err(|error| CliError::LoginProfile(error.to_string()))?
-                    .upsert(response.credentials)
-                    .map_err(|error| CliError::LoginProfile(error.to_string()))?;
-                }
-                return Ok(());
-            }
-            bcode_provider_auth_models::AuthFlowStatus::Failed => {
-                return Err(CliError::LoginProfile(
-                    "Provider authentication flow failed.".to_owned(),
-                ));
-            }
-            bcode_provider_auth_models::AuthFlowStatus::Cancelled => {
-                return Err(CliError::LoginProfile(
-                    "Provider authentication flow was cancelled.".to_owned(),
-                ));
-            }
+            return Ok(());
         }
+        request.operation = bcode_provider_auth_models::AuthFlowOperation::Continue;
+        request.state = response.state;
+        request.input = input;
+    }
+}
+
+fn auth_flow_terminal_result(
+    status: bcode_provider_auth_models::AuthFlowStatus,
+) -> Result<Option<()>, CliError> {
+    match status {
+        bcode_provider_auth_models::AuthFlowStatus::Pending => Ok(None),
+        bcode_provider_auth_models::AuthFlowStatus::Succeeded => Ok(Some(())),
+        bcode_provider_auth_models::AuthFlowStatus::Failed => Err(CliError::LoginProfile(
+            "Provider authentication flow failed.".to_owned(),
+        )),
+        bcode_provider_auth_models::AuthFlowStatus::Cancelled => Err(CliError::LoginProfile(
+            "Provider authentication flow was cancelled.".to_owned(),
+        )),
     }
 }
 
@@ -9028,6 +9029,79 @@ mod auth_cli_tests {
                     profile: Some(profile),
                 }
             }) if provider == "test" && profile == "work"
+        ));
+    }
+
+    #[test]
+    fn unknown_and_disabled_provider_lookup_fails_closed() {
+        let host = bcode_plugin::PluginHost::default();
+        let error = registered_auth_provider(&host, "missing").expect_err("missing provider");
+        assert!(
+            error
+                .to_string()
+                .contains("not registered by an enabled plugin")
+        );
+    }
+
+    #[test]
+    fn failed_and_cancelled_flow_statuses_are_terminal_errors() {
+        assert!(
+            auth_flow_terminal_result(bcode_provider_auth_models::AuthFlowStatus::Failed).is_err()
+        );
+        assert!(
+            auth_flow_terminal_result(bcode_provider_auth_models::AuthFlowStatus::Cancelled)
+                .is_err()
+        );
+        assert_eq!(
+            auth_flow_terminal_result(bcode_provider_auth_models::AuthFlowStatus::Pending)
+                .expect("pending result"),
+            None
+        );
+        assert_eq!(
+            auth_flow_terminal_result(bcode_provider_auth_models::AuthFlowStatus::Succeeded)
+                .expect("success result"),
+            Some(())
+        );
+    }
+
+    #[test]
+    fn malformed_and_unsupported_flow_responses_fail_validation() {
+        assert!(
+            serde_json::from_value::<bcode_provider_auth_models::AuthFlowResponse>(
+                serde_json::json!({"schema_version": 1, "status": "not_a_status"})
+            )
+            .is_err()
+        );
+
+        let unsupported = bcode_provider_auth_models::AuthFlowResponse {
+            schema_version: bcode_provider_auth_models::AUTH_FLOW_SCHEMA_VERSION + 1,
+            status: bcode_provider_auth_models::AuthFlowStatus::Failed,
+            state: None,
+            effects: Vec::new(),
+            credentials: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        };
+        assert!(matches!(
+            unsupported.validate(),
+            Err(bcode_provider_auth_models::AuthContractError::UnsupportedSchema { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_provider_registration_is_rejected_before_cli_dispatch() {
+        let contribution = bcode_provider_auth_models::AuthProviderContribution {
+            schema_version: bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+            provider_id: "test".to_owned(),
+            display_name: "Test".to_owned(),
+            methods: vec![interactive("browser")],
+        };
+        let mut registry = bcode_plugin::AuthProviderRegistry::new();
+        registry
+            .register("bcode.first", contribution.clone())
+            .expect("first registration");
+        assert!(matches!(
+            registry.register("bcode.second", contribution),
+            Err(bcode_plugin::AuthProviderRegistryError::DuplicateProvider { .. })
         ));
     }
 
