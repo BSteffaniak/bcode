@@ -922,7 +922,7 @@ enum SessionCommand {
     Reindex {
         session_id: SessionId,
     },
-    /// Ask the verified daemon owning a session to release its database handle.
+    /// Ask the verified daemon owning a session to release ownership when quiescent.
     ReleaseOwner {
         session_id: SessionId,
     },
