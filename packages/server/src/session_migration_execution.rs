@@ -193,7 +193,8 @@ pub async fn migrate_owned_session_storage(
     writer_epoch: u64,
     progress: &MigrationExecutionProgress,
     metrics: &MetricsRegistry,
-) -> Result<(), SessionError> {
+    lease_owner: &lease::SessionLeaseOwnerContext,
+) -> Result<lease::SessionLeaseGuard, SessionError> {
     let started = metrics.timer();
     metrics.increment_counter("session.manager.storage_migration.attempted_total");
     progress.stage(
@@ -230,10 +231,11 @@ pub async fn migrate_owned_session_storage(
         .await?;
     }
     drop(write);
-    drop(maintenance);
+    let lease =
+        lease::transition_session_maintenance_to_lease(maintenance, root, session_id, lease_owner)?;
     let current = db::SessionDb::open_existing_turso_in_root(session_id, root).await?;
     current.validate_write_readiness().await?;
-    Ok(())
+    Ok(lease)
 }
 
 /// Execute one exclusively owned historical migration through the current target API.

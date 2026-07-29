@@ -7636,14 +7636,19 @@ async fn handle_prepare_session_open(
                     let root = sessions
                         .session_store_root()
                         .ok_or(bcode_session::SessionError::NotFound(session_id))?;
-                    session_migration_execution::migrate_owned_session_storage(
+                    let lease_owner = sessions
+                        .session_lease_owner()
+                        .ok_or(bcode_session::SessionError::NotFound(session_id))?;
+                    let lease = session_migration_execution::migrate_owned_session_storage(
                         session_id,
                         &root,
                         u64::from(source_writer_epoch),
                         &reporter,
                         &bcode_metrics::MetricsRegistry::disabled(),
+                        &lease_owner,
                     )
                     .await?;
+                    sessions.adopt_session_lease(session_id, lease).await?;
                     sessions.load_current_session(session_id).await
                 }
                 .await;

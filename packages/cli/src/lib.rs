@@ -6776,6 +6776,7 @@ struct SessionDiagnosis {
     write_readiness: String,
     model_context_status: String,
     projections: Vec<SessionProjectionDiagnosis>,
+    owner_observations: Vec<bcode_session::lease::SessionOwnerObservation>,
     active_owners: Vec<bcode_session::lease::SessionLeaseOwner>,
     recovery_guidance: Option<String>,
     event_count: usize,
@@ -6850,7 +6851,18 @@ async fn collect_session_diagnosis(
     let strict_history = db.all_events_strict().await;
     let strict_history_error = strict_history.as_ref().err().map(ToString::to_string);
     let history = strict_history.unwrap_or_default();
-    let active_owners = bcode_session::lease::active_session_owners(root, session_id)?;
+    let owner_observations = bcode_session::lease::session_owner_observations(root, session_id)?;
+    let active_owners = owner_observations
+        .iter()
+        .filter(|observation| {
+            matches!(
+                observation.liveness,
+                bcode_session::lease::SessionOwnerLiveness::Live
+                    | bcode_session::lease::SessionOwnerLiveness::Unverifiable
+            )
+        })
+        .map(|observation| observation.owner.clone())
+        .collect::<Vec<_>>();
     let waiting_for_owner = migration_plan.is_some() && !active_owners.is_empty();
     let retained_backup =
         bcode_session_migration::latest_retained_migration_backup(root, session_id)?;
@@ -6907,6 +6919,7 @@ async fn collect_session_diagnosis(
             write_readiness,
             model_context_status,
             projections,
+            owner_observations,
             active_owners,
             recovery_guidance,
         },
@@ -7194,6 +7207,7 @@ struct SessionStorageDiagnosis {
     write_readiness: String,
     model_context_status: String,
     projections: Vec<SessionProjectionDiagnosis>,
+    owner_observations: Vec<bcode_session::lease::SessionOwnerObservation>,
     active_owners: Vec<bcode_session::lease::SessionLeaseOwner>,
     recovery_guidance: Option<String>,
 }
@@ -7253,6 +7267,7 @@ impl SessionDiagnosis {
             write_readiness: storage.write_readiness,
             model_context_status: storage.model_context_status,
             projections: storage.projections,
+            owner_observations: storage.owner_observations,
             active_owners: storage.active_owners,
             recovery_guidance: storage.recovery_guidance,
             event_count: history.len(),
@@ -7265,6 +7280,7 @@ impl SessionDiagnosis {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn print_session_diagnosis(diagnosis: &SessionDiagnosis) {
     println!("session: {}", diagnosis.session_id);
     println!(
@@ -7310,6 +7326,23 @@ fn print_session_diagnosis(diagnosis: &SessionDiagnosis) {
             projection.schema_version,
             projection.expected_schema_version,
             projection.checkpoint
+        );
+    }
+    println!("owner observations: {}", diagnosis.owner_observations.len());
+    for observation in &diagnosis.owner_observations {
+        let owner = &observation.owner;
+        println!(
+            "  liveness={:?} schema={} token={} pid={} instance={:?} acquired_at_ms={} namespace={:?} build={:?} writer_epoch={:?} endpoint={:?}",
+            observation.liveness,
+            owner.schema_version,
+            owner.lease_token,
+            owner.pid,
+            owner.daemon_instance_id,
+            owner.acquired_at_ms,
+            owner.daemon_namespace,
+            owner.build_fingerprint,
+            owner.storage_writer_epoch,
+            owner.endpoint
         );
     }
     println!("active owners: {}", diagnosis.active_owners.len());

@@ -886,7 +886,7 @@ if ! rg -q 'daemon_instance_id: Some\(format!\("process-' packages/session/src/l
   || ! rg -q 'maintenance_refuses_any_live_session_owner' packages/session/src/lease.rs \
   || ! rg -q 'maintenance_to_lease_transition_prevents_incompatible_handoff_race' packages/session/src/lease.rs \
   || ! sed -n '/pub async fn migrate_owned_session_storage(/,/^}/p' packages/server/src/session_migration_execution.rs | grep -q 'acquire_maintenance_session_write_lock' \
-  || ! sed -n '/pub async fn migrate_owned_session_storage(/,/^}/p' packages/server/src/session_migration_execution.rs | grep -q 'drop(maintenance)' \
+  || ! sed -n '/pub async fn migrate_owned_session_storage(/,/^}/p' packages/server/src/session_migration_execution.rs | grep -q 'transition_session_maintenance_to_lease' \
   || ! sed -n '/pub async fn migrate_owned_session_storage(/,/^}/p' packages/server/src/session_migration_execution.rs | grep -q 'validate_write_readiness' \
   || ! rg -q 'execute_owned_legacy_storage' packages/server/src/session_migration_execution.rs \
   || ! rg -q 'progress_reporter_throttles_intermediate_updates_and_preserves_boundaries' packages/session-migration/src/operation.rs \
@@ -897,7 +897,7 @@ if ! rg -q 'daemon_instance_id: Some\(format!\("process-' packages/session/src/l
   || ! rg -q 'session_migrations' packages/server/src/lib.rs \
   || ! rg -q '\.operations\(\)' packages/server/src/lib.rs \
   || ! rg -q '\.start_or_join\(' packages/server/src/lib.rs \
-  || ! rg -q 'session_migrations\.active_count\(\)' packages/server/src/lib.rs \
+  || ! rg -q 'session_migrations\.(active_count|is_active)\(' packages/server/src/lib.rs \
   || ! rg -q 'pub async fn prepare_session_open' packages/session/src/lib.rs \
   || rg -n 'migration_operations: bcode_session_migration::SessionMigrationOperations|with_migration_operations' packages/session/src/lib.rs \
   || ! rg -q 'concurrent_starts_join_one_running_operation' packages/session-migration/src/operation.rs \
@@ -1020,7 +1020,7 @@ migration_capability_body="$(sed -n '/pub async fn migrate_owned_session_storage
 if ! rg -q "maintenance: &'a lease::SessionMaintenanceGuard" packages/server/src/session_migration_execution.rs \
   || ! rg -q "write: &'a lease::SessionWriteGuard" packages/server/src/session_migration_execution.rs \
   || ! grep -q 'validate_write_readiness().await' <<<"$migration_capability_body" \
-  || ! grep -q 'drop(maintenance)' <<<"$migration_capability_body"; then
+  || ! grep -q 'transition_session_maintenance_to_lease' <<<"$migration_capability_body"; then
   echo "Session migration capability violation: maintenance and write guards must remain borrowed through migration and write-readiness validation before lease transition." >&2
   violations=1
 fi

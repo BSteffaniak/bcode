@@ -466,6 +466,14 @@ impl SessionHandle {
         self.send(SessionCommand::ReleaseOwnershipIfQuiescent).await
     }
 
+    pub async fn adopt_lease(&self, lease: SessionLeaseGuard) -> Result<(), SessionError> {
+        self.send(|reply| SessionCommand::AdoptLease {
+            lease: Arc::new(lease),
+            reply,
+        })
+        .await
+    }
+
     pub fn client_count(&self) -> usize {
         self.snapshot().summary.client_count
     }
@@ -578,6 +586,10 @@ enum SessionCommand {
     },
     OwnershipSnapshot(oneshot::Sender<SessionOwnershipSnapshot>),
     ReleaseOwnershipIfQuiescent(oneshot::Sender<SessionOwnershipRelease>),
+    AdoptLease {
+        lease: Arc<SessionLeaseGuard>,
+        reply: oneshot::Sender<()>,
+    },
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -817,6 +829,11 @@ impl SessionActor {
             }
             SessionCommand::ReleaseOwnershipIfQuiescent(reply) => {
                 let _ = reply.send(self.release_ownership_if_quiescent());
+            }
+            SessionCommand::AdoptLease { lease, reply } => {
+                self.lease = Some(lease);
+                self.refresh_snapshot();
+                let _ = reply.send(());
             }
             SessionCommand::Shutdown(reply) => {
                 let _ = reply.send(());

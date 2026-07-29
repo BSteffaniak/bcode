@@ -212,6 +212,49 @@ impl Drop for CatalogLockGuard {
     }
 }
 
+/// Read-only liveness observation for one decodable owner record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SessionOwnerObservation {
+    /// Owner metadata.
+    pub owner: SessionLeaseOwner,
+    /// Lock/PID-backed liveness classification.
+    pub liveness: SessionOwnerLiveness,
+}
+
+/// Inspect every decodable owner record without mutating lease metadata.
+///
+/// # Errors
+///
+/// Returns an error when the owner directory cannot be inspected.
+pub fn session_owner_observations(
+    root: &Path,
+    session_id: SessionId,
+) -> Result<Vec<SessionOwnerObservation>, SessionLeaseError> {
+    let access_dir = session_owner_dir(root, session_id);
+    let Ok(entries) = fs::read_dir(&access_dir) else {
+        return Ok(Vec::new());
+    };
+    let mut observations = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| SessionLeaseError::Io {
+            path: access_dir.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(owner) = read_owner_metadata(&path) {
+            observations.push(SessionOwnerObservation {
+                liveness: classify_owner_liveness(&path, &owner),
+                owner,
+            });
+        }
+    }
+    observations.sort_by(|left, right| left.owner.lease_token.cmp(&right.owner.lease_token));
+    Ok(observations)
+}
+
 /// Return live owner metadata for one session without mutating owner records.
 ///
 /// # Errors
@@ -534,7 +577,8 @@ fn write_owner_metadata(path: &Path, owner: &SessionLeaseOwner) -> Result<File, 
 }
 
 /// Conservative liveness classification for one owner record.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SessionOwnerLiveness {
     /// Positive evidence shows the owner is live.
     Live,

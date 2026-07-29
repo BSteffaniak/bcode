@@ -707,6 +707,12 @@ impl SessionManager {
         self.store.as_ref().map(SessionStoreExecutor::root_path)
     }
 
+    /// Return the configured runtime lease owner identity.
+    #[must_use]
+    pub fn session_lease_owner(&self) -> Option<SessionLeaseOwnerContext> {
+        self.store.as_ref().map(|store| store.lease_owner().clone())
+    }
+
     async fn load_db_session_state(
         &self,
         session_id: SessionId,
@@ -2098,6 +2104,20 @@ impl SessionManager {
             .sessions
             .get(&session_id)
             .is_some_and(|handle| handle.snapshot().owned)
+    }
+
+    /// Adopt a migration-held runtime lease into the session actor without an ownership gap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session actor cannot be loaded.
+    pub async fn adopt_session_lease(
+        &self,
+        session_id: SessionId,
+        lease: SessionLeaseGuard,
+    ) -> Result<(), SessionError> {
+        let handle = self.session_handle(session_id).await?;
+        handle.adopt_lease(lease).await
     }
 
     /// Acquire a long-lived ownership guard for server work.
