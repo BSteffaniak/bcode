@@ -375,6 +375,13 @@ fn current_time_ms() -> u64 {
     feature = "static-bundled-workflow-plugin"
 ))]
 #[must_use]
+#[cfg(any(
+    feature = "static-bundled-code-review-plugin",
+    feature = "static-bundled-filesystem-plugin",
+    feature = "static-bundled-plugins",
+    feature = "static-bundled-ralph-plugin",
+    feature = "static-bundled-workflow-plugin"
+))]
 pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
     bcode_bundled_plugins::static_bundled_plugins()
 }
@@ -432,22 +439,6 @@ fn bundled_interaction_adapter(
     platform_id: &str,
 ) -> Option<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability> {
     bcode_bundled_plugins::interaction_adapter(producer_id, schema, schema_version, platform_id)
-}
-
-#[cfg(not(any(
-    feature = "static-bundled-code-review-plugin",
-    feature = "static-bundled-filesystem-plugin",
-    feature = "static-bundled-plugins",
-    feature = "static-bundled-ralph-plugin",
-    feature = "static-bundled-workflow-plugin"
-)))]
-const fn bundled_interaction_adapter(
-    _producer_id: &str,
-    _schema: &str,
-    _schema_version: u32,
-    _platform_id: &str,
-) -> Option<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability> {
-    None
 }
 
 #[cfg(any(

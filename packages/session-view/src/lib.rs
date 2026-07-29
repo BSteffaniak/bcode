@@ -2045,14 +2045,18 @@ impl SessionView {
             .entry(key.clone())
             .or_default()
             .apply(event);
+        self.refresh_live_reasoning_activity(&key);
+    }
+
+    fn refresh_live_reasoning_activity(&mut self, key: &(String, String)) {
         let activity = self
             .live_reasoning
-            .get(&key)
+            .get(key)
             .expect("live reasoning activity was inserted");
-        let item_id = TranscriptViewItemId::reasoning(turn_id, event.activity_id());
+        let item_id = TranscriptViewItemId::reasoning(&key.0, &key.1);
         let view = live_reasoning_activity_view(
-            turn_id,
-            event.activity_id(),
+            &key.0,
+            &key.1,
             activity,
             self.snapshot.thinking.visible,
             self.snapshot.thinking.mode,

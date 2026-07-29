@@ -1806,6 +1806,38 @@ async fn load_plugin_session_status(
     (contributions, first_error)
 }
 
+#[cfg(any(
+    feature = "static-bundled-code-review-plugin",
+    feature = "static-bundled-filesystem-plugin",
+    feature = "static-bundled-plugins",
+    feature = "static-bundled-ralph-plugin",
+    feature = "static-bundled-workflow-plugin"
+))]
+fn interaction_adapter_for_exchange(
+    producer_id: &str,
+    schema: &str,
+    schema_version: u32,
+    platform_id: &str,
+) -> Option<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability> {
+    bcode_bundled_plugins::interaction_adapter(producer_id, schema, schema_version, platform_id)
+}
+
+#[cfg(not(any(
+    feature = "static-bundled-code-review-plugin",
+    feature = "static-bundled-filesystem-plugin",
+    feature = "static-bundled-plugins",
+    feature = "static-bundled-ralph-plugin",
+    feature = "static-bundled-workflow-plugin"
+)))]
+const fn interaction_adapter_for_exchange(
+    _producer_id: &str,
+    _schema: &str,
+    _schema_version: u32,
+    _platform_id: &str,
+) -> Option<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability> {
+    None
+}
+
 async fn load_pending_interactions(
     client: &BcodeClient,
     session_id: SessionId,
@@ -1820,7 +1852,7 @@ async fn load_pending_interactions(
         let exchange = request.request;
         let interaction_id = exchange.exchange_id.clone();
         let snapshot = exchange.payload;
-        let adapter = super::bundled_interaction_adapter(
+        let adapter = interaction_adapter_for_exchange(
             &exchange.producer_id,
             &exchange.schema,
             exchange.schema_version,

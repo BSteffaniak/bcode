@@ -2292,6 +2292,26 @@ fn interaction_surface_request(
     })
 }
 
+#[cfg(not(any(
+    feature = "static-bundled-code-review-plugin",
+    feature = "static-bundled-filesystem-plugin",
+    feature = "static-bundled-plugins",
+    feature = "static-bundled-ralph-plugin",
+    feature = "static-bundled-workflow-plugin"
+)))]
+const fn tool_exchange_surface_request(
+    _request: &bcode_session_models::ToolExchangeRequest,
+) -> Option<InteractiveSurfaceRequest> {
+    None
+}
+
+#[cfg(any(
+    feature = "static-bundled-code-review-plugin",
+    feature = "static-bundled-filesystem-plugin",
+    feature = "static-bundled-plugins",
+    feature = "static-bundled-ralph-plugin",
+    feature = "static-bundled-workflow-plugin"
+))]
 fn tool_exchange_surface_request(
     request: &bcode_session_models::ToolExchangeRequest,
 ) -> Option<InteractiveSurfaceRequest> {
