@@ -541,6 +541,13 @@ fn open_lock_file(path: &Path) -> Result<File, SessionLeaseError> {
         })
 }
 
+#[cfg(test)]
+fn abort_before_owner_metadata_publish() {
+    if std::env::var_os("BCODE_LEASE_PRE_PUBLISH_CRASH").is_some() {
+        std::process::abort();
+    }
+}
+
 fn write_owner_metadata(path: &Path, owner: &SessionLeaseOwner) -> Result<File, SessionLeaseError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| SessionLeaseError::Io {
@@ -569,6 +576,8 @@ fn write_owner_metadata(path: &Path, owner: &SessionLeaseOwner) -> Result<File, 
             path: temp_path.clone(),
             source,
         })?;
+    #[cfg(test)]
+    abort_before_owner_metadata_publish();
     fs::rename(&temp_path, path).map_err(|source| SessionLeaseError::Io {
         path: path.to_path_buf(),
         source,
@@ -904,6 +913,102 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    #[ignore = "subprocess helper for pre_publish_crash_does_not_publish_owner"]
+    fn pre_publish_crash_helper() {
+        let Some(root) = std::env::var_os("BCODE_LEASE_PRE_PUBLISH_ROOT") else {
+            return;
+        };
+        let session_id = std::env::var("BCODE_LEASE_PRE_PUBLISH_SESSION")
+            .expect("pre-publish session id")
+            .parse::<SessionId>()
+            .expect("valid pre-publish session id");
+        let _ = acquire_session_lease(Path::new(&root), session_id, &context("crashing", 5));
+    }
+
+    #[test]
+    fn pre_publish_crash_does_not_publish_owner() {
+        use std::process::{Command, Stdio};
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let status = Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "lease::tests::pre_publish_crash_helper",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("BCODE_LEASE_PRE_PUBLISH_CRASH", "1")
+            .env("BCODE_LEASE_PRE_PUBLISH_ROOT", temp_dir.path())
+            .env("BCODE_LEASE_PRE_PUBLISH_SESSION", session_id.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run crashing lease publisher");
+        assert!(!status.success(), "publisher must terminate at crash hook");
+        assert!(
+            active_session_owners(temp_dir.path(), session_id)
+                .expect("owner scan")
+                .is_empty(),
+            "pre-publish crash must not expose an owner record"
+        );
+        acquire_session_lease(temp_dir.path(), session_id, &context("next", 5))
+            .expect("next owner must acquire after pre-publish crash");
+    }
+
+    #[test]
+    fn abandoned_pre_publish_owner_temp_file_does_not_block_acquisition() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let access_dir = session_owner_dir(temp_dir.path(), session_id);
+        fs::create_dir_all(&access_dir).expect("owner dir");
+        let abandoned = access_dir.join("abandoned.json.tmp-pre-publish");
+        fs::write(&abandoned, b"partial metadata").expect("abandoned temp file");
+
+        assert!(
+            active_session_owners(temp_dir.path(), session_id)
+                .expect("owner scan")
+                .is_empty()
+        );
+        let owner = acquire_session_lease(temp_dir.path(), session_id, &context("current", 5))
+            .expect("pre-publish temp file must not block acquisition");
+        assert_eq!(owner.owner().daemon_instance_id.as_deref(), Some("current"));
+        assert!(
+            abandoned.exists(),
+            "normal acquisition must not mutate temp debris"
+        );
+    }
+
+    #[test]
+    fn schema_v2_reused_live_pid_remains_conservatively_owned() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let access_dir = session_owner_dir(temp_dir.path(), session_id);
+        fs::create_dir_all(&access_dir).expect("owner dir");
+        let mut owner = SessionLeaseOwner::new(session_id, &context("historical", 4));
+        owner.schema_version = 2;
+        owner.pid = std::process::id();
+        let owner_path = access_dir.join(format!("{}.json", owner.lease_token));
+        fs::write(
+            &owner_path,
+            serde_json::to_vec_pretty(&owner).expect("serialize v2"),
+        )
+        .expect("write v2");
+
+        assert_eq!(
+            classify_owner_liveness(&owner_path, &owner),
+            SessionOwnerLiveness::Live
+        );
+        assert!(matches!(
+            acquire_session_lease(temp_dir.path(), session_id, &context("current", 5))
+                .expect_err("v2 PID reuse ambiguity must fail closed"),
+            SessionLeaseError::OwnedByOtherDaemon { .. }
+        ));
+        assert!(owner_path.exists(), "ambiguous v2 owner must not be pruned");
     }
 
     #[test]
@@ -1247,6 +1352,32 @@ mod tests {
         assert!(child.wait().expect("wait child").success());
         acquire_session_lease(temp_dir.path(), session_id, &context("next", 7))
             .expect("next owner after child release");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owner_record_open_error_is_unverifiable_and_fails_closed() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let access_dir = session_owner_dir(temp_dir.path(), session_id);
+        fs::create_dir_all(&access_dir).expect("owner dir");
+        let owner = SessionLeaseOwner::new(session_id, &context("unreadable", 4));
+        let owner_path = access_dir.join(format!("{}.json", owner.lease_token));
+        fs::create_dir(&owner_path).expect("directory at owner record path");
+
+        assert_eq!(
+            classify_owner_liveness(&owner_path, &owner),
+            SessionOwnerLiveness::Unverifiable
+        );
+        assert!(matches!(
+            acquire_session_lease(temp_dir.path(), session_id, &context("current", 5))
+                .expect_err("unverifiable owner path must fail closed"),
+            SessionLeaseError::UnverifiableOwnerMetadata { .. }
+        ));
+        assert!(
+            owner_path.is_dir(),
+            "failed classification must not mutate owner path"
+        );
     }
 
     #[test]
