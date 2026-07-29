@@ -1820,7 +1820,7 @@ async fn load_pending_interactions(
         let exchange = request.request;
         let interaction_id = exchange.exchange_id.clone();
         let snapshot = exchange.payload;
-        let adapter = bcode_bundled_plugins::interaction_adapter(
+        let adapter = super::bundled_interaction_adapter(
             &exchange.producer_id,
             &exchange.schema,
             exchange.schema_version,

@@ -367,9 +367,111 @@ fn current_time_ms() -> u64 {
 }
 
 /// Return statically bundled plugin registrations enabled through `bcode_bundled_plugins`.
+#[cfg(any(
+    feature = "static-bundled-code-review-plugin",
+    feature = "static-bundled-filesystem-plugin",
+    feature = "static-bundled-plugins",
+    feature = "static-bundled-ralph-plugin",
+    feature = "static-bundled-workflow-plugin"
+))]
 #[must_use]
 pub fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
     bcode_bundled_plugins::static_bundled_plugins()
+}
+
+/// Return no static plugin registrations when static bundling is disabled.
+#[cfg(not(any(
+    feature = "static-bundled-code-review-plugin",
+    feature = "static-bundled-filesystem-plugin",
+    feature = "static-bundled-plugins",
+    feature = "static-bundled-ralph-plugin",
+    feature = "static-bundled-workflow-plugin"
+)))]
+#[must_use]
+pub const fn static_bundled_plugins() -> Vec<bcode_plugin::StaticBundledPlugin> {
+    Vec::new()
+}
+
+#[cfg(any(
+    feature = "static-bundled-code-review-plugin",
+    feature = "static-bundled-filesystem-plugin",
+    feature = "static-bundled-plugins",
+    feature = "static-bundled-ralph-plugin",
+    feature = "static-bundled-workflow-plugin"
+))]
+fn bundled_interaction_adapters(
+    platform_id: &str,
+) -> Vec<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability> {
+    bcode_bundled_plugins::interaction_adapters(platform_id)
+}
+
+#[cfg(not(any(
+    feature = "static-bundled-code-review-plugin",
+    feature = "static-bundled-filesystem-plugin",
+    feature = "static-bundled-plugins",
+    feature = "static-bundled-ralph-plugin",
+    feature = "static-bundled-workflow-plugin"
+)))]
+const fn bundled_interaction_adapters(
+    _platform_id: &str,
+) -> Vec<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability> {
+    Vec::new()
+}
+
+#[cfg(any(
+    feature = "static-bundled-code-review-plugin",
+    feature = "static-bundled-filesystem-plugin",
+    feature = "static-bundled-plugins",
+    feature = "static-bundled-ralph-plugin",
+    feature = "static-bundled-workflow-plugin"
+))]
+fn bundled_interaction_adapter(
+    producer_id: &str,
+    schema: &str,
+    schema_version: u32,
+    platform_id: &str,
+) -> Option<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability> {
+    bcode_bundled_plugins::interaction_adapter(producer_id, schema, schema_version, platform_id)
+}
+
+#[cfg(not(any(
+    feature = "static-bundled-code-review-plugin",
+    feature = "static-bundled-filesystem-plugin",
+    feature = "static-bundled-plugins",
+    feature = "static-bundled-ralph-plugin",
+    feature = "static-bundled-workflow-plugin"
+)))]
+const fn bundled_interaction_adapter(
+    _producer_id: &str,
+    _schema: &str,
+    _schema_version: u32,
+    _platform_id: &str,
+) -> Option<bcode_plugin_sdk::interaction::PluginInteractionAdapterCapability> {
+    None
+}
+
+#[cfg(any(
+    feature = "static-bundled-code-review-plugin",
+    feature = "static-bundled-filesystem-plugin",
+    feature = "static-bundled-plugins",
+    feature = "static-bundled-ralph-plugin",
+    feature = "static-bundled-workflow-plugin"
+))]
+fn bundled_tui_registry(plugin_id: &str) -> Option<bcode_plugin_sdk::tui::PluginTuiRegistry> {
+    bcode_bundled_plugins::tui_registry(plugin_id)
+}
+
+#[cfg(not(any(
+    feature = "static-bundled-code-review-plugin",
+    feature = "static-bundled-filesystem-plugin",
+    feature = "static-bundled-plugins",
+    feature = "static-bundled-ralph-plugin",
+    feature = "static-bundled-workflow-plugin"
+)))]
+const fn bundled_tui_registry(
+    _plugin_id: &str,
+) -> Option<bcode_plugin_sdk::tui::PluginTuiRegistry> {
+    None
 }
 
 /// Run the main terminal UI and open a plugin-owned surface on startup.

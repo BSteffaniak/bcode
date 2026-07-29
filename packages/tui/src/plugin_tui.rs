@@ -300,8 +300,9 @@ fn valid_diagnostic_name(name: &str) -> bool {
 /// Long-lived visual rendering must acquire registries through [`PluginTuiPresentation`]. Fresh
 /// registries remain appropriate for opening independent interactive surface instances.
 #[must_use]
+#[allow(clippy::missing_const_for_fn)]
 pub fn tui_registry(plugin_id: &str) -> Option<PluginTuiRegistry> {
-    let registry = bcode_bundled_plugins::tui_registry(plugin_id);
+    let registry = super::bundled_tui_registry(plugin_id);
     #[cfg(test)]
     let registry = registry.or_else(|| match plugin_id {
         "bcode.filesystem" => Some(bcode_filesystem_plugin::filesystem_tui_registry()),

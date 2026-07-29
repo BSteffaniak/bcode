@@ -79,7 +79,7 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
                     .with_request_timeout(Duration::from_secs(config.client.request_timeout_secs))
             },
         )
-        .with_interaction_adapters(bcode_bundled_plugins::interaction_adapters("tui"));
+        .with_interaction_adapters(super::bundled_interaction_adapters("tui"));
     let daemon_host = super::daemon_host::TuiDaemonHost::new(static_plugins);
     let mut terminal_events = TuiInput::start();
     let (event_sender, event_receiver) = mpsc::unbounded_channel();

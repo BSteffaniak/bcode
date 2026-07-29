@@ -2286,7 +2286,7 @@ fn interaction_surface_request(
 fn tool_exchange_surface_request(
     request: &bcode_session_models::ToolExchangeRequest,
 ) -> Option<InteractiveSurfaceRequest> {
-    let adapter = bcode_bundled_plugins::interaction_adapter(
+    let adapter = super::bundled_interaction_adapter(
         &request.producer_id,
         &request.schema,
         request.schema_version,
@@ -2473,7 +2473,7 @@ async fn maybe_start_interactive_surface(
     }
     let runtime = loop_state.plugin_runtime.get_or_insert_with(|| {
         super::plugin_tui::load_default_runtime_with_static_bundled(
-            &bcode_bundled_plugins::static_bundled_plugins(),
+            &super::static_bundled_plugins(),
         )
         .expect("load plugin runtime for interactive TUI surfaces")
     });
