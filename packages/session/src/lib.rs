@@ -701,6 +701,18 @@ impl SessionManager {
         self.ensure_session_loaded(session_id).await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn cancel_attach_before_reply(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+    ) -> Result<(), SessionError> {
+        let handle = self.session_handle(session_id).await?;
+        handle
+            .cancel_attach_before_reply(client_id, AttachMode::Recent { limit: 8 })
+            .await
+    }
+
     /// Return the persistent session store root, when this manager is store-backed.
     #[must_use]
     pub fn session_store_root(&self) -> Option<PathBuf> {
@@ -5380,6 +5392,120 @@ mod tests {
         assert_eq!(subscription.session.id, session.id);
         assert!(!manager.session_is_owned(session.id).await);
         drop(subscription);
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn migration_lease_adoption_releases_when_actor_is_quiescent() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("migration adoption".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should create");
+        let lease = crate::lease::acquire_session_lease(
+            &root,
+            session.id,
+            &SessionLeaseOwnerContext::default(),
+        )
+        .expect("migration-held runtime lease");
+
+        manager
+            .adopt_session_lease(session.id, lease)
+            .await
+            .expect("adopt migration lease");
+
+        assert!(!manager.session_is_owned(session.id).await);
+        assert!(
+            crate::lease::active_session_owners(&root, session.id)
+                .expect("owner scan")
+                .is_empty()
+        );
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn migration_lease_adoption_remains_owned_for_attached_actor() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("migration attached adoption".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should create");
+        let client_id = ClientId::new();
+        manager
+            .attach_session_recent(session.id, client_id, 8)
+            .await
+            .expect("attach");
+        manager
+            .release_session_database_resources(session.id)
+            .await
+            .expect("database release");
+        let existing =
+            crate::lease::active_session_owners(&root, session.id).expect("existing owners");
+        assert_eq!(existing.len(), 1);
+        let lease = crate::lease::acquire_session_lease(
+            &root,
+            session.id,
+            &SessionLeaseOwnerContext::default(),
+        )
+        .expect("reentrant migration lease");
+
+        manager
+            .adopt_session_lease(session.id, lease)
+            .await
+            .expect("adopt migration lease");
+        assert!(manager.session_is_owned(session.id).await);
+        manager
+            .detach_session(session.id, client_id)
+            .await
+            .expect("detach");
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while manager.session_is_owned(session.id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("final detach should release adopted lease");
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn cancelled_attach_reply_rolls_back_client_and_ownership() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(
+                Some("cancelled attach".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should create");
+        manager
+            .cancel_attach_before_reply(session.id, ClientId::new())
+            .await
+            .expect("cancel attach reply");
+
+        assert_eq!(
+            manager
+                .session_summary(session.id)
+                .await
+                .expect("summary")
+                .client_count,
+            0
+        );
+        assert!(!manager.session_is_owned(session.id).await);
+        assert!(
+            crate::lease::active_session_owners(&root, session.id)
+                .expect("owner scan")
+                .is_empty()
+        );
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 

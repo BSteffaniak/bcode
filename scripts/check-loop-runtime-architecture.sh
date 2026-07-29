@@ -1276,6 +1276,27 @@ if ! grep -F 'struct ServerToolInvoker' packages/server/src/lib.rs >/dev/null ||
   violations=1
 fi
 
+if ! sed -n '/struct BackgroundInvariantGuidanceWork/,/^}/p' packages/server/src/lib.rs \
+      | grep -F 'task: String' >/dev/null \
+  || sed -n '/struct BackgroundInvariantGuidanceWork/,/^}/p; /async fn launch_background_invariant_guidance(/,/^}/p' packages/server/src/lib.rs \
+      | rg -q 'SessionHandle|SessionOwnershipGuard|acquire_session_ownership|session_history|session_events_range' \
+  || sed -n '/pub async fn subscribe_session_events(/,/^    }/p' packages/session/src/subscription.rs \
+      | rg -q 'ensure_session_loaded|acquire_session_ownership' \
+  || sed -n '/fn forward_session_events(/,/^}/p' packages/server/src/lib.rs \
+      | rg -q 'SessionOwnershipGuard|acquire_session_ownership'; then
+  echo "Runtime ownership violation: bounded invariant snapshots, event subscriptions, and attach forwarders must remain ownership-neutral." >&2
+  violations=1
+fi
+
+if ! grep -F 'pending_permission_cannot_outlive_parent_command_ownership' packages/server/src/lib.rs >/dev/null \
+  || ! sed -n '/async fn run_session_runtime(/,/^}/p' packages/server/src/lib.rs \
+      | rg -U 'FollowupCommand::ExecuteTurn[\s\S]{0,3000}process_existing_user_event_command[\s\S]{0,1000}drop\(ownership\)' >/dev/null \
+  || ! sed -n '/^fn execute_model_tool_batch/,/^}$/p' packages/server/src/lib.rs \
+      | grep -F 'tokio::join!(batch_flow, sink_drain)' >/dev/null; then
+  echo "Runtime ownership violation: queued-command ownership must contain pending interactions and invocation-sink terminal draining." >&2
+  violations=1
+fi
+
 if ! grep -F 'select_interaction_adapter' packages/plugin-sdk/src/interaction.rs >/dev/null ||
    ! grep -F 'min_schema_version' packages/plugin-sdk/src/interaction.rs >/dev/null ||
    ! grep -F 'platform_id' packages/plugin-sdk/src/interaction.rs >/dev/null ||

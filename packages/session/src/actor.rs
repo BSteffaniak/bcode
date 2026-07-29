@@ -319,6 +319,27 @@ impl SessionHandle {
             .map_err(|_| SessionError::NotFound(self.snapshot().summary.id))?
     }
 
+    #[cfg(test)]
+    pub async fn cancel_attach_before_reply(
+        &self,
+        client_id: ClientId,
+        mode: AttachMode,
+    ) -> Result<(), SessionError> {
+        let (reply, receiver) = oneshot::channel();
+        self.commands
+            .send(SessionCommand::Attach {
+                client_id,
+                mode,
+                queued_at: Instant::now(),
+                reply,
+            })
+            .await
+            .map_err(|_| SessionError::NotFound(self.snapshot().summary.id))?;
+        drop(receiver);
+        let _summary = self.summary().await?;
+        Ok(())
+    }
+
     pub async fn subscribe_events(&self) -> Result<SessionEventReceivers, SessionError> {
         self.send(SessionCommand::SubscribeEvents).await?
     }
@@ -703,7 +724,11 @@ impl SessionActor {
                 {
                     let _ = self.release_idle_resources();
                 }
-                let _ = reply.send(result);
+                if let Err(undelivered) = reply.send(result)
+                    && undelivered.is_ok()
+                {
+                    let _ = self.detach(client_id);
+                }
             }
             SessionCommand::SetComposerDraft {
                 text,
@@ -838,6 +863,9 @@ impl SessionActor {
             SessionCommand::AdoptLease { lease, reply } => {
                 self.lease = Some(lease);
                 self.refresh_snapshot();
+                if self.state.clients.is_empty() && !self.has_ownership_guards() {
+                    let _ = self.release_idle_resources();
+                }
                 let _ = reply.send(());
             }
             SessionCommand::Shutdown(reply) => {

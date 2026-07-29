@@ -35777,6 +35777,60 @@ library = "test"
     }
 
     #[tokio::test]
+    async fn session_runtime_exit_drops_unprocessed_command_ownership() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("sessions");
+        let session = sessions
+            .create_session(Some("runtime exit".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let state = Arc::new(test_server_state(sessions.clone()));
+        let ownership = sessions
+            .acquire_session_ownership(
+                session.id,
+                bcode_session::SessionOwnershipKind::QueuedCommand,
+            )
+            .await
+            .expect("queued ownership");
+        let (followup_sender, followup_receiver) = mpsc::channel(1);
+        let (response, _completion) = oneshot::channel();
+        followup_sender
+            .send(FollowupCommand::CompactSession {
+                client_id: ClientId::new(),
+                selection: SessionModelSelection::default(),
+                response,
+                ownership,
+            })
+            .await
+            .expect("queue command");
+        drop(followup_sender);
+        let (steering_sender, steering_receiver) = mpsc::channel(1);
+        drop(steering_sender);
+        let (cancel_sender, cancel_receiver) = mpsc::channel(1);
+        drop(cancel_sender);
+
+        run_session_runtime(
+            Arc::clone(&state),
+            session.id,
+            Arc::new(Mutex::new(Some(followup_receiver))),
+            Arc::new(Mutex::new(Some(steering_receiver))),
+            Arc::new(Mutex::new(Some(cancel_receiver))),
+            Arc::new(AtomicUsize::new(1)),
+            Arc::new(Mutex::new(SessionRuntimePhase::Idle)),
+            Arc::new(Mutex::new(None)),
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sessions.session_is_owned(session.id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("runtime exit should drop queued ownership");
+    }
+
+    #[tokio::test]
     async fn queue_send_failure_drops_command_ownership_and_releases_session() {
         let root = tempfile::tempdir().expect("session root");
         let sessions = SessionManager::persistent(root.path()).expect("sessions");
@@ -49014,6 +49068,77 @@ event_symbol = "bcode_plugin_handle_event_v1"
             SessionEventKind::ContextCompacted { .. }
                 | SessionEventKind::ProviderContextCompacted { .. }
         )));
+    }
+
+    #[tokio::test]
+    async fn pending_permission_cannot_outlive_parent_command_ownership() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("sessions");
+        let session = sessions
+            .create_session(
+                Some("permission ownership".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let client_id = ClientId::new();
+        sessions
+            .attach_session_recent(session.id, client_id, 8)
+            .await
+            .expect("attach");
+        let state = Arc::new(test_server_state(sessions.clone()));
+        let ownership = sessions
+            .acquire_session_ownership(
+                session.id,
+                bcode_session::SessionOwnershipKind::QueuedCommand,
+            )
+            .await
+            .expect("parent command ownership");
+        let cancel_state = Arc::new(TurnCancelState::default());
+        let task_state = Arc::clone(&state);
+        let task_cancel = Arc::clone(&cancel_state);
+        let permission_task = tokio::spawn(async move {
+            let _ownership = ownership;
+            request_tool_permission(
+                task_state.as_ref(),
+                session.id,
+                &bcode_model::ToolCall {
+                    id: "permission-owned-call".to_owned(),
+                    name: "test.tool".to_owned(),
+                    arguments: serde_json::json!({}),
+                },
+                "test.tool",
+                "test.plugin",
+                task_cancel.as_ref(),
+                PermissionPolicyContext::default(),
+            )
+            .await
+        });
+        let permission = wait_for_pending_permissions(state.as_ref(), 1)
+            .await
+            .into_iter()
+            .next()
+            .expect("pending permission");
+        sessions
+            .detach_session(session.id, client_id)
+            .await
+            .expect("detach");
+        assert!(sessions.session_is_owned(session.id).await);
+
+        state
+            .pending_permissions
+            .lock()
+            .await
+            .remove(&permission.summary.permission_id);
+        resolve_pending_permission(state.as_ref(), permission, false, false).await;
+        assert!(!permission_task.await.expect("permission task"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sessions.session_is_owned(session.id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("parent completion should release ownership");
     }
 
     #[tokio::test]

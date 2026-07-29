@@ -1288,6 +1288,37 @@ mod tests {
     }
 
     #[test]
+    fn failed_maintenance_to_lease_transition_releases_coordinator() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let maintenance = acquire_session_maintenance_guard(temp_dir.path(), session_id)
+            .expect("maintenance guard");
+        let error = transition_session_maintenance_to_lease(
+            maintenance,
+            temp_dir.path(),
+            session_id,
+            &SessionLeaseOwnerContext {
+                storage_writer_epoch: None,
+                ..SessionLeaseOwnerContext::default()
+            },
+        )
+        .expect_err("missing writer identity should fail transition");
+        assert!(matches!(
+            error,
+            SessionLeaseError::MissingStorageWriterEpoch { .. }
+        ));
+
+        let next = acquire_session_maintenance_guard(temp_dir.path(), session_id)
+            .expect("failed transition must release maintenance coordinator");
+        drop(next);
+        assert!(
+            active_session_owners(temp_dir.path(), session_id)
+                .expect("owner scan")
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn maintenance_to_lease_transition_prevents_incompatible_handoff_race() {
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let session_id = SessionId::new();
