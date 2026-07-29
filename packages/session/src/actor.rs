@@ -905,18 +905,55 @@ impl SessionActor {
 
     fn release_ownership_if_quiescent(&mut self) -> SessionOwnershipRelease {
         let snapshot = self.ownership_snapshot();
-        if !snapshot.is_quiescent() {
-            return SessionOwnershipRelease::Blocked(snapshot);
-        }
-        let released_database = self.release_database_resources();
-        let released_lease = self.lease.take().is_some();
-        if released_lease {
-            self.refresh_snapshot();
-        }
-        if released_database || released_lease {
-            SessionOwnershipRelease::Released
+        let outcome = if snapshot.is_quiescent() {
+            let released_database = self.release_database_resources();
+            let released_lease = self.lease.take().is_some();
+            if released_lease {
+                self.refresh_snapshot();
+            }
+            if released_database || released_lease {
+                SessionOwnershipRelease::Released
+            } else {
+                SessionOwnershipRelease::AlreadyUnowned
+            }
         } else {
-            SessionOwnershipRelease::AlreadyUnowned
+            SessionOwnershipRelease::Blocked(snapshot)
+        };
+        self.record_ownership_release(&outcome);
+        outcome
+    }
+
+    fn record_ownership_release(&self, outcome: &SessionOwnershipRelease) {
+        let Some(metrics) = self.store.as_ref().map(SessionStoreExecutor::metrics) else {
+            return;
+        };
+        let mut labels = bcode_metrics::MetricLabels::new();
+        let outcome_label = match outcome {
+            SessionOwnershipRelease::Released => "released",
+            SessionOwnershipRelease::AlreadyUnowned => "already_unowned",
+            SessionOwnershipRelease::Blocked(_) => "blocked",
+        };
+        labels.insert("outcome".to_owned(), outcome_label.to_owned());
+        metrics.add_counter_with_labels("session.ownership.release_total", 1, labels);
+        if let SessionOwnershipRelease::Blocked(snapshot) = outcome {
+            if snapshot.attached_clients > 0 {
+                let mut labels = bcode_metrics::MetricLabels::new();
+                labels.insert("blocker".to_owned(), "attached_client".to_owned());
+                metrics.add_counter_with_labels(
+                    "session.ownership.release_blocked_total",
+                    1,
+                    labels,
+                );
+            }
+            for kind in snapshot.guards.keys() {
+                let mut labels = bcode_metrics::MetricLabels::new();
+                labels.insert("blocker".to_owned(), kind.label().to_owned());
+                metrics.add_counter_with_labels(
+                    "session.ownership.release_blocked_total",
+                    1,
+                    labels,
+                );
+            }
         }
     }
 
@@ -938,11 +975,17 @@ impl SessionActor {
             .store
             .as_ref()
             .ok_or(SessionError::NotFound(self.state.summary.id))?;
+        let reacquiring = matches!(self.state.load_status, SessionLoadStatusKind::SummaryOnly);
         self.lease = Some(Arc::new(crate::lease::acquire_session_lease(
             &store.root_path(),
             self.state.summary.id,
             store.lease_owner(),
         )?));
+        if reacquiring {
+            store
+                .metrics()
+                .increment_counter("session.ownership.reacquired_total");
+        }
         self.refresh_snapshot();
         Ok(())
     }

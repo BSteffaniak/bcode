@@ -1831,6 +1831,12 @@ impl ServerState {
                 "daemon has {queued_session_commands} queued session commands; refusing idle-only stop"
             ));
         }
+        let active_runtime_work = self.runtime_work.active_count().await;
+        if active_runtime_work > 0 {
+            return Some(format!(
+                "daemon has {active_runtime_work} active runtime work item(s); refusing idle-only stop"
+            ));
+        }
         let plugin_running = self
             .plugins
             .executor_statuses()
@@ -27016,6 +27022,117 @@ event_symbol = "bcode_plugin_handle_event_v1"
             bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION
         );
         assert_eq!(entry.payload["root"], root.display().to_string());
+    }
+
+    #[tokio::test]
+    async fn idle_shutdown_blocker_covers_clients_and_runtime_work_then_clears() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("sessions");
+        let session = sessions
+            .create_session(Some("idle blocker".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let state = test_server_state(sessions);
+
+        assert_eq!(state.idle_shutdown_blocker().await, None);
+        let control_client = ClientId::new();
+        state.register_client(control_client).await;
+        assert_eq!(
+            state.idle_shutdown_blocker().await,
+            None,
+            "one control/status client must not block its own idle-only stop request"
+        );
+        let second_client = ClientId::new();
+        state.register_client(second_client).await;
+        assert!(
+            state
+                .idle_shutdown_blocker()
+                .await
+                .is_some_and(|blocker| blocker.contains("2 connected clients"))
+        );
+        state.unregister_client(second_client).await;
+
+        register_runtime_work(
+            &state,
+            session.id,
+            RuntimeWorkSpec::new(
+                WorkId::new("idle-blocker-work"),
+                RuntimeWorkKind::Workflow,
+                "idle blocker".to_owned(),
+                CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+            ),
+        )
+        .await;
+        assert!(
+            state
+                .idle_shutdown_blocker()
+                .await
+                .is_some_and(|blocker| blocker.contains("1 active runtime work item"))
+        );
+        finish_registered_runtime_work(
+            &state,
+            session.id,
+            WorkId::new("idle-blocker-work"),
+            RuntimeWorkStatus::Completed,
+            None,
+        )
+        .await;
+        assert_eq!(state.idle_shutdown_blocker().await, None);
+    }
+
+    #[tokio::test]
+    async fn idle_shutdown_watcher_stops_daemon_with_zero_clients() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let mut shutdown = state.subscribe_shutdown();
+        state.start_idle_shutdown_watcher(Duration::from_millis(10));
+
+        tokio::time::timeout(Duration::from_millis(100), shutdown.recv())
+            .await
+            .expect("zero-client daemon should reach idle shutdown")
+            .expect("shutdown channel");
+    }
+
+    #[tokio::test]
+    async fn idle_shutdown_watcher_resets_for_work_and_stops_after_quiescence() {
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("idle watcher".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let state = Arc::new(test_server_state(sessions));
+        let mut shutdown = state.subscribe_shutdown();
+        state.start_idle_shutdown_watcher(Duration::from_millis(20));
+
+        tokio::time::sleep(Duration::from_millis(15)).await;
+        register_runtime_work(
+            &state,
+            session.id,
+            RuntimeWorkSpec::new(
+                WorkId::new("watcher-work"),
+                RuntimeWorkKind::Workflow,
+                "watcher blocker".to_owned(),
+                CancellationHandle::Test(Arc::new(AtomicUsize::new(0))),
+            ),
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(matches!(
+            shutdown.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        finish_registered_runtime_work(
+            &state,
+            session.id,
+            WorkId::new("watcher-work"),
+            RuntimeWorkStatus::Completed,
+            None,
+        )
+        .await;
+        tokio::time::timeout(Duration::from_millis(100), shutdown.recv())
+            .await
+            .expect("idle watcher should request shutdown")
+            .expect("shutdown channel");
     }
 
     #[test]

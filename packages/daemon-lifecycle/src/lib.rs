@@ -15,6 +15,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use thiserror::Error;
 
 /// Current daemon registry record schema version.
@@ -298,18 +299,147 @@ async fn probe_daemon_status(endpoint: &IpcEndpoint) -> Option<bcode_ipc::Daemon
     }
 }
 
-async fn live_record_matches_instance(record: &DaemonRecord) -> bool {
-    let Some(endpoint) = record.endpoint.to_ipc_endpoint() else {
-        return false;
-    };
-    let Some(status) = probe_daemon_status(&endpoint).await else {
-        return false;
-    };
+/// Conservative classification of one daemon registry record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonRecordClassification {
+    /// Current-build daemon responded with the exact persisted identity.
+    CurrentHealthy,
+    /// Historical daemon responded with the exact persisted identity.
+    HistoricalExactResponsive,
+    /// Endpoint could not be decoded with the current protocol, but independent process evidence
+    /// exactly identifies the historical daemon.
+    HistoricalProcessVerifiedProtocolUnsupported,
+    /// An endpoint responded, but its identity does not match this record.
+    ResponsiveIdentityMismatch,
+    /// Endpoint is unreachable and positive process evidence proves the recorded process is gone
+    /// or replaced.
+    UnreachableStale,
+    /// Evidence is incomplete or ambiguous; callers must preserve the record.
+    Unverifiable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessIdentityEvidence {
+    Exact,
+    MissingOrReused,
+    Unverifiable,
+}
+
+fn classify_daemon_record_evidence(
+    record: &DaemonRecord,
+    status: Option<&bcode_ipc::DaemonStatus>,
+    endpoint_reachable: bool,
+    process: ProcessIdentityEvidence,
+) -> DaemonRecordClassification {
+    status.map_or_else(
+        || {
+            if endpoint_reachable && process == ProcessIdentityEvidence::Exact {
+                DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported
+            } else if !endpoint_reachable && process == ProcessIdentityEvidence::MissingOrReused {
+                DaemonRecordClassification::UnreachableStale
+            } else {
+                DaemonRecordClassification::Unverifiable
+            }
+        },
+        |status| {
+            if daemon_status_matches_record(record, status) {
+                if record.is_current_namespace() {
+                    DaemonRecordClassification::CurrentHealthy
+                } else {
+                    DaemonRecordClassification::HistoricalExactResponsive
+                }
+            } else {
+                DaemonRecordClassification::ResponsiveIdentityMismatch
+            }
+        },
+    )
+}
+
+fn daemon_status_matches_record(record: &DaemonRecord, status: &bcode_ipc::DaemonStatus) -> bool {
     status.instance_id == record.instance_id
         && status.namespace == record.namespace
+        && status.protocol_version == record.protocol_version
         && status.build_fingerprint == record.build_fingerprint
         && status.executable_digest == record.executable_digest
         && status.storage_writer_epoch == record.storage_writer_epoch
+        && status.pid == record.pid
+        && status.started_at_unix_ms == record.started_at_unix_ms
+}
+
+fn process_identity_evidence(record: &DaemonRecord) -> ProcessIdentityEvidence {
+    let (Some(pid), Some(expected_digest)) = (record.pid, record.executable_digest.as_deref())
+    else {
+        return ProcessIdentityEvidence::Unverifiable;
+    };
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+    let Some(process) = system.process(pid) else {
+        return ProcessIdentityEvidence::MissingOrReused;
+    };
+    let process_started_at_seconds = process.start_time();
+    if process_started_at_seconds != record.started_at_unix_ms / 1_000 {
+        return ProcessIdentityEvidence::MissingOrReused;
+    }
+    let Some(executable) = process.exe() else {
+        return ProcessIdentityEvidence::Unverifiable;
+    };
+    match executable_sha256(executable) {
+        Ok(actual_digest) if actual_digest == expected_digest => ProcessIdentityEvidence::Exact,
+        Ok(_) => ProcessIdentityEvidence::MissingOrReused,
+        Err(_) => ProcessIdentityEvidence::Unverifiable,
+    }
+}
+
+/// Classify one daemon record without mutating registry or endpoint state.
+pub async fn classify_daemon_record(record: &DaemonRecord) -> DaemonRecordClassification {
+    let endpoint = record.endpoint.to_ipc_endpoint();
+    let status = if let Some(endpoint) = endpoint.as_ref() {
+        tokio::time::timeout(Duration::from_millis(500), probe_daemon_status(endpoint))
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+    let endpoint_reachable = if status.is_some() {
+        true
+    } else if let Some(endpoint) = endpoint.as_ref() {
+        tokio::time::timeout(
+            Duration::from_millis(250),
+            bcode_ipc::LocalIpcStream::connect(endpoint),
+        )
+        .await
+        .is_ok_and(|result| result.is_ok())
+    } else {
+        false
+    };
+    classify_daemon_record_evidence(
+        record,
+        status.as_ref(),
+        endpoint_reachable,
+        process_identity_evidence(record),
+    )
+}
+
+async fn live_record_matches_instance(record: &DaemonRecord) -> bool {
+    matches!(
+        classify_daemon_record(record).await,
+        DaemonRecordClassification::CurrentHealthy
+            | DaemonRecordClassification::HistoricalExactResponsive
+    )
+}
+
+/// Classify every decodable daemon record without mutating registry state.
+pub async fn classified_records(
+    state_dir: &Path,
+) -> Vec<(PathBuf, DaemonRecord, DaemonRecordClassification)> {
+    let mut classified = Vec::new();
+    for (path, record) in read_records(state_dir) {
+        let classification = classify_daemon_record(&record).await;
+        classified.push((path, record, classification));
+    }
+    classified
 }
 
 /// Return daemon registry records whose IPC endpoints currently respond and whose server identity
@@ -338,10 +468,17 @@ pub async fn incompatible_storage_writer_records(
     state_dir: &Path,
     storage_writer_epoch: u32,
 ) -> Vec<(PathBuf, DaemonRecord)> {
-    live_records(state_dir)
+    classified_records(state_dir)
         .await
         .into_iter()
-        .filter(|(_, record)| storage_writer_is_incompatible(record, storage_writer_epoch))
+        .filter(|(_, record, classification)| {
+            matches!(
+                classification,
+                DaemonRecordClassification::CurrentHealthy
+                    | DaemonRecordClassification::HistoricalExactResponsive
+            ) && storage_writer_is_incompatible(record, storage_writer_epoch)
+        })
+        .map(|(path, record, _)| (path, record))
         .collect()
 }
 
@@ -650,6 +787,99 @@ mod tests {
             last_seen_unix_ms: 0,
             instance_id: "test-instance".to_string(),
         }
+    }
+
+    #[test]
+    fn current_process_identity_evidence_rejects_pid_reuse_and_accepts_exact_record() {
+        let (executable_path, executable_digest) = current_executable_identity().expect("identity");
+        let mut system = System::new();
+        let pid = Pid::from_u32(std::process::id());
+        system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        let process = system.process(pid).expect("current process");
+        let record = DaemonRecord {
+            pid: Some(std::process::id()),
+            executable_path: Some(executable_path),
+            executable_digest: Some(executable_digest),
+            started_at_unix_ms: process.start_time().saturating_mul(1_000),
+            ..record_with_writer_epoch(Some(2))
+        };
+        assert_eq!(
+            process_identity_evidence(&record),
+            ProcessIdentityEvidence::Exact
+        );
+        assert_eq!(
+            process_identity_evidence(&DaemonRecord {
+                started_at_unix_ms: record.started_at_unix_ms.saturating_add(1_000),
+                ..record.clone()
+            }),
+            ProcessIdentityEvidence::MissingOrReused
+        );
+        assert_eq!(
+            process_identity_evidence(&DaemonRecord {
+                executable_digest: Some("reused-image".to_owned()),
+                ..record
+            }),
+            ProcessIdentityEvidence::MissingOrReused
+        );
+    }
+
+    #[test]
+    fn daemon_record_classification_preserves_historical_and_ambiguous_evidence() {
+        let current = record_with_writer_epoch(Some(2));
+        let exact = bcode_ipc::DaemonStatus {
+            namespace: current.namespace.clone(),
+            protocol_version: current.protocol_version,
+            build_fingerprint: current.build_fingerprint.clone(),
+            executable_digest: current.executable_digest.clone(),
+            storage_writer_epoch: current.storage_writer_epoch,
+            session_event_schema_version: None,
+            pid: current.pid,
+            instance_id: current.instance_id.clone(),
+            started_at_unix_ms: current.started_at_unix_ms,
+        };
+        assert_eq!(
+            classify_daemon_record_evidence(
+                &current,
+                Some(&exact),
+                true,
+                ProcessIdentityEvidence::Exact,
+            ),
+            DaemonRecordClassification::HistoricalExactResponsive
+        );
+        assert_eq!(
+            classify_daemon_record_evidence(&current, None, true, ProcessIdentityEvidence::Exact,),
+            DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported
+        );
+        assert_eq!(
+            classify_daemon_record_evidence(
+                &current,
+                Some(&bcode_ipc::DaemonStatus {
+                    instance_id: "replacement".to_owned(),
+                    ..exact
+                }),
+                true,
+                ProcessIdentityEvidence::MissingOrReused,
+            ),
+            DaemonRecordClassification::ResponsiveIdentityMismatch
+        );
+        assert_eq!(
+            classify_daemon_record_evidence(
+                &current,
+                None,
+                false,
+                ProcessIdentityEvidence::MissingOrReused,
+            ),
+            DaemonRecordClassification::UnreachableStale
+        );
+        assert_eq!(
+            classify_daemon_record_evidence(
+                &current,
+                None,
+                false,
+                ProcessIdentityEvidence::Unverifiable,
+            ),
+            DaemonRecordClassification::Unverifiable
+        );
     }
 
     #[test]
@@ -1101,16 +1331,6 @@ fn daemon_status_matches_current_executable(status: &bcode_ipc::DaemonStatus) ->
         .is_ok_and(|(_path, digest)| status.executable_digest.as_deref() == Some(digest.as_str()))
 }
 
-async fn probe_daemon_ready(endpoint: &IpcEndpoint) -> bool {
-    for delay in [25, 50, 100, 200, 400] {
-        if ping_ready(endpoint).await {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(delay)).await;
-    }
-    false
-}
-
 async fn wait_for_existing_daemon(endpoint: &IpcEndpoint) -> bool {
     for delay in [50, 100, 200, 400, 800, 1_000] {
         if ping_ready(endpoint).await {
@@ -1127,10 +1347,10 @@ async fn cleanup_stale_daemon_records() -> Result<(), DaemonLifecycleError> {
         if record.is_current_namespace() {
             continue;
         }
-        let Some(endpoint) = record.endpoint.to_ipc_endpoint() else {
-            continue;
-        };
-        if probe_daemon_ready(&endpoint).await {
+        if !matches!(
+            classify_daemon_record(&record).await,
+            DaemonRecordClassification::UnreachableStale
+        ) {
             continue;
         }
         remove_record_path(&path)?;

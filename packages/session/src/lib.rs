@@ -5396,6 +5396,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multiple_guard_categories_release_only_after_all_drop() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager");
+        let session = manager
+            .create_session(
+                Some("guard categories".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let queued = manager
+            .acquire_session_ownership(session.id, crate::SessionOwnershipKind::QueuedCommand)
+            .await
+            .expect("queued guard");
+        let runtime = manager
+            .acquire_session_ownership(session.id, crate::SessionOwnershipKind::RuntimeWork)
+            .await
+            .expect("runtime guard");
+        let plugin = manager
+            .acquire_session_ownership(session.id, crate::SessionOwnershipKind::PluginInvocation)
+            .await
+            .expect("plugin guard");
+        let snapshot = manager
+            .session_ownership_snapshot(session.id)
+            .await
+            .expect("snapshot");
+        assert_eq!(snapshot.guards.len(), 3);
+
+        drop(queued);
+        drop(runtime);
+        tokio::task::yield_now().await;
+        assert!(manager.session_is_owned(session.id).await);
+        drop(plugin);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while manager.session_is_owned(session.id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("last category should release ownership");
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn cloned_handle_actor_shutdown_releases_lease_and_closes_commands() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager");
+        let session = manager
+            .create_session(Some("actor shutdown".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        manager
+            .set_session_composer_draft(session.id, "owned".to_owned())
+            .await
+            .expect("acquire actor ownership");
+        let handle = manager.session_handle(session.id).await.expect("handle");
+        let clone = handle.clone();
+        handle.shutdown().await.expect("shutdown actor");
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !crate::lease::active_session_owners(&root, session.id)
+                .expect("owner scan")
+                .is_empty()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("actor shutdown should release lease");
+        assert!(
+            matches!(clone.summary().await, Err(SessionError::NotFound(id)) if id == session.id)
+        );
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn ownership_metrics_cover_blocked_release_reacquisition_and_release() {
+        let root = unique_temp_dir();
+        let metrics = MetricsRegistry::in_memory();
+        let manager =
+            SessionManager::persistent_with_metrics(&root, metrics.clone()).expect("manager");
+        let session = manager
+            .create_session(
+                Some("ownership metrics".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let guard = manager
+            .acquire_session_ownership(session.id, crate::SessionOwnershipKind::RuntimeWork)
+            .await
+            .expect("guard");
+        assert!(matches!(
+            manager
+                .release_session_ownership(session.id)
+                .await
+                .expect("blocked release"),
+            crate::SessionOwnershipRelease::Blocked(_)
+        ));
+        drop(guard);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while manager.session_is_owned(session.id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("automatic release");
+        let reacquired = manager
+            .acquire_session_ownership(session.id, crate::SessionOwnershipKind::QueuedCommand)
+            .await
+            .expect("reacquire");
+        drop(reacquired);
+        tokio::task::yield_now().await;
+
+        let snapshot = metrics.snapshot();
+        assert!(
+            snapshot
+                .counters
+                .get("session.ownership.release_total")
+                .is_some_and(|count| *count >= 2)
+        );
+        assert!(
+            snapshot
+                .counters
+                .get("session.ownership.release_blocked_total")
+                .is_some_and(|count| *count >= 1)
+        );
+        assert_eq!(
+            snapshot.counters.get("session.ownership.reacquired_total"),
+            Some(&2)
+        );
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
     async fn migration_lease_adoption_releases_when_actor_is_quiescent() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent(&root).expect("manager should initialize");

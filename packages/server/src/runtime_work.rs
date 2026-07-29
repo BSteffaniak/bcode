@@ -333,6 +333,11 @@ impl RuntimeWorkManager {
         self.take(session_id, work_id).await.is_some()
     }
 
+    /// Return the number of active work registrations across all sessions.
+    pub async fn active_count(&self) -> usize {
+        self.active.lock().await.len()
+    }
+
     /// Return active work snapshots for a session.
     pub async fn active_for_session(&self, session_id: SessionId) -> Vec<RuntimeWorkSnapshot> {
         self.active

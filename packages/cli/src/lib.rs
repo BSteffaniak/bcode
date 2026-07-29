@@ -6707,6 +6707,35 @@ struct DaemonCleanupSummary {
     messages: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DaemonControlPolicy {
+    GracefulIpc,
+    ReviewedForceOnly,
+    PreserveAndRefuse,
+    PruneStale,
+}
+
+const fn daemon_control_policy(
+    classification: bcode_daemon_lifecycle::DaemonRecordClassification,
+) -> DaemonControlPolicy {
+    match classification {
+        bcode_daemon_lifecycle::DaemonRecordClassification::CurrentHealthy
+        | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalExactResponsive => {
+            DaemonControlPolicy::GracefulIpc
+        }
+        bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported => {
+            DaemonControlPolicy::ReviewedForceOnly
+        }
+        bcode_daemon_lifecycle::DaemonRecordClassification::ResponsiveIdentityMismatch
+        | bcode_daemon_lifecycle::DaemonRecordClassification::Unverifiable => {
+            DaemonControlPolicy::PreserveAndRefuse
+        }
+        bcode_daemon_lifecycle::DaemonRecordClassification::UnreachableStale => {
+            DaemonControlPolicy::PruneStale
+        }
+    }
+}
+
 async fn cleanup_daemons(stop_current: bool, verbose: bool) -> DaemonCleanupSummary {
     let state_dir = bcode_config::default_state_dir();
     let records = bcode_daemon_lifecycle::read_records(&state_dir);
@@ -6716,21 +6745,15 @@ async fn cleanup_daemons(stop_current: bool, verbose: bool) -> DaemonCleanupSumm
             summary.skipped = summary.skipped.saturating_add(1);
             continue;
         }
-        let Some(endpoint) = record.endpoint.to_ipc_endpoint() else {
-            summary.skipped = summary.skipped.saturating_add(1);
-            if verbose {
-                summary.messages.push(format!(
-                    "skipped {}: unsupported endpoint",
-                    record.namespace
-                ));
-            }
-            continue;
-        };
-        let client =
-            BcodeClient::new(endpoint).with_daemon_availability(DaemonAvailability::RequireRunning);
-        let status = tokio::time::timeout(Duration::from_millis(250), client.server_status()).await;
-        match status {
-            Ok(Ok(status)) if daemon_status_matches(&record, &status.daemon) => {
+        let classification = bcode_daemon_lifecycle::classify_daemon_record(&record).await;
+        match daemon_control_policy(classification) {
+            DaemonControlPolicy::GracefulIpc => {
+                let Some(endpoint) = record.endpoint.to_ipc_endpoint() else {
+                    summary.skipped = summary.skipped.saturating_add(1);
+                    continue;
+                };
+                let client = BcodeClient::new(endpoint)
+                    .with_daemon_availability(DaemonAvailability::RequireRunning);
                 let stop_result = if stop_current {
                     tokio::time::timeout(Duration::from_millis(250), client.server_stop()).await
                 } else {
@@ -6754,16 +6777,7 @@ async fn cleanup_daemons(stop_current: bool, verbose: bool) -> DaemonCleanupSumm
                     }
                 }
             }
-            Ok(Ok(_)) => {
-                summary.skipped = summary.skipped.saturating_add(1);
-                if verbose {
-                    summary.messages.push(format!(
-                        "skipped {}: registry identity did not match running daemon",
-                        record.namespace
-                    ));
-                }
-            }
-            _ => {
+            DaemonControlPolicy::PruneStale => {
                 if bcode_daemon_lifecycle::remove_record_path(&path).is_ok() {
                     summary.removed = summary.removed.saturating_add(1);
                     remove_stale_socket(&record);
@@ -6774,6 +6788,15 @@ async fn cleanup_daemons(stop_current: bool, verbose: bool) -> DaemonCleanupSumm
                     }
                 } else {
                     summary.skipped = summary.skipped.saturating_add(1);
+                }
+            }
+            DaemonControlPolicy::ReviewedForceOnly | DaemonControlPolicy::PreserveAndRefuse => {
+                summary.skipped = summary.skipped.saturating_add(1);
+                if verbose {
+                    summary.messages.push(format!(
+                        "preserved {}: {classification:?}",
+                        record.namespace
+                    ));
                 }
             }
         }
@@ -6887,16 +6910,25 @@ async fn session_owner_record(
 ) -> Result<bcode_daemon_lifecycle::DaemonRecord, CliError> {
     let root = bcode_config::default_session_store_dir();
     let owners = bcode_session::lease::active_session_owners(&root, session_id)?;
-    let live = bcode_daemon_lifecycle::live_records(&bcode_config::default_state_dir()).await;
+    let classified =
+        bcode_daemon_lifecycle::classified_records(&bcode_config::default_state_dir()).await;
     let matching = owners
         .into_iter()
         .filter_map(|owner| {
             let instance_id = owner.daemon_instance_id.as_deref()?;
-            live.iter()
-                .find(|(_, record)| {
-                    record.instance_id == instance_id && record.pid == Some(owner.pid)
+            classified
+                .iter()
+                .find(|(_, record, classification)| {
+                    record.instance_id == instance_id
+                        && record.pid == Some(owner.pid)
+                        && matches!(
+                            classification,
+                            bcode_daemon_lifecycle::DaemonRecordClassification::CurrentHealthy
+                                | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalExactResponsive
+                                | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported
+                        )
                 })
-                .map(|(_, record)| record.clone())
+                .map(|(_, record, _)| record.clone())
         })
         .collect::<Vec<_>>();
     match matching.as_slice() {
@@ -6971,6 +7003,25 @@ async fn stop_session_owner(session_id: SessionId, force: bool) -> Result<(), Cl
         println!("terminated session owner {}", record.instance_id);
         return Ok(());
     }
+    let classification = bcode_daemon_lifecycle::classify_daemon_record(&record).await;
+    if matches!(
+        classification,
+        bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported
+    ) {
+        return Err(CliError::InvalidArguments(format!(
+            "daemon {} is process-verified but protocol-unsupported; use `bcode session kill-owner {session_id}` after reviewing its identity",
+            record.instance_id
+        )));
+    }
+    if !matches!(
+        classification,
+        bcode_daemon_lifecycle::DaemonRecordClassification::CurrentHealthy
+            | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalExactResponsive
+    ) {
+        return Err(CliError::InvalidArguments(format!(
+            "refusing graceful stop because daemon identity is {classification:?}"
+        )));
+    }
     let endpoint = record.endpoint.to_ipc_endpoint().ok_or_else(|| {
         CliError::InvalidArguments(format!(
             "daemon {} has no supported IPC endpoint",
@@ -6991,10 +7042,12 @@ async fn wait_for_daemon_exit(
 ) -> Result<(), CliError> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        let still_live = bcode_daemon_lifecycle::live_records(&bcode_config::default_state_dir())
-            .await
-            .into_iter()
-            .any(|(_, record)| record.instance_id == expected.instance_id);
+        let still_live = matches!(
+            bcode_daemon_lifecycle::classify_daemon_record(expected).await,
+            bcode_daemon_lifecycle::DaemonRecordClassification::CurrentHealthy
+                | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalExactResponsive
+                | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported
+        );
         if !still_live {
             return Ok(());
         }
@@ -7011,14 +7064,16 @@ async fn wait_for_daemon_exit(
 async fn terminate_verified_daemon(
     expected: &bcode_daemon_lifecycle::DaemonRecord,
 ) -> Result<(), CliError> {
-    let verified = bcode_daemon_lifecycle::live_records(&bcode_config::default_state_dir())
-        .await
-        .into_iter()
-        .any(|(_, record)| record == *expected);
-    if !verified {
-        return Err(CliError::InvalidArguments(
-            "refusing termination because daemon identity changed".to_owned(),
-        ));
+    let classification = bcode_daemon_lifecycle::classify_daemon_record(expected).await;
+    if !matches!(
+        classification,
+        bcode_daemon_lifecycle::DaemonRecordClassification::CurrentHealthy
+            | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalExactResponsive
+            | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported
+    ) {
+        return Err(CliError::InvalidArguments(format!(
+            "refusing termination because daemon identity is {classification:?}"
+        )));
     }
     let pid = expected.pid.ok_or_else(|| {
         CliError::InvalidArguments("verified daemon record has no process id".to_owned())
@@ -7037,11 +7092,12 @@ async fn terminate_verified_daemon(
         if wait_for_daemon_exit(expected).await.is_ok() {
             return Ok(());
         }
-        let still_verified =
-            bcode_daemon_lifecycle::live_records(&bcode_config::default_state_dir())
-                .await
-                .into_iter()
-                .any(|(_, record)| record == *expected);
+        let still_verified = matches!(
+            bcode_daemon_lifecycle::classify_daemon_record(expected).await,
+            bcode_daemon_lifecycle::DaemonRecordClassification::CurrentHealthy
+                | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalExactResponsive
+                | bcode_daemon_lifecycle::DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported
+        );
         if !still_verified {
             return Err(CliError::InvalidArguments(
                 "refusing SIGKILL because daemon identity changed after SIGTERM".to_owned(),
@@ -9487,6 +9543,36 @@ mod web_command_tests {
                 ..matching
             }
         ));
+    }
+
+    #[test]
+    fn daemon_control_policy_never_spawns_protocol_unsupported_or_ambiguous_records() {
+        use bcode_daemon_lifecycle::DaemonRecordClassification as Classification;
+
+        assert_eq!(
+            daemon_control_policy(Classification::CurrentHealthy),
+            DaemonControlPolicy::GracefulIpc
+        );
+        assert_eq!(
+            daemon_control_policy(Classification::HistoricalExactResponsive),
+            DaemonControlPolicy::GracefulIpc
+        );
+        assert_eq!(
+            daemon_control_policy(Classification::HistoricalProcessVerifiedProtocolUnsupported),
+            DaemonControlPolicy::ReviewedForceOnly
+        );
+        assert_eq!(
+            daemon_control_policy(Classification::ResponsiveIdentityMismatch),
+            DaemonControlPolicy::PreserveAndRefuse
+        );
+        assert_eq!(
+            daemon_control_policy(Classification::Unverifiable),
+            DaemonControlPolicy::PreserveAndRefuse
+        );
+        assert_eq!(
+            daemon_control_policy(Classification::UnreachableStale),
+            DaemonControlPolicy::PruneStale
+        );
     }
 
     #[test]

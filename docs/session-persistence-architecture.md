@@ -245,6 +245,11 @@ Ordinary compatible writers share maintenance coordination and serialize write c
 Mutating maintenance holds the coordinator exclusively, refuses every live owner, and then acquires
 the write lock. Never acquire these capabilities in reverse order.
 
+Schema-v3 owner publication uses `std::fs::File` locking: `flock` on Unix and `LockFileEx` on
+Windows. The live guard retains the locked published file handle through its full lifetime. CI runs
+the focused cross-process lease suite on Linux, macOS, and Windows so platform lock, rename, crash,
+and stale-classification behavior cannot silently diverge.
+
 A loaded actor owns the runtime lease rather than the manager registry. It releases database/event
 caches and the lease atomically when its attached-client count and typed ownership-guard counts are
 all zero. Queued commands, runtime work, and plugin invocations carry clone-safe typed guards through
@@ -253,6 +258,19 @@ Summary/catalog state and broadcast brokers remain available without retaining o
 runtime lease. A later mutation or protected activity reacquires through the actor before opening a
 runtime database or write lock. Explicit owner release uses this same serialized quiescence decision
 and reports stable blocker categories without cancelling work or detaching clients.
+
+## Historical daemon record classification
+
+Daemon registry cleanup uses one conservative classification based on four independent facts:
+current-build readiness, exact decoded endpoint identity, raw endpoint reachability, and process
+identity from PID, process start time, executable path, and executable digest. Exact responsive
+historical daemons remain controllable through their verified IPC endpoint. A historical process
+whose protocol cannot be decoded is preserved when independent process identity is exact; Bcode
+does not invoke its cached executable because an unknown historical CLI cannot be proven to stop
+without spawning or replacing a daemon. Such records require an explicitly reviewed force action.
+Responsive identity mismatches and unverifiable evidence are preserved and refused. Only an
+unreachable record with positive missing/reused-process evidence is stale and removable. Cached
+images referenced by every preserved record remain retained.
 
 ## Historical epoch-root recovery
 

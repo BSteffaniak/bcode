@@ -6,6 +6,21 @@ on:
     branches: [master]
 
 jobs:
+  session-lease-locks:
+    name: Session lease locks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test cross-process session lease locking
+        run: cargo test --package bcode_session lease::tests --no-default-features
+
   model-catalog:
     runs-on: ubuntu-latest
     permissions:
