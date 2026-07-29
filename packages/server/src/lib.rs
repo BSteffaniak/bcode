@@ -45717,6 +45717,109 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[tokio::test]
+    async fn runtime_work_guard_survives_detach_until_terminal_event_is_persisted() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("sessions");
+        let session = sessions
+            .create_session(
+                Some("runtime terminal".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        let client_id = ClientId::new();
+        sessions
+            .attach_session_recent(session.id, client_id, 8)
+            .await
+            .expect("attach");
+        let state = test_server_state(sessions.clone());
+        state.attach_client_session(client_id, session.id).await;
+        let work_id = WorkId::new("terminal-order");
+        register_runtime_work(
+            &state,
+            session.id,
+            RuntimeWorkSpec::new(
+                work_id.clone(),
+                RuntimeWorkKind::PluginInvocation,
+                "terminal order".to_owned(),
+                CancellationHandle::Test(Arc::new(std::sync::atomic::AtomicUsize::new(0))),
+            ),
+        )
+        .await;
+        state
+            .detach_client_session(client_id)
+            .await
+            .expect("detach");
+        assert!(sessions.session_is_owned(session.id).await);
+
+        finish_registered_runtime_work(
+            &state,
+            session.id,
+            work_id.clone(),
+            RuntimeWorkStatus::Completed,
+            Some("done".to_owned()),
+        )
+        .await;
+        let history = sessions.session_history(session.id).await.expect("history");
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::RuntimeWorkFinished { work_id: finished, status, .. }
+                if finished == &work_id && *status == RuntimeWorkStatus::Completed
+        )));
+        assert!(!sessions.session_is_owned(session.id).await);
+    }
+
+    #[tokio::test]
+    async fn plugin_registration_guard_drop_reevaluates_detached_ownership() {
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(root.path()).expect("sessions");
+        let session = sessions
+            .create_session(Some("plugin drop".to_owned()), test_working_directory())
+            .await
+            .expect("session");
+        let client_id = ClientId::new();
+        sessions
+            .attach_session_recent(session.id, client_id, 8)
+            .await
+            .expect("attach");
+        let state = test_server_state(sessions.clone());
+        state.attach_client_session(client_id, session.id).await;
+        let ownership = sessions
+            .acquire_session_ownership(
+                session.id,
+                bcode_session::SessionOwnershipKind::PluginInvocation,
+            )
+            .await
+            .expect("plugin ownership");
+        let (inputs, _receiver) = mpsc::channel(1);
+        let registration = ActivePluginInvocationRegistration::register(
+            Arc::clone(&state.active_plugin_invocations),
+            Arc::clone(&state.active_artifacts),
+            session.id,
+            "call-owned",
+            ActivePluginInvocation {
+                producer_plugin_id: "test.plugin".to_owned(),
+                inputs,
+            },
+            Some(ownership),
+        )
+        .expect("registration");
+        state
+            .detach_client_session(client_id)
+            .await
+            .expect("detach");
+        assert!(sessions.session_is_owned(session.id).await);
+        drop(registration);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while sessions.session_is_owned(session.id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("plugin guard drop should release");
+    }
+
+    #[tokio::test]
     async fn idle_session_detach_preserves_live_state_for_active_plugin_invocation() {
         let sessions = SessionManager::default();
         let session = sessions
