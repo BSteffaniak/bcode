@@ -875,6 +875,21 @@ mod tests {
                 .expect("commit projection"),
             ready["request"]
         );
+        let commit_result = &template.definition.nodes["commit_result"];
+        assert_eq!(commit_result.kind, bcode_workflow::NodeKind::Input);
+        assert_eq!(commit_result.input, git_commit_block.output);
+        assert_eq!(commit_result.output, git_commit_block.output);
+        assert!(template.definition.edges.iter().any(|edge| {
+            edge.from == "git_commit"
+                && edge.to == "commit_result"
+                && edge.kind == bcode_workflow::EdgeKind::Direct
+        }));
+        assert!(
+            template
+                .definition
+                .exits
+                .contains(&"commit_result".to_string())
+        );
         let required = template.configuration_schema.schema["required"]
             .as_array()
             .expect("required fields");

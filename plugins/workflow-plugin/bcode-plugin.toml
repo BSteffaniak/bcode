@@ -197,9 +197,10 @@ edges = [
         "paths",
     ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, message = { type = "string" }, paths = { type = "array", minItems = 1, uniqueItems = true, items = { type = "string" } } } } } } },
     { from = "commit_decision", to = "no_changes", kind = { kind = "conditional", predicate = { operation = "equals", version = 1, path = "status", value = "ready" }, expected = false } },
+    { from = "git_commit", to = "commit_result", kind = { kind = "direct" } },
 ]
 entries = ["implementation"]
-exits = ["git_commit", "no_changes", "verification_failed"]
+exits = ["commit_result", "no_changes", "verification_failed"]
 name = "implementation-verification-commit"
 schema_version = 1
 
@@ -225,6 +226,29 @@ type_name = "bcode.workflow.implementation-verification-commit-config/v1"
 [workflow_templates.definition.nodes.configuration.output]
 schema    = { type = "object" }
 type_name = "bcode.workflow.implementation-verification-commit-config/v1"
+
+[workflow_templates.definition.nodes.commit_result]
+configuration = { gate_version = 1 }
+id            = "commit_result"
+kind          = "input"
+name          = "Retain exact Git commit result"
+resources     = []
+
+[workflow_templates.definition.nodes.commit_result.input]
+schema = { type = "object", required = [
+    "previous_head",
+    "commit_hash",
+    "paths",
+], properties = { previous_head = { type = "string" }, commit_hash = { type = "string" }, paths = { type = "array", items = { type = "string" } } } }
+type_name = "bcode.git.commit-result/v1"
+
+[workflow_templates.definition.nodes.commit_result.output]
+schema = { type = "object", required = [
+    "previous_head",
+    "commit_hash",
+    "paths",
+], properties = { previous_head = { type = "string" }, commit_hash = { type = "string" }, paths = { type = "array", items = { type = "string" } } } }
+type_name = "bcode.git.commit-result/v1"
 
 [workflow_templates.definition.nodes.commit_decision]
 id        = "commit_decision"
