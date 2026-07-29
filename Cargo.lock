@@ -2188,7 +2188,9 @@ dependencies = [
  "sha2 0.10.9",
  "ssh-key",
  "sshenv_vault",
+ "tempfile",
  "thiserror 2.0.19",
+ "zeroize",
 ]
 
 [[package]]

@@ -10,6 +10,7 @@
 
 pub mod auth_pool_routing;
 pub mod auth_pool_state;
+pub mod lifecycle;
 pub mod security;
 
 use std::collections::{BTreeMap, BTreeSet};
