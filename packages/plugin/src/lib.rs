@@ -6,8 +6,9 @@ mod bmux_host_adapter;
 
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::{
-    CURRENT_PLUGIN_ABI_VERSION, CommandRegistrationCallback, DEFAULT_NATIVE_ACTIVATE_SYMBOL,
-    DEFAULT_NATIVE_DEACTIVATE_SYMBOL, DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_MANIFEST_SYMBOL,
+    AuthRegistrationCallback, CURRENT_PLUGIN_ABI_VERSION, CommandRegistrationCallback,
+    DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL, DEFAULT_NATIVE_EVENT_SYMBOL,
+    DEFAULT_NATIVE_MANIFEST_SYMBOL, DEFAULT_NATIVE_REGISTER_AUTH_PROVIDERS_SYMBOL,
     DEFAULT_NATIVE_REGISTER_COMMANDS_SYMBOL, DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL,
     EVENT_STATUS_OK, NativeEventContext, NativeServiceContext, PluginConfigContext, PluginEvent,
     SERVICE_BRIDGE_MAX_REQUEST_BYTES, SERVICE_BRIDGE_MAX_RESPONSE_BYTES,
@@ -18,6 +19,116 @@ use bcode_plugin_sdk::{
     ServiceCancellationWaitCallback, ServiceEventCallback, ServiceRequest, StaticPluginVtable,
 };
 pub use bcode_plugin_sdk::{ServiceError, ServiceResponse};
+pub use bcode_provider_auth_models::{AuthContractError, AuthProviderContribution};
+
+/// Authentication provider contribution with canonical host-attached plugin ownership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegisteredAuthProvider {
+    pub plugin_id: String,
+    pub contribution: AuthProviderContribution,
+}
+
+/// Deterministic host registry of authentication providers from enabled plugins.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AuthProviderRegistry {
+    providers: BTreeMap<String, RegisteredAuthProvider>,
+}
+
+impl AuthProviderRegistry {
+    /// Create an empty authentication provider registry.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            providers: BTreeMap::new(),
+        }
+    }
+
+    /// Register a provider with host-attached plugin ownership.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed plugin IDs or contributions and duplicate provider IDs.
+    pub fn register(
+        &mut self,
+        plugin_id: &str,
+        contribution: AuthProviderContribution,
+    ) -> Result<(), AuthProviderRegistryError> {
+        validate_auth_plugin_id(plugin_id)?;
+        contribution
+            .validate()
+            .map_err(AuthProviderRegistryError::InvalidContribution)?;
+        let provider_id = contribution.provider_id.clone();
+        if let Some(existing) = self.providers.get(&provider_id) {
+            return Err(AuthProviderRegistryError::DuplicateProvider {
+                provider_id,
+                first_plugin_id: existing.plugin_id.clone(),
+                second_plugin_id: plugin_id.to_owned(),
+            });
+        }
+        self.providers.insert(
+            provider_id,
+            RegisteredAuthProvider {
+                plugin_id: plugin_id.to_owned(),
+                contribution,
+            },
+        );
+        Ok(())
+    }
+
+    /// Return one provider by exact ID.
+    #[must_use]
+    pub fn get(&self, provider_id: &str) -> Option<&RegisteredAuthProvider> {
+        self.providers.get(provider_id)
+    }
+
+    /// Return providers in stable provider-ID order.
+    #[must_use]
+    pub fn providers(&self) -> Vec<&RegisteredAuthProvider> {
+        self.providers.values().collect()
+    }
+
+    /// Return the number of registered providers.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.providers.len()
+    }
+
+    /// Return whether no providers are registered.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.providers.is_empty()
+    }
+}
+
+/// Authentication provider registration failure.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum AuthProviderRegistryError {
+    #[error("invalid registering plugin ID")]
+    InvalidPluginId,
+    #[error("invalid authentication provider contribution: {0}")]
+    InvalidContribution(AuthContractError),
+    #[error(
+        "authentication provider '{provider_id}' is contributed by both '{first_plugin_id}' and '{second_plugin_id}'"
+    )]
+    DuplicateProvider {
+        provider_id: String,
+        first_plugin_id: String,
+        second_plugin_id: String,
+    },
+}
+
+fn validate_auth_plugin_id(plugin_id: &str) -> Result<(), AuthProviderRegistryError> {
+    if plugin_id.is_empty()
+        || plugin_id.len() > bcode_provider_auth_models::MAX_AUTH_LABEL_BYTES
+        || !plugin_id.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-' | b'_')
+        })
+    {
+        Err(AuthProviderRegistryError::InvalidPluginId)
+    } else {
+        Ok(())
+    }
+}
 pub use bmux_host_adapter::{
     BcodeHostCapabilityMap, BcodePluginRuntimeMode, BmuxHostPluginAdapter,
 };
@@ -44,6 +155,8 @@ type ManifestFn = unsafe extern "C" fn() -> *const std::ffi::c_char;
 type LifecycleFn = unsafe extern "C" fn() -> i32;
 type RegisterCommandsFn =
     unsafe extern "C" fn(Option<CommandRegistrationCallback>, *mut std::ffi::c_void) -> i32;
+type RegisterAuthProvidersFn =
+    unsafe extern "C" fn(Option<AuthRegistrationCallback>, *mut std::ffi::c_void) -> i32;
 type StreamingServiceFn = unsafe extern "C" fn(
     *const u8,
     usize,
@@ -611,6 +724,8 @@ pub struct NativePluginRuntime {
     pub deactivate_symbol: String,
     #[serde(default = "default_streaming_service_symbol")]
     pub streaming_service_symbol: String,
+    #[serde(default = "default_register_auth_providers_symbol")]
+    pub register_auth_providers_symbol: String,
     #[serde(default = "default_event_symbol")]
     pub event_symbol: String,
 }
@@ -840,6 +955,7 @@ enum LoadedPluginBackend {
         _library: ManuallyDrop<Library>,
         activate: LifecycleFn,
         register_commands: Option<RegisterCommandsFn>,
+        register_auth_providers: RegisterAuthProvidersFn,
         deactivate: LifecycleFn,
         invoke_service_streaming: StreamingServiceFn,
         handle_event: EventFn,
@@ -956,6 +1072,89 @@ impl LoadedPlugin {
                 code,
             })
         }
+    }
+
+    /// Register plugin-owned authentication providers through the activation registration hook.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the hook fails, emits malformed data, or contributes an invalid or
+    /// duplicate provider.
+    pub fn register_auth_providers(
+        &self,
+        registry: &mut AuthProviderRegistry,
+    ) -> Result<(), PluginLoadError> {
+        struct RegistrationContext<'a> {
+            plugin_id: &'a str,
+            registry: &'a mut AuthProviderRegistry,
+            error: Option<AuthProviderRegistryError>,
+        }
+
+        extern "C" fn register_auth_provider_callback(
+            payload: *const u8,
+            payload_len: usize,
+            user_data: *mut std::ffi::c_void,
+        ) {
+            if payload.is_null() || user_data.is_null() {
+                return;
+            }
+            let context = unsafe { &mut *user_data.cast::<RegistrationContext<'_>>() };
+            if context.error.is_some() {
+                return;
+            }
+            let bytes = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+            let Ok(contribution) = serde_json::from_slice::<AuthProviderContribution>(bytes) else {
+                context.error = Some(AuthProviderRegistryError::InvalidContribution(
+                    AuthContractError::InvalidFlowShape(
+                        "authentication registration payload did not decode",
+                    ),
+                ));
+                return;
+            };
+            if let Err(error) = context.registry.register(context.plugin_id, contribution) {
+                context.error = Some(error);
+            }
+        }
+
+        let mut context = RegistrationContext {
+            plugin_id: &self.manifest.id,
+            registry,
+            error: None,
+        };
+        let user_data = std::ptr::from_mut(&mut context).cast::<std::ffi::c_void>();
+        let code = match &self.backend {
+            LoadedPluginBackend::Dynamic {
+                register_auth_providers,
+                ..
+            } => unsafe {
+                register_auth_providers(Some(register_auth_provider_callback), user_data)
+            },
+            LoadedPluginBackend::Static { vtable } => {
+                vtable
+                    .register_auth_providers
+                    .map_or(0, |register_auth_providers| {
+                        register_auth_providers(
+                            vtable.instance,
+                            Some(register_auth_provider_callback),
+                            user_data,
+                        )
+                    })
+            }
+        };
+        if code != 0 {
+            return Err(PluginLoadError::LifecycleFailed {
+                plugin_id: self.manifest.id.clone(),
+                hook: "register_auth_providers",
+                code,
+            });
+        }
+        if let Some(source) = context.error {
+            return Err(PluginLoadError::AuthRegistration {
+                plugin_id: self.manifest.id.clone(),
+                source,
+            });
+        }
+        Ok(())
     }
 
     /// Deactivate the plugin.
@@ -1226,6 +1425,11 @@ pub enum PluginLoadError {
         plugin_id: String,
         actual: u16,
         expected: u16,
+    },
+    #[error("plugin '{plugin_id}' authentication registration failed: {source}")]
+    AuthRegistration {
+        plugin_id: String,
+        source: AuthProviderRegistryError,
     },
     #[error("failed to load native library {path}: {source}")]
     LibraryLoad {
@@ -2592,6 +2796,7 @@ pub struct PluginRuntimeHost {
     event_dispatchers: Arc<BTreeMap<String, Arc<PluginEventDispatcher>>>,
     configs: Arc<BTreeMap<String, ResolvedPluginConfig>>,
     command_registry: Arc<bcode_command::CommandRegistry>,
+    auth_provider_registry: Arc<AuthProviderRegistry>,
     resources: Arc<PluginResourceLimiter>,
     metrics: bcode_metrics::MetricsRegistry,
 }
@@ -2645,6 +2850,19 @@ impl PluginRuntimeHost {
         surface: &bcode_command::CommandSurface,
     ) -> Vec<bcode_command::CommandContribution> {
         self.command_registry.commands_for_surface(surface)
+    }
+
+    /// Return the host-owned authentication provider registry.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn auth_provider_registry(&self) -> &AuthProviderRegistry {
+        &self.auth_provider_registry
+    }
+
+    /// Return a registered authentication provider by exact ID.
+    #[must_use]
+    pub fn auth_provider(&self, provider_id: &str) -> Option<&RegisteredAuthProvider> {
+        self.auth_provider_registry.get(provider_id)
     }
 
     /// Return loaded plugin ids.
@@ -3186,6 +3404,8 @@ impl From<PluginHost> for PluginRuntimeHost {
     fn from(mut host: PluginHost) -> Self {
         let loaded = std::mem::take(&mut host.loaded);
         let configs = std::mem::take(&mut host.configs);
+        let command_registry = std::mem::take(&mut host.command_registry);
+        let auth_provider_registry = std::mem::take(&mut host.auth_provider_registry);
         let mut manifests = BTreeMap::new();
         let mut executors = BTreeMap::new();
         let mut event_dispatchers = BTreeMap::new();
@@ -3227,7 +3447,8 @@ impl From<PluginHost> for PluginRuntimeHost {
             executors: Arc::new(executors),
             event_dispatchers: Arc::new(event_dispatchers),
             configs: Arc::new(configs),
-            command_registry: Arc::new(std::mem::take(&mut host.command_registry)),
+            command_registry: Arc::new(command_registry),
+            auth_provider_registry: Arc::new(auth_provider_registry),
             resources: Arc::default(),
             metrics: bcode_metrics::MetricsRegistry::disabled(),
         }
@@ -3540,6 +3761,7 @@ pub struct PluginHost {
     loaded: Vec<LoadedPlugin>,
     configs: BTreeMap<String, ResolvedPluginConfig>,
     command_registry: bcode_command::CommandRegistry,
+    auth_provider_registry: AuthProviderRegistry,
 }
 
 impl Default for PluginHost {
@@ -3550,6 +3772,7 @@ impl Default for PluginHost {
             loaded: Vec::new(),
             configs: BTreeMap::new(),
             command_registry,
+            auth_provider_registry: AuthProviderRegistry::new(),
         }
     }
 }
@@ -3640,6 +3863,7 @@ impl PluginHost {
                 registry.extend(bcode_command::bundled_host_palette_commands());
                 registry
             },
+            auth_provider_registry: AuthProviderRegistry::new(),
         };
         host.load_static_plugins_into(&static_plugins)?;
         host.load_registered_plugins_into(&plugins)?;
@@ -3714,6 +3938,7 @@ impl PluginHost {
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "activating plugin");
             loaded.activate()?;
             loaded.register_commands(&mut self.command_registry)?;
+            loaded.register_auth_providers(&mut self.auth_provider_registry)?;
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "plugin activated");
             self.loaded.push(loaded);
         }
@@ -3733,6 +3958,7 @@ impl PluginHost {
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "activating plugin");
             loaded.activate()?;
             loaded.register_commands(&mut self.command_registry)?;
+            loaded.register_auth_providers(&mut self.auth_provider_registry)?;
             tracing::debug!(target: "bcode_plugin::startup", plugin_id = %loaded.manifest().id, "plugin activated");
             self.loaded.push(loaded);
         }
@@ -3815,6 +4041,19 @@ impl PluginHost {
         surface: &bcode_command::CommandSurface,
     ) -> Vec<bcode_command::CommandContribution> {
         self.command_registry.commands_for_surface(surface)
+    }
+
+    /// Return the host-owned authentication provider registry.
+    #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
+    pub fn auth_provider_registry(&self) -> &AuthProviderRegistry {
+        &self.auth_provider_registry
+    }
+
+    /// Return a registered authentication provider by exact ID.
+    #[must_use]
+    pub fn auth_provider(&self, provider_id: &str) -> Option<&RegisteredAuthProvider> {
+        self.auth_provider_registry.get(provider_id)
     }
 
     /// Return the service registry for currently loaded plugins.
@@ -3997,6 +4236,11 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
     tracing::debug!(target: "bcode_plugin::startup", plugin_id = %plugin.manifest.id, "loading native symbols");
     let activate = load_lifecycle_symbol(&library, &library_path, &runtime.activate_symbol)?;
     let register_commands = load_register_commands_symbol(&library);
+    let register_auth_providers = load_register_auth_providers_symbol(
+        &library,
+        &library_path,
+        &runtime.register_auth_providers_symbol,
+    )?;
     let deactivate = load_lifecycle_symbol(&library, &library_path, &runtime.deactivate_symbol)?;
     let invoke_service_streaming =
         load_streaming_service_symbol(&library, &library_path, &runtime.streaming_service_symbol)?;
@@ -4009,6 +4253,7 @@ pub fn load_registered_plugin(plugin: &RegisteredPlugin) -> Result<LoadedPlugin,
             _library: ManuallyDrop::new(library),
             activate,
             register_commands,
+            register_auth_providers,
             deactivate,
             invoke_service_streaming,
             handle_event,
@@ -4169,6 +4414,22 @@ fn load_register_commands_symbol(library: &Library) -> Option<RegisterCommandsFn
     unsafe { library.get::<RegisterCommandsFn>(&*symbol).ok().map(|s| *s) }
 }
 
+fn load_register_auth_providers_symbol(
+    library: &Library,
+    library_path: &Path,
+    symbol: &str,
+) -> Result<RegisterAuthProvidersFn, PluginLoadError> {
+    let loaded =
+        unsafe { library.get::<RegisterAuthProvidersFn>(symbol.as_bytes()) }.map_err(|source| {
+            PluginLoadError::SymbolLoad {
+                library: library_path.to_path_buf(),
+                symbol: symbol.to_owned(),
+                source,
+            }
+        })?;
+    Ok(*loaded)
+}
+
 fn load_streaming_service_symbol(
     library: &Library,
     library_path: &Path,
@@ -4222,6 +4483,10 @@ fn default_deactivate_symbol() -> String {
 
 fn default_streaming_service_symbol() -> String {
     DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL.to_string()
+}
+
+fn default_register_auth_providers_symbol() -> String {
+    DEFAULT_NATIVE_REGISTER_AUTH_PROVIDERS_SYMBOL.to_string()
 }
 
 fn default_event_symbol() -> String {
@@ -4396,6 +4661,7 @@ library = "libdisabled.dylib"
                 manifest,
                 activate: lifecycle,
                 register_commands: None,
+                register_auth_providers: None,
                 deactivate: lifecycle,
                 invoke_service_streaming: test_streaming_service,
                 cli_registration: None,
@@ -4443,6 +4709,7 @@ library = "libexample_static.dylib"
                 manifest,
                 activate: lifecycle,
                 register_commands: None,
+                register_auth_providers: None,
                 deactivate: lifecycle,
                 invoke_service_streaming: test_streaming_service,
                 cli_registration: None,
@@ -4549,6 +4816,7 @@ library = "libcommands.dylib"
                     },
                     activate: test_activate,
                     register_commands: Some(register_commands),
+                    register_auth_providers: None,
                     deactivate: test_deactivate,
                     invoke_service_streaming: test_streaming_service,
                     cli_registration: None,
@@ -4571,6 +4839,129 @@ library = "libcommands.dylib"
                         command_id: "example.run".to_string(),
                     }
         }));
+    }
+
+    #[test]
+    fn plugin_host_registers_auth_providers_with_canonical_ownership() {
+        fn register_auth_providers(
+            _instance: *const std::ffi::c_void,
+            callback: Option<AuthRegistrationCallback>,
+            user_data: *mut std::ffi::c_void,
+        ) -> i32 {
+            let contribution = AuthProviderContribution {
+                schema_version:
+                    bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+                provider_id: "exa".to_owned(),
+                display_name: "Exa".to_owned(),
+                methods: vec![
+                    bcode_provider_auth_models::AuthMethodContribution::SecretFields {
+                        method_id: "api_key".to_owned(),
+                        display_name: "API key".to_owned(),
+                        fields: vec![bcode_provider_auth_models::AuthSecretField {
+                            credential_id: "api_key".to_owned(),
+                            storage_key: "EXA_API_KEY".to_owned(),
+                            prompt: "Exa API key".to_owned(),
+                            optional: false,
+                            validation: bcode_provider_auth_models::AuthSecretValidation::default(),
+                        }],
+                        supports_verification: false,
+                        supports_revocation: false,
+                    },
+                ],
+            };
+            let payload = serde_json::to_vec(&contribution).expect("contribution encodes");
+            callback.expect("registration callback")(payload.as_ptr(), payload.len(), user_data);
+            SERVICE_STATUS_OK
+        }
+
+        let manifest = toml::from_str::<PluginManifest>(&format!(
+            r#"
+id = "bcode.web-search"
+name = "Web Search"
+version = "0.0.1"
+
+[runtime]
+type = "native"
+abi_version = {CURRENT_PLUGIN_ABI_VERSION}
+library = "libweb_search.dylib"
+"#
+        ))
+        .expect("manifest should parse");
+        let vtable = StaticPluginVtable {
+            instance: std::ptr::null(),
+            manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| std::ptr::null(),
+            activate: test_activate,
+            register_commands: None,
+            register_auth_providers: Some(register_auth_providers),
+            deactivate: test_deactivate,
+            invoke_service_streaming: test_streaming_service,
+            cli_registration: None,
+            handle_event: test_handle_event,
+        };
+        let loaded = LoadedPlugin {
+            config: ResolvedPluginConfig::default(),
+            manifest,
+            backend: LoadedPluginBackend::Static { vtable },
+        };
+        let mut registry = AuthProviderRegistry::new();
+
+        loaded
+            .register_auth_providers(&mut registry)
+            .expect("plugin registers auth provider");
+
+        let provider = registry.get("exa").expect("Exa registered");
+        assert_eq!(provider.plugin_id, "bcode.web-search");
+        assert_eq!(provider.contribution.display_name, "Exa");
+    }
+
+    #[test]
+    fn auth_provider_registry_rejects_duplicates_and_invalid_contributions() {
+        let contribution = AuthProviderContribution {
+            schema_version: bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+            provider_id: "exa".to_owned(),
+            display_name: "Exa".to_owned(),
+            methods: vec![
+                bcode_provider_auth_models::AuthMethodContribution::Interactive {
+                    method_id: "browser".to_owned(),
+                    display_name: "Browser".to_owned(),
+                    operation: "login".to_owned(),
+                    supports_revocation: false,
+                },
+            ],
+        };
+        let mut registry = AuthProviderRegistry::new();
+        registry
+            .register("bcode.first", contribution.clone())
+            .expect("first provider");
+        assert!(matches!(
+            registry.register("bcode.second", contribution),
+            Err(AuthProviderRegistryError::DuplicateProvider {
+                first_plugin_id,
+                second_plugin_id,
+                ..
+            }) if first_plugin_id == "bcode.first" && second_plugin_id == "bcode.second"
+        ));
+
+        let mut invalid = AuthProviderContribution {
+            schema_version: bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+            provider_id: "valid".to_owned(),
+            display_name: "Valid".to_owned(),
+            methods: vec![
+                bcode_provider_auth_models::AuthMethodContribution::Interactive {
+                    method_id: "flow".to_owned(),
+                    display_name: "Flow".to_owned(),
+                    operation: "flow".to_owned(),
+                    supports_revocation: false,
+                },
+            ],
+        };
+        invalid.schema_version += 1;
+        assert!(matches!(
+            registry.register("bcode.third", invalid),
+            Err(AuthProviderRegistryError::InvalidContribution(
+                AuthContractError::UnsupportedSchema { .. }
+            ))
+        ));
     }
 
     #[test]
@@ -4604,6 +4995,7 @@ library = "libcommands.dylib"
                 activate_symbol: default_activate_symbol(),
                 deactivate_symbol: default_deactivate_symbol(),
                 streaming_service_symbol: default_streaming_service_symbol(),
+                register_auth_providers_symbol: default_register_auth_providers_symbol(),
                 event_symbol: default_event_symbol(),
             }),
         };
@@ -4648,6 +5040,7 @@ library = "libcommands.dylib"
                 activate_symbol: default_activate_symbol(),
                 deactivate_symbol: default_deactivate_symbol(),
                 streaming_service_symbol: default_streaming_service_symbol(),
+                register_auth_providers_symbol: default_register_auth_providers_symbol(),
                 event_symbol: default_event_symbol(),
             }),
         };
@@ -4977,6 +5370,7 @@ library = "libexample_plugin.dylib"
             loaded: vec![loaded],
             configs: BTreeMap::new(),
             command_registry: bcode_command::CommandRegistry::new(),
+            auth_provider_registry: AuthProviderRegistry::new(),
         };
 
         let error = host
@@ -5573,6 +5967,7 @@ library = "libexample_plugin.dylib"
         let runtime = PluginRuntimeHost::from(PluginHost {
             configs: BTreeMap::new(),
             command_registry: bcode_command::CommandRegistry::new(),
+            auth_provider_registry: AuthProviderRegistry::new(),
             loaded: vec![LoadedPlugin {
                 config: ResolvedPluginConfig::default(),
                 manifest,
@@ -5829,6 +6224,8 @@ library = "libexample_plugin.dylib"
                     activate_symbol: DEFAULT_NATIVE_ACTIVATE_SYMBOL.to_string(),
                     deactivate_symbol: DEFAULT_NATIVE_DEACTIVATE_SYMBOL.to_string(),
                     streaming_service_symbol: DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL.to_string(),
+                    register_auth_providers_symbol: DEFAULT_NATIVE_REGISTER_AUTH_PROVIDERS_SYMBOL
+                        .to_string(),
                     event_symbol: DEFAULT_NATIVE_EVENT_SYMBOL.to_string(),
                 }),
             }
@@ -5842,6 +6239,7 @@ library = "libexample_plugin.dylib"
             let runtime = PluginRuntimeHost::from(PluginHost {
                 configs: BTreeMap::new(),
                 command_registry: bcode_command::CommandRegistry::new(),
+                auth_provider_registry: AuthProviderRegistry::new(),
                 loaded: vec![
                     LoadedPlugin {
                         config: ResolvedPluginConfig::default(),
@@ -5854,6 +6252,7 @@ library = "libexample_plugin.dylib"
                                 },
                                 activate,
                                 register_commands: None,
+                                register_auth_providers: None,
                                 deactivate,
                                 invoke_service_streaming:
                                     |_,
@@ -5893,6 +6292,7 @@ library = "libexample_plugin.dylib"
                                 },
                                 activate,
                                 register_commands: None,
+                                register_auth_providers: None,
                                 deactivate,
                                 invoke_service_streaming:
                                     |_,
@@ -6050,6 +6450,7 @@ library = "libexample_plugin.dylib"
             let runtime = PluginRuntimeHost::from(PluginHost {
                 configs: BTreeMap::new(),
                 command_registry: bcode_command::CommandRegistry::new(),
+                auth_provider_registry: AuthProviderRegistry::new(),
                 loaded: vec![LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: manifest(),
@@ -6061,6 +6462,7 @@ library = "libexample_plugin.dylib"
                             },
                             activate: test_activate,
                             register_commands: None,
+                            register_auth_providers: None,
                             deactivate: test_deactivate,
                             invoke_service_streaming: service_streaming,
                             handle_event: test_handle_event,
@@ -6183,6 +6585,7 @@ library = "libexample_plugin.dylib"
             let runtime = PluginRuntimeHost::from(PluginHost {
                 configs: BTreeMap::new(),
                 command_registry: bcode_command::CommandRegistry::new(),
+                auth_provider_registry: AuthProviderRegistry::new(),
                 loaded: vec![LoadedPlugin {
                     config: ResolvedPluginConfig::default(),
                     manifest: manifest(),
@@ -6194,6 +6597,7 @@ library = "libexample_plugin.dylib"
                             },
                             activate: test_activate,
                             register_commands: None,
+                            register_auth_providers: None,
                             deactivate: test_deactivate,
                             invoke_service_streaming: service_streaming,
                             handle_event: test_handle_event,
@@ -6419,6 +6823,7 @@ library = "libexample_plugin.dylib"
             manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| std::ptr::null(),
             activate: test_activate,
             register_commands: None,
+            register_auth_providers: None,
             deactivate: test_deactivate,
             invoke_service_streaming: test_large_chunking_service,
             cli_registration: None,
@@ -6432,6 +6837,7 @@ library = "libexample_plugin.dylib"
             manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| std::ptr::null(),
             activate: test_activate,
             register_commands: None,
+            register_auth_providers: None,
             deactivate: test_deactivate,
             invoke_service_streaming: |instance,
                                        input_ptr,
@@ -6458,6 +6864,7 @@ library = "libexample_plugin.dylib"
             manifest: |_: &'static std::sync::OnceLock<Option<std::ffi::CString>>| std::ptr::null(),
             activate: test_activate,
             register_commands: None,
+            register_auth_providers: None,
             deactivate: test_deactivate,
             invoke_service_streaming: test_streaming_service,
             cli_registration: None,
@@ -6571,6 +6978,8 @@ library = "libexample_plugin.dylib"
                 activate_symbol: DEFAULT_NATIVE_ACTIVATE_SYMBOL.to_string(),
                 deactivate_symbol: DEFAULT_NATIVE_DEACTIVATE_SYMBOL.to_string(),
                 streaming_service_symbol: DEFAULT_NATIVE_STREAMING_SERVICE_SYMBOL.to_string(),
+                register_auth_providers_symbol: DEFAULT_NATIVE_REGISTER_AUTH_PROVIDERS_SYMBOL
+                    .to_string(),
                 event_symbol: DEFAULT_NATIVE_EVENT_SYMBOL.to_string(),
             }),
         }

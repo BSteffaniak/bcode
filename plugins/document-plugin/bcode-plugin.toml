@@ -43,7 +43,7 @@ max  = 2
 type = "limited"
 
 [runtime]
-abi_version  = 2
+abi_version  = 3
 event_symbol = "bcode_plugin_handle_event_v1"
 library      = "libbcode_document_plugin.dylib"
 type         = "native"

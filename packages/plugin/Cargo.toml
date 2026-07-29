@@ -11,22 +11,23 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_command    = { workspace = true }
-bcode_metrics    = { workspace = true }
-bcode_plugin_sdk = { workspace = true }
-bcode_tool       = { workspace = true }
-bcode_workflow   = { workspace = true }
-bmux_plugin      = { workspace = true }
-bmux_plugin_sdk  = { workspace = true }
-clap             = { workspace = true, features = ["std"] }
-libloading       = { workspace = true }
-semver           = { workspace = true, features = ["serde"] }
-serde            = { workspace = true, features = ["derive", "std"] }
-serde_json       = { workspace = true }
-thiserror        = { workspace = true, features = ["std"] }
-tokio            = { workspace = true, features = ["macros", "rt", "sync", "time"] }
-toml             = { workspace = true }
-tracing          = { workspace = true }
+bcode_command              = { workspace = true }
+bcode_metrics              = { workspace = true }
+bcode_plugin_sdk           = { workspace = true }
+bcode_provider_auth_models = { workspace = true }
+bcode_tool                 = { workspace = true }
+bcode_workflow             = { workspace = true }
+bmux_plugin                = { workspace = true }
+bmux_plugin_sdk            = { workspace = true }
+clap                       = { workspace = true, features = ["std"] }
+libloading                 = { workspace = true }
+semver                     = { workspace = true, features = ["serde"] }
+serde                      = { workspace = true, features = ["derive", "std"] }
+serde_json                 = { workspace = true }
+thiserror                  = { workspace = true, features = ["std"] }
+tokio                      = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+toml                       = { workspace = true }
+tracing                    = { workspace = true }
 
 [dev-dependencies]
 bcode_hello_plugin            = { workspace = true }

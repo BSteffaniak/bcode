@@ -11,17 +11,18 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_agent_profile  = { workspace = true }
-bcode_command        = { workspace = true }
-bcode_session_models = { workspace = true }
-bcode_tool           = { workspace = true }
-bcode_workflow       = { workspace = true }
-bmux_tui             = { workspace = true, optional = true }
-clap                 = { workspace = true, features = ["std"] }
-schemars             = { workspace = true }
-serde                = { workspace = true, features = ["derive", "std"] }
-serde_json           = { workspace = true }
-tokio                = { workspace = true, features = ["rt", "sync"], optional = true }
+bcode_agent_profile        = { workspace = true }
+bcode_command              = { workspace = true }
+bcode_provider_auth_models = { workspace = true }
+bcode_session_models       = { workspace = true }
+bcode_tool                 = { workspace = true }
+bcode_workflow             = { workspace = true }
+bmux_tui                   = { workspace = true, optional = true }
+clap                       = { workspace = true, features = ["std"] }
+schemars                   = { workspace = true }
+serde                      = { workspace = true, features = ["derive", "std"] }
+serde_json                 = { workspace = true }
+tokio                      = { workspace = true, features = ["rt", "sync"], optional = true }
 
 [dev-dependencies]
 bcode_plugin_sdk = { path = ".", features = ["tui"] }

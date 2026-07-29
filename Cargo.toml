@@ -64,6 +64,7 @@ members = [
     "packages/plugin",
     "packages/plugin-sdk",
     "packages/provider-auth",
+    "packages/provider-auth/models",
     "packages/ralph",
     "packages/server",
     "packages/settings",
@@ -154,6 +155,7 @@ bcode_pi_session_import_plugin          = { version = "0.0.1-alpha.0", default-f
 bcode_plugin                            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
 bcode_plugin_sdk                        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin-sdk" }
 bcode_provider_auth                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/provider-auth" }
+bcode_provider_auth_models              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/provider-auth/models" }
 bcode_question_dynamic_plugin           = { version = "0.0.1-alpha.0", default-features = false, path = "examples/question-dynamic-plugin" }
 bcode_question_plugin                   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/question-plugin" }
 bcode_ralph                             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ralph" }

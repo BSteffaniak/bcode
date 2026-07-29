@@ -13,7 +13,7 @@ kind        = "skills.active"
 title       = "Active Skills"
 
 [runtime]
-abi_version  = 2
+abi_version  = 3
 event_symbol = "bcode_plugin_handle_event_v1"
 library      = "libbcode_skills_plugin.dylib"
 type         = "native"

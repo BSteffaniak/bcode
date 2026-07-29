@@ -1,0 +1,21 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Portable provider authentication contracts for bcode"
+edition     = { workspace = true }
+keywords    = ["auth", "bcode", "models", "plugin"]
+license     = { workspace = true }
+name        = "bcode_provider_auth_models"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []
