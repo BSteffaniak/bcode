@@ -9,8 +9,10 @@ use super::{
     usize_to_u64,
 };
 use crate::db::{MaterializedProjection, SessionDb, SessionDbError};
+use crate::lease::SessionLeaseGuard;
 use bcode_metrics::MetricsContext;
 use bcode_session_models::ProjectionWindowAnchor;
+use std::collections::BTreeMap;
 use std::sync::RwLock;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
@@ -82,16 +84,107 @@ pub struct SessionHandle {
     snapshot: Arc<RwLock<SessionSnapshot>>,
 }
 
+/// Categories of server work that can keep a persistent session owned after clients detach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SessionOwnershipKind {
+    /// A prompt, skill, or compaction command accepted for later execution.
+    QueuedCommand,
+    /// Runtime work that can access or mutate canonical session state.
+    RuntimeWork,
+    /// A plugin invocation that can still publish canonical session results.
+    PluginInvocation,
+}
+
+impl SessionOwnershipKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::QueuedCommand => "queued_command",
+            Self::RuntimeWork => "runtime_work",
+            Self::PluginInvocation => "plugin_invocation",
+        }
+    }
+}
+
+/// Snapshot of ownership blockers currently registered with one session actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionOwnershipSnapshot {
+    /// Number of clients attached to the actor.
+    pub attached_clients: usize,
+    /// Long-lived ownership guards grouped by category.
+    pub guards: BTreeMap<SessionOwnershipKind, u64>,
+}
+
+/// Result of an atomic quiescent ownership-release attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionOwnershipRelease {
+    /// Runtime ownership and cached database resources were released.
+    Released,
+    /// The actor did not own the persistent session.
+    AlreadyUnowned,
+    /// Clients or typed guards still require runtime ownership.
+    Blocked(SessionOwnershipSnapshot),
+}
+
+impl SessionOwnershipSnapshot {
+    /// Return whether no client or long-lived activity currently requires ownership.
+    #[must_use]
+    pub fn is_quiescent(&self) -> bool {
+        self.attached_clients == 0 && self.guards.values().all(|count| *count == 0)
+    }
+}
+
+/// Cloneable hold that keeps one persistent session's compatibility lease alive.
+///
+/// Dropping the final clone notifies the actor, which serially reevaluates quiescent release.
+#[derive(Debug, Clone)]
+pub struct SessionOwnershipGuard {
+    _inner: Arc<SessionOwnershipGuardInner>,
+}
+
+#[derive(Debug)]
+struct SessionOwnershipGuardInner {
+    releases: mpsc::UnboundedSender<OwnershipRelease>,
+    kind: SessionOwnershipKind,
+    lease: Option<Arc<SessionLeaseGuard>>,
+}
+
+#[derive(Debug)]
+struct OwnershipRelease {
+    kind: SessionOwnershipKind,
+    lease: Option<Arc<SessionLeaseGuard>>,
+}
+
+impl Drop for SessionOwnershipGuardInner {
+    fn drop(&mut self) {
+        let _ = self.releases.send(OwnershipRelease {
+            kind: self.kind,
+            lease: self.lease.take(),
+        });
+    }
+}
+
 impl SessionHandle {
     #[must_use]
-    pub fn new(state: SessionState, store: Option<SessionStoreExecutor>) -> Self {
-        let snapshot = Arc::new(RwLock::new(SessionSnapshot::from_state(&state)));
+    pub fn new(
+        state: SessionState,
+        store: Option<SessionStoreExecutor>,
+        lease: Option<SessionLeaseGuard>,
+    ) -> Self {
+        let snapshot = Arc::new(RwLock::new(SessionSnapshot::from_state(
+            &state,
+            lease.is_some(),
+        )));
         let (commands, receiver) = mpsc::channel(256);
+        let (ownership_releases, ownership_release_receiver) = mpsc::unbounded_channel();
         let actor = SessionActor {
             state,
             store,
+            lease: lease.map(Arc::new),
+            ownership_guards: BTreeMap::new(),
             db: None,
             commands: receiver,
+            ownership_releases,
+            ownership_release_receiver,
             snapshot: Arc::clone(&snapshot),
         };
         tokio::spawn(actor.run());
@@ -355,6 +448,24 @@ impl SessionHandle {
         self.send(SessionCommand::ReleaseDatabaseResources).await
     }
 
+    pub async fn acquire_ownership(
+        &self,
+        kind: SessionOwnershipKind,
+    ) -> Result<SessionOwnershipGuard, SessionError> {
+        self.send(|reply| SessionCommand::AcquireOwnership { kind, reply })
+            .await?
+    }
+
+    pub async fn ownership_snapshot(&self) -> Result<SessionOwnershipSnapshot, SessionError> {
+        self.send(SessionCommand::OwnershipSnapshot).await
+    }
+
+    pub async fn release_ownership_if_quiescent(
+        &self,
+    ) -> Result<SessionOwnershipRelease, SessionError> {
+        self.send(SessionCommand::ReleaseOwnershipIfQuiescent).await
+    }
+
     pub fn client_count(&self) -> usize {
         self.snapshot().summary.client_count
     }
@@ -461,14 +572,24 @@ enum SessionCommand {
     },
     ReleaseIdleResources(oneshot::Sender<bool>),
     ReleaseDatabaseResources(oneshot::Sender<bool>),
+    AcquireOwnership {
+        kind: SessionOwnershipKind,
+        reply: oneshot::Sender<Result<SessionOwnershipGuard, SessionError>>,
+    },
+    OwnershipSnapshot(oneshot::Sender<SessionOwnershipSnapshot>),
+    ReleaseOwnershipIfQuiescent(oneshot::Sender<SessionOwnershipRelease>),
     Shutdown(oneshot::Sender<()>),
 }
 
 struct SessionActor {
     state: SessionState,
     store: Option<SessionStoreExecutor>,
+    lease: Option<Arc<SessionLeaseGuard>>,
+    ownership_guards: BTreeMap<SessionOwnershipKind, u64>,
     db: Option<SessionDb>,
     commands: mpsc::Receiver<SessionCommand>,
+    ownership_releases: mpsc::UnboundedSender<OwnershipRelease>,
+    ownership_release_receiver: mpsc::UnboundedReceiver<OwnershipRelease>,
     snapshot: Arc<RwLock<SessionSnapshot>>,
 }
 
@@ -477,21 +598,40 @@ impl SessionActor {
         let context = MetricsContext::new().with_session_id(&self.state.summary.id);
         loop {
             let command = if self.db.is_some() {
-                if let Ok(command) =
-                    tokio::time::timeout(SESSION_DATABASE_IDLE_TIMEOUT, self.commands.recv()).await
-                {
-                    command
-                } else {
-                    if self.release_database_resources() {
-                        tracing::debug!(
-                            session_id = %self.state.summary.id,
-                            "released idle session database handle"
-                        );
+                tokio::select! {
+                    release = self.ownership_release_receiver.recv() => {
+                        if let Some(release) = release {
+                            self.release_ownership(release.kind, release.lease);
+                        }
+                        continue;
                     }
-                    continue;
+                    result = tokio::time::timeout(
+                        SESSION_DATABASE_IDLE_TIMEOUT,
+                        self.commands.recv(),
+                    ) => {
+                        if let Ok(command) = result {
+                            command
+                        } else {
+                            if self.release_database_resources() {
+                                tracing::debug!(
+                                    session_id = %self.state.summary.id,
+                                    "released idle session database handle"
+                                );
+                            }
+                            continue;
+                        }
+                    }
                 }
             } else {
-                self.commands.recv().await
+                tokio::select! {
+                    release = self.ownership_release_receiver.recv() => {
+                        if let Some(release) = release {
+                            self.release_ownership(release.kind, release.lease);
+                        }
+                        continue;
+                    }
+                    command = self.commands.recv() => command,
+                }
             };
             let Some(command) = command else {
                 break;
@@ -669,6 +809,15 @@ impl SessionActor {
             SessionCommand::ReleaseDatabaseResources(reply) => {
                 let _ = reply.send(self.release_database_resources());
             }
+            SessionCommand::AcquireOwnership { kind, reply } => {
+                let _ = reply.send(self.acquire_ownership(kind));
+            }
+            SessionCommand::OwnershipSnapshot(reply) => {
+                let _ = reply.send(self.ownership_snapshot());
+            }
+            SessionCommand::ReleaseOwnershipIfQuiescent(reply) => {
+                let _ = reply.send(self.release_ownership_if_quiescent());
+            }
             SessionCommand::Shutdown(reply) => {
                 let _ = reply.send(());
                 return true;
@@ -693,14 +842,32 @@ impl SessionActor {
         *self
             .snapshot
             .write()
-            .expect("session snapshot lock poisoned") = SessionSnapshot::from_state(&self.state);
+            .expect("session snapshot lock poisoned") =
+            SessionSnapshot::from_state(&self.state, self.lease.is_some());
     }
 
     fn release_idle_resources(&mut self) -> bool {
-        if !self.state.clients.is_empty() {
-            return false;
+        matches!(
+            self.release_ownership_if_quiescent(),
+            SessionOwnershipRelease::Released
+        )
+    }
+
+    fn release_ownership_if_quiescent(&mut self) -> SessionOwnershipRelease {
+        let snapshot = self.ownership_snapshot();
+        if !snapshot.is_quiescent() {
+            return SessionOwnershipRelease::Blocked(snapshot);
         }
-        self.release_database_resources()
+        let released_database = self.release_database_resources();
+        let released_lease = self.lease.take().is_some();
+        if released_lease {
+            self.refresh_snapshot();
+        }
+        if released_database || released_lease {
+            SessionOwnershipRelease::Released
+        } else {
+            SessionOwnershipRelease::AlreadyUnowned
+        }
     }
 
     fn release_database_resources(&mut self) -> bool {
@@ -713,11 +880,79 @@ impl SessionActor {
         true
     }
 
+    fn ensure_ownership(&mut self) -> Result<(), SessionError> {
+        if self.store.is_none() || self.lease.is_some() {
+            return Ok(());
+        }
+        let store = self
+            .store
+            .as_ref()
+            .ok_or(SessionError::NotFound(self.state.summary.id))?;
+        self.lease = Some(Arc::new(crate::lease::acquire_session_lease(
+            &store.root_path(),
+            self.state.summary.id,
+            store.lease_owner(),
+        )?));
+        self.refresh_snapshot();
+        Ok(())
+    }
+
+    fn acquire_ownership(
+        &mut self,
+        kind: SessionOwnershipKind,
+    ) -> Result<SessionOwnershipGuard, SessionError> {
+        self.ensure_ownership()?;
+        let count = self.ownership_guards.entry(kind).or_default();
+        *count = count.saturating_add(1);
+        if let Some(metrics) = self.store.as_ref().map(SessionStoreExecutor::metrics) {
+            let mut labels = bcode_metrics::MetricLabels::new();
+            labels.insert("kind".to_owned(), kind.label().to_owned());
+            metrics.add_counter_with_labels("session.ownership.guard_acquired_total", 1, labels);
+        }
+        Ok(SessionOwnershipGuard {
+            _inner: Arc::new(SessionOwnershipGuardInner {
+                releases: self.ownership_releases.clone(),
+                kind,
+                lease: self.lease.clone(),
+            }),
+        })
+    }
+
+    fn release_ownership(
+        &mut self,
+        kind: SessionOwnershipKind,
+        lease: Option<Arc<SessionLeaseGuard>>,
+    ) {
+        let Some(count) = self.ownership_guards.get_mut(&kind) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            self.ownership_guards.remove(&kind);
+        }
+        drop(lease);
+        if self.state.clients.is_empty() && !self.has_ownership_guards() {
+            let _ = self.release_idle_resources();
+        }
+    }
+
+    fn ownership_snapshot(&self) -> SessionOwnershipSnapshot {
+        SessionOwnershipSnapshot {
+            attached_clients: self.state.clients.len(),
+            guards: self.ownership_guards.clone(),
+        }
+    }
+
+    fn has_ownership_guards(&self) -> bool {
+        self.ownership_guards.values().any(|count| *count > 0)
+    }
+
     async fn set_composer_draft(
         &mut self,
         text: &str,
         updated_at_ms: u64,
     ) -> Result<(), SessionError> {
+        self.ensure_ownership()?;
         let Some(db) = self.existing_session_db().await? else {
             return Ok(());
         };
@@ -739,6 +974,7 @@ impl SessionActor {
     }
 
     async fn validate_write_readiness(&mut self) -> Result<(), SessionError> {
+        self.ensure_ownership()?;
         let db = self.session_db_for_write().await?;
         db.validate_write_readiness().await?;
         Ok(())
@@ -873,6 +1109,7 @@ impl SessionActor {
         provenance: Option<SessionEventProvenance>,
         activity_timestamp_ms: u64,
     ) -> Result<SessionEvent, SessionError> {
+        self.ensure_ownership()?;
         let total_started_at = Instant::now();
         let metrics = self.store.as_ref().map(SessionStoreExecutor::metrics);
         crate::ensure_durable_session_event_kind(&kind, metrics.as_ref())?;
@@ -1048,6 +1285,7 @@ impl SessionActor {
         mode: AttachMode,
         queued_at: Instant,
     ) -> Result<SessionAttachment, SessionError> {
+        self.ensure_ownership()?;
         let total_started_at = Instant::now();
         let metrics = self.store.as_ref().map(SessionStoreExecutor::metrics);
         if let Some(metrics) = &metrics {
@@ -1154,6 +1392,9 @@ impl SessionActor {
         if self.state.clients.remove(&client_id) {
             self.state.summary.client_count = self.state.clients.len();
             self.refresh_snapshot();
+            if self.state.clients.is_empty() && !self.has_ownership_guards() {
+                let _ = self.release_idle_resources();
+            }
             return true;
         }
         false
@@ -1761,14 +2002,16 @@ pub struct SessionSnapshot {
     pub summary: SessionSummary,
     pub working_directory: PathBuf,
     pub load_status: SessionLoadStatusKind,
+    pub owned: bool,
 }
 
 impl SessionSnapshot {
-    fn from_state(state: &SessionState) -> Self {
+    fn from_state(state: &SessionState, owned: bool) -> Self {
         Self {
             summary: state.summary(),
             working_directory: state.working_directory.clone(),
             load_status: state.load_status,
+            owned,
         }
     }
 }

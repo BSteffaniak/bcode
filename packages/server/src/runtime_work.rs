@@ -1,6 +1,7 @@
 use bcode_ipc::RuntimeWorkSnapshot;
 use bcode_metrics::{MetricLabels, MetricsRegistry};
 use bcode_plugin::PluginInvocationCancelHandle;
+use bcode_session::SessionOwnershipGuard;
 use bcode_session_models::{RuntimeWorkKind, RuntimeWorkStatus, SessionId, WorkId};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -97,6 +98,7 @@ pub struct RuntimeWorkSpec {
     pub operation: Option<String>,
     pub parent_work_id: Option<WorkId>,
     pub cancellation: CancellationHandle,
+    pub ownership: Option<SessionOwnershipGuard>,
 }
 
 impl RuntimeWorkSpec {
@@ -117,6 +119,7 @@ impl RuntimeWorkSpec {
             operation: None,
             parent_work_id: None,
             cancellation,
+            ownership: None,
         }
     }
 
@@ -316,13 +319,18 @@ impl RuntimeWorkManager {
             .collect()
     }
 
-    /// Remove active work and return whether this manager owned it.
-    pub async fn finish(&self, session_id: SessionId, work_id: &WorkId) -> bool {
+    /// Remove active work and return the owned registration, if present.
+    pub async fn take(&self, session_id: SessionId, work_id: &WorkId) -> Option<RuntimeWorkSpec> {
         self.active
             .lock()
             .await
             .remove(&(session_id, work_id.clone()))
-            .is_some()
+            .map(|work| work.spec)
+    }
+
+    /// Remove active work and return whether this manager owned it.
+    pub async fn finish(&self, session_id: SessionId, work_id: &WorkId) -> bool {
+        self.take(session_id, work_id).await.is_some()
     }
 
     /// Return active work snapshots for a session.

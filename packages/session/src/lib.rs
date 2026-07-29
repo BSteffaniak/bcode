@@ -48,6 +48,9 @@ mod subscription;
 mod tools;
 
 use actor::{AttachMode, SessionHandle};
+pub use actor::{
+    SessionOwnershipGuard, SessionOwnershipKind, SessionOwnershipRelease, SessionOwnershipSnapshot,
+};
 pub use attachment::{
     SessionAttachment, SessionEventSubscription, SessionMutationCommitted,
     SessionProjectionWindowAttachment,
@@ -466,7 +469,6 @@ pub struct SessionManager {
 #[derive(Debug, Default)]
 struct SessionManagerInner {
     sessions: BTreeMap<SessionId, SessionHandle>,
-    leases: BTreeMap<SessionId, SessionLeaseGuard>,
     load_gates: BTreeMap<SessionId, Arc<Mutex<()>>>,
 }
 
@@ -609,11 +611,10 @@ impl SessionManager {
                     .map(|(session_id, state)| {
                         (
                             session_id,
-                            SessionHandle::new(state, Some(executor.clone())),
+                            SessionHandle::new(state, Some(executor.clone()), None),
                         )
                     })
                     .collect(),
-                leases: BTreeMap::new(),
                 load_gates: BTreeMap::new(),
             })),
             store: Some(executor),
@@ -649,7 +650,14 @@ impl SessionManager {
         if !db::session_db_path(&root, session_id).exists() {
             return Err(SessionError::NotFound(session_id));
         }
-        if self.inner.lock().await.leases.contains_key(&session_id) {
+        if self
+            .inner
+            .lock()
+            .await
+            .sessions
+            .get(&session_id)
+            .is_some_and(|handle| handle.snapshot().owned)
+        {
             let db = db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
             return classify_known_current_session_open(session_id, &db).await;
         }
@@ -804,29 +812,23 @@ impl SessionManager {
             return Ok(());
         }
         let snapshot = handle.snapshot();
-        let inserted_lease = self
-            .acquire_missing_session_lease(session_id, store)
-            .await?;
         let refreshed_summary = snapshot.load_status == SessionLoadStatusKind::SummaryOnly;
+        let _load_guard = if snapshot.owned {
+            None
+        } else {
+            Some(
+                handle
+                    .acquire_ownership(SessionOwnershipKind::QueuedCommand)
+                    .await?,
+            )
+        };
         if refreshed_summary {
-            let result = self
-                .refresh_summary_session(session_id, store, &handle)
-                .await;
-            if result.is_err() && inserted_lease {
-                self.inner.lock().await.leases.remove(&session_id);
-            }
-            result?;
-        } else if inserted_lease {
-            let readiness = async {
-                let db = db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path())
-                    .await?;
-                db.validate_write_readiness().await
-            }
-            .await;
-            if readiness.is_err() {
-                self.inner.lock().await.leases.remove(&session_id);
-            }
-            readiness?;
+            self.refresh_summary_session(session_id, store, &handle)
+                .await?;
+        } else if !snapshot.owned {
+            let db =
+                db::SessionDb::open_existing_turso_in_root(session_id, &store.root_path()).await?;
+            db.validate_write_readiness().await?;
         }
         record_ensure_loaded_duration(
             &self.metrics,
@@ -908,26 +910,6 @@ impl SessionManager {
         }
     }
 
-    async fn acquire_missing_session_lease(
-        &self,
-        session_id: SessionId,
-        store: &SessionStoreExecutor,
-    ) -> Result<bool, SessionError> {
-        if self.inner.lock().await.leases.contains_key(&session_id) {
-            return Ok(false);
-        }
-        let lease = self
-            .acquire_session_lease_for_load(session_id, store)
-            .await?;
-        let mut inner = self.inner.lock().await;
-        if let std::collections::btree_map::Entry::Vacant(entry) = inner.leases.entry(session_id) {
-            entry.insert(lease);
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
     async fn refresh_summary_session(
         &self,
         session_id: SessionId,
@@ -990,10 +972,10 @@ impl SessionManager {
         );
         let insert_timer = self.metrics.timer();
         let mut inner = self.inner.lock().await;
-        inner
-            .sessions
-            .insert(session_id, SessionHandle::new(state, Some(store.clone())));
-        inner.leases.insert(session_id, lease);
+        inner.sessions.insert(
+            session_id,
+            SessionHandle::new(state, Some(store.clone()), Some(lease)),
+        );
         self.metrics.record_histogram(
             "session.manager.ensure_loaded.insert_handle_duration_ms",
             insert_timer.elapsed_ms(),
@@ -1047,7 +1029,7 @@ impl SessionManager {
                 inner
                     .sessions
                     .entry(session_id)
-                    .or_insert_with(|| SessionHandle::new(state, Some(store.clone())));
+                    .or_insert_with(|| SessionHandle::new(state, Some(store.clone()), None));
             }
             drop(inner);
             let _ = status.send(CatalogLoadStatus::Loaded);
@@ -1098,6 +1080,7 @@ impl SessionManager {
                 SessionHandle::new(
                     SessionState::from_catalog_summary(summary.clone()),
                     Some(store.clone()),
+                    None,
                 )
             });
         }
@@ -1333,7 +1316,7 @@ impl SessionManager {
             .as_ref()
             .map(|store| lease::acquire_session_lease(&store.root_path(), id, store.lease_owner()))
             .transpose()?;
-        let handle = SessionHandle::new(state, self.store.clone());
+        let handle = SessionHandle::new(state, self.store.clone(), lease);
         let event = handle
             .append_event(
                 SessionEventKind::SessionCreated {
@@ -1358,13 +1341,7 @@ impl SessionManager {
         } else {
             None
         };
-        {
-            let mut inner = self.inner.lock().await;
-            inner.sessions.insert(id, handle);
-            if let Some(lease) = lease {
-                inner.leases.insert(id, lease);
-            }
-        }
+        self.inner.lock().await.sessions.insert(id, handle);
         self.release_persistent_idle_session_resources(id).await;
         self.publish_committed_mutation(event, summary.clone());
         if let Some(event) = execution_event {
@@ -1834,16 +1811,14 @@ impl SessionManager {
         if handle.client_count() != 0 {
             return Err(SessionError::ConnectedClients(session_id));
         }
-        let _lease = {
+        {
             let mut inner = self.inner.lock().await;
             inner
                 .sessions
                 .remove(&session_id)
                 .ok_or(SessionError::NotFound(session_id))?;
-            let lease = inner.leases.remove(&session_id);
             inner.load_gates.remove(&session_id);
-            lease
-        };
+        }
         if let Some(store) = &self.store {
             let catalog = db::GlobalSessionDb::open_turso_in_root(&store.root_path()).await;
             if let Ok(catalog) = catalog
@@ -2087,11 +2062,75 @@ impl SessionManager {
         handle.current_agent_selection().await
     }
 
-    /// Release cached per-session resources when no clients remain attached.
+    /// Return whether the actor currently holds a runtime lease.
+    pub async fn session_is_owned(&self, session_id: SessionId) -> bool {
+        self.inner
+            .lock()
+            .await
+            .sessions
+            .get(&session_id)
+            .is_some_and(|handle| handle.snapshot().owned)
+    }
+
+    /// Acquire a long-lived ownership guard for server work.
     ///
-    /// The session stays visible through its lightweight summary, and its compatibility lease
-    /// remains held for the loaded actor lifetime. Only cached database/event state is released;
-    /// this prevents an incompatible daemon from claiming the session between idle operations.
+    /// # Errors
+    ///
+    /// Returns an error when the session cannot be loaded or leased.
+    pub async fn acquire_session_ownership(
+        &self,
+        session_id: SessionId,
+        kind: SessionOwnershipKind,
+    ) -> Result<SessionOwnershipGuard, SessionError> {
+        let handle = self.session_handle(session_id).await?;
+        handle.acquire_ownership(kind).await
+    }
+
+    /// Return authoritative actor ownership blockers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session actor is unavailable.
+    pub async fn session_ownership_snapshot(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionOwnershipSnapshot, SessionError> {
+        let handle = self
+            .inner
+            .lock()
+            .await
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or(SessionError::NotFound(session_id))?;
+        handle.ownership_snapshot().await
+    }
+
+    /// Atomically release persistent ownership if the actor is quiescent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SessionError::NotFound`] when the session actor is unavailable.
+    pub async fn release_session_ownership(
+        &self,
+        session_id: SessionId,
+    ) -> Result<SessionOwnershipRelease, SessionError> {
+        let handle = self
+            .inner
+            .lock()
+            .await
+            .sessions
+            .get(&session_id)
+            .cloned()
+            .ok_or(SessionError::NotFound(session_id))?;
+        handle.release_ownership_if_quiescent().await
+    }
+
+    /// Release cached per-session resources when no clients or ownership guards remain attached.
+    ///
+    /// The session stays visible through its lightweight summary. When no clients or long-lived
+    /// ownership guards remain, the actor releases cached database/event state and its runtime
+    /// compatibility lease. A later ownership-requiring command reacquires through the actor.
     ///
     /// # Errors
     ///
@@ -2560,14 +2599,14 @@ mod tests {
             .execute(db.database())
             .await
             .expect("set future writer epoch");
-        manager
+        let handle = manager
             .inner
             .lock()
             .await
             .sessions
             .remove(&session.id)
             .expect("remove cached actor handle");
-        manager.inner.lock().await.leases.remove(&session.id);
+        handle.shutdown().await.expect("shutdown cached actor");
 
         let page = manager
             .session_history_page(
@@ -4479,7 +4518,11 @@ mod tests {
                 .acquire_session_lease_for_load(session_id, store)
                 .await
                 .expect("current runtime lease");
-            manager.inner.lock().await.leases.insert(session_id, lease);
+            drop(lease);
+            manager
+                .load_current_session(session_id)
+                .await
+                .expect("install current runtime lease");
             let _current_db = db::SessionDb::open_existing_turso_in_root(session_id, &root)
                 .await
                 .expect("current benchmark DB");
@@ -5133,12 +5176,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn release_idle_session_resources_drops_loaded_state_but_retains_lease() {
+    async fn final_detach_releases_runtime_ownership_and_next_daemon_can_acquire() {
         let root = unique_temp_dir();
         let manager = SessionManager::persistent_with_metrics_and_lease_owner(
             &root,
             MetricsRegistry::default(),
             SessionLeaseOwnerContext {
+                daemon_instance_id: Some("current-test-daemon".to_string()),
                 build_fingerprint: Some("current-test-build".to_string()),
                 ..SessionLeaseOwnerContext::default()
             },
@@ -5154,75 +5198,77 @@ mod tests {
             .await
             .expect("session should attach");
 
+        assert!(manager.session_is_owned(session.id).await);
+        assert!(
+            !manager
+                .release_idle_session_resources(session.id)
+                .await
+                .expect("attached release should be checked")
+        );
         assert!(
             manager
-                .release_session_database_resources(session.id)
+                .detach_session(session.id, client_id)
                 .await
-                .expect("explicit database release should succeed"),
-            "attached inactive sessions should release their database handle"
+                .expect("session should detach")
         );
-        manager
-            .session_summary(session.id)
-            .await
-            .expect("summary should remain available after database release");
-
+        assert!(!manager.session_is_owned(session.id).await);
         assert!(
-            !manager
-                .release_idle_session_resources(session.id)
-                .await
-                .expect("release should check clients"),
-            "attached sessions should not release resources"
+            crate::lease::active_session_owners(&root, session.id)
+                .expect("owner scan")
+                .is_empty()
         );
 
-        manager
-            .detach_session(session.id, client_id)
-            .await
-            .expect("session should detach");
-        assert!(
-            !manager
-                .release_idle_session_resources(session.id)
-                .await
-                .expect("already released resources should remain released"),
-            "the explicit release already dropped the database handle"
-        );
-
-        assert!(
-            manager.inner.lock().await.leases.contains_key(&session.id),
-            "idle resource release must retain compatibility ownership"
-        );
-
-        let incompatible = SessionManager::persistent_with_metrics_and_lease_owner(
+        let next = SessionManager::persistent_with_metrics_and_lease_owner(
             &root,
             MetricsRegistry::default(),
             SessionLeaseOwnerContext {
-                storage_writer_epoch: Some(
-                    crate::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH.saturating_add(1),
-                ),
-                build_fingerprint: Some("incompatible-test-build".to_string()),
+                daemon_instance_id: Some("next-test-daemon".to_string()),
+                build_fingerprint: Some("next-test-build".to_string()),
                 ..SessionLeaseOwnerContext::default()
             },
         )
-        .expect("incompatible manager should initialize lazily");
-        assert!(matches!(
-            incompatible.ensure_session_loaded(session.id).await,
-            Err(SessionError::Lease(
-                crate::lease::SessionLeaseError::OwnedByOtherDaemon { .. }
-            ))
-        ));
+        .expect("next manager should initialize lazily");
+        next.load_current_session(session.id)
+            .await
+            .expect("next daemon should acquire after final detach");
 
+        std::fs::remove_dir_all(root).expect("temp dir should clean up");
+    }
+
+    #[tokio::test]
+    async fn ownership_guard_survives_detach_until_final_clone_drops() {
+        let root = unique_temp_dir();
+        let manager = SessionManager::persistent(&root).expect("manager should initialize");
+        let session = manager
+            .create_session(Some("guarded".to_string()), test_working_directory())
+            .await
+            .expect("session should create");
+        let client_id = ClientId::new();
         manager
-            .append_user_message(session.id, ClientId::new(), "after release".to_owned())
+            .attach_session_recent(session.id, client_id, 8)
             .await
-            .expect("released session should reload on next use");
-        let history = manager
-            .session_history(session.id)
+            .expect("attach");
+        let guard = manager
+            .acquire_session_ownership(session.id, crate::SessionOwnershipKind::RuntimeWork)
             .await
-            .expect("history should load after release");
-        assert!(history.iter().any(|event| matches!(
-            &event.kind,
-            SessionEventKind::UserMessage { text, .. } if text == "after release"
-        )));
-
+            .expect("runtime ownership");
+        let guard_clone = guard.clone();
+        manager
+            .detach_session(session.id, client_id)
+            .await
+            .expect("detach");
+        assert!(manager.session_is_owned(session.id).await);
+        drop(guard);
+        tokio::task::yield_now().await;
+        assert!(manager.session_is_owned(session.id).await);
+        drop(guard_clone);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while manager.session_is_owned(session.id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("final guard drop should release ownership");
         std::fs::remove_dir_all(root).expect("temp dir should clean up");
     }
 
@@ -5244,7 +5290,7 @@ mod tests {
                 .create_session(Some("lease release".to_string()), test_working_directory())
                 .await
                 .expect("session should create");
-            assert!(manager.inner.lock().await.leases.contains_key(&session.id));
+            assert!(manager.session_is_owned(session.id).await);
             session.id
         };
 
@@ -5668,14 +5714,14 @@ mod tests {
             .await
             .expect("canonical payload should corrupt");
         drop(db);
-        manager
+        let handle = manager
             .inner
             .lock()
             .await
             .sessions
             .remove(&session.id)
             .expect("cached actor should exist");
-        manager.inner.lock().await.leases.remove(&session.id);
+        handle.shutdown().await.expect("shutdown cached actor");
 
         let summary = manager
             .session_summary(session.id)

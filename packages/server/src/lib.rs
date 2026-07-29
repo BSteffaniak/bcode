@@ -525,6 +525,7 @@ enum FollowupCommand {
         queued_steering: Option<Arc<AtomicUsize>>,
         cancel_state: Option<Arc<TurnCancelState>>,
         completion: Option<oneshot::Sender<ModelTurnCompletion>>,
+        ownership: bcode_session::SessionOwnershipGuard,
     },
     SkillInvocation {
         client_id: ClientId,
@@ -533,11 +534,13 @@ enum FollowupCommand {
         arguments: String,
         source: Option<SkillSource>,
         display_text: String,
+        ownership: bcode_session::SessionOwnershipGuard,
     },
     CompactSession {
         client_id: ClientId,
         selection: SessionModelSelection,
         response: oneshot::Sender<Result<String, CompactionError>>,
+        ownership: bcode_session::SessionOwnershipGuard,
     },
 }
 
@@ -1560,12 +1563,28 @@ impl ServerState {
         {
             return;
         }
-        if self.session_has_active_turn(session_id).await
-            || !self
-                .runtime_work
-                .active_for_session(session_id)
-                .await
-                .is_empty()
+        if let Some(runtime) = self.session_runtimes.lock().await.get(&session_id).cloned()
+            && (runtime.queued_followups.load(Ordering::Acquire) > 0
+                || runtime.queued_steering.load(Ordering::Acquire) > 0
+                || runtime.phase.lock().await.has_active_work()
+                || runtime.current_turn.lock().await.is_some())
+        {
+            return;
+        }
+        if self
+            .active_session_namespaces
+            .lock()
+            .await
+            .get(&session_id)
+            .is_some_and(|namespace| namespace.pending_attaches > 0)
+        {
+            return;
+        }
+        if !self
+            .runtime_work
+            .active_for_session(session_id)
+            .await
+            .is_empty()
             || session_has_active_plugin_invocations(self, session_id)
         {
             return;
@@ -6763,6 +6782,7 @@ struct ActivePluginInvocationRegistration {
     invocations: Arc<StdMutex<BTreeMap<(SessionId, String), ActivePluginInvocation>>>,
     active_artifacts: Arc<StdMutex<BTreeMap<ActiveArtifactKey, ActiveArtifactReference>>>,
     key: (SessionId, String),
+    _ownership: Option<bcode_session::SessionOwnershipGuard>,
 }
 
 impl ActivePluginInvocationRegistration {
@@ -6772,6 +6792,7 @@ impl ActivePluginInvocationRegistration {
         session_id: SessionId,
         tool_call_id: &str,
         invocation: ActivePluginInvocation,
+        ownership: Option<bcode_session::SessionOwnershipGuard>,
     ) -> Result<Self, String> {
         let key = (session_id, tool_call_id.to_owned());
         let mut entries = invocations
@@ -6786,6 +6807,7 @@ impl ActivePluginInvocationRegistration {
             invocations,
             active_artifacts,
             key,
+            _ownership: ownership,
         })
     }
 }
@@ -8241,6 +8263,13 @@ async fn enqueue_user_message_command(
         .await;
     }
 
+    let ownership = state
+        .sessions
+        .acquire_session_ownership(
+            session_id,
+            bcode_session::SessionOwnershipKind::QueuedCommand,
+        )
+        .await?;
     let (_, user_event) = admit_turn(
         state,
         session_id,
@@ -8269,6 +8298,7 @@ async fn enqueue_user_message_command(
             queued_steering: None,
             cancel_state: None,
             completion: None,
+            ownership,
         })
         .await
         .map_err(|error| error.to_string());
@@ -8297,6 +8327,13 @@ async fn enqueue_steering_message_command(
 ) -> Result<MessageQueueStatus, ServerError> {
     match window {
         SteeringWindow::Idle => {
+            let ownership = state
+                .sessions
+                .acquire_session_ownership(
+                    session_id,
+                    bcode_session::SessionOwnershipKind::QueuedCommand,
+                )
+                .await?;
             let (_, user_event) = admit_turn(
                 state,
                 session_id,
@@ -8316,6 +8353,7 @@ async fn enqueue_steering_message_command(
                     queued_steering: None,
                     cancel_state: None,
                     completion: None,
+                    ownership,
                 })
                 .await
                 .map_err(|error| error.to_string());
@@ -8348,6 +8386,13 @@ async fn enqueue_steering_message_command(
             }
         }
         SteeringWindow::ProviderInFlight | SteeringWindow::Finishing => {
+            let ownership = state
+                .sessions
+                .acquire_session_ownership(
+                    session_id,
+                    bcode_session::SessionOwnershipKind::QueuedCommand,
+                )
+                .await?;
             let user_event = append_steering_user_message(state, session_id, client_id, text)
                 .await?
                 .ok_or_else(|| bcode_session::SessionError::NotFound(session_id))?;
@@ -8363,6 +8408,7 @@ async fn enqueue_steering_message_command(
                     queued_steering: Some(Arc::clone(&handle.queued_steering)),
                     cancel_state: None,
                     completion: None,
+                    ownership,
                 })
                 .await
                 .map_err(|error| error.to_string());
@@ -8470,6 +8516,13 @@ async fn enqueue_compact_session_command(
     selection: SessionModelSelection,
 ) -> Result<Result<String, CompactionError>, ServerError> {
     let (response, completion) = oneshot::channel();
+    let ownership = state
+        .sessions
+        .acquire_session_ownership(
+            session_id,
+            bcode_session::SessionOwnershipKind::QueuedCommand,
+        )
+        .await?;
     enqueue_followup_command(
         state,
         session_id,
@@ -8477,6 +8530,7 @@ async fn enqueue_compact_session_command(
             client_id,
             selection,
             response,
+            ownership,
         },
     )
     .await?;
@@ -8614,6 +8668,7 @@ async fn run_session_runtime(
                 user_event,
                 cancel_state,
                 completion,
+                ownership,
                 ..
             } => {
                 Box::pin(process_existing_user_event_command(
@@ -8632,6 +8687,7 @@ async fn run_session_runtime(
                     cancel_state,
                 ))
                 .await;
+                drop(ownership);
             }
             FollowupCommand::SkillInvocation {
                 client_id,
@@ -8640,6 +8696,7 @@ async fn run_session_runtime(
                 arguments,
                 source,
                 display_text,
+                ownership,
             } => {
                 Box::pin(process_skill_invocation_command(
                     &state,
@@ -8658,11 +8715,13 @@ async fn run_session_runtime(
                     display_text,
                 ))
                 .await;
+                drop(ownership);
             }
             FollowupCommand::CompactSession {
                 client_id,
                 selection,
                 response,
+                ownership,
             } => {
                 let result = Box::pin(process_compact_session_command(
                     &state,
@@ -8678,6 +8737,7 @@ async fn run_session_runtime(
                 ))
                 .await;
                 let _sent = response.send(result);
+                drop(ownership);
             }
         }
     }
@@ -9367,6 +9427,13 @@ async fn handle_invoke_skill(
         )
         .await;
     };
+    let ownership = state
+        .sessions
+        .acquire_session_ownership(
+            session_id,
+            bcode_session::SessionOwnershipKind::QueuedCommand,
+        )
+        .await?;
     let command = FollowupCommand::SkillInvocation {
         client_id,
         runtime_context: state.client_runtime_context(client_id).await,
@@ -9374,6 +9441,7 @@ async fn handle_invoke_skill(
         arguments,
         source: Some(summary.source),
         display_text,
+        ownership,
     };
     match enqueue_followup_command(state, session_id, command).await {
         Ok(status) => {
@@ -9410,6 +9478,13 @@ async fn submit_session_model_turn_with_admission(
     let client_id = ClientId::new();
     let admission_lock = turn_admission_lock(state, session_id).await;
     let _admission_guard = admission_lock.lock().await;
+    let ownership = state
+        .sessions
+        .acquire_session_ownership(
+            session_id,
+            bcode_session::SessionOwnershipKind::QueuedCommand,
+        )
+        .await?;
     let (admission, user_event) =
         admit_turn(state, session_id, client_id, text, admission_metadata).await?;
     let receipt = match admission {
@@ -9443,6 +9518,7 @@ async fn submit_session_model_turn_with_admission(
             queued_steering: None,
             cancel_state,
             completion: Some(sender),
+            ownership,
         },
     )
     .await?;
@@ -9537,6 +9613,24 @@ async fn handle_submit_turn(
     }
     let admission_lock = turn_admission_lock(state, session_id).await;
     let _admission_guard = admission_lock.lock().await;
+    let ownership = match state
+        .sessions
+        .acquire_session_ownership(
+            session_id,
+            bcode_session::SessionOwnershipKind::QueuedCommand,
+        )
+        .await
+    {
+        Ok(ownership) => ownership,
+        Err(error) => {
+            return send_response(
+                writer,
+                request_id,
+                Response::Err(session_error_response(&error)),
+            )
+            .await;
+        }
+    };
     let result = admit_turn(state, session_id, client_id, text, admission).await;
     let (admission, user_event) = match result {
         Ok(result) => result,
@@ -9561,6 +9655,7 @@ async fn handle_submit_turn(
                 queued_steering: None,
                 cancel_state: None,
                 completion: None,
+                ownership,
             },
         )
         .await?;
@@ -19875,6 +19970,14 @@ async fn invoke_plugin_tool_transport(
     .await;
     let (input_sender, input_receiver) = mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY);
     let input_receiver = Mutex::new(input_receiver);
+    let invocation_ownership = state
+        .sessions
+        .acquire_session_ownership(
+            session_id,
+            bcode_session::SessionOwnershipKind::PluginInvocation,
+        )
+        .await
+        .map_err(|error| error.to_string())?;
     let _action_registration = ActivePluginInvocationRegistration::register(
         Arc::clone(&state.active_plugin_invocations),
         Arc::clone(&state.active_artifacts),
@@ -19884,6 +19987,7 @@ async fn invoke_plugin_tool_transport(
             producer_plugin_id: plugin_id.to_string(),
             inputs: input_sender,
         },
+        Some(invocation_ownership),
     )?;
     let request = ToolInvocationRequest {
         tool_call_id: call.id.clone(),
@@ -22237,11 +22341,8 @@ async fn append_tool_finished_event_inner(
     } = input;
     let runtime_work_id = WorkId::new(format!("tool_{tool_call_id}"));
     let runtime_status = runtime_work_status_from_tool_result(&result, is_error);
-    let owned_runtime_work = state
-        .runtime_work
-        .finish(session_id, &runtime_work_id)
-        .await;
-    if !owned_runtime_work {
+    let owned_runtime_work = state.runtime_work.take(session_id, &runtime_work_id).await;
+    if owned_runtime_work.is_none() {
         tracing::debug!(%session_id, work_id = %runtime_work_id, "tool runtime work already reached a terminal state");
     }
     let content_note = tool_result_content_model_note(&tool_call_id, &content);
@@ -22278,7 +22379,7 @@ async fn append_tool_finished_event_inner(
     transition_finalized_active_artifacts(state, session_id, semantic_result.as_ref());
     publish_session_event(state, &generic_event).await;
     retire_tool_request_draft_after_result(state, session_id, &tool_call_id).await;
-    if owned_runtime_work
+    if owned_runtime_work.is_some()
         && let Ok(runtime_event) = state
             .sessions
             .append_runtime_work_finished(
@@ -22292,6 +22393,8 @@ async fn append_tool_finished_event_inner(
     {
         publish_session_event(state, &runtime_event).await;
     }
+    drop(owned_runtime_work);
+    state.release_session_resources_if_idle(session_id).await;
     Ok(generic_event)
 }
 
@@ -22352,7 +22455,23 @@ async fn append_system_event(state: &ServerState, session_id: SessionId, text: S
     }
 }
 
-async fn register_runtime_work(state: &ServerState, session_id: SessionId, spec: RuntimeWorkSpec) {
+async fn register_runtime_work(
+    state: &ServerState,
+    session_id: SessionId,
+    mut spec: RuntimeWorkSpec,
+) {
+    let ownership = match state
+        .sessions
+        .acquire_session_ownership(session_id, bcode_session::SessionOwnershipKind::RuntimeWork)
+        .await
+    {
+        Ok(ownership) => ownership,
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "failed to acquire runtime-work session ownership");
+            return;
+        }
+    };
+    spec.ownership = Some(ownership);
     let work_id = spec.work_id.clone();
     let kind = spec.kind;
     let label = spec.label.clone();
@@ -24037,11 +24156,12 @@ async fn finish_registered_runtime_work(
     status: RuntimeWorkStatus,
     message: Option<String>,
 ) {
-    if !state.runtime_work.finish(session_id, &work_id).await {
+    let Some(owned_work) = state.runtime_work.take(session_id, &work_id).await else {
         tracing::debug!(%session_id, work_id = %work_id, "runtime work already reached a terminal state");
         return;
-    }
+    };
     append_runtime_work_finished_event(state, session_id, work_id, status, message).await;
+    drop(owned_work);
     state.release_session_resources_if_idle(session_id).await;
 }
 
@@ -27164,6 +27284,7 @@ library = "test"
                 producer_plugin_id: "example.plugin".to_owned(),
                 inputs: mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY).0,
             },
+            None,
         )
         .expect("register invocation");
         let active = invocations.lock().expect("registry");
@@ -27182,6 +27303,7 @@ library = "test"
                     producer_plugin_id: "other.plugin".to_owned(),
                     inputs: mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY).0,
                 },
+                None,
             )
             .is_err()
         );
@@ -27216,6 +27338,7 @@ library = "test"
                 producer_plugin_id: "fixture.plugin".to_owned(),
                 inputs: mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY).0,
             },
+            None,
         )
         .expect("register invocation");
         let storage_uri = url::Url::from_file_path(&path)
@@ -27366,6 +27489,7 @@ library = "test"
                 producer_plugin_id: "fixture.plugin".to_owned(),
                 inputs: mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY).0,
             },
+            None,
         )
         .expect("registration");
         let update = artifact_contribution_envelope(
@@ -27478,6 +27602,7 @@ library = "test"
                 producer_plugin_id: "fixture.plugin".to_owned(),
                 inputs: mpsc::channel(ACTIVE_INVOCATION_INPUT_QUEUE_CAPACITY).0,
             },
+            None,
         )
         .expect("registration");
         let update = artifact_contribution_envelope(
@@ -31541,6 +31666,14 @@ library = "test"
         let state = Arc::new(state);
         let client_id = ClientId::new();
         let (turn_tx, turn_rx) = oneshot::channel();
+        let ownership = state
+            .sessions
+            .acquire_session_ownership(
+                session_id,
+                bcode_session::SessionOwnershipKind::QueuedCommand,
+            )
+            .await
+            .expect("queued ownership");
         enqueue_followup_command(
             &state,
             session_id,
@@ -31551,6 +31684,7 @@ library = "test"
                 queued_steering: None,
                 cancel_state: None,
                 completion: Some(turn_tx),
+                ownership,
             },
         )
         .await
@@ -31572,6 +31706,14 @@ library = "test"
             .cloned()
             .expect("selection");
         let (compact_tx, compact_rx) = oneshot::channel();
+        let compact_ownership = state
+            .sessions
+            .acquire_session_ownership(
+                session_id,
+                bcode_session::SessionOwnershipKind::QueuedCommand,
+            )
+            .await
+            .expect("compaction ownership");
         let status = enqueue_followup_command(
             &state,
             session_id,
@@ -31579,6 +31721,7 @@ library = "test"
                 client_id,
                 selection,
                 response: compact_tx,
+                ownership: compact_ownership,
             },
         )
         .await
@@ -37390,6 +37533,7 @@ library = "test"
                 producer_plugin_id: "bcode.filesystem".to_owned(),
                 inputs,
             },
+            None,
         )
         .expect("active invocation");
         publish_tool_request_draft_live(
@@ -40182,7 +40326,12 @@ library = "test"
 
     #[tokio::test]
     async fn workflow_and_manual_turns_share_one_fifo_runtime_queue() {
-        let session_id = SessionId::new();
+        let sessions = SessionManager::default();
+        let session = sessions
+            .create_session(Some("queue".to_owned()), PathBuf::from("."))
+            .await
+            .expect("session");
+        let session_id = session.id;
         let (sender, mut receiver) = mpsc::channel(4);
         let queued_followups = AtomicUsize::new(0);
         let event = |sequence, text: &str, priority| bcode_session_models::SessionEvent {
@@ -40200,22 +40349,43 @@ library = "test"
                 },
             },
         };
-        let command = |event| FollowupCommand::ExecuteTurn {
+        let ownership_one = sessions
+            .acquire_session_ownership(
+                session_id,
+                bcode_session::SessionOwnershipKind::QueuedCommand,
+            )
+            .await
+            .expect("first queue ownership");
+        let ownership_two = sessions
+            .acquire_session_ownership(
+                session_id,
+                bcode_session::SessionOwnershipKind::QueuedCommand,
+            )
+            .await
+            .expect("second queue ownership");
+        let command = |event, ownership| FollowupCommand::ExecuteTurn {
             client_id: ClientId::new(),
             runtime_context: None,
             user_event: Box::new(event),
             queued_steering: None,
             cancel_state: None,
             completion: None,
+            ownership,
         };
         queued_followups.fetch_add(1, Ordering::AcqRel);
         sender
-            .send(command(event(1, "manual", TurnPriority::Interactive)))
+            .send(command(
+                event(1, "manual", TurnPriority::Interactive),
+                ownership_one,
+            ))
             .await
             .expect("manual");
         queued_followups.fetch_add(1, Ordering::AcqRel);
         sender
-            .send(command(event(2, "loop", TurnPriority::Background)))
+            .send(command(
+                event(2, "loop", TurnPriority::Background),
+                ownership_two,
+            ))
             .await
             .expect("loop");
         for expected in [
@@ -45284,6 +45454,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 producer_plugin_id: "bcode.filesystem".to_owned(),
                 inputs,
             },
+            None,
         )
         .expect("active invocation");
 
