@@ -183,7 +183,11 @@ sidecars, byte counts, and verification status. Receipts are current audit metad
 branches for old behavior.
 
 Corrected runtime ownership is one daemon instance per session, with any number of clients routed
-through that owner. Lease metadata includes writer epoch and daemon instance identity. A live older
+through that owner. Lease metadata includes writer epoch and daemon instance identity. Schema-v3
+owner records are published by locking and synchronizing a unique temporary file before atomic
+rename; the owning actor retains that locked file handle. Liveness for v3 comes from lock evidence,
+not PID identity. Schema-v2 records retain conservative PID-based classification for compatibility,
+and malformed or unknown owner metadata is unverifiable and never pruned as stale. A live older
 daemon is never forced out or migrated underneath: it continues until release, idle close, graceful
 stop, or process exit. A newer daemon waits or reports actionable owner metadata without taking the
 database lock. Maintenance-to-runtime handoff must have no unowned writable gap, and an older writer
@@ -241,8 +245,14 @@ Ordinary compatible writers share maintenance coordination and serialize write c
 Mutating maintenance holds the coordinator exclusively, refuses every live owner, and then acquires
 the write lock. Never acquire these capabilities in reverse order.
 
-A loaded actor retains its compatibility lease while dropping idle database/event caches. This
-prevents an incompatible writer from claiming the session between operations.
+A loaded actor owns the runtime lease rather than the manager registry. It releases database/event
+caches and the lease atomically when its attached-client count and typed ownership-guard counts are
+all zero. Queued commands, runtime work, and plugin invocations carry clone-safe typed guards through
+their terminal persistence boundary; dropping the final guard triggers actor-side reevaluation.
+Summary/catalog state and broadcast brokers remain available without retaining or reacquiring a
+runtime lease. A later mutation or protected activity reacquires through the actor before opening a
+runtime database or write lock. Explicit owner release uses this same serialized quiescence decision
+and reports stable blocker categories without cancelling work or detaching clients.
 
 ## Historical epoch-root recovery
 

@@ -3,6 +3,30 @@ set -euo pipefail
 
 violations=0
 
+if rg -n 'leases: BTreeMap<SessionId, SessionLeaseGuard>|retains its compatibility lease while dropping idle database' \
+  packages/session/src docs/session-persistence-architecture.md --glob '*.rs' --glob '*.md' \
+  >/tmp/bcode-session-indefinite-owner.txt; then
+  echo "Session ownership violation: manager-owned or indefinite summary-only runtime ownership was reintroduced." >&2
+  cat /tmp/bcode-session-indefinite-owner.txt >&2
+  violations=1
+fi
+
+if ! rg -q 'SessionOwnershipReleaseOutcome' packages/ipc/src/lib.rs \
+  || ! rg -q 'ReleaseSessionOwnership' packages/ipc/src/lib.rs \
+  || ! rg -q 'release_session_ownership\(' packages/client/src/lib.rs \
+  || ! rg -q 'release_ownership_if_quiescent' packages/session/src/actor.rs; then
+  echo "Session ownership violation: explicit typed release must route through the actor quiescence primitive." >&2
+  violations=1
+fi
+
+if ! rg -q 'schema_version: 3' packages/session/src/lease.rs \
+  || ! rg -q 'SessionOwnerLiveness' packages/session/src/lease.rs \
+  || ! rg -q 'file.try_lock\(\)' packages/session/src/lease.rs \
+  || ! rg -q 'file.sync_all\(\)' packages/session/src/lease.rs; then
+  echo "Session ownership violation: schema-v3 lock-backed publication and shared classification must remain present." >&2
+  violations=1
+fi
+
 if rg -n 'publish_transient_event|PublishTransient' packages/session/src --glob '*.rs' >/tmp/bcode-session-transient-durable-type.txt; then
   echo "Session architecture violation: live-only publication must use SessionLiveEvent, not replayable SessionEvent types." >&2
   cat /tmp/bcode-session-transient-durable-type.txt >&2

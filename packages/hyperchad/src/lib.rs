@@ -801,7 +801,7 @@ fn client_error_message(error: &ClientError) -> String {
         ClientError::Server { code, .. } => match code.as_str() {
             "session_not_found" => "This session is no longer available.".to_owned(),
             "session_active_elsewhere" => {
-                "This session is active in another client and cannot perform that action here."
+                "This session is owned by another Bcode daemon or storage writer and cannot perform that action here."
                     .to_owned()
             }
             "session_repair_required" | "projection_stale" => {

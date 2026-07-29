@@ -107,7 +107,7 @@ impl TuiDaemonIssue {
             Self::SessionDatabaseLocked { message } => TuiDaemonIssueMessage {
                 status: format!("{label}: session database is owned by another Bcode instance"),
                 detail: Some(format!(
-                    "Bcode will automatically release an inactive session database after 30 seconds. Retry now, or run `bcode session release-owner <session-id>`. If the owner does not cooperate, run `bcode session stop-owner <session-id>`. Last resort: `bcode session kill-owner <session-id> --yes` forcefully terminates only the verified owning daemon. Never delete the WAL file.\n\nDaemon error: {message}"
+                    "Bcode automatically releases session ownership after the final client disconnects and all queued or active session work reaches its terminal persistence boundary. Retry now, or run `bcode session release-owner <session-id>` for a typed blocker report. If the verified owner does not cooperate, run `bcode session stop-owner <session-id>`. Last resort: `bcode session kill-owner <session-id> --yes` forcefully terminates only the verified owning daemon. Never delete lease, database, or WAL files.\n\nDaemon error: {message}"
                 )),
             },
             Self::SessionUnavailable { message } => TuiDaemonIssueMessage {

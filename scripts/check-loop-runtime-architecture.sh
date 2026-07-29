@@ -1087,7 +1087,7 @@ if ! grep -F 'pub struct PluginInteractionAdapterCapability' packages/plugin-sdk
    ! grep -F 'with_interaction_adapters' packages/client/src/lib.rs >/dev/null ||
    ! grep -F 'client_supports_exchange' packages/server/src/lib.rs >/dev/null ||
    ! grep -F 'has_exchange_consumer' packages/server/src/lib.rs >/dev/null ||
-   ! grep -F 'bcode_bundled_plugins::interaction_adapter(' packages/tui/src/effects.rs >/dev/null ||
+   ! grep -F 'bundled_interaction_adapter(' packages/tui/src/effects.rs >/dev/null ||
    ! grep -F 'SessionEventKind::ToolExchangeRequested { request }' packages/tui/src/chat_loop.rs >/dev/null ||
    ! grep -F 'local_interaction_adapter(&exchange)' packages/hyperchad/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: renderer-local exchange adapter routing was removed." >&2
