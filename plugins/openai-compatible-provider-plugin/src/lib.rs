@@ -1080,6 +1080,7 @@ struct OpenAiErrorBody {
 enum StreamOutcome {
     Finished,
     ToolCall,
+    MaxTokens,
     Cancelled,
 }
 
@@ -2049,6 +2050,9 @@ async fn stream_chat_completion(request: &ModelTurnRequest, turn: &TurnState) {
         }),
         Ok(StreamOutcome::ToolCall) => turn.push(ProviderTurnEvent::TurnFinished {
             stop_reason: StopReason::ToolCall,
+        }),
+        Ok(StreamOutcome::MaxTokens) => turn.push(ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::MaxTokens,
         }),
         Ok(StreamOutcome::Cancelled) => {
             turn.push(ProviderTurnEvent::Cancelled);
@@ -3297,7 +3301,7 @@ async fn read_stream_events(
                     &mut saw_tool_call,
                     &name_map,
                 )?;
-                if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall) {
+                if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall | StreamOutcome::MaxTokens) {
                     return Ok(outcome);
                 }
             }
@@ -3351,7 +3355,7 @@ async fn read_responses_stream_events(
                     &mut reasoning_items,
                     &mut saw_tool_call,
                 )?;
-                if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall) {
+                if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall | StreamOutcome::MaxTokens) {
                     return Ok(outcome);
                 }
             }
@@ -3390,7 +3394,10 @@ fn process_responses_stream_buffer(
             reasoning_items,
             saw_tool_call,
         )?;
-        if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall) {
+        if matches!(
+            outcome,
+            StreamOutcome::Finished | StreamOutcome::ToolCall | StreamOutcome::MaxTokens
+        ) {
             return Ok(outcome);
         }
     }
@@ -3575,6 +3582,41 @@ fn process_responses_stream_line(
             return Ok(outcome);
         }
         "response.incomplete" => {
+            if responses_incomplete_reason(&event) == "max_output_tokens" {
+                if let Some(usage) = openai_usage_from_responses_event(&event) {
+                    let exact_input = (!processor.uses_previous_response)
+                        .then(|| usage.prompt_tokens.or(usage.input_tokens))
+                        .flatten();
+                    processor.turn.push(ProviderTurnEvent::Usage {
+                        usage: token_usage_from_openai_usage(usage, processor.dialect),
+                    });
+                    if let Some(tokens) = exact_input {
+                        processor
+                            .turn
+                            .push(ProviderTurnEvent::ExactRequestInputTokens {
+                                tokens: bcode_model::ExactRequestInputTokens::new(u64::from(
+                                    tokens,
+                                )),
+                            });
+                    }
+                }
+                if processor.dialect.supports_previous_response_id()
+                    && !processor.suppress_provider_reuse_state
+                    && let Some(response_id) = event
+                        .get("response")
+                        .and_then(|response| response.get("id"))
+                        .and_then(serde_json::Value::as_str)
+                {
+                    processor.turn.push(ProviderTurnEvent::ProviderMetadata {
+                        key: "provider_response_id".to_string(),
+                        value: response_id.to_string(),
+                    });
+                }
+                if !processor.suppress_provider_reuse_state {
+                    push_responses_provider_state(processor.turn, reasoning_items);
+                }
+                return Ok(StreamOutcome::MaxTokens);
+            }
             return Err(responses_incomplete_error(&event));
         }
         "response.failed" | "error" => {
@@ -3640,14 +3682,20 @@ fn responses_failed_error(event: &serde_json::Value) -> ProviderError {
     error
 }
 
-fn responses_incomplete_error(event: &serde_json::Value) -> ProviderError {
-    let response = event.get("response").unwrap_or(event);
-    let reason = response
+fn responses_incomplete_reason(event: &serde_json::Value) -> &str {
+    event
+        .get("response")
+        .unwrap_or(event)
         .get("incomplete_details")
         .and_then(|details| details.get("reason"))
         .and_then(serde_json::Value::as_str)
         .filter(|reason| !reason.trim().is_empty())
-        .unwrap_or("response_incomplete");
+        .unwrap_or("response_incomplete")
+}
+
+fn responses_incomplete_error(event: &serde_json::Value) -> ProviderError {
+    let response = event.get("response").unwrap_or(event);
+    let reason = responses_incomplete_reason(event);
     let message = format!("OpenAI Responses API returned an incomplete response ({reason})");
     let mut error = provider_error(
         reason,
@@ -4087,7 +4135,10 @@ fn process_stream_buffer(
         }
         buffer.drain(..=position);
         let outcome = process_stream_line(&line, turn, tool_calls, saw_tool_call, name_map)?;
-        if matches!(outcome, StreamOutcome::Finished | StreamOutcome::ToolCall) {
+        if matches!(
+            outcome,
+            StreamOutcome::Finished | StreamOutcome::ToolCall | StreamOutcome::MaxTokens
+        ) {
             return Ok(outcome);
         }
     }
@@ -10473,6 +10524,38 @@ mod tests {
             OPENAI_CODEX_API_ENDPOINT,
             true,
         ));
+    }
+
+    #[test]
+    fn responses_max_output_tokens_incomplete_is_continuable() {
+        let turn = TurnState::default();
+        let mut tool_calls = BTreeMap::new();
+        let mut reasoning_items = BTreeMap::new();
+        let mut saw_tool_call = false;
+        let name_map = BTreeMap::new();
+        let processor = test_responses_stream_processor(&turn, &name_map);
+
+        let outcome = process_responses_stream_line(
+            r#"data: {"type":"response.incomplete","response":{"id":"resp_incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":10,"output_tokens":20}}}"#,
+            &processor,
+            &mut tool_calls,
+            &mut reasoning_items,
+            &mut saw_tool_call,
+        )
+        .expect("output exhaustion should remain continuable");
+
+        assert_eq!(outcome, StreamOutcome::MaxTokens);
+        let events = turn.drain();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::Usage { usage }
+                if usage.input_tokens == Some(10) && usage.output_tokens == Some(20)
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ProviderMetadata { key, value }
+                if key == "provider_response_id" && value == "resp_incomplete"
+        )));
     }
 
     #[test]

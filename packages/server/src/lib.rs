@@ -12594,6 +12594,8 @@ const MODEL_STREAM_FLUSH_INTERVAL: Duration = Duration::from_millis(16);
 const TOOL_ARGUMENTS_DECODE_FAILED_CODE: &str = "tool_arguments_decode_failed";
 const MODEL_NO_PROGRESS_TIMEOUT_CODE: &str = "model_no_progress_timeout";
 const MALFORMED_TOOL_ARGUMENTS_RETRY_INSTRUCTION: &str = "The previous model turn emitted malformed JSON for a tool call, so the tool did not run. Reissue the intended tool call with valid JSON arguments. Do not explain unless the user explicitly asked for an explanation.";
+const MAX_TOKENS_CONTINUATION_INSTRUCTION: &str = "Continue exactly where the previous response stopped. Do not repeat completed content. Finish the pending task, including any required tool calls.";
+const MAX_TOKENS_CONTINUATION_LIMIT: u32 = 8;
 
 #[derive(Debug, Clone, Default)]
 struct ModelPollOutcome {
@@ -13059,6 +13061,7 @@ fn serialized_tool_argument_len(arguments: &serde_json::Value) -> usize {
 struct ModelTurnRecoveryState {
     retried_after_context_overflow: bool,
     retried_after_malformed_tool_arguments: bool,
+    max_tokens_continuations: u32,
     retry_attempts: BTreeMap<String, u64>,
     retry_instruction: Option<&'static str>,
 }
@@ -13567,6 +13570,31 @@ async fn run_model_turn_inner(
                     );
                 }
             }
+            Some(bcode_model::StopReason::MaxTokens)
+                if should_continue_after_max_tokens(recovery.max_tokens_continuations) =>
+            {
+                recovery.max_tokens_continuations =
+                    recovery.max_tokens_continuations.saturating_add(1);
+                recovery.retry_instruction = Some(MAX_TOKENS_CONTINUATION_INSTRUCTION);
+                append_provider_event_trace(
+                    state,
+                    session_id,
+                    &request.turn_id,
+                    "max_tokens_continuation",
+                    Some(format!(
+                        "model exhausted its output token budget; continuing ({}/{MAX_TOKENS_CONTINUATION_LIMIT})",
+                        recovery.max_tokens_continuations
+                    )),
+                )
+                .await;
+            }
+            Some(bcode_model::StopReason::MaxTokens) => {
+                let message = format!(
+                    "model repeatedly exhausted its output token budget ({MAX_TOKENS_CONTINUATION_LIMIT} continuations)"
+                );
+                append_system_event(state, session_id, message.clone()).await;
+                return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
+            }
             Some(_) => {
                 return outcome
                     .assistant_output
@@ -13593,6 +13621,10 @@ async fn run_model_turn_inner(
             );
         }
     }
+}
+
+const fn should_continue_after_max_tokens(continuations: u32) -> bool {
+    continuations < MAX_TOKENS_CONTINUATION_LIMIT
 }
 
 async fn maybe_retry_after_provider_error(
@@ -32232,6 +32264,17 @@ library = "test"
             compaction_error_detail(CompactionError::Provider("model failed".to_string())),
             "model failed"
         );
+    }
+
+    #[test]
+    fn max_token_continuations_are_bounded() {
+        assert!(should_continue_after_max_tokens(0));
+        assert!(should_continue_after_max_tokens(
+            MAX_TOKENS_CONTINUATION_LIMIT - 1
+        ));
+        assert!(!should_continue_after_max_tokens(
+            MAX_TOKENS_CONTINUATION_LIMIT
+        ));
     }
 
     #[test]
