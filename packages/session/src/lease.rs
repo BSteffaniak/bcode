@@ -8,7 +8,7 @@
 use bcode_session_models::SessionId;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use thiserror::Error;
@@ -53,7 +53,7 @@ impl SessionLeaseOwner {
     fn new(session_id: SessionId, context: &SessionLeaseOwnerContext) -> Self {
         let now = unix_time_millis();
         Self {
-            schema_version: 2,
+            schema_version: 3,
             session_id,
             lease_token: format!("{}-{now}-{session_id}", std::process::id()),
             pid: std::process::id(),
@@ -136,6 +136,12 @@ pub enum SessionLeaseError {
         /// Human-readable owner summary.
         owner_summary: String,
     },
+    /// Owner metadata exists but cannot be classified safely.
+    #[error("session owner metadata at {path} is malformed or uses an unsupported schema")]
+    UnverifiableOwnerMetadata {
+        /// Owner metadata path that could not be classified.
+        path: PathBuf,
+    },
     /// Current platform does not support Bcode's session access mechanism.
     #[error("session access guards are unsupported on this platform")]
     Unsupported,
@@ -145,6 +151,7 @@ pub enum SessionLeaseError {
 #[derive(Debug)]
 pub struct SessionLeaseGuard {
     owner_path: PathBuf,
+    owner_file: Option<File>,
     owner: SessionLeaseOwner,
 }
 
@@ -159,6 +166,9 @@ impl SessionLeaseGuard {
 impl Drop for SessionLeaseGuard {
     fn drop(&mut self) {
         remove_owner_metadata_if_token_matches(&self.owner_path, &self.owner.lease_token);
+        if let Some(file) = self.owner_file.take() {
+            let _ = unlock_file(&file);
+        }
     }
 }
 
@@ -226,7 +236,10 @@ pub fn active_session_owners(
             continue;
         }
         if let Some(owner) = read_owner_metadata(&path)
-            && process_is_alive(owner.pid)
+            && matches!(
+                classify_owner_liveness(&path, &owner),
+                SessionOwnerLiveness::Live | SessionOwnerLiveness::Unverifiable
+            )
         {
             owners.push(owner);
         }
@@ -280,9 +293,13 @@ pub fn acquire_session_lease(
 
     let owner = SessionLeaseOwner::new(session_id, context);
     let owner_path = access_dir.join(format!("{}.json", owner.lease_token));
-    write_owner_metadata(&owner_path, &owner)?;
+    let owner_file = write_owner_metadata(&owner_path, &owner)?;
     let _ = unlock_file(&file);
-    Ok(SessionLeaseGuard { owner_path, owner })
+    Ok(SessionLeaseGuard {
+        owner_path,
+        owner_file: Some(owner_file),
+        owner,
+    })
 }
 
 /// Acquire exclusive maintenance access, refusing every live session owner.
@@ -358,11 +375,15 @@ pub fn transition_session_maintenance_to_lease(
     }
     let owner = SessionLeaseOwner::new(session_id, context);
     let owner_path = access_dir.join(format!("{}.json", owner.lease_token));
-    write_owner_metadata(&owner_path, &owner)?;
+    let owner_file = write_owner_metadata(&owner_path, &owner)?;
     #[cfg(test)]
     abort_at_lease_handoff_boundary();
     drop(maintenance);
-    Ok(SessionLeaseGuard { owner_path, owner })
+    Ok(SessionLeaseGuard {
+        owner_path,
+        owner_file: Some(owner_file),
+        owner,
+    })
 }
 
 fn first_owner(access_dir: &Path) -> Result<Option<SessionLeaseOwner>, SessionLeaseError> {
@@ -477,7 +498,7 @@ fn open_lock_file(path: &Path) -> Result<File, SessionLeaseError> {
         })
 }
 
-fn write_owner_metadata(path: &Path, owner: &SessionLeaseOwner) -> Result<(), SessionLeaseError> {
+fn write_owner_metadata(path: &Path, owner: &SessionLeaseOwner) -> Result<File, SessionLeaseError> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|source| SessionLeaseError::Io {
             path: parent.to_path_buf(),
@@ -486,14 +507,62 @@ fn write_owner_metadata(path: &Path, owner: &SessionLeaseOwner) -> Result<(), Se
     }
     let temp_path = path.with_extension(format!("json.tmp-{}", owner.lease_token));
     let contents = serde_json::to_vec_pretty(owner)?;
-    fs::write(&temp_path, contents).map_err(|source| SessionLeaseError::Io {
+    let mut file = OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(&temp_path)
+        .map_err(|source| SessionLeaseError::Io {
+            path: temp_path.clone(),
+            source,
+        })?;
+    lock_file_exclusive(&file).map_err(|source| SessionLeaseError::Io {
         path: temp_path.clone(),
         source,
     })?;
+    file.write_all(&contents)
+        .and_then(|()| file.sync_all())
+        .map_err(|source| SessionLeaseError::Io {
+            path: temp_path.clone(),
+            source,
+        })?;
     fs::rename(&temp_path, path).map_err(|source| SessionLeaseError::Io {
         path: path.to_path_buf(),
         source,
-    })
+    })?;
+    Ok(file)
+}
+
+/// Conservative liveness classification for one owner record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOwnerLiveness {
+    /// Positive evidence shows the owner is live.
+    Live,
+    /// Positive evidence shows the owner is stale.
+    Stale,
+    /// The owner cannot be classified safely.
+    Unverifiable,
+}
+
+fn classify_owner_liveness(path: &Path, owner: &SessionLeaseOwner) -> SessionOwnerLiveness {
+    if owner.schema_version >= 3 {
+        match OpenOptions::new().read(true).write(true).open(path) {
+            Ok(file) => match try_lock_file_exclusive(&file) {
+                Ok(true) => {
+                    let _ = unlock_file(&file);
+                    SessionOwnerLiveness::Stale
+                }
+                Ok(false) => SessionOwnerLiveness::Live,
+                Err(_) => SessionOwnerLiveness::Unverifiable,
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => SessionOwnerLiveness::Stale,
+            Err(_) => SessionOwnerLiveness::Unverifiable,
+        }
+    } else if process_is_alive(owner.pid) {
+        SessionOwnerLiveness::Live
+    } else {
+        SessionOwnerLiveness::Stale
+    }
 }
 
 fn read_owner_metadata(path: &Path) -> Option<SessionLeaseOwner> {
@@ -524,10 +593,9 @@ fn prune_dead_owner_records(access_dir: &Path) -> Result<(), SessionLeaseError> 
             continue;
         }
         let Some(owner) = read_owner_metadata(&path) else {
-            remove_file_best_effort(&path)?;
-            continue;
+            return Err(SessionLeaseError::UnverifiableOwnerMetadata { path });
         };
-        if !process_is_alive(owner.pid) {
+        if classify_owner_liveness(&path, &owner) == SessionOwnerLiveness::Stale {
             remove_file_best_effort(&path)?;
         }
     }
@@ -651,6 +719,32 @@ fn lock_file_shared(_file: &File) -> io::Result<()> {
 }
 
 #[cfg(unix)]
+fn try_lock_file_exclusive(file: &File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    let result = unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) };
+    if result == 0 {
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if matches!(error.kind(), io::ErrorKind::WouldBlock) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(unix))]
+fn try_lock_file_exclusive(_file: &File) -> io::Result<bool> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        SessionLeaseError::Unsupported.to_string(),
+    ))
+}
+
+#[cfg(unix)]
 fn lock_file_exclusive(file: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
 
@@ -767,6 +861,79 @@ mod tests {
                 .expect("current writer session");
         assert_eq!(older.owner().storage_writer_epoch, Some(4));
         assert_eq!(current.owner().storage_writer_epoch, Some(5));
+    }
+
+    #[test]
+    fn schema_v3_owner_uses_lock_liveness_and_normal_drop_removes_record() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let guard = acquire_session_lease(temp_dir.path(), session_id, &context("v3", 5))
+            .expect("v3 owner");
+        assert_eq!(guard.owner().schema_version, 3);
+        assert_eq!(
+            classify_owner_liveness(&guard.owner_path, guard.owner()),
+            SessionOwnerLiveness::Live
+        );
+        assert_eq!(
+            active_session_owners(temp_dir.path(), session_id)
+                .expect("owners")
+                .len(),
+            1
+        );
+        let owner_path = guard.owner_path.clone();
+        drop(guard);
+        assert!(!owner_path.exists());
+        assert!(
+            active_session_owners(temp_dir.path(), session_id)
+                .expect("owners")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn stale_schema_v3_record_is_pruned_without_pid_evidence() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let access_dir = session_owner_dir(temp_dir.path(), session_id);
+        let owner = SessionLeaseOwner::new(session_id, &context("stale-v3", 5));
+        let owner_path = access_dir.join(format!("{}.json", owner.lease_token));
+        let file = write_owner_metadata(&owner_path, &owner).expect("owner metadata");
+        unlock_file(&file).expect("unlock abandoned owner");
+        drop(file);
+        assert_eq!(
+            classify_owner_liveness(&owner_path, &owner),
+            SessionOwnerLiveness::Stale
+        );
+        let next = acquire_session_lease(temp_dir.path(), session_id, &context("next", 5))
+            .expect("stale v3 owner should be pruned");
+        assert_eq!(next.owner().daemon_instance_id.as_deref(), Some("next"));
+    }
+
+    #[test]
+    fn schema_v2_owner_preserves_conservative_pid_fallback() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let access_dir = session_owner_dir(temp_dir.path(), session_id);
+        fs::create_dir_all(&access_dir).expect("owner dir");
+        let mut owner = SessionLeaseOwner::new(session_id, &context("v2", 5));
+        owner.schema_version = 2;
+        owner.pid = std::process::id();
+        let owner_path = access_dir.join(format!("{}.json", owner.lease_token));
+        fs::write(
+            &owner_path,
+            serde_json::to_vec_pretty(&owner).expect("serialize v2"),
+        )
+        .expect("write v2");
+        assert_eq!(
+            classify_owner_liveness(&owner_path, &owner),
+            SessionOwnerLiveness::Live
+        );
+        assert_eq!(
+            active_session_owners(temp_dir.path(), session_id)
+                .expect("owners")
+                .len(),
+            1
+        );
     }
 
     #[test]
