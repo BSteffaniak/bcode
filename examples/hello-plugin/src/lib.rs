@@ -17,6 +17,12 @@ impl RustPlugin for HelloPlugin {
         Ok(())
     }
 
+    fn register_auth_providers(&mut self, registrar: AuthRegistrar) -> Result<(), PluginError> {
+        registrar
+            .register(&hello_auth_provider())
+            .map_err(|error| PluginError::failed(error.to_string()))
+    }
+
     fn deactivate(&mut self) -> Result<(), PluginError> {
         Ok(())
     }
@@ -176,6 +182,29 @@ fn bridge_tool_response(context: &NativeServiceContext, invocation_id: &str) -> 
     .unwrap_or_else(|error| {
         ServiceResponse::error("tool_response_encode_failed", error.to_string())
     })
+}
+
+fn hello_auth_provider() -> bcode_provider_auth_models::AuthProviderContribution {
+    bcode_provider_auth_models::AuthProviderContribution {
+        schema_version: bcode_provider_auth_models::AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+        provider_id: "example-hello".to_owned(),
+        display_name: "Example Hello".to_owned(),
+        methods: vec![
+            bcode_provider_auth_models::AuthMethodContribution::SecretFields {
+                method_id: "api_key".to_owned(),
+                display_name: "API key".to_owned(),
+                fields: vec![bcode_provider_auth_models::AuthSecretField {
+                    credential_id: "api_key".to_owned(),
+                    storage_key: "EXAMPLE_HELLO_API_KEY".to_owned(),
+                    prompt: "Example API key".to_owned(),
+                    optional: false,
+                    validation: bcode_provider_auth_models::AuthSecretValidation::default(),
+                }],
+                supports_verification: false,
+                supports_revocation: false,
+            },
+        ],
+    }
 }
 
 /// Return the statically linked hello plugin vtable.

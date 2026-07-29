@@ -1802,6 +1802,7 @@ name = "bcode_hello_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_plugin_sdk",
+ "bcode_provider_auth_models",
  "bcode_tool",
  "serde_json",
 ]
@@ -2187,6 +2188,7 @@ dependencies = [
  "sha2 0.10.9",
  "ssh-key",
  "sshenv_vault",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

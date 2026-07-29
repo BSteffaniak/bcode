@@ -523,6 +523,8 @@ fn runtime_subscription_auth_profile(
 ) -> bcode_config::AuthProfileConfig {
     bcode_config::AuthProfileConfig {
         backend: "sshenv".to_string(),
+        provider_id: None,
+        owner_plugin_id: None,
         scheme: Some(profile.scheme.clone()),
         settings: BTreeMap::from([
             ("provider".to_string(), profile.provider.clone()),

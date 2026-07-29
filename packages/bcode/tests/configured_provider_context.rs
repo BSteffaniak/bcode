@@ -29,6 +29,8 @@ fn configured_builder_materializes_selected_provider_context() {
         "work".to_owned(),
         AuthProfileConfig {
             backend: "env".to_owned(),
+            provider_id: None,
+            owner_plugin_id: None,
             scheme: Some("bearer".to_owned()),
             map: BTreeMap::from([(
                 "token".to_owned(),

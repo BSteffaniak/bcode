@@ -2570,6 +2570,10 @@ pub struct AuthConfig {
     #[config_doc(nested, map_key = "<profile>")]
     #[serde(default)]
     pub profiles: BTreeMap<String, AuthProfileConfig>,
+    /// Provider IDs mapped to selected auth profiles.
+    #[config_doc(nested, map_key = "<provider-id>")]
+    #[serde(default)]
+    pub bindings: BTreeMap<String, AuthBindingConfig>,
     /// Named auth profile pools used for failover.
     #[config_doc(nested, map_key = "<pool>")]
     #[serde(default)]
@@ -2660,12 +2664,27 @@ pub struct AuthPoolQuotaConfig {
     pub weekly_cooldown: Option<String>,
 }
 
+/// Declarative provider-to-profile authentication binding.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "auth_binding")]
+pub struct AuthBindingConfig {
+    /// Selected auth profile. Defaults to the provider ID when omitted.
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
 /// Generic authentication profile configuration.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "auth_profile")]
 pub struct AuthProfileConfig {
     /// Auth backend id for this profile.
     pub backend: String,
+    /// Provider ID this profile authenticates.
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    /// Plugin that owns the provider registration for this profile.
+    #[serde(default)]
+    pub owner_plugin_id: Option<String>,
     /// Optional provider/plugin auth scheme, for example `api_key` or `chatgpt`.
     #[serde(default)]
     pub scheme: Option<String>,
@@ -3740,6 +3759,8 @@ pub fn set_openai_compatible_sshenv_auth_mode(
             profile.clone(),
             AuthProfileConfig {
                 backend: "sshenv".to_string(),
+                provider_id: None,
+                owner_plugin_id: None,
                 scheme: Some(mode_setting.to_string()),
                 map: auth_map,
                 settings,
@@ -3794,6 +3815,8 @@ pub fn add_openai_chatgpt_subscription_auth(
             profile.to_string(),
             AuthProfileConfig {
                 backend: "sshenv".to_string(),
+                provider_id: None,
+                owner_plugin_id: None,
                 scheme: Some("chatgpt".to_string()),
                 map: openai_compatible_auth_map("openai", &AuthMode::ChatGpt),
                 settings,
@@ -3956,6 +3979,8 @@ pub fn set_bedrock_model_profile(
             auth_profile,
             AuthProfileConfig {
                 backend: "aws_default_chain".to_string(),
+                provider_id: None,
+                owner_plugin_id: None,
                 scheme: Some("aws_default_chain".to_string()),
                 settings: auth_settings,
                 ..AuthProfileConfig::default()
@@ -3993,6 +4018,32 @@ fn update_writable_config(
 pub struct RuntimeAuthSubscriptions {
     #[serde(default)]
     pub pools: BTreeMap<String, RuntimeAuthSubscriptionPool>,
+    /// Runtime provider-to-profile bindings used only when no declarative binding/profile exists.
+    #[serde(default)]
+    pub bindings: BTreeMap<String, RuntimeAuthBinding>,
+    /// Runtime auth profile metadata. Secret values remain in the vault.
+    #[serde(default)]
+    pub profiles: BTreeMap<String, RuntimeAuthProfile>,
+}
+
+/// Non-secret runtime provider binding.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeAuthBinding {
+    pub profile: String,
+    pub owner_plugin_id: String,
+}
+
+/// Non-secret runtime auth profile metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeAuthProfile {
+    pub provider_id: String,
+    pub owner_plugin_id: String,
+    pub backend: String,
+    pub scheme: String,
+    pub storage_profile: String,
+    pub vault: PathBuf,
+    #[serde(default)]
+    pub map: BTreeMap<String, AuthCredentialMapping>,
 }
 
 /// Runtime subscriptions associated with one logical auth pool.
@@ -4000,6 +4051,12 @@ pub struct RuntimeAuthSubscriptions {
 pub struct RuntimeAuthSubscriptionPool {
     #[serde(default)]
     pub provider_plugin_id: Option<String>,
+    /// Provider ID associated with this pool.
+    #[serde(default)]
+    pub provider_id: Option<String>,
+    /// Plugin that owns the provider registration.
+    #[serde(default)]
+    pub owner_plugin_id: Option<String>,
     #[serde(default)]
     pub profiles: Vec<RuntimeAuthSubscriptionProfile>,
 }
@@ -4012,6 +4069,9 @@ pub struct RuntimeAuthSubscriptionProfile {
     pub vault: PathBuf,
     pub provider: String,
     pub scheme: String,
+    /// Plugin that owns this runtime profile when known.
+    #[serde(default)]
+    pub owner_plugin_id: Option<String>,
 }
 
 /// Return the runtime auth subscription registry path.
@@ -4049,10 +4109,18 @@ pub fn register_runtime_auth_subscription(
             .pools
             .entry(pool.to_string())
             .or_insert_with(|| RuntimeAuthSubscriptionPool {
-                provider_plugin_id: Some("bcode.openai-compatible".to_string()),
+                provider_plugin_id: profile.owner_plugin_id.clone(),
+                provider_id: Some(profile.provider.clone()),
+                owner_plugin_id: profile.owner_plugin_id.clone(),
                 profiles: Vec::new(),
             });
-    pool_entry.provider_plugin_id = Some("bcode.openai-compatible".to_string());
+    pool_entry
+        .provider_plugin_id
+        .clone_from(&profile.owner_plugin_id);
+    pool_entry.provider_id = Some(profile.provider.clone());
+    pool_entry
+        .owner_plugin_id
+        .clone_from(&profile.owner_plugin_id);
     if let Some(existing) = pool_entry
         .profiles
         .iter_mut()
@@ -4077,6 +4145,82 @@ pub fn register_runtime_auth_subscription(
         source,
     })?;
     Ok(path)
+}
+
+/// Register non-secret runtime auth profile metadata and its provider binding.
+///
+/// Declarative profiles and bindings are never modified by this operation and take precedence
+/// during resolution.
+///
+/// # Errors
+///
+/// Returns an error when ownership is incomplete, an existing runtime entry conflicts, or the
+/// runtime metadata file cannot be written.
+pub fn register_runtime_auth_profile(
+    profile_name: &str,
+    profile: RuntimeAuthProfile,
+) -> Result<PathBuf, ConfigError> {
+    if profile_name.trim().is_empty()
+        || profile.provider_id.trim().is_empty()
+        || profile.owner_plugin_id.trim().is_empty()
+    {
+        return Err(ConfigError::Composition {
+            message: "runtime auth profile requires non-empty profile, provider, and plugin IDs"
+                .to_string(),
+        });
+    }
+    let path = runtime_auth_subscriptions_path();
+    let mut registry = load_runtime_auth_subscriptions();
+    if let Some(existing) = registry.profiles.get(profile_name)
+        && (existing.provider_id != profile.provider_id
+            || existing.owner_plugin_id != profile.owner_plugin_id)
+    {
+        return Err(ConfigError::Composition {
+            message: format!(
+                "runtime auth profile '{profile_name}' ownership conflicts with existing metadata"
+            ),
+        });
+    }
+    if let Some(existing) = registry.bindings.get(&profile.provider_id)
+        && (existing.profile != profile_name || existing.owner_plugin_id != profile.owner_plugin_id)
+    {
+        return Err(ConfigError::Composition {
+            message: format!(
+                "runtime auth binding '{}' conflicts with existing metadata",
+                profile.provider_id
+            ),
+        });
+    }
+    registry.bindings.insert(
+        profile.provider_id.clone(),
+        RuntimeAuthBinding {
+            profile: profile_name.to_string(),
+            owner_plugin_id: profile.owner_plugin_id.clone(),
+        },
+    );
+    registry.profiles.insert(profile_name.to_string(), profile);
+    write_runtime_auth_subscriptions(&path, &registry)?;
+    Ok(path)
+}
+
+fn write_runtime_auth_subscriptions(
+    path: &Path,
+    registry: &RuntimeAuthSubscriptions,
+) -> Result<(), ConfigError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| ConfigError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    let contents =
+        serde_json::to_string_pretty(registry).map_err(|source| ConfigError::Composition {
+            message: format!("failed to serialize runtime auth metadata: {source}"),
+        })?;
+    fs::write(path, contents).map_err(|source| ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
 }
 
 /// Return the default Bcode state directory.

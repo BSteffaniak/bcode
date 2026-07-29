@@ -3233,6 +3233,8 @@ mod tests {
             "openai".to_owned(),
             bcode_config::AuthProfileConfig {
                 backend: "sshenv".to_owned(),
+                provider_id: None,
+                owner_plugin_id: None,
                 settings: BTreeMap::from([("device_seal".to_owned(), "required".to_owned())]),
                 ..bcode_config::AuthProfileConfig::default()
             },

@@ -2330,6 +2330,8 @@ fn runtime_subscription_auth_profile_config(
 ) -> bcode_config::AuthProfileConfig {
     bcode_config::AuthProfileConfig {
         backend: "sshenv".to_string(),
+        provider_id: None,
+        owner_plugin_id: None,
         scheme: Some(profile.scheme.clone()),
         map: BTreeMap::new(),
         settings: BTreeMap::from([
@@ -4411,6 +4413,7 @@ async fn login_openai_chatgpt(
                         vault: target.vault_path.clone(),
                         provider: "openai".to_string(),
                         scheme: "chatgpt".to_string(),
+                        owner_plugin_id: Some("bcode.openai-compatible".to_string()),
                     },
                 )?;
                 Ok(registry_path)

@@ -4965,6 +4965,89 @@ library = "libweb_search.dylib"
     }
 
     #[test]
+    fn auth_registration_hook_and_activation_failures_are_reported() {
+        fn loaded_with(
+            activate: fn(*const std::ffi::c_void) -> i32,
+            register_auth_providers: Option<bcode_plugin_sdk::StaticAuthRegistrationFn>,
+        ) -> LoadedPlugin {
+            let manifest = toml::from_str::<PluginManifest>(&format!(
+                r#"
+id = "bcode.auth-test"
+name = "Auth Test"
+version = "0.0.1"
+
+[runtime]
+type = "native"
+abi_version = {CURRENT_PLUGIN_ABI_VERSION}
+library = "libauth_test.dylib"
+"#
+            ))
+            .expect("manifest");
+            LoadedPlugin {
+                config: ResolvedPluginConfig::default(),
+                manifest,
+                backend: LoadedPluginBackend::Static {
+                    vtable: StaticPluginVtable {
+                        instance: std::ptr::null(),
+                        manifest: |_: &'static OnceLock<Option<std::ffi::CString>>| {
+                            std::ptr::null()
+                        },
+                        activate,
+                        register_commands: None,
+                        register_auth_providers,
+                        deactivate: test_deactivate,
+                        invoke_service_streaming: test_streaming_service,
+                        cli_registration: None,
+                        handle_event: test_handle_event,
+                    },
+                },
+            }
+        }
+
+        assert!(matches!(
+            loaded_with(test_activate_failed, None).activate(),
+            Err(PluginLoadError::LifecycleFailed {
+                hook: "activate",
+                code: 71,
+                ..
+            })
+        ));
+        assert!(matches!(
+            loaded_with(test_activate, Some(test_register_auth_failed))
+                .register_auth_providers(&mut AuthProviderRegistry::new()),
+            Err(PluginLoadError::LifecycleFailed {
+                hook: "register_auth_providers",
+                code: 72,
+                ..
+            })
+        ));
+        assert!(matches!(
+            loaded_with(test_activate, Some(test_register_auth_malformed))
+                .register_auth_providers(&mut AuthProviderRegistry::new()),
+            Err(PluginLoadError::AuthRegistration {
+                source: AuthProviderRegistryError::InvalidContribution(_),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn static_plugins_with_incompatible_abi_fail_closed() {
+        let mut manifest = toml::from_str::<PluginManifest>(include_str!(
+            "../../../examples/hello-plugin/bcode-plugin.toml"
+        ))
+        .expect("hello manifest");
+        let PluginRuntime::Native(runtime) = &mut manifest.runtime;
+        runtime.abi_version = CURRENT_PLUGIN_ABI_VERSION - 1;
+
+        assert!(matches!(
+            load_static_plugin(manifest, bcode_hello_plugin::static_plugin()),
+            Err(PluginLoadError::UnsupportedAbi { actual, expected, .. })
+                if actual + 1 == expected
+        ));
+    }
+
+    #[test]
     fn registered_plugins_expose_config_extension_catalog() {
         let manifest = PluginManifest {
             id: "bcode.example".to_string(),
@@ -5588,6 +5671,36 @@ library = "libexample_plugin.dylib"
             response.error.as_ref().map(|error| error.code.as_str()),
             Some("bridge_failed")
         );
+    }
+
+    #[test]
+    fn dynamic_and_static_hello_plugins_register_auth_providers() {
+        for plugin in [load_dynamic_hello_plugin(), load_static_hello_plugin()] {
+            let mut registry = AuthProviderRegistry::new();
+            plugin
+                .register_auth_providers(&mut registry)
+                .expect("hello auth provider registration");
+            let provider = registry
+                .get("example-hello")
+                .expect("example provider registered");
+            assert_eq!(provider.plugin_id, "example.hello");
+        }
+    }
+
+    #[test]
+    fn disabled_static_plugin_does_not_contribute_auth_provider() {
+        let static_plugin = StaticBundledPlugin::new(
+            include_str!("../../../examples/hello-plugin/bcode-plugin.toml"),
+            bcode_hello_plugin::static_plugin(),
+        );
+        let mut selection = PluginSelection::all_enabled();
+        selection.disabled.insert("example.hello".to_owned());
+        let selected =
+            filter_selected_static_plugins(&[static_plugin], &selection).expect("static selection");
+        let host = PluginHost::load_static_plugins(&selected).expect("empty selected host");
+
+        assert!(selected.is_empty());
+        assert!(host.auth_provider_registry().is_empty());
     }
 
     #[test]
@@ -6647,6 +6760,28 @@ library = "libexample_plugin.dylib"
     }
 
     fn test_activate(_: *const std::ffi::c_void) -> i32 {
+        0
+    }
+
+    fn test_activate_failed(_: *const std::ffi::c_void) -> i32 {
+        71
+    }
+
+    fn test_register_auth_failed(
+        _: *const std::ffi::c_void,
+        _: Option<AuthRegistrationCallback>,
+        _: *mut std::ffi::c_void,
+    ) -> i32 {
+        72
+    }
+
+    fn test_register_auth_malformed(
+        _: *const std::ffi::c_void,
+        callback: Option<AuthRegistrationCallback>,
+        user_data: *mut std::ffi::c_void,
+    ) -> i32 {
+        let payload = b"not-json";
+        callback.expect("registration callback")(payload.as_ptr(), payload.len(), user_data);
         0
     }
 

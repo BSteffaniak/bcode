@@ -120,6 +120,8 @@ fn runtime_subscription_auth_profile_config(
 ) -> bcode_config::AuthProfileConfig {
     bcode_config::AuthProfileConfig {
         backend: "sshenv".to_string(),
+        provider_id: Some(profile.provider.clone()),
+        owner_plugin_id: profile.owner_plugin_id.clone(),
         scheme: Some(profile.scheme.clone()),
         map: BTreeMap::new(),
         settings: BTreeMap::from([
@@ -129,6 +131,167 @@ fn runtime_subscription_auth_profile_config(
             ("mode".to_string(), "chatgpt".to_string()),
         ]),
     }
+}
+
+/// Resolved provider-owned authentication profile metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAuthProfile {
+    pub profile_name: String,
+    pub provider_id: String,
+    pub owner_plugin_id: String,
+    pub profile: bcode_config::AuthProfileConfig,
+    pub source: AuthProfileSource,
+}
+
+/// Source selected by generic provider-to-profile resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthProfileSource {
+    Declarative,
+    Runtime,
+}
+
+/// Generic provider-to-profile resolution failure.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum AuthProfileResolutionError {
+    #[error("auth provider and plugin IDs must not be empty")]
+    InvalidOwner,
+    #[error("auth profile '{profile}' is not configured for provider '{provider_id}'")]
+    MissingProfile {
+        provider_id: String,
+        profile: String,
+    },
+    #[error("auth profile '{profile}' belongs to provider '{actual}', not '{expected}'")]
+    ProviderMismatch {
+        profile: String,
+        expected: String,
+        actual: String,
+    },
+    #[error("auth profile '{profile}' belongs to plugin '{actual}', not '{expected}'")]
+    OwnerMismatch {
+        profile: String,
+        expected: String,
+        actual: String,
+    },
+}
+
+/// Resolve an auth profile for one registered provider with declarative precedence.
+///
+/// An explicit profile wins over bindings. Otherwise a declarative binding is used, then a
+/// same-named declarative profile, then a runtime binding/profile. Runtime metadata never
+/// overrides a declarative profile of the same name.
+///
+/// # Errors
+///
+/// Returns an error for missing profiles or provider/plugin ownership mismatch.
+pub fn resolve_auth_provider_profile(
+    config: &bcode_config::BcodeConfig,
+    provider_id: &str,
+    owner_plugin_id: &str,
+    explicit_profile: Option<&str>,
+    runtime: &bcode_config::RuntimeAuthSubscriptions,
+) -> Result<ResolvedAuthProfile, AuthProfileResolutionError> {
+    if provider_id.trim().is_empty() || owner_plugin_id.trim().is_empty() {
+        return Err(AuthProfileResolutionError::InvalidOwner);
+    }
+    let declarative_binding = config
+        .auth
+        .bindings
+        .get(provider_id)
+        .and_then(|binding| binding.profile.as_deref());
+    let runtime_binding = runtime.bindings.get(provider_id);
+    let profile_name = explicit_profile
+        .or(declarative_binding)
+        .or_else(|| {
+            config
+                .auth
+                .profiles
+                .contains_key(provider_id)
+                .then_some(provider_id)
+        })
+        .or_else(|| runtime_binding.map(|binding| binding.profile.as_str()))
+        .unwrap_or(provider_id);
+
+    if let Some(profile) = config.auth.profiles.get(profile_name) {
+        validate_auth_profile_ownership(profile_name, profile, provider_id, owner_plugin_id)?;
+        return Ok(ResolvedAuthProfile {
+            profile_name: profile_name.to_string(),
+            provider_id: provider_id.to_string(),
+            owner_plugin_id: owner_plugin_id.to_string(),
+            profile: profile.clone(),
+            source: AuthProfileSource::Declarative,
+        });
+    }
+
+    let runtime_profile = runtime.profiles.get(profile_name).ok_or_else(|| {
+        AuthProfileResolutionError::MissingProfile {
+            provider_id: provider_id.to_string(),
+            profile: profile_name.to_string(),
+        }
+    })?;
+    if runtime_profile.provider_id != provider_id {
+        return Err(AuthProfileResolutionError::ProviderMismatch {
+            profile: profile_name.to_string(),
+            expected: provider_id.to_string(),
+            actual: runtime_profile.provider_id.clone(),
+        });
+    }
+    if runtime_profile.owner_plugin_id != owner_plugin_id {
+        return Err(AuthProfileResolutionError::OwnerMismatch {
+            profile: profile_name.to_string(),
+            expected: owner_plugin_id.to_string(),
+            actual: runtime_profile.owner_plugin_id.clone(),
+        });
+    }
+    Ok(ResolvedAuthProfile {
+        profile_name: profile_name.to_string(),
+        provider_id: provider_id.to_string(),
+        owner_plugin_id: owner_plugin_id.to_string(),
+        profile: bcode_config::AuthProfileConfig {
+            backend: runtime_profile.backend.clone(),
+            provider_id: Some(provider_id.to_string()),
+            owner_plugin_id: Some(owner_plugin_id.to_string()),
+            scheme: Some(runtime_profile.scheme.clone()),
+            map: runtime_profile.map.clone(),
+            settings: BTreeMap::from([
+                (
+                    "profile".to_string(),
+                    runtime_profile.storage_profile.clone(),
+                ),
+                (
+                    "vault".to_string(),
+                    runtime_profile.vault.display().to_string(),
+                ),
+            ]),
+        },
+        source: AuthProfileSource::Runtime,
+    })
+}
+
+fn validate_auth_profile_ownership(
+    profile_name: &str,
+    profile: &bcode_config::AuthProfileConfig,
+    provider_id: &str,
+    owner_plugin_id: &str,
+) -> Result<(), AuthProfileResolutionError> {
+    if let Some(actual) = &profile.provider_id
+        && actual != provider_id
+    {
+        return Err(AuthProfileResolutionError::ProviderMismatch {
+            profile: profile_name.to_string(),
+            expected: provider_id.to_string(),
+            actual: actual.clone(),
+        });
+    }
+    if let Some(actual) = &profile.owner_plugin_id
+        && actual != owner_plugin_id
+    {
+        return Err(AuthProfileResolutionError::OwnerMismatch {
+            profile: profile_name.to_string(),
+            expected: owner_plugin_id.to_string(),
+            actual: actual.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// Auth material and compatibility environment resolved for a selected profile.
@@ -464,9 +627,107 @@ mod tests {
     use super::*;
 
     #[test]
+    fn declarative_binding_precedes_runtime_and_enforces_ownership() {
+        let declarative_profile = bcode_config::AuthProfileConfig {
+            backend: "sshenv".to_owned(),
+            provider_id: Some("exa".to_owned()),
+            owner_plugin_id: Some("bcode.web-search".to_owned()),
+            scheme: Some("api_key".to_owned()),
+            map: BTreeMap::new(),
+            settings: BTreeMap::new(),
+        };
+        let config = bcode_config::BcodeConfig {
+            auth: bcode_config::AuthConfig {
+                profiles: BTreeMap::from([("exa-work".to_owned(), declarative_profile)]),
+                bindings: BTreeMap::from([(
+                    "exa".to_owned(),
+                    bcode_config::AuthBindingConfig {
+                        profile: Some("exa-work".to_owned()),
+                    },
+                )]),
+                ..bcode_config::AuthConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+        let runtime = bcode_config::RuntimeAuthSubscriptions {
+            bindings: BTreeMap::from([(
+                "exa".to_owned(),
+                bcode_config::RuntimeAuthBinding {
+                    profile: "runtime-exa".to_owned(),
+                    owner_plugin_id: "bcode.web-search".to_owned(),
+                },
+            )]),
+            ..bcode_config::RuntimeAuthSubscriptions::default()
+        };
+
+        let resolved =
+            resolve_auth_provider_profile(&config, "exa", "bcode.web-search", None, &runtime)
+                .expect("declarative binding resolves");
+        assert_eq!(resolved.profile_name, "exa-work");
+        assert_eq!(resolved.source, AuthProfileSource::Declarative);
+        assert!(matches!(
+            resolve_auth_provider_profile(&config, "exa", "bcode.other", None, &runtime),
+            Err(AuthProfileResolutionError::OwnerMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn runtime_binding_resolves_only_without_declarative_profile() {
+        let runtime = bcode_config::RuntimeAuthSubscriptions {
+            bindings: BTreeMap::from([(
+                "exa".to_owned(),
+                bcode_config::RuntimeAuthBinding {
+                    profile: "exa".to_owned(),
+                    owner_plugin_id: "bcode.web-search".to_owned(),
+                },
+            )]),
+            profiles: BTreeMap::from([(
+                "exa".to_owned(),
+                bcode_config::RuntimeAuthProfile {
+                    provider_id: "exa".to_owned(),
+                    owner_plugin_id: "bcode.web-search".to_owned(),
+                    backend: "sshenv".to_owned(),
+                    scheme: "api_key".to_owned(),
+                    storage_profile: "exa".to_owned(),
+                    vault: PathBuf::from("/vault"),
+                    map: BTreeMap::from([(
+                        "api_key".to_owned(),
+                        bcode_config::AuthCredentialMapping {
+                            env: None,
+                            key: Some("EXA_API_KEY".to_owned()),
+                        },
+                    )]),
+                },
+            )]),
+            ..bcode_config::RuntimeAuthSubscriptions::default()
+        };
+
+        let resolved = resolve_auth_provider_profile(
+            &bcode_config::BcodeConfig::default(),
+            "exa",
+            "bcode.web-search",
+            None,
+            &runtime,
+        )
+        .expect("runtime profile resolves");
+        assert_eq!(resolved.source, AuthProfileSource::Runtime);
+        assert_eq!(resolved.profile.provider_id.as_deref(), Some("exa"));
+        assert_eq!(
+            resolved
+                .profile
+                .map
+                .get("api_key")
+                .and_then(|mapping| mapping.key.as_deref()),
+            Some("EXA_API_KEY")
+        );
+    }
+
+    #[test]
     fn mapped_api_key_uses_canonical_credential_name() {
         let profile = bcode_config::AuthProfileConfig {
             backend: "sshenv".to_string(),
+            provider_id: None,
+            owner_plugin_id: None,
             scheme: Some("api_key".to_string()),
             map: BTreeMap::from([(
                 "api_key".to_string(),
