@@ -4247,6 +4247,67 @@ struct XaiLoginOptions {
     model: Option<String>,
 }
 
+fn enroll_registered_secret_fields(
+    provider_id: &str,
+    profile: Option<&str>,
+    vault: Option<PathBuf>,
+    recipient_key: Option<&str>,
+    device_seal_off: bool,
+    mut supplied: BTreeMap<String, String>,
+) -> Result<bcode_provider_auth::ResolvedAuthProfile, CliError> {
+    let mut host = load_cli_plugin_host()?;
+    let provider = registered_auth_provider(&host, provider_id)?;
+    let method = selected_auth_method(&provider, Some("api_key"))?;
+    let bcode_provider_auth_models::AuthMethodContribution::SecretFields { fields, .. } = method
+    else {
+        return Err(CliError::LoginProfile(format!(
+            "Provider '{provider_id}' api_key method is not a generic secret-field method."
+        )));
+    };
+    let (mut resolved, persist_runtime) =
+        resolve_or_prepare_auth_profile(&provider, method, profile, vault, recipient_key)?;
+    if device_seal_off {
+        resolved
+            .profile
+            .settings
+            .insert("device_seal".to_owned(), "off".to_owned());
+    }
+    let mut credentials = BTreeMap::new();
+    for field in fields {
+        let value = supplied.remove(&field.credential_id).map_or_else(
+            || rpassword::prompt_password(format!("{}: ", field.prompt)),
+            Ok,
+        )?;
+        if value.is_empty() && field.optional {
+            continue;
+        }
+        field
+            .validation
+            .validate_secret(&value)
+            .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+        credentials.insert(field.credential_id.clone(), value);
+    }
+    if let Some(credential_id) = supplied.keys().next() {
+        return Err(CliError::LoginProfile(format!(
+            "Provider '{provider_id}' does not declare credential '{credential_id}'."
+        )));
+    }
+    bcode_provider_auth::lifecycle::AuthVaultLifecycle::new(
+        &resolved,
+        provider_id,
+        &provider.plugin_id,
+        method,
+    )
+    .map_err(|error| CliError::LoginProfile(error.to_string()))?
+    .replace_owned(credentials)
+    .map_err(|error| CliError::LoginProfile(error.to_string()))?;
+    if persist_runtime {
+        persist_prepared_runtime_profile(&resolved)?;
+    }
+    host.deactivate_all()?;
+    Ok(resolved)
+}
+
 async fn run_registered_auth_method(
     provider_id: &str,
     method_id: &str,
@@ -4297,13 +4358,12 @@ async fn login_openai(options: OpenAiLoginOptions) -> Result<(), CliError> {
     }
     if options.api_key.is_some() || (options.base_url.is_some() && !options.mode.auth.is_chatgpt())
     {
-        let store = open_auth_store(&target.vault_path)?;
-        login_openai_api_key(
-            &store,
+        login_compatible_api_key_via_registry(
             &target,
             options.api_key,
-            options.base_url,
+            options.base_url.as_deref(),
             options.model,
+            LoginProvider::OpenAi,
         )
     } else {
         login_openai_chatgpt_via_registry(
@@ -4770,96 +4830,42 @@ fn upsert_auth_profile_secrets(
         })
 }
 
-/// Generic helper for storing API-key auth for any OpenAI-compatible provider (`OpenAI`, xAI, etc.).
-/// `prefix` is "OPENAI" or "XAI" (used for env-style secret keys stored in the vault).
-fn login_compatible_api_key(
-    store: &sshenv_vault::SshenvStore,
+fn login_compatible_api_key_via_registry(
     target: &LoginTarget,
     api_key: Option<String>,
-    base_url: Option<String>,
+    base_url: Option<&str>,
     model: Option<String>,
     provider: LoginProvider,
 ) -> Result<(), CliError> {
-    let prefix = provider.prefix();
-    let prompt = format!("{prefix} API key: ");
-    let api_key = match api_key {
-        Some(api_key) => api_key,
-        None => rpassword::prompt_password(&prompt)?,
-    };
-    let auth_mode_key = format!("BCODE_{prefix}_AUTH_MODE");
-    let api_key_key = target
-        .api_key_env
-        .clone()
-        .unwrap_or_else(|| format!("BCODE_{prefix}_API_KEY"));
-    let base_url_key = format!("BCODE_{prefix}_BASE_URL");
-
-    let config_base_url = base_url.clone();
-    let mut values = BTreeMap::from([
-        (auth_mode_key, "api_key".to_string()),
-        (api_key_key, api_key),
-    ]);
-    let mut remove_keys = Vec::new();
-    if let Some(base_url) = base_url {
-        values.insert(base_url_key, base_url);
-    } else {
-        remove_keys.push(base_url_key);
+    let mut supplied = BTreeMap::new();
+    if let Some(api_key) = api_key {
+        supplied.insert("api_key".to_owned(), api_key);
     }
-    remove_keys.extend([
-        format!("BCODE_{prefix}_CODEX_ACCESS_TOKEN"),
-        format!("BCODE_{prefix}_CODEX_ID_TOKEN"),
-        format!("BCODE_{prefix}_CODEX_REFRESH_TOKEN"),
-        format!("BCODE_{prefix}_CODEX_EXPIRES_AT"),
-        format!("BCODE_{prefix}_CODEX_ACCOUNT_ID"),
-    ]);
-    upsert_auth_profile_secrets(store, target, values, &remove_keys)?;
-    apply_auth_device_seal_policy(
-        &target.vault_path,
-        &target.storage_profile,
-        target.device_seal_policy,
+    enroll_registered_secret_fields(
+        provider.subcommand(),
+        Some(&target.auth_profile),
+        Some(target.vault_path.clone()),
         target.recipient_key.as_deref(),
+        target.device_seal_policy == bcode_provider_auth::security::AuthDeviceSealPolicy::Off,
+        supplied,
     )?;
-
-    // Always route through the shared OpenAI-compatible provider plugin.
+    let prefix = provider.prefix();
     report_login_completion(
         &format!("{prefix} API credentials saved"),
         target,
         prefix,
         || {
             bcode_config::set_openai_compatible_sshenv_auth_mode(
-                compatible_provider_name(prefix),
+                provider.subcommand(),
                 target.auth_profile.clone(),
                 target.vault_path.clone(),
                 model,
                 AuthMode::ApiKey,
-                config_base_url.as_deref(),
+                base_url,
             )
         },
     );
     Ok(())
-}
-
-fn compatible_provider_name(prefix: &str) -> &'static str {
-    match prefix {
-        "XAI" => "xai",
-        _ => "openai",
-    }
-}
-
-fn login_openai_api_key(
-    store: &sshenv_vault::SshenvStore,
-    target: &LoginTarget,
-    api_key: Option<String>,
-    base_url: Option<String>,
-    model: Option<String>,
-) -> Result<(), CliError> {
-    login_compatible_api_key(
-        store,
-        target,
-        api_key,
-        base_url,
-        model,
-        LoginProvider::OpenAi,
-    )
 }
 
 fn login_xai(options: XaiLoginOptions) -> Result<(), CliError> {
@@ -4872,16 +4878,13 @@ fn login_xai(options: XaiLoginOptions) -> Result<(), CliError> {
     if options.no_device_seal {
         target.device_seal_policy = bcode_provider_auth::security::AuthDeviceSealPolicy::Off;
     }
-    let store = open_auth_store(&target.vault_path)?;
-    login_compatible_api_key(
-        &store,
+    let base_url = options
+        .base_url
+        .unwrap_or_else(|| "https://api.x.ai/v1".to_owned());
+    login_compatible_api_key_via_registry(
         &target,
         options.api_key,
-        Some(
-            options
-                .base_url
-                .unwrap_or_else(|| "https://api.x.ai/v1".to_string()),
-        ),
+        Some(&base_url),
         options.model,
         LoginProvider::Xai,
     )

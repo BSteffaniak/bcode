@@ -3741,12 +3741,14 @@ pub fn set_openai_compatible_sshenv_auth_mode(
             config.model.model_id = Some(model_id);
         }
         let auth_map = openai_compatible_auth_map(provider, &mode);
-        config.auth.openai = Some(AuthProviderConfig {
-            backend: "sshenv".to_string(),
-            mode,
-            profile: profile.clone(),
-            vault: Some(vault),
-        });
+        if provider == "openai" {
+            config.auth.openai = Some(AuthProviderConfig {
+                backend: "sshenv".to_string(),
+                mode,
+                profile: profile.clone(),
+                vault: Some(vault),
+            });
+        }
         let mut settings = BTreeMap::new();
         settings.insert("provider".to_string(), provider.to_string());
         settings.insert("profile".to_string(), profile.clone());
@@ -3759,8 +3761,8 @@ pub fn set_openai_compatible_sshenv_auth_mode(
             profile.clone(),
             AuthProfileConfig {
                 backend: "sshenv".to_string(),
-                provider_id: None,
-                owner_plugin_id: None,
+                provider_id: Some(provider.to_string()),
+                owner_plugin_id: Some("bcode.openai-compatible".to_string()),
                 scheme: Some(mode_setting.to_string()),
                 map: auth_map,
                 settings,
@@ -5501,6 +5503,14 @@ fn write_auth_toml(output: &mut String, auth: &AuthConfig) {
             .expect("writing to string should not fail");
         writeln!(output, "backend = {}", toml_string(&profile.backend))
             .expect("writing to string should not fail");
+        if let Some(provider_id) = &profile.provider_id {
+            writeln!(output, "provider_id = {}", toml_string(provider_id))
+                .expect("writing to string should not fail");
+        }
+        if let Some(owner_plugin_id) = &profile.owner_plugin_id {
+            writeln!(output, "owner_plugin_id = {}", toml_string(owner_plugin_id))
+                .expect("writing to string should not fail");
+        }
         if let Some(scheme) = &profile.scheme {
             writeln!(output, "scheme = {}", toml_string(scheme))
                 .expect("writing to string should not fail");
@@ -7215,6 +7225,33 @@ disabled = ["shell.run"]
         assert!(config.tools.enabled.contains("filesystem.read"));
         assert!(config.tools.enabled.contains("vim_edit.preview"));
         assert!(config.tools.disabled.contains("shell.run"));
+    }
+
+    #[test]
+    fn config_to_toml_preserves_auth_profile_ownership() {
+        let mut config = BcodeConfig::default();
+        config.auth.profiles.insert(
+            "openai".to_owned(),
+            super::AuthProfileConfig {
+                backend: "sshenv".to_owned(),
+                provider_id: Some("openai".to_owned()),
+                owner_plugin_id: Some("bcode.openai-compatible".to_owned()),
+                scheme: Some("api_key".to_owned()),
+                map: BTreeMap::new(),
+                settings: BTreeMap::new(),
+            },
+        );
+        let rendered = super::config_to_toml(&config);
+        let decoded: BcodeConfig = toml::from_str(&rendered).expect("rendered config parses");
+        assert_eq!(
+            decoded.auth.profiles["openai"],
+            config.auth.profiles["openai"]
+        );
+        assert!(rendered.contains("provider_id = \"openai\""), "{rendered}");
+        assert!(
+            rendered.contains("owner_plugin_id = \"bcode.openai-compatible\""),
+            "{rendered}"
+        );
     }
 
     #[test]
