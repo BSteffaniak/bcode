@@ -1425,7 +1425,8 @@ impl ReleasedEventVariantDescriptor {
 
 fn released_event_schema_range(kind: &str) -> (u16, u16) {
     match kind {
-        "assistant_reasoning_activity" | "assistant_response_segment" => (41, 41),
+        "assistant_reasoning_activity" => (40, 41),
+        "assistant_response_segment" => (41, 41),
         "agent_changed" => (3, 41),
         "assistant_reasoning_delta"
         | "assistant_reasoning_message"
@@ -2165,6 +2166,10 @@ pub const RELEASED_WRITER_SCHEMA_COMBINATIONS: &[ReleasedWriterSchemaDescriptor]
     },
     ReleasedWriterSchemaDescriptor {
         writer_epoch: 5,
+        event_schema: 40,
+    },
+    ReleasedWriterSchemaDescriptor {
+        writer_epoch: 5,
         event_schema: 41,
     },
 ];
@@ -2174,10 +2179,11 @@ pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4, 5];
 
 /// Released historical event schemas currently evidenced by Git history.
 ///
-/// Schemas 33, 34, 36, and 40 were never released.
+/// Schemas 33, 34, and 36 were never released. Schema 40 was emitted by an epoch-5
+/// development build and is retained as supported historical input.
 pub const RELEASED_HISTORICAL_EVENT_SCHEMAS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 41,
+    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 40, 41,
 ];
 
 /// Current event schema emitted by this build.
@@ -2639,6 +2645,10 @@ mod tests {
                 },
                 ReleasedWriterSchemaDescriptor {
                     writer_epoch: 5,
+                    event_schema: 40,
+                },
+                ReleasedWriterSchemaDescriptor {
+                    writer_epoch: 5,
                     event_schema: 41,
                 },
             ]
@@ -2653,7 +2663,7 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0] < pair[1])
         );
-        for unreleased in [33, 34, 36, 40] {
+        for unreleased in [33, 34, 36] {
             assert!(!is_released_historical_event_schema(unreleased));
         }
         for released in RELEASED_HISTORICAL_EVENT_SCHEMAS {

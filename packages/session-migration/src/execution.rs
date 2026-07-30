@@ -928,6 +928,34 @@ mod tests {
     }
 
     #[test]
+    fn epoch_5_schema_40_fixture_normalizes_to_current_without_reinterpreting_kinds() {
+        let payloads = include_str!("../fixtures/stores/epoch-5-schema-40-events.jsonl");
+        for (event_seq, payload) in payloads.lines().enumerate() {
+            let source = serde_json::from_str::<FixtureEnvelope>(payload).expect("schema-40 event");
+            let source_kind = source.kind.keys().next().expect("schema-40 event kind");
+            let normalized =
+                normalize_canonical_row(&bcode_session_migration_target::CanonicalRow {
+                    sequence: u64::try_from(event_seq).expect("fixture sequence"),
+                    event_kind: source_kind.clone(),
+                    schema_version: 40,
+                    payload: payload.to_owned(),
+                })
+                .expect("schema-40 event should normalize");
+
+            assert_eq!(normalized.event.schema_version, crate::CURRENT_EVENT_SCHEMA);
+            assert_eq!(normalized.event.sequence, source.sequence);
+            assert_eq!(
+                serde_json::to_value(&normalized.event.kind)
+                    .expect("normalized kind")
+                    .as_object()
+                    .and_then(|kind| kind.keys().next()),
+                Some(source_kind)
+            );
+            assert!(!normalized.retired_known);
+        }
+    }
+
+    #[test]
     fn historical_codec_only_applies_family_rules_to_released_schema_ranges() {
         let payload = format!(
             r#"{{"schema_version":43,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"tool_call_finished":{{"tool_call_id":"call","result":"done"}}}}}}"#
@@ -942,7 +970,10 @@ mod tests {
         );
         assert!(matches!(
             decode_for_migration(&payload, reject_current),
-            Err(HistoricalSessionEventError::UnsupportedSchema { schema_version: 40 })
+            Err(HistoricalSessionEventError::UnsupportedEventKind {
+                schema_version: 40,
+                ..
+            })
         ));
 
         let payload = format!(

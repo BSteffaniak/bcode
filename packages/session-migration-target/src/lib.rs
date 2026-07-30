@@ -393,8 +393,14 @@ mod tests {
     #[test]
     fn capability_surface_is_exact_and_current_contracts_match_models() {
         assert_eq!(current_migration_target_capabilities().len(), 9);
-        assert_eq!(CURRENT_EVENT_SCHEMA, 41);
-        assert_eq!(CURRENT_WRITER_EPOCH, 5);
+        assert_eq!(
+            CURRENT_EVENT_SCHEMA,
+            bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION
+        );
+        assert_eq!(
+            CURRENT_WRITER_EPOCH,
+            bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH
+        );
     }
 
     #[test]

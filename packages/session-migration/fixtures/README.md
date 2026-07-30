@@ -23,6 +23,13 @@ Expected migration treatment:
   streaming behavior.
 * flat `context_usage_observed` converts to `RequestContextObserved`.
 
+## Epoch-5 development schema 40
+
+`stores/epoch-5-schema-40-events.jsonl` captures the sanitized schema-40 event surface emitted by an
+epoch-5 development build that wrote durable user sessions. Although that format was not a release
+boundary, those sessions are real migration inputs. Strict current reads continue to reject schema
+40; exclusive epoch-5-to-6 migration normalizes it to the current schema and rebuilds projections.
+
 ## Confirmed current-equivalent event families
 
 `stores/released-current-equivalent-events.jsonl` contains one complete, sanitized payload for every

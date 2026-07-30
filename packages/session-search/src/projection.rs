@@ -115,10 +115,12 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         | SessionEventKind::SystemMessage { .. }
         | SessionEventKind::ContextCompacted { .. }
         | SessionEventKind::SessionRenamed { name: Some(_) }
-        | SessionEventKind::AssistantResponseSegment { .. } => {
+        | SessionEventKind::AssistantResponseSegment { .. }
+        | SessionEventKind::PositionedAssistantResponseSegment { .. } => {
             PersistedEventClassification::Searchable
         }
         SessionEventKind::ToolCallRequested { .. }
+        | SessionEventKind::PositionedToolCallRequested { .. }
         | SessionEventKind::PermissionRequested { .. }
         | SessionEventKind::PermissionResolved { .. }
         | SessionEventKind::RuntimeWorkStarted { .. }
@@ -138,7 +140,8 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
                 },
         }
         | SessionEventKind::AssistantReasoningMessage { .. }
-        | SessionEventKind::AssistantReasoningActivity { .. } => {
+        | SessionEventKind::AssistantReasoningActivity { .. }
+        | SessionEventKind::PositionedAssistantReasoningActivity { .. } => {
             PersistedEventClassification::PolicyControlled
         }
         SessionEventKind::ToolInvocationResultRecorded {
@@ -310,16 +313,10 @@ pub fn normalize_terminal_text(source: &str) -> String {
     normalize_terminal_bytes(source.as_bytes(), source.len()).text
 }
 
-/// Project one decoded canonical event according to an explicit bounded policy.
-///
-/// # Errors
-///
-/// Returns an error when the policy has a zero text limit or the event uses a future schema version
-/// that this projection does not understand.
-pub fn project_event(
+const fn validate_projection_request(
     event: &SessionEvent,
     policy: &SearchProjectionPolicy,
-) -> Result<EventProjection, ContractValidationError> {
+) -> Result<(), ContractValidationError> {
     if policy.max_text_bytes_per_record == 0 {
         return Err(ContractValidationError::InvalidProjection(
             "maximum record text bytes must be greater than zero",
@@ -330,6 +327,28 @@ pub fn project_event(
             "future session event schema is unsupported",
         ));
     }
+    Ok(())
+}
+
+const fn reasoning_activity(kind: &SessionEventKind) -> Option<&ReasoningActivity> {
+    match kind {
+        SessionEventKind::AssistantReasoningActivity { activity, .. }
+        | SessionEventKind::PositionedAssistantReasoningActivity { activity, .. } => Some(activity),
+        _ => None,
+    }
+}
+
+/// Project one decoded canonical event according to an explicit bounded policy.
+///
+/// # Errors
+///
+/// Returns an error when the policy has a zero text limit or the event uses a future schema version
+/// that this projection does not understand.
+pub fn project_event(
+    event: &SessionEvent,
+    policy: &SearchProjectionPolicy,
+) -> Result<EventProjection, ContractValidationError> {
+    validate_projection_request(event, policy)?;
     let _classification = classify_persisted_event(&event.kind);
 
     if let Some(projection) = project_transcript_event(event, policy) {
@@ -341,7 +360,7 @@ pub fn project_event(
     if let Some(projection) = project_tool_event(event, policy) {
         return Ok(projection);
     }
-    if let SessionEventKind::AssistantReasoningActivity { activity, .. } = &event.kind {
+    if let Some(activity) = reasoning_activity(&event.kind) {
         return Ok(if policy.reasoning.enabled() {
             project_reasoning_activity(event, activity, policy.max_text_bytes_per_record)
         } else {
@@ -415,9 +434,12 @@ pub fn project_event(
         | SessionEventKind::RuntimeWorkProgress { .. }
         | SessionEventKind::TraceEvent { .. }
         | SessionEventKind::ToolCallRequested { .. }
+        | SessionEventKind::PositionedToolCallRequested { .. }
         | SessionEventKind::ToolInvocationResultRecorded { .. }
         | SessionEventKind::AssistantReasoningActivity { .. }
-        | SessionEventKind::AssistantResponseSegment { .. } => {
+        | SessionEventKind::PositionedAssistantReasoningActivity { .. }
+        | SessionEventKind::AssistantResponseSegment { .. }
+        | SessionEventKind::PositionedAssistantResponseSegment { .. } => {
             unreachable!("searchable event variants must be handled by their focused projector")
         }
     };
@@ -820,6 +842,13 @@ fn project_transcript_event(
             segment_id,
             segment_order,
             text,
+        }
+        | SessionEventKind::PositionedAssistantResponseSegment {
+            turn_id,
+            segment_id,
+            segment_order,
+            text,
+            ..
         } => {
             return Some(project_text(
                 event,
@@ -861,60 +890,84 @@ fn project_transcript_event(
     ))
 }
 
+fn tool_request(
+    kind: &SessionEventKind,
+) -> Option<(&str, &str, &str, Option<&std::path::PathBuf>)> {
+    match kind {
+        SessionEventKind::ToolCallRequested {
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            working_directory,
+            ..
+        }
+        | SessionEventKind::PositionedToolCallRequested {
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            working_directory,
+            ..
+        } => Some((
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            working_directory.as_ref(),
+        )),
+        _ => None,
+    }
+}
+
+fn project_tool_request(
+    event: &SessionEvent,
+    policy: &SearchProjectionPolicy,
+) -> Option<EventProjection> {
+    let (tool_call_id, tool_name, arguments_json, working_directory) = tool_request(&event.kind)?;
+    if tool_name == SHELL_RUN_TOOL_NAME {
+        return Some(if policy.shell_commands.enabled() {
+            project_shell_command(
+                event,
+                tool_call_id,
+                arguments_json,
+                working_directory,
+                policy.max_text_bytes_per_record,
+            )
+        } else {
+            EventProjection::Excluded(ProjectionExclusion::DisabledByPolicy)
+        });
+    }
+    Some(if policy.tool_arguments.enabled() {
+        let mut attributes = BTreeMap::from([
+            ("invocation_id".to_owned(), tool_call_id.to_owned()),
+            ("tool_name".to_owned(), tool_name.to_owned()),
+        ]);
+        if let Some(working_directory) = working_directory {
+            attributes.insert(
+                "working_directory".to_owned(),
+                working_directory.to_string_lossy().into_owned(),
+            );
+        }
+        project_text(
+            event,
+            "tool-arguments",
+            SearchContentKind::ToolArguments,
+            SearchField::ToolArguments,
+            arguments_json,
+            attributes,
+            policy.max_text_bytes_per_record,
+        )
+    } else {
+        EventProjection::Excluded(ProjectionExclusion::DisabledByPolicy)
+    })
+}
+
 fn project_tool_event(
     event: &SessionEvent,
     policy: &SearchProjectionPolicy,
 ) -> Option<EventProjection> {
+    if let Some(projection) = project_tool_request(event, policy) {
+        return Some(projection);
+    }
     match &event.kind {
-        SessionEventKind::ToolCallRequested {
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            working_directory,
-            ..
-        } if tool_name == SHELL_RUN_TOOL_NAME && policy.shell_commands.enabled() => {
-            Some(project_shell_command(
-                event,
-                tool_call_id,
-                arguments_json,
-                working_directory.as_ref(),
-                policy.max_text_bytes_per_record,
-            ))
-        }
-        SessionEventKind::ToolCallRequested { tool_name, .. }
-            if tool_name == SHELL_RUN_TOOL_NAME =>
-        {
-            Some(EventProjection::Excluded(
-                ProjectionExclusion::DisabledByPolicy,
-            ))
-        }
-        SessionEventKind::ToolCallRequested {
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            working_directory,
-            ..
-        } if policy.tool_arguments.enabled() => {
-            let mut attributes = BTreeMap::from([
-                ("invocation_id".to_owned(), tool_call_id.clone()),
-                ("tool_name".to_owned(), tool_name.clone()),
-            ]);
-            if let Some(working_directory) = working_directory {
-                attributes.insert(
-                    "working_directory".to_owned(),
-                    working_directory.to_string_lossy().into_owned(),
-                );
-            }
-            Some(project_text(
-                event,
-                "tool-arguments",
-                SearchContentKind::ToolArguments,
-                SearchField::ToolArguments,
-                arguments_json,
-                attributes,
-                policy.max_text_bytes_per_record,
-            ))
-        }
         SessionEventKind::ToolInvocationResultRecorded { record }
             if shell_result_metadata(record).is_some() && policy.shell_output.enabled() =>
         {
@@ -937,6 +990,7 @@ fn project_tool_event(
             Some(project_tool_result(event, record, policy))
         }
         SessionEventKind::ToolCallRequested { .. }
+        | SessionEventKind::PositionedToolCallRequested { .. }
         | SessionEventKind::ToolInvocationResultRecorded { .. } => Some(EventProjection::Excluded(
             ProjectionExclusion::DisabledByPolicy,
         )),
@@ -1755,6 +1809,47 @@ mod tests {
             records[0].attributes.get("segment_id").map(String::as_str),
             Some("segment-1")
         );
+    }
+
+    #[test]
+    fn positioned_output_variants_reuse_existing_search_semantics() {
+        let segment = event(
+            12,
+            SessionEventKind::PositionedAssistantResponseSegment {
+                turn_id: "turn-1".to_owned(),
+                output_position: bcode_session_models::TurnOutputPosition::new(4),
+                segment_id: "segment-1".to_owned(),
+                segment_order: 3,
+                text: "answer".to_owned(),
+            },
+        );
+        let EventProjection::Records(segment_records) =
+            project_event(&segment, &SearchProjectionPolicy::default())
+                .expect("project positioned assistant segment")
+        else {
+            panic!("positioned assistant segment must produce a record");
+        };
+        assert_eq!(segment_records[0].record_id, "12:assistant-segment-3:0");
+
+        let tool = event(
+            13,
+            SessionEventKind::PositionedToolCallRequested {
+                turn_id: "turn-1".to_owned(),
+                output_position: bcode_session_models::TurnOutputPosition::new(5),
+                tool_call_id: "call-shell".to_owned(),
+                producer_plugin_id: Some("bcode.shell".to_owned()),
+                tool_name: SHELL_RUN_TOOL_NAME.to_owned(),
+                arguments_json: serde_json::json!({"command": "printf hello"}).to_string(),
+                working_directory: Some(std::path::PathBuf::from("/workspace")),
+            },
+        );
+        let EventProjection::Records(tool_records) =
+            project_event(&tool, &SearchProjectionPolicy::default())
+                .expect("project positioned tool request")
+        else {
+            panic!("positioned tool request must produce a record");
+        };
+        assert_eq!(tool_records[0].text.as_deref(), Some("printf hello"));
     }
 
     #[test]
