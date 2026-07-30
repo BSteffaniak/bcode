@@ -627,7 +627,8 @@ mod tests {
         let openai = host.auth_provider("openai").expect("OpenAI auth provider");
         assert_eq!(openai.plugin_id, "bcode.openai-compatible");
         assert_eq!(openai.contribution.methods[0].method_id(), "api_key");
-        assert_eq!(openai.contribution.methods[1].method_id(), "device");
+        assert_eq!(openai.contribution.methods[1].method_id(), "browser");
+        assert_eq!(openai.contribution.methods[2].method_id(), "device");
         let xai = host.auth_provider("xai").expect("xAI auth provider");
         assert_eq!(xai.plugin_id, "bcode.openai-compatible");
         assert_eq!(xai.contribution.methods.len(), 1);

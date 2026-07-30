@@ -52,6 +52,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::io::{Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -65,13 +67,19 @@ const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 const DEFAULT_XAI_MODEL_ID: &str = "grok-4.3"; // from https://docs.x.ai/developers/models/grok-4.3
 const PROVIDER_ID: &str = "bcode.openai-compatible";
 const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const OPENAI_CODEX_AUTHORIZE_URL: &str = "https://auth.openai.com/oauth/authorize";
 const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const OPENAI_CODEX_DEVICE_USER_CODE_URL: &str =
     "https://auth.openai.com/api/accounts/deviceauth/usercode";
 const OPENAI_CODEX_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
 const OPENAI_CODEX_DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
 const OPENAI_CODEX_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+const OPENAI_CODEX_SCOPE: &str = "openid profile email offline_access";
+const OPENAI_CODEX_OAUTH_PORT: u16 = 1455;
 const OPENAI_AUTH_FLOW_OPERATION: &str = "flow";
+const OPENAI_BROWSER_PROMPT_ID: &str = "callback_url";
+const OPENAI_BROWSER_WAIT_MILLIS: u64 = 500;
+const OPENAI_BROWSER_MAX_POLLS: u16 = 1_200;
 const OPENAI_AUTH_MAX_POLLS: u16 = 300;
 const OPENAI_CODEX_API_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 const OPENAI_DIALECT_SETTING: &str = "dialect";
@@ -170,6 +178,15 @@ struct TurnState {
 
 #[derive(Debug)]
 enum OpenAiAuthFlowState {
+    Browser {
+        profile: String,
+        oauth_state: String,
+        verifier: String,
+        redirect_uri: String,
+        listeners: Vec<TcpListener>,
+        polls: u16,
+        prompt_shown: bool,
+    },
     Device {
         profile: String,
         device_auth_id: String,
@@ -257,6 +274,7 @@ fn register_auth_providers(registrar: AuthRegistrar) -> Result<(), PluginError> 
             display_name: "OpenAI".to_owned(),
             methods: vec![
                 api_key_auth_method("BCODE_OPENAI_API_KEY", "OpenAI API key"),
+                openai_browser_auth_method(),
                 openai_device_auth_method(),
             ],
         },
@@ -297,6 +315,16 @@ fn api_key_auth_method(storage_key: &str, prompt: &str) -> AuthMethodContributio
     }
 }
 
+fn openai_browser_auth_method() -> AuthMethodContribution {
+    AuthMethodContribution::Interactive {
+        method_id: "browser".to_owned(),
+        display_name: "ChatGPT browser OAuth".to_owned(),
+        operation: OPENAI_AUTH_FLOW_OPERATION.to_owned(),
+        credentials: openai_oauth_credential_storage(),
+        supports_revocation: false,
+    }
+}
+
 fn openai_device_auth_method() -> AuthMethodContribution {
     AuthMethodContribution::Interactive {
         method_id: "device".to_owned(),
@@ -322,6 +350,203 @@ fn openai_oauth_credential_storage() -> Vec<AuthCredentialStorage> {
         storage_key: storage_key.to_owned(),
     })
     .collect()
+}
+
+const fn cancelled_auth_flow_response() -> AuthFlowResponse {
+    AuthFlowResponse {
+        schema_version: AUTH_FLOW_SCHEMA_VERSION,
+        status: AuthFlowStatus::Cancelled,
+        state: None,
+        effects: Vec::new(),
+        credentials: BTreeMap::new(),
+        diagnostics: Vec::new(),
+    }
+}
+
+fn open_oauth_listeners(port: u16) -> Result<Vec<TcpListener>, String> {
+    let mut listeners = Vec::new();
+    let mut errors = Vec::new();
+    for address in ["127.0.0.1", "::1"] {
+        match TcpListener::bind((address, port)) {
+            Ok(listener) => {
+                listener.set_nonblocking(true).map_err(|error| {
+                    format!("failed to configure OAuth callback listener: {error}")
+                })?;
+                listeners.push(listener);
+            }
+            Err(error) => errors.push(format!("{address}: {error}")),
+        }
+    }
+    if listeners.is_empty() {
+        return Err(format!(
+            "failed to bind OpenAI OAuth callback server on localhost:{port}: {}",
+            errors.join("; ")
+        ));
+    }
+    Ok(listeners)
+}
+
+fn poll_oauth_listeners(
+    listeners: &[TcpListener],
+    expected_state: &str,
+) -> Result<Option<String>, String> {
+    for listener in listeners {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                return handle_oauth_callback_stream(&mut stream, expected_state);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => return Err(format!("OpenAI OAuth callback failed: {error}")),
+        }
+    }
+    Ok(None)
+}
+
+fn handle_oauth_callback_stream(
+    stream: &mut TcpStream,
+    expected_state: &str,
+) -> Result<Option<String>, String> {
+    let mut request = [0_u8; 8 * 1024];
+    let size = stream
+        .read(&mut request)
+        .map_err(|error| format!("OpenAI OAuth callback read failed: {error}"))?;
+    let first_line = String::from_utf8_lossy(&request[..size])
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
+    let result = parse_oauth_callback(&first_line, expected_state);
+    let success = result.is_ok();
+    let body = if success {
+        "Bcode OpenAI login complete. You can close this tab."
+    } else {
+        "Bcode OpenAI login did not complete. Return to your terminal."
+    };
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|error| format!("OpenAI OAuth callback response failed: {error}"))?;
+    result.map(Some)
+}
+
+fn parse_oauth_callback(input: &str, expected_state: &str) -> Result<String, String> {
+    let candidate = if input.starts_with("GET ") || input.starts_with("POST ") {
+        input
+            .split_whitespace()
+            .nth(1)
+            .ok_or("OpenAI OAuth callback request was invalid")?
+    } else {
+        input.trim()
+    };
+    let path = if candidate.starts_with("/auth/callback") {
+        candidate
+    } else {
+        let (_, without_scheme) = candidate
+            .split_once("://")
+            .ok_or("paste the full OpenAI localhost callback URL")?;
+        let path_start = without_scheme
+            .find('/')
+            .ok_or("OpenAI OAuth callback URL has no path")?;
+        &without_scheme[path_start..]
+    };
+    let query = path
+        .split_once('?')
+        .map(|(_, query)| query)
+        .ok_or("OpenAI OAuth callback URL has no query")?;
+    let values = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(key, value)| (pct_decode(key), pct_decode(value)))
+        .collect::<BTreeMap<_, _>>();
+    if let Some(error) = values
+        .get("error_description")
+        .or_else(|| values.get("error"))
+    {
+        return Err(format!("OpenAI OAuth failed: {error}"));
+    }
+    let state = values
+        .get("state")
+        .ok_or("OpenAI OAuth callback has no state")?;
+    if state != expected_state {
+        return Err("OpenAI OAuth callback state did not match".to_owned());
+    }
+    values
+        .get("code")
+        .cloned()
+        .ok_or_else(|| "OpenAI OAuth callback has no authorization code".to_owned())
+}
+
+fn openai_codex_authorize_url(redirect_uri: &str, state: &str, challenge: &str) -> String {
+    let params = [
+        ("response_type", "code"),
+        ("client_id", OPENAI_CODEX_CLIENT_ID),
+        ("redirect_uri", redirect_uri),
+        ("scope", OPENAI_CODEX_SCOPE),
+        ("code_challenge", challenge),
+        ("code_challenge_method", "S256"),
+        ("id_token_add_organizations", "true"),
+        ("codex_cli_simplified_flow", "true"),
+        ("state", state),
+        ("originator", "bcode"),
+    ];
+    let query = params
+        .into_iter()
+        .map(|(key, value)| format!("{}={}", pct_encode(key), pct_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{OPENAI_CODEX_AUTHORIZE_URL}?{query}")
+}
+
+fn pct_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
+}
+
+fn pct_decode(value: &str) -> String {
+    let mut decoded = Vec::new();
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && let (Some(high), Some(low)) =
+                (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2]))
+        {
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(if bytes[index] == b'+' {
+                b' '
+            } else {
+                bytes[index]
+            });
+            index += 1;
+        }
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+const fn hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn random_urlsafe(bytes: usize) -> Result<String, String> {
@@ -562,7 +787,9 @@ impl OpenAiCompatibleProviderPlugin {
         if let Err(error) = request.validate() {
             return ServiceResponse::error("invalid_auth_flow", error.to_string());
         }
-        if request.provider_id != "openai" || request.method_id != "device" {
+        if request.provider_id != "openai"
+            || !matches!(request.method_id.as_str(), "browser" | "device")
+        {
             return ServiceResponse::error(
                 "unsupported_auth_method",
                 "unsupported OpenAI authentication provider or method",
@@ -577,14 +804,163 @@ impl OpenAiCompatibleProviderPlugin {
                 );
             }
         };
-        match runtime.block_on(Self::openai_device_auth_flow(
-            Arc::clone(&self.state),
-            request,
-        )) {
+        let method_id = request.method_id.clone();
+        let state = Arc::clone(&self.state);
+        let future = async move {
+            if method_id == "browser" {
+                Self::openai_browser_auth_flow(state, request).await
+            } else {
+                Self::openai_device_auth_flow(state, request).await
+            }
+        };
+        match runtime.block_on(future) {
             Ok(Ok(response)) => json_response(&response),
             Ok(Err(error)) => json_response(&auth_flow_failure(&error)),
             Err(error) => ServiceResponse::error("auth_runtime_failed", error.to_string()),
         }
+    }
+
+    async fn openai_browser_auth_flow(
+        state: Arc<Mutex<OpenAiCompatibleProviderState>>,
+        request: AuthFlowRequest,
+    ) -> Result<AuthFlowResponse, String> {
+        match request.operation {
+            AuthFlowOperation::Begin => Self::begin_openai_browser_auth(&state, request.profile),
+            AuthFlowOperation::Continue => {
+                let state_id = request.state.ok_or("missing browser flow state")?;
+                match Self::continue_openai_browser_auth(
+                    Arc::clone(&state),
+                    state_id.clone(),
+                    request.input,
+                    OPENAI_CODEX_TOKEN_URL.to_owned(),
+                )
+                .await
+                {
+                    Ok(response) => Ok(response),
+                    Err(error) => {
+                        Self::remove_auth_flow(&state, &state_id)?;
+                        Err(error)
+                    }
+                }
+            }
+            AuthFlowOperation::Cancel => {
+                let state_id = request.state.ok_or("missing browser flow state")?;
+                Self::remove_auth_flow(&state, &state_id)?;
+                Ok(cancelled_auth_flow_response())
+            }
+        }
+    }
+
+    fn begin_openai_browser_auth(
+        state: &Arc<Mutex<OpenAiCompatibleProviderState>>,
+        profile: String,
+    ) -> Result<AuthFlowResponse, String> {
+        let listeners = open_oauth_listeners(OPENAI_CODEX_OAUTH_PORT)?;
+        let redirect_uri = format!("http://localhost:{OPENAI_CODEX_OAUTH_PORT}/auth/callback");
+        let oauth_state = random_urlsafe(32)?;
+        let verifier = random_urlsafe(32)?;
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let authorize_url = openai_codex_authorize_url(&redirect_uri, &oauth_state, &challenge);
+        let state_id = random_urlsafe(24)?;
+        state
+            .lock()
+            .map_err(|_| "OpenAI auth state is unavailable".to_owned())?
+            .auth_flows
+            .insert(
+                state_id.clone(),
+                OpenAiAuthFlowState::Browser {
+                    profile,
+                    oauth_state,
+                    verifier,
+                    redirect_uri,
+                    listeners,
+                    polls: 0,
+                    prompt_shown: false,
+                },
+            );
+        Ok(AuthFlowResponse {
+            schema_version: AUTH_FLOW_SCHEMA_VERSION,
+            status: AuthFlowStatus::Pending,
+            state: Some(state_id),
+            effects: vec![
+                AuthFlowEffect::OpenBrowser { url: authorize_url },
+                AuthFlowEffect::Wait {
+                    millis: OPENAI_BROWSER_WAIT_MILLIS,
+                },
+            ],
+            credentials: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        })
+    }
+
+    async fn continue_openai_browser_auth(
+        state: Arc<Mutex<OpenAiCompatibleProviderState>>,
+        state_id: String,
+        input: Option<bcode_provider_auth_models::AuthFlowInput>,
+        token_endpoint: String,
+    ) -> Result<AuthFlowResponse, String> {
+        let completion = {
+            let mut auth_state = state
+                .lock()
+                .map_err(|_| "OpenAI auth state is unavailable".to_owned())?;
+            let Some(OpenAiAuthFlowState::Browser {
+                profile,
+                oauth_state,
+                verifier,
+                redirect_uri,
+                listeners,
+                polls,
+                prompt_shown,
+                ..
+            }) = auth_state.auth_flows.get_mut(&state_id)
+            else {
+                return Err("OpenAI browser flow state is missing or expired".to_owned());
+            };
+            *polls = polls.saturating_add(1);
+            if *polls > OPENAI_BROWSER_MAX_POLLS {
+                return Err("OpenAI browser authorization timed out".to_owned());
+            }
+            let manual = input
+                .as_ref()
+                .filter(|input| input.prompt_id == OPENAI_BROWSER_PROMPT_ID)
+                .map(|input| input.value.trim())
+                .filter(|value| !value.is_empty());
+            let code = manual
+                .map(|value| parse_oauth_callback(value, oauth_state))
+                .transpose()?
+                .or(poll_oauth_listeners(listeners, oauth_state)?);
+            let result = code.map(|code| {
+                (
+                    code,
+                    verifier.clone(),
+                    redirect_uri.clone(),
+                    profile.clone(),
+                )
+            });
+            if result.is_none() {
+                *prompt_shown = true;
+            }
+            drop(auth_state);
+            result
+        };
+        if let Some((code, verifier, redirect_uri, profile)) = completion {
+            let token =
+                exchange_openai_code_at(&token_endpoint, &redirect_uri, &verifier, &code).await?;
+            Self::remove_auth_flow(&state, &state_id)?;
+            return Ok(auth_flow_success(token, &profile));
+        }
+        Ok(AuthFlowResponse {
+            schema_version: AUTH_FLOW_SCHEMA_VERSION,
+            status: AuthFlowStatus::Pending,
+            state: Some(state_id),
+            effects: vec![AuthFlowEffect::Prompt {
+                prompt_id: OPENAI_BROWSER_PROMPT_ID.to_owned(),
+                message: "If localhost callback did not complete, paste the full redirected localhost URL. Press Enter to keep waiting.".to_owned(),
+                choices: Vec::new(),
+            }],
+            credentials: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        })
     }
 
     async fn openai_device_auth_flow(
@@ -8368,6 +8744,117 @@ mod tests {
         }
     }
 
+    fn browser_auth_state(
+        listeners: Vec<TcpListener>,
+        oauth_state: &str,
+    ) -> Arc<Mutex<OpenAiCompatibleProviderState>> {
+        let state = Arc::new(Mutex::new(OpenAiCompatibleProviderState::default()));
+        state.lock().expect("auth state").auth_flows.insert(
+            "browser-state".to_owned(),
+            OpenAiAuthFlowState::Browser {
+                profile: "openai".to_owned(),
+                oauth_state: oauth_state.to_owned(),
+                verifier: "verifier-1".to_owned(),
+                redirect_uri: "http://localhost:1455/auth/callback".to_owned(),
+                listeners,
+                polls: 0,
+                prompt_shown: false,
+            },
+        );
+        state
+    }
+
+    #[test]
+    fn browser_auth_manual_callback_validates_state_and_normalizes_credentials() {
+        assert!(
+            parse_oauth_callback(
+                "http://localhost:1455/auth/callback?code=wrong&state=other",
+                "expected",
+            )
+            .is_err()
+        );
+        let server = AuthMockServer::start(vec![(
+            "200 OK",
+            r#"{"access_token":"browser-access","expires_in":3600}"#,
+        )]);
+        let state = browser_auth_state(Vec::new(), "expected-state");
+        let runtime = ProviderRuntime::new().expect("runtime");
+        let response = runtime
+            .block_on(OpenAiCompatibleProviderPlugin::continue_openai_browser_auth(
+                Arc::clone(&state),
+                "browser-state".to_owned(),
+                Some(bcode_provider_auth_models::AuthFlowInput {
+                    prompt_id: OPENAI_BROWSER_PROMPT_ID.to_owned(),
+                    value: "http://localhost:1455/auth/callback?code=browser-code&state=expected-state"
+                        .to_owned(),
+                }),
+                server.endpoint("/token"),
+            ))
+            .expect("browser runtime")
+            .expect("browser completion");
+        server.finish();
+        response.validate().expect("valid browser success");
+        assert_eq!(response.status, AuthFlowStatus::Succeeded);
+        assert_eq!(
+            response.credentials.get("access_token"),
+            Some(&"browser-access".to_owned())
+        );
+        assert!(state.lock().expect("auth state").auth_flows.is_empty());
+        let requests = server.requests.lock().expect("auth requests");
+        assert!(requests[0].contains("code=browser-code"));
+        assert!(!requests[0].contains("browser-access"));
+        drop(requests);
+    }
+
+    #[test]
+    fn browser_auth_automatic_localhost_callback_completes_without_manual_input() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("callback listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking callback");
+        let address = listener.local_addr().expect("callback address");
+        let state = browser_auth_state(vec![listener], "automatic-state");
+        let callback = thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connect callback");
+            stream
+                .write_all(
+                    b"GET /auth/callback?code=automatic-code&state=automatic-state HTTP/1.1\r\nHost: localhost\r\n\r\n",
+                )
+                .expect("write callback");
+            let mut response = String::new();
+            stream
+                .read_to_string(&mut response)
+                .expect("read callback response");
+            response
+        });
+        let server = AuthMockServer::start(vec![(
+            "200 OK",
+            r#"{"access_token":"automatic-access","expires_in":3600}"#,
+        )]);
+        let runtime = ProviderRuntime::new().expect("runtime");
+        let response = runtime
+            .block_on(
+                OpenAiCompatibleProviderPlugin::continue_openai_browser_auth(
+                    Arc::clone(&state),
+                    "browser-state".to_owned(),
+                    None,
+                    server.endpoint("/token"),
+                ),
+            )
+            .expect("browser runtime")
+            .expect("automatic completion");
+        server.finish();
+        let callback_response = callback.join().expect("callback thread");
+        assert!(callback_response.contains("login complete"));
+        response.validate().expect("valid automatic success");
+        assert_eq!(response.status, AuthFlowStatus::Succeeded);
+        assert_eq!(
+            response.credentials.get("access_token"),
+            Some(&"automatic-access".to_owned())
+        );
+        assert!(state.lock().expect("auth state").auth_flows.is_empty());
+    }
+
     #[test]
     fn device_auth_timeout_clears_transient_state_without_network_or_credentials() {
         let state = Arc::new(Mutex::new(OpenAiCompatibleProviderState::default()));
@@ -8553,7 +9040,13 @@ mod tests {
             .collect::<Vec<_>>();
         drop(registrations);
         assert_eq!(contributions.len(), 2);
-        assert_eq!(contributions[0].methods.len(), 2);
+        assert_eq!(contributions[0].methods.len(), 3);
+        assert!(
+            contributions[0]
+                .methods
+                .iter()
+                .any(|method| method.method_id() == "browser")
+        );
         assert!(
             contributions[0]
                 .methods
