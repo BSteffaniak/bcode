@@ -209,6 +209,51 @@ impl<'a> AuthVaultLifecycle<'a> {
         self.reconcile_device_seal(Some(&recipient_key))
     }
 
+    /// Replace the complete credential set owned by the selected method.
+    ///
+    /// Credentials owned by other methods or integrations in the same profile are preserved.
+    /// Declared credentials omitted from `credentials` are removed, preventing stale optional
+    /// tokens from surviving re-authentication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error before mutation for undeclared credentials, damaged vault/profile state,
+    /// write failure, or unsatisfied required device-seal policy.
+    pub fn replace_owned(
+        &self,
+        credentials: BTreeMap<String, String>,
+    ) -> Result<Vec<crate::security::AuthSecurityDiagnostic>, AuthVaultLifecycleError> {
+        let storage_keys = self.credential_storage_keys()?;
+        for credential in credentials.keys() {
+            if !storage_keys.contains_key(credential) {
+                return Err(AuthVaultLifecycleError::UnknownCredential {
+                    method_id: self.method.method_id().to_owned(),
+                    credential_id: credential.clone(),
+                });
+            }
+        }
+        let (store, recipient_key) = self.open_or_initialize_store()?;
+        let mut values = match store.get_profile(self.storage_profile()) {
+            Ok(Some(values)) => values,
+            Ok(None) => BTreeMap::new(),
+            Err(error) => {
+                return Err(AuthVaultLifecycleError::ProfileUnavailable(
+                    error.to_string(),
+                ));
+            }
+        };
+        for key in storage_keys.values() {
+            values.remove(key);
+        }
+        for (credential, value) in credentials {
+            values.insert(storage_keys[&credential].clone(), Zeroizing::new(value));
+        }
+        store
+            .replace_profile(self.storage_profile(), values)
+            .map_err(|error| AuthVaultLifecycleError::WriteFailed(error.to_string()))?;
+        self.reconcile_device_seal(Some(&recipient_key))
+    }
+
     /// Delete only credentials declared by the selected provider method.
     ///
     /// Other values and credentials in the same profile are preserved. Missing profiles are
@@ -239,23 +284,40 @@ impl<'a> AuthVaultLifecycle<'a> {
     }
 
     fn credential_storage_keys(&self) -> Result<BTreeMap<String, String>, AuthVaultLifecycleError> {
-        let AuthMethodContribution::SecretFields { fields, .. } = self.method else {
+        let mut keys = BTreeMap::new();
+        match self.method {
+            AuthMethodContribution::SecretFields { fields, .. } => {
+                for field in fields {
+                    let configured = self
+                        .resolved
+                        .profile
+                        .map
+                        .get(&field.credential_id)
+                        .and_then(|mapping| mapping.key.as_ref().or(mapping.env.as_ref()))
+                        .cloned()
+                        .unwrap_or_else(|| field.storage_key.clone());
+                    keys.insert(field.credential_id.clone(), configured);
+                }
+            }
+            AuthMethodContribution::Interactive { credentials, .. } => {
+                for credential in credentials {
+                    let configured = self
+                        .resolved
+                        .profile
+                        .map
+                        .get(&credential.credential_id)
+                        .and_then(|mapping| mapping.key.as_ref().or(mapping.env.as_ref()))
+                        .cloned()
+                        .unwrap_or_else(|| credential.storage_key.clone());
+                    keys.insert(credential.credential_id.clone(), configured);
+                }
+            }
+        }
+        if keys.is_empty() {
             return Err(AuthVaultLifecycleError::UnknownMethod {
                 provider_id: self.resolved.provider_id.clone(),
                 method_id: self.method.method_id().to_owned(),
             });
-        };
-        let mut keys = BTreeMap::new();
-        for field in fields {
-            let configured = self
-                .resolved
-                .profile
-                .map
-                .get(&field.credential_id)
-                .and_then(|mapping| mapping.key.as_ref().or(mapping.env.as_ref()))
-                .cloned()
-                .unwrap_or_else(|| field.storage_key.clone());
-            keys.insert(field.credential_id.clone(), configured);
         }
         Ok(keys)
     }
@@ -376,7 +438,9 @@ fn initialize_vault(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bcode_provider_auth_models::{AuthSecretField, AuthSecretValidation};
+    use bcode_provider_auth_models::{
+        AuthCredentialStorage, AuthSecretField, AuthSecretValidation,
+    };
 
     fn resolved(vault: &Path) -> ResolvedAuthProfile {
         ResolvedAuthProfile {
@@ -413,6 +477,66 @@ mod tests {
             supports_verification: false,
             supports_revocation: false,
         }
+    }
+
+    fn interactive_method() -> AuthMethodContribution {
+        AuthMethodContribution::Interactive {
+            method_id: "browser".to_owned(),
+            display_name: "Browser OAuth".to_owned(),
+            operation: "flow".to_owned(),
+            credentials: vec![
+                AuthCredentialStorage {
+                    credential_id: "access_token".to_owned(),
+                    storage_key: "BCODE_OPENAI_CODEX_ACCESS_TOKEN".to_owned(),
+                },
+                AuthCredentialStorage {
+                    credential_id: "refresh_token".to_owned(),
+                    storage_key: "BCODE_OPENAI_CODEX_REFRESH_TOKEN".to_owned(),
+                },
+            ],
+            supports_revocation: false,
+        }
+    }
+
+    #[test]
+    fn interactive_credentials_use_declared_storage_and_reject_undeclared_values() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let vault = temp.path().join("vault");
+        let mut resolved = resolved(&vault);
+        resolved.profile.scheme = Some("browser".to_owned());
+        let method = interactive_method();
+        let lifecycle = AuthVaultLifecycle::new(&resolved, "exa", "bcode.web-search", &method)
+            .expect("interactive lifecycle");
+        lifecycle
+            .upsert(BTreeMap::from([
+                ("access_token".to_owned(), "access".to_owned()),
+                ("refresh_token".to_owned(), "refresh".to_owned()),
+            ]))
+            .expect("interactive credentials stored");
+        assert_eq!(
+            lifecycle.read().expect("interactive credentials read"),
+            BTreeMap::from([
+                ("access_token".to_owned(), "access".to_owned()),
+                ("refresh_token".to_owned(), "refresh".to_owned()),
+            ])
+        );
+        lifecycle
+            .replace_owned(BTreeMap::from([(
+                "access_token".to_owned(),
+                "replacement".to_owned(),
+            )]))
+            .expect("interactive credentials replaced");
+        assert_eq!(
+            lifecycle.read().expect("replacement read"),
+            BTreeMap::from([("access_token".to_owned(), "replacement".to_owned())])
+        );
+        assert!(matches!(
+            lifecycle.upsert(BTreeMap::from([(
+                "id_token".to_owned(),
+                "undeclared".to_owned(),
+            )])),
+            Err(AuthVaultLifecycleError::UnknownCredential { .. })
+        ));
     }
 
     #[test]

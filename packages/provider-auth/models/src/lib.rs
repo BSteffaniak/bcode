@@ -109,6 +109,9 @@ pub enum AuthMethodContribution {
         display_name: String,
         /// Plugin service operation used to begin and continue the flow.
         operation: String,
+        /// Credentials this flow may return for host-owned storage.
+        #[serde(default)]
+        credentials: Vec<AuthCredentialStorage>,
         /// Whether this method supports explicit remote revocation.
         #[serde(default)]
         supports_revocation: bool,
@@ -158,14 +161,47 @@ impl AuthMethodContribution {
                 method_id,
                 display_name,
                 operation,
+                credentials,
                 ..
             } => {
                 validate_id("method_id", method_id)?;
                 validate_text("method.display_name", display_name, MAX_AUTH_LABEL_BYTES)?;
                 validate_id("operation", operation)?;
+                validate_count("credentials", credentials.len(), MAX_AUTH_SECRET_FIELDS)?;
+                let mut ids = std::collections::BTreeSet::new();
+                for credential in credentials {
+                    credential.validate()?;
+                    if !ids.insert(credential.credential_id.as_str()) {
+                        return Err(AuthContractError::DuplicateId {
+                            field: "credentials",
+                            id: credential.credential_id.clone(),
+                        });
+                    }
+                }
             }
         }
         Ok(())
+    }
+}
+
+/// Host-owned storage declaration for a credential returned by an interactive flow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthCredentialStorage {
+    /// Canonical credential ID returned by the plugin flow.
+    pub credential_id: String,
+    /// Backend key used in the selected vault profile.
+    pub storage_key: String,
+}
+
+impl AuthCredentialStorage {
+    /// Validate this credential storage declaration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid credential ID or storage key.
+    pub fn validate(&self) -> Result<(), AuthContractError> {
+        validate_id("credential_id", &self.credential_id)?;
+        validate_storage_key(&self.storage_key)
     }
 }
 
@@ -788,6 +824,61 @@ mod tests {
         }
     }
 
+    fn browser_contribution() -> AuthMethodContribution {
+        AuthMethodContribution::Interactive {
+            method_id: "browser".to_owned(),
+            display_name: "Browser OAuth".to_owned(),
+            operation: "flow".to_owned(),
+            credentials: vec![
+                AuthCredentialStorage {
+                    credential_id: "access_token".to_owned(),
+                    storage_key: "BCODE_OPENAI_CODEX_ACCESS_TOKEN".to_owned(),
+                },
+                AuthCredentialStorage {
+                    credential_id: "refresh_token".to_owned(),
+                    storage_key: "BCODE_OPENAI_CODEX_REFRESH_TOKEN".to_owned(),
+                },
+            ],
+            supports_revocation: false,
+        }
+    }
+
+    #[test]
+    fn interactive_credential_storage_round_trips_and_validates() {
+        let method = browser_contribution();
+        method.validate().expect("valid interactive credentials");
+        let encoded = serde_json::to_vec(&method).expect("serialize interactive method");
+        let decoded = serde_json::from_slice::<AuthMethodContribution>(&encoded)
+            .expect("deserialize interactive method");
+        assert_eq!(decoded, method);
+    }
+
+    #[test]
+    fn interactive_credential_storage_rejects_duplicates_and_invalid_keys() {
+        let mut method = browser_contribution();
+        let AuthMethodContribution::Interactive { credentials, .. } = &mut method else {
+            unreachable!();
+        };
+        credentials.push(credentials[0].clone());
+        assert!(matches!(
+            method.validate(),
+            Err(AuthContractError::DuplicateId {
+                field: "credentials",
+                ..
+            })
+        ));
+
+        let mut method = browser_contribution();
+        let AuthMethodContribution::Interactive { credentials, .. } = &mut method else {
+            unreachable!();
+        };
+        credentials[0].storage_key = "not a storage key".to_owned();
+        assert!(matches!(
+            method.validate(),
+            Err(AuthContractError::InvalidStorageKey)
+        ));
+    }
+
     #[test]
     fn contribution_round_trips_and_validates() {
         let contribution = exa_contribution();
@@ -848,6 +939,7 @@ mod tests {
                 method_id: format!("method-{index}"),
                 display_name: "Method".to_owned(),
                 operation: "auth-flow".to_owned(),
+                credentials: Vec::new(),
                 supports_revocation: false,
             })
             .collect();

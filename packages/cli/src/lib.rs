@@ -3483,9 +3483,21 @@ fn resolve_or_prepare_auth_profile(
                         )
                     })
                     .collect(),
-                bcode_provider_auth_models::AuthMethodContribution::Interactive { .. } => {
-                    BTreeMap::new()
-                }
+                bcode_provider_auth_models::AuthMethodContribution::Interactive {
+                    credentials,
+                    ..
+                } => credentials
+                    .iter()
+                    .map(|credential| {
+                        (
+                            credential.credential_id.clone(),
+                            bcode_config::AuthCredentialMapping {
+                                env: None,
+                                key: Some(credential.storage_key.clone()),
+                            },
+                        )
+                    })
+                    .collect(),
             };
             Ok((
                 bcode_provider_auth::ResolvedAuthProfile {
@@ -3782,7 +3794,7 @@ async fn run_auth_interactive_flow(
                     method,
                 )
                 .map_err(|error| CliError::LoginProfile(error.to_string()))?
-                .upsert(response.credentials)
+                .replace_owned(response.credentials)
                 .map_err(|error| CliError::LoginProfile(error.to_string()))?;
             }
             return Ok(());
@@ -9108,6 +9120,7 @@ mod auth_cli_tests {
             method_id: method_id.to_owned(),
             display_name: method_id.to_owned(),
             operation: "flow".to_owned(),
+            credentials: Vec::new(),
             supports_revocation: false,
         }
     }
