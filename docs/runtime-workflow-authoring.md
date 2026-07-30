@@ -26,6 +26,19 @@ publication, and starts exact published revisions. IPC and clients serialize the
 portable contracts; they do not expose store rows, daemon internals, provider-private values, or
 renderer models.
 
+`WorkflowApplicationOperationFacts` is the versioned workflow-owned policy input for side-effecting
+authoring operations. It carries the exact operation; application-authenticated actor; workflow,
+draft, revision, and preset identities applicable to that operation; untrusted producer provenance;
+resolved requirements; aggregate effects and resources; and activation/execution intent. The daemon
+derives local-client actor identity from the accepted connection and must not accept actor identity
+from authored content. Tool-call/session permission facts are not substitutes for these application
+facts.
+
+`bcode_workflow` also owns portable authored-list and revision cursor contracts. Persistence validates
+those cursors before using them for stable keyset queries; IPC, clients, CLI, and future frontends
+share the same cursor representation rather than defining transport- or presentation-specific
+continuation tokens.
+
 Plugins continue to own contributed block behavior and plugin templates. A contributed template is a
 versioned plugin manifest contract, not a user-owned mutable draft. A template may be used as source
 material for a draft only through an explicit conversion or fork operation that produces a complete
@@ -140,7 +153,10 @@ Creating or changing durable authoring state, publishing, activating, archiving,
 starting are side-effecting application operations. Applicable policy decisions over normalized
 operation facts complete before mutation. Publication facts include exact workflow, draft, and
 revision identity; producer identity; referenced capabilities; aggregate effect classes; resources;
-and whether activation or execution was requested.
+and whether activation or execution was requested. The daemon application-operation authorization
+boundary is separate from tool-call/session permission coordination. Its default local policy admits
+local-client operations while plugin and service actors fail closed unless explicitly registered or
+configured. Every mutation handler must authorize before acquiring the workflow store for mutation.
 
 Publishing a workflow containing mutating blocks does not authorize those mutations. Existing exact,
 activation-scoped grants and approval-before-dispatch rules remain in force. Imports and generated
@@ -150,6 +166,15 @@ Saved presets bind an exact revision and carry their own optimistic generation. 
 validated non-secret configuration and permitted limit/workspace policy. Secrets remain approved
 references resolved for a request; inline secret material is not made durable implicitly. Starting a
 preset records the exact preset generation, revision, final configuration, and compiled definition.
+
+Validation, preview, and publication compilation accept a bounded server-side deadline and a stable
+caller operation identity. The daemon executes bounded pure computation away from the async request
+loop, rejects duplicate live identities, and supports exact cancellation. Timeout or cancellation
+removes the operation registration and produces a typed public error. Publication performs this
+computation before application authorization and before acquiring the workflow store for mutation,
+so cancellation cannot leave a partial revision or active pointer. Client transport timeout remains
+a separate observation deadline and cannot imply durable cancellation; callers that need explicit
+server cancellation use the operation identity.
 
 ## Import and export
 
@@ -194,6 +219,15 @@ Portable typed operations cover:
 * revision-bound preset create, get/list, optimistic update, validate, and delete;
 * exact export, side-effect-free import preview, and authorized import; and
 * exact-revision, active-revision, exact-preset, and publish-then-start execution.
+
+The routed mutation surface atomically creates a logical workflow with its generation-1 draft,
+replaces or discards an exact draft generation, publishes an immutable revision with optional atomic
+activation, compare-and-sets an existing revision as active, and archives/unarchives logical
+workflows. Each derives the actor from the local connection and authorizes before locking the store
+for mutation. Stale optimistic operations return typed conflict results carrying expected and current
+values; they are not transport failures and leave the connection usable. Exact draft/revision forks
+and revision-bound preset create/update/delete operations use the same authorization boundary;
+preset updates and deletes retain generation conflict semantics and cannot change revision binding.
 
 Publish-and-start reports publication and run admission as separate outcomes. It may be a convenience
 request, but it cannot collapse their atomic boundaries or make a failed run admission appear to undo

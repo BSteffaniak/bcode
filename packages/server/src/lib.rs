@@ -114,8 +114,9 @@ use bcode_tool::{
     ToolResultContent,
 };
 use bcode_workflow::{
-    AgentSkillActivationMode, WorkflowAgentConfiguration, WorkflowApprovalResolver, WorkflowError,
-    WorkflowGrantScope, WorkflowPolicyGrant, WorkflowToolCapability,
+    AgentSkillActivationMode, WorkflowAgentConfiguration, WorkflowApplicationOperationFacts,
+    WorkflowApprovalResolver, WorkflowError, WorkflowGrantScope, WorkflowPolicyGrant,
+    WorkflowToolCapability,
 };
 use bcode_workflow_store::{ActivationDispatchOwner, WorkflowStoreError};
 #[cfg(test)]
@@ -186,10 +187,20 @@ pub enum ServerError {
     BlockingTask(#[from] tokio::task::JoinError),
     #[error("workflow store error: {0}")]
     WorkflowStore(#[from] bcode_workflow_store::WorkflowStoreError),
+    #[error("workflow contract error: {0}")]
+    Workflow(#[from] bcode_workflow::WorkflowError),
     #[error("workflow definition is unsupported by this production host: {0}")]
     WorkflowDefinitionUnsupported(String),
     #[error("workflow capability is unavailable: {0}")]
     WorkflowCapabilityUnavailable(String),
+    #[error("authored-workflow application operation is unauthorized: {0}")]
+    WorkflowApplicationOperationUnauthorized(String),
+    #[error("authored-workflow computation timed out: {0}")]
+    WorkflowComputationTimedOut(String),
+    #[error("authored-workflow computation was cancelled: {0}")]
+    WorkflowComputationCancelled(String),
+    #[error("authored-workflow computation control is invalid: {0}")]
+    WorkflowComputationControlInvalid(String),
     #[error("model catalog error: {0}")]
     ModelCatalog(#[from] bcode_model_catalog::Error),
     #[error("model turn completion channel closed: {0}")]
@@ -215,6 +226,97 @@ struct InvariantSelectorRuntime {
     guidance: Arc<Mutex<BTreeMap<SessionId, invariant_guidance::InvariantGuidance>>>,
     full_fallback: Arc<Mutex<BTreeSet<SessionId>>>,
     generations: Arc<Mutex<BTreeMap<SessionId, u64>>>,
+}
+
+#[derive(Clone)]
+struct WorkflowApplicationAuthorizationPolicy {
+    evaluator: Arc<
+        dyn Fn(&WorkflowApplicationOperationFacts) -> WorkflowApplicationAuthorizationDecision
+            + Send
+            + Sync,
+    >,
+}
+
+impl std::fmt::Debug for WorkflowApplicationAuthorizationPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkflowApplicationAuthorizationPolicy")
+            .finish_non_exhaustive()
+    }
+}
+
+impl WorkflowApplicationAuthorizationPolicy {
+    fn evaluate(
+        &self,
+        facts: &WorkflowApplicationOperationFacts,
+    ) -> WorkflowApplicationAuthorizationDecision {
+        (self.evaluator)(facts)
+    }
+}
+
+/// Server-owned input used to derive authenticated local-client operation facts.
+struct LocalWorkflowApplicationOperationRequest {
+    operation: bcode_workflow::WorkflowApplicationOperation,
+    workflow_id: String,
+    draft_id: Option<String>,
+    revision: Option<u64>,
+    preset_id: Option<String>,
+    producer: Option<bcode_workflow::WorkflowProducerProvenance>,
+    requirements: bcode_workflow::WorkflowRequirementSummary,
+    effects: bcode_workflow::WorkflowEffectSummary,
+    activates: bool,
+    executes: bool,
+}
+
+/// Decision returned by the daemon application-operation authorization boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowApplicationAuthorizationDecision {
+    /// The normalized operation may proceed to its side-effect boundary.
+    Allow,
+    /// The normalized operation is denied with a secret-safe reason.
+    Deny { reason: String },
+}
+
+fn authorize_local_workflow_application_operation(
+    facts: &WorkflowApplicationOperationFacts,
+) -> WorkflowApplicationAuthorizationDecision {
+    match facts.actor.kind {
+        bcode_workflow::WorkflowApplicationActorKind::LocalClient => {
+            WorkflowApplicationAuthorizationDecision::Allow
+        }
+        bcode_workflow::WorkflowApplicationActorKind::Plugin => {
+            WorkflowApplicationAuthorizationDecision::Deny {
+                reason: "plugins require an explicitly registered authored-workflow application capability"
+                    .to_string(),
+            }
+        }
+        bcode_workflow::WorkflowApplicationActorKind::Service => {
+            WorkflowApplicationAuthorizationDecision::Deny {
+                reason: "services require an explicitly configured authored-workflow maintenance policy"
+                    .to_string(),
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WorkflowComputationCancellation {
+    cancelled: std::sync::atomic::AtomicBool,
+    notify: Notify,
+}
+
+impl WorkflowComputationCancellation {
+    fn new() -> Self {
+        Self {
+            cancelled: std::sync::atomic::AtomicBool::new(false),
+            notify: Notify::new(),
+        }
+    }
+
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
 }
 
 #[derive(Debug)]
@@ -258,6 +360,8 @@ pub struct ServerState {
     session_runtimes: Mutex<BTreeMap<SessionId, SessionRuntimeHandle>>,
     turn_admission_locks: Mutex<BTreeMap<SessionId, Arc<Mutex<()>>>>,
     workflow_store: StdMutex<bcode_workflow_store::WorkflowStore>,
+    workflow_application_authorization: WorkflowApplicationAuthorizationPolicy,
+    workflow_computations: StdMutex<BTreeMap<String, Arc<WorkflowComputationCancellation>>>,
     runtime_work: RuntimeWorkManager,
     ralph_store: bcode_ralph::RalphStateStore,
     active_ralph_runs: Mutex<BTreeMap<PathBuf, JoinHandle<()>>>,
@@ -1269,10 +1373,69 @@ struct ServerStateInit {
     daemon_record_path: Option<PathBuf>,
     metrics: MetricsRegistry,
     workflow_store: Option<bcode_workflow_store::WorkflowStore>,
+    workflow_application_authorization: Option<WorkflowApplicationAuthorizationPolicy>,
     ralph_store: bcode_ralph::RalphStateStore,
 }
 
 impl ServerState {
+    /// Authorize one normalized side-effecting authored-workflow application operation.
+    ///
+    /// This boundary is independent of tool-call/session permission coordination. Callers must
+    /// complete it before acquiring the workflow store for mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed facts or when application policy denies the operation.
+    pub fn authorize_workflow_application_operation(
+        &self,
+        facts: &WorkflowApplicationOperationFacts,
+    ) -> Result<(), ServerError> {
+        facts.validate().map_err(|error| {
+            ServerError::WorkflowApplicationOperationUnauthorized(error.to_string())
+        })?;
+        match self.workflow_application_authorization.evaluate(facts) {
+            WorkflowApplicationAuthorizationDecision::Allow => Ok(()),
+            WorkflowApplicationAuthorizationDecision::Deny { reason } => Err(
+                ServerError::WorkflowApplicationOperationUnauthorized(reason),
+            ),
+        }
+    }
+
+    /// Authorize a local client's normalized authored-workflow application operation.
+    ///
+    /// The server derives the authenticated actor from the accepted connection identity rather
+    /// than trusting producer provenance or a caller-supplied actor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed operation facts or when application policy denies the
+    /// operation.
+    fn authorize_local_workflow_application_operation(
+        &self,
+        client_id: ClientId,
+        request: LocalWorkflowApplicationOperationRequest,
+    ) -> Result<WorkflowApplicationOperationFacts, ServerError> {
+        let facts = WorkflowApplicationOperationFacts {
+            version: bcode_workflow::WORKFLOW_APPLICATION_OPERATION_FACTS_VERSION,
+            operation: request.operation,
+            actor: bcode_workflow::WorkflowApplicationActor {
+                kind: bcode_workflow::WorkflowApplicationActorKind::LocalClient,
+                actor_id: client_id.to_string(),
+            },
+            workflow_id: request.workflow_id,
+            draft_id: request.draft_id,
+            revision: request.revision,
+            preset_id: request.preset_id,
+            producer: request.producer,
+            requirements: request.requirements,
+            effects: request.effects,
+            activates: request.activates,
+            executes: request.executes,
+        };
+        self.authorize_workflow_application_operation(&facts)?;
+        Ok(facts)
+    }
+
     /// Create a fresh workflow execution session in a registered worktree.
     ///
     /// # Errors
@@ -1403,6 +1566,12 @@ impl ServerState {
                 bcode_workflow_store::WorkflowStore::open_default()
                     .expect("default workflow store must open")
             })),
+            workflow_application_authorization: init.workflow_application_authorization.unwrap_or(
+                WorkflowApplicationAuthorizationPolicy {
+                    evaluator: Arc::new(authorize_local_workflow_application_operation),
+                },
+            ),
+            workflow_computations: StdMutex::new(BTreeMap::new()),
             runtime_work: RuntimeWorkManager::with_metrics(init.metrics.clone()),
             ralph_store: init.ralph_store,
             active_ralph_runs: Mutex::default(),
@@ -3110,6 +3279,7 @@ async fn run_with_static_bundled_inner(
             }),
             metrics,
             workflow_store: None,
+            workflow_application_authorization: None,
             ralph_store: bcode_ralph::RalphStateStore::default(),
         },
     ));
@@ -3275,11 +3445,23 @@ fn workflow_store_error_response(error: &WorkflowStoreError) -> ErrorResponse {
 fn request_error_response(error: &ServerError) -> ErrorResponse {
     match error {
         ServerError::WorkflowStore(error) => workflow_store_error_response(error),
+        ServerError::Workflow(error) => {
+            ErrorResponse::new("workflow_contract_invalid", error.to_string())
+        }
         ServerError::WorkflowDefinitionUnsupported(_) => {
             ErrorResponse::new("workflow_definition_unsupported", error.to_string())
         }
         ServerError::WorkflowCapabilityUnavailable(_) => {
             ErrorResponse::new("workflow_capability_unavailable", error.to_string())
+        }
+        ServerError::WorkflowComputationTimedOut(_) => {
+            ErrorResponse::new("workflow_computation_timed_out", error.to_string())
+        }
+        ServerError::WorkflowComputationCancelled(_) => {
+            ErrorResponse::new("workflow_computation_cancelled", error.to_string())
+        }
+        ServerError::WorkflowComputationControlInvalid(_) => {
+            ErrorResponse::new("workflow_computation_control_invalid", error.to_string())
         }
         _ => ErrorResponse::new("request_failed", error.to_string()),
     }
@@ -3505,6 +3687,17 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::RuntimeWorkHistory { .. } => "runtime_work_history",
         Request::ListRuntimeWork { .. } => "list_runtime_work",
         Request::CancelRuntimeWork { .. } => "cancel_runtime_work",
+        Request::CreateAuthoredWorkflow(_) => "create_authored_workflow",
+        Request::CancelWorkflowComputation { .. } => "cancel_workflow_computation",
+        Request::UpdateWorkflowDraft(_) => "update_workflow_draft",
+        Request::PublishWorkflowDraft(_) => "publish_workflow_draft",
+        Request::ActivateWorkflowRevision(_) => "activate_workflow_revision",
+        Request::SetAuthoredWorkflowArchived(_) => "set_authored_workflow_archived",
+        Request::DiscardWorkflowDraft(_) => "discard_workflow_draft",
+        Request::ForkWorkflowDraft(_) => "fork_workflow_draft",
+        Request::CreateWorkflowPreset(_) => "create_workflow_preset",
+        Request::UpdateWorkflowPreset(_) => "update_workflow_preset",
+        Request::DeleteWorkflowPreset(_) => "delete_workflow_preset",
         Request::ListAuthoredWorkflows { .. } => "list_authored_workflows",
         Request::GetAuthoredWorkflow { .. } => "get_authored_workflow",
         Request::ListWorkflowDrafts { .. } => "list_workflow_drafts",
@@ -3997,19 +4190,59 @@ async fn handle_request_inner(
             handle_cancel_runtime_work(request_id, client_id, state, writer, session_id, work_id)
                 .await
         }
-        Request::ListAuthoredWorkflows { limit } => {
+        Request::CreateAuthoredWorkflow(request) => {
+            handle_create_authored_workflow(request_id, client_id, state, writer, request).await
+        }
+        Request::CancelWorkflowComputation { operation_id } => {
+            let cancelled = cancel_workflow_computation(state, &operation_id);
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowComputationCancellationRequested {
+                    cancelled,
+                }),
+            )
+            .await
+        }
+        Request::UpdateWorkflowDraft(request) => {
+            handle_update_workflow_draft(request_id, client_id, state, writer, request).await
+        }
+        Request::PublishWorkflowDraft(request) => {
+            handle_publish_workflow_draft(request_id, client_id, state, writer, request).await
+        }
+        Request::ActivateWorkflowRevision(request) => {
+            handle_activate_workflow_revision(request_id, client_id, state, writer, request).await
+        }
+        Request::SetAuthoredWorkflowArchived(request) => {
+            handle_set_authored_workflow_archived(request_id, client_id, state, writer, request)
+                .await
+        }
+        Request::DiscardWorkflowDraft(request) => {
+            handle_discard_workflow_draft(request_id, client_id, state, writer, request).await
+        }
+        Request::ForkWorkflowDraft(request) => {
+            handle_fork_workflow_draft(request_id, client_id, state, writer, request).await
+        }
+        Request::CreateWorkflowPreset(request) => {
+            handle_create_workflow_preset(request_id, client_id, state, writer, request).await
+        }
+        Request::UpdateWorkflowPreset(request) => {
+            handle_update_workflow_preset(request_id, client_id, state, writer, request).await
+        }
+        Request::DeleteWorkflowPreset(request) => {
+            handle_delete_workflow_preset(request_id, client_id, state, writer, request).await
+        }
+        Request::ListAuthoredWorkflows { cursor, limit } => {
             let workflows = state
                 .workflow_store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .list_authored_workflows(limit)?
-                .into_iter()
-                .map(authored_workflow_snapshot)
-                .collect();
+                .list_authored_workflows_page(cursor.as_ref(), limit)?;
+            let page = authored_workflow_page(workflows, limit);
             send_response(
                 writer,
                 request_id,
-                Response::Ok(ResponsePayload::AuthoredWorkflowList { workflows }),
+                Response::Ok(ResponsePayload::AuthoredWorkflowList { page }),
             )
             .await
         }
@@ -4027,19 +4260,25 @@ async fn handle_request_inner(
             )
             .await
         }
-        Request::ListWorkflowDrafts { workflow_id, limit } => {
+        Request::ListWorkflowDrafts {
+            workflow_id,
+            cursor,
+            limit,
+        } => {
             let drafts = state
                 .workflow_store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .list_workflow_drafts(&workflow_id, limit)?
-                .into_iter()
-                .map(workflow_draft_snapshot)
-                .collect();
+                .list_workflow_drafts_page(
+                    &workflow_id,
+                    cursor.as_ref(),
+                    limit.saturating_add(1),
+                )?;
+            let page = workflow_draft_page(drafts, limit);
             send_response(
                 writer,
                 request_id,
-                Response::Ok(ResponsePayload::WorkflowDraftList { drafts }),
+                Response::Ok(ResponsePayload::WorkflowDraftList { page }),
             )
             .await
         }
@@ -4061,19 +4300,21 @@ async fn handle_request_inner(
             )
             .await
         }
-        Request::ListWorkflowRevisions { workflow_id, limit } => {
+        Request::ListWorkflowRevisions {
+            workflow_id,
+            cursor,
+            limit,
+        } => {
             let revisions = state
                 .workflow_store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .list_workflow_revisions(&workflow_id, limit)?
-                .into_iter()
-                .map(workflow_revision_snapshot)
-                .collect();
+                .list_workflow_revisions_page(&workflow_id, cursor, limit)?;
+            let page = workflow_revision_page(revisions, limit);
             send_response(
                 writer,
                 request_id,
-                Response::Ok(ResponsePayload::WorkflowRevisionList { revisions }),
+                Response::Ok(ResponsePayload::WorkflowRevisionList { page }),
             )
             .await
         }
@@ -4095,19 +4336,25 @@ async fn handle_request_inner(
             )
             .await
         }
-        Request::ListWorkflowPresets { workflow_id, limit } => {
+        Request::ListWorkflowPresets {
+            workflow_id,
+            cursor,
+            limit,
+        } => {
             let presets = state
                 .workflow_store
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .list_workflow_presets(&workflow_id, limit)?
-                .into_iter()
-                .map(workflow_preset_snapshot)
-                .collect();
+                .list_workflow_presets_page(
+                    &workflow_id,
+                    cursor.as_ref(),
+                    limit.saturating_add(1),
+                )?;
+            let page = workflow_preset_page(presets, limit);
             send_response(
                 writer,
                 request_id,
-                Response::Ok(ResponsePayload::WorkflowPresetList { presets }),
+                Response::Ok(ResponsePayload::WorkflowPresetList { page }),
             )
             .await
         }
@@ -4131,22 +4378,35 @@ async fn handle_request_inner(
         Request::WorkflowAuthoringCatalog => {
             handle_workflow_authoring_catalog(request_id, state, writer).await
         }
-        Request::ValidateWorkflowAuthoring { document } => {
+        Request::ValidateWorkflowAuthoring { document, control } => {
+            let report = run_workflow_computation(
+                state,
+                control,
+                format!("validate-{request_id}"),
+                move || document.validation_report(),
+            )
+            .await?;
             send_response(
                 writer,
                 request_id,
-                Response::Ok(ResponsePayload::WorkflowAuthoringValidated {
-                    report: document.validation_report(),
-                }),
+                Response::Ok(ResponsePayload::WorkflowAuthoringValidated { report }),
             )
             .await
         }
         Request::PreviewWorkflowCompilation {
             document,
             configuration,
+            control,
         } => {
-            handle_preview_workflow_compilation(request_id, state, writer, document, configuration)
-                .await
+            handle_preview_workflow_compilation(
+                request_id,
+                state,
+                writer,
+                document,
+                configuration,
+                control,
+            )
+            .await
         }
         Request::ListWorkflowTemplates { limit } => {
             handle_list_workflow_templates(request_id, state, writer, limit).await
@@ -11655,6 +11915,755 @@ async fn handle_cancel_session_turn(
     .await
 }
 
+async fn run_workflow_computation<T, F>(
+    state: &ServerState,
+    control: bcode_ipc::WorkflowComputationControl,
+    fallback_operation_id: String,
+    compute: F,
+) -> Result<T, ServerError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let operation_id = if control.operation_id.is_empty() {
+        fallback_operation_id
+    } else {
+        control.operation_id
+    };
+    if operation_id.len() > 512
+        || operation_id.is_empty()
+        || control.timeout_ms == 0
+        || control.timeout_ms > bcode_ipc::MAX_WORKFLOW_COMPUTATION_TIMEOUT_MS
+    {
+        return Err(ServerError::WorkflowComputationControlInvalid(
+            "operation identity or timeout is outside supported bounds".to_string(),
+        ));
+    }
+    let cancellation = Arc::new(WorkflowComputationCancellation::new());
+    {
+        let mut computations = state
+            .workflow_computations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if computations.contains_key(&operation_id) {
+            return Err(ServerError::WorkflowComputationControlInvalid(format!(
+                "workflow computation operation is already active: {operation_id}"
+            )));
+        }
+        computations.insert(operation_id.clone(), Arc::clone(&cancellation));
+    }
+    let mut task = tokio::task::spawn_blocking(compute);
+    let outcome = tokio::select! {
+        result = &mut task => result.map_err(ServerError::BlockingTask),
+        () = cancellation.notify.notified() => {
+            Err(ServerError::WorkflowComputationCancelled(operation_id.clone()))
+        }
+        () = tokio::time::sleep(Duration::from_millis(control.timeout_ms)) => {
+            cancellation.cancel();
+            Err(ServerError::WorkflowComputationTimedOut(operation_id.clone()))
+        }
+    };
+    state
+        .workflow_computations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&operation_id);
+    outcome
+}
+
+fn cancel_workflow_computation(state: &ServerState, operation_id: &str) -> bool {
+    let cancellation = state
+        .workflow_computations
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(operation_id)
+        .cloned();
+    cancellation.is_some_and(|cancellation| {
+        cancellation.cancel();
+        true
+    })
+}
+
+async fn handle_create_authored_workflow(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::CreateAuthoredWorkflowRequest,
+) -> Result<(), ServerError> {
+    request.document.validate()?;
+    let workflow_id = request.document.workflow_id.clone();
+    let producer = request.document.producer.clone();
+    state.authorize_local_workflow_application_operation(
+        client_id,
+        LocalWorkflowApplicationOperationRequest {
+            operation: bcode_workflow::WorkflowApplicationOperation::CreateWorkflow,
+            workflow_id: workflow_id.clone(),
+            draft_id: None,
+            revision: None,
+            preset_id: None,
+            producer: Some(producer.clone()),
+            requirements: request.document.requirements.clone(),
+            effects: bcode_workflow::WorkflowEffectSummary::default(),
+            activates: false,
+            executes: false,
+        },
+    )?;
+    let now = current_time_ms();
+    let workflow = bcode_workflow_store::AuthoredWorkflow {
+        workflow_id: workflow_id.clone(),
+        title: request.document.metadata.title.clone(),
+        description: request.document.metadata.description.clone(),
+        archived: false,
+        active_revision: None,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    let draft = bcode_workflow_store::WorkflowDraft {
+        workflow_id,
+        draft_id: request.draft_id,
+        base_revision: None,
+        generation: 1,
+        checksum_sha256: request.document.source_digest_sha256()?,
+        document: request.document,
+        producer,
+        created_at_ms: now,
+        updated_at_ms: now,
+    };
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .create_authored_workflow_with_initial_draft(&workflow, &draft)?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::AuthoredWorkflowCreated {
+            workflow: authored_workflow_snapshot(workflow),
+            draft: Box::new(workflow_draft_snapshot(draft)),
+        }),
+    )
+    .await
+}
+
+async fn handle_update_workflow_draft(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::UpdateWorkflowDraftRequest,
+) -> Result<(), ServerError> {
+    request.document.validate()?;
+    if request.document.workflow_id != request.workflow_id {
+        return Err(ServerError::WorkflowDefinitionUnsupported(
+            "draft document workflow identity does not match the request".to_string(),
+        ));
+    }
+    state.authorize_local_workflow_application_operation(
+        client_id,
+        LocalWorkflowApplicationOperationRequest {
+            operation: bcode_workflow::WorkflowApplicationOperation::UpdateDraft,
+            workflow_id: request.workflow_id.clone(),
+            draft_id: Some(request.draft_id.clone()),
+            revision: None,
+            preset_id: None,
+            producer: Some(request.producer.clone()),
+            requirements: request.document.requirements.clone(),
+            effects: bcode_workflow::WorkflowEffectSummary::default(),
+            activates: false,
+            executes: false,
+        },
+    )?;
+    let update = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .update_workflow_draft(
+            &request.workflow_id,
+            &request.draft_id,
+            request.expected_generation,
+            &request.document,
+            &request.producer,
+            current_time_ms(),
+        );
+    let result = match update {
+        Ok(draft) => {
+            bcode_ipc::WorkflowDraftUpdateResult::Updated(Box::new(workflow_draft_snapshot(draft)))
+        }
+        Err(WorkflowStoreError::AuthoringConflict {
+            entity_id,
+            expected,
+            current,
+        }) => {
+            bcode_ipc::WorkflowDraftUpdateResult::Conflict(bcode_ipc::WorkflowAuthoringConflict {
+                entity_id,
+                expected_generation: expected,
+                current_generation: current,
+            })
+        }
+        Err(error) => return Err(error.into()),
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowDraftUpdateResult { result }),
+    )
+    .await
+}
+
+fn authoring_conflict_result(
+    error: WorkflowStoreError,
+) -> Result<bcode_ipc::WorkflowAuthoringConflict, WorkflowStoreError> {
+    match error {
+        WorkflowStoreError::AuthoringConflict {
+            entity_id,
+            expected,
+            current,
+        } => Ok(bcode_ipc::WorkflowAuthoringConflict {
+            entity_id,
+            expected_generation: expected,
+            current_generation: current,
+        }),
+        error => Err(error),
+    }
+}
+
+async fn handle_publish_workflow_draft(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::PublishWorkflowDraftRequest,
+) -> Result<(), ServerError> {
+    let draft = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .workflow_draft(&request.workflow_id, &request.draft_id)?
+        .ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!(
+                "workflow draft not found: {}/{}",
+                request.workflow_id, request.draft_id
+            ))
+        })?;
+    let catalog = workflow_authoring_catalog_snapshot(state).await?;
+    let configuration = request.configuration.clone();
+    let preview = run_workflow_computation(
+        state,
+        request.control.clone(),
+        format!("publish-{request_id}"),
+        {
+            let document = draft.document.clone();
+            move || document.compilation_preview(&catalog, configuration.as_ref())
+        },
+    )
+    .await?;
+    let compiled = preview.compiled.as_ref().ok_or_else(|| {
+        ServerError::WorkflowDefinitionUnsupported(
+            "draft publication requires a successful compilation preview".to_string(),
+        )
+    })?;
+    state.authorize_local_workflow_application_operation(
+        client_id,
+        LocalWorkflowApplicationOperationRequest {
+            operation: bcode_workflow::WorkflowApplicationOperation::PublishDraft,
+            workflow_id: request.workflow_id.clone(),
+            draft_id: Some(request.draft_id.clone()),
+            revision: None,
+            preset_id: None,
+            producer: Some(draft.producer.clone()),
+            requirements: compiled.requirements.clone(),
+            effects: compiled.effects.clone(),
+            activates: request.activate,
+            executes: false,
+        },
+    )?;
+    let publication = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .publish_workflow_draft(
+            &request.workflow_id,
+            &request.draft_id,
+            request.expected_generation,
+            &preview,
+            request.activate,
+            request.expected_active_revision,
+            current_time_ms(),
+        );
+    let result = match publication {
+        Ok(publication) => bcode_ipc::WorkflowPublicationResult::Published {
+            revision: Box::new(workflow_revision_snapshot(publication.revision)),
+            active_revision: publication.active_revision,
+        },
+        Err(error) => {
+            bcode_ipc::WorkflowPublicationResult::Conflict(authoring_conflict_result(error)?)
+        }
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowPublicationResult { result }),
+    )
+    .await
+}
+
+async fn handle_activate_workflow_revision(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::ActivateWorkflowRevisionRequest,
+) -> Result<(), ServerError> {
+    state.authorize_local_workflow_application_operation(
+        client_id,
+        LocalWorkflowApplicationOperationRequest {
+            operation: bcode_workflow::WorkflowApplicationOperation::ActivateRevision,
+            workflow_id: request.workflow_id.clone(),
+            draft_id: None,
+            revision: Some(request.revision),
+            preset_id: None,
+            producer: None,
+            requirements: bcode_workflow::WorkflowRequirementSummary::default(),
+            effects: bcode_workflow::WorkflowEffectSummary::default(),
+            activates: true,
+            executes: false,
+        },
+    )?;
+    let update = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .set_active_workflow_revision(
+            &request.workflow_id,
+            request.expected_active_revision,
+            request.revision,
+            current_time_ms(),
+        );
+    let result = match update {
+        Ok(()) => bcode_ipc::WorkflowAuthoringMutationResult::Applied,
+        Err(error) => {
+            bcode_ipc::WorkflowAuthoringMutationResult::Conflict(authoring_conflict_result(error)?)
+        }
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowActivationResult { result }),
+    )
+    .await
+}
+
+async fn handle_set_authored_workflow_archived(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::SetAuthoredWorkflowArchivedRequest,
+) -> Result<(), ServerError> {
+    state.authorize_local_workflow_application_operation(
+        client_id,
+        LocalWorkflowApplicationOperationRequest {
+            operation: if request.archived {
+                bcode_workflow::WorkflowApplicationOperation::ArchiveWorkflow
+            } else {
+                bcode_workflow::WorkflowApplicationOperation::UnarchiveWorkflow
+            },
+            workflow_id: request.workflow_id.clone(),
+            draft_id: None,
+            revision: None,
+            preset_id: None,
+            producer: None,
+            requirements: bcode_workflow::WorkflowRequirementSummary::default(),
+            effects: bcode_workflow::WorkflowEffectSummary::default(),
+            activates: false,
+            executes: false,
+        },
+    )?;
+    let workflow = {
+        let mut store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.set_authored_workflow_archived(
+            &request.workflow_id,
+            request.archived,
+            current_time_ms(),
+        )?;
+        store
+            .authored_workflow(&request.workflow_id)?
+            .expect("updated authored workflow remains present")
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::AuthoredWorkflowArchived {
+            workflow: authored_workflow_snapshot(workflow),
+        }),
+    )
+    .await
+}
+
+async fn handle_discard_workflow_draft(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::DiscardWorkflowDraftRequest,
+) -> Result<(), ServerError> {
+    state.authorize_local_workflow_application_operation(
+        client_id,
+        LocalWorkflowApplicationOperationRequest {
+            operation: bcode_workflow::WorkflowApplicationOperation::DiscardDraft,
+            workflow_id: request.workflow_id.clone(),
+            draft_id: Some(request.draft_id.clone()),
+            revision: None,
+            preset_id: None,
+            producer: None,
+            requirements: bcode_workflow::WorkflowRequirementSummary::default(),
+            effects: bcode_workflow::WorkflowEffectSummary::default(),
+            activates: false,
+            executes: false,
+        },
+    )?;
+    let discard = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .discard_workflow_draft(
+            &request.workflow_id,
+            &request.draft_id,
+            request.expected_generation,
+        );
+    let result = match discard {
+        Ok(()) => bcode_ipc::WorkflowAuthoringMutationResult::Applied,
+        Err(error) => {
+            bcode_ipc::WorkflowAuthoringMutationResult::Conflict(authoring_conflict_result(error)?)
+        }
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowDraftDiscardResult { result }),
+    )
+    .await
+}
+
+async fn handle_fork_workflow_draft(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::ForkWorkflowDraftRequest,
+) -> Result<(), ServerError> {
+    state.authorize_local_workflow_application_operation(
+        client_id,
+        LocalWorkflowApplicationOperationRequest {
+            operation: bcode_workflow::WorkflowApplicationOperation::ForkDraft,
+            workflow_id: request.workflow_id.clone(),
+            draft_id: Some(request.draft_id.clone()),
+            revision: None,
+            preset_id: None,
+            producer: Some(request.producer.clone()),
+            requirements: bcode_workflow::WorkflowRequirementSummary::default(),
+            effects: bcode_workflow::WorkflowEffectSummary::default(),
+            activates: false,
+            executes: false,
+        },
+    )?;
+    let draft = {
+        let mut store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match request.source {
+            bcode_ipc::WorkflowDraftForkSource::Draft { draft_id } => store.fork_workflow_draft(
+                &request.workflow_id,
+                &draft_id,
+                &request.draft_id,
+                request.producer,
+                current_time_ms(),
+            )?,
+            bcode_ipc::WorkflowDraftForkSource::Revision { revision } => store
+                .fork_workflow_revision(
+                    &request.workflow_id,
+                    revision,
+                    &request.draft_id,
+                    request.producer,
+                    current_time_ms(),
+                )?,
+        }
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowDraftForked {
+            draft: Box::new(workflow_draft_snapshot(draft)),
+        }),
+    )
+    .await
+}
+
+fn workflow_preset_from_mutation(
+    mutation: bcode_ipc::WorkflowPresetMutation,
+    generation: u64,
+    created_at_ms: u64,
+) -> bcode_workflow_store::WorkflowPreset {
+    bcode_workflow_store::WorkflowPreset {
+        workflow_id: mutation.workflow_id,
+        preset_id: mutation.preset_id,
+        revision: mutation.revision,
+        name: mutation.name,
+        generation,
+        configuration: mutation.configuration,
+        run_limits: mutation.run_limits,
+        producer: mutation.producer,
+        created_at_ms,
+        updated_at_ms: created_at_ms,
+    }
+}
+
+async fn handle_create_workflow_preset(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::CreateWorkflowPresetRequest,
+) -> Result<(), ServerError> {
+    state.authorize_local_workflow_application_operation(
+        client_id,
+        LocalWorkflowApplicationOperationRequest {
+            operation: bcode_workflow::WorkflowApplicationOperation::CreatePreset,
+            workflow_id: request.preset.workflow_id.clone(),
+            draft_id: None,
+            revision: None,
+            preset_id: Some(request.preset.preset_id.clone()),
+            producer: Some(request.preset.producer.clone()),
+            requirements: bcode_workflow::WorkflowRequirementSummary::default(),
+            effects: bcode_workflow::WorkflowEffectSummary::default(),
+            activates: false,
+            executes: false,
+        },
+    )?;
+    let preset = workflow_preset_from_mutation(request.preset, 1, current_time_ms());
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .create_workflow_preset(&preset)?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowPresetCreated {
+            preset: workflow_preset_snapshot(preset),
+        }),
+    )
+    .await
+}
+
+async fn handle_update_workflow_preset(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::UpdateWorkflowPresetRequest,
+) -> Result<(), ServerError> {
+    state.authorize_local_workflow_application_operation(
+        client_id,
+        LocalWorkflowApplicationOperationRequest {
+            operation: bcode_workflow::WorkflowApplicationOperation::UpdatePreset,
+            workflow_id: request.preset.workflow_id.clone(),
+            draft_id: None,
+            revision: None,
+            preset_id: Some(request.preset.preset_id.clone()),
+            producer: Some(request.preset.producer.clone()),
+            requirements: bcode_workflow::WorkflowRequirementSummary::default(),
+            effects: bcode_workflow::WorkflowEffectSummary::default(),
+            activates: false,
+            executes: false,
+        },
+    )?;
+    let preset = request.preset;
+    let update = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .update_workflow_preset(
+            &preset.workflow_id,
+            &preset.preset_id,
+            request.expected_generation,
+            &preset.name,
+            &preset.configuration,
+            preset.run_limits.as_ref(),
+            &preset.producer,
+            current_time_ms(),
+        );
+    let result = match update {
+        Ok(preset) => {
+            bcode_ipc::WorkflowPresetUpdateResult::Updated(workflow_preset_snapshot(preset))
+        }
+        Err(error) => {
+            bcode_ipc::WorkflowPresetUpdateResult::Conflict(authoring_conflict_result(error)?)
+        }
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowPresetUpdateResult { result }),
+    )
+    .await
+}
+
+async fn handle_delete_workflow_preset(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::DeleteWorkflowPresetRequest,
+) -> Result<(), ServerError> {
+    state.authorize_local_workflow_application_operation(
+        client_id,
+        LocalWorkflowApplicationOperationRequest {
+            operation: bcode_workflow::WorkflowApplicationOperation::DeletePreset,
+            workflow_id: request.workflow_id.clone(),
+            draft_id: None,
+            revision: None,
+            preset_id: Some(request.preset_id.clone()),
+            producer: None,
+            requirements: bcode_workflow::WorkflowRequirementSummary::default(),
+            effects: bcode_workflow::WorkflowEffectSummary::default(),
+            activates: false,
+            executes: false,
+        },
+    )?;
+    let deletion = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .delete_workflow_preset(
+            &request.workflow_id,
+            &request.preset_id,
+            request.expected_generation,
+        );
+    let result = match deletion {
+        Ok(()) => bcode_ipc::WorkflowAuthoringMutationResult::Applied,
+        Err(error) => {
+            bcode_ipc::WorkflowAuthoringMutationResult::Conflict(authoring_conflict_result(error)?)
+        }
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowPresetDeleteResult { result }),
+    )
+    .await
+}
+
+fn authored_workflow_page(
+    page: bcode_workflow_store::WorkflowAuthoringStorePage<bcode_workflow_store::AuthoredWorkflow>,
+    _limit: usize,
+) -> bcode_ipc::WorkflowAuthoringPage<
+    bcode_ipc::AuthoredWorkflowSnapshot,
+    bcode_workflow::WorkflowAuthoringListCursor,
+> {
+    let bcode_workflow_store::WorkflowAuthoringStorePage {
+        items: workflows,
+        has_more,
+    } = page;
+    let next_cursor = has_more.then(|| {
+        let last = workflows
+            .last()
+            .expect("a page with more items is non-empty");
+        bcode_workflow::WorkflowAuthoringListCursor {
+            updated_at_ms: last.updated_at_ms,
+            entity_id: last.workflow_id.clone(),
+        }
+    });
+    bcode_ipc::WorkflowAuthoringPage {
+        items: workflows
+            .into_iter()
+            .map(authored_workflow_snapshot)
+            .collect(),
+        next_cursor,
+    }
+}
+
+fn workflow_draft_page(
+    page: bcode_workflow_store::WorkflowAuthoringStorePage<bcode_workflow_store::WorkflowDraft>,
+    _limit: usize,
+) -> bcode_ipc::WorkflowAuthoringPage<
+    bcode_ipc::WorkflowDraftSnapshot,
+    bcode_workflow::WorkflowAuthoringListCursor,
+> {
+    let bcode_workflow_store::WorkflowAuthoringStorePage {
+        items: drafts,
+        has_more,
+    } = page;
+    let next_cursor = has_more.then(|| {
+        let last = drafts.last().expect("a page with more items is non-empty");
+        bcode_workflow::WorkflowAuthoringListCursor {
+            updated_at_ms: last.updated_at_ms,
+            entity_id: last.draft_id.clone(),
+        }
+    });
+    bcode_ipc::WorkflowAuthoringPage {
+        items: drafts.into_iter().map(workflow_draft_snapshot).collect(),
+        next_cursor,
+    }
+}
+
+fn workflow_revision_page(
+    page: bcode_workflow_store::WorkflowAuthoringStorePage<
+        bcode_workflow_store::PublishedWorkflowRevision,
+    >,
+    _limit: usize,
+) -> bcode_ipc::WorkflowAuthoringPage<
+    bcode_ipc::WorkflowRevisionSnapshot,
+    bcode_workflow::WorkflowRevisionListCursor,
+> {
+    let bcode_workflow_store::WorkflowAuthoringStorePage {
+        items: revisions,
+        has_more,
+    } = page;
+    let next_cursor = has_more.then(|| bcode_workflow::WorkflowRevisionListCursor {
+        revision: revisions
+            .last()
+            .expect("a page with more items is non-empty")
+            .revision,
+    });
+    bcode_ipc::WorkflowAuthoringPage {
+        items: revisions
+            .into_iter()
+            .map(workflow_revision_snapshot)
+            .collect(),
+        next_cursor,
+    }
+}
+
+fn workflow_preset_page(
+    page: bcode_workflow_store::WorkflowAuthoringStorePage<bcode_workflow_store::WorkflowPreset>,
+    _limit: usize,
+) -> bcode_ipc::WorkflowAuthoringPage<
+    bcode_ipc::WorkflowPresetSnapshot,
+    bcode_workflow::WorkflowAuthoringListCursor,
+> {
+    let bcode_workflow_store::WorkflowAuthoringStorePage {
+        items: presets,
+        has_more,
+    } = page;
+    let next_cursor = has_more.then(|| {
+        let last = presets.last().expect("a page with more items is non-empty");
+        bcode_workflow::WorkflowAuthoringListCursor {
+            updated_at_ms: last.updated_at_ms,
+            entity_id: last.preset_id.clone(),
+        }
+    });
+    bcode_ipc::WorkflowAuthoringPage {
+        items: presets.into_iter().map(workflow_preset_snapshot).collect(),
+        next_cursor,
+    }
+}
+
 fn authored_workflow_snapshot(
     workflow: bcode_workflow_store::AuthoredWorkflow,
 ) -> bcode_ipc::AuthoredWorkflowSnapshot {
@@ -11788,13 +12797,19 @@ async fn handle_preview_workflow_compilation(
     writer: &SharedWriter,
     document: bcode_workflow::WorkflowAuthoringDocument,
     configuration: Option<serde_json::Value>,
+    control: bcode_ipc::WorkflowComputationControl,
 ) -> Result<(), ServerError> {
     let catalog = workflow_authoring_catalog_snapshot(state).await?;
+    let preview =
+        run_workflow_computation(state, control, format!("preview-{request_id}"), move || {
+            document.compilation_preview(&catalog, configuration.as_ref())
+        })
+        .await?;
     send_response(
         writer,
         request_id,
         Response::Ok(ResponsePayload::WorkflowCompilationPreview {
-            preview: Box::new(document.compilation_preview(&catalog, configuration.as_ref())),
+            preview: Box::new(preview),
         }),
     )
     .await
@@ -27779,7 +28794,10 @@ mod tests {
         let validation = send(
             &mut stream,
             2,
-            Request::ValidateWorkflowAuthoring { document: invalid },
+            Request::ValidateWorkflowAuthoring {
+                document: invalid,
+                control: bcode_ipc::WorkflowComputationControl::default(),
+            },
         )
         .await;
         let Response::Ok(ResponsePayload::WorkflowAuthoringValidated { report }) = validation
@@ -27795,6 +28813,7 @@ mod tests {
             Request::PreviewWorkflowCompilation {
                 document: test_workflow_authoring_document(),
                 configuration: None,
+                control: bcode_ipc::WorkflowComputationControl::default(),
             },
         )
         .await;
@@ -27820,6 +28839,218 @@ mod tests {
                 .expect("authored workflows")
                 .is_empty()
         );
+        drop(stream);
+        server.await.expect("server task");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn authored_workflow_create_update_conflict_and_ping_share_one_connection() {
+        let sessions = SessionManager::default();
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+            .expect("workflow store");
+        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+            sessions, store,
+        ));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("client connection");
+            handle_client(stream, server_state)
+                .await
+                .expect("handle client");
+        });
+        let mut stream = LocalIpcStream::connect(&endpoint).await.expect("connect");
+        let send = async |stream: &mut LocalIpcStream, id, request: Request| {
+            let envelope = bcode_ipc::request_envelope(id, &request).expect("request envelope");
+            bcode_ipc::send_envelope(stream, &envelope)
+                .await
+                .expect("send request");
+            let response = bcode_ipc::recv_envelope(stream)
+                .await
+                .expect("receive response");
+            bcode_ipc::decode_response(&response.payload).expect("decode response")
+        };
+        let document = test_workflow_authoring_document();
+        let workflow_id = document.workflow_id.clone();
+        let producer = document.producer.clone();
+        let created = send(
+            &mut stream,
+            1,
+            Request::CreateAuthoredWorkflow(bcode_ipc::CreateAuthoredWorkflowRequest {
+                document: document.clone(),
+                draft_id: "draft-1".to_string(),
+            }),
+        )
+        .await;
+        let Response::Ok(ResponsePayload::AuthoredWorkflowCreated { workflow, draft }) = created
+        else {
+            panic!("unexpected create response: {created:?}");
+        };
+        assert_eq!(workflow.workflow_id, workflow_id);
+        assert_eq!(draft.generation, 1);
+
+        let updated = send(
+            &mut stream,
+            2,
+            Request::UpdateWorkflowDraft(bcode_ipc::UpdateWorkflowDraftRequest {
+                workflow_id: workflow_id.clone(),
+                draft_id: "draft-1".to_string(),
+                expected_generation: 1,
+                document: document.clone(),
+                producer: producer.clone(),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            updated,
+            Response::Ok(ResponsePayload::WorkflowDraftUpdateResult {
+                result: bcode_ipc::WorkflowDraftUpdateResult::Updated(_)
+            })
+        ));
+
+        let conflict = send(
+            &mut stream,
+            3,
+            Request::UpdateWorkflowDraft(bcode_ipc::UpdateWorkflowDraftRequest {
+                workflow_id,
+                draft_id: "draft-1".to_string(),
+                expected_generation: 1,
+                document,
+                producer,
+            }),
+        )
+        .await;
+        let Response::Ok(ResponsePayload::WorkflowDraftUpdateResult {
+            result: bcode_ipc::WorkflowDraftUpdateResult::Conflict(conflict),
+        }) = conflict
+        else {
+            panic!("unexpected conflict response: {conflict:?}");
+        };
+        assert_eq!(conflict.expected_generation, 1);
+        assert_eq!(conflict.current_generation, 2);
+        let publication = send(
+            &mut stream,
+            4,
+            Request::PublishWorkflowDraft(bcode_ipc::PublishWorkflowDraftRequest {
+                workflow_id: "authored/ipc-test".to_string(),
+                draft_id: "draft-1".to_string(),
+                expected_generation: 2,
+                configuration: None,
+                activate: true,
+                expected_active_revision: None,
+                control: bcode_ipc::WorkflowComputationControl::default(),
+            }),
+        )
+        .await;
+        let Response::Ok(ResponsePayload::WorkflowPublicationResult {
+            result:
+                bcode_ipc::WorkflowPublicationResult::Published {
+                    revision,
+                    active_revision,
+                },
+        }) = publication
+        else {
+            panic!("unexpected publication response: {publication:?}");
+        };
+        assert_eq!(revision.identity.revision, 1);
+        assert_eq!(active_revision, Some(1));
+        let fork = send(
+            &mut stream,
+            5,
+            Request::ForkWorkflowDraft(bcode_ipc::ForkWorkflowDraftRequest {
+                workflow_id: revision.identity.workflow_id.clone(),
+                source: bcode_ipc::WorkflowDraftForkSource::Revision { revision: 1 },
+                draft_id: "draft-2".to_string(),
+                producer: revision.producer.clone(),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            fork,
+            Response::Ok(ResponsePayload::WorkflowDraftForked { .. })
+        ));
+        let preset = bcode_ipc::WorkflowPresetMutation {
+            workflow_id: revision.identity.workflow_id.clone(),
+            preset_id: "default".to_string(),
+            revision: 1,
+            name: "Default".to_string(),
+            configuration: serde_json::json!({}),
+            run_limits: None,
+            producer: revision.producer.clone(),
+        };
+        let created_preset = send(
+            &mut stream,
+            6,
+            Request::CreateWorkflowPreset(bcode_ipc::CreateWorkflowPresetRequest {
+                preset: preset.clone(),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            created_preset,
+            Response::Ok(ResponsePayload::WorkflowPresetCreated { .. })
+        ));
+        let updated_preset = send(
+            &mut stream,
+            7,
+            Request::UpdateWorkflowPreset(bcode_ipc::UpdateWorkflowPresetRequest {
+                expected_generation: 1,
+                preset: preset.clone(),
+            }),
+        )
+        .await;
+        assert!(matches!(
+            updated_preset,
+            Response::Ok(ResponsePayload::WorkflowPresetUpdateResult {
+                result: bcode_ipc::WorkflowPresetUpdateResult::Updated(_)
+            })
+        ));
+        let preset_conflict = send(
+            &mut stream,
+            8,
+            Request::UpdateWorkflowPreset(bcode_ipc::UpdateWorkflowPresetRequest {
+                expected_generation: 1,
+                preset,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            preset_conflict,
+            Response::Ok(ResponsePayload::WorkflowPresetUpdateResult {
+                result: bcode_ipc::WorkflowPresetUpdateResult::Conflict(
+                    bcode_ipc::WorkflowAuthoringConflict {
+                        expected_generation: 1,
+                        current_generation: 2,
+                        ..
+                    }
+                )
+            })
+        ));
+        let deleted_preset = send(
+            &mut stream,
+            9,
+            Request::DeleteWorkflowPreset(bcode_ipc::DeleteWorkflowPresetRequest {
+                workflow_id: revision.identity.workflow_id.clone(),
+                preset_id: "default".to_string(),
+                expected_generation: 2,
+            }),
+        )
+        .await;
+        assert!(matches!(
+            deleted_preset,
+            Response::Ok(ResponsePayload::WorkflowPresetDeleteResult {
+                result: bcode_ipc::WorkflowAuthoringMutationResult::Applied
+            })
+        ));
+        assert!(matches!(
+            send(&mut stream, 10, Request::Ping).await,
+            Response::Ok(ResponsePayload::Pong)
+        ));
         drop(stream);
         server.await.expect("server task");
     }
@@ -36735,6 +37966,155 @@ library = "test"
         );
     }
 
+    #[tokio::test]
+    async fn workflow_computation_deadline_and_cancellation_are_bounded_and_cleaned_up() {
+        let state = Arc::new(test_server_state(SessionManager::default()));
+        let timeout = run_workflow_computation(
+            state.as_ref(),
+            bcode_ipc::WorkflowComputationControl {
+                operation_id: "timeout-test".to_string(),
+                timeout_ms: 1,
+            },
+            "fallback".to_string(),
+            || {
+                std::thread::sleep(Duration::from_millis(50));
+                1_u8
+            },
+        )
+        .await
+        .expect_err("computation must time out");
+        assert!(matches!(
+            timeout,
+            ServerError::WorkflowComputationTimedOut(_)
+        ));
+        assert!(
+            state
+                .workflow_computations
+                .lock()
+                .expect("computations")
+                .is_empty()
+        );
+
+        let cancellation_state = Arc::clone(&state);
+        let operation = tokio::spawn(async move {
+            run_workflow_computation(
+                cancellation_state.as_ref(),
+                bcode_ipc::WorkflowComputationControl {
+                    operation_id: "cancel-test".to_string(),
+                    timeout_ms: 1_000,
+                },
+                "fallback".to_string(),
+                || {
+                    std::thread::sleep(Duration::from_millis(50));
+                    1_u8
+                },
+            )
+            .await
+        });
+        tokio::task::yield_now().await;
+        assert!(cancel_workflow_computation(state.as_ref(), "cancel-test"));
+        let cancelled = operation
+            .await
+            .expect("join cancellation test")
+            .expect_err("explicit cancellation must win");
+        assert!(matches!(
+            cancelled,
+            ServerError::WorkflowComputationCancelled(_)
+        ));
+        assert!(
+            state
+                .workflow_computations
+                .lock()
+                .expect("computations")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn authored_workflow_application_authorization_uses_canonical_facts_and_precedes_mutation() {
+        let mut state = test_server_state(SessionManager::default());
+        let workflow_id = "workflow/authorization-test".to_string();
+        let facts = WorkflowApplicationOperationFacts {
+            version: bcode_workflow::WORKFLOW_APPLICATION_OPERATION_FACTS_VERSION,
+            operation: bcode_workflow::WorkflowApplicationOperation::CreateWorkflow,
+            actor: bcode_workflow::WorkflowApplicationActor {
+                kind: bcode_workflow::WorkflowApplicationActorKind::LocalClient,
+                actor_id: ClientId::new().to_string(),
+            },
+            workflow_id: workflow_id.clone(),
+            draft_id: None,
+            revision: None,
+            preset_id: None,
+            producer: None,
+            requirements: bcode_workflow::WorkflowRequirementSummary::default(),
+            effects: bcode_workflow::WorkflowEffectSummary::default(),
+            activates: false,
+            executes: false,
+        };
+        state.workflow_application_authorization = WorkflowApplicationAuthorizationPolicy {
+            evaluator: Arc::new(|facts| {
+                assert_eq!(
+                    facts.operation,
+                    bcode_workflow::WorkflowApplicationOperation::CreateWorkflow
+                );
+                assert_eq!(
+                    facts.actor.kind,
+                    bcode_workflow::WorkflowApplicationActorKind::LocalClient
+                );
+                WorkflowApplicationAuthorizationDecision::Deny {
+                    reason: "test policy denial".to_string(),
+                }
+            }),
+        };
+
+        let error = state
+            .authorize_workflow_application_operation(&facts)
+            .expect_err("policy must deny operation");
+        assert!(matches!(
+            error,
+            ServerError::WorkflowApplicationOperationUnauthorized(reason)
+                if reason == "test policy denial"
+        ));
+        assert!(
+            state
+                .workflow_store
+                .lock()
+                .expect("workflow store")
+                .authored_workflow(&workflow_id)
+                .expect("read workflow")
+                .is_none(),
+            "authorization denial must occur before any store mutation"
+        );
+    }
+
+    #[test]
+    fn local_application_authorization_derives_actor_from_connection_identity() {
+        let state = test_server_state(SessionManager::default());
+        let client_id = ClientId::new();
+        let facts = state
+            .authorize_local_workflow_application_operation(
+                client_id,
+                LocalWorkflowApplicationOperationRequest {
+                    operation: bcode_workflow::WorkflowApplicationOperation::CreateWorkflow,
+                    workflow_id: "workflow/local-client".to_string(),
+                    draft_id: None,
+                    revision: None,
+                    preset_id: None,
+                    producer: None,
+                    requirements: bcode_workflow::WorkflowRequirementSummary::default(),
+                    effects: bcode_workflow::WorkflowEffectSummary::default(),
+                    activates: false,
+                    executes: false,
+                },
+            )
+            .expect("local client operation authorized");
+        assert_eq!(facts.actor.actor_id, client_id.to_string());
+        assert_eq!(
+            facts.actor.kind,
+            bcode_workflow::WorkflowApplicationActorKind::LocalClient
+        );
+    }
+
     fn test_server_state(sessions: SessionManager) -> ServerState {
         test_server_state_with_ralph_store(sessions, bcode_ralph::RalphStateStore::default())
     }
@@ -42563,6 +43943,7 @@ library = "test"
                 },
                 daemon_record_path: None,
                 metrics: MetricsRegistry::default(),
+                workflow_application_authorization: None,
                 workflow_store: Some(
                     bcode_workflow_store::WorkflowStore::open_in_state_dir(
                         tempfile::tempdir()
@@ -51242,6 +52623,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
                 metrics: MetricsRegistry::default(),
+                workflow_application_authorization: None,
                 workflow_store: Some(
                     bcode_workflow_store::WorkflowStore::open_in_state_dir(
                         tempfile::tempdir()
@@ -51929,6 +53311,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
                 metrics: MetricsRegistry::default(),
+                workflow_application_authorization: None,
                 workflow_store: Some(
                     bcode_workflow_store::WorkflowStore::open_in_state_dir(
                         tempfile::tempdir()

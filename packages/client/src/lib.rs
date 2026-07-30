@@ -1991,6 +1991,192 @@ impl BcodeClient {
         }
     }
 
+    /// Atomically create one logical workflow and its initial draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the authored document.
+    pub async fn create_authored_workflow(
+        &self,
+        request: bcode_ipc::CreateAuthoredWorkflowRequest,
+    ) -> Result<
+        (
+            bcode_ipc::AuthoredWorkflowSnapshot,
+            bcode_ipc::WorkflowDraftSnapshot,
+        ),
+        ClientError,
+    > {
+        match self
+            .send_request(Request::CreateAuthoredWorkflow(request))
+            .await?
+        {
+            ResponsePayload::AuthoredWorkflowCreated { workflow, draft } => Ok((workflow, *draft)),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Replace one exact authored-workflow draft generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the authored document.
+    pub async fn update_workflow_draft(
+        &self,
+        request: bcode_ipc::UpdateWorkflowDraftRequest,
+    ) -> Result<bcode_ipc::WorkflowDraftUpdateResult, ClientError> {
+        match self
+            .send_request(Request::UpdateWorkflowDraft(request))
+            .await?
+        {
+            ResponsePayload::WorkflowDraftUpdateResult { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Publish one exact draft generation, optionally activating the new immutable revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects publication.
+    pub async fn publish_workflow_draft(
+        &self,
+        request: bcode_ipc::PublishWorkflowDraftRequest,
+    ) -> Result<bcode_ipc::WorkflowPublicationResult, ClientError> {
+        match self
+            .send_request(Request::PublishWorkflowDraft(request))
+            .await?
+        {
+            ResponsePayload::WorkflowPublicationResult { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Compare-and-set one immutable revision as active.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects activation.
+    pub async fn activate_workflow_revision(
+        &self,
+        request: bcode_ipc::ActivateWorkflowRevisionRequest,
+    ) -> Result<bcode_ipc::WorkflowAuthoringMutationResult, ClientError> {
+        match self
+            .send_request(Request::ActivateWorkflowRevision(request))
+            .await?
+        {
+            ResponsePayload::WorkflowActivationResult { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Archive or unarchive one logical authored workflow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the mutation.
+    pub async fn set_authored_workflow_archived(
+        &self,
+        request: bcode_ipc::SetAuthoredWorkflowArchivedRequest,
+    ) -> Result<bcode_ipc::AuthoredWorkflowSnapshot, ClientError> {
+        match self
+            .send_request(Request::SetAuthoredWorkflowArchived(request))
+            .await?
+        {
+            ResponsePayload::AuthoredWorkflowArchived { workflow } => Ok(workflow),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Discard one exact mutable draft generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the mutation.
+    pub async fn discard_workflow_draft(
+        &self,
+        request: bcode_ipc::DiscardWorkflowDraftRequest,
+    ) -> Result<bcode_ipc::WorkflowAuthoringMutationResult, ClientError> {
+        match self
+            .send_request(Request::DiscardWorkflowDraft(request))
+            .await?
+        {
+            ResponsePayload::WorkflowDraftDiscardResult { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Fork one exact draft or immutable revision into a new generation-1 draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the source/identity.
+    pub async fn fork_workflow_draft(
+        &self,
+        request: bcode_ipc::ForkWorkflowDraftRequest,
+    ) -> Result<bcode_ipc::WorkflowDraftSnapshot, ClientError> {
+        match self
+            .send_request(Request::ForkWorkflowDraft(request))
+            .await?
+        {
+            ResponsePayload::WorkflowDraftForked { draft } => Ok(*draft),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Create one revision-bound workflow preset.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the preset.
+    pub async fn create_workflow_preset(
+        &self,
+        request: bcode_ipc::CreateWorkflowPresetRequest,
+    ) -> Result<bcode_ipc::WorkflowPresetSnapshot, ClientError> {
+        match self
+            .send_request(Request::CreateWorkflowPreset(request))
+            .await?
+        {
+            ResponsePayload::WorkflowPresetCreated { preset } => Ok(preset),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Replace one exact workflow preset generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the preset.
+    pub async fn update_workflow_preset(
+        &self,
+        request: bcode_ipc::UpdateWorkflowPresetRequest,
+    ) -> Result<bcode_ipc::WorkflowPresetUpdateResult, ClientError> {
+        match self
+            .send_request(Request::UpdateWorkflowPreset(request))
+            .await?
+        {
+            ResponsePayload::WorkflowPresetUpdateResult { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Delete one exact workflow preset generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects deletion.
+    pub async fn delete_workflow_preset(
+        &self,
+        request: bcode_ipc::DeleteWorkflowPresetRequest,
+    ) -> Result<bcode_ipc::WorkflowAuthoringMutationResult, ClientError> {
+        match self
+            .send_request(Request::DeleteWorkflowPreset(request))
+            .await?
+        {
+            ResponsePayload::WorkflowPresetDeleteResult { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// List bounded logical authored workflows.
     ///
     /// # Errors
@@ -1998,13 +2184,20 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached or rejects the bound.
     pub async fn list_authored_workflows(
         &self,
+        cursor: Option<bcode_workflow::WorkflowAuthoringListCursor>,
         limit: usize,
-    ) -> Result<Vec<bcode_ipc::AuthoredWorkflowSnapshot>, ClientError> {
+    ) -> Result<
+        bcode_ipc::WorkflowAuthoringPage<
+            bcode_ipc::AuthoredWorkflowSnapshot,
+            bcode_workflow::WorkflowAuthoringListCursor,
+        >,
+        ClientError,
+    > {
         match self
-            .send_request(Request::ListAuthoredWorkflows { limit })
+            .send_request(Request::ListAuthoredWorkflows { cursor, limit })
             .await?
         {
-            ResponsePayload::AuthoredWorkflowList { workflows } => Ok(workflows),
+            ResponsePayload::AuthoredWorkflowList { page } => Ok(page),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -2035,13 +2228,24 @@ impl BcodeClient {
     pub async fn list_workflow_drafts(
         &self,
         workflow_id: String,
+        cursor: Option<bcode_workflow::WorkflowAuthoringListCursor>,
         limit: usize,
-    ) -> Result<Vec<bcode_ipc::WorkflowDraftSnapshot>, ClientError> {
+    ) -> Result<
+        bcode_ipc::WorkflowAuthoringPage<
+            bcode_ipc::WorkflowDraftSnapshot,
+            bcode_workflow::WorkflowAuthoringListCursor,
+        >,
+        ClientError,
+    > {
         match self
-            .send_request(Request::ListWorkflowDrafts { workflow_id, limit })
+            .send_request(Request::ListWorkflowDrafts {
+                workflow_id,
+                cursor,
+                limit,
+            })
             .await?
         {
-            ResponsePayload::WorkflowDraftList { drafts } => Ok(drafts),
+            ResponsePayload::WorkflowDraftList { page } => Ok(page),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -2076,13 +2280,24 @@ impl BcodeClient {
     pub async fn list_workflow_revisions(
         &self,
         workflow_id: String,
+        cursor: Option<bcode_workflow::WorkflowRevisionListCursor>,
         limit: usize,
-    ) -> Result<Vec<bcode_ipc::WorkflowRevisionSnapshot>, ClientError> {
+    ) -> Result<
+        bcode_ipc::WorkflowAuthoringPage<
+            bcode_ipc::WorkflowRevisionSnapshot,
+            bcode_workflow::WorkflowRevisionListCursor,
+        >,
+        ClientError,
+    > {
         match self
-            .send_request(Request::ListWorkflowRevisions { workflow_id, limit })
+            .send_request(Request::ListWorkflowRevisions {
+                workflow_id,
+                cursor,
+                limit,
+            })
             .await?
         {
-            ResponsePayload::WorkflowRevisionList { revisions } => Ok(revisions),
+            ResponsePayload::WorkflowRevisionList { page } => Ok(page),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -2119,13 +2334,24 @@ impl BcodeClient {
     pub async fn list_workflow_presets(
         &self,
         workflow_id: String,
+        cursor: Option<bcode_workflow::WorkflowAuthoringListCursor>,
         limit: usize,
-    ) -> Result<Vec<bcode_ipc::WorkflowPresetSnapshot>, ClientError> {
+    ) -> Result<
+        bcode_ipc::WorkflowAuthoringPage<
+            bcode_ipc::WorkflowPresetSnapshot,
+            bcode_workflow::WorkflowAuthoringListCursor,
+        >,
+        ClientError,
+    > {
         match self
-            .send_request(Request::ListWorkflowPresets { workflow_id, limit })
+            .send_request(Request::ListWorkflowPresets {
+                workflow_id,
+                cursor,
+                limit,
+            })
             .await?
         {
-            ResponsePayload::WorkflowPresetList { presets } => Ok(presets),
+            ResponsePayload::WorkflowPresetList { page } => Ok(page),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -2175,8 +2401,26 @@ impl BcodeClient {
         &self,
         document: bcode_workflow::WorkflowAuthoringDocument,
     ) -> Result<bcode_workflow::WorkflowValidationReport, ClientError> {
+        self.validate_workflow_authoring_with_control(
+            document,
+            bcode_ipc::WorkflowComputationControl::default(),
+        )
+        .await
+    }
+
+    /// Validate one document with an explicit server-side deadline/cancellation identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, computation is cancelled/times out, or
+    /// the response is incompatible.
+    pub async fn validate_workflow_authoring_with_control(
+        &self,
+        document: bcode_workflow::WorkflowAuthoringDocument,
+        control: bcode_ipc::WorkflowComputationControl,
+    ) -> Result<bcode_workflow::WorkflowValidationReport, ClientError> {
         match self
-            .send_request(Request::ValidateWorkflowAuthoring { document })
+            .send_request(Request::ValidateWorkflowAuthoring { document, control })
             .await?
         {
             ResponsePayload::WorkflowAuthoringValidated { report } => Ok(report),
@@ -2194,14 +2438,55 @@ impl BcodeClient {
         document: bcode_workflow::WorkflowAuthoringDocument,
         configuration: Option<serde_json::Value>,
     ) -> Result<bcode_workflow::WorkflowCompilationPreview, ClientError> {
+        self.preview_workflow_compilation_with_control(
+            document,
+            configuration,
+            bcode_ipc::WorkflowComputationControl::default(),
+        )
+        .await
+    }
+
+    /// Compile and preview with an explicit server-side deadline/cancellation identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached, computation is cancelled/times out, or
+    /// the response is incompatible.
+    pub async fn preview_workflow_compilation_with_control(
+        &self,
+        document: bcode_workflow::WorkflowAuthoringDocument,
+        configuration: Option<serde_json::Value>,
+        control: bcode_ipc::WorkflowComputationControl,
+    ) -> Result<bcode_workflow::WorkflowCompilationPreview, ClientError> {
         match self
             .send_request(Request::PreviewWorkflowCompilation {
                 document,
                 configuration,
+                control,
             })
             .await?
         {
             ResponsePayload::WorkflowCompilationPreview { preview } => Ok(*preview),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Request cancellation of one exact authored-workflow validation or compilation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the operation identity.
+    pub async fn cancel_workflow_computation(
+        &self,
+        operation_id: String,
+    ) -> Result<bool, ClientError> {
+        match self
+            .send_request(Request::CancelWorkflowComputation { operation_id })
+            .await?
+        {
+            ResponsePayload::WorkflowComputationCancellationRequested { cancelled } => {
+                Ok(cancelled)
+            }
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

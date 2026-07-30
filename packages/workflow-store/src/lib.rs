@@ -5,9 +5,9 @@
 //! Durable workflow persistence owned independently from session transcript storage.
 
 use bcode_workflow::{
-    WORKFLOW_COMPILATION_PREVIEW_VERSION, WorkflowAuthoringDocument, WorkflowCompilationPreview,
-    WorkflowDefinition, WorkflowDefinitionIdentity, WorkflowProducerProvenance,
-    WorkflowRunLimitPolicy,
+    WORKFLOW_COMPILATION_PREVIEW_VERSION, WorkflowAuthoringDocument, WorkflowAuthoringListCursor,
+    WorkflowCompilationPreview, WorkflowDefinition, WorkflowDefinitionIdentity,
+    WorkflowProducerProvenance, WorkflowRevisionListCursor, WorkflowRunLimitPolicy,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -23,6 +23,24 @@ const SCHEMA_VERSION: u32 = 7;
 const MAX_ID_BYTES: usize = 512;
 const MAX_DISPLAY_LABEL_BYTES: usize = 512;
 const MAX_INLINE_JSON_BYTES: usize = 1_048_576;
+
+/// One bounded internal authored-list page with stable continuation knowledge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowAuthoringStorePage<T> {
+    /// Items in stable query order, never exceeding the requested page size.
+    pub items: Vec<T>,
+    /// Whether at least one item follows this page.
+    pub has_more: bool,
+}
+
+fn finish_authoring_store_page<T>(
+    mut items: Vec<T>,
+    limit: usize,
+) -> WorkflowAuthoringStorePage<T> {
+    let has_more = items.len() > limit;
+    items.truncate(limit);
+    WorkflowAuthoringStorePage { items, has_more }
+}
 
 /// Durable workflow run status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1131,6 +1149,64 @@ impl WorkflowStore {
             .collect()
     }
 
+    /// Create a logical authored workflow and its initial draft atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed state, mismatched identities, an identity conflict, or a
+    /// database failure. Any error rolls back both inserts.
+    pub fn create_authored_workflow_with_initial_draft(
+        &mut self,
+        workflow: &AuthoredWorkflow,
+        draft: &WorkflowDraft,
+    ) -> Result<(), WorkflowStoreError> {
+        validate_authored_workflow(workflow)?;
+        validate_workflow_draft(draft)?;
+        if workflow.active_revision.is_some()
+            || workflow.workflow_id != draft.workflow_id
+            || draft.base_revision.is_some()
+            || draft.generation != 1
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "initial authored workflow and draft identities or initial state are invalid"
+                    .to_string(),
+            ));
+        }
+        let document_json = bounded_json("draft document", &draft.document)?;
+        let producer_json = bounded_json("draft producer", &draft.producer)?;
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
+            "INSERT INTO authored_workflows \
+             (workflow_id, title, description, archived, active_revision, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6)",
+            (
+                &workflow.workflow_id,
+                &workflow.title,
+                &workflow.description,
+                workflow.archived,
+                workflow.created_at_ms,
+                workflow.updated_at_ms,
+            ),
+        )?;
+        transaction.execute(
+            "INSERT INTO workflow_drafts \
+             (workflow_id, draft_id, base_revision, generation, checksum_sha256, document_json, producer_json, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8)",
+            (
+                &draft.workflow_id,
+                &draft.draft_id,
+                draft.generation,
+                &draft.checksum_sha256,
+                document_json,
+                producer_json,
+                draft.created_at_ms,
+                draft.updated_at_ms,
+            ),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Create one logical authored workflow.
     ///
     /// # Errors
@@ -1211,18 +1287,44 @@ impl WorkflowStore {
         &self,
         limit: usize,
     ) -> Result<Vec<AuthoredWorkflow>, WorkflowStoreError> {
-        let limit = bounded_limit(limit)?;
+        Ok(self.list_authored_workflows_page(None, limit)?.items)
+    }
+
+    /// Return one stable keyset page of authored workflows ordered by recent update.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid cursor/bound, inconsistent stored data, or query failure.
+    pub fn list_authored_workflows_page(
+        &self,
+        cursor: Option<&WorkflowAuthoringListCursor>,
+        limit: usize,
+    ) -> Result<WorkflowAuthoringStorePage<AuthoredWorkflow>, WorkflowStoreError> {
+        if let Some(cursor) = cursor {
+            cursor
+                .validate()
+                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        }
+        let query_limit = authoring_page_query_limit(limit)?;
         let mut statement = self.connection.prepare(
             "SELECT workflow_id, title, description, archived, active_revision, created_at_ms, updated_at_ms \
-             FROM authored_workflows ORDER BY updated_at_ms DESC, workflow_id LIMIT ?1",
+             FROM authored_workflows \
+             WHERE ?1 IS NULL OR updated_at_ms < ?1 OR (updated_at_ms = ?1 AND workflow_id > ?2) \
+             ORDER BY updated_at_ms DESC, workflow_id ASC LIMIT ?3",
         )?;
+        let updated_at_ms = cursor.map(|cursor| cursor.updated_at_ms);
+        let entity_id = cursor.map_or("", |cursor| cursor.entity_id.as_str());
         statement
-            .query_map([limit], decode_authored_workflow)?
+            .query_map(
+                (updated_at_ms, entity_id, query_limit),
+                decode_authored_workflow,
+            )?
             .map(|row| {
                 row.map_err(WorkflowStoreError::from)
                     .and_then(validate_stored_authored_workflow)
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
+            .map(|items| finish_authoring_store_page(items, limit))
     }
 
     /// Archive or unarchive one logical workflow without deleting history.
@@ -1336,20 +1438,48 @@ impl WorkflowStore {
         workflow_id: &str,
         limit: usize,
     ) -> Result<Vec<WorkflowDraft>, WorkflowStoreError> {
+        Ok(self
+            .list_workflow_drafts_page(workflow_id, None, limit)?
+            .items)
+    }
+
+    /// Return one stable keyset page of drafts for a logical workflow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid identity/cursor/bound, inconsistent data, or query failure.
+    pub fn list_workflow_drafts_page(
+        &self,
+        workflow_id: &str,
+        cursor: Option<&WorkflowAuthoringListCursor>,
+        limit: usize,
+    ) -> Result<WorkflowAuthoringStorePage<WorkflowDraft>, WorkflowStoreError> {
         validate_id("workflow_id", workflow_id)?;
-        let limit = bounded_limit(limit)?;
+        if let Some(cursor) = cursor {
+            cursor
+                .validate()
+                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        }
+        let query_limit = authoring_page_query_limit(limit)?;
         let mut statement = self.connection.prepare(
             "SELECT workflow_id, draft_id, base_revision, generation, checksum_sha256, document_json, producer_json, created_at_ms, updated_at_ms \
              FROM workflow_drafts WHERE workflow_id = ?1 \
-             ORDER BY updated_at_ms DESC, draft_id LIMIT ?2",
+             AND (?2 IS NULL OR updated_at_ms < ?2 OR (updated_at_ms = ?2 AND draft_id > ?3)) \
+             ORDER BY updated_at_ms DESC, draft_id ASC LIMIT ?4",
         )?;
+        let updated_at_ms = cursor.map(|cursor| cursor.updated_at_ms);
+        let entity_id = cursor.map_or("", |cursor| cursor.entity_id.as_str());
         statement
-            .query_map((workflow_id, limit), decode_workflow_draft)?
+            .query_map(
+                (workflow_id, updated_at_ms, entity_id, query_limit),
+                decode_workflow_draft,
+            )?
             .map(|row| {
                 row.map_err(WorkflowStoreError::from)
                     .and_then(validate_stored_workflow_draft)
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
+            .map(|items| finish_authoring_store_page(items, limit))
     }
 
     /// Replace one draft using an exact expected generation.
@@ -1818,19 +1948,50 @@ impl WorkflowStore {
         workflow_id: &str,
         limit: usize,
     ) -> Result<Vec<PublishedWorkflowRevision>, WorkflowStoreError> {
+        Ok(self
+            .list_workflow_revisions_page(workflow_id, None, limit)?
+            .items)
+    }
+
+    /// Return one stable keyset page of immutable revisions newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity/cursor/bound, inconsistent content, or query
+    /// failure.
+    pub fn list_workflow_revisions_page(
+        &self,
+        workflow_id: &str,
+        cursor: Option<WorkflowRevisionListCursor>,
+        limit: usize,
+    ) -> Result<WorkflowAuthoringStorePage<PublishedWorkflowRevision>, WorkflowStoreError> {
         validate_id("workflow_id", workflow_id)?;
-        let limit = bounded_limit(limit)?;
+        if let Some(cursor) = cursor {
+            cursor
+                .validate()
+                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        }
+        let query_limit = authoring_page_query_limit(limit)?;
         let mut statement = self.connection.prepare(
             "SELECT workflow_id, revision, source_checksum_sha256, executable_source_checksum_sha256, definition_id, definition_version, document_json, producer_json, published_at_ms \
-             FROM workflow_revisions WHERE workflow_id = ?1 ORDER BY revision DESC LIMIT ?2",
+             FROM workflow_revisions WHERE workflow_id = ?1 AND (?2 IS NULL OR revision < ?2) \
+             ORDER BY revision DESC LIMIT ?3",
         )?;
         statement
-            .query_map((workflow_id, limit), decode_workflow_revision)?
+            .query_map(
+                (
+                    workflow_id,
+                    cursor.map(|cursor| cursor.revision),
+                    query_limit,
+                ),
+                decode_workflow_revision,
+            )?
             .map(|row| {
                 row.map_err(WorkflowStoreError::from)
                     .and_then(validate_stored_workflow_revision)
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
+            .map(|items| finish_authoring_store_page(items, limit))
     }
 
     /// Compare-and-set the active immutable revision pointer.
@@ -1963,19 +2124,49 @@ impl WorkflowStore {
         workflow_id: &str,
         limit: usize,
     ) -> Result<Vec<WorkflowPreset>, WorkflowStoreError> {
+        Ok(self
+            .list_workflow_presets_page(workflow_id, None, limit)?
+            .items)
+    }
+
+    /// Return one stable keyset page of presets for a logical workflow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity/cursor/bound, inconsistent content, or query
+    /// failure.
+    pub fn list_workflow_presets_page(
+        &self,
+        workflow_id: &str,
+        cursor: Option<&WorkflowAuthoringListCursor>,
+        limit: usize,
+    ) -> Result<WorkflowAuthoringStorePage<WorkflowPreset>, WorkflowStoreError> {
         validate_id("workflow_id", workflow_id)?;
-        let limit = bounded_limit(limit)?;
+        if let Some(cursor) = cursor {
+            cursor
+                .validate()
+                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        }
+        let query_limit = authoring_page_query_limit(limit)?;
         let mut statement = self.connection.prepare(
             "SELECT workflow_id, preset_id, revision, name, generation, configuration_json, run_limits_json, producer_json, created_at_ms, updated_at_ms \
-             FROM workflow_presets WHERE workflow_id = ?1 ORDER BY updated_at_ms DESC, preset_id LIMIT ?2",
+             FROM workflow_presets WHERE workflow_id = ?1 \
+             AND (?2 IS NULL OR updated_at_ms < ?2 OR (updated_at_ms = ?2 AND preset_id > ?3)) \
+             ORDER BY updated_at_ms DESC, preset_id ASC LIMIT ?4",
         )?;
+        let updated_at_ms = cursor.map(|cursor| cursor.updated_at_ms);
+        let entity_id = cursor.map_or("", |cursor| cursor.entity_id.as_str());
         statement
-            .query_map((workflow_id, limit), decode_workflow_preset)?
+            .query_map(
+                (workflow_id, updated_at_ms, entity_id, query_limit),
+                decode_workflow_preset,
+            )?
             .map(|row| {
                 row.map_err(WorkflowStoreError::from)
                     .and_then(validate_stored_workflow_preset)
             })
-            .collect()
+            .collect::<Result<Vec<_>, _>>()
+            .map(|items| finish_authoring_store_page(items, limit))
     }
 
     /// Replace one preset using exact optimistic generation.
@@ -7268,6 +7459,11 @@ fn enforce_attempt_limits(
         ));
     }
     Ok(())
+}
+
+fn authoring_page_query_limit(limit: usize) -> Result<i64, WorkflowStoreError> {
+    let limit = bounded_limit(limit)?;
+    Ok(limit.saturating_add(1))
 }
 
 fn bounded_limit(limit: usize) -> Result<i64, WorkflowStoreError> {
@@ -13753,6 +13949,107 @@ mod tests {
                 .expect("table lookup");
             assert_eq!(count, 1, "missing migrated table {table}");
         }
+    }
+
+    #[test]
+    fn initial_workflow_and_draft_creation_is_atomic() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (workflow, draft, _) = authored_store_fixture();
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .create_authored_workflow_with_initial_draft(&workflow, &draft)
+            .expect("atomic create");
+        assert_eq!(
+            store
+                .authored_workflow(&workflow.workflow_id)
+                .expect("workflow"),
+            Some(workflow.clone())
+        );
+        assert_eq!(
+            store
+                .workflow_draft(&workflow.workflow_id, &draft.draft_id)
+                .expect("draft"),
+            Some(draft.clone())
+        );
+
+        let mut conflicting = draft.clone();
+        conflicting.draft_id = "other-draft".to_string();
+        assert!(
+            store
+                .create_authored_workflow_with_initial_draft(&workflow, &conflicting)
+                .is_err()
+        );
+        assert!(
+            store
+                .workflow_draft(&workflow.workflow_id, &conflicting.draft_id)
+                .expect("conflicting draft")
+                .is_none(),
+            "workflow identity conflict must roll back the initial draft insert"
+        );
+    }
+
+    #[test]
+    fn authored_list_keyset_pagination_is_stable_and_complete() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (workflow, draft, _) = authored_store_fixture();
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        for index in 0..3_u64 {
+            let mut item = workflow.clone();
+            item.workflow_id = format!("authored/{index}");
+            item.title = format!("Workflow {index}");
+            item.created_at_ms = index + 1;
+            item.updated_at_ms = if index < 2 { 10 } else { 5 };
+            assert!(store.create_authored_workflow(&item).expect("workflow"));
+        }
+
+        let first = store
+            .list_authored_workflows_page(None, 2)
+            .expect("first page");
+        assert!(first.has_more);
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|workflow| workflow.workflow_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["authored/0", "authored/1"]
+        );
+        let cursor = WorkflowAuthoringListCursor {
+            updated_at_ms: first.items[1].updated_at_ms,
+            entity_id: first.items[1].workflow_id.clone(),
+        };
+        let second = store
+            .list_authored_workflows_page(Some(&cursor), 2)
+            .expect("second page");
+        assert!(!second.has_more);
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].workflow_id, "authored/2");
+
+        let mut first_draft = draft;
+        first_draft.workflow_id = "authored/0".to_string();
+        first_draft.document.workflow_id = first_draft.workflow_id.clone();
+        first_draft.checksum_sha256 = first_draft
+            .document
+            .source_digest_sha256()
+            .expect("draft checksum");
+        assert!(store.create_workflow_draft(&first_draft).expect("draft"));
+        let mut second_draft = first_draft.clone();
+        second_draft.draft_id = "draft-2".to_string();
+        assert!(store.create_workflow_draft(&second_draft).expect("draft"));
+        let drafts = store
+            .list_workflow_drafts_page("authored/0", None, 1)
+            .expect("draft page");
+        assert!(drafts.has_more);
+        assert_eq!(drafts.items[0].draft_id, "draft-1");
+        let cursor = WorkflowAuthoringListCursor {
+            updated_at_ms: drafts.items[0].updated_at_ms,
+            entity_id: drafts.items[0].draft_id.clone(),
+        };
+        let drafts = store
+            .list_workflow_drafts_page("authored/0", Some(&cursor), 1)
+            .expect("next draft page");
+        assert!(!drafts.has_more);
+        assert_eq!(drafts.items[0].draft_id, "draft-2");
     }
 
     #[test]

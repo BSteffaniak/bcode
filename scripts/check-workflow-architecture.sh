@@ -18,12 +18,29 @@ rm -f /tmp/bcode-workflow-architecture-violations
 
 if [[ ! -f docs/runtime-workflow-authoring.md ]] \
   || ! rg -q 'WorkflowAuthoringDocument' docs/runtime-workflow-authoring.md \
+  || ! rg -q 'WorkflowApplicationOperationFacts' docs/runtime-workflow-authoring.md \
   || ! rg -q 'Active-run pinning' docs/runtime-workflow-authoring.md \
   || ! rg -q 'Producer-neutral authoring' docs/runtime-workflow-authoring.md \
   || ! rg -q 'Import and export' docs/runtime-workflow-authoring.md; then
   echo "Workflow authoring architecture violation: source/compile/run, pinning, producer, and import boundaries must remain documented." >&2
   violations=1
 fi
+
+if ! rg -q 'pub struct WorkflowApplicationOperationFacts' packages/workflow/src/lib.rs \
+  || ! rg -q 'WORKFLOW_APPLICATION_OPERATION_FACTS_VERSION' packages/workflow/src/lib.rs \
+  || ! rg -q 'authorize_workflow_application_operation' packages/server/src/lib.rs \
+  || ! rg -q 'authorize_local_workflow_application_operation' packages/server/src/lib.rs; then
+  echo "Workflow authorization boundary violation: normalized workflow-owned operation facts and the daemon authorization gate must remain present." >&2
+  violations=1
+fi
+
+if rg -n 'ToolPolicyOperation|EvaluateToolCallRequest|RuntimePermissionRequest|PermissionPolicyContext' \
+  packages/workflow/src/lib.rs >/tmp/bcode-workflow-authorization-leaks 2>/dev/null; then
+  echo "Workflow authorization boundary violation: application operation facts must not depend on tool-call/session permission types." >&2
+  cat /tmp/bcode-workflow-authorization-leaks >&2
+  violations=1
+fi
+rm -f /tmp/bcode-workflow-authorization-leaks
 
 # Workflow authoring models live with the renderer-neutral workflow contracts. Keep implementation
 # packages and third-party frontend/database frameworks out of that owner before authoring types land,

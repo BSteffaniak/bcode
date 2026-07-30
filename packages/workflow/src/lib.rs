@@ -1423,6 +1423,291 @@ const MAX_WORKFLOW_AUTHORING_PRESENTATION_BYTES: usize = 131_072;
 pub const WORKFLOW_AUTHORING_CATALOG_VERSION: u32 = 1;
 /// Portable workflow compilation preview contract version.
 pub const WORKFLOW_COMPILATION_PREVIEW_VERSION: u32 = 1;
+/// Normalized authored-workflow application-operation fact version.
+pub const WORKFLOW_APPLICATION_OPERATION_FACTS_VERSION: u32 = 1;
+
+/// Authenticated class of actor requesting an authored-workflow application operation.
+///
+/// This identity is assigned by the application boundary. It is distinct from untrusted producer
+/// provenance embedded in authored content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowApplicationActorKind {
+    /// A client connected through the authenticated local application boundary.
+    LocalClient,
+    /// A loaded plugin acting through its declared application capability.
+    Plugin,
+    /// A daemon-owned maintenance or lifecycle service.
+    Service,
+}
+
+/// Authenticated actor identity used for authored-workflow application authorization.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowApplicationActor {
+    /// Actor class assigned by the application boundary.
+    pub kind: WorkflowApplicationActorKind,
+    /// Stable bounded identity in the actor class' namespace.
+    pub actor_id: String,
+}
+
+impl WorkflowApplicationActor {
+    /// Validate this normalized actor identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the actor identity is malformed.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        validate_authoring_id("actor.actor_id", &self.actor_id)
+    }
+}
+
+/// Side-effecting authored-workflow operation evaluated by application policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowApplicationOperation {
+    CreateWorkflow,
+    UpdateWorkflowMetadata,
+    ArchiveWorkflow,
+    UnarchiveWorkflow,
+    CreateDraft,
+    ForkDraft,
+    UpdateDraft,
+    DiscardDraft,
+    PublishDraft,
+    ActivateRevision,
+    CreatePreset,
+    UpdatePreset,
+    DeletePreset,
+    ImportWorkflow,
+    StartRevision,
+    StartActiveRevision,
+    StartPreset,
+    PublishAndStart,
+}
+
+impl WorkflowApplicationOperation {
+    const fn requires_draft(self) -> bool {
+        matches!(
+            self,
+            Self::CreateDraft
+                | Self::ForkDraft
+                | Self::UpdateDraft
+                | Self::DiscardDraft
+                | Self::PublishDraft
+                | Self::PublishAndStart
+        )
+    }
+
+    const fn requires_revision(self) -> bool {
+        matches!(self, Self::ActivateRevision | Self::StartRevision)
+    }
+
+    const fn requires_preset(self) -> bool {
+        matches!(
+            self,
+            Self::CreatePreset | Self::UpdatePreset | Self::DeletePreset | Self::StartPreset
+        )
+    }
+
+    const fn permits_activation(self) -> bool {
+        matches!(
+            self,
+            Self::PublishDraft
+                | Self::ActivateRevision
+                | Self::ImportWorkflow
+                | Self::PublishAndStart
+        )
+    }
+
+    const fn executes(self) -> bool {
+        matches!(
+            self,
+            Self::StartRevision
+                | Self::StartActiveRevision
+                | Self::StartPreset
+                | Self::PublishAndStart
+        )
+    }
+}
+
+/// Canonical policy input for one side-effecting authored-workflow application operation.
+///
+/// Facts are normalized by the application boundary and do not contain renderer, transport,
+/// persistence, provider-private, or tool-call types. Producer provenance remains diagnostic and
+/// cannot replace the authenticated actor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowApplicationOperationFacts {
+    /// Fact schema version.
+    pub version: u32,
+    /// Exact requested operation.
+    pub operation: WorkflowApplicationOperation,
+    /// Authenticated actor assigned by the application boundary.
+    pub actor: WorkflowApplicationActor,
+    /// Target logical workflow.
+    pub workflow_id: String,
+    /// Exact draft target when the operation acts on a draft.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_id: Option<String>,
+    /// Exact immutable revision target when known before mutation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    /// Exact preset target when the operation acts on a preset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_id: Option<String>,
+    /// Untrusted producer provenance retained only as a policy fact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer: Option<WorkflowProducerProvenance>,
+    /// Exact referenced capabilities and contracts known before the side effect.
+    #[serde(default)]
+    pub requirements: WorkflowRequirementSummary,
+    /// Aggregate effects, reconciliation classes, and resources known before the side effect.
+    #[serde(default)]
+    pub effects: WorkflowEffectSummary,
+    /// Whether the request can update the active revision pointer.
+    pub activates: bool,
+    /// Whether the request can admit execution after any preceding mutation completes.
+    pub executes: bool,
+}
+
+impl WorkflowApplicationOperationFacts {
+    /// Validate canonical authored-workflow application-operation facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported fact version, malformed identity, missing or unrelated
+    /// target identity, invalid aggregate facts, or activation/execution flags inconsistent with
+    /// the exact operation.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_APPLICATION_OPERATION_FACTS_VERSION {
+            return Err(authoring_error(
+                "application_operation.version",
+                format!(
+                    "unsupported application operation fact version {}; expected {}",
+                    self.version, WORKFLOW_APPLICATION_OPERATION_FACTS_VERSION
+                ),
+            ));
+        }
+        self.actor.validate()?;
+        validate_authoring_id("application_operation.workflow_id", &self.workflow_id)?;
+        validate_optional_operation_id(
+            "application_operation.draft_id",
+            self.draft_id.as_deref(),
+            self.operation.requires_draft(),
+        )?;
+        validate_optional_operation_id(
+            "application_operation.preset_id",
+            self.preset_id.as_deref(),
+            self.operation.requires_preset(),
+        )?;
+        if self.operation.requires_revision() != self.revision.is_some() {
+            return Err(authoring_error(
+                "application_operation.revision",
+                if self.operation.requires_revision() {
+                    "this operation requires an exact revision"
+                } else {
+                    "this operation must not include an unrelated revision"
+                },
+            ));
+        }
+        if self.revision == Some(0) {
+            return Err(authoring_error(
+                "application_operation.revision",
+                "published revision must be greater than zero",
+            ));
+        }
+        if self.activates && !self.operation.permits_activation() {
+            return Err(authoring_error(
+                "application_operation.activates",
+                "this operation cannot activate a revision",
+            ));
+        }
+        if self.operation == WorkflowApplicationOperation::ActivateRevision && !self.activates {
+            return Err(authoring_error(
+                "application_operation.activates",
+                "activate_revision must declare activation",
+            ));
+        }
+        if self.executes != self.operation.executes() {
+            return Err(authoring_error(
+                "application_operation.executes",
+                "execution intent does not match the exact operation",
+            ));
+        }
+        if let Some(producer) = &self.producer {
+            producer.validate()?;
+        }
+        self.requirements.validate()?;
+        self.effects.validate()?;
+        Ok(())
+    }
+}
+
+fn validate_optional_operation_id(
+    path: &str,
+    value: Option<&str>,
+    required: bool,
+) -> Result<(), WorkflowError> {
+    match (value, required) {
+        (Some(value), true) => validate_authoring_id(path, value),
+        (None, true) => Err(authoring_error(
+            path,
+            "this operation requires an exact identity",
+        )),
+        (Some(_), false) => Err(authoring_error(
+            path,
+            "this operation must not include an unrelated identity",
+        )),
+        (None, false) => Ok(()),
+    }
+}
+
+/// Stable keyset cursor for authored lists ordered by newest update then identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAuthoringListCursor {
+    /// Update timestamp of the final item in the previous page.
+    pub updated_at_ms: u64,
+    /// Stable identity tie-breaker of the final item in the previous page.
+    pub entity_id: String,
+}
+
+impl WorkflowAuthoringListCursor {
+    /// Validate this portable list cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the stable entity identity is malformed.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        validate_authoring_id("cursor.entity_id", &self.entity_id)
+    }
+}
+
+/// Stable keyset cursor for immutable revisions ordered newest first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRevisionListCursor {
+    /// Final revision returned by the previous page.
+    pub revision: u64,
+}
+
+impl WorkflowRevisionListCursor {
+    /// Validate this portable revision cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the revision is zero.
+    pub fn validate(self) -> Result<(), WorkflowError> {
+        if self.revision == 0 {
+            return Err(authoring_error(
+                "cursor.revision",
+                "revision cursor must be positive",
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Stable logical identity for one runtime-authored workflow.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -7493,6 +7778,53 @@ mod tests {
                 .message
                 .contains("exact plugin block")
         );
+    }
+
+    #[test]
+    fn application_operation_facts_are_portable_and_fail_closed() {
+        let document = authored_document();
+        let preview = document.compilation_preview(&authoring_catalog(), None);
+        let compiled = preview.compiled.expect("compiled preview");
+        let facts = WorkflowApplicationOperationFacts {
+            version: WORKFLOW_APPLICATION_OPERATION_FACTS_VERSION,
+            operation: WorkflowApplicationOperation::PublishDraft,
+            actor: WorkflowApplicationActor {
+                kind: WorkflowApplicationActorKind::LocalClient,
+                actor_id: "local-client/1".to_string(),
+            },
+            workflow_id: document.workflow_id.clone(),
+            draft_id: Some("draft/1".to_string()),
+            revision: None,
+            preset_id: None,
+            producer: Some(document.producer),
+            requirements: compiled.requirements,
+            effects: compiled.effects,
+            activates: true,
+            executes: false,
+        };
+        facts.validate().expect("valid operation facts");
+        let encoded = serde_json::to_value(&facts).expect("serialize operation facts");
+        assert_eq!(
+            serde_json::from_value::<WorkflowApplicationOperationFacts>(encoded.clone())
+                .expect("deserialize operation facts"),
+            facts
+        );
+
+        let mut future = facts.clone();
+        future.version += 1;
+        assert!(future.validate().is_err());
+
+        let mut missing_draft = facts.clone();
+        missing_draft.draft_id = None;
+        assert!(missing_draft.validate().is_err());
+
+        let mut forged_execution = facts;
+        forged_execution.executes = true;
+        assert!(forged_execution.validate().is_err());
+
+        let mut unknown = encoded;
+        unknown["transport_private"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<WorkflowApplicationOperationFacts>(unknown).is_err());
     }
 
     #[test]

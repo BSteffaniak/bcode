@@ -287,8 +287,34 @@ pub enum Request {
         session_id: SessionId,
         work_id: WorkId,
     },
+    /// Atomically create one logical workflow and its initial mutable draft.
+    CreateAuthoredWorkflow(CreateAuthoredWorkflowRequest),
+    /// Cancel one exact in-flight authored-workflow validation or compilation operation.
+    CancelWorkflowComputation {
+        operation_id: String,
+    },
+    /// Replace one exact draft generation.
+    UpdateWorkflowDraft(UpdateWorkflowDraftRequest),
+    /// Publish one exact draft generation, optionally activating it atomically.
+    PublishWorkflowDraft(PublishWorkflowDraftRequest),
+    /// Compare-and-set one immutable revision as active.
+    ActivateWorkflowRevision(ActivateWorkflowRevisionRequest),
+    /// Archive or unarchive one logical workflow.
+    SetAuthoredWorkflowArchived(SetAuthoredWorkflowArchivedRequest),
+    /// Discard one exact mutable draft generation.
+    DiscardWorkflowDraft(DiscardWorkflowDraftRequest),
+    /// Fork one exact draft or revision into a new mutable draft.
+    ForkWorkflowDraft(ForkWorkflowDraftRequest),
+    /// Create one revision-bound preset.
+    CreateWorkflowPreset(CreateWorkflowPresetRequest),
+    /// Replace one exact preset generation.
+    UpdateWorkflowPreset(UpdateWorkflowPresetRequest),
+    /// Delete one exact preset generation.
+    DeleteWorkflowPreset(DeleteWorkflowPresetRequest),
     /// List bounded logical authored workflows.
     ListAuthoredWorkflows {
+        #[serde(default)]
+        cursor: Option<bcode_workflow::WorkflowAuthoringListCursor>,
         limit: usize,
     },
     /// Get one logical authored workflow.
@@ -298,6 +324,8 @@ pub enum Request {
     /// List bounded drafts for one logical workflow.
     ListWorkflowDrafts {
         workflow_id: String,
+        #[serde(default)]
+        cursor: Option<bcode_workflow::WorkflowAuthoringListCursor>,
         limit: usize,
     },
     /// Get one exact mutable draft.
@@ -308,6 +336,8 @@ pub enum Request {
     /// List bounded immutable published revisions.
     ListWorkflowRevisions {
         workflow_id: String,
+        #[serde(default)]
+        cursor: Option<bcode_workflow::WorkflowRevisionListCursor>,
         limit: usize,
     },
     /// Get one exact immutable published revision.
@@ -318,6 +348,8 @@ pub enum Request {
     /// List bounded revision-bound presets.
     ListWorkflowPresets {
         workflow_id: String,
+        #[serde(default)]
+        cursor: Option<bcode_workflow::WorkflowAuthoringListCursor>,
         limit: usize,
     },
     /// Get one exact revision-bound preset.
@@ -330,12 +362,16 @@ pub enum Request {
     /// Validate one portable workflow authoring document without mutation.
     ValidateWorkflowAuthoring {
         document: bcode_workflow::WorkflowAuthoringDocument,
+        #[serde(default)]
+        control: WorkflowComputationControl,
     },
     /// Compile and preview one authored workflow without mutation or dispatch.
     PreviewWorkflowCompilation {
         document: bcode_workflow::WorkflowAuthoringDocument,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         configuration: Option<serde_json::Value>,
+        #[serde(default)]
+        control: WorkflowComputationControl,
     },
     /// List bounded plugin-owned workflow templates and requirement diagnostics.
     ListWorkflowTemplates {
@@ -1285,6 +1321,41 @@ pub struct WorkflowTemplateStartRequest {
     pub limits: bcode_workflow_store::WorkflowRunLimits,
 }
 
+/// Portable bounded keyset page.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAuthoringPage<T, C> {
+    /// Items in stable query order.
+    pub items: Vec<T>,
+    /// Cursor for the next page, absent when this page exhausted the query.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<C>,
+}
+
+/// Default bounded deadline for authored-workflow validation and compilation.
+pub const DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS: u64 = 30_000;
+/// Maximum caller-selected authored-workflow computation deadline.
+pub const MAX_WORKFLOW_COMPUTATION_TIMEOUT_MS: u64 = 120_000;
+
+/// Explicit control for one bounded authored-workflow validation or compilation request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowComputationControl {
+    /// Stable caller identity used to target cancellation while the request is in flight.
+    pub operation_id: String,
+    /// Server-enforced computation deadline in milliseconds.
+    pub timeout_ms: u64,
+}
+
+impl Default for WorkflowComputationControl {
+    fn default() -> Self {
+        Self {
+            operation_id: String::new(),
+            timeout_ms: DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS,
+        }
+    }
+}
+
 /// Portable logical authored-workflow snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1354,6 +1425,14 @@ pub struct WorkflowAuthoringConflict {
     pub current_generation: u64,
 }
 
+/// Typed result of an optimistic draft replacement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowDraftUpdateResult {
+    Updated(Box<WorkflowDraftSnapshot>),
+    Conflict(WorkflowAuthoringConflict),
+}
+
 /// One typed authored-workflow creation request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1383,6 +1462,71 @@ pub struct PublishWorkflowDraftRequest {
     pub configuration: Option<serde_json::Value>,
     pub activate: bool,
     pub expected_active_revision: Option<u64>,
+    #[serde(default)]
+    pub control: WorkflowComputationControl,
+}
+
+/// Compare-and-set one exact immutable revision as active.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActivateWorkflowRevisionRequest {
+    pub workflow_id: String,
+    pub revision: u64,
+    pub expected_active_revision: Option<u64>,
+}
+
+/// Archive or unarchive one logical authored workflow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetAuthoredWorkflowArchivedRequest {
+    pub workflow_id: String,
+    pub archived: bool,
+}
+
+/// Discard one exact mutable draft generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiscardWorkflowDraftRequest {
+    pub workflow_id: String,
+    pub draft_id: String,
+    pub expected_generation: u64,
+}
+
+/// Exact source used to fork a new mutable generation-1 draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowDraftForkSource {
+    Draft { draft_id: String },
+    Revision { revision: u64 },
+}
+
+/// Fork one exact draft or immutable revision into a new mutable draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkWorkflowDraftRequest {
+    pub workflow_id: String,
+    pub source: WorkflowDraftForkSource,
+    pub draft_id: String,
+    pub producer: bcode_workflow::WorkflowProducerProvenance,
+}
+
+/// Typed optimistic mutation outcome without an entity payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowAuthoringMutationResult {
+    Applied,
+    Conflict(WorkflowAuthoringConflict),
+}
+
+/// Typed atomic publication outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPublicationResult {
+    Published {
+        revision: Box<WorkflowRevisionSnapshot>,
+        active_revision: Option<u64>,
+    },
+    Conflict(WorkflowAuthoringConflict),
 }
 
 /// One preset create/update payload.
@@ -1396,6 +1540,38 @@ pub struct WorkflowPresetMutation {
     pub configuration: serde_json::Value,
     pub run_limits: Option<bcode_workflow::WorkflowRunLimitPolicy>,
     pub producer: bcode_workflow::WorkflowProducerProvenance,
+}
+
+/// Create one revision-bound preset at generation 1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateWorkflowPresetRequest {
+    pub preset: WorkflowPresetMutation,
+}
+
+/// Replace one exact preset generation without changing its revision binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateWorkflowPresetRequest {
+    pub expected_generation: u64,
+    pub preset: WorkflowPresetMutation,
+}
+
+/// Delete one exact preset generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeleteWorkflowPresetRequest {
+    pub workflow_id: String,
+    pub preset_id: String,
+    pub expected_generation: u64,
+}
+
+/// Typed result of an optimistic preset replacement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPresetUpdateResult {
+    Updated(WorkflowPresetSnapshot),
+    Conflict(WorkflowAuthoringConflict),
 }
 
 /// Request to durably register one compiled workflow definition.
@@ -1658,26 +1834,72 @@ pub enum ResponsePayload {
     RuntimeWorkCancellationRequested {
         cancelled: bool,
     },
+    AuthoredWorkflowCreated {
+        workflow: AuthoredWorkflowSnapshot,
+        draft: Box<WorkflowDraftSnapshot>,
+    },
+    WorkflowComputationCancellationRequested {
+        cancelled: bool,
+    },
+    WorkflowDraftUpdateResult {
+        result: WorkflowDraftUpdateResult,
+    },
+    WorkflowPublicationResult {
+        result: WorkflowPublicationResult,
+    },
+    WorkflowActivationResult {
+        result: WorkflowAuthoringMutationResult,
+    },
+    AuthoredWorkflowArchived {
+        workflow: AuthoredWorkflowSnapshot,
+    },
+    WorkflowDraftDiscardResult {
+        result: WorkflowAuthoringMutationResult,
+    },
+    WorkflowDraftForked {
+        draft: Box<WorkflowDraftSnapshot>,
+    },
+    WorkflowPresetCreated {
+        preset: WorkflowPresetSnapshot,
+    },
+    WorkflowPresetUpdateResult {
+        result: WorkflowPresetUpdateResult,
+    },
+    WorkflowPresetDeleteResult {
+        result: WorkflowAuthoringMutationResult,
+    },
     AuthoredWorkflowList {
-        workflows: Vec<AuthoredWorkflowSnapshot>,
+        page: WorkflowAuthoringPage<
+            AuthoredWorkflowSnapshot,
+            bcode_workflow::WorkflowAuthoringListCursor,
+        >,
     },
     AuthoredWorkflowDescription {
         workflow: Option<AuthoredWorkflowSnapshot>,
     },
     WorkflowDraftList {
-        drafts: Vec<WorkflowDraftSnapshot>,
+        page: WorkflowAuthoringPage<
+            WorkflowDraftSnapshot,
+            bcode_workflow::WorkflowAuthoringListCursor,
+        >,
     },
     WorkflowDraftDescription {
         draft: Option<Box<WorkflowDraftSnapshot>>,
     },
     WorkflowRevisionList {
-        revisions: Vec<WorkflowRevisionSnapshot>,
+        page: WorkflowAuthoringPage<
+            WorkflowRevisionSnapshot,
+            bcode_workflow::WorkflowRevisionListCursor,
+        >,
     },
     WorkflowRevisionDescription {
         revision: Option<Box<WorkflowRevisionSnapshot>>,
     },
     WorkflowPresetList {
-        presets: Vec<WorkflowPresetSnapshot>,
+        page: WorkflowAuthoringPage<
+            WorkflowPresetSnapshot,
+            bcode_workflow::WorkflowAuthoringListCursor,
+        >,
     },
     WorkflowPresetDescription {
         preset: Option<WorkflowPresetSnapshot>,
@@ -2746,12 +2968,84 @@ mod tests {
             presentation: None,
         };
         let requests = vec![
-            Request::ListAuthoredWorkflows { limit: 25 },
+            Request::CreateAuthoredWorkflow(CreateAuthoredWorkflowRequest {
+                document: authoring_document.clone(),
+                draft_id: "draft-1".to_string(),
+            }),
+            Request::UpdateWorkflowDraft(UpdateWorkflowDraftRequest {
+                workflow_id: authoring_document.workflow_id.clone(),
+                draft_id: "draft-1".to_string(),
+                expected_generation: 1,
+                document: authoring_document.clone(),
+                producer: authoring_document.producer.clone(),
+            }),
+            Request::PublishWorkflowDraft(PublishWorkflowDraftRequest {
+                workflow_id: authoring_document.workflow_id.clone(),
+                draft_id: "draft-1".to_string(),
+                expected_generation: 1,
+                configuration: None,
+                activate: true,
+                expected_active_revision: None,
+                control: WorkflowComputationControl::default(),
+            }),
+            Request::ActivateWorkflowRevision(ActivateWorkflowRevisionRequest {
+                workflow_id: authoring_document.workflow_id.clone(),
+                revision: 1,
+                expected_active_revision: None,
+            }),
+            Request::SetAuthoredWorkflowArchived(SetAuthoredWorkflowArchivedRequest {
+                workflow_id: authoring_document.workflow_id.clone(),
+                archived: true,
+            }),
+            Request::DiscardWorkflowDraft(DiscardWorkflowDraftRequest {
+                workflow_id: authoring_document.workflow_id.clone(),
+                draft_id: "draft-1".to_string(),
+                expected_generation: 1,
+            }),
+            Request::ForkWorkflowDraft(ForkWorkflowDraftRequest {
+                workflow_id: authoring_document.workflow_id.clone(),
+                source: WorkflowDraftForkSource::Revision { revision: 1 },
+                draft_id: "draft-2".to_string(),
+                producer: authoring_document.producer.clone(),
+            }),
+            Request::CreateWorkflowPreset(CreateWorkflowPresetRequest {
+                preset: WorkflowPresetMutation {
+                    workflow_id: authoring_document.workflow_id.clone(),
+                    preset_id: "default".to_string(),
+                    revision: 1,
+                    name: "Default".to_string(),
+                    configuration: serde_json::json!({}),
+                    run_limits: None,
+                    producer: authoring_document.producer.clone(),
+                },
+            }),
+            Request::UpdateWorkflowPreset(UpdateWorkflowPresetRequest {
+                expected_generation: 1,
+                preset: WorkflowPresetMutation {
+                    workflow_id: authoring_document.workflow_id.clone(),
+                    preset_id: "default".to_string(),
+                    revision: 1,
+                    name: "Updated".to_string(),
+                    configuration: serde_json::json!({}),
+                    run_limits: None,
+                    producer: authoring_document.producer.clone(),
+                },
+            }),
+            Request::DeleteWorkflowPreset(DeleteWorkflowPresetRequest {
+                workflow_id: authoring_document.workflow_id.clone(),
+                preset_id: "default".to_string(),
+                expected_generation: 2,
+            }),
+            Request::ListAuthoredWorkflows {
+                cursor: None,
+                limit: 25,
+            },
             Request::GetAuthoredWorkflow {
                 workflow_id: "authored/review".to_string(),
             },
             Request::ListWorkflowDrafts {
                 workflow_id: "authored/review".to_string(),
+                cursor: None,
                 limit: 25,
             },
             Request::GetWorkflowDraft {
@@ -2760,6 +3054,7 @@ mod tests {
             },
             Request::ListWorkflowRevisions {
                 workflow_id: "authored/review".to_string(),
+                cursor: None,
                 limit: 25,
             },
             Request::GetWorkflowRevision {
@@ -2768,6 +3063,7 @@ mod tests {
             },
             Request::ListWorkflowPresets {
                 workflow_id: "authored/review".to_string(),
+                cursor: None,
                 limit: 25,
             },
             Request::GetWorkflowPreset {
@@ -2777,10 +3073,12 @@ mod tests {
             Request::WorkflowAuthoringCatalog,
             Request::ValidateWorkflowAuthoring {
                 document: authoring_document.clone(),
+                control: WorkflowComputationControl::default(),
             },
             Request::PreviewWorkflowCompilation {
                 document: authoring_document,
                 configuration: Some(serde_json::json!({})),
+                control: WorkflowComputationControl::default(),
             },
             Request::RegisterWorkflowDefinition(WorkflowDefinitionRegistrationRequest {
                 definition_id: "review".to_string(),
