@@ -2079,17 +2079,20 @@ impl SessionActor {
         };
         let checkpoint_kind = match kind {
             SessionLiveEventKind::AssistantTextStreamUpdated {
+                output_position,
                 turn_id,
                 segment_id,
                 segment_order,
                 ..
             } => SessionLiveEventKind::AssistantTextStreamUpdated {
+                output_position: *output_position,
                 turn_id: turn_id.clone(),
                 segment_id: segment_id.clone(),
                 segment_order: *segment_order,
                 update: checkpoint_update,
             },
             SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                output_position,
                 turn_id,
                 activity_id,
                 activity_order,
@@ -2099,6 +2102,7 @@ impl SessionActor {
                 part_order,
                 ..
             } => SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                output_position: *output_position,
                 turn_id: turn_id.clone(),
                 activity_id: activity_id.clone(),
                 activity_order: *activity_order,

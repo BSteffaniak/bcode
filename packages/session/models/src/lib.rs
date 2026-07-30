@@ -11,7 +11,7 @@
 //! required fallback for every other surface.
 
 /// Durable session-storage writer epoch shared by runtime and daemon compatibility handshakes.
-pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5;
+pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 6;
 
 use bcode_skill_models::{SkillActivationMode, SkillContextResponse, SkillId, SkillSource};
 pub use bcode_tool_models::{
@@ -36,6 +36,25 @@ pub use context_management::{
     ProviderContextSnapshotOrigin, RequestContextObservation, RequestContextOccupancy,
     RequestContextTokenCount,
 };
+
+/// Stable zero-based position of one semantic output unit within a model turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TurnOutputPosition(u64);
+
+impl TurnOutputPosition {
+    /// Create a turn output position.
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// Return the zero-based position.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 /// Renderer-neutral state for one tool invocation reconstructed from raw session events.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -123,6 +142,14 @@ pub fn apply_tool_invocation_projection_event(
 ) {
     match &event.kind {
         SessionEventKind::ToolCallRequested {
+            tool_call_id,
+            producer_plugin_id,
+            tool_name,
+            arguments_json,
+            working_directory,
+            ..
+        }
+        | SessionEventKind::PositionedToolCallRequested {
             tool_call_id,
             producer_plugin_id,
             tool_name,
@@ -262,7 +289,7 @@ fn tool_invocation_projection_mut<'a>(
 }
 
 /// Current persisted session event schema version.
-pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 41;
+pub const CURRENT_SESSION_EVENT_SCHEMA_VERSION: u16 = 42;
 
 /// Return the current Unix timestamp in milliseconds.
 #[must_use]
@@ -1711,6 +1738,9 @@ pub enum TextStreamTerminalStatus {
 pub enum SessionLiveEventKind {
     /// Ordered assistant segment update produced by a new application model turn.
     AssistantTextStreamUpdated {
+        /// Cross-type semantic output position within the turn, when provided by a v2 provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_position: Option<TurnOutputPosition>,
         /// Application model turn that owns the segment.
         turn_id: String,
         /// Stable segment identifier scoped to `turn_id`.
@@ -1735,6 +1765,9 @@ pub enum SessionLiveEventKind {
     },
     /// Ordered readable text update for one structured reasoning part.
     AssistantReasoningTextStreamUpdated {
+        /// Cross-type semantic output position within the turn, when provided by a v2 provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_position: Option<TurnOutputPosition>,
         /// Application model turn that owns the activity.
         turn_id: String,
         /// Stable reasoning activity identifier scoped to `turn_id`.
@@ -1760,6 +1793,9 @@ pub enum SessionLiveEventKind {
     AssistantReasoningDelta { turn_id: String, text: String },
     /// Provider-neutral reasoning activity operation produced by an active model turn.
     AssistantReasoningActivity {
+        /// Cross-type semantic output position within the turn, when provided by a v2 provider.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_position: Option<TurnOutputPosition>,
         /// Model turn associated with the activity.
         turn_id: String,
         /// Structured reasoning operation.
@@ -1800,6 +1836,9 @@ const fn default_tool_request_draft_placement() -> ToolContributionPlacement {
 /// One live-only provider tool-request draft update.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRequestDraftEvent {
+    /// Cross-type semantic output position within the turn, when provided by a v2 provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_position: Option<TurnOutputPosition>,
     /// Model turn that owns the draft generation.
     pub turn_id: String,
     /// Provider tool-call identifier.
@@ -2668,6 +2707,47 @@ pub enum SessionEventKind {
         /// Complete visible assistant text.
         text: String,
     },
+    /// Complete durable assistant response segment with provider-authoritative cross-type position.
+    PositionedAssistantResponseSegment {
+        /// Application model turn that owns the segment.
+        turn_id: String,
+        /// Stable cross-type position within the turn.
+        output_position: TurnOutputPosition,
+        /// Stable segment identifier scoped to `turn_id`.
+        segment_id: String,
+        /// Zero-based assistant segment order within the turn.
+        segment_order: u32,
+        /// Complete visible assistant text.
+        text: String,
+    },
+    /// Complete durable reasoning activity with provider-authoritative cross-type position.
+    PositionedAssistantReasoningActivity {
+        /// Application model turn that owns the activity.
+        turn_id: String,
+        /// Stable cross-type position within the turn.
+        output_position: TurnOutputPosition,
+        /// Complete terminal reasoning activity.
+        activity: ReasoningActivity,
+    },
+    /// Durable tool request with provider-authoritative cross-type position.
+    PositionedToolCallRequested {
+        /// Application model turn that owns the request.
+        turn_id: String,
+        /// Stable cross-type position within the turn.
+        output_position: TurnOutputPosition,
+        /// Provider tool call identifier.
+        tool_call_id: String,
+        /// Plugin that owns the tool, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        producer_plugin_id: Option<String>,
+        /// Model-visible tool name.
+        tool_name: String,
+        /// Complete JSON arguments.
+        arguments_json: String,
+        /// Working directory captured for execution, when known.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        working_directory: Option<PathBuf>,
+    },
 }
 
 #[cfg(test)]
@@ -2803,6 +2883,7 @@ mod tests {
         ];
         for (index, operation) in operations.into_iter().enumerate() {
             let event = ToolRequestDraftEvent {
+                output_position: None,
                 turn_id: "turn-1".to_owned(),
                 tool_call_id: "call-1".to_owned(),
                 tool_name: "filesystem.write".to_owned(),

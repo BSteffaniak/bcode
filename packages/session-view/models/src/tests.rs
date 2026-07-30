@@ -394,6 +394,7 @@ fn tool_presentation_slot_ids_collapse_primary_and_keep_supplementals_independen
 fn structured_reasoning_activity_round_trips_through_renderer_wire_model() {
     let sentinel = "encrypted-sentinel-do-not-expose";
     let item = TranscriptViewItem {
+        output_location: None,
         id: TranscriptViewItemId::reasoning("turn-1", "reasoning-1"),
         revision: 2,
         sequence: Some(9),
@@ -594,6 +595,7 @@ fn transcript_patch_replaces_tool_slot_across_draft_and_final_schemas() {
         None,
     );
     let draft = TranscriptViewItem {
+        output_location: None,
         id: id.clone(),
         revision: 1,
         sequence: None,
@@ -601,6 +603,7 @@ fn transcript_patch_replaces_tool_slot_across_draft_and_final_schemas() {
         streaming: true,
         kind: TranscriptViewItemKind::ToolRequestDraft {
             draft: ToolRequestDraftView {
+                output_location: None,
                 turn_id: "turn-1".to_owned(),
                 tool_call_id: "call-1".to_owned(),
                 tool_name: "filesystem.write".to_owned(),
@@ -618,6 +621,7 @@ fn transcript_patch_replaces_tool_slot_across_draft_and_final_schemas() {
         },
     };
     let final_item = TranscriptViewItem {
+        output_location: None,
         id,
         revision: 2,
         sequence: None,
@@ -1230,6 +1234,7 @@ fn growing_vim_artifact_metadata_replaces_one_bounded_primary_item() {
     current.revision = 1;
     let tool_call_id = "vim-call";
     let make_item = |revision| TranscriptViewItem {
+        output_location: None,
         id: TranscriptViewItemId::tool(tool_call_id),
         revision,
         sequence: Some(1),
@@ -1242,6 +1247,7 @@ fn growing_vim_artifact_metadata_replaces_one_bounded_primary_item() {
                 tool_name: Some("vim_edit.apply".to_owned()),
                 arguments_json: Some(r#"{"path":"/tmp/fixture.rs"}"#.to_owned()),
                 working_directory: None,
+                request_draft: None,
                 status: if revision < 128 {
                     ToolInvocationViewStatus::Running
                 } else {
@@ -1628,6 +1634,7 @@ fn transcript_item_with_revision(
     text: &str,
 ) -> TranscriptViewItem {
     TranscriptViewItem {
+        output_location: None,
         id: TranscriptViewItemId::new(id),
         sequence: Some(sequence),
         timestamp_ms: Some(sequence.saturating_mul(10)),

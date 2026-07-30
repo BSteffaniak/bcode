@@ -169,6 +169,33 @@ impl SessionManager {
         .await
     }
 
+    /// Append a complete positioned assistant response segment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_positioned_assistant_response_segment(
+        &self,
+        session_id: SessionId,
+        turn_id: String,
+        output_position: bcode_session_models::TurnOutputPosition,
+        segment_id: String,
+        segment_order: u32,
+        text: String,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::PositionedAssistantResponseSegment {
+                turn_id,
+                output_position,
+                segment_id,
+                segment_order,
+                text,
+            },
+        )
+        .await
+    }
+
     /// Append one complete terminal provider-reported reasoning activity.
     ///
     /// # Errors
@@ -183,6 +210,29 @@ impl SessionManager {
         self.append_event(
             session_id,
             SessionEventKind::AssistantReasoningActivity { turn_id, activity },
+        )
+        .await
+    }
+
+    /// Append one complete positioned terminal reasoning activity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_positioned_assistant_reasoning_activity(
+        &self,
+        session_id: SessionId,
+        turn_id: String,
+        output_position: bcode_session_models::TurnOutputPosition,
+        activity: bcode_session_models::ReasoningActivity,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::PositionedAssistantReasoningActivity {
+                turn_id,
+                output_position,
+                activity,
+            },
         )
         .await
     }

@@ -53,7 +53,7 @@ impl BlockingModelProviderInvoker for FakePluginInvoker {
         let response = self.plugin.invoke_service_concurrent(NativeServiceContext {
             plugin_id: "bcode.fake-provider".to_string(),
             request: ServiceRequest {
-                interface_id: bcode_model::MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                interface_id: bcode_model::MODEL_PROVIDER_INTERFACE_ID_V2.to_string(),
                 operation: operation.to_string(),
                 payload: serde_json::to_vec(request).map_err(|error| error.to_string())?,
             },

@@ -21,6 +21,7 @@ use bcode_session_view_models::{
     SkillViewStatus, TextFormat, TextStreamViewState, TextStreamViewStatus, ThinkingViewState,
     ToolInvocationView, ToolInvocationViewStatus, ToolRequestDraftView, ToolResultView,
     ToolTimingView, TranscriptViewItem, TranscriptViewItemId, TranscriptViewItemKind,
+    TurnOutputLocation,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -98,7 +99,8 @@ impl LiveReasoningActivity {
 
 fn tool_invocation_id(event: &SessionEvent) -> Option<&str> {
     match &event.kind {
-        SessionEventKind::ToolCallRequested { tool_call_id, .. } => Some(tool_call_id),
+        SessionEventKind::ToolCallRequested { tool_call_id, .. }
+        | SessionEventKind::PositionedToolCallRequested { tool_call_id, .. } => Some(tool_call_id),
         SessionEventKind::ToolInvocationLifecycle { event } => Some(&event.invocation_id),
         SessionEventKind::ToolInvocationResultRecorded { record } => Some(&record.invocation_id),
         _ => None,
@@ -135,6 +137,7 @@ pub struct SessionView {
     live_reasoning: BTreeMap<(String, String), LiveReasoningActivity>,
     last_text_stream_updates:
         BTreeMap<TranscriptViewItemId, bcode_session_models::TextStreamUpdate>,
+    renderer_local_notice_sequence: u64,
 }
 
 impl Default for SessionView {
@@ -157,6 +160,7 @@ impl SessionView {
             terminal_runtime_work: BTreeSet::new(),
             live_reasoning: BTreeMap::new(),
             last_text_stream_updates: BTreeMap::new(),
+            renderer_local_notice_sequence: 0,
         }
     }
 
@@ -207,6 +211,30 @@ impl SessionView {
     #[must_use]
     pub fn into_snapshot(self) -> SessionViewSnapshot {
         self.snapshot
+    }
+
+    /// Append a non-durable renderer-local system notice.
+    ///
+    /// Renderer-local notices exist only in this in-memory view. History-window rebuilds clear
+    /// them, and they do not define transport retention, replay, or reconnect behavior.
+    pub fn push_renderer_local_system_notice(&mut self, text: String, format: TextFormat) {
+        self.renderer_local_notice_sequence = self.renderer_local_notice_sequence.saturating_add(1);
+        self.push_item(
+            TranscriptViewItemId::new(format!(
+                "renderer-local-system:{}",
+                self.renderer_local_notice_sequence
+            )),
+            0,
+            None,
+            false,
+            TranscriptViewItemKind::SystemMessage {
+                message: ChatMessageView {
+                    text,
+                    display_label: None,
+                    format,
+                },
+            },
+        );
     }
 
     /// Apply canonical session metadata from an attach or catalog response.
@@ -586,6 +614,10 @@ impl SessionView {
         replacement.snapshot.revision = self.snapshot.revision.saturating_add(1);
         for draft in live_tool_request_drafts {
             replacement.apply_tool_request_draft(&bcode_session_models::ToolRequestDraftEvent {
+                output_position: draft
+                    .output_location
+                    .as_ref()
+                    .map(|location| location.position),
                 turn_id: draft.turn_id,
                 tool_call_id: draft.tool_call_id,
                 tool_name: draft.tool_name,
@@ -757,6 +789,47 @@ impl SessionView {
                 );
                 self.last_text_stream_updates.remove(&id);
             }
+            SessionEventKind::PositionedAssistantResponseSegment {
+                turn_id,
+                output_position,
+                segment_id,
+                text,
+                ..
+            } => {
+                let id = TranscriptViewItemId::new(format!(
+                    "assistant-turn:{turn_id}:segment:{segment_id}"
+                ));
+                self.finish_or_push_message(
+                    id.clone(),
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    StreamingMessageKind::Assistant,
+                    text,
+                );
+                let accepted_bytes = text.len();
+                self.snapshot.text_streams.insert(
+                    id.clone(),
+                    TextStreamViewState {
+                        generation: self
+                            .snapshot
+                            .text_streams
+                            .get(&id)
+                            .map_or(0, |state| state.generation),
+                        revision: self
+                            .snapshot
+                            .text_streams
+                            .get(&id)
+                            .map_or(0, |state| state.revision.saturating_add(1)),
+                        accepted_bytes,
+                        truncated: false,
+                        status: TextStreamViewStatus::Terminal(
+                            bcode_session_models::TextStreamTerminalStatus::Completed,
+                        ),
+                    },
+                );
+                self.last_text_stream_updates.remove(&id);
+                self.assign_output_location(&id, turn_id, Some(*output_position));
+            }
             SessionEventKind::AssistantReasoningDelta { text } => {
                 self.snapshot.thinking = ThinkingViewState {
                     visible: self.snapshot.thinking.visible,
@@ -805,6 +878,31 @@ impl SessionView {
                         ),
                     },
                 );
+            }
+            SessionEventKind::PositionedAssistantReasoningActivity {
+                turn_id,
+                output_position,
+                activity,
+            } => {
+                let key = (turn_id.clone(), activity.activity_id.clone());
+                self.live_reasoning
+                    .insert(key, LiveReasoningActivity::from_complete(activity));
+                let id = TranscriptViewItemId::reasoning(turn_id, &activity.activity_id);
+                self.upsert_item(
+                    id.clone(),
+                    event.sequence,
+                    Some(event.timestamp_ms),
+                    false,
+                    TranscriptViewItemKind::ReasoningActivity {
+                        activity: reasoning_activity_view(
+                            turn_id,
+                            activity,
+                            self.snapshot.thinking.visible,
+                            self.snapshot.thinking.mode,
+                        ),
+                    },
+                );
+                self.assign_output_location(&id, turn_id, Some(*output_position));
             }
             SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
                 use bcode_session_models::ToolInvocationLifecycleStage;
@@ -940,6 +1038,34 @@ impl SessionView {
                     aggregate.terminal_request_draft = None;
                 }
                 self.upsert_tool_item(tool_call_id, event.sequence, Some(event.timestamp_ms));
+            }
+            SessionEventKind::PositionedToolCallRequested {
+                turn_id,
+                output_position,
+                tool_call_id,
+                ..
+            } => {
+                if self
+                    .tool_invocations
+                    .get(tool_call_id)
+                    .and_then(|aggregate| aggregate.request_draft.as_ref())
+                    .is_some_and(|draft| {
+                        draft.placement == bcode_session_models::ToolContributionPlacement::Request
+                    })
+                    && let Some(aggregate) = self.tool_invocations.get_mut(tool_call_id)
+                {
+                    aggregate.request_draft = None;
+                }
+                if let Some(aggregate) = self.tool_invocations.get_mut(tool_call_id) {
+                    aggregate.terminal_request_draft = None;
+                }
+                self.upsert_tool_item(tool_call_id, event.sequence, Some(event.timestamp_ms));
+                let id = self
+                    .tool_item_ids
+                    .get(tool_call_id)
+                    .cloned()
+                    .unwrap_or_else(|| TranscriptViewItemId::tool(tool_call_id));
+                self.assign_output_location(&id, turn_id, Some(*output_position));
             }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
                 let already_terminal = self
@@ -1539,6 +1665,7 @@ impl SessionView {
         self.snapshot.session_id = Some(event.session_id);
         match &event.kind {
             SessionLiveEventKind::AssistantTextStreamUpdated {
+                output_position,
                 turn_id,
                 segment_id,
                 update,
@@ -1547,7 +1674,8 @@ impl SessionView {
                 let id = TranscriptViewItemId::new(format!(
                     "assistant-turn:{turn_id}:segment:{segment_id}"
                 ));
-                self.apply_ordered_assistant_update(id, update);
+                self.apply_ordered_assistant_update(id.clone(), update);
+                self.assign_output_location(&id, turn_id, *output_position);
             }
             SessionLiveEventKind::AssistantTextDelta {
                 turn_id,
@@ -1566,6 +1694,7 @@ impl SessionView {
                 );
             }
             SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                output_position,
                 turn_id,
                 activity_id,
                 activity_order,
@@ -1585,6 +1714,11 @@ impl SessionView {
                     *part_order,
                     update,
                 );
+                self.assign_output_location(
+                    &TranscriptViewItemId::reasoning(turn_id, activity_id),
+                    turn_id,
+                    *output_position,
+                );
             }
             SessionLiveEventKind::AssistantReasoningDelta { turn_id, text } => {
                 self.snapshot.thinking = ThinkingViewState {
@@ -1601,8 +1735,17 @@ impl SessionView {
                     text,
                 );
             }
-            SessionLiveEventKind::AssistantReasoningActivity { turn_id, event } => {
+            SessionLiveEventKind::AssistantReasoningActivity {
+                output_position,
+                turn_id,
+                event,
+            } => {
                 self.apply_live_reasoning_activity(turn_id, event);
+                self.assign_output_location(
+                    &TranscriptViewItemId::reasoning(turn_id, event.activity_id()),
+                    turn_id,
+                    *output_position,
+                );
             }
             SessionLiveEventKind::ToolContributionPlaced { envelope } => {
                 self.apply_contribution_event(0, None, &envelope.contribution, envelope.placement);
@@ -1612,6 +1755,12 @@ impl SessionView {
             }
             SessionLiveEventKind::ToolRequestDraft { event } => {
                 self.apply_tool_request_draft(event);
+                let id = self
+                    .tool_item_ids
+                    .get(&event.tool_call_id)
+                    .cloned()
+                    .unwrap_or_else(|| TranscriptViewItemId::tool(&event.tool_call_id));
+                self.assign_output_location(&id, &event.turn_id, event.output_position);
             }
             SessionLiveEventKind::ToolInvocationProgress { event } => {
                 if event.stage == bcode_session_models::ToolInvocationLifecycleStage::Progress
@@ -1770,23 +1919,21 @@ impl SessionView {
                 .or_default()
                 .request_draft = None;
         }
-        if let ToolRequestDraftOperation::Remove { .. } = event.operation {
-            self.tool_invocations
-                .entry(key.clone())
-                .or_default()
-                .request_draft = None;
-            self.tool_invocations
-                .entry(key)
-                .or_default()
-                .terminal_request_draft =
+        if let ToolRequestDraftOperation::Remove { reason } = event.operation {
+            let aggregate = self.tool_invocations.entry(key).or_default();
+            if reason != bcode_session_models::ToolRequestDraftTerminalReason::Completed {
+                aggregate.request_draft = None;
+            }
+            aggregate.terminal_request_draft =
                 Some((event.generation, event.revision.saturating_add(1)));
-            self.refresh_legacy_contribution_projection(
-                &event.tool_call_id,
-                event.placement,
-                None,
-                0,
-                None,
-            );
+            if reason == bcode_session_models::ToolRequestDraftTerminalReason::Completed {
+                self.refresh_tool_from_aggregate(&event.tool_call_id, 0, None);
+            } else if aggregate.projection.started_at_ms.is_none() {
+                self.snapshot.tools.remove(&event.tool_call_id);
+                self.remove_transcript_item(&TranscriptViewItemId::tool(&event.tool_call_id));
+            } else {
+                self.refresh_tool_from_aggregate(&event.tool_call_id, 0, None);
+            }
             return;
         }
         self.tool_invocations
@@ -1796,6 +1943,10 @@ impl SessionView {
         let mut draft = current
             .filter(|current| current.generation == event.generation)
             .unwrap_or_else(|| ToolRequestDraftView {
+                output_location: event.output_position.map(|position| TurnOutputLocation {
+                    turn_id: event.turn_id.clone(),
+                    position,
+                }),
                 turn_id: event.turn_id.clone(),
                 tool_call_id: event.tool_call_id.clone(),
                 tool_name: event.tool_name.clone(),
@@ -1827,6 +1978,12 @@ impl SessionView {
             ToolRequestDraftOperation::Remove { .. } => unreachable!(),
         }
         draft.turn_id.clone_from(&event.turn_id);
+        if let Some(position) = event.output_position {
+            draft.output_location = Some(TurnOutputLocation {
+                turn_id: event.turn_id.clone(),
+                position,
+            });
+        }
         draft.tool_name.clone_from(&event.tool_name);
         draft
             .producer_plugin_id
@@ -1837,16 +1994,27 @@ impl SessionView {
         draft.revision = event.revision;
         draft.argument_bytes = event.argument_bytes;
         draft.truncated = event.truncated;
-        self.tool_invocations.entry(key).or_default().request_draft = Some(draft);
+        let aggregate = self.tool_invocations.entry(key).or_default();
+        aggregate
+            .projection
+            .tool_call_id
+            .clone_from(&event.tool_call_id);
+        aggregate
+            .projection
+            .producer_plugin_id
+            .clone_from(&event.producer_plugin_id);
+        aggregate.projection.tool_name = Some(event.tool_name.clone());
+        aggregate.projection.arguments_json = Some(draft.preview.clone());
+        aggregate.request_draft = Some(draft);
         if previous_placement.is_some_and(|placement| placement != event.placement) {
-            self.refresh_legacy_contribution_projection(
+            let previous_id = legacy_contribution_projection::item_id(
                 &event.tool_call_id,
+                "request-draft",
                 previous_placement.expect("checked draft placement"),
-                None,
-                0,
-                None,
             );
+            self.remove_transcript_item(&previous_id);
         }
+        self.refresh_tool_from_aggregate(&event.tool_call_id, 0, None);
         self.refresh_legacy_contribution_projection(
             &event.tool_call_id,
             event.placement,
@@ -2123,10 +2291,6 @@ impl SessionView {
                 .map(|(_, contribution)| contribution.clone())
         };
         let tool = self.snapshot.tools.get(invocation_id).cloned();
-        let draft = self
-            .tool_invocations
-            .get(invocation_id)
-            .and_then(|aggregate| aggregate.request_draft.clone());
         let kind = if placement == ToolContributionPlacement::Supplemental {
             latest_contribution(ToolContributionPlacement::Supplemental).map(|contribution| {
                 TranscriptViewItemKind::ToolContribution {
@@ -2151,20 +2315,11 @@ impl SessionView {
                     }
                 })
             });
-            contribution
-                .or_else(|| {
-                    tool.clone()
-                        .filter(|tool| is_terminal_tool_status(tool.status))
-                        .map(|tool| TranscriptViewItemKind::ToolInvocation {
-                            tool: Box::new(tool),
-                        })
+            contribution.or_else(|| {
+                tool.map(|tool| TranscriptViewItemKind::ToolInvocation {
+                    tool: Box::new(tool),
                 })
-                .or_else(|| draft.map(|draft| TranscriptViewItemKind::ToolRequestDraft { draft }))
-                .or_else(|| {
-                    tool.map(|tool| TranscriptViewItemKind::ToolInvocation {
-                        tool: Box::new(tool),
-                    })
-                })
+            })
         };
         let Some(kind) = kind else {
             let item_count = self.snapshot.transcript.items.len();
@@ -2189,10 +2344,11 @@ impl SessionView {
                     })
             }
             TranscriptViewItemKind::ToolInvocation { tool } => {
-                matches!(
-                    tool.status,
-                    ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
-                )
+                tool.request_draft.is_some()
+                    || matches!(
+                        tool.status,
+                        ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+                    )
             }
             _ => false,
         };
@@ -2394,6 +2550,75 @@ impl SessionView {
         );
     }
 
+    fn assign_output_location(
+        &mut self,
+        id: &TranscriptViewItemId,
+        turn_id: &str,
+        position: Option<bcode_session_models::TurnOutputPosition>,
+    ) {
+        let Some(position) = position else {
+            return;
+        };
+        let Some(index) = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|item| &item.id == id)
+        else {
+            return;
+        };
+        let location = TurnOutputLocation {
+            turn_id: turn_id.to_owned(),
+            position,
+        };
+        if self.snapshot.transcript.items[index]
+            .output_location
+            .as_ref()
+            == Some(&location)
+        {
+            return;
+        }
+        let mut item = self.snapshot.transcript.items.remove(index);
+        item.output_location = Some(location.clone());
+        item.revision = item.revision.saturating_add(1);
+
+        let insert_at = self
+            .snapshot
+            .transcript
+            .items
+            .iter()
+            .position(|candidate| {
+                candidate
+                    .output_location
+                    .as_ref()
+                    .is_some_and(|candidate_location| {
+                        candidate_location.turn_id == location.turn_id
+                            && candidate_location.position > location.position
+                    })
+            })
+            .or_else(|| {
+                self.snapshot
+                    .transcript
+                    .items
+                    .iter()
+                    .rposition(|candidate| {
+                        candidate
+                            .output_location
+                            .as_ref()
+                            .is_some_and(|candidate_location| {
+                                candidate_location.turn_id == location.turn_id
+                                    && candidate_location.position < location.position
+                            })
+                    })
+                    .map(|index| index.saturating_add(1))
+            })
+            .unwrap_or_else(|| index.min(self.snapshot.transcript.items.len()));
+        self.snapshot.transcript.items.insert(insert_at, item);
+        self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+        self.bump_revision();
+    }
+
     const fn bump_revision(&mut self) {
         self.snapshot.revision = self.snapshot.revision.saturating_add(1);
     }
@@ -2411,6 +2636,7 @@ impl SessionView {
             revision: 0,
             sequence: (sequence != 0).then_some(sequence),
             timestamp_ms,
+            output_location: None,
             streaming,
             kind,
         });
@@ -2495,6 +2721,34 @@ impl SessionView {
             .map(Into::into)
     }
 
+    fn refresh_tool_from_aggregate(
+        &mut self,
+        tool_call_id: &str,
+        sequence: u64,
+        timestamp_ms: Option<u64>,
+    ) {
+        let Some(aggregate) = self.tool_invocations.get(tool_call_id) else {
+            return;
+        };
+        let mut tool = tool_invocation_view_from_projection(aggregate.projection.clone());
+        tool.request_draft.clone_from(&aggregate.request_draft);
+        self.attach_primary_presentation(&mut tool);
+        if let Some(status) = aggregate.terminal_status {
+            tool.status = status;
+        }
+        self.snapshot
+            .tools
+            .insert(tool_call_id.to_owned(), tool.clone());
+        self.refresh_canonical_tool_item(tool_call_id, sequence, timestamp_ms, &tool);
+    }
+
+    fn attach_request_draft(&self, tool: &mut ToolInvocationView) {
+        tool.request_draft = self
+            .tool_invocations
+            .get(&tool.tool_call_id)
+            .and_then(|aggregate| aggregate.request_draft.clone());
+    }
+
     fn attach_primary_presentation(&self, tool: &mut ToolInvocationView) {
         if let Some(presentation) = self.current_primary_presentation(&tool.tool_call_id) {
             tool.presentation = Some(presentation);
@@ -2558,30 +2812,18 @@ impl SessionView {
         tool: &ToolInvocationView,
     ) {
         let id = TranscriptViewItemId::tool(tool_call_id);
-        let kind = self
-            .tool_invocations
-            .get(tool_call_id)
-            .and_then(|aggregate| aggregate.request_draft.clone())
-            .filter(|draft| {
-                draft.placement == bcode_session_models::ToolContributionPlacement::Result
-                    && tool.result.is_none()
-                    && tool.result_text.is_none()
-            })
-            .map_or_else(
-                || TranscriptViewItemKind::ToolInvocation {
-                    tool: Box::new(tool.clone()),
-                },
-                |draft| TranscriptViewItemKind::ToolRequestDraft { draft },
-            );
         self.upsert_item(
             id.clone(),
             sequence,
             timestamp_ms,
-            matches!(
-                tool.status,
-                ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
-            ),
-            kind,
+            tool.request_draft.is_some()
+                || matches!(
+                    tool.status,
+                    ToolInvocationViewStatus::Running | ToolInvocationViewStatus::Waiting
+                ),
+            TranscriptViewItemKind::ToolInvocation {
+                tool: Box::new(tool.clone()),
+            },
         );
         self.tool_item_ids.insert(tool_call_id.to_owned(), id);
     }
@@ -2593,6 +2835,7 @@ impl SessionView {
         let projection = aggregate.projection.clone();
         let terminal_status = aggregate.terminal_status;
         let mut tool = tool_invocation_view_from_projection(projection);
+        self.attach_request_draft(&mut tool);
         self.attach_primary_presentation(&mut tool);
         if let Some(status) = terminal_status {
             tool.status = status;
@@ -3310,6 +3553,7 @@ fn tool_invocation_view_from_projection(
         tool_name: projection.tool_name,
         arguments_json: projection.arguments_json,
         working_directory: projection.working_directory,
+        request_draft: None,
         status: projection.status.into(),
         result_text: projection.result_text,
         is_error: projection.is_error,
@@ -3665,6 +3909,14 @@ mod tests {
             })
     }
 
+    fn tool_request_draft(item: &TranscriptViewItem) -> Option<&ToolRequestDraftView> {
+        match &item.kind {
+            TranscriptViewItemKind::ToolInvocation { tool } => tool.request_draft.as_ref(),
+            TranscriptViewItemKind::ToolRequestDraft { draft } => Some(draft),
+            _ => None,
+        }
+    }
+
     fn assert_reasoning_text(item: &TranscriptViewItem, text: &str, streaming: bool) {
         assert_eq!(item.streaming, streaming);
         assert!(match &item.kind {
@@ -3948,6 +4200,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-cadence".to_owned(),
                     tool_call_id: "call-cadence".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -3987,6 +4240,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-cadence".to_owned(),
                     tool_call_id: "call-cadence".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -4006,10 +4260,16 @@ mod tests {
         };
         full_cadence.apply_live_event(&remove);
         coalesced.apply_live_event(&remove);
-        assert!(full_cadence.tool_request_drafts().is_empty());
-        assert!(coalesced.tool_request_drafts().is_empty());
-        assert!(full_cadence.snapshot().transcript.items.is_empty());
-        assert!(coalesced.snapshot().transcript.items.is_empty());
+        assert_eq!(
+            full_cadence.tool_request_drafts()["call-cadence"].preview,
+            "latest"
+        );
+        assert_eq!(
+            coalesced.tool_request_drafts()["call-cadence"].preview,
+            "latest"
+        );
+        assert_eq!(full_cadence.snapshot().transcript.items.len(), 1);
+        assert_eq!(coalesced.snapshot().transcript.items.len(), 1);
     }
 
     #[test]
@@ -4019,6 +4279,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-parity".to_owned(),
                     tool_call_id: "call-parity".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -4098,6 +4359,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: "call-write".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -4145,17 +4407,19 @@ mod tests {
                 .count(),
             1
         );
-        assert!(matches!(
-            view.snapshot()
-                .transcript
-                .items
-                .iter()
-                .find(|item| item.id == result_id)
-                .map(|item| &item.kind),
-            Some(TranscriptViewItemKind::ToolRequestDraft { draft })
-                if draft.placement == bcode_session_models::ToolContributionPlacement::Result
-                    && draft.preview == "preview-2"
-        ));
+        let projected_draft = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.id == result_id)
+            .and_then(tool_request_draft)
+            .expect("unified request draft");
+        assert_eq!(
+            projected_draft.placement,
+            bcode_session_models::ToolContributionPlacement::Result
+        );
+        assert_eq!(projected_draft.preview, "preview-2");
     }
 
     #[test]
@@ -4166,6 +4430,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: "call-write".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -4201,14 +4466,9 @@ mod tests {
             .transcript
             .items
             .iter()
-            .find(|item| matches!(item.kind, TranscriptViewItemKind::ToolRequestDraft { .. }))
+            .find(|item| tool_request_draft(item).is_some())
             .expect("request draft item");
-        let TranscriptViewItemKind::ToolRequestDraft {
-            draft: projected_draft,
-        } = &item.kind
-        else {
-            unreachable!();
-        };
+        let projected_draft = tool_request_draft(item).expect("unified request draft");
         assert_eq!(projected_draft.preview, "hello world");
         assert!(item.streaming);
 
@@ -4232,19 +4492,17 @@ mod tests {
                 text: "post-terminal".to_owned(),
             },
         ));
-        assert!(view.tool_request_drafts().is_empty());
+        assert_eq!(
+            view.tool_request_drafts()["call-write"].preview,
+            "hello world"
+        );
         assert_eq!(
             view.terminal_tool_request_drafts().get("call-write"),
             Some(&(1, 4))
         );
-        assert!(
-            !view
-                .snapshot()
-                .transcript
-                .items
-                .iter()
-                .any(|item| matches!(item.kind, TranscriptViewItemKind::ToolRequestDraft { .. }))
-        );
+        assert!(view.snapshot().transcript.items.iter().any(|item| {
+            tool_request_draft(item).is_some_and(|draft| draft.preview == "hello world")
+        }));
     }
 
     #[test]
@@ -4255,6 +4513,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: "call-write".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -4293,6 +4552,7 @@ mod tests {
                 session_id,
                 kind: SessionLiveEventKind::ToolRequestDraft {
                     event: bcode_session_models::ToolRequestDraftEvent {
+                        output_position: None,
                         turn_id: "turn-1".to_owned(),
                         tool_call_id: "call-write".to_owned(),
                         tool_name: "filesystem.write".to_owned(),
@@ -4401,6 +4661,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: format!("turn-{generation}"),
                     tool_call_id: "call-write".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -4434,16 +4695,16 @@ mod tests {
             bcode_session_models::ToolContributionPlacement::Result,
             None,
         );
-        assert!(matches!(
-            view.snapshot()
-                .transcript
-                .items
-                .iter()
-                .find(|item| item.id == slot_id)
-                .map(|item| &item.kind),
-            Some(TranscriptViewItemKind::ToolRequestDraft { draft })
-                if draft.generation == 2 && draft.preview == "replacement preview"
-        ));
+        let draft = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .find(|item| item.id == slot_id)
+            .and_then(tool_request_draft)
+            .expect("replacement draft");
+        assert_eq!(draft.generation, 2);
+        assert_eq!(draft.preview, "replacement preview");
     }
 
     #[test]
@@ -4454,6 +4715,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: tool_call_id.to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -4486,7 +4748,7 @@ mod tests {
                 .transcript
                 .items
                 .iter()
-                .filter(|item| matches!(item.kind, TranscriptViewItemKind::ToolRequestDraft { .. }))
+                .filter(|item| tool_request_draft(item).is_some())
                 .count(),
             2
         );
@@ -4496,16 +4758,15 @@ mod tests {
                 bcode_session_models::ToolContributionPlacement::Result,
                 None,
             );
-            assert!(matches!(
-                snapshot
-                    .transcript
-                    .items
-                    .iter()
-                    .find(|item| item.id == slot_id)
-                    .map(|item| &item.kind),
-                Some(TranscriptViewItemKind::ToolRequestDraft { draft })
-                    if draft.tool_call_id == tool_call_id && draft.preview == expected
-            ));
+            let draft = snapshot
+                .transcript
+                .items
+                .iter()
+                .find(|item| item.id == slot_id)
+                .and_then(tool_request_draft)
+                .expect("isolated unified draft");
+            assert_eq!(draft.tool_call_id, tool_call_id);
+            assert_eq!(draft.preview, expected);
         }
     }
 
@@ -4603,6 +4864,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: "call-1".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -4662,6 +4924,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: "call-1".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -4767,15 +5030,13 @@ mod tests {
                 .filter(|item| item.id == result_id)
                 .collect::<Vec<_>>();
             assert_eq!(slots.len(), 1);
-            assert!(matches!(
-                slots[0].kind,
-                TranscriptViewItemKind::ToolRequestDraft { .. }
-            ));
+            assert!(tool_request_draft(slots[0]).is_some());
         };
         view.apply_live_event(&SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: "call-1".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -4798,6 +5059,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: "call-1".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -4890,6 +5152,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: "call-1".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -4929,6 +5192,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: "call-1".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -4952,15 +5216,14 @@ mod tests {
             bcode_session_models::ToolContributionPlacement::Result,
             None,
         );
-        assert!(matches!(
+        assert!(
             view.snapshot()
                 .transcript
                 .items
                 .iter()
                 .find(|item| item.id == slot_id)
-                .map(|item| &item.kind),
-            Some(TranscriptViewItemKind::ToolRequestDraft { .. })
-        ));
+                .is_some_and(|item| tool_request_draft(item).is_some())
+        );
 
         view.apply_event(&event(
             session_id,
@@ -5012,6 +5275,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: "call-1".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -5059,15 +5323,14 @@ mod tests {
             bcode_session_models::ToolContributionPlacement::Result,
             None,
         );
-        assert!(matches!(
+        assert!(
             view.snapshot()
                 .transcript
                 .items
                 .iter()
                 .find(|item| item.id == slot_id)
-                .map(|item| &item.kind),
-            Some(TranscriptViewItemKind::ToolRequestDraft { .. })
-        ));
+                .is_some_and(|item| tool_request_draft(item).is_some())
+        );
 
         view.apply_event(&event(
             session_id,
@@ -5237,6 +5500,7 @@ mod tests {
                 session_id,
                 kind: SessionLiveEventKind::ToolRequestDraft {
                     event: bcode_session_models::ToolRequestDraftEvent {
+                        output_position: None,
                         turn_id: "turn-1".to_owned(),
                         tool_call_id: "call-cancel".to_owned(),
                         tool_name: "filesystem.write".to_owned(),
@@ -5315,6 +5579,7 @@ mod tests {
                 session_id,
                 kind: SessionLiveEventKind::ToolRequestDraft {
                     event: bcode_session_models::ToolRequestDraftEvent {
+                        output_position: None,
                         turn_id: "turn-1".to_owned(),
                         tool_call_id: "call-cancel".to_owned(),
                         tool_name: "filesystem.write".to_owned(),
@@ -5443,6 +5708,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: "call-1".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -5480,10 +5746,13 @@ mod tests {
             bcode_session_models::ToolContributionPlacement::Result,
             None,
         );
-        assert!(view.snapshot().transcript.items.iter().any(|item| {
-            item.id == result_id
-                && matches!(item.kind, TranscriptViewItemKind::ToolRequestDraft { .. })
-        }));
+        assert!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .any(|item| { item.id == result_id && tool_request_draft(item).is_some() })
+        );
     }
 
     #[test]
@@ -5569,6 +5838,7 @@ mod tests {
                 session_id,
                 kind: SessionLiveEventKind::ToolRequestDraft {
                     event: bcode_session_models::ToolRequestDraftEvent {
+                        output_position: None,
                         turn_id: "turn-1".to_owned(),
                         tool_call_id: "call-1".to_owned(),
                         tool_name: "example.tool".to_owned(),
@@ -5908,6 +6178,7 @@ mod tests {
             live.apply_live_event(&SessionLiveEvent {
                 session_id,
                 kind: SessionLiveEventKind::AssistantReasoningActivity {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     event,
                 },
@@ -6449,6 +6720,32 @@ mod tests {
     }
 
     #[test]
+    fn renderer_local_notices_are_semantic_and_cleared_by_history_rebuild() {
+        let mut view = SessionView::new();
+        view.push_renderer_local_system_notice("plain".to_owned(), TextFormat::PlainText);
+        view.push_renderer_local_system_notice("json".to_owned(), TextFormat::Json);
+
+        assert_eq!(view.snapshot().transcript.items.len(), 2);
+        assert_eq!(
+            view.snapshot().transcript.items[0].id,
+            TranscriptViewItemId::new("renderer-local-system:1")
+        );
+        assert!(matches!(
+            &view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::SystemMessage { message }
+                if message.text == "plain" && message.format == TextFormat::PlainText
+        ));
+        assert!(matches!(
+            &view.snapshot().transcript.items[1].kind,
+            TranscriptViewItemKind::SystemMessage { message }
+                if message.text == "json" && message.format == TextFormat::Json
+        ));
+
+        view.rebuild_history_window(&[]);
+        assert!(view.snapshot().transcript.items.is_empty());
+    }
+
+    #[test]
     fn duplicate_durable_events_do_not_mutate_the_view() {
         let session_id = SessionId::new();
         let event = event(
@@ -6555,6 +6852,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: "call-draft".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -7281,6 +7579,7 @@ mod tests {
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: "call-1".to_owned(),
                     tool_name: "test.tool".to_owned(),
@@ -8126,6 +8425,7 @@ mod tests {
                     operation| SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                output_position: None,
                 turn_id: "turn-1".to_owned(),
                 activity_id: "activity-1".to_owned(),
                 activity_order,
@@ -8367,6 +8667,7 @@ mod tests {
         let update = |revision, operation| SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                output_position: None,
                 turn_id: "turn-1".to_owned(),
                 segment_id: "segment-0".to_owned(),
                 segment_order: 0,
@@ -8462,6 +8763,7 @@ mod tests {
             view.apply_live_event(&SessionLiveEvent {
                 session_id,
                 kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     segment_id: format!("segment-{segment_order}"),
                     segment_order,
@@ -9257,6 +9559,171 @@ mod tests {
                 if message.text
                     == "Ralph started\n* Loop: loop\n* running\n* State: .bcode/ralph/loop"
         ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One scenario proves live ordering, durable handoff, and rebuild convergence.
+    fn positioned_live_outputs_use_cross_type_order_not_arrival_order() {
+        let session_id = SessionId::new();
+        let turn_id = "turn-positioned";
+        let mut view = SessionView::new();
+        let live = |kind| SessionLiveEvent { session_id, kind };
+
+        view.apply_live_event(&live(SessionLiveEventKind::AssistantTextStreamUpdated {
+            output_position: Some(bcode_session_models::TurnOutputPosition::new(2)),
+            turn_id: turn_id.to_owned(),
+            segment_id: "segment-0".to_owned(),
+            segment_order: 0,
+            update: bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: 1,
+                revision: 1,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset: 0,
+                    text: "answer".to_owned(),
+                },
+            },
+        }));
+        view.apply_live_event(&live(SessionLiveEventKind::ToolRequestDraft {
+            event: bcode_session_models::ToolRequestDraftEvent {
+                output_position: Some(bcode_session_models::TurnOutputPosition::new(1)),
+                turn_id: turn_id.to_owned(),
+                tool_call_id: "call-1".to_owned(),
+                tool_name: "filesystem.write".to_owned(),
+                producer_plugin_id: None,
+                schema: "bcode.tool.request-draft".to_owned(),
+                schema_version: 0,
+                placement: bcode_session_models::ToolContributionPlacement::Request,
+                generation: 1,
+                revision: 1,
+                operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                    start_offset: 0,
+                    text: r#"{"path":"src/lib.rs"}"#.to_owned(),
+                },
+                argument_bytes: 21,
+                truncated: false,
+            },
+        }));
+        view.apply_live_event(&live(SessionLiveEventKind::AssistantReasoningActivity {
+            output_position: Some(bcode_session_models::TurnOutputPosition::new(0)),
+            turn_id: turn_id.to_owned(),
+            event: bcode_session_models::ReasoningActivityEvent::PartDelta {
+                activity_id: "reasoning-1".to_owned(),
+                activity_order: 0,
+                part_id: "summary-0".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                part_order: 0,
+                text: "reasoning".to_owned(),
+            },
+        }));
+
+        let locations = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .map(|item| {
+                let location = item.output_location.as_ref().expect("positioned item");
+                assert_eq!(location.turn_id, turn_id);
+                location.position.get()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(locations, vec![0, 1, 2]);
+        assert!(matches!(
+            view.snapshot().transcript.items[0].kind,
+            TranscriptViewItemKind::ReasoningActivity { .. }
+        ));
+        assert_eq!(
+            view.snapshot().transcript.items[1].id,
+            TranscriptViewItemId::tool("call-1")
+        );
+        assert!(matches!(
+            view.snapshot().transcript.items[2].kind,
+            TranscriptViewItemKind::AssistantMessage { .. }
+        ));
+
+        let live_items = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .map(|item| (item.id.clone(), item.revision))
+            .collect::<Vec<_>>();
+        let complete_reasoning = bcode_session_models::ReasoningActivity {
+            activity_id: "reasoning-1".to_owned(),
+            order: 0,
+            status: bcode_session_models::ReasoningActivityStatus::Completed,
+            parts: vec![bcode_session_models::ReasoningPart {
+                part_id: "summary-0".to_owned(),
+                kind: bcode_session_models::ReasoningContentKind::Summary,
+                role: bcode_session_models::ReasoningContentRole::Milestone,
+                order: 0,
+                text: "reasoning".to_owned(),
+            }],
+            opaque: false,
+        };
+        let durable = [
+            event(
+                session_id,
+                1,
+                SessionEventKind::PositionedAssistantResponseSegment {
+                    turn_id: turn_id.to_owned(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(2),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
+                    text: "answer".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::PositionedToolCallRequested {
+                    turn_id: turn_id.to_owned(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(1),
+                    tool_call_id: "call-1".to_owned(),
+                    producer_plugin_id: None,
+                    tool_name: "filesystem.write".to_owned(),
+                    arguments_json: r#"{"path":"src/lib.rs"}"#.to_owned(),
+                    working_directory: None,
+                },
+            ),
+            event(
+                session_id,
+                3,
+                SessionEventKind::PositionedAssistantReasoningActivity {
+                    turn_id: turn_id.to_owned(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(0),
+                    activity: complete_reasoning,
+                },
+            ),
+        ];
+        view.apply_history(&durable);
+        assert_eq!(view.snapshot().transcript.items.len(), 3);
+        for ((live_id, live_revision), durable_item) in
+            live_items.iter().zip(&view.snapshot().transcript.items)
+        {
+            assert_eq!(live_id, &durable_item.id);
+            assert!(durable_item.revision > *live_revision);
+        }
+
+        let mut rebuilt = SessionView::new();
+        rebuilt.apply_history(&durable);
+        let semantic_document = |view: &SessionView| {
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .map(|item| {
+                    (
+                        item.id.clone(),
+                        item.output_location.clone(),
+                        item.kind.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(semantic_document(&view), semantic_document(&rebuilt));
     }
 
     #[test]

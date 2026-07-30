@@ -1358,9 +1358,27 @@ if rg -n 'push_live_(assistant|reasoning)_delta|sync_shared_tool_items|push_requ
   violations=1
 fi
 
-if ! grep -F 'struct SessionViewTerminalAdapter' packages/tui/src/app.rs >/dev/null \
-  || ! grep -F 'terminal_item_from_shared(item)' packages/tui/src/app.rs >/dev/null; then
-  echo "Runtime architecture violation: the single SessionView-to-terminal adapter boundary was removed." >&2
+if rg -n 'target\.(upsert_from_shared|reorder_from_shared|retain_from_shared|replace_from_shared)|\.transcript\.(upsert_from_shared|reorder_from_shared|retain_from_shared|replace_from_shared)' \
+  packages/tui/src --glob '*.rs' --glob '!session_view_terminal_adapter.rs' --glob '!transcript_document.rs' \
+  >/tmp/bcode-tui-transcript-document-mutation.txt; then
+  echo "Runtime architecture violation: TranscriptDocument mutation escaped the exclusive SessionView terminal adapter boundary." >&2
+  cat /tmp/bcode-tui-transcript-document-mutation.txt >&2
+  violations=1
+fi
+
+if rg -n '^\s*pub\s+fn\s+(upsert_from_shared|reorder_from_shared|retain_from_shared|replace_from_shared)' \
+  packages/tui/src/transcript_document.rs >/tmp/bcode-tui-transcript-document-public-mutation.txt; then
+  echo "Runtime architecture violation: TranscriptDocument mutation APIs must remain private to the SessionView terminal adapter." >&2
+  cat /tmp/bcode-tui-transcript-document-public-mutation.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'struct SessionViewTerminalAdapter' packages/tui/src/session_view_terminal_adapter.rs >/dev/null \
+  || ! grep -F '#[path = "session_view_terminal_adapter.rs"]' packages/tui/src/transcript_document.rs >/dev/null \
+  || ! grep -F 'terminal_item_from_shared(item)' packages/tui/src/session_view_terminal_adapter.rs >/dev/null \
+  || ! grep -F 'raw_durable_handlers_cannot_create_or_finalize_terminal_rows' packages/tui/src/app.rs >/dev/null \
+  || ! grep -F 'raw_live_handlers_cannot_create_or_finalize_terminal_rows' packages/tui/src/app.rs >/dev/null; then
+  echo "Runtime architecture violation: the single SessionView-to-terminal adapter boundary or raw-handler non-mutation coverage was removed." >&2
   violations=1
 fi
 

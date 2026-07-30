@@ -1,9 +1,16 @@
 # Model provider contract
 
 This document is the normative behavioral contract for the versioned
-`bcode.model-provider/v1` plugin service. The Rust payload types and operation inventory live in
-`bcode_model`; the reusable deterministic harness lives in
+`bcode.model-provider/v1` and `bcode.model-provider/v2` plugin services. The Rust payload types and
+operation inventory live in `bcode_model`; the reusable deterministic harness lives in
 `bcode_model_provider_runtime`.
+
+Version 2 retains the v1 operation and request/response inventory, but semantic turn output uses
+`ProviderTurnEvent::Output` with stable `TurnOutputPosition` values across assistant text,
+structured reasoning, and tool calls. Bundled providers advertise both versions during the
+compatibility window. Hosts prefer v2 for a provider that advertises it and fall back to v1 for
+legacy plugins. A turn must use one selected interface consistently for start, poll, cancellation,
+and finish.
 
 The contract applies equally to bundled providers, third-party native plugins, in-process test
 adapters, and proxies that expose the same typed operations. A provider must not advertise a
@@ -11,11 +18,11 @@ capability that it cannot satisfy through this contract.
 
 ## Version and compatibility
 
-`bcode.model-provider/v1` identifies one wire-compatible family of JSON request and response
-payloads. Operation names, payload types, and their requirement levels are published as
-`bcode_model::MODEL_PROVIDER_OPERATIONS`.
+`bcode.model-provider/v1` identifies the legacy flat-output JSON family.
+`bcode.model-provider/v2` identifies the positioned-output family. Both publish the operation names,
+payload types, and requirement levels in `bcode_model::MODEL_PROVIDER_OPERATIONS`.
 
-Within `v1`:
+Within either version:
 
 * providers must ignore unknown additive JSON fields when deserializing host requests;
 * hosts must tolerate unknown provider metadata keys and provider extension content;
@@ -109,6 +116,9 @@ The event protocol is ordered and draining:
 4. Polling drains events. A later poll must not replay events returned by an earlier poll.
 5. Empty poll batches are valid while work remains active.
 6. No event may be emitted after `TurnFinished`.
+7. Under v2, every assistant text segment, reasoning activity, and tool call has one monotonic
+   `TurnOutputPosition`; every update for the same semantic unit reuses that position, and later
+   events must not regress below the last emitted position.
 
 A host may poll, cancel, and finish from different tasks. Providers must synchronize active-turn
 state and handle completion races without panics, duplicate terminal events, leaked work, or reused

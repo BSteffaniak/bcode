@@ -14,13 +14,14 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bcode_model          = { workspace = true }
-bcode_plugin_sdk     = { workspace = true }
-bcode_session_models = { workspace = true }
-jsonschema           = { workspace = true }
-serde                = { workspace = true, features = ["derive", "std"] }
-serde_json           = { workspace = true }
-tokio                = { workspace = true, features = ["sync"] }
+bcode_model                  = { workspace = true }
+bcode_model_provider_runtime = { workspace = true }
+bcode_plugin_sdk             = { workspace = true }
+bcode_session_models         = { workspace = true }
+jsonschema                   = { workspace = true }
+serde                        = { workspace = true, features = ["derive", "std"] }
+serde_json                   = { workspace = true }
+tokio                        = { workspace = true, features = ["sync"] }
 
 [features]
 default          = []

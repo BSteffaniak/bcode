@@ -98,7 +98,6 @@ use super::{
     render, slash_palette, slash_palette_render,
     time_format::{format_duration_nanos, format_millis},
     transcript::{TranscriptItem, TranscriptItemKind, transcript_items_from_events_with_reasoning},
-    transcript_document::TranscriptDocument,
 };
 
 fn theme_transition_config(curve: TuiAccentTransitionCurve) -> TuiConfig {
@@ -688,78 +687,6 @@ fn live_provider_tool_call_progress_updates_status() {
             detail: "assembling example.write arguments (4.0 KiB received)".to_owned(),
         }
     );
-}
-
-#[test]
-fn transcript_document_mutations_bump_revision() {
-    let mut document = TranscriptDocument::default();
-    assert_eq!(document.revision(), 0);
-
-    document.push(TranscriptItem::new("System", "one".to_owned()));
-    assert_eq!(document.revision(), 1);
-
-    document.replace(vec![TranscriptItem::new("You", "two".to_owned())]);
-    assert_eq!(document.revision(), 2);
-
-    let item = document.get_mut(0).expect("item exists");
-    item.append_text("!");
-    assert_eq!(document.revision(), 3);
-
-    let item = document.get_mut(0).expect("item exists");
-    item.finish_streaming();
-    assert_eq!(document.revision(), 4);
-}
-
-#[test]
-fn transcript_document_streaming_helpers_bump_revision() {
-    let mut document = TranscriptDocument::default();
-
-    document.push_streaming_item("Assistant", "hello");
-    assert_eq!(document.revision(), 1);
-    assert_eq!(document.items()[0].text(), "hello");
-
-    document.push_streaming_item("Assistant", " world");
-    assert_eq!(document.revision(), 2);
-    assert_eq!(document.items()[0].text(), "hello world");
-
-    document.finish_streaming_item("Assistant", "hello world");
-    assert_eq!(document.revision(), 3);
-    assert!(!document.items()[0].streaming());
-}
-
-#[test]
-fn reasoning_streaming_starts_new_item_after_interleaved_transcript_item() {
-    let mut document = TranscriptDocument::default();
-
-    document.push_streaming_item("Reasoning summary", "first thought");
-    document.push(TranscriptItem::new("System", "tool output".to_owned()));
-    document.push_streaming_item("Reasoning summary", "second thought");
-
-    assert_eq!(document.len(), 3);
-    assert_eq!(document.items()[0].text(), "first thought");
-    assert_eq!(document.items()[1].text(), "tool output");
-    assert_eq!(document.items()[2].text(), "second thought");
-    assert!(document.items()[0].streaming());
-    assert!(document.items()[2].streaming());
-}
-
-#[test]
-fn reasoning_finish_preserves_split_streaming_items() {
-    let mut document = TranscriptDocument::default();
-
-    document.push_streaming_item("Reasoning summary", "first thought");
-    document.push(TranscriptItem::new("System", "tool output".to_owned()));
-    document.push_streaming_item("Reasoning summary", "second thought");
-    document.finish_streaming_item(
-        "Reasoning summary",
-        "first thought second thought final aggregate",
-    );
-
-    assert_eq!(document.len(), 3);
-    assert_eq!(document.items()[0].text(), "first thought");
-    assert_eq!(document.items()[2].text(), "second thought");
-    assert!(!document.items()[0].streaming());
-    assert!(!document.items()[2].streaming());
 }
 
 #[test]
@@ -4648,7 +4575,7 @@ fn transcript_resident_window_prunes_old_tool_state_after_trim() {
     }
 
     assert!(app.resident_transcript_event_count() <= 600);
-    assert!(app.resident_tool_call_context_count() < 360);
+    assert!(app.session_view_snapshot().tools.len() < 360);
 }
 
 fn filesystem_change_artifact() -> bcode_session_models::ToolArtifact {
@@ -4729,7 +4656,7 @@ fn vim_edit_plugin_host() -> bcode_plugin::PluginHost {
 }
 
 #[test]
-fn live_filesystem_request_draft_renders_updates_and_removes() {
+fn live_filesystem_request_draft_renders_updates_and_retains_completed_handoff() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
     app.set_plugin_host(Arc::new(filesystem_plugin_host()));
@@ -4737,6 +4664,7 @@ fn live_filesystem_request_draft_renders_updates_and_removes() {
         session_id,
         kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
             event: bcode_session_models::ToolRequestDraftEvent {
+                output_position: None,
                 turn_id: "turn-1".to_owned(),
                 tool_call_id: "call-write".to_owned(),
                 tool_name: "filesystem.write".to_owned(),
@@ -4785,11 +4713,12 @@ fn live_filesystem_request_draft_renders_updates_and_removes() {
         },
         46,
     ));
-    let removed = render_app_text(&mut app);
+    let handed_off = render_app_text(&mut app);
     assert!(
-        !removed.contains("Filesystem write · assembling"),
-        "{removed}"
+        handed_off.contains("Filesystem write · assembling"),
+        "{handed_off}"
     );
+    assert!(handed_off.contains("hello world"), "{handed_off}");
 }
 
 #[test]
@@ -4802,6 +4731,7 @@ fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
         session_id,
         kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
             event: bcode_session_models::ToolRequestDraftEvent {
+                output_position: None,
                 turn_id: "turn-1".to_owned(),
                 tool_call_id: "call-write".to_owned(),
                 tool_name: "filesystem.write".to_owned(),
@@ -4909,7 +4839,7 @@ fn filesystem_result_replaces_result_draft_without_duplicate_visual() {
 }
 
 #[test]
-fn live_filesystem_edit_request_draft_renders_progressive_diff_and_removes() {
+fn live_filesystem_edit_request_draft_renders_progressive_diff_and_retains_completed_handoff() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
     app.set_plugin_host(Arc::new(filesystem_plugin_host()));
@@ -4917,6 +4847,7 @@ fn live_filesystem_edit_request_draft_renders_progressive_diff_and_removes() {
         session_id,
         kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
             event: bcode_session_models::ToolRequestDraftEvent {
+                output_position: None,
                 turn_id: "turn-edit".to_owned(),
                 tool_call_id: "call-edit".to_owned(),
                 tool_name: "filesystem.edit".to_owned(),
@@ -4971,12 +4902,12 @@ fn live_filesystem_edit_request_draft_renders_progressive_diff_and_removes() {
         },
         65,
     ));
-    let removed = render_app_text(&mut app);
+    let handed_off = render_app_text(&mut app);
     assert!(
-        !removed.contains("Filesystem edit · assembling"),
-        "{removed}"
+        handed_off.contains("Filesystem edit · assembling"),
+        "{handed_off}"
     );
-    assert!(!removed.contains("after two"), "{removed}");
+    assert!(handed_off.contains("after two"), "{handed_off}");
 }
 
 #[test]

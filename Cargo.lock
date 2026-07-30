@@ -1751,6 +1751,7 @@ name = "bcode_fake_provider_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bcode_model",
+ "bcode_model_provider_runtime",
  "bcode_plugin_sdk",
  "bcode_session_models",
  "jsonschema",

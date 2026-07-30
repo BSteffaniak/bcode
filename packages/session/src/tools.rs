@@ -41,6 +41,33 @@ impl SessionManager {
         .await
     }
 
+    /// Append a positioned tool-call request event to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the session does not exist or the event cannot be persisted.
+    pub async fn append_positioned_tool_call_requested(
+        &self,
+        session_id: SessionId,
+        turn_id: String,
+        output_position: bcode_session_models::TurnOutputPosition,
+        input: AppendToolCallRequestedInput,
+    ) -> Result<SessionEvent, SessionError> {
+        self.append_event(
+            session_id,
+            SessionEventKind::PositionedToolCallRequested {
+                turn_id,
+                output_position,
+                tool_call_id: input.tool_call_id,
+                tool_name: input.tool_name,
+                arguments_json: input.arguments_json,
+                producer_plugin_id: input.producer_plugin_id,
+                working_directory: input.working_directory,
+            },
+        )
+        .await
+    }
+
     /// Append a generic terminal invocation result record to a session.
     ///
     /// Repeating an append for an invocation that already has a terminal result is idempotent: the

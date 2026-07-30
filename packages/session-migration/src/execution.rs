@@ -904,11 +904,11 @@ mod tests {
         let current_payload = format!(
             r#"{{"schema_version":39,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"session_created":{{"summary":{{"id":"{SESSION_ID}","title":"fixture","cwd":"/tmp","created_at_ms":1,"updated_at_ms":1}}}}}}}}"#
         );
-        let normalized = normalize_canonical_event(&current_payload, 41, |payload| {
+        let normalized = normalize_canonical_event(&current_payload, 42, |payload| {
             serde_json::from_str(payload).map_err(|error| error.to_string())
         })
         .expect("normalize current-compatible event");
-        assert_eq!(normalized.event.schema_version, 41);
+        assert_eq!(normalized.event.schema_version, 42);
         assert!(normalized.historical.is_none());
         assert!(!normalized.retired_known);
         assert!(normalized.metric_counter.is_none());
@@ -916,9 +916,9 @@ mod tests {
         let historical_payload = format!(
             r#"{{"schema_version":28,"sequence":8,"timestamp_ms":9,"session_id":"{SESSION_ID}","kind":{{"context_usage_observed":{{"snapshot":{{"provider_plugin_id":"provider","model_id":"model","input_tokens":123,"context_through_sequence":4,"request_id":"request","model_turn_id":"turn","round":0,"request_fingerprint":"fingerprint","auth_profile":"profile","estimated_input_tokens":120,"context_format_version":null,"compatibility_key":null,"source":"estimated"}}}}}}}}"#
         );
-        let normalized = normalize_canonical_event(&historical_payload, 41, reject_current)
+        let normalized = normalize_canonical_event(&historical_payload, 42, reject_current)
             .expect("normalize historical event");
-        assert_eq!(normalized.event.schema_version, 41);
+        assert_eq!(normalized.event.schema_version, 42);
         assert_eq!(normalized.historical.expect("metadata").source_schema, 28);
         assert!(!normalized.retired_known);
         assert_eq!(
@@ -930,11 +930,11 @@ mod tests {
     #[test]
     fn historical_codec_only_applies_family_rules_to_released_schema_ranges() {
         let payload = format!(
-            r#"{{"schema_version":42,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"tool_call_finished":{{"tool_call_id":"call","result":"done"}}}}}}"#
+            r#"{{"schema_version":43,"sequence":1,"session_id":"{SESSION_ID}","kind":{{"tool_call_finished":{{"tool_call_id":"call","result":"done"}}}}}}"#
         );
         assert!(matches!(
             decode_for_migration(&payload, reject_current),
-            Err(HistoricalSessionEventError::UnsupportedSchema { schema_version: 42 })
+            Err(HistoricalSessionEventError::UnsupportedSchema { schema_version: 43 })
         ));
 
         let payload = format!(
@@ -971,14 +971,14 @@ mod tests {
     #[test]
     fn strict_current_payload_bypasses_historical_inventory() {
         let payload = format!(
-            r#"{{"schema_version":41,"sequence":1,"timestamp_ms":2,"session_id":"{SESSION_ID}","kind":{{"assistant_response_segment":{{"turn_id":"turn-1","segment_id":"segment-0","segment_order":0,"text":"current"}}}}}}"#
+            r#"{{"schema_version":42,"sequence":1,"timestamp_ms":2,"session_id":"{SESSION_ID}","kind":{{"assistant_response_segment":{{"turn_id":"turn-1","segment_id":"segment-0","segment_order":0,"text":"current"}}}}}}"#
         );
         assert!(matches!(
             decode_for_migration(&payload, |payload| {
                 serde_json::from_str(payload).map_err(|error| error.to_string())
             }),
             Ok(HistoricalDecode::Current(SessionEvent {
-                schema_version: 41,
+                schema_version: 42,
                 sequence: 1,
                 kind: SessionEventKind::AssistantResponseSegment { ref text, .. },
                 ..

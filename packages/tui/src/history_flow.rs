@@ -587,6 +587,7 @@ mod tests {
             session_id,
             kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: "call-1".to_owned(),
                     tool_name: "filesystem.write".to_owned(),

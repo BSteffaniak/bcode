@@ -7,8 +7,8 @@
 use bcode_model::{
     AckResponse, CancelTurnRequest, CompactContextRequest, CompactContextResponse, ContentBlock,
     ContextManagementCapabilities, ContextManagementCapabilitiesRequest, FinishTurnRequest,
-    MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelCapability, ModelInfo, ModelList,
-    ModelListRequest, ModelMessage, ModelTurnRequest, NativeWebSearchRequest,
+    MODEL_PROVIDER_INTERFACE_ID, MODEL_PROVIDER_INTERFACE_ID_V2, MessageRole, ModelCapability,
+    ModelInfo, ModelList, ModelListRequest, ModelMessage, ModelTurnRequest, NativeWebSearchRequest,
     NativeWebSearchResponse, NativeWebSearchResult, OP_CANCEL_TURN, OP_CAPABILITIES,
     OP_COMPACT_CONTEXT, OP_CONTEXT_MANAGEMENT_CAPABILITIES, OP_FINISH_TURN, OP_MODELS,
     OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG,
@@ -17,6 +17,7 @@ use bcode_model::{
     StartTurnResponse, StopReason, TokenUsage, ToolCall, ToolChoice, ValidateConfigRequest,
     ValidateConfigResponse,
 };
+use bcode_model_provider_runtime::ProviderOutputPositionAllocator;
 use bcode_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -158,14 +159,28 @@ struct FakeProviderState {
 #[derive(Debug, Clone, Default)]
 struct FakeTurn {
     events: Arc<Mutex<VecDeque<ProviderTurnEvent>>>,
+    output_positions: Arc<Mutex<ProviderOutputPositionAllocator>>,
+    positioned_output: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
 }
 
 impl FakeTurn {
     fn push(&self, event: ProviderTurnEvent) {
+        let event = if self.positioned_output.load(Ordering::Acquire) {
+            match self.output_positions.lock() {
+                Ok(mut positions) => positions.position(event),
+                Err(_) => event,
+            }
+        } else {
+            event
+        };
         if let Ok(mut events) = self.events.lock() {
             events.push_back(event);
         }
+    }
+
+    fn enable_positioned_output(&self) {
+        self.positioned_output.store(true, Ordering::Release);
     }
 
     fn drain(&self) -> Vec<ProviderTurnEvent> {
@@ -209,7 +224,10 @@ impl RustPlugin for FakeProviderPlugin {
 
 impl FakeProviderPlugin {
     fn invoke_provider_service(&self, context: &NativeServiceContext) -> ServiceResponse {
-        if context.request.interface_id != MODEL_PROVIDER_INTERFACE_ID {
+        if !matches!(
+            context.request.interface_id.as_str(),
+            MODEL_PROVIDER_INTERFACE_ID | MODEL_PROVIDER_INTERFACE_ID_V2
+        ) {
             return ServiceResponse::error(
                 "unsupported_interface",
                 "unsupported model provider service interface",
@@ -242,7 +260,10 @@ impl FakeProviderPlugin {
                 json_response(&fake_context_capabilities(&request))
             }
             OP_COMPACT_CONTEXT => Self::compact_context(&context.request),
-            OP_START_TURN => self.start_turn(&context.request),
+            OP_START_TURN => self.start_turn(
+                &context.request,
+                context.request.interface_id == MODEL_PROVIDER_INTERFACE_ID_V2,
+            ),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
             OP_CANCEL_TURN => self.cancel_turn(&context.request),
             OP_FINISH_TURN => self.finish_turn(&context.request),
@@ -318,7 +339,7 @@ impl FakeProviderPlugin {
         })
     }
 
-    fn start_turn(&self, request: &ServiceRequest) -> ServiceResponse {
+    fn start_turn(&self, request: &ServiceRequest, positioned_output: bool) -> ServiceResponse {
         let request = match request.payload_json::<ModelTurnRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
@@ -367,6 +388,9 @@ impl FakeProviderPlugin {
         let has_tool_result = tool_result.is_some();
         let text = fake_response_text(&request, tool_result.as_deref(), &user_text);
         let turn = FakeTurn::default();
+        if positioned_output {
+            turn.enable_positioned_output();
+        }
         turn.push(ProviderTurnEvent::TurnStarted);
         emit_fake_managed_compaction(&request, &turn);
         let emit_overflow = request
@@ -386,43 +410,18 @@ impl FakeProviderPlugin {
             .is_some_and(|value| value == "true");
         state.turns.insert(provider_turn_id.clone(), turn.clone());
         drop(state);
-        if let Some(script) = event_script {
-            run_fake_event_script(turn, script);
-        } else if emit_overflow {
-            turn.push(ProviderTurnEvent::Error {
-                error: ProviderError {
-                    code: "context_length_exceeded".to_string(),
-                    category: ProviderErrorCategory::ContextLength,
-                    message: "fake context overflow".to_string(),
-                    retryable: false,
-                    provider_message: None,
-                    failure: None,
-                    request_id: None,
-                    diagnostic_context: Box::default(),
-                    sources: Box::default(),
-                    retry: None,
-                },
-            });
-            turn.push(ProviderTurnEvent::TurnFinished {
-                stop_reason: StopReason::Error,
-            });
-        } else if finish_configured_fake_tool_conformance(
-            &turn,
-            &request,
+        dispatch_fake_turn(FakeTurnDispatch {
+            turn,
+            request: &request,
+            event_script,
+            emit_overflow,
             configured_tool_call_count,
             emit_malformed_tool_call,
             has_tool_result,
-        ) {
-        } else if let Some(tool_call) = tool_call {
-            finish_fake_tool_turn(&turn, tool_call);
-        } else {
-            finish_fake_text_response(
-                turn,
-                text,
-                fake_request_delay(&request),
-                request_input_tokens,
-            );
-        }
+            tool_call,
+            text,
+            request_input_tokens,
+        });
         json_response(&StartTurnResponse { provider_turn_id })
     }
 
@@ -474,6 +473,71 @@ impl FakeProviderPlugin {
             turn.cancel();
         }
         json_response(&AckResponse::default())
+    }
+}
+
+struct FakeTurnDispatch<'a> {
+    turn: FakeTurn,
+    request: &'a ModelTurnRequest,
+    event_script: Option<FakeProviderEventScript>,
+    emit_overflow: bool,
+    configured_tool_call_count: usize,
+    emit_malformed_tool_call: bool,
+    has_tool_result: bool,
+    tool_call: Option<ToolCall>,
+    text: Result<String, ProviderError>,
+    request_input_tokens: u64,
+}
+
+fn dispatch_fake_turn(dispatch: FakeTurnDispatch<'_>) {
+    let FakeTurnDispatch {
+        turn,
+        request,
+        event_script,
+        emit_overflow,
+        configured_tool_call_count,
+        emit_malformed_tool_call,
+        has_tool_result,
+        tool_call,
+        text,
+        request_input_tokens,
+    } = dispatch;
+    if let Some(script) = event_script {
+        run_fake_event_script(turn, script);
+    } else if emit_overflow {
+        turn.push(ProviderTurnEvent::Error {
+            error: ProviderError {
+                code: "context_length_exceeded".to_string(),
+                category: ProviderErrorCategory::ContextLength,
+                message: "fake context overflow".to_string(),
+                retryable: false,
+                provider_message: None,
+                failure: None,
+                request_id: None,
+                diagnostic_context: Box::default(),
+                sources: Box::default(),
+                retry: None,
+            },
+        });
+        turn.push(ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::Error,
+        });
+    } else if finish_configured_fake_tool_conformance(
+        &turn,
+        request,
+        configured_tool_call_count,
+        emit_malformed_tool_call,
+        has_tool_result,
+    ) {
+    } else if let Some(tool_call) = tool_call {
+        finish_fake_tool_turn(&turn, tool_call);
+    } else {
+        finish_fake_text_response(
+            turn,
+            text,
+            fake_request_delay(request),
+            request_input_tokens,
+        );
     }
 }
 
@@ -1526,7 +1590,8 @@ bcode_plugin_sdk::export_concurrent_plugin!(
 mod tests {
     use super::*;
     use bcode_model::{
-        CapabilitySupport, ModelParameterKey, RequestedModelFeature, StructuredOutputMode,
+        CapabilitySupport, ModelParameterKey, ProviderOutputEvent, RequestedModelFeature,
+        StructuredOutputMode, TurnOutputPosition,
     };
 
     fn drain_script_until(
@@ -1550,33 +1615,45 @@ mod tests {
         let gate = "fake-event-script-test-tool";
         let (gates, ready) = &*FAKE_SCRIPT_GATES;
         gates.lock().expect("script gates").remove(gate);
-        let reasoning = ProviderTurnEvent::ReasoningActivity {
-            event: bcode_session_models::ReasoningActivityEvent::PartDelta {
-                activity_id: "reasoning-1".to_owned(),
-                activity_order: 0,
-                part_id: "summary-0".to_owned(),
-                kind: bcode_session_models::ReasoningContentKind::Summary,
-                role: bcode_session_models::ReasoningContentRole::Milestone,
-                part_order: 0,
-                text: "reasoning".to_owned(),
+        let reasoning = ProviderTurnEvent::output(
+            TurnOutputPosition::new(1),
+            ProviderOutputEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::PartDelta {
+                    activity_id: "reasoning-1".to_owned(),
+                    activity_order: 0,
+                    part_id: "summary-0".to_owned(),
+                    kind: bcode_session_models::ReasoningContentKind::Summary,
+                    role: bcode_session_models::ReasoningContentRole::Milestone,
+                    part_order: 0,
+                    text: "reasoning".to_owned(),
+                },
             },
-        };
+        );
         let tool = ToolCall {
             id: "call-1".to_owned(),
             name: "filesystem.write".to_owned(),
             arguments: serde_json::json!({"path": "src/lib.rs", "contents": "hello"}),
         };
         let expected_after_gate = vec![
-            reasoning.clone(),
-            ProviderTurnEvent::ToolCallStarted {
-                call_id: tool.id.clone(),
-                name: tool.name.clone(),
-            },
-            ProviderTurnEvent::ToolCallDelta {
-                call_id: tool.id.clone(),
-                delta: r#"{"path":"src/lib.rs""#.to_owned(),
-            },
-            ProviderTurnEvent::ToolCallFinished { call: tool },
+            reasoning,
+            ProviderTurnEvent::output(
+                TurnOutputPosition::new(2),
+                ProviderOutputEvent::ToolCallStarted {
+                    call_id: tool.id.clone(),
+                    name: tool.name.clone(),
+                },
+            ),
+            ProviderTurnEvent::output(
+                TurnOutputPosition::new(2),
+                ProviderOutputEvent::ToolCallDelta {
+                    call_id: tool.id.clone(),
+                    delta: r#"{"path":"src/lib.rs""#.to_owned(),
+                },
+            ),
+            ProviderTurnEvent::output(
+                TurnOutputPosition::new(2),
+                ProviderOutputEvent::ToolCallFinished { call: tool },
+            ),
             ProviderTurnEvent::Usage {
                 usage: TokenUsage::default(),
             },
@@ -1587,9 +1664,12 @@ mod tests {
         let mut steps = vec![FakeProviderEventScriptStep {
             gate: None,
             delay_ms: None,
-            event: ProviderTurnEvent::TextDelta {
-                text: "before gate".to_owned(),
-            },
+            event: ProviderTurnEvent::output(
+                TurnOutputPosition::new(0),
+                ProviderOutputEvent::TextDelta {
+                    text: "before gate".to_owned(),
+                },
+            ),
         }];
         steps.extend(
             expected_after_gate
@@ -1608,9 +1688,12 @@ mod tests {
         let before_gate = drain_script_until(&turn, |events| !events.is_empty());
         assert_eq!(
             before_gate,
-            [ProviderTurnEvent::TextDelta {
-                text: "before gate".to_owned()
-            }]
+            [ProviderTurnEvent::output(
+                TurnOutputPosition::new(0),
+                ProviderOutputEvent::TextDelta {
+                    text: "before gate".to_owned(),
+                },
+            )]
         );
         std::thread::sleep(Duration::from_millis(20));
         assert!(turn.drain().is_empty(), "gated events escaped early");
@@ -1632,10 +1715,13 @@ mod tests {
             steps: vec![FakeProviderEventScriptStep {
                 gate: Some("release".to_owned()),
                 delay_ms: Some(25),
-                event: ProviderTurnEvent::ToolCallDelta {
-                    call_id: "call-1".to_owned(),
-                    delta: "partial arguments".to_owned(),
-                },
+                event: ProviderTurnEvent::output(
+                    TurnOutputPosition::new(2),
+                    ProviderOutputEvent::ToolCallDelta {
+                        call_id: "call-1".to_owned(),
+                        delta: "partial arguments".to_owned(),
+                    },
+                ),
             }],
         };
         let encoded = serde_json::to_string(&script).expect("encode script");

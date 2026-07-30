@@ -186,6 +186,7 @@ pub enum ShellInvocationAction {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ShellLiveRecordingPayload {
     pub mode: &'static str,
+    pub timeout_ms: u64,
 }
 
 const fn default_format_commands() -> bool {

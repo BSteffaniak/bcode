@@ -395,7 +395,14 @@ pub struct AgentTurnResponse {
 pub enum AgentRuntimeEvent {
     /// The provider accepted the turn.
     TurnStarted,
-    /// Assistant text delta.
+    /// Positioned semantic output from a v2 provider.
+    Output {
+        /// Stable position within the provider turn.
+        position: bcode_session_models::TurnOutputPosition,
+        /// Positioned provider-neutral output event.
+        event: bcode_model::ProviderOutputEvent,
+    },
+    /// Assistant text delta from a legacy v1 provider.
     TextDelta(String),
     /// Legacy untyped reasoning text delta.
     ///
@@ -3831,6 +3838,15 @@ fn normalize_provider_event(
     match event {
         ProviderTurnEvent::TurnStarted => {
             Ok(EventDisposition::Continue(AgentRuntimeEvent::TurnStarted))
+        }
+        ProviderTurnEvent::Output { position, event } => {
+            if let bcode_model::ProviderOutputEvent::TextDelta { text } = &event {
+                text_buffer.push_str(text);
+            }
+            Ok(EventDisposition::Continue(AgentRuntimeEvent::Output {
+                position,
+                event,
+            }))
         }
         ProviderTurnEvent::TextDelta { text } => {
             text_buffer.push_str(&text);

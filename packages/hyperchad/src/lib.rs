@@ -2142,6 +2142,7 @@ mod tests {
     fn scoped_snapshot_patch_replaces_stable_primary_tool_item() {
         let item_id = bcode_session_view_models::TranscriptViewItemId::tool("call-1");
         let draft = bcode_session_view_models::TranscriptViewItem {
+            output_location: None,
             id: item_id.clone(),
             revision: 1,
             sequence: None,
@@ -2149,6 +2150,7 @@ mod tests {
             streaming: true,
             kind: bcode_session_view_models::TranscriptViewItemKind::ToolRequestDraft {
                 draft: bcode_session_view_models::ToolRequestDraftView {
+                    output_location: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: "call-1".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -2166,6 +2168,7 @@ mod tests {
             },
         };
         let final_item = bcode_session_view_models::TranscriptViewItem {
+            output_location: None,
             id: item_id,
             revision: 2,
             sequence: Some(2),
@@ -3118,6 +3121,7 @@ mod tests {
         snapshot.composer.can_submit = true;
         snapshot.transcript.items = (0..500)
             .map(|index| bcode_session_view_models::TranscriptViewItem {
+                output_location: None,
                 id: bcode_session_view_models::TranscriptViewItemId::new(format!(
                     "performance:{index}"
                 )),

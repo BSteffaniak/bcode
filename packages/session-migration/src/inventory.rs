@@ -1426,7 +1426,7 @@ impl ReleasedEventVariantDescriptor {
 fn released_event_schema_range(kind: &str) -> (u16, u16) {
     match kind {
         "assistant_reasoning_activity" | "assistant_response_segment" => (41, 41),
-        "agent_changed" => (3, 39),
+        "agent_changed" => (3, 41),
         "assistant_reasoning_delta"
         | "assistant_reasoning_message"
         | "skill_activated"
@@ -1434,40 +1434,40 @@ fn released_event_schema_range(kind: &str) -> (u16, u16) {
         | "skill_deactivated"
         | "skill_invocation_failed"
         | "skill_invoked"
-        | "skill_suggested" => (9, 39),
-        "context_compacted" => (6, 39),
+        | "skill_suggested" => (9, 41),
+        "context_compacted" => (6, 41),
         "context_usage_observed" => (26, 31),
-        "provider_context_compacted" => (26, 39),
-        "execution_session_created" | "opaque_event" => (39, 39),
+        "provider_context_compacted" => (26, 41),
+        "execution_session_created" => (39, 41),
+        "opaque_event" => (39, 39),
         "interactive_tool_request_created" | "interactive_tool_request_resolved" => (25, 35),
-        "legacy_event"
-        | "legacy_turn_finished"
-        | "legacy_turn_started"
-        | "request_context_observed" => (32, 39),
-        "legacy_tool_invocation_presentation" | "reasoning_changed" => (25, 39),
-        "model_turn_cancel_requested" => (17, 39),
-        "model_turn_finished" | "model_turn_started" => (4, 39),
-        "model_usage" => (5, 39),
-        "permission_requested" | "permission_resolved" => (2, 39),
+        "legacy_event" | "legacy_turn_finished" | "legacy_turn_started" => (32, 39),
+        "request_context_observed" => (32, 41),
+        "legacy_tool_invocation_presentation" => (25, 39),
+        "reasoning_changed" => (25, 41),
+        "model_turn_cancel_requested" => (17, 41),
+        "model_turn_finished" | "model_turn_started" => (4, 41),
+        "model_usage" => (5, 41),
+        "permission_requested" | "permission_resolved" => (2, 41),
         "plugin_automation_turn_finished" | "plugin_automation_turn_started" => (29, 32),
-        "plugin_status_note" => (29, 39),
-        "ralph_lifecycle" => (23, 39),
+        "plugin_status_note" => (29, 41),
+        "ralph_lifecycle" => (23, 41),
         "runtime_work_cancel_requested" | "runtime_work_finished" | "runtime_work_started" => {
-            (11, 39)
+            (11, 41)
         }
-        "runtime_work_progress" => (18, 39),
-        "session_forked" => (22, 39),
-        "session_imported" => (16, 39),
-        "session_renamed" | "trace_event" => (7, 39),
+        "runtime_work_progress" => (18, 41),
+        "session_forked" => (22, 41),
+        "session_imported" => (16, 41),
+        "session_renamed" | "trace_event" => (7, 41),
         "tool_contribution"
         | "tool_exchange_requested"
         | "tool_exchange_resolved"
-        | "tool_invocation_lifecycle" => (35, 39),
-        "tool_contribution_placed" => (38, 39),
+        | "tool_invocation_lifecycle" => (35, 41),
+        "tool_contribution_placed" => (38, 41),
         "tool_invocation_presentation" => (21, 25),
-        "tool_invocation_result_recorded" => (37, 39),
+        "tool_invocation_result_recorded" => (37, 41),
         "tool_invocation_stream" => (12, 39),
-        "working_directory_changed" => (15, 39),
+        "working_directory_changed" => (15, 41),
         "assistant_delta"
         | "assistant_message"
         | "client_attached"
@@ -1475,9 +1475,9 @@ fn released_event_schema_range(kind: &str) -> (u16, u16) {
         | "model_changed"
         | "session_created"
         | "system_message"
-        | "tool_call_finished"
         | "tool_call_requested"
-        | "user_message" => (1, 39),
+        | "user_message" => (1, 41),
+        "tool_call_finished" => (1, 39),
         _ => unreachable!("released event inventory must declare a schema range"),
     }
 }
@@ -2096,7 +2096,7 @@ pub struct MigrationStepDescriptor {
     pub target_writer_epoch: u32,
 }
 
-pub const MIGRATION_STEPS: [MigrationStepDescriptor; 4] = [
+pub const MIGRATION_STEPS: [MigrationStepDescriptor; 5] = [
     MigrationStepDescriptor {
         id: "session-writer-epoch-1-to-2",
         source_writer_epoch: 1,
@@ -2116,6 +2116,11 @@ pub const MIGRATION_STEPS: [MigrationStepDescriptor; 4] = [
         id: "session-writer-epoch-4-to-5",
         source_writer_epoch: 4,
         target_writer_epoch: 5,
+    },
+    MigrationStepDescriptor {
+        id: "session-writer-epoch-5-to-6",
+        source_writer_epoch: 5,
+        target_writer_epoch: 6,
     },
 ];
 
@@ -2158,18 +2163,21 @@ pub const RELEASED_WRITER_SCHEMA_COMBINATIONS: &[ReleasedWriterSchemaDescriptor]
         writer_epoch: 4,
         event_schema: 39,
     },
+    ReleasedWriterSchemaDescriptor {
+        writer_epoch: 5,
+        event_schema: 41,
+    },
 ];
 
 /// Released historical writer epochs that must migrate to [`CURRENT_WRITER_EPOCH`].
-pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4];
+pub const RELEASED_HISTORICAL_WRITER_EPOCHS: &[u32] = &[1, 2, 3, 4, 5];
 
 /// Released historical event schemas currently evidenced by Git history.
 ///
-/// Schemas 33, 34, and 36 were never declared. Schemas 40 and 41 are unreleased/current
-/// development formats and therefore are not historical migration input.
+/// Schemas 33, 34, 36, and 40 were never released.
 pub const RELEASED_HISTORICAL_EVENT_SCHEMAS: &[u16] = &[
     1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26,
-    27, 28, 29, 30, 31, 32, 35, 37, 38, 39,
+    27, 28, 29, 30, 31, 32, 35, 37, 38, 39, 41,
 ];
 
 /// Current event schema emitted by this build.
@@ -2426,7 +2434,7 @@ mod tests {
             released_fixture_writer_coverage(&manifest)
                 .into_keys()
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from([1, 2, 3, 4])
+            BTreeSet::from([1, 2, 3, 4, 5])
         );
         assert_eq!(
             released_fixture_schema_coverage(&manifest).get(&28),
@@ -2628,6 +2636,10 @@ mod tests {
                 ReleasedWriterSchemaDescriptor {
                     writer_epoch: 4,
                     event_schema: 39,
+                },
+                ReleasedWriterSchemaDescriptor {
+                    writer_epoch: 5,
+                    event_schema: 41,
                 },
             ]
         );

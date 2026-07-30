@@ -35,8 +35,10 @@ use super::pending_submission::PendingSubmission;
 use super::pending_submissions::PendingSubmissions;
 use super::theme::{PresentedTheme, ResolvedTheme};
 use super::timeline_dialog::TimelineEntry;
-use super::transcript::{TranscriptItem, TranscriptItemKind, terminal_item_from_shared};
-use super::transcript_document::{TranscriptDocument, TranscriptDocumentDamage};
+use super::transcript::{TranscriptItem, terminal_item_from_shared};
+use super::transcript_document::{
+    SessionViewTerminalAdapter, TranscriptDocument, TranscriptDocumentDamage,
+};
 use super::transcript_layout::{TranscriptLayoutCache, VisibleTranscriptSource};
 use super::transcript_resident_window::{TranscriptResidentWindow, TranscriptWindowPolicy};
 use super::transcript_viewport::TranscriptViewport;
@@ -217,7 +219,7 @@ impl ReasoningSupport {
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TranscriptFrameObservation {
+pub struct TranscriptFrameObservation {
     pub semantic_items: Vec<(
         bcode_session_view_models::TranscriptViewItemId,
         bcode_session_view_models::ViewRevision,
@@ -238,73 +240,9 @@ pub(crate) struct TranscriptFrameObservation {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StableTranscriptAnchor {
+pub struct StableTranscriptAnchor {
     pub item_id: bcode_session_view_models::TranscriptViewItemId,
     pub row_in_item: usize,
-}
-
-#[derive(Debug, Clone, Default)]
-struct SessionViewTerminalAdapter {
-    document_revision: Option<bcode_session_view_models::ViewRevision>,
-    item_revisions: BTreeMap<
-        bcode_session_view_models::TranscriptViewItemId,
-        bcode_session_view_models::ViewRevision,
-    >,
-}
-
-impl SessionViewTerminalAdapter {
-    fn reset(&mut self) {
-        self.document_revision = None;
-        self.item_revisions.clear();
-    }
-
-    fn apply(
-        &mut self,
-        source: &bcode_session_view_models::TranscriptViewDocument,
-        target: &mut TranscriptDocument,
-    ) -> TranscriptDocumentDamage {
-        if !target.source_index_is_consistent() {
-            target.replace(source.items.iter().map(terminal_item_from_shared).collect());
-            self.item_revisions = source
-                .items
-                .iter()
-                .map(|item| (item.id.clone(), item.revision))
-                .collect();
-            self.document_revision = Some(source.revision);
-            return TranscriptDocumentDamage::FullReset;
-        }
-        let source_items = source.items.iter();
-        let ordered_source_ids = source_items
-            .clone()
-            .map(|item| item.id.clone())
-            .collect::<Vec<_>>();
-        let source_ids = ordered_source_ids.iter().cloned().collect::<BTreeSet<_>>();
-        let previous_ids = self.item_revisions.keys().cloned().collect::<BTreeSet<_>>();
-        let structural = source_ids != previous_ids;
-        let mut changed = BTreeSet::new();
-        target.retain(|item| {
-            item.source_view_item_id()
-                .is_none_or(|id| source_ids.contains(id))
-        });
-        self.item_revisions.retain(|id, _| source_ids.contains(id));
-        for item in source_items {
-            let target_has_item = target.source_index(&item.id).is_some();
-            if !target_has_item || self.item_revisions.get(&item.id) != Some(&item.revision) {
-                target.upsert_shared_item(terminal_item_from_shared(item));
-                self.item_revisions.insert(item.id.clone(), item.revision);
-                changed.insert(item.id.clone());
-            }
-        }
-        target.reorder_shared_items(&ordered_source_ids);
-        self.document_revision = Some(source.revision);
-        if structural {
-            TranscriptDocumentDamage::Structural
-        } else if changed.is_empty() {
-            TranscriptDocumentDamage::None
-        } else {
-            TranscriptDocumentDamage::Items(changed)
-        }
-    }
 }
 
 /// State owned by the terminal user interface.
@@ -334,7 +272,6 @@ pub struct BmuxApp {
     session_view: bcode_session_view::SessionView,
     transcript_window: TranscriptResidentWindow,
     latest_history_sequence: Option<u64>,
-    tool_call_contexts: BTreeMap<String, ToolCallContext>,
     pending_submissions: PendingSubmissions,
     transcript_layout: TranscriptLayoutCache,
     transcript_markdown_cache: crate::transcript_markdown_cache::TranscriptMarkdownCache,
@@ -352,8 +289,6 @@ pub struct BmuxApp {
     latest_bar_animation_started_at: Instant,
     submitted_user_message_following: SubmittedUserMessageFollowing,
     assistant_scroll_anchor: AssistantScrollAnchorState,
-    active_tool_calls: BTreeSet<String>,
-    tool_activity_seen: bool,
     pending_assistant_stream_anchor: bool,
     pending_transcript_top_anchor_sequence: Option<u64>,
     older_history: OlderHistoryState,
@@ -464,13 +399,6 @@ impl AssistantScrollAnchorState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ToolCallContext {
-    tool_name: String,
-    arguments_json: String,
-    working_directory: Option<std::path::PathBuf>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PermissionRequestInput<'a> {
     event_sequence: u64,
@@ -545,7 +473,6 @@ impl BmuxApp {
             session_view: bcode_session_view::SessionView::new(),
             transcript_window: TranscriptResidentWindow::default(),
             latest_history_sequence: None,
-            tool_call_contexts: BTreeMap::new(),
             pending_submissions: PendingSubmissions::default(),
             transcript_layout: TranscriptLayoutCache::default(),
             transcript_markdown_cache:
@@ -564,8 +491,6 @@ impl BmuxApp {
             latest_bar_animation_started_at: now,
             submitted_user_message_following: SubmittedUserMessageFollowing::Idle,
             assistant_scroll_anchor: AssistantScrollAnchorState::Idle,
-            active_tool_calls: BTreeSet::new(),
-            tool_activity_seen: false,
             pending_assistant_stream_anchor: false,
             pending_transcript_top_anchor_sequence: None,
             older_history: OlderHistoryState::new(history, has_older_history),
@@ -1078,7 +1003,6 @@ impl BmuxApp {
         self.transcript_window.replace_window(events);
         self.older_history = OlderHistoryState::new(events, has_older_history);
         self.rebuild_transcript_from_history();
-        self.reconcile_tool_state_with_resident_transcript();
         self.pending_visual_overflow_bottom = None;
     }
 
@@ -1095,7 +1019,6 @@ impl BmuxApp {
         self.older_history
             .replace_centered(events, has_older, has_newer, anchor_sequence);
         self.rebuild_transcript_from_history();
-        self.reconcile_tool_state_with_resident_transcript();
         self.pending_visual_overflow_bottom = None;
     }
 
@@ -1806,12 +1729,6 @@ impl BmuxApp {
         self.transcript_window.oldest_sequence()
     }
 
-    /// Return resident tool-call context count.
-    #[cfg(test)]
-    pub fn resident_tool_call_context_count(&self) -> usize {
-        self.tool_call_contexts.keys().count()
-    }
-
     /// Return whether older history may be available.
     #[must_use]
     pub const fn has_older_history(&self) -> bool {
@@ -2037,29 +1954,33 @@ impl BmuxApp {
 
     /// Append a plain-text system-style transcript note.
     pub fn push_system_plain(&mut self, text: String) {
-        self.transcript.push(TranscriptItem::with_format(
-            "System",
+        self.push_renderer_local_system_notice(
             text,
             bcode_session_view_models::TextFormat::PlainText,
-        ));
+        );
     }
 
     /// Append a JSON system-style transcript note.
     pub fn push_system_json(&mut self, text: String) {
-        self.transcript.push(TranscriptItem::with_format(
-            "System",
-            text,
-            bcode_session_view_models::TextFormat::Json,
-        ));
+        self.push_renderer_local_system_notice(text, bcode_session_view_models::TextFormat::Json);
     }
 
     /// Append a Markdown system-style transcript note.
     pub fn push_system_markdown(&mut self, text: String) {
-        self.transcript.push(TranscriptItem::with_format(
-            "System",
+        self.push_renderer_local_system_notice(
             text,
             bcode_session_view_models::TextFormat::Markdown,
-        ));
+        );
+    }
+
+    fn push_renderer_local_system_notice(
+        &mut self,
+        text: String,
+        format: bcode_session_view_models::TextFormat,
+    ) {
+        self.session_view
+            .push_renderer_local_system_notice(text, format);
+        self.apply_session_view_terminal_adapter();
     }
 
     /// Replace the current status line.
@@ -2182,8 +2103,6 @@ impl BmuxApp {
         };
         self.scroll_mode = TranscriptScrollMode::TransitionToEntry { sticky: false };
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
-        self.active_tool_calls.clear();
-        self.tool_activity_seen = false;
         self.pending_submissions.stage(text);
         self.input_history.reset_navigation();
         self.composer.buffer_mut().clear();
@@ -2568,9 +2487,6 @@ impl BmuxApp {
         {
             self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
         }
-        if !self.active_tool_loop() {
-            self.tool_activity_seen = false;
-        }
     }
 
     #[cfg(test)]
@@ -2579,7 +2495,14 @@ impl BmuxApp {
     }
 
     fn active_tool_loop(&self) -> bool {
-        !self.active_tool_calls.is_empty()
+        self.session_view.snapshot().tools.values().any(|tool| {
+            matches!(
+                tool.status,
+                bcode_session_view_models::ToolInvocationViewStatus::Requested
+                    | bcode_session_view_models::ToolInvocationViewStatus::Running
+                    | bcode_session_view_models::ToolInvocationViewStatus::Waiting
+            )
+        })
     }
 
     fn start_transcript_scroll_animation(&mut self, top_row: usize) {
@@ -2625,9 +2548,6 @@ impl BmuxApp {
         let events = self.transcript_window.events().to_vec();
         self.session_view.clear_history_window();
         self.session_view_terminal_adapter.reset();
-        self.transcript.replace(Vec::new());
-        self.tool_call_contexts.clear();
-        self.active_tool_calls.clear();
         for event in &events {
             self.session_view.apply_event(event);
             self.apply_session_event(event, SessionEventApplication::Replay);
@@ -2647,7 +2567,6 @@ impl BmuxApp {
                 .mark_dropped_history_before(new_oldest_sequence);
         }
         self.rebuild_transcript_from_history();
-        self.reconcile_tool_state_with_resident_transcript();
         self.viewport.scroll_to_bottom(&mut self.older_history);
         self.pending_visual_overflow_bottom = None;
     }
@@ -2666,15 +2585,9 @@ impl BmuxApp {
             && self.viewport.at_bottom_threshold()
             && self.transcript_scroll_animation.is_none()
             && !self.manual_transcript_scroll_active()
-            && self.active_tool_calls.is_empty()
+            && !self.active_tool_loop()
             && !self.pending_assistant_stream_anchor
             && !self.older_history.loading()
-    }
-
-    fn reconcile_tool_state_with_resident_transcript(&mut self) {
-        let referenced = referenced_tool_call_ids(self.transcript.items());
-        self.tool_call_contexts
-            .retain(|tool_call_id, _| referenced.contains(tool_call_id));
     }
 
     /// Prepend older history and preserve the current viewport.
@@ -2701,7 +2614,6 @@ impl BmuxApp {
             self.latest_history_sequence = events.last().map(|event| event.sequence);
         }
         self.rebuild_transcript_from_history();
-        self.reconcile_tool_state_with_resident_transcript();
         self.older_history.update_cursor(events, has_more);
         self.older_history.set_loading(false);
         if self.older_history.has_older_history() {
@@ -2723,7 +2635,6 @@ impl BmuxApp {
         self.latest_history_sequence = events.last().map(|event| event.sequence);
         self.transcript_window.append_history(events);
         self.rebuild_transcript_from_history();
-        self.reconcile_tool_state_with_resident_transcript();
         self.older_history.update_newer_cursor(events, has_more);
         self.older_history.set_loading_newer(false);
         if self.older_history.has_newer_history() {
@@ -2764,6 +2675,10 @@ impl BmuxApp {
     pub fn absorb_session_live_event(&mut self, event: &SessionLiveEvent) {
         self.session_view.apply_live_event(event);
         self.apply_session_view_terminal_adapter();
+        self.apply_session_live_event_side_effects(event);
+    }
+
+    fn apply_session_live_event_side_effects(&mut self, event: &SessionLiveEvent) {
         match &event.kind {
             SessionLiveEventKind::AssistantTextStreamUpdated { .. } => {
                 let should_anchor = self.should_anchor_new_assistant_stream();
@@ -2797,7 +2712,7 @@ impl BmuxApp {
             | SessionLiveEventKind::ToolPresentationUpdated { .. }
             | SessionLiveEventKind::RequestContextOccupancyChanged { .. }
             | SessionLiveEventKind::ToolRequestDraft { .. } => {
-                // SessionView owns semantic replacement/removal; reconciliation runs below.
+                // SessionView already owns and projects the semantic update.
             }
             SessionLiveEventKind::ToolInvocationProgress { .. } => {
                 self.apply_shared_runtime_work_activity();
@@ -2825,11 +2740,9 @@ impl BmuxApp {
         }
         match &event.kind {
             SessionEventKind::UserMessage { text, .. } => {
-                self.active_tool_calls.clear();
-                self.tool_activity_seen = false;
                 self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
                 self.pending_assistant_stream_anchor = false;
-                self.push_committed_user_message(
+                self.apply_committed_user_message(
                     event.sequence,
                     text,
                     event.timestamp_ms,
@@ -2853,24 +2766,14 @@ impl BmuxApp {
                 tool_call_id,
                 tool_name,
                 arguments_json,
-                working_directory,
                 ..
             } => {
-                self.record_shared_active_tool_requested(tool_call_id);
-                self.tool_activity_seen = true;
-                self.apply_tool_request_side_effects(
-                    (event.sequence, event.timestamp_ms),
-                    tool_call_id,
-                    tool_name,
-                    arguments_json,
-                    working_directory.clone(),
-                );
+                self.apply_tool_request_side_effects(tool_call_id, tool_name, arguments_json);
             }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
                 if application.live_activity() {
                     self.set_activity(ActivityState::PreparingFollowUpRequest);
                 }
-                self.finish_shared_active_tool_call(&record.invocation_id);
                 self.push_tool_result(
                     &record.invocation_id,
                     &record.model_output,
@@ -2968,16 +2871,16 @@ impl BmuxApp {
             }
             SessionEventKind::ToolInvocationLifecycle { event: lifecycle } => {
                 if lifecycle.stage == bcode_session_models::ToolInvocationLifecycleStage::Started
-                    && let Some(context) = self
-                        .tool_call_contexts
+                    && application.live_activity()
+                    && let Some(tool_name) = self
+                        .session_view
+                        .snapshot()
+                        .tools
                         .get(&lifecycle.invocation_id)
-                        .cloned()
+                        .and_then(|tool| tool.tool_name.clone())
                 {
-                    self.apply_tool_started(
-                        &lifecycle.invocation_id,
-                        &context.tool_name,
-                        application,
-                    );
+                    self.set_file_activity(&tool_name);
+                    tool_name.clone_into(&mut self.status);
                 }
                 if application.live_activity() {
                     self.apply_shared_runtime_work_activity();
@@ -3261,7 +3164,7 @@ impl BmuxApp {
         self.pending_submissions.remove(text);
     }
 
-    fn push_committed_user_message(
+    fn apply_committed_user_message(
         &mut self,
         sequence: u64,
         text: &str,
@@ -3273,29 +3176,9 @@ impl BmuxApp {
             .unwrap_or_else(|| text.to_owned());
         self.input_history
             .push_committed(sequence, timestamp_ms, &text);
+        self.remove_pending_submission(&text);
         if application.live_activity() {
-            self.push_live_user_message(sequence, &text, timestamp_ms);
-        } else {
-            self.push_user_message(sequence, &text, timestamp_ms);
-        }
-    }
-
-    fn push_live_user_message(&mut self, sequence: u64, text: &str, timestamp_ms: u64) {
-        self.set_activity(ActivityState::PreparingModelRequest);
-        self.push_user_message(sequence, text, timestamp_ms);
-    }
-
-    fn push_user_message(&mut self, sequence: u64, text: &str, timestamp_ms: u64) {
-        self.remove_pending_submission(text);
-        if sequence == 0 {
-            self.transcript.push(
-                TranscriptItem::with_format(
-                    "You",
-                    text.to_owned(),
-                    bcode_session_view_models::TextFormat::Markdown,
-                )
-                .with_event_metadata(sequence, timestamp_ms),
-            );
+            self.set_activity(ActivityState::PreparingModelRequest);
         }
     }
 
@@ -3444,82 +3327,24 @@ impl BmuxApp {
         }
     }
 
-    fn projected_tool_request_context(
-        &self,
-        tool_call_id: &str,
-        tool_name: &str,
-        arguments_json: &str,
-        working_directory: Option<std::path::PathBuf>,
-    ) -> ToolCallContext {
-        let shared_tool = self.session_view.snapshot().tools.get(tool_call_id);
-        ToolCallContext {
-            tool_name: shared_tool
-                .and_then(|tool| tool.tool_name.clone())
-                .unwrap_or_else(|| tool_name.to_owned()),
-            arguments_json: shared_tool
-                .and_then(|tool| tool.arguments_json.clone())
-                .unwrap_or_else(|| arguments_json.to_owned()),
-            working_directory: shared_tool
-                .and_then(|tool| tool.working_directory.clone())
-                .or(working_directory),
-        }
-    }
-
-    fn record_shared_active_tool_requested(&mut self, tool_call_id: &str) {
-        let Some(tool) = self.session_view.snapshot().tools.get(tool_call_id) else {
-            self.active_tool_calls.insert(tool_call_id.to_owned());
-            return;
-        };
-        if !matches!(
-            tool.status,
-            bcode_session_view_models::ToolInvocationViewStatus::Finished
-                | bcode_session_view_models::ToolInvocationViewStatus::Cancelled
-                | bcode_session_view_models::ToolInvocationViewStatus::Failed
-        ) {
-            self.active_tool_calls.insert(tool_call_id.to_owned());
-        }
-    }
-
-    fn finish_shared_active_tool_call(&mut self, tool_call_id: &str) {
-        let finished = self
-            .session_view
-            .snapshot()
-            .tools
-            .get(tool_call_id)
-            .is_none_or(|tool| {
-                matches!(
-                    tool.status,
-                    bcode_session_view_models::ToolInvocationViewStatus::Finished
-                        | bcode_session_view_models::ToolInvocationViewStatus::Cancelled
-                        | bcode_session_view_models::ToolInvocationViewStatus::Failed
-                )
-            });
-        if finished {
-            self.active_tool_calls.remove(tool_call_id);
-        }
-    }
-
     fn apply_tool_request_side_effects(
         &mut self,
-        _event_metadata: (u64, u64),
         tool_call_id: &str,
         tool_name: &str,
         arguments_json: &str,
-        working_directory: Option<std::path::PathBuf>,
     ) {
-        let projected_context = self.projected_tool_request_context(
-            tool_call_id,
-            tool_name,
-            arguments_json,
-            working_directory,
-        );
-        self.tool_call_contexts
-            .insert(tool_call_id.to_owned(), projected_context.clone());
+        let shared_tool = self.session_view.snapshot().tools.get(tool_call_id);
+        let projected_tool_name = shared_tool
+            .and_then(|tool| tool.tool_name.clone())
+            .unwrap_or_else(|| tool_name.to_owned());
+        let projected_arguments = shared_tool
+            .and_then(|tool| tool.arguments_json.clone())
+            .unwrap_or_else(|| arguments_json.to_owned());
         self.set_activity(ActivityState::RunningTool {
-            name: projected_context.tool_name,
+            name: projected_tool_name,
         });
-        self.status = tool_request_status(&projected_context.arguments_json)
-            .unwrap_or_else(|| "started".to_owned());
+        self.status =
+            tool_request_status(&projected_arguments).unwrap_or_else(|| "started".to_owned());
     }
 
     fn push_permission_request(&mut self, input: PermissionRequestInput<'_>) {
@@ -3586,9 +3411,6 @@ impl BmuxApp {
         } else {
             "permission denied"
         };
-        if !approved && let Some(tool_call_id) = self.permission_tool_call_id(permission_id) {
-            self.active_tool_calls.remove(&tool_call_id);
-        }
         status.clone_into(&mut self.status);
     }
 
@@ -3596,15 +3418,6 @@ impl BmuxApp {
         self.set_activity(ActivityState::RunningTool {
             name: tool_name.to_owned(),
         });
-    }
-
-    fn set_activity_for_tool_call(&mut self, tool_call_id: &str, fallback_tool_name: &str) {
-        if let Some(context) = self.tool_call_contexts.get(tool_call_id) {
-            let tool_name = context.tool_name.clone();
-            self.set_file_activity(&tool_name);
-        } else {
-            self.set_file_activity(fallback_tool_name);
-        }
     }
 
     const fn tool_call_file_status(_tool_call_id: &str) -> Option<String> {
@@ -3645,49 +3458,6 @@ impl BmuxApp {
         application: SessionEventApplication,
     ) {
         self.update_tool_result_status(tool_call_id, is_error, application);
-    }
-
-    fn apply_tool_started(
-        &mut self,
-        tool_call_id: &str,
-        tool_name: &str,
-        application: SessionEventApplication,
-    ) {
-        self.active_tool_calls.insert(tool_call_id.to_owned());
-        self.tool_activity_seen = true;
-        if application.live_activity() {
-            self.set_activity_for_tool_call(tool_call_id, tool_name);
-            if let Some(status) = Self::tool_call_file_status(tool_call_id) {
-                self.status = status;
-            } else {
-                tool_name.clone_into(&mut self.status);
-            }
-        }
-    }
-
-    fn permission_tool_call_id(&self, permission_id: &str) -> Option<String> {
-        self.session_view
-            .snapshot()
-            .permissions
-            .iter()
-            .find(|permission| permission.permission_id == permission_id)
-            .map(|permission| permission.tool_call_id.clone())
-            .or_else(|| {
-                self.session_view
-                    .snapshot()
-                    .transcript
-                    .items
-                    .iter()
-                    .rev()
-                    .find_map(|item| match &item.kind {
-                        bcode_session_view_models::TranscriptViewItemKind::Permission {
-                            permission,
-                        } if permission.permission_id == permission_id => {
-                            Some(permission.tool_call_id.clone())
-                        }
-                        _ => None,
-                    })
-            })
     }
 
     fn push_model_usage(
@@ -3749,11 +3519,6 @@ impl BmuxApp {
                 || model_turn_outcome_label(outcome).to_owned(),
                 ToOwned::to_owned,
             );
-        }
-        if let Some(last) = self.transcript.last_mut()
-            && last.role == "Assistant"
-        {
-            last.finish_streaming();
         }
         if application.live_activity() {
             self.set_activity(ActivityState::Idle);
@@ -3893,10 +3658,13 @@ impl BmuxApp {
                 approved,
                 ..
             } => {
-                let tool_name = self.tool_call_contexts.get(tool_call_id).map_or_else(
-                    || "unknown tool".to_owned(),
-                    |context| context.tool_name.clone(),
-                );
+                let tool_name = self
+                    .session_view
+                    .snapshot()
+                    .tools
+                    .get(tool_call_id)
+                    .and_then(|tool| tool.tool_name.clone())
+                    .unwrap_or_else(|| "unknown tool".to_owned());
                 self.set_activity(if approved.is_none() {
                     ActivityState::WaitingPermission { name: tool_name }
                 } else {
@@ -4407,40 +4175,15 @@ const fn event_breaks_sticky_entry_anchor(event: &SessionEvent) -> bool {
     matches!(&event.kind, SessionEventKind::PermissionRequested { .. })
 }
 
-fn referenced_tool_call_ids(items: &[TranscriptItem]) -> BTreeSet<String> {
-    let mut ids = BTreeSet::new();
-    for item in items {
-        match item.kind() {
-            TranscriptItemKind::ToolRequest { tool_call_id, .. }
-            | TranscriptItemKind::ToolResult { tool_call_id, .. }
-            | TranscriptItemKind::PermissionRequest { tool_call_id, .. } => {
-                ids.insert(tool_call_id.clone());
-            }
-            TranscriptItemKind::ToolRequestDraft { draft } => {
-                ids.insert(draft.tool_call_id.clone());
-            }
-            TranscriptItemKind::UserMessage
-            | TranscriptItemKind::AssistantMessage
-            | TranscriptItemKind::ReasoningMessage
-            | TranscriptItemKind::Usage { .. }
-            | TranscriptItemKind::PermissionResult { .. }
-            | TranscriptItemKind::System
-            | TranscriptItemKind::Meta
-            | TranscriptItemKind::Skill
-            | TranscriptItemKind::SkillError
-            | TranscriptItemKind::ToolContribution { .. }
-            | TranscriptItemKind::Generic => {}
-        }
-    }
-    ids
-}
-
 const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
     match &event.kind {
         SessionEventKind::UserMessage { .. }
         | SessionEventKind::AssistantDelta { .. }
         | SessionEventKind::AssistantMessage { .. }
         | SessionEventKind::AssistantResponseSegment { .. }
+        | SessionEventKind::PositionedAssistantResponseSegment { .. }
+        | SessionEventKind::PositionedAssistantReasoningActivity { .. }
+        | SessionEventKind::PositionedToolCallRequested { .. }
         | SessionEventKind::SystemMessage { .. }
         | SessionEventKind::ToolCallRequested { .. }
         | SessionEventKind::ToolInvocationResultRecorded { .. }
@@ -4492,6 +4235,7 @@ const fn event_affects_transcript_rows(event: &SessionEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcript::TranscriptItemKind;
 
     fn snapshot(
         estimated: bool,
@@ -4894,6 +4638,88 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn raw_durable_handlers_cannot_create_or_finalize_terminal_rows() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let event = |sequence, kind| bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        };
+
+        app.apply_session_event(
+            &event(
+                0,
+                bcode_session_models::SessionEventKind::UserMessage {
+                    client_id: bcode_session_models::ClientId::new(),
+                    text: "raw user".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            ),
+            SessionEventApplication::Live,
+        );
+        assert!(app.transcript.items().is_empty());
+
+        app.session_view
+            .apply_live_event(&bcode_session_models::SessionLiveEvent {
+                session_id,
+                kind: bcode_session_models::SessionLiveEventKind::AssistantTextDelta {
+                    turn_id: "turn-1".to_owned(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
+                    text: "streaming".to_owned(),
+                },
+            });
+        app.apply_session_view_terminal_adapter();
+        let before = app.transcript.clone();
+        app.apply_session_event(
+            &event(
+                1,
+                bcode_session_models::SessionEventKind::ModelTurnFinished {
+                    turn_id: "turn-1".to_owned(),
+                    outcome: bcode_session_models::ModelTurnOutcome::Completed,
+                    message: None,
+                },
+            ),
+            SessionEventApplication::Live,
+        );
+        assert_eq!(app.transcript, before);
+    }
+
+    #[test]
+    fn raw_live_handlers_cannot_create_or_finalize_terminal_rows() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let live = bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::AssistantTextDelta {
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                text: "raw live assistant".to_owned(),
+            },
+        };
+
+        app.apply_session_live_event_side_effects(&live);
+        assert!(app.transcript.items().is_empty());
+
+        app.session_view.apply_live_event(&live);
+        app.apply_session_view_terminal_adapter();
+        let before = app.transcript.clone();
+        app.apply_session_live_event_side_effects(&bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::AssistantReasoningDelta {
+                turn_id: "turn-1".to_owned(),
+                text: "raw reasoning".to_owned(),
+            },
+        });
+        assert_eq!(app.transcript, before);
     }
 
     #[test]
@@ -6271,13 +6097,13 @@ mod tests {
     }
 
     #[test]
-    fn active_tool_calls_follow_shared_tool_status() {
+    fn active_tool_loop_follows_shared_tool_status() {
         let session_id = SessionId::new();
         let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         let event = |sequence, kind| shared_projection_adapter_event(session_id, sequence, kind);
 
         app.absorb_session_event(&event(1, shared_tool_call_request_kind()));
-        assert!(app.active_tool_calls.contains("tool-shared"));
+        assert!(app.active_tool_loop());
         assert!(matches!(
             app.session_view_snapshot()
                 .tools
@@ -6302,7 +6128,7 @@ mod tests {
             },
         ));
 
-        assert!(!app.active_tool_calls.contains("tool-shared"));
+        assert!(!app.active_tool_loop());
         assert!(matches!(
             app.session_view_snapshot()
                 .tools
@@ -6337,18 +6163,6 @@ mod tests {
             app.status(),
             tool_request_status(tool.arguments_json.as_deref().expect("arguments"))
                 .unwrap_or_else(|| "started".to_owned())
-        );
-        let context = app
-            .tool_call_contexts
-            .get("tool-shared")
-            .expect("terminal tool context");
-        assert_eq!(
-            context.tool_name,
-            tool.tool_name.as_deref().unwrap_or_default()
-        );
-        assert_eq!(
-            context.arguments_json,
-            tool.arguments_json.as_deref().unwrap_or_default()
         );
         let shared = app
             .session_view_snapshot()

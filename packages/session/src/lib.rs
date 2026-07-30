@@ -3367,6 +3367,7 @@ mod tests {
                 .expect("history before live updates");
             let assistant =
                 |revision, operation| SessionLiveEventKind::AssistantTextStreamUpdated {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     segment_id: "segment-0".to_owned(),
                     segment_order: 0,
@@ -3395,6 +3396,7 @@ mod tests {
                     },
                 ),
                 SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     activity_id: "activity-0".to_owned(),
                     activity_order: 0,
@@ -3652,6 +3654,7 @@ mod tests {
             .expect("session should create");
         let publish = |revision, expected_offset, text: &str| {
             SessionLiveEventKind::AssistantTextStreamUpdated {
+                output_position: None,
                 turn_id: "turn-1".to_owned(),
                 segment_id: "segment-0".to_owned(),
                 segment_order: 0,
@@ -3681,6 +3684,7 @@ mod tests {
         assert!(matches!(
             &attachment.live_checkpoints[0].kind,
             SessionLiveEventKind::AssistantTextStreamUpdated {
+                    output_position: None,
                 update: bcode_session_models::TextStreamUpdate {
                     first_revision: 2,
                     revision: 2,
@@ -3734,6 +3738,7 @@ mod tests {
             .publish_live_event(
                 session.id,
                 SessionLiveEventKind::AssistantTextStreamUpdated {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     segment_id: "segment-0".to_owned(),
                     segment_order: 0,
@@ -3768,6 +3773,7 @@ mod tests {
             .publish_live_event(
                 session.id,
                 SessionLiveEventKind::AssistantTextStreamUpdated {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     segment_id: "segment-0".to_owned(),
                     segment_order: 0,
@@ -3790,6 +3796,7 @@ mod tests {
         assert!(matches!(
             &attachment.live_checkpoints[0].kind,
             SessionLiveEventKind::AssistantTextStreamUpdated {
+                    output_position: None,
                 update: bcode_session_models::TextStreamUpdate {
                     operation: bcode_session_models::TextStreamOperation::Checkpoint {
                         start_offset,
@@ -3816,6 +3823,7 @@ mod tests {
             .expect("session should create");
         let publish = |part_id: &str, generation, revision, expected_offset, text: &str| {
             SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                output_position: None,
                 turn_id: "turn-1".to_owned(),
                 activity_id: "activity-1".to_owned(),
                 activity_order: 0,
@@ -3844,6 +3852,7 @@ mod tests {
             .publish_live_event(
                 session.id,
                 SessionLiveEventKind::AssistantTextStreamUpdated {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     segment_id: "part-0".to_owned(),
                     segment_order: 0,
@@ -3868,6 +3877,7 @@ mod tests {
         assert!(attachment.live_checkpoints.iter().any(|event| matches!(
             &event.kind,
             SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                    output_position: None,
                 part_id,
                 update: bcode_session_models::TextStreamUpdate {
                     operation: bcode_session_models::TextStreamOperation::Checkpoint {
@@ -3924,6 +3934,7 @@ mod tests {
             .publish_live_event(
                 session.id,
                 SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     activity_id: "activity-1".to_owned(),
                     activity_order: 0,
@@ -3975,6 +3986,7 @@ mod tests {
         assert!(matches!(
             &attachment.live_checkpoints[0].kind,
             SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                    output_position: None,
                 part_id,
                 update: bcode_session_models::TextStreamUpdate { generation: 1, .. },
                 ..
@@ -3994,6 +4006,7 @@ mod tests {
             .publish_live_event(
                 session.id,
                 SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     activity_id: "activity-1".to_owned(),
                     activity_order: 0,
@@ -4020,6 +4033,7 @@ mod tests {
         assert!(matches!(
             &attachment.live_checkpoints[0].kind,
             SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                    output_position: None,
                 update: bcode_session_models::TextStreamUpdate {
                     operation: bcode_session_models::TextStreamOperation::Checkpoint {
                         start_offset,
@@ -6422,8 +6436,12 @@ mod tests {
                 include_str!("../fixtures/migrations/future-schema-v41.json"),
             ),
             (
-                "future-schema-v42.json",
-                include_str!("../fixtures/migrations/future-schema-v42.json"),
+                "current-schema-v42.json",
+                include_str!("../fixtures/migrations/current-schema-v42.json"),
+            ),
+            (
+                "future-schema-v43.json",
+                include_str!("../fixtures/migrations/future-schema-v43.json"),
             ),
             (
                 "malformed-json-v39.json",

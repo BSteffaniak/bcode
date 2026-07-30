@@ -17,23 +17,23 @@ use bcode_config::AuthMode;
 use bcode_model::{
     AckResponse, CancelTurnRequest, CompactContextRequest, CompactContextResponse, ContentBlock,
     ContextManagementCapabilities, ContextManagementCapabilitiesRequest, FinishTurnRequest,
-    MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelCapability, ModelCatalogHints,
-    ModelCatalogPolicy, ModelCatalogSupportHint, ModelInfo, ModelList, ModelListAuthority,
-    ModelListRequest, ModelMessage, ModelMetadataSource, ModelPricingInfo, ModelPricingSource,
-    ModelPricingUnit, ModelReasoningCapabilitySource, ModelTokenPrice, ModelTurnRequest,
-    NativeWebSearchRequest, NativeWebSearchResponse, NativeWebSearchResult, OP_AUTH_PRIME,
-    OP_AUTH_RESET_CREDIT_CONSUME, OP_AUTH_RESET_CREDITS, OP_AUTH_USAGE, OP_CANCEL_TURN,
-    OP_CAPABILITIES, OP_COMPACT_CONTEXT, OP_CONTEXT_MANAGEMENT_CAPABILITIES, OP_FINISH_TURN,
-    OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG,
-    OP_VERIFY_MODEL, PollTurnEventsRequest, PollTurnEventsResponse, ProviderAuthCandidate,
-    ProviderCapabilities, ProviderCapability, ProviderContextFormat, ProviderError,
-    ProviderErrorCategory, ProviderErrorSource, ProviderRequestContext, ProviderRequestProjection,
-    ProviderRetryRule, ProviderRetryRuleMatch, ProviderTurnEvent, StartTurnResponse, StopReason,
-    TokenUsage, ToolCall, ValidateConfigResponse,
+    MODEL_PROVIDER_INTERFACE_ID, MODEL_PROVIDER_INTERFACE_ID_V2, MessageRole, ModelCapability,
+    ModelCatalogHints, ModelCatalogPolicy, ModelCatalogSupportHint, ModelInfo, ModelList,
+    ModelListAuthority, ModelListRequest, ModelMessage, ModelMetadataSource, ModelPricingInfo,
+    ModelPricingSource, ModelPricingUnit, ModelReasoningCapabilitySource, ModelTokenPrice,
+    ModelTurnRequest, NativeWebSearchRequest, NativeWebSearchResponse, NativeWebSearchResult,
+    OP_AUTH_PRIME, OP_AUTH_RESET_CREDIT_CONSUME, OP_AUTH_RESET_CREDITS, OP_AUTH_USAGE,
+    OP_CANCEL_TURN, OP_CAPABILITIES, OP_COMPACT_CONTEXT, OP_CONTEXT_MANAGEMENT_CAPABILITIES,
+    OP_FINISH_TURN, OP_MODELS, OP_NATIVE_WEB_SEARCH, OP_POLL_TURN_EVENTS, OP_START_TURN,
+    OP_VALIDATE_CONFIG, OP_VERIFY_MODEL, PollTurnEventsRequest, PollTurnEventsResponse,
+    ProviderAuthCandidate, ProviderCapabilities, ProviderCapability, ProviderContextFormat,
+    ProviderError, ProviderErrorCategory, ProviderErrorSource, ProviderRequestContext,
+    ProviderRequestProjection, ProviderRetryRule, ProviderRetryRuleMatch, ProviderTurnEvent,
+    StartTurnResponse, StopReason, TokenUsage, ToolCall, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::{
-    ProviderRuntime, retry_hint_from_json_value, retry_hint_from_response_parts,
-    sanitize_provider_diagnostic,
+    ProviderOutputPositionAllocator, ProviderRuntime, retry_hint_from_json_value,
+    retry_hint_from_response_parts, sanitize_provider_diagnostic,
 };
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
@@ -172,6 +172,8 @@ impl Default for OpenAiCompatibleProviderPlugin {
 #[derive(Debug, Clone, Default)]
 struct TurnState {
     events: Arc<Mutex<VecDeque<ProviderTurnEvent>>>,
+    output_positions: Arc<Mutex<ProviderOutputPositionAllocator>>,
+    positioned_output: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
 }
@@ -222,9 +224,21 @@ struct OpenAiAuthTokenResponse {
 
 impl TurnState {
     fn push(&self, event: ProviderTurnEvent) {
+        let event = if self.positioned_output.load(Ordering::Acquire) {
+            match self.output_positions.lock() {
+                Ok(mut positions) => positions.position(event),
+                Err(_) => event,
+            }
+        } else {
+            event
+        };
         if let Ok(mut events) = self.events.lock() {
             events.push_back(event);
         }
+    }
+
+    fn enable_positioned_output(&self) {
+        self.positioned_output.store(true, Ordering::Release);
     }
 
     fn drain(&self) -> Vec<ProviderTurnEvent> {
@@ -1139,7 +1153,10 @@ impl OpenAiCompatibleProviderPlugin {
         if context.request.interface_id == AUTH_INTERFACE_ID {
             return self.invoke_auth_service(&context.request);
         }
-        if context.request.interface_id != MODEL_PROVIDER_INTERFACE_ID {
+        if !matches!(
+            context.request.interface_id.as_str(),
+            MODEL_PROVIDER_INTERFACE_ID | MODEL_PROVIDER_INTERFACE_ID_V2
+        ) {
             return ServiceResponse::error(
                 "unsupported_interface",
                 "unsupported model provider service interface",
@@ -1160,7 +1177,10 @@ impl OpenAiCompatibleProviderPlugin {
             OP_AUTH_RESET_CREDITS => self.auth_reset_credits(&context.request),
             OP_AUTH_RESET_CREDIT_CONSUME => self.auth_reset_credit_consume(&context.request),
             OP_NATIVE_WEB_SEARCH => self.native_web_search(&context.request),
-            OP_START_TURN => self.start_turn(&context.request),
+            OP_START_TURN => self.start_turn(
+                &context.request,
+                context.request.interface_id == MODEL_PROVIDER_INTERFACE_ID_V2,
+            ),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
             OP_CANCEL_TURN => self.cancel_turn(&context.request),
             OP_FINISH_TURN => self.finish_turn(&context.request),
@@ -1302,7 +1322,7 @@ impl OpenAiCompatibleProviderPlugin {
         }
     }
 
-    fn start_turn(&self, request: &ServiceRequest) -> ServiceResponse {
+    fn start_turn(&self, request: &ServiceRequest, positioned_output: bool) -> ServiceResponse {
         let request = match request.payload_json::<ModelTurnRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
@@ -1314,6 +1334,9 @@ impl OpenAiCompatibleProviderPlugin {
         state.next_turn += 1;
         let provider_turn_id = format!("openai-compatible-turn-{}", state.next_turn);
         let turn = TurnState::default();
+        if positioned_output {
+            turn.enable_positioned_output();
+        }
         turn.push(ProviderTurnEvent::TurnStarted);
         turn.push(ProviderTurnEvent::RequestProjection {
             projection: openai_request_projection(&request),
@@ -9090,7 +9113,7 @@ mod tests {
             let response = self.plugin.invoke_service_concurrent(NativeServiceContext {
                 plugin_id: PROVIDER_ID.to_string(),
                 request: ServiceRequest {
-                    interface_id: MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                    interface_id: MODEL_PROVIDER_INTERFACE_ID_V2.to_string(),
                     operation: operation.to_string(),
                     payload: serde_json::to_vec(request).map_err(|error| error.to_string())?,
                 },

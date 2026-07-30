@@ -96,11 +96,18 @@ struct ShellPreparationDescriptor {
     workspace_root: Option<PathBuf>,
     #[serde(default)]
     artifact_root: Option<PathBuf>,
+    timeout_ms: u64,
 }
 
 fn shell_preparation_descriptor(
     preparation: &bcode_tool::ToolPreparationRequest,
 ) -> Result<ShellPreparationDescriptor, String> {
+    let timeout_ms = preparation
+        .invocation
+        .arguments
+        .get("timeout_ms")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(DEFAULT_SHELL_TIMEOUT_MS);
     Ok(ShellPreparationDescriptor {
         workspace_root: shell_context_path(
             preparation,
@@ -114,6 +121,7 @@ fn shell_preparation_descriptor(
             bcode_tool::TOOL_ARTIFACT_CONTEXT_SCHEMA_VERSION,
             "root",
         )?,
+        timeout_ms,
     })
 }
 
@@ -633,12 +641,19 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             });
         }
     };
+    let mut arguments = request.arguments;
+    if let Some(arguments) = arguments.as_object_mut() {
+        arguments.insert(
+            "timeout_ms".to_owned(),
+            serde_json::Value::from(descriptor.timeout_ms),
+        );
+    }
     let response = match request.name.as_str() {
         "shell.run" => run_shell_tool(
             context,
             context.events,
             &request.tool_call_id,
-            request.arguments,
+            arguments,
             descriptor.workspace_root.as_deref(),
             TerminalRunPaths {
                 session_cwd: descriptor.workspace_root.as_deref(),
@@ -1257,6 +1272,7 @@ fn run_terminal_shell_command_inner(
                 &ShellVisualStreamContext {
                     columns,
                     rows,
+                    timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
                     prelude_markers,
                     progress_limits,
                     cancellation: cancellation_for_reader,
@@ -1465,6 +1481,7 @@ struct PreludeGateMarkers {
 struct ShellVisualStreamContext {
     columns: u16,
     rows: u16,
+    timeout_ms: u64,
     prelude_markers: PreludeGateMarkers,
     progress_limits: bcode_plugin_sdk::TransientProgressLimits,
     cancellation: bcode_plugin_sdk::ServiceCancellation,
@@ -1647,6 +1664,7 @@ where
                 Some(shell_recording_commit_observer(
                     events,
                     tool_call_id,
+                    visual_context.timeout_ms,
                     visual_context.progress_limits,
                     visual_context.cancellation.clone(),
                 )),
@@ -1849,6 +1867,7 @@ fn artifact_writer(path: Option<&Path>) -> Result<Box<dyn Write + Send>, String>
 fn shell_recording_commit_observer(
     events: ServiceEventEmitter,
     tool_call_id: &str,
+    timeout_ms: u64,
     limits: bcode_plugin_sdk::TransientProgressLimits,
     cancellation: bcode_plugin_sdk::ServiceCancellation,
 ) -> recording::ShellRecordingCommitObserver {
@@ -1893,11 +1912,19 @@ fn shell_recording_commit_observer(
             false
         };
         if publish_immediately {
-            let _ = presentation
-                .replace_with_artifact(&ShellLiveRecordingPayload { mode: "terminal" }, artifact);
+            let _ = presentation.replace_with_artifact(
+                &ShellLiveRecordingPayload {
+                    mode: "terminal",
+                    timeout_ms,
+                },
+                artifact,
+            );
         } else {
             let _ = presentation.replace_with_artifact_if_ready(
-                &ShellLiveRecordingPayload { mode: "terminal" },
+                &ShellLiveRecordingPayload {
+                    mode: "terminal",
+                    timeout_ms,
+                },
                 artifact,
             );
         }
@@ -2564,7 +2591,22 @@ mod tests {
             ShellPreparationDescriptor {
                 workspace_root: Some(PathBuf::from("/tmp/workspace")),
                 artifact_root: Some(PathBuf::from("/tmp/artifacts/session-1")),
+                timeout_ms: DEFAULT_SHELL_TIMEOUT_MS,
             }
+        );
+
+        let explicit = prepare_shell_tool(&preparation_request(serde_json::json!({
+            "command": "printf hello",
+            "timeout_ms": 1_234,
+        })));
+        let prepared = explicit
+            .payload_json::<bcode_tool::ToolPreparationResponse>()
+            .expect("explicit timeout preparation response");
+        assert_eq!(
+            serde_json::from_value::<ShellPreparationDescriptor>(prepared.descriptor)
+                .expect("Shell descriptor")
+                .timeout_ms,
+            1_234
         );
     }
 
@@ -2749,6 +2791,7 @@ mod tests {
         let observer = shell_recording_commit_observer(
             emitter,
             "live-recording",
+            DEFAULT_SHELL_TIMEOUT_MS,
             bcode_plugin_sdk::TransientProgressLimits {
                 max_encoded_bytes: bcode_plugin_sdk::DEFAULT_TRANSIENT_PROGRESS_MAX_ENCODED_BYTES,
                 min_interval_ms: 60_000,
@@ -3747,6 +3790,7 @@ mod tests {
         let context = ShellVisualStreamContext {
             columns: 120,
             rows: 30,
+            timeout_ms: DEFAULT_SHELL_TIMEOUT_MS,
             prelude_markers: PreludeGateMarkers::default(),
             progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
             cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
@@ -3991,6 +4035,7 @@ mod tests {
             &ShellVisualStreamContext {
                 columns: 80,
                 rows: 24,
+                timeout_ms: DEFAULT_SHELL_TIMEOUT_MS,
                 prelude_markers: PreludeGateMarkers::default(),
                 progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
                 cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
@@ -4139,6 +4184,7 @@ mod tests {
         let context = ShellVisualStreamContext {
             columns: 80,
             rows: 24,
+            timeout_ms: DEFAULT_SHELL_TIMEOUT_MS,
             prelude_markers: PreludeGateMarkers::default(),
             progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
             cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
@@ -4216,6 +4262,7 @@ mod tests {
             &ShellVisualStreamContext {
                 columns: 80,
                 rows: 24,
+                timeout_ms: DEFAULT_SHELL_TIMEOUT_MS,
                 prelude_markers: PreludeGateMarkers {
                     live: vec!["__MARK__".to_owned()],
                     replay: vec!["__MARK__".to_owned()],
@@ -4255,6 +4302,7 @@ mod tests {
             &ShellVisualStreamContext {
                 columns: 80,
                 rows: 24,
+                timeout_ms: DEFAULT_SHELL_TIMEOUT_MS,
                 prelude_markers: PreludeGateMarkers {
                     live: vec!["__MARK__".to_string()],
                     replay: vec!["__MARK__".to_string()],
@@ -4286,6 +4334,7 @@ mod tests {
             &ShellVisualStreamContext {
                 columns: 80,
                 rows: 24,
+                timeout_ms: DEFAULT_SHELL_TIMEOUT_MS,
                 prelude_markers: PreludeGateMarkers {
                     live: vec!["__MARK__".to_string()],
                     replay: Vec::new(),

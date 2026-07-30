@@ -146,9 +146,19 @@ pub struct ProviderEventValidator {
     usage_events: usize,
     text_events: usize,
     reasoning_events: usize,
+    last_output_position: Option<bcode_model::TurnOutputPosition>,
+    output_positions: BTreeMap<bcode_model::TurnOutputPosition, ConformanceOutputIdentity>,
+    output_tool_positions: BTreeMap<String, bcode_model::TurnOutputPosition>,
     reasoning_activities: BTreeMap<String, ConformanceReasoningActivity>,
     open_tool_calls: BTreeMap<String, String>,
     finished_tool_calls: Vec<bcode_model::ToolCall>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ConformanceOutputIdentity {
+    Text,
+    Reasoning(String),
+    Tool(String),
 }
 
 #[derive(Debug, Default)]
@@ -263,6 +273,9 @@ impl ProviderEventValidator {
                 }
                 self.started = true;
             }
+            ProviderTurnEvent::Output { position, event } => {
+                self.observe_positioned_output(*position, event)?;
+            }
             ProviderTurnEvent::TextDelta { text } => {
                 if text.is_empty() {
                     return violation(BASE_TURN, "provider emitted an empty text delta");
@@ -324,6 +337,84 @@ impl ProviderEventValidator {
             | ProviderTurnEvent::ProviderMetadata { .. }
             | ProviderTurnEvent::Warning { .. } => {}
         }
+        Ok(())
+    }
+
+    fn observe_positioned_output(
+        &mut self,
+        position: bcode_model::TurnOutputPosition,
+        event: &bcode_model::ProviderOutputEvent,
+    ) -> Result<(), ProviderConformanceError> {
+        use bcode_model::ProviderOutputEvent;
+
+        match event {
+            ProviderOutputEvent::TextDelta { text } => {
+                self.observe_output_position(position, ConformanceOutputIdentity::Text)?;
+                if text.is_empty() {
+                    return violation(BASE_TURN, "provider emitted an empty text delta");
+                }
+                self.text_events += 1;
+            }
+            ProviderOutputEvent::ReasoningActivity { event } => {
+                self.observe_output_position(
+                    position,
+                    ConformanceOutputIdentity::Reasoning(event.activity_id().to_owned()),
+                )?;
+                self.observe_reasoning_activity(event)?;
+                self.reasoning_events += 1;
+            }
+            ProviderOutputEvent::ToolCallStarted { call_id, name } => {
+                self.observe_output_position(
+                    position,
+                    ConformanceOutputIdentity::Tool(call_id.clone()),
+                )?;
+                if self
+                    .output_tool_positions
+                    .insert(call_id.clone(), position)
+                    .is_some()
+                {
+                    return violation(BASE_TURN, "provider reused a positioned tool call id");
+                }
+                self.observe_tool_call_started(call_id, name)?;
+            }
+            ProviderOutputEvent::ToolCallDelta { call_id, delta } => {
+                if self.output_tool_positions.get(call_id) != Some(&position) {
+                    return violation(BASE_TURN, "tool-call position changed during stream");
+                }
+                self.observe_tool_call_delta(call_id, delta)?;
+            }
+            ProviderOutputEvent::ToolCallFinished { call } => {
+                if self.output_tool_positions.remove(&call.id) != Some(position) {
+                    return violation(BASE_TURN, "tool-call position changed before completion");
+                }
+                self.observe_tool_call_finished(call)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn observe_output_position(
+        &mut self,
+        position: bcode_model::TurnOutputPosition,
+        identity: ConformanceOutputIdentity,
+    ) -> Result<(), ProviderConformanceError> {
+        if self
+            .last_output_position
+            .is_some_and(|previous| position < previous)
+        {
+            return violation(BASE_TURN, "provider output positions must be monotonic");
+        }
+        if let Some(existing) = self.output_positions.get(&position) {
+            if existing != &identity {
+                return violation(
+                    BASE_TURN,
+                    "provider reused one output position for a different semantic unit",
+                );
+            }
+        } else {
+            self.output_positions.insert(position, identity);
+        }
+        self.last_output_position = Some(position);
         Ok(())
     }
 
@@ -1123,8 +1214,13 @@ where
             }
         };
         for event in &response.events {
-            if let ProviderTurnEvent::TextDelta { text: delta } = event {
-                text.push_str(delta);
+            match event {
+                ProviderTurnEvent::TextDelta { text: delta }
+                | ProviderTurnEvent::Output {
+                    event: bcode_model::ProviderOutputEvent::TextDelta { text: delta },
+                    ..
+                } => text.push_str(delta),
+                _ => {}
             }
         }
         if let Err(error) = validator.observe(&response.events) {
@@ -1588,6 +1684,147 @@ mod tests {
         let summary = validator.finish().expect("valid terminal state");
         assert_eq!(summary.stop_reason, StopReason::EndTurn);
         assert_eq!(summary.usage_events, 1);
+    }
+
+    #[test]
+    fn validator_accepts_positioned_text_reasoning_and_correlated_tool_output() {
+        use bcode_model::{ProviderOutputEvent, TurnOutputPosition};
+
+        let mut validator = ProviderEventValidator::default();
+        validator
+            .observe(&[
+                ProviderTurnEvent::TurnStarted,
+                ProviderTurnEvent::output(
+                    TurnOutputPosition::new(0),
+                    ProviderOutputEvent::ReasoningActivity {
+                        event: bcode_session_models::ReasoningActivityEvent::Started {
+                            activity_id: "reasoning-1".to_owned(),
+                            order: 0,
+                        },
+                    },
+                ),
+                ProviderTurnEvent::output(
+                    TurnOutputPosition::new(0),
+                    ProviderOutputEvent::ReasoningActivity {
+                        event: bcode_session_models::ReasoningActivityEvent::Finished {
+                            activity_id: "reasoning-1".to_owned(),
+                            activity_order: 0,
+                            status: bcode_session_models::ReasoningActivityStatus::Completed,
+                        },
+                    },
+                ),
+                ProviderTurnEvent::output(
+                    TurnOutputPosition::new(1),
+                    ProviderOutputEvent::TextDelta {
+                        text: "answer".to_owned(),
+                    },
+                ),
+                ProviderTurnEvent::output(
+                    TurnOutputPosition::new(2),
+                    ProviderOutputEvent::ToolCallStarted {
+                        call_id: "call-1".to_owned(),
+                        name: "read".to_owned(),
+                    },
+                ),
+                ProviderTurnEvent::output(
+                    TurnOutputPosition::new(2),
+                    ProviderOutputEvent::ToolCallDelta {
+                        call_id: "call-1".to_owned(),
+                        delta: "{}".to_owned(),
+                    },
+                ),
+                ProviderTurnEvent::output(
+                    TurnOutputPosition::new(2),
+                    ProviderOutputEvent::ToolCallFinished {
+                        call: ToolCall {
+                            id: "call-1".to_owned(),
+                            name: "read".to_owned(),
+                            arguments: serde_json::json!({}),
+                        },
+                    },
+                ),
+                ProviderTurnEvent::Usage {
+                    usage: TokenUsage::default(),
+                },
+                ProviderTurnEvent::TurnFinished {
+                    stop_reason: StopReason::ToolCall,
+                },
+            ])
+            .expect("positioned events");
+        let summary = validator.finish().expect("valid positioned turn");
+        assert_eq!(summary.text_events, 1);
+        assert_eq!(summary.reasoning_events, 2);
+        assert_eq!(summary.tool_calls.len(), 1);
+    }
+
+    #[test]
+    fn validator_rejects_regressing_and_changed_tool_positions() {
+        use bcode_model::{ProviderOutputEvent, TurnOutputPosition};
+
+        let mut regressing = ProviderEventValidator::default();
+        let error = regressing
+            .observe(&[
+                ProviderTurnEvent::TurnStarted,
+                ProviderTurnEvent::output(
+                    TurnOutputPosition::new(1),
+                    ProviderOutputEvent::TextDelta {
+                        text: "later".to_owned(),
+                    },
+                ),
+                ProviderTurnEvent::output(
+                    TurnOutputPosition::new(0),
+                    ProviderOutputEvent::TextDelta {
+                        text: "earlier".to_owned(),
+                    },
+                ),
+            ])
+            .expect_err("regressing position must fail");
+        assert!(error.to_string().contains("monotonic"));
+
+        let mut reused = ProviderEventValidator::default();
+        let error = reused
+            .observe(&[
+                ProviderTurnEvent::TurnStarted,
+                ProviderTurnEvent::output(
+                    TurnOutputPosition::new(0),
+                    ProviderOutputEvent::TextDelta {
+                        text: "text".to_owned(),
+                    },
+                ),
+                ProviderTurnEvent::output(
+                    TurnOutputPosition::new(0),
+                    ProviderOutputEvent::ReasoningActivity {
+                        event: bcode_session_models::ReasoningActivityEvent::Started {
+                            activity_id: "reasoning-1".to_owned(),
+                            order: 0,
+                        },
+                    },
+                ),
+            ])
+            .expect_err("reused semantic position must fail");
+        assert!(error.to_string().contains("different semantic unit"));
+
+        let mut changed_tool = ProviderEventValidator::default();
+        let error = changed_tool
+            .observe(&[
+                ProviderTurnEvent::TurnStarted,
+                ProviderTurnEvent::output(
+                    TurnOutputPosition::new(0),
+                    ProviderOutputEvent::ToolCallStarted {
+                        call_id: "call-1".to_owned(),
+                        name: "read".to_owned(),
+                    },
+                ),
+                ProviderTurnEvent::output(
+                    TurnOutputPosition::new(1),
+                    ProviderOutputEvent::ToolCallDelta {
+                        call_id: "call-1".to_owned(),
+                        delta: "{}".to_owned(),
+                    },
+                ),
+            ])
+            .expect_err("changed tool position must fail");
+        assert!(error.to_string().contains("position changed"));
     }
 
     #[test]

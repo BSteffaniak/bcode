@@ -28,13 +28,13 @@ use aws_smithy_types::{Document, Number};
 use base64::Engine as _;
 use bcode_model::{
     AckResponse, CancelTurnRequest, ContentBlock, FinishTurnRequest, MODEL_PROVIDER_INTERFACE_ID,
-    MessageRole, ModelCapability, ModelCatalogHints, ModelInfo, ModelList, ModelListRequest,
-    ModelMessage, ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES, OP_FINISH_TURN, OP_MODELS,
-    OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG, PollTurnEventsRequest,
-    PollTurnEventsResponse, ProviderCapabilities, ProviderCapability, ProviderError,
-    ProviderErrorCategory, ProviderErrorSource, ProviderRequestContext, ProviderRequestProjection,
-    ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage, ToolCall, ToolChoice,
-    ToolDefinition, ValidateConfigResponse,
+    MODEL_PROVIDER_INTERFACE_ID_V2, MessageRole, ModelCapability, ModelCatalogHints, ModelInfo,
+    ModelList, ModelListRequest, ModelMessage, ModelTurnRequest, OP_CANCEL_TURN, OP_CAPABILITIES,
+    OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN, OP_VALIDATE_CONFIG,
+    PollTurnEventsRequest, PollTurnEventsResponse, ProviderCapabilities, ProviderCapability,
+    ProviderError, ProviderErrorCategory, ProviderErrorSource, ProviderRequestContext,
+    ProviderRequestProjection, ProviderTurnEvent, StartTurnResponse, StopReason, TokenUsage,
+    ToolCall, ToolChoice, ToolDefinition, ValidateConfigResponse,
 };
 use bcode_model_provider_runtime::{
     ProviderRuntime, StreamOutcome, TurnState, TurnStore, provider_error, retry_hint_from_body,
@@ -145,7 +145,10 @@ impl BedrockProviderPlugin {
     }
 
     fn invoke_provider_service(&self, context: &NativeServiceContext) -> ServiceResponse {
-        if context.request.interface_id != MODEL_PROVIDER_INTERFACE_ID {
+        if !matches!(
+            context.request.interface_id.as_str(),
+            MODEL_PROVIDER_INTERFACE_ID | MODEL_PROVIDER_INTERFACE_ID_V2
+        ) {
             return ServiceResponse::error(
                 "unsupported_interface",
                 "unsupported model provider service interface",
@@ -155,7 +158,10 @@ impl BedrockProviderPlugin {
             OP_CAPABILITIES => json_response(&capabilities()),
             OP_MODELS => self.models_response(&context.request),
             OP_VALIDATE_CONFIG => self.validate_config_response(&context.request),
-            OP_START_TURN => self.start_turn(&context.request),
+            OP_START_TURN => self.start_turn(
+                &context.request,
+                context.request.interface_id == MODEL_PROVIDER_INTERFACE_ID_V2,
+            ),
             OP_POLL_TURN_EVENTS => self.poll_turn_events(&context.request),
             OP_CANCEL_TURN => self.cancel_turn(&context.request),
             OP_FINISH_TURN => self.finish_turn(&context.request),
@@ -170,7 +176,7 @@ impl BedrockProviderPlugin {
         json_response(&self.models(&model_list_request(request)))
     }
 
-    fn start_turn(&self, request: &ServiceRequest) -> ServiceResponse {
+    fn start_turn(&self, request: &ServiceRequest, positioned_output: bool) -> ServiceResponse {
         let request = match request.payload_json::<ModelTurnRequest>() {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
@@ -180,6 +186,9 @@ impl BedrockProviderPlugin {
             .lock()
             .expect("bedrock turn store lock should not be poisoned")
             .insert_started("bedrock-turn");
+        if positioned_output {
+            turn.enable_positioned_output();
+        }
         turn.push(ProviderTurnEvent::RequestProjection {
             projection: bedrock_request_projection(&request),
         });
@@ -3023,7 +3032,7 @@ mod tests {
             let response = self.plugin.invoke_service_concurrent(NativeServiceContext {
                 plugin_id: PROVIDER_ID.to_string(),
                 request: ServiceRequest {
-                    interface_id: MODEL_PROVIDER_INTERFACE_ID.to_string(),
+                    interface_id: MODEL_PROVIDER_INTERFACE_ID_V2.to_string(),
                     operation: operation.to_string(),
                     payload: serde_json::to_vec(request).map_err(|error| error.to_string())?,
                 },

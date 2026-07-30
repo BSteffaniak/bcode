@@ -267,17 +267,21 @@ fn transcript_item_body_with_context(
         },
         TranscriptViewItemKind::Compaction { compaction } => compaction_notice(compaction),
         TranscriptViewItemKind::Skill { skill } => skill_notice(skill),
-        TranscriptViewItemKind::ToolRequest { tool }
-        | TranscriptViewItemKind::ToolInvocation { tool } => {
+        TranscriptViewItemKind::ToolRequest { tool } => {
             render_tool_lifecycle_with_context(tool, session_id, context)
         }
-        TranscriptViewItemKind::ToolRequestDraft { draft } => container! {
-            aside color=(color::MUTED) {
-                div color=(color::STRONG) { (format!("{} · assembling…", draft.tool_name)) }
-                div font-size=((typeface::LABEL)) { (format!("{} argument bytes", draft.argument_bytes)) }
-                div white-space="preserve-wrap" { (draft.preview) }
+        TranscriptViewItemKind::ToolInvocation { tool } => {
+            if let Some(draft) = tool.request_draft.as_ref()
+                && tool.presentation.is_none()
+                && tool.result.is_none()
+                && tool.result_text.is_none()
+            {
+                tool_request_draft_body(draft)
+            } else {
+                render_tool_lifecycle_with_context(tool, session_id, context)
             }
-        },
+        }
+        TranscriptViewItemKind::ToolRequestDraft { draft } => tool_request_draft_body(draft),
         TranscriptViewItemKind::Permission { permission } => permission_history(permission),
         TranscriptViewItemKind::Usage { usage } => usage_transcript_item(usage),
         TranscriptViewItemKind::RuntimeWork { work } => container! {
@@ -292,6 +296,16 @@ fn transcript_item_body_with_context(
             placement,
             invocation: _,
         } => render_tool_contribution(contribution, *placement),
+    }
+}
+
+fn tool_request_draft_body(draft: &bcode_session_view_models::ToolRequestDraftView) -> Containers {
+    container! {
+        aside color=(color::MUTED) {
+            div color=(color::STRONG) { (format!("{} · assembling…", draft.tool_name)) }
+            div font-size=((typeface::LABEL)) { (format!("{} argument bytes", draft.argument_bytes)) }
+            div white-space="preserve-wrap" { (draft.preview) }
+        }
     }
 }
 

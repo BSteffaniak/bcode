@@ -8,14 +8,14 @@ use bmux_tui::frame::Frame;
 use bmux_tui::geometry::Rect;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TranscriptFrameSnapshot {
+pub struct TranscriptFrameSnapshot {
     pub label: String,
     pub text: String,
     pub observation: TranscriptFrameObservation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TranscriptFrameSequenceError {
+pub struct TranscriptFrameSequenceError {
     pub frame_index: usize,
     pub frame_label: String,
     pub message: String,
@@ -37,7 +37,7 @@ impl std::fmt::Display for TranscriptFrameSequenceError {
     }
 }
 
-pub(crate) fn assert_no_forbidden_frames(
+pub fn assert_no_forbidden_frames(
     frames: &[TranscriptFrameSnapshot],
     forbidden: impl Fn(&TranscriptFrameSnapshot) -> Option<String>,
 ) -> Result<(), TranscriptFrameSequenceError> {
@@ -58,18 +58,23 @@ pub(crate) fn assert_no_forbidden_frames(
     Ok(())
 }
 
-pub(crate) enum TranscriptFrameInput {
+pub enum TranscriptFrameInput {
     Durable(SessionEvent),
     Live(SessionLiveEvent),
+    PrependHistory {
+        events: Vec<SessionEvent>,
+        has_more: bool,
+    },
+    ScrollUp(usize),
     Observe,
 }
 
-pub(crate) struct TranscriptFrameStep {
+pub struct TranscriptFrameStep {
     pub label: &'static str,
     pub input: TranscriptFrameInput,
 }
 
-pub(crate) struct TranscriptFrameSequence {
+pub struct TranscriptFrameSequence {
     app: BmuxApp,
     width: u16,
     height: u16,
@@ -77,7 +82,7 @@ pub(crate) struct TranscriptFrameSequence {
 }
 
 impl TranscriptFrameSequence {
-    pub(crate) const fn new(app: BmuxApp, width: u16, height: u16) -> Self {
+    pub const fn new(app: BmuxApp, width: u16, height: u16) -> Self {
         Self {
             app,
             width,
@@ -86,7 +91,7 @@ impl TranscriptFrameSequence {
         }
     }
 
-    pub(crate) fn run(
+    pub fn run(
         mut self,
         steps: impl IntoIterator<Item = TranscriptFrameStep>,
     ) -> Vec<TranscriptFrameSnapshot> {
@@ -94,6 +99,12 @@ impl TranscriptFrameSequence {
             match step.input {
                 TranscriptFrameInput::Durable(event) => self.app.absorb_session_event(&event),
                 TranscriptFrameInput::Live(event) => self.app.absorb_session_live_event(&event),
+                TranscriptFrameInput::PrependHistory { events, has_more } => {
+                    self.app.prepend_older_history(&events, has_more);
+                }
+                TranscriptFrameInput::ScrollUp(rows) => {
+                    let _ = self.app.scroll_transcript_up(rows);
+                }
                 TranscriptFrameInput::Observe => {}
             }
             let frame = self.capture(step.label);
@@ -123,7 +134,37 @@ mod tests {
     use super::*;
     use bcode_session_models::{
         ClientId, SessionEventKind, SessionId, TextStreamOperation, TextStreamUpdate,
+        ToolInvocationResult,
     };
+    use std::sync::Arc;
+
+    fn filesystem_plugin_host() -> bcode_plugin::PluginHost {
+        let bundled = [bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/filesystem-plugin/bcode-plugin.toml"),
+            bcode_filesystem_plugin::static_plugin(),
+        )];
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &bundled,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .expect("static filesystem plugin manifest should parse");
+        bcode_plugin::PluginHost::load_static_plugins(&selected)
+            .expect("static filesystem plugin should load")
+    }
+
+    fn shell_plugin_host() -> bcode_plugin::PluginHost {
+        let bundled = [bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+            bcode_shell_plugin::static_plugin(),
+        )];
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &bundled,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .expect("static shell plugin manifest should parse");
+        bcode_plugin::PluginHost::load_static_plugins(&selected)
+            .expect("static shell plugin should load")
+    }
 
     fn durable(session_id: SessionId, sequence: u64, kind: SessionEventKind) -> SessionEvent {
         SessionEvent {
@@ -137,6 +178,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)] // One scenario proves all per-frame observation dimensions together.
     fn frame_sequence_captures_semantic_terminal_damage_and_viewport_state() {
         let session_id = SessionId::new();
         let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
@@ -162,6 +204,7 @@ mod tests {
                 input: TranscriptFrameInput::Live(SessionLiveEvent {
                     session_id,
                     kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
+                        output_position: None,
                         turn_id: "turn-1".to_owned(),
                         segment_id: "segment-0".to_owned(),
                         segment_order: 0,
@@ -182,6 +225,7 @@ mod tests {
                 input: TranscriptFrameInput::Live(SessionLiveEvent {
                     session_id,
                     kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
+                        output_position: None,
                         turn_id: "turn-1".to_owned(),
                         segment_id: "segment-0".to_owned(),
                         segment_order: 0,
@@ -240,6 +284,631 @@ mod tests {
                 .then(|| "raw JSON flashed".to_owned())
         })
         .expect("frame sequence should remain rich");
+    }
+
+    #[test]
+    fn assistant_frames_preserve_every_accepted_cumulative_prefix() {
+        let session_id = SessionId::new();
+        let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let chunks = ["Leading ", "words and ", "trailing chars ✓"];
+        let mut expected_offset = 0_usize;
+        let steps = chunks.into_iter().enumerate().map(|(index, text)| {
+            let revision = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+            let step = TranscriptFrameStep {
+                label: match index {
+                    0 => "assistant-leading",
+                    1 => "assistant-middle",
+                    _ => "assistant-trailing",
+                },
+                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                    session_id,
+                    kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
+                        output_position: None,
+                        turn_id: "turn-1".to_owned(),
+                        segment_id: "segment-0".to_owned(),
+                        segment_order: 0,
+                        update: TextStreamUpdate {
+                            generation: 0,
+                            first_revision: revision,
+                            revision,
+                            operation: TextStreamOperation::Append {
+                                expected_offset,
+                                text: text.to_owned(),
+                            },
+                        },
+                    },
+                }),
+            };
+            expected_offset = expected_offset.saturating_add(text.len());
+            step
+        });
+        let frames = TranscriptFrameSequence::new(app, 100, 40).run(steps);
+        let mut expected = String::new();
+        for (frame, chunk) in frames.iter().zip(chunks) {
+            expected.push_str(chunk);
+            assert!(
+                frame.text.contains(&expected),
+                "{}\n{}",
+                frame.label,
+                frame.text
+            );
+        }
+    }
+
+    #[test]
+    fn structured_reasoning_is_visible_on_each_live_part_revision() {
+        let session_id = SessionId::new();
+        let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let update = |revision, expected_offset, text: &str| {
+            TranscriptFrameStep {
+            label: if revision == 1 {
+                "reasoning-first-part"
+            } else {
+                "reasoning-second-part"
+            },
+            input: TranscriptFrameInput::Live(SessionLiveEvent {
+                session_id,
+                kind: bcode_session_models::SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                    output_position: None,
+                    turn_id: "turn-1".to_owned(),
+                    activity_id: "reasoning-1".to_owned(),
+                    activity_order: 0,
+                    part_id: "summary-0".to_owned(),
+                    kind: bcode_session_models::ReasoningContentKind::Summary,
+                    role: bcode_session_models::ReasoningContentRole::Milestone,
+                    part_order: 0,
+                    update: TextStreamUpdate {
+                        generation: 0,
+                        first_revision: revision,
+                        revision,
+                        operation: TextStreamOperation::Append {
+                            expected_offset,
+                            text: text.to_owned(),
+                        },
+                    },
+                },
+            }),
+        }
+        };
+        let frames = TranscriptFrameSequence::new(app, 100, 40).run([
+            update(1, 0, "Immediate reasoning"),
+            update(2, 19, " continues"),
+        ]);
+        assert!(
+            frames[0].text.contains("Immediate reasoning"),
+            "{}",
+            frames[0].text
+        );
+        assert!(
+            frames[1].text.contains("Immediate reasoning continues"),
+            "{}",
+            frames[1].text
+        );
+        assert_eq!(frames[1].observation.semantic_items.len(), 1);
+        assert_eq!(frames[1].observation.terminal_items.len(), 1);
+        assert_eq!(
+            frames[0].observation.terminal_items[0].0,
+            frames[1].observation.terminal_items[0].0
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One transition fixture proves every draft-to-result frame.
+    fn filesystem_handoff_has_no_blank_or_raw_json_frame() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+        let draft = |revision, contents: &str| SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+                event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
+                    turn_id: "turn-1".to_owned(),
+                    tool_call_id: "call-write".to_owned(),
+                    tool_name: "filesystem.write".to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    schema: "bcode.filesystem.request-draft.write".to_owned(),
+                    schema_version: 1,
+                    placement: bcode_session_models::ToolContributionPlacement::Result,
+                    generation: 1,
+                    revision,
+                    operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                        start_offset: 0,
+                        text: serde_json::json!({
+                            "path": "src/lib.rs",
+                            "contents": contents
+                        })
+                        .to_string(),
+                    },
+                    argument_bytes: contents.len().saturating_add(35),
+                    truncated: false,
+                },
+            },
+        };
+        let request = durable(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-write".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                tool_name: "filesystem.write".to_owned(),
+                arguments_json: r#"{"path":"src/lib.rs","contents":"hello"}"#.to_owned(),
+                working_directory: None,
+            },
+        );
+        let result = durable(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-write".to_owned(),
+                    model_output: "wrote 5 bytes".to_owned(),
+                    is_error: false,
+                    presentation: None,
+                    result: Some(ToolInvocationResult::Artifact {
+                        artifact: Box::new(bcode_session_models::ToolArtifact {
+                            artifact_id: "call-write-filesystem-change".to_owned(),
+                            producer_plugin_id: "bcode.filesystem".to_owned(),
+                            schema: "bcode.filesystem.change".to_owned(),
+                            schema_version: 1,
+                            tool_call_id: Some("call-write".to_owned()),
+                            title: Some("File change".to_owned()),
+                            metadata: serde_json::json!({
+                                "tool_name": "filesystem.write",
+                                "summary": "wrote 5 bytes",
+                                "path": "src/lib.rs",
+                                "old_text": "",
+                                "new_text": "hello",
+                                "old_start_line": 1,
+                                "new_start_line": 1
+                            }),
+                            refs: Vec::new(),
+                        }),
+                    }),
+                },
+            },
+        );
+        let frames = TranscriptFrameSequence::new(app, 100, 40).run([
+            TranscriptFrameStep {
+                label: "draft-first",
+                input: TranscriptFrameInput::Live(draft(1, "hello")),
+            },
+            TranscriptFrameStep {
+                label: "draft-second",
+                input: TranscriptFrameInput::Live(draft(2, "hello world")),
+            },
+            TranscriptFrameStep {
+                label: "accepted-request",
+                input: TranscriptFrameInput::Durable(request),
+            },
+            TranscriptFrameStep {
+                label: "result",
+                input: TranscriptFrameInput::Durable(result),
+            },
+        ]);
+        assert_no_forbidden_frames(&frames, |frame| {
+            let raw_json = frame.text.contains(r#""contents":"hello""#);
+            let blank = !frame.text.contains("src/lib.rs") && !frame.text.contains("hello");
+            (raw_json || blank).then(|| "blank or raw JSON tool frame".to_owned())
+        })
+        .unwrap_or_else(|error| panic!("{error}"));
+        assert!(frames[0].text.contains("assembling"), "{}", frames[0].text);
+        assert!(frames[1].text.contains("hello world"), "{}", frames[1].text);
+        assert!(frames[3].text.contains("File change"), "{}", frames[3].text);
+        assert_eq!(
+            frames[0].observation.terminal_items[0].0,
+            frames[3].observation.terminal_items[0].0
+        );
+    }
+
+    #[test]
+    fn fast_operation_first_draw_is_only_the_final_invocation_frame() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        app.absorb_session_event(&durable(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-fast".to_owned(),
+                producer_plugin_id: Some("example.plugin".to_owned()),
+                tool_name: "example.fast".to_owned(),
+                arguments_json: r#"{"transient":"must-not-flash"}"#.to_owned(),
+                working_directory: None,
+            },
+        ));
+        app.absorb_session_event(&durable(
+            session_id,
+            2,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-fast".to_owned(),
+                    model_output: "completed immediately".to_owned(),
+                    is_error: false,
+                    presentation: None,
+                    result: None,
+                },
+            },
+        ));
+
+        let frames = TranscriptFrameSequence::new(app, 100, 40).run([TranscriptFrameStep {
+            label: "final-only",
+            input: TranscriptFrameInput::Observe,
+        }]);
+        let frame = &frames[0];
+        assert!(
+            frame.text.contains("completed immediately"),
+            "{}",
+            frame.text
+        );
+        assert!(!frame.text.contains("must-not-flash"), "{}", frame.text);
+        assert!(!frame.text.contains("requested"), "{}", frame.text);
+        assert_eq!(frame.observation.semantic_items.len(), 1);
+        assert_eq!(frame.observation.terminal_items.len(), 1);
+        assert_eq!(
+            frame.observation.semantic_items[0].0,
+            bcode_session_view_models::TranscriptViewItemId::tool("call-fast")
+        );
+        assert_eq!(
+            frame.observation.terminal_items[0].1.as_ref(),
+            Some(&frame.observation.semantic_items[0].0)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One lifecycle fixture proves timeout and recording identity continuity.
+    fn shell_recording_revisions_keep_one_timed_invocation_item() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        app.set_plugin_host(Arc::new(shell_plugin_host()));
+        let presentation = |revision, committed_bytes| TranscriptFrameStep {
+            label: if revision == 1 {
+                "recording-first"
+            } else {
+                "recording-later"
+            },
+            input: TranscriptFrameInput::Live(SessionLiveEvent {
+                session_id,
+                kind: bcode_session_models::SessionLiveEventKind::ToolPresentationUpdated {
+                    update: bcode_tool::ToolPresentationUpdate {
+                        invocation_id: "call-shell".to_owned(),
+                        producer_id: "bcode.shell".to_owned(),
+                        generation: 0,
+                        revision,
+                        identity: bcode_tool::ToolPresentationIdentity::Primary,
+                        retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                        schema: "bcode.shell.run".to_owned(),
+                        schema_version: 1,
+                        artifact: Some(bcode_tool::ToolContributionArtifact {
+                            artifact_id: "call-shell-shell-run".to_owned(),
+                            reference_key: "shell_recording".to_owned(),
+                            content_type: Some("application/vnd.bcode.shell-recording".to_owned()),
+                            storage_uri: "file:///tmp/call-shell.bcsr".to_owned(),
+                            committed_bytes,
+                            revision: committed_bytes,
+                            finalized: false,
+                            availability: None,
+                        }),
+                        payload: serde_json::json!({
+                            "mode": "terminal",
+                            "timeout_ms": 30_000,
+                        }),
+                    },
+                },
+            }),
+        };
+        let frames = TranscriptFrameSequence::new(app, 100, 40).run([
+            TranscriptFrameStep {
+                label: "accepted",
+                input: TranscriptFrameInput::Durable(durable(
+                    session_id,
+                    1,
+                    SessionEventKind::ToolCallRequested {
+                        tool_call_id: "call-shell".to_owned(),
+                        producer_plugin_id: Some("bcode.shell".to_owned()),
+                        tool_name: "shell.run".to_owned(),
+                        arguments_json: r#"{"command":"printf hello"}"#.to_owned(),
+                        working_directory: None,
+                    },
+                )),
+            },
+            presentation(1, 64),
+            TranscriptFrameStep {
+                label: "running",
+                input: TranscriptFrameInput::Durable(durable(
+                    session_id,
+                    2,
+                    SessionEventKind::ToolInvocationLifecycle {
+                        event: bcode_session_models::ToolInvocationLifecycleEvent {
+                            invocation_id: "call-shell".to_owned(),
+                            sequence: 1,
+                            stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+                            message: None,
+                            metadata: serde_json::Value::Null,
+                        },
+                    },
+                )),
+            },
+            presentation(2, 128),
+        ]);
+
+        assert_eq!(frames.len(), 4);
+        for frame in &frames {
+            assert_eq!(frame.observation.semantic_items.len(), 1, "{}", frame.text);
+            assert_eq!(frame.observation.terminal_items.len(), 1, "{}", frame.text);
+            assert_eq!(
+                frame.observation.semantic_items[0].0,
+                bcode_session_view_models::TranscriptViewItemId::tool("call-shell")
+            );
+            assert_eq!(
+                frame.observation.terminal_items[0].1.as_ref(),
+                Some(&frame.observation.semantic_items[0].0)
+            );
+        }
+        assert!(
+            frames[1].text.contains("timeout 30.0s"),
+            "{}",
+            frames[1].text
+        );
+        assert!(
+            frames[2].text.contains("timeout 30.0s"),
+            "{}",
+            frames[2].text
+        );
+        assert!(
+            frames[3].text.contains("timeout 30.0s"),
+            "{}",
+            frames[3].text
+        );
+        assert!(
+            frames
+                .windows(2)
+                .all(|frames| frames[0].observation.terminal_items[0].0
+                    == frames[1].observation.terminal_items[0].0)
+        );
+        assert!(
+            frames[3].observation.semantic_items[0].1 > frames[2].observation.semantic_items[0].1
+        );
+    }
+
+    #[test]
+    fn tool_update_preserves_detached_viewport_and_stable_anchor() {
+        let session_id = SessionId::new();
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+        let mut steps = (0..24_u64)
+            .map(|index| TranscriptFrameStep {
+                label: "history-row",
+                input: TranscriptFrameInput::Durable(durable(
+                    session_id,
+                    index.saturating_add(1),
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: format!("history row {index} with enough text to retain an anchor"),
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    },
+                )),
+            })
+            .collect::<Vec<_>>();
+        steps.push(TranscriptFrameStep {
+            label: "manual-scroll",
+            input: TranscriptFrameInput::ScrollUp(12),
+        });
+        steps.push(TranscriptFrameStep {
+            label: "tool-update",
+            input: TranscriptFrameInput::Live(SessionLiveEvent {
+                session_id,
+                kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+                    event: bcode_session_models::ToolRequestDraftEvent {
+                        output_position: None,
+                        turn_id: "turn-1".to_owned(),
+                        tool_call_id: "call-write".to_owned(),
+                        tool_name: "filesystem.write".to_owned(),
+                        producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                        schema: "bcode.filesystem.request-draft.write".to_owned(),
+                        schema_version: 1,
+                        placement: bcode_session_models::ToolContributionPlacement::Request,
+                        generation: 1,
+                        revision: 1,
+                        operation: bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                            start_offset: 0,
+                            text: r#"{"path":"src/lib.rs","contents":"hello"}"#.to_owned(),
+                        },
+                        argument_bytes: 40,
+                        truncated: false,
+                    },
+                },
+            }),
+        });
+        let frames = TranscriptFrameSequence::new(app, 80, 12).run(steps);
+        let detached = &frames[frames.len() - 2].observation;
+        let updated = &frames[frames.len() - 1].observation;
+        assert_eq!(detached.scroll_mode, "manual_detached");
+        assert_eq!(updated.scroll_mode, "manual_detached");
+        assert_eq!(updated.viewport_top, detached.viewport_top);
+        assert_eq!(updated.anchor, detached.anchor);
+        assert!(
+            updated.anchor.is_some(),
+            "detached viewport lacked stable anchor"
+        );
+    }
+
+    #[test]
+    fn history_prepend_preserves_detached_viewport_and_stable_anchor() {
+        let session_id = SessionId::new();
+        let app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let mut steps = (0..24_u64)
+            .map(|index| TranscriptFrameStep {
+                label: "newer-history-row",
+                input: TranscriptFrameInput::Durable(durable(
+                    session_id,
+                    index.saturating_add(101),
+                    SessionEventKind::UserMessage {
+                        client_id: ClientId::new(),
+                        text: format!("newer row {index} with enough text to retain an anchor"),
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    },
+                )),
+            })
+            .collect::<Vec<_>>();
+        steps.push(TranscriptFrameStep {
+            label: "manual-scroll-before-prepend",
+            input: TranscriptFrameInput::ScrollUp(12),
+        });
+        steps.push(TranscriptFrameStep {
+            label: "prepend-older-history",
+            input: TranscriptFrameInput::PrependHistory {
+                events: (0..8_u64)
+                    .map(|index| {
+                        durable(
+                            session_id,
+                            index.saturating_add(1),
+                            SessionEventKind::UserMessage {
+                                client_id: ClientId::new(),
+                                text: format!(
+                                    "older row {index} with enough text to shift the document"
+                                ),
+                                admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                            },
+                        )
+                    })
+                    .collect(),
+                has_more: false,
+            },
+        });
+        let frames = TranscriptFrameSequence::new(app, 80, 12).run(steps);
+        let before = &frames[frames.len() - 2].observation;
+        let after = &frames[frames.len() - 1].observation;
+        assert_eq!(before.scroll_mode, "manual_detached");
+        assert_eq!(after.scroll_mode, "manual_detached");
+        assert_eq!(after.anchor, before.anchor);
+        assert_ne!(after.viewport_top, before.viewport_top);
+        assert!(
+            after.anchor.is_some(),
+            "history prepend lacked stable anchor"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One reverse-arrival scenario covers all positioned output types.
+    fn positioned_reasoning_tool_and_assistant_frames_follow_semantic_order() {
+        let session_id = SessionId::new();
+        let turn_id = "turn-positioned";
+        let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+        let frames = TranscriptFrameSequence::new(app, 100, 40).run([
+            TranscriptFrameStep {
+                label: "assistant-position-2",
+                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                    session_id,
+                    kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
+                        output_position: Some(bcode_session_models::TurnOutputPosition::new(2)),
+                        turn_id: turn_id.to_owned(),
+                        segment_id: "segment-0".to_owned(),
+                        segment_order: 0,
+                        update: TextStreamUpdate {
+                            generation: 0,
+                            first_revision: 1,
+                            revision: 1,
+                            operation: TextStreamOperation::Append {
+                                expected_offset: 0,
+                                text: "Final answer".to_owned(),
+                            },
+                        },
+                    },
+                }),
+            },
+            TranscriptFrameStep {
+                label: "tool-position-1",
+                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                    session_id,
+                    kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+                        event: bcode_session_models::ToolRequestDraftEvent {
+                            output_position: Some(bcode_session_models::TurnOutputPosition::new(1)),
+                            turn_id: turn_id.to_owned(),
+                            tool_call_id: "call-write".to_owned(),
+                            tool_name: "filesystem.write".to_owned(),
+                            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                            schema: "bcode.filesystem.request-draft.write".to_owned(),
+                            schema_version: 1,
+                            placement: bcode_session_models::ToolContributionPlacement::Request,
+                            generation: 1,
+                            revision: 1,
+                            operation:
+                                bcode_session_models::ToolRequestDraftOperation::Checkpoint {
+                                    start_offset: 0,
+                                    text: r#"{"path":"src/lib.rs","contents":"hello"}"#.to_owned(),
+                                },
+                            argument_bytes: 40,
+                            truncated: false,
+                        },
+                    },
+                }),
+            },
+            TranscriptFrameStep {
+                label: "reasoning-position-0",
+                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                    session_id,
+                    kind: bcode_session_models::SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                        output_position: Some(bcode_session_models::TurnOutputPosition::new(0)),
+                        turn_id: turn_id.to_owned(),
+                        activity_id: "reasoning-1".to_owned(),
+                        activity_order: 0,
+                        part_id: "summary-0".to_owned(),
+                        kind: bcode_session_models::ReasoningContentKind::Summary,
+                        role: bcode_session_models::ReasoningContentRole::Milestone,
+                        part_order: 0,
+                        update: TextStreamUpdate {
+                            generation: 0,
+                            first_revision: 1,
+                            revision: 1,
+                            operation: TextStreamOperation::Append {
+                                expected_offset: 0,
+                                text: "Plan first".to_owned(),
+                            },
+                        },
+                    },
+                }),
+            },
+        ]);
+
+        let positions = |frame: &TranscriptFrameSnapshot| {
+            frame
+                .observation
+                .semantic_items
+                .iter()
+                .filter_map(|(id, _)| {
+                    // IDs identify the expected positioned semantic rows in shared order.
+                    if id.get().contains("reasoning") {
+                        Some(0)
+                    } else if id.get().contains("tool:") {
+                        Some(1)
+                    } else if id.get().contains("assistant-turn") {
+                        Some(2)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(positions(&frames[0]), vec![2]);
+        assert_eq!(positions(&frames[1]), vec![1, 2]);
+        assert_eq!(positions(&frames[2]), vec![0, 1, 2]);
+        let terminal_rows = &frames[2].observation.terminal_rows;
+        let first_row_for = |needle: &str| {
+            terminal_rows
+                .iter()
+                .position(|(id, _)| id.as_ref().is_some_and(|id| id.get().contains(needle)))
+                .unwrap_or_else(|| panic!("missing terminal rows for {needle}: {terminal_rows:?}"))
+        };
+        let reasoning = first_row_for("reasoning");
+        let tool = first_row_for("tool:");
+        let assistant = first_row_for("assistant-turn");
+        assert!(reasoning < tool && tool < assistant, "{terminal_rows:?}");
+        assert!(
+            frames[2].text.contains("Final answer"),
+            "{}",
+            frames[2].text
+        );
     }
 
     #[test]

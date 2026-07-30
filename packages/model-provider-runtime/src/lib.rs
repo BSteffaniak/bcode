@@ -11,7 +11,10 @@ pub use conformance::{
     ProviderEventValidator, run_provider_conformance_suite,
 };
 
-use bcode_model::{ProviderError, ProviderErrorCategory, ProviderRetryHint, ProviderTurnEvent};
+use bcode_model::{
+    ProviderError, ProviderErrorCategory, ProviderOutputEvent, ProviderRetryHint,
+    ProviderTurnEvent, TurnOutputPosition,
+};
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,10 +34,125 @@ pub enum StreamOutcome {
     Cancelled,
 }
 
+/// Allocates stable monotonic positions for legacy semantic provider events.
+#[derive(Debug, Clone, Default)]
+pub struct ProviderOutputPositionAllocator {
+    next_position: u64,
+    active_text_position: Option<TurnOutputPosition>,
+    reasoning_positions: BTreeMap<String, TurnOutputPosition>,
+    tool_positions: BTreeMap<String, TurnOutputPosition>,
+}
+
+impl ProviderOutputPositionAllocator {
+    /// Convert a legacy semantic event to a positioned v2 envelope.
+    ///
+    /// Already-positioned and non-semantic lifecycle events pass through unchanged.
+    #[must_use]
+    pub fn position(&mut self, event: ProviderTurnEvent) -> ProviderTurnEvent {
+        match event {
+            ProviderTurnEvent::Output { position, event } => {
+                self.next_position = self.next_position.max(position.get().saturating_add(1));
+                self.remember_position(position, &event);
+                ProviderTurnEvent::Output { position, event }
+            }
+            ProviderTurnEvent::TextDelta { text } => {
+                let position = self
+                    .active_text_position
+                    .unwrap_or_else(|| self.allocate_text_position());
+                ProviderTurnEvent::output(position, ProviderOutputEvent::TextDelta { text })
+            }
+            ProviderTurnEvent::ReasoningActivity { event } => {
+                self.active_text_position = None;
+                let activity_id = event.activity_id().to_owned();
+                let position = self
+                    .reasoning_positions
+                    .get(&activity_id)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        let position = self.allocate();
+                        self.reasoning_positions.insert(activity_id, position);
+                        position
+                    });
+                ProviderTurnEvent::output(
+                    position,
+                    ProviderOutputEvent::ReasoningActivity { event },
+                )
+            }
+            ProviderTurnEvent::ToolCallStarted { call_id, name } => {
+                self.active_text_position = None;
+                let position = self.tool_position(&call_id);
+                ProviderTurnEvent::output(
+                    position,
+                    ProviderOutputEvent::ToolCallStarted { call_id, name },
+                )
+            }
+            ProviderTurnEvent::ToolCallDelta { call_id, delta } => {
+                self.active_text_position = None;
+                let position = self.tool_position(&call_id);
+                ProviderTurnEvent::output(
+                    position,
+                    ProviderOutputEvent::ToolCallDelta { call_id, delta },
+                )
+            }
+            ProviderTurnEvent::ToolCallFinished { call } => {
+                self.active_text_position = None;
+                let position = self.tool_position(&call.id);
+                ProviderTurnEvent::output(position, ProviderOutputEvent::ToolCallFinished { call })
+            }
+            event => event,
+        }
+    }
+
+    const fn allocate_text_position(&mut self) -> TurnOutputPosition {
+        let position = self.allocate();
+        self.active_text_position = Some(position);
+        position
+    }
+
+    fn tool_position(&mut self, call_id: &str) -> TurnOutputPosition {
+        self.tool_positions
+            .get(call_id)
+            .copied()
+            .unwrap_or_else(|| {
+                let position = self.allocate();
+                self.tool_positions.insert(call_id.to_owned(), position);
+                position
+            })
+    }
+
+    const fn allocate(&mut self) -> TurnOutputPosition {
+        let position = TurnOutputPosition::new(self.next_position);
+        self.next_position = self.next_position.saturating_add(1);
+        position
+    }
+
+    fn remember_position(&mut self, position: TurnOutputPosition, event: &ProviderOutputEvent) {
+        match event {
+            ProviderOutputEvent::TextDelta { .. } => self.active_text_position = Some(position),
+            ProviderOutputEvent::ReasoningActivity { event } => {
+                self.active_text_position = None;
+                self.reasoning_positions
+                    .insert(event.activity_id().to_owned(), position);
+            }
+            ProviderOutputEvent::ToolCallStarted { call_id, .. }
+            | ProviderOutputEvent::ToolCallDelta { call_id, .. } => {
+                self.active_text_position = None;
+                self.tool_positions.insert(call_id.clone(), position);
+            }
+            ProviderOutputEvent::ToolCallFinished { call } => {
+                self.active_text_position = None;
+                self.tool_positions.insert(call.id.clone(), position);
+            }
+        }
+    }
+}
+
 /// Queued event/cancellation state for one provider turn.
 #[derive(Debug, Clone, Default)]
 pub struct TurnState {
     events: Arc<Mutex<VecDeque<ProviderTurnEvent>>>,
+    output_positions: Arc<Mutex<ProviderOutputPositionAllocator>>,
+    positioned_output: Arc<AtomicBool>,
     cancelled: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
 }
@@ -42,9 +160,22 @@ pub struct TurnState {
 impl TurnState {
     /// Queue a provider event for the host to poll.
     pub fn push(&self, event: ProviderTurnEvent) {
+        let event = if self.positioned_output.load(Ordering::Acquire) {
+            match self.output_positions.lock() {
+                Ok(mut positions) => positions.position(event),
+                Err(_) => event,
+            }
+        } else {
+            event
+        };
         if let Ok(mut events) = self.events.lock() {
             events.push_back(event);
         }
+    }
+
+    /// Enable positioned v2 semantic output for this turn.
+    pub fn enable_positioned_output(&self) {
+        self.positioned_output.store(true, Ordering::Release);
     }
 
     /// Drain currently queued provider events.
@@ -944,4 +1075,81 @@ where
             provider_turn_id: provider_turn_id.to_string(),
         },
     );
+}
+
+#[cfg(test)]
+mod output_position_tests {
+    use super::*;
+    use bcode_model::{ProviderOutputEvent, ToolCall};
+
+    #[test]
+    fn allocator_keeps_semantic_units_stable_and_monotonic() {
+        let mut allocator = ProviderOutputPositionAllocator::default();
+        let events = [
+            ProviderTurnEvent::TextDelta {
+                text: "first ".to_owned(),
+            },
+            ProviderTurnEvent::TextDelta {
+                text: "segment".to_owned(),
+            },
+            ProviderTurnEvent::ToolCallStarted {
+                call_id: "call-1".to_owned(),
+                name: "filesystem.read".to_owned(),
+            },
+            ProviderTurnEvent::ToolCallDelta {
+                call_id: "call-1".to_owned(),
+                delta: "{}".to_owned(),
+            },
+            ProviderTurnEvent::ToolCallFinished {
+                call: ToolCall {
+                    id: "call-1".to_owned(),
+                    name: "filesystem.read".to_owned(),
+                    arguments: serde_json::Value::Null,
+                },
+            },
+            ProviderTurnEvent::TextDelta {
+                text: "after tool".to_owned(),
+            },
+        ]
+        .map(|event| allocator.position(event));
+
+        let positions = events
+            .iter()
+            .filter_map(ProviderTurnEvent::positioned_output)
+            .map(|(position, _)| position.get())
+            .collect::<Vec<_>>();
+        assert_eq!(positions, vec![0, 0, 1, 1, 1, 2]);
+        assert!(matches!(
+            &events[2],
+            ProviderTurnEvent::Output {
+                event: ProviderOutputEvent::ToolCallStarted { call_id, .. },
+                ..
+            } if call_id == "call-1"
+        ));
+    }
+
+    #[test]
+    fn allocator_preserves_explicit_positions_and_advances_after_them() {
+        let mut allocator = ProviderOutputPositionAllocator::default();
+        let explicit = allocator.position(ProviderTurnEvent::output(
+            TurnOutputPosition::new(7),
+            ProviderOutputEvent::TextDelta {
+                text: "explicit".to_owned(),
+            },
+        ));
+        let next = allocator.position(ProviderTurnEvent::ToolCallStarted {
+            call_id: "call-1".to_owned(),
+            name: "tool".to_owned(),
+        });
+        assert_eq!(
+            explicit
+                .positioned_output()
+                .map(|(position, _)| position.get()),
+            Some(7)
+        );
+        assert_eq!(
+            next.positioned_output().map(|(position, _)| position.get()),
+            Some(8)
+        );
+    }
 }

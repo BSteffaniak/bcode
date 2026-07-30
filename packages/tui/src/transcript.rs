@@ -163,14 +163,10 @@ impl TranscriptItem {
     }
 
     /// Create a local transcript item with an explicit text format.
+    #[cfg(test)]
     #[must_use]
     pub fn with_format(role: &'static str, text: String, text_format: TextFormat) -> Self {
         Self::with_identity(role, text, false, text_format, kind_for_role(role))
-    }
-
-    #[cfg(test)]
-    pub fn new_streaming(role: &'static str, text: String) -> Self {
-        Self::with_identity(role, text, true, TextFormat::PlainText, kind_for_role(role))
     }
 
     pub(crate) fn with_kind(
@@ -340,12 +336,6 @@ impl TranscriptItem {
         if let TranscriptItemKind::ToolResult { result, .. } = &mut self.kind {
             result.push_str(text);
         }
-        self.bump_revision();
-    }
-
-    /// Mark this transcript item as no longer streaming.
-    pub const fn finish_streaming(&mut self) {
-        self.streaming = false;
         self.bump_revision();
     }
 
@@ -735,6 +725,27 @@ fn bounded_tool_request_draft_fallback(
     )
 }
 
+fn terminal_tool_invocation_item_from_shared(
+    tool: &bcode_session_view_models::ToolInvocationView,
+) -> TranscriptItem {
+    if let Some(draft) = tool.request_draft.as_ref()
+        && tool.presentation.is_none()
+        && tool.result.is_none()
+        && tool.result_text.is_none()
+    {
+        TranscriptItem::with_kind(
+            "Tool request draft",
+            bounded_tool_request_draft_fallback(draft),
+            true,
+            TranscriptItemKind::ToolRequestDraft {
+                draft: Box::new(draft.clone()),
+            },
+        )
+    } else {
+        terminal_tool_item_from_shared(tool)
+    }
+}
+
 /// Adapt one generic shared semantic item into terminal transcript presentation.
 #[must_use]
 pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
@@ -779,7 +790,9 @@ pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
             TranscriptItemKind::Meta,
         ),
         TranscriptViewItemKind::Skill { skill } => terminal_skill_item_from_shared(skill),
-        TranscriptViewItemKind::ToolInvocation { tool } => terminal_tool_item_from_shared(tool),
+        TranscriptViewItemKind::ToolInvocation { tool } => {
+            terminal_tool_invocation_item_from_shared(tool)
+        }
         TranscriptViewItemKind::ToolRequestDraft { draft } => TranscriptItem::with_kind(
             "Tool request draft",
             bounded_tool_request_draft_fallback(draft),
@@ -1116,105 +1129,6 @@ pub fn truncate_block(value: &str, max_chars: usize) -> String {
 }
 
 #[cfg(test)]
-pub fn push_streaming_transcript_item(
-    items: &mut Vec<TranscriptItem>,
-    role: &'static str,
-    text: &str,
-) {
-    if let Some(item) = active_streaming_item_mut(items, role) {
-        item.text.push_str(text);
-        return;
-    }
-    items.push(TranscriptItem::new_streaming(role, text.to_owned()));
-}
-
-#[cfg(test)]
-pub fn finish_streaming_transcript_item(
-    items: &mut Vec<TranscriptItem>,
-    role: &'static str,
-    text: &str,
-) {
-    if role_requires_last_item_stream_boundary(role) {
-        finish_boundary_streaming_transcript_item(items, role, text);
-        return;
-    }
-    if let Some(item) = latest_streaming_item_mut(items, role) {
-        item.text.clear();
-        item.text.push_str(text);
-        item.streaming = false;
-        return;
-    }
-    items.push(TranscriptItem::new(role, text.to_owned()));
-}
-
-#[cfg(test)]
-fn active_streaming_item_mut<'items>(
-    items: &'items mut [TranscriptItem],
-    role: &'static str,
-) -> Option<&'items mut TranscriptItem> {
-    if role_requires_last_item_stream_boundary(role) {
-        return latest_item_mut_if_streaming_role(items, role);
-    }
-    latest_streaming_item_mut(items, role)
-}
-
-#[cfg(test)]
-fn finish_boundary_streaming_transcript_item(
-    items: &mut Vec<TranscriptItem>,
-    role: &'static str,
-    text: &str,
-) {
-    let matching_stream_count = items
-        .iter()
-        .filter(|item| item.role == role && item.streaming)
-        .count();
-    if matching_stream_count > 1 {
-        for item in items
-            .iter_mut()
-            .filter(|item| item.role == role && item.streaming)
-        {
-            item.streaming = false;
-        }
-        return;
-    }
-    if let Some(item) = latest_item_mut_if_streaming_role(items, role) {
-        item.text.clear();
-        item.text.push_str(text);
-        item.streaming = false;
-        return;
-    }
-    items.push(TranscriptItem::new(role, text.to_owned()));
-}
-
-#[cfg(test)]
-fn latest_item_mut_if_streaming_role<'items>(
-    items: &'items mut [TranscriptItem],
-    role: &'static str,
-) -> Option<&'items mut TranscriptItem> {
-    let item = items.last_mut()?;
-    if item.role == role && item.streaming {
-        Some(item)
-    } else {
-        None
-    }
-}
-
-#[cfg(test)]
-fn latest_streaming_item_mut<'items>(
-    items: &'items mut [TranscriptItem],
-    role: &'static str,
-) -> Option<&'items mut TranscriptItem> {
-    items
-        .iter_mut()
-        .rev()
-        .find(|item| item.role == role && item.streaming)
-}
-
-#[cfg(test)]
-fn role_requires_last_item_stream_boundary(role: &'static str) -> bool {
-    role == "Reasoning summary"
-}
-
 fn kind_for_role(role: &str) -> TranscriptItemKind {
     match role {
         "You" => TranscriptItemKind::UserMessage,
@@ -1277,6 +1191,7 @@ mod tests {
             TextFormat::Json,
         ] {
             let item = TranscriptViewItem {
+                output_location: None,
                 id: bcode_session_view_models::TranscriptViewItemId::new("message"),
                 revision: 0,
                 sequence: Some(1),
@@ -1299,6 +1214,7 @@ mod tests {
     fn request_draft_fallback_is_bounded_and_never_exposes_preview_json() {
         let preview = "{\"secret\":\"value\"}";
         let draft = bcode_session_view_models::ToolRequestDraftView {
+            output_location: None,
             turn_id: "turn-1".to_owned(),
             tool_call_id: "call-1".to_owned(),
             tool_name: "x".repeat(1_000),
@@ -1325,6 +1241,7 @@ mod tests {
     fn replacing_shared_item_updates_text_format() {
         let source_id = bcode_session_view_models::TranscriptViewItemId::new("message");
         let item = |revision, format| TranscriptViewItem {
+            output_location: None,
             id: source_id.clone(),
             revision,
             sequence: Some(1),
@@ -1436,6 +1353,7 @@ mod tests {
             ),
         ] {
             let item = TranscriptViewItem {
+                output_location: None,
                 id: bcode_session_view_models::TranscriptViewItemId::new(format!(
                     "reasoning:{status:?}"
                 )),
@@ -1514,6 +1432,7 @@ mod tests {
 
         for (kind, role, expected_kind) in cases {
             let shared = TranscriptViewItem {
+                output_location: None,
                 id: bcode_session_view_models::TranscriptViewItemId::new("test:item"),
                 revision: 1,
                 sequence: Some(7),

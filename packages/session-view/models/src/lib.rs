@@ -258,7 +258,7 @@ pub struct SessionViewSnapshot {
 
 impl SessionViewSnapshot {
     /// Current snapshot schema version.
-    pub const SCHEMA_VERSION: u16 = 13;
+    pub const SCHEMA_VERSION: u16 = 14;
 
     /// Create an empty snapshot.
     #[must_use]
@@ -418,7 +418,7 @@ pub struct SessionViewPatch {
 
 impl SessionViewPatch {
     /// Current patch schema version.
-    pub const SCHEMA_VERSION: u16 = 13;
+    pub const SCHEMA_VERSION: u16 = 14;
 
     /// Create an empty patch between two revisions.
     #[must_use]
@@ -910,6 +910,15 @@ pub enum TextStreamViewStatus {
     Terminal(bcode_session_models::TextStreamTerminalStatus),
 }
 
+/// Cross-type semantic location of one transcript item within a model turn.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct TurnOutputLocation {
+    /// Application model turn that owns the output unit.
+    pub turn_id: String,
+    /// Stable position within the turn.
+    pub position: bcode_session_models::TurnOutputPosition,
+}
+
 /// Renderer-neutral transcript item.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptViewItem {
@@ -921,6 +930,9 @@ pub struct TranscriptViewItem {
     pub sequence: Option<u64>,
     /// Source event timestamp in Unix milliseconds, when known.
     pub timestamp_ms: Option<u64>,
+    /// Cross-type semantic output location within a turn, when provider-authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_location: Option<TurnOutputLocation>,
     /// Whether this item is currently receiving streamed updates.
     pub streaming: bool,
     /// Semantic item kind.
@@ -1112,6 +1124,9 @@ const fn default_tool_request_draft_placement() -> bcode_session_models::ToolCon
 /// Renderer-neutral live tool request draft.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolRequestDraftView {
+    /// Cross-type semantic output location within the turn, when provider-authoritative.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_location: Option<TurnOutputLocation>,
     /// Model turn that owns this generation.
     pub turn_id: String,
     /// Provider tool-call identifier.
@@ -1183,6 +1198,9 @@ pub struct ToolInvocationView {
     pub arguments_json: Option<String>,
     /// Working directory captured for this invocation, when known.
     pub working_directory: Option<PathBuf>,
+    /// Current live request-draft state for this invocation, when active.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_draft: Option<ToolRequestDraftView>,
     /// Current lifecycle status.
     pub status: ToolInvocationViewStatus,
     /// Raw final text result, when finished.

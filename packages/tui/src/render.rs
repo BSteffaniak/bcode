@@ -2353,6 +2353,7 @@ fn every_producer_family_renders_canonical_lifecycle_fallback_in_tui() {
 fn unsupported_tool_presentation_uses_semantic_fallback_without_opaque_payload() {
     let secret = "opaque-presentation-secret";
     let shared = bcode_session_view_models::TranscriptViewItem {
+        output_location: None,
         id: bcode_session_view_models::TranscriptViewItemId::tool("call-fallback"),
         revision: 4,
         sequence: Some(1),
@@ -2365,6 +2366,7 @@ fn unsupported_tool_presentation_uses_semantic_fallback_without_opaque_payload()
                 tool_name: Some("example.run".to_owned()),
                 arguments_json: Some(r#"{"target":"fixture"}"#.to_owned()),
                 working_directory: None,
+                request_draft: None,
                 status: bcode_session_view_models::ToolInvocationViewStatus::Finished,
                 result_text: Some("semantic result".to_owned()),
                 is_error: Some(false),
@@ -2400,6 +2402,7 @@ fn repeated_malformed_presentations_keep_bounded_semantic_fallback() {
     let secret = "opaque-malformed-presentation-secret";
     for revision in 1..=256 {
         let shared = bcode_session_view_models::TranscriptViewItem {
+            output_location: None,
             id: bcode_session_view_models::TranscriptViewItemId::tool("call-malformed"),
             revision,
             sequence: Some(1),
@@ -2412,6 +2415,7 @@ fn repeated_malformed_presentations_keep_bounded_semantic_fallback() {
                     tool_name: Some("shell.run".to_owned()),
                     arguments_json: Some(r#"{"command":"cargo test"}"#.to_owned()),
                     working_directory: None,
+                    request_draft: None,
                     status: bcode_session_view_models::ToolInvocationViewStatus::Running,
                     result_text: None,
                     is_error: None,

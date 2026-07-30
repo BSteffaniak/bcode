@@ -22,6 +22,17 @@ The default production session root is resolved only by
 tests, imports, and isolated stores, but all production default paths use the same canonical root.
 `bcode_session::db::session_dir_path` and `session_db_path` own per-session path construction.
 
+### Positioned durable transcript events
+
+Session event schema 42 and writer epoch 6 add positioned durable assistant segments, reasoning
+activities, and tool requests. Their `TurnOutputPosition` values place different output kinds in one
+turn-local semantic ordering domain. Durable completion revises the matching live semantic identity
+instead of creating an arrival-ordered replacement row. Epoch-5 history remains readable as legacy
+sequence-ordered input; migration does not invent output positions that were never recorded.
+
+This durable ordering does not make live checkpoints durable. Ordered assistant/reasoning appends,
+active presentations, and terminal tombstones remain bounded actor-owned state as described below.
+
 ## Live-only progress boundary
 
 Intermediate provider argument fragments, request previews, execution frames, replaceable progress,

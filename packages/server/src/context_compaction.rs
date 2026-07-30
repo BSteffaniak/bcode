@@ -1428,6 +1428,17 @@ pub async fn handle_compaction_events(
 ) -> CompactionPollStatus {
     for event in events {
         match event {
+            ProviderTurnEvent::Output { event, .. } => match event {
+                bcode_model::ProviderOutputEvent::TextDelta { text } => summary.push_str(&text),
+                bcode_model::ProviderOutputEvent::ToolCallStarted { .. }
+                | bcode_model::ProviderOutputEvent::ToolCallDelta { .. }
+                | bcode_model::ProviderOutputEvent::ToolCallFinished { .. } => {
+                    return CompactionPollStatus::Failed(
+                        "compaction summary unexpectedly requested a tool".to_string(),
+                    );
+                }
+                bcode_model::ProviderOutputEvent::ReasoningActivity { .. } => {}
+            },
             ProviderTurnEvent::TextDelta { text } => summary.push_str(&text),
             ProviderTurnEvent::Usage { usage } => {
                 append_model_usage_event(state, session_id, turn_id.to_string(), usage).await;

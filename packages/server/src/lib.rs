@@ -66,11 +66,11 @@ use bcode_ipc::{
 use bcode_metrics::{MetricLabels, MetricsContext, MetricsEventLogConfig, MetricsRegistry};
 use bcode_model::{
     CancelTurnRequest, ContentBlock, FinishTurnRequest, ImageMetadata as ModelImageMetadata,
-    ImageRefContent, MODEL_PROVIDER_INTERFACE_ID, MessageRole, ModelList, ModelMessage,
-    ModelParameters, ModelTurnRequest, OP_AUTH_USAGE, OP_CANCEL_TURN, OP_FINISH_TURN, OP_MODELS,
-    OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest, PollTurnEventsResponse,
-    ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage, ToolCallRequestPolicy,
-    ToolChoice,
+    ImageRefContent, MODEL_PROVIDER_INTERFACE_ID, MODEL_PROVIDER_INTERFACE_ID_V2, MessageRole,
+    ModelList, ModelMessage, ModelParameters, ModelTurnRequest, OP_AUTH_USAGE, OP_CANCEL_TURN,
+    OP_FINISH_TURN, OP_MODELS, OP_POLL_TURN_EVENTS, OP_START_TURN, PollTurnEventsRequest,
+    PollTurnEventsResponse, ProviderTurnEvent, ReasoningEffort, StartTurnResponse, TokenUsage,
+    ToolCallRequestPolicy, ToolChoice,
 };
 use bcode_plugin::{
     PluginInvocationBridge, PluginInvocationScope, StreamingServiceInvocationEvent,
@@ -11521,6 +11521,7 @@ fn dispatch_provider_turn_cleanup(
     plugins: bcode_plugin::PluginRuntimeHost,
     metrics: MetricsRegistry,
     provider_plugin_id: String,
+    interface_id: &'static str,
     request: CancelTurnRequest,
     scope: PluginInvocationScope,
 ) {
@@ -11529,7 +11530,7 @@ fn dispatch_provider_turn_cleanup(
         let result = plugins
             .invoke_service_json_scoped::<_, bcode_model::AckResponse>(
                 &provider_plugin_id,
-                MODEL_PROVIDER_INTERFACE_ID,
+                interface_id,
                 OP_CANCEL_TURN,
                 &request,
                 scope,
@@ -11586,11 +11587,15 @@ async fn finish_session_turn_cancellation(
                 .ok()
                 .map(ToString::to_string)
         });
-        if let Some(provider_plugin_id) = provider_plugin_id {
+        if let Some(provider_plugin_id) = provider_plugin_id
+            && let Some(interface_id) =
+                model_provider_interface_for_plugin(state, &provider_plugin_id)
+        {
             dispatch_provider_turn_cleanup(
                 state.plugins.clone(),
                 state.metrics.clone(),
                 provider_plugin_id,
+                interface_id,
                 CancelTurnRequest {
                     provider_turn_id: model.provider_turn_id.clone(),
                 },
@@ -13690,6 +13695,7 @@ struct ModelPollOutcome {
     pending_provider_response_id: Option<String>,
     pending_tool_calls: Vec<bcode_model::ToolCall>,
     reasoning_activities: BTreeMap<String, ReasoningActivityAccumulator>,
+    tool_output_positions: BTreeMap<String, (String, bcode_session_models::TurnOutputPosition)>,
     reasoning_text_streams: BTreeMap<(String, String), (u64, usize)>,
     saw_reasoning_evidence: bool,
 }
@@ -13698,6 +13704,7 @@ struct ModelPollOutcome {
 struct ReasoningActivityAccumulator {
     activity_id: String,
     order: u32,
+    output_position: Option<bcode_session_models::TurnOutputPosition>,
     status: Option<bcode_session_models::ReasoningActivityStatus>,
     parts: BTreeMap<String, bcode_session_models::ReasoningPart>,
     completed_parts: BTreeSet<String>,
@@ -13709,6 +13716,7 @@ impl ReasoningActivityAccumulator {
         Self {
             activity_id,
             order,
+            output_position: None,
             status: None,
             parts: BTreeMap::new(),
             completed_parts: BTreeSet::new(),
@@ -13806,7 +13814,16 @@ struct PendingManagedCompaction {
 }
 
 #[derive(Debug, Clone)]
+struct ToolRequestDraftPresentation {
+    producer_plugin_id: Option<String>,
+    schema: String,
+    schema_version: u32,
+    placement: bcode_session_models::ToolContributionPlacement,
+}
+
+#[derive(Debug, Clone)]
 struct ToolArgumentStreamProgress {
+    output_position: Option<bcode_session_models::TurnOutputPosition>,
     call_id: String,
     name: String,
     producer_plugin_id: Option<String>,
@@ -13834,6 +13851,7 @@ struct ModelStreamProgress {
 struct AssistantSegmentOutput {
     segment_id: String,
     segment_order: u32,
+    output_position: Option<bcode_session_models::TurnOutputPosition>,
     text: String,
 }
 
@@ -13843,6 +13861,7 @@ struct ModelStreamAccumulator {
     turn_id: String,
     segment_id: String,
     segment_order: u32,
+    output_position: Option<bcode_session_models::TurnOutputPosition>,
     assistant_text: String,
     pending_text: String,
     pending_text_offset: usize,
@@ -13863,6 +13882,7 @@ impl ModelStreamAccumulator {
             turn_id: turn_id.to_owned(),
             segment_id: format!("segment-{segment_order}"),
             segment_order,
+            output_position: None,
             assistant_text: String::new(),
             pending_text: String::new(),
             pending_text_offset: 0,
@@ -13905,6 +13925,7 @@ impl ModelStreamAccumulator {
                 .publish_live_event(
                     self.session_id,
                     SessionLiveEventKind::AssistantTextStreamUpdated {
+                        output_position: self.output_position,
                         turn_id: self.turn_id.clone(),
                         segment_id: self.segment_id.clone(),
                         segment_order: self.segment_order,
@@ -13931,13 +13952,26 @@ impl ModelStreamAccumulator {
         (!text.is_empty()).then(|| AssistantSegmentOutput {
             segment_id: self.segment_id.clone(),
             segment_order: self.segment_order,
+            output_position: self.output_position,
             text,
         })
+    }
+
+    const fn output_position(&self) -> Option<bcode_session_models::TurnOutputPosition> {
+        self.output_position
+    }
+
+    const fn set_output_position(
+        &mut self,
+        position: Option<bcode_session_models::TurnOutputPosition>,
+    ) {
+        self.output_position = position;
     }
 
     fn advance_segment(&mut self, segment_order: u32) {
         self.segment_order = segment_order;
         self.segment_id = format!("segment-{segment_order}");
+        self.output_position = None;
         self.pending_text_offset = 0;
         self.next_text_revision = 1;
     }
@@ -13946,6 +13980,7 @@ impl ModelStreamAccumulator {
         (!self.assistant_text.is_empty()).then_some(AssistantSegmentOutput {
             segment_id: self.segment_id,
             segment_order: self.segment_order,
+            output_position: self.output_position,
             text: self.assistant_text,
         })
     }
@@ -13960,25 +13995,42 @@ impl ModelStreamProgress {
         name: String,
         producer_plugin_id: Option<String>,
     ) {
+        self.start_tool_call_at(None, call_id, name, producer_plugin_id);
+    }
+
+    fn start_tool_call_at(
+        &mut self,
+        output_position: Option<bcode_session_models::TurnOutputPosition>,
+        call_id: String,
+        name: String,
+        producer_plugin_id: Option<String>,
+    ) {
         self.start_tool_call_with_presentation(
+            output_position,
             call_id,
             name,
-            producer_plugin_id,
-            "bcode.tool.request-draft".to_owned(),
-            0,
-            bcode_session_models::ToolContributionPlacement::Request,
+            ToolRequestDraftPresentation {
+                producer_plugin_id,
+                schema: "bcode.tool.request-draft".to_owned(),
+                schema_version: 0,
+                placement: bcode_session_models::ToolContributionPlacement::Request,
+            },
         );
     }
 
     fn start_tool_call_with_presentation(
         &mut self,
+        output_position: Option<bcode_session_models::TurnOutputPosition>,
         call_id: String,
         name: String,
-        producer_plugin_id: Option<String>,
-        schema: String,
-        schema_version: u32,
-        placement: bcode_session_models::ToolContributionPlacement,
+        presentation: ToolRequestDraftPresentation,
     ) {
+        let ToolRequestDraftPresentation {
+            producer_plugin_id,
+            schema,
+            schema_version,
+            placement,
+        } = presentation;
         let generation = self
             .generations
             .entry(call_id.clone())
@@ -13987,6 +14039,7 @@ impl ModelStreamProgress {
         self.active_tool_calls.insert(
             call_id.clone(),
             ToolArgumentStreamProgress {
+                output_position,
                 call_id,
                 name,
                 producer_plugin_id,
@@ -14076,6 +14129,7 @@ impl ModelStreamProgress {
             }
         };
         Some(bcode_session_models::ToolRequestDraftEvent {
+            output_position: active.output_position,
             turn_id: turn_id.to_owned(),
             tool_call_id: active.call_id.clone(),
             tool_name: active.name.clone(),
@@ -14098,6 +14152,7 @@ impl ModelStreamProgress {
     ) -> Option<bcode_session_models::ToolRequestDraftEvent> {
         let active = self.active_tool_calls.get(call_id)?;
         Some(bcode_session_models::ToolRequestDraftEvent {
+            output_position: active.output_position,
             turn_id: turn_id.to_owned(),
             tool_call_id: active.call_id.clone(),
             tool_name: active.name.clone(),
@@ -14641,6 +14696,7 @@ async fn run_model_turn_inner(
                     state,
                     session_id,
                     outcome.pending_tool_calls,
+                    &outcome.tool_output_positions,
                     Arc::clone(&cancel_state),
                     command_context,
                     &execution,
@@ -15959,6 +16015,13 @@ fn model_events_include_progress(events: &[ProviderTurnEvent]) -> bool {
 
 const fn model_event_is_progress(event: &ProviderTurnEvent) -> bool {
     match event {
+        ProviderTurnEvent::Output { event, .. } => match event {
+            bcode_model::ProviderOutputEvent::TextDelta { text } => !text.is_empty(),
+            bcode_model::ProviderOutputEvent::ToolCallDelta { delta, .. } => !delta.is_empty(),
+            bcode_model::ProviderOutputEvent::ReasoningActivity { .. }
+            | bcode_model::ProviderOutputEvent::ToolCallStarted { .. }
+            | bcode_model::ProviderOutputEvent::ToolCallFinished { .. } => true,
+        },
         ProviderTurnEvent::TextDelta { text } | ProviderTurnEvent::ReasoningDelta { text } => {
             !text.is_empty()
         }
@@ -16136,6 +16199,152 @@ async fn handle_provider_turn_event(
         return;
     }
     match event {
+        ProviderTurnEvent::Output { position, event } => match event {
+            bcode_model::ProviderOutputEvent::TextDelta { text } => {
+                begin_positioned_assistant_output(
+                    state,
+                    session_id,
+                    turn_id,
+                    next_assistant_segment_order,
+                    position,
+                    stream,
+                )
+                .await;
+                if state.observability.debug_enabled() {
+                    append_provider_event_trace(state, session_id, turn_id, "text_delta", None)
+                        .await;
+                }
+                state.metrics.record_histogram(
+                    "model.provider.text_delta_chars",
+                    text.chars().count() as u64,
+                );
+                stream.push_text(&text);
+                stream.flush_if_ready(state).await;
+            }
+            bcode_model::ProviderOutputEvent::ReasoningActivity { event } => {
+                outcome.saw_reasoning_evidence = true;
+                state
+                    .metrics
+                    .increment_counter("model.provider.reasoning_activity_events_total");
+                let activity = outcome
+                    .reasoning_activities
+                    .entry(event.activity_id().to_owned())
+                    .or_insert_with(|| {
+                        ReasoningActivityAccumulator::new(
+                            event.activity_id().to_owned(),
+                            event.activity_order(),
+                        )
+                    });
+                activity.output_position = Some(position);
+                activity.apply(&event);
+                publish_reasoning_activity_live(
+                    state,
+                    session_id,
+                    turn_id,
+                    Some(position),
+                    outcome,
+                    &event,
+                )
+                .await;
+            }
+            bcode_model::ProviderOutputEvent::ToolCallStarted { call_id, name } => {
+                outcome
+                    .tool_output_positions
+                    .insert(call_id.clone(), (turn_id.to_owned(), position));
+                let presentation =
+                    state
+                        .plugins
+                        .tool_presentation(&name)
+                        .map(|(plugin_id, presentation)| {
+                            (
+                                Some(plugin_id.to_owned()),
+                                presentation.request_draft_schema.clone(),
+                                presentation.request_draft_schema_version,
+                                bcode_session_models::ToolContributionPlacement::Request,
+                            )
+                        });
+                let (producer_plugin_id, schema, schema_version, placement) =
+                    if let Some(presentation) = presentation {
+                        presentation
+                    } else {
+                        let producer_plugin_id = collect_server_tool_catalog(state)
+                            .await
+                            .ok()
+                            .and_then(|catalog| catalog.find_tool(&name))
+                            .and_then(|tool| match tool.source {
+                                ToolSource::Plugin { plugin_id } => Some(plugin_id),
+                                ToolSource::Inline => None,
+                            });
+                        (
+                            producer_plugin_id,
+                            "bcode.tool.request-draft".to_owned(),
+                            0,
+                            bcode_session_models::ToolContributionPlacement::Request,
+                        )
+                    };
+                stream_progress.start_tool_call_with_presentation(
+                    Some(position),
+                    call_id.clone(),
+                    name.clone(),
+                    ToolRequestDraftPresentation {
+                        producer_plugin_id,
+                        schema,
+                        schema_version,
+                        placement,
+                    },
+                );
+                publish_provider_stream_progress_live(
+                    state,
+                    session_id,
+                    turn_id,
+                    ProviderStreamEvent::ToolCallStarted {
+                        tool_call_id: call_id,
+                        tool_name: name,
+                    },
+                )
+                .await;
+            }
+            bcode_model::ProviderOutputEvent::ToolCallDelta { call_id, delta } => {
+                stream_progress.record_tool_call_delta(&call_id, &delta);
+                if let Some(draft) =
+                    stream_progress.take_tool_request_draft_event(turn_id, &call_id)
+                {
+                    publish_tool_request_draft_live(state, session_id, draft).await;
+                }
+            }
+            bcode_model::ProviderOutputEvent::ToolCallFinished { call } => {
+                let call_id = call.id.clone();
+                stream_progress.record_completed_tool_call(&call);
+                if let Some(checkpoint) =
+                    stream_progress.tool_request_draft_checkpoint(turn_id, &call_id)
+                {
+                    publish_tool_request_draft_live(state, session_id, checkpoint.clone()).await;
+                    if checkpoint.placement
+                        == bcode_session_models::ToolContributionPlacement::Request
+                    {
+                        remove_tool_request_draft_live(
+                            state,
+                            session_id,
+                            &checkpoint,
+                            bcode_session_models::ToolRequestDraftTerminalReason::Completed,
+                        )
+                        .await;
+                    }
+                }
+                persist_completed_reasoning_activities(state, session_id, turn_id, outcome).await;
+                handle_provider_tool_call_finished_event(
+                    state,
+                    session_id,
+                    turn_id,
+                    next_assistant_segment_order,
+                    &call,
+                    stream,
+                )
+                .await;
+                outcome.pending_tool_calls.push(call);
+                stream_progress.finish_tool_call(&call_id);
+            }
+        },
         ProviderTurnEvent::TextDelta { text } => {
             if state.observability.debug_enabled() {
                 append_provider_event_trace(state, session_id, turn_id, "text_delta", None).await;
@@ -16370,12 +16579,15 @@ async fn handle_provider_turn_event(
                     )
                 };
             stream_progress.start_tool_call_with_presentation(
+                None,
                 call_id.clone(),
                 name.clone(),
-                producer_plugin_id,
-                schema,
-                schema_version,
-                placement,
+                ToolRequestDraftPresentation {
+                    producer_plugin_id,
+                    schema,
+                    schema_version,
+                    placement,
+                },
             );
             publish_provider_stream_progress_live(
                 state,
@@ -16406,7 +16618,8 @@ async fn handle_provider_turn_event(
                 .entry(activity_id.clone())
                 .or_insert_with(|| ReasoningActivityAccumulator::new(activity_id, activity_order))
                 .apply(&event);
-            publish_reasoning_activity_live(state, session_id, turn_id, outcome, &event).await;
+            publish_reasoning_activity_live(state, session_id, turn_id, None, outcome, &event)
+                .await;
             if state.observability.debug_enabled() {
                 append_provider_event_trace(state, session_id, turn_id, "reasoning_delta", None)
                     .await;
@@ -16427,7 +16640,8 @@ async fn handle_provider_turn_event(
                     )
                 })
                 .apply(&event);
-            publish_reasoning_activity_live(state, session_id, turn_id, outcome, &event).await;
+            publish_reasoning_activity_live(state, session_id, turn_id, None, outcome, &event)
+                .await;
             if state.observability.debug_enabled() {
                 append_provider_event_trace(state, session_id, turn_id, "reasoning_activity", None)
                     .await;
@@ -16446,6 +16660,7 @@ async fn publish_reasoning_activity_live(
     state: &ServerState,
     session_id: SessionId,
     turn_id: &str,
+    output_position: Option<bcode_session_models::TurnOutputPosition>,
     outcome: &mut ModelPollOutcome,
     event: &bcode_session_models::ReasoningActivityEvent,
 ) {
@@ -16476,6 +16691,7 @@ async fn publish_reasoning_activity_live(
             };
             *offset = offset.saturating_add(text.len());
             SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                output_position,
                 turn_id: turn_id.to_owned(),
                 activity_id: activity_id.clone(),
                 activity_order: *activity_order,
@@ -16501,6 +16717,7 @@ async fn publish_reasoning_activity_live(
                 .or_insert((0, 0));
             *revision = revision.saturating_add(1);
             SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                output_position,
                 turn_id: turn_id.to_owned(),
                 activity_id: activity_id.clone(),
                 activity_order: *activity_order,
@@ -16522,6 +16739,7 @@ async fn publish_reasoning_activity_live(
             }
         }
         _ => SessionLiveEventKind::AssistantReasoningActivity {
+            output_position,
             turn_id: turn_id.to_owned(),
             event: event.clone(),
         },
@@ -16565,6 +16783,7 @@ async fn handle_provider_usage_event(
                 .publish_live_event(
                     session_id,
                     SessionLiveEventKind::AssistantReasoningActivity {
+                        output_position: None,
                         turn_id: turn_id.to_owned(),
                         event,
                     },
@@ -16703,6 +16922,35 @@ async fn handle_provider_cancelled_event(
         ModelTurnOutcome::Cancelled,
         message,
     ));
+}
+
+async fn begin_positioned_assistant_output(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    next_assistant_segment_order: &mut u32,
+    position: bcode_session_models::TurnOutputPosition,
+    stream: &mut ModelStreamAccumulator,
+) {
+    if stream
+        .output_position()
+        .is_some_and(|current| current != position)
+    {
+        stream.flush(state).await;
+        if let Some(segment) = stream.take_assistant_segment()
+            && append_assistant_response_segment_event(
+                state,
+                session_id,
+                turn_id,
+                next_assistant_segment_order,
+                segment,
+            )
+            .await
+        {
+            stream.advance_segment(*next_assistant_segment_order);
+        }
+    }
+    stream.set_output_position(Some(position));
 }
 
 async fn handle_provider_tool_call_finished_event(
@@ -16970,6 +17218,7 @@ async fn remove_tool_request_draft_live(
     reason: bcode_session_models::ToolRequestDraftTerminalReason,
 ) {
     let event = bcode_session_models::ToolRequestDraftEvent {
+        output_position: current.output_position,
         turn_id: current.turn_id.clone(),
         tool_call_id: current.tool_call_id.clone(),
         tool_name: current.tool_name.clone(),
@@ -17478,26 +17727,51 @@ async fn session_runtime_selection_payload(
         .unwrap_or_default()
 }
 
-fn has_model_provider(state: &ServerState, provider_plugin_id: Option<&str>) -> bool {
-    if let Some(provider_plugin_id) = provider_plugin_id {
-        return state
-            .plugins
-            .registry()
-            .manifests()
-            .get(provider_plugin_id)
-            .is_some_and(|manifest| {
-                manifest
-                    .services
-                    .iter()
-                    .any(|service| service.interface_id == MODEL_PROVIDER_INTERFACE_ID)
-            });
-    }
-    state
+fn model_provider_interface_for_plugin(
+    state: &ServerState,
+    provider_plugin_id: &str,
+) -> Option<&'static str> {
+    let manifest = state
         .plugins
         .registry()
-        .service_registry()
-        .providers_for(MODEL_PROVIDER_INTERFACE_ID)
-        .is_some()
+        .manifests()
+        .get(provider_plugin_id)?;
+    if manifest
+        .services
+        .iter()
+        .any(|service| service.interface_id == MODEL_PROVIDER_INTERFACE_ID_V2)
+    {
+        Some(MODEL_PROVIDER_INTERFACE_ID_V2)
+    } else if manifest
+        .services
+        .iter()
+        .any(|service| service.interface_id == MODEL_PROVIDER_INTERFACE_ID)
+    {
+        Some(MODEL_PROVIDER_INTERFACE_ID)
+    } else {
+        None
+    }
+}
+
+fn unique_model_provider_route(state: &ServerState) -> Result<(String, &'static str), String> {
+    for interface_id in [MODEL_PROVIDER_INTERFACE_ID_V2, MODEL_PROVIDER_INTERFACE_ID] {
+        if let Ok(plugin_id) = state
+            .plugins
+            .registry()
+            .service_registry()
+            .unique_provider(interface_id)
+        {
+            return Ok((plugin_id.to_owned(), interface_id));
+        }
+    }
+    Err("no unique model provider is available".to_owned())
+}
+
+fn has_model_provider(state: &ServerState, provider_plugin_id: Option<&str>) -> bool {
+    if let Some(provider_plugin_id) = provider_plugin_id {
+        return model_provider_interface_for_plugin(state, provider_plugin_id).is_some();
+    }
+    unique_model_provider_route(state).is_ok()
 }
 
 async fn invoke_model_provider_json_blocking<Q, R>(
@@ -17531,21 +17805,16 @@ where
     Q: serde::Serialize + Send + Sync + 'static,
     R: serde::de::DeserializeOwned + Send + 'static,
 {
-    let provider_plugin_id = if let Some(provider_plugin_id) = provider_plugin_id.as_deref() {
-        provider_plugin_id
-    } else {
-        state
-            .plugins
-            .registry()
-            .service_registry()
-            .unique_provider(MODEL_PROVIDER_INTERFACE_ID)
-            .map_err(|error| error.to_string())?
-    };
+    let (provider_plugin_id, interface_id) =
+        if let Some(provider_plugin_id) = provider_plugin_id.as_deref() {
+            let interface_id = model_provider_interface_for_plugin(state, provider_plugin_id)
+                .ok_or_else(|| format!("plugin {provider_plugin_id} is not a model provider"))?;
+            (provider_plugin_id.to_owned(), interface_id)
+        } else {
+            unique_model_provider_route(state)?
+        };
     let mut labels = MetricLabels::new();
-    labels.insert(
-        "provider_plugin_id".to_owned(),
-        provider_plugin_id.to_owned(),
-    );
+    labels.insert("provider_plugin_id".to_owned(), provider_plugin_id.clone());
     labels.insert("operation".to_owned(), operation.to_owned());
     labels.insert("scope".to_owned(), plugin_scope_kind(&scope).to_owned());
     state
@@ -17554,8 +17823,8 @@ where
             "model.provider.service",
             labels,
             state.plugins.invoke_service_json_scoped::<_, R>(
-                provider_plugin_id,
-                MODEL_PROVIDER_INTERFACE_ID,
+                &provider_plugin_id,
+                interface_id,
                 operation,
                 &request,
                 scope,
@@ -19414,6 +19683,8 @@ struct ServerToolInvoker<'a> {
     session_id: SessionId,
     working_directory: &'a Path,
     cancel_state: &'a TurnCancelState,
+    output_positions:
+        Option<&'a BTreeMap<String, (String, bcode_session_models::TurnOutputPosition)>>,
     persist_requests: bool,
     persist_lifecycle: bool,
 }
@@ -19430,12 +19701,17 @@ impl<'a> ServerToolInvoker<'a> {
             session_id,
             working_directory,
             cancel_state,
+            output_positions: None,
             persist_requests: false,
             persist_lifecycle: true,
         }
     }
 
-    const fn for_production_batch(mut self) -> Self {
+    const fn for_production_batch(
+        mut self,
+        output_positions: &'a BTreeMap<String, (String, bcode_session_models::TurnOutputPosition)>,
+    ) -> Self {
+        self.output_positions = Some(output_positions);
         self.persist_requests = true;
         self.persist_lifecycle = false;
         self
@@ -19495,10 +19771,17 @@ impl ToolInvoker for ServerToolInvoker<'_> {
                 append_tool_request_event(
                     self.state,
                     self.session_id,
-                    request.invocation.invocation_id.clone(),
-                    request.invocation.tool_name.clone(),
-                    serde_json::to_string(&request.invocation.arguments).unwrap_or_default(),
-                    Some(plugin_id.clone()),
+                    self.output_positions.and_then(|positions| {
+                        positions.get(&request.invocation.invocation_id).cloned()
+                    }),
+                    AppendToolCallRequestedInput {
+                        tool_call_id: request.invocation.invocation_id.clone(),
+                        tool_name: request.invocation.tool_name.clone(),
+                        arguments_json: serde_json::to_string(&request.invocation.arguments)
+                            .unwrap_or_default(),
+                        producer_plugin_id: Some(plugin_id.clone()),
+                        working_directory: None,
+                    },
                     self.working_directory,
                 )
                 .await;
@@ -20145,6 +20428,7 @@ fn execute_model_tool_batch<'a>(
     state: &'a ServerState,
     session_id: SessionId,
     calls: Vec<bcode_model::ToolCall>,
+    output_positions: &'a BTreeMap<String, (String, bcode_session_models::TurnOutputPosition)>,
     cancel_state: Arc<TurnCancelState>,
     command_context: &'a mut RuntimeCommandContext<'_>,
     execution: &bcode_session_models::TurnExecutionOptions,
@@ -20204,7 +20488,7 @@ fn execute_model_tool_batch<'a>(
         );
         let invoker =
             ServerToolInvoker::new(state, session_id, &working_directory, cancel_state.as_ref())
-                .for_production_batch();
+                .for_production_batch(output_positions);
         let agent_id = agent_profile.unwrap_or(session_agent_selection(state, session_id).await);
         let coordinator = ServerAuthorizationCoordinator::new(
             state,
@@ -23013,12 +23297,25 @@ async fn persist_completed_reasoning_activities(
     let mut completed = take_completed_reasoning_activities(outcome);
     completed.sort_by_key(|activity| (activity.order, activity.activity_id.clone()));
     for activity in completed {
+        let output_position = activity.output_position;
         let activity = activity.finish(bcode_session_models::ReasoningActivityStatus::Completed);
-        match state
-            .sessions
-            .append_assistant_reasoning_activity(session_id, turn_id.to_owned(), activity)
-            .await
-        {
+        let appended = if let Some(output_position) = output_position {
+            state
+                .sessions
+                .append_positioned_assistant_reasoning_activity(
+                    session_id,
+                    turn_id.to_owned(),
+                    output_position,
+                    activity,
+                )
+                .await
+        } else {
+            state
+                .sessions
+                .append_assistant_reasoning_activity(session_id, turn_id.to_owned(), activity)
+                .await
+        };
+        match appended {
             Ok(event) => publish_session_event(state, &event).await,
             Err(error) => tracing::warn!("failed to append assistant reasoning activity: {error}"),
         }
@@ -23045,15 +23342,30 @@ async fn persist_reasoning_activities(
     };
     let mut activities = std::mem::take(&mut outcome.reasoning_activities)
         .into_values()
-        .map(|activity| activity.finish(fallback_status))
+        .map(|activity| {
+            let output_position = activity.output_position;
+            (output_position, activity.finish(fallback_status))
+        })
         .collect::<Vec<_>>();
-    activities.sort_by_key(|activity| (activity.order, activity.activity_id.clone()));
-    for activity in activities {
-        match state
-            .sessions
-            .append_assistant_reasoning_activity(session_id, turn_id.to_owned(), activity)
-            .await
-        {
+    activities.sort_by_key(|(_, activity)| (activity.order, activity.activity_id.clone()));
+    for (output_position, activity) in activities {
+        let appended = if let Some(output_position) = output_position {
+            state
+                .sessions
+                .append_positioned_assistant_reasoning_activity(
+                    session_id,
+                    turn_id.to_owned(),
+                    output_position,
+                    activity,
+                )
+                .await
+        } else {
+            state
+                .sessions
+                .append_assistant_reasoning_activity(session_id, turn_id.to_owned(), activity)
+                .await
+        };
+        match appended {
             Ok(event) => publish_session_event(state, &event).await,
             Err(error) => tracing::warn!("failed to append assistant reasoning activity: {error}"),
         }
@@ -23068,17 +23380,31 @@ async fn append_assistant_response_segment_event(
     segment: AssistantSegmentOutput,
 ) -> bool {
     debug_assert_eq!(segment.segment_order, *next_segment_order);
-    match state
-        .sessions
-        .append_assistant_response_segment(
-            session_id,
-            turn_id.to_owned(),
-            segment.segment_id,
-            segment.segment_order,
-            segment.text,
-        )
-        .await
-    {
+    let appended = if let Some(output_position) = segment.output_position {
+        state
+            .sessions
+            .append_positioned_assistant_response_segment(
+                session_id,
+                turn_id.to_owned(),
+                output_position,
+                segment.segment_id,
+                segment.segment_order,
+                segment.text,
+            )
+            .await
+    } else {
+        state
+            .sessions
+            .append_assistant_response_segment(
+                session_id,
+                turn_id.to_owned(),
+                segment.segment_id,
+                segment.segment_order,
+                segment.text,
+            )
+            .await
+    };
+    match appended {
         Ok(event) => {
             *next_segment_order = next_segment_order.saturating_add(1);
             publish_session_event(state, &event).await;
@@ -23143,29 +23469,29 @@ async fn append_tool_invocation_terminal_event(
 async fn append_tool_request_event(
     state: &ServerState,
     session_id: SessionId,
-    tool_call_id: String,
-    tool_name: String,
-    arguments_json: String,
-    producer_plugin_id: Option<String>,
+    output_location: Option<(String, bcode_session_models::TurnOutputPosition)>,
+    input: AppendToolCallRequestedInput,
     working_directory: &std::path::Path,
 ) {
-    let runtime_work_id = WorkId::new(format!("tool_{tool_call_id}"));
-    let runtime_label = tool_name.clone();
-    let runtime_tool_call_id = tool_call_id.clone();
-    match state
-        .sessions
-        .append_tool_call_requested(
-            session_id,
-            AppendToolCallRequestedInput {
-                tool_call_id,
-                tool_name,
-                arguments_json,
-                producer_plugin_id,
-                working_directory: Some(working_directory.to_path_buf()),
-            },
-        )
-        .await
-    {
+    let runtime_work_id = WorkId::new(format!("tool_{}", input.tool_call_id));
+    let runtime_label = input.tool_name.clone();
+    let runtime_tool_call_id = input.tool_call_id.clone();
+    let input = AppendToolCallRequestedInput {
+        working_directory: Some(working_directory.to_path_buf()),
+        ..input
+    };
+    let appended = if let Some((turn_id, output_position)) = output_location {
+        state
+            .sessions
+            .append_positioned_tool_call_requested(session_id, turn_id, output_position, input)
+            .await
+    } else {
+        state
+            .sessions
+            .append_tool_call_requested(session_id, input)
+            .await
+    };
+    match appended {
         Ok(event) => publish_session_event(state, &event).await,
         Err(error) => tracing::warn!("failed to append tool request: {error}"),
     }
@@ -25856,6 +26182,13 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantDelta { .. } => "assistant_delta",
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::AssistantResponseSegment { .. } => "assistant_response_segment",
+        SessionEventKind::PositionedAssistantResponseSegment { .. } => {
+            "positioned_assistant_response_segment"
+        }
+        SessionEventKind::PositionedAssistantReasoningActivity { .. } => {
+            "positioned_assistant_reasoning_activity"
+        }
+        SessionEventKind::PositionedToolCallRequested { .. } => "positioned_tool_call_requested",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",
@@ -28148,6 +28481,7 @@ library = "test"
             bcode_plugin::PluginHost::default().into(),
             metrics.clone(),
             "missing.provider".to_owned(),
+            MODEL_PROVIDER_INTERFACE_ID,
             CancelTurnRequest {
                 provider_turn_id: "provider-turn".to_owned(),
             },
@@ -28202,6 +28536,7 @@ library = "test"
                 plugins,
                 MetricsRegistry::default(),
                 "test.non-returning-provider".to_string(),
+                MODEL_PROVIDER_INTERFACE_ID,
                 CancelTurnRequest {
                     provider_turn_id: "provider-turn".to_string(),
                 },
@@ -31097,6 +31432,7 @@ library = "test"
         operation: bcode_session_models::ToolRequestDraftOperation,
     ) -> bcode_session_models::ToolRequestDraftEvent {
         bcode_session_models::ToolRequestDraftEvent {
+            output_position: None,
             turn_id: "turn-1".to_owned(),
             tool_call_id: tool_call_id.to_owned(),
             tool_name: "filesystem.write".to_owned(),
@@ -32301,12 +32637,15 @@ library = "test"
     fn tool_request_draft_batches_append_bytes_and_checkpoints_bounded_state() {
         let mut progress = ModelStreamProgress::default();
         progress.start_tool_call_with_presentation(
+            None,
             "call-write".to_owned(),
             "filesystem.write".to_owned(),
-            Some("bcode.filesystem".to_owned()),
-            "bcode.filesystem.request-draft.write".to_owned(),
-            1,
-            bcode_session_models::ToolContributionPlacement::Result,
+            ToolRequestDraftPresentation {
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                schema: "bcode.filesystem.request-draft.write".to_owned(),
+                schema_version: 1,
+                placement: bcode_session_models::ToolContributionPlacement::Result,
+            },
         );
         progress.record_tool_call_delta("call-write", "{\"path\":\"src/lib.rs\",");
         progress.record_tool_call_delta("call-write", "\"contents\":\"hello\"}");
@@ -36629,6 +36968,7 @@ library = "test"
             .publish_live_event(
                 session.id,
                 SessionLiveEventKind::AssistantTextStreamUpdated {
+                    output_position: None,
                     turn_id: turn_id.to_owned(),
                     segment_id: "segment-0".to_owned(),
                     segment_order: 0,
@@ -38397,6 +38737,7 @@ library = "test"
                         }),
                     },
                 ],
+                &BTreeMap::new(),
                 Arc::new(TurnCancelState::default()),
                 &mut command_context,
                 &bcode_session_models::TurnExecutionOptions::default(),
@@ -38471,6 +38812,7 @@ library = "test"
                     name: "shell.run".to_owned(),
                     arguments: serde_json::json!({"command": "sleep 30"}),
                 }],
+                &BTreeMap::new(),
                 task_cancel,
                 &mut command_context,
                 &bcode_session_models::TurnExecutionOptions::default(),
@@ -38579,6 +38921,7 @@ library = "test"
                 task_state.as_ref(),
                 session_id,
                 calls,
+                &BTreeMap::new(),
                 task_cancel,
                 &mut command_context,
                 &bcode_session_models::TurnExecutionOptions::default(),
@@ -41904,6 +42247,104 @@ library = "test"
         let mut state = test_server_state(sessions);
         state.plugins = plugins;
         state
+    }
+
+    #[test]
+    fn bundled_model_provider_route_prefers_v2_and_keeps_v1_compatibility() {
+        let state = test_server_state_with_fake_provider(SessionManager::default());
+        assert_eq!(
+            model_provider_interface_for_plugin(&state, "bcode.fake-provider"),
+            Some(MODEL_PROVIDER_INTERFACE_ID_V2)
+        );
+        assert_eq!(
+            unique_model_provider_route(&state),
+            Ok((
+                "bcode.fake-provider".to_owned(),
+                MODEL_PROVIDER_INTERFACE_ID_V2
+            ))
+        );
+        let manifest = state
+            .plugins
+            .registry()
+            .manifests()
+            .get("bcode.fake-provider")
+            .expect("fake provider manifest");
+        assert!(
+            manifest
+                .services
+                .iter()
+                .any(|service| { service.interface_id == MODEL_PROVIDER_INTERFACE_ID })
+        );
+    }
+
+    #[tokio::test]
+    async fn bundled_v2_provider_route_emits_positioned_output() {
+        let state = test_server_state_with_fake_provider(SessionManager::default());
+        let request = ModelTurnRequest {
+            session_id: SessionId::new(),
+            turn_id: "turn-v2".to_owned(),
+            model_id: "fake-model".to_owned(),
+            provider_context: bcode_model::ProviderRequestContext::default(),
+            system_prompt: None,
+            messages: vec![ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "hello".to_owned(),
+                }],
+            }],
+            tools: Vec::new(),
+            tool_call_policy: ToolCallRequestPolicy {
+                parallel: Some(false),
+                choice: ToolChoice::None,
+            },
+            parameters: ModelParameters::default(),
+            structured_output: None,
+            context_management: bcode_model::ContextManagementRequest::default(),
+            prompt_cache: bcode_model::PromptCacheHints::default(),
+            conversation_reuse: bcode_model::ConversationReuseHints::default(),
+            metadata: BTreeMap::new(),
+        };
+        let start = invoke_model_provider_json_blocking::<_, StartTurnResponse>(
+            &state,
+            Some("bcode.fake-provider".to_owned()),
+            OP_START_TURN,
+            request,
+        )
+        .await
+        .expect("start v2 fake turn");
+        let mut events = Vec::new();
+        for _ in 0..20 {
+            let response = invoke_model_provider_json_blocking::<_, PollTurnEventsResponse>(
+                &state,
+                Some("bcode.fake-provider".to_owned()),
+                OP_POLL_TURN_EVENTS,
+                PollTurnEventsRequest {
+                    provider_turn_id: start.provider_turn_id.clone(),
+                },
+            )
+            .await
+            .expect("poll v2 fake turn");
+            events.extend(response.events);
+            if events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::TurnFinished { .. }))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::Output {
+                event: bcode_model::ProviderOutputEvent::TextDelta { .. },
+                ..
+            }
+        )));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::TextDelta { .. }))
+        );
     }
 
     fn test_skill_registry() -> SkillRegistry {
@@ -46870,6 +47311,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-benchmark".to_owned(),
                     tool_call_id: "call-write".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -46983,6 +47425,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let append = |revision, offset, text: &str| bcode_session_models::SessionLiveEvent {
             session_id,
             kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                output_position: None,
                 turn_id: "turn-1".to_owned(),
                 segment_id: "segment-0".to_owned(),
                 segment_order: 0,
@@ -47010,6 +47453,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
         assert!(matches!(
             &events[0].event.kind,
             SessionLiveEventKind::AssistantTextStreamUpdated {
+                    output_position: None,
                 update: bcode_session_models::TextStreamUpdate {
                     first_revision: 1,
                     revision: 2,
@@ -47060,6 +47504,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-1".to_owned(),
                     tool_call_id: "call-write".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -47130,6 +47575,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             session_id,
             kind: SessionLiveEventKind::ToolRequestDraft {
                 event: bcode_session_models::ToolRequestDraftEvent {
+                    output_position: None,
                     turn_id: "turn-append-bound".to_owned(),
                     tool_call_id: "call-append-bound".to_owned(),
                     tool_name: "filesystem.write".to_owned(),
@@ -48356,10 +48802,14 @@ event_symbol = "bcode_plugin_handle_event_v1"
         append_tool_request_event(
             &state,
             session_id,
-            "call-1".to_owned(),
-            "example.tool".to_owned(),
-            "{}".to_owned(),
-            Some("test.plugin".to_owned()),
+            None,
+            AppendToolCallRequestedInput {
+                tool_call_id: "call-1".to_owned(),
+                tool_name: "example.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                producer_plugin_id: Some("test.plugin".to_owned()),
+                working_directory: None,
+            },
             &test_working_directory(),
         )
         .await;

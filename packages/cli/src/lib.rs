@@ -8031,6 +8031,13 @@ const fn session_event_kind_name(kind: &SessionEventKind) -> &'static str {
         SessionEventKind::AssistantDelta { .. } => "assistant_delta",
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::AssistantResponseSegment { .. } => "assistant_response_segment",
+        SessionEventKind::PositionedAssistantResponseSegment { .. } => {
+            "positioned_assistant_response_segment"
+        }
+        SessionEventKind::PositionedAssistantReasoningActivity { .. } => {
+            "positioned_assistant_reasoning_activity"
+        }
+        SessionEventKind::PositionedToolCallRequested { .. } => "positioned_tool_call_requested",
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
         SessionEventKind::PermissionRequested { .. } => "permission_requested",
         SessionEventKind::PermissionResolved { .. } => "permission_resolved",
@@ -8361,7 +8368,7 @@ fn session_live_event_description(event: &SessionLiveEvent) -> String {
         SessionLiveEventKind::AssistantReasoningDelta { turn_id, text } => {
             format!("live reasoning delta ({turn_id}): {text}")
         }
-        SessionLiveEventKind::AssistantReasoningActivity { turn_id, event } => {
+        SessionLiveEventKind::AssistantReasoningActivity { turn_id, event, .. } => {
             format!("live reasoning activity ({turn_id}): {event:?}")
         }
         SessionLiveEventKind::ProviderStreamProgress { turn_id, event } => {
@@ -8486,6 +8493,17 @@ fn print_non_trace_session_event(event: &SessionEvent) {
                 reasoning_activity_description(event.sequence, turn_id, activity)
             );
         }
+        SessionEventKind::PositionedAssistantReasoningActivity {
+            turn_id,
+            output_position,
+            activity,
+        } => {
+            println!(
+                "{}\noutput position: {}",
+                reasoning_activity_description(event.sequence, turn_id, activity),
+                output_position.get()
+            );
+        }
         SessionEventKind::AssistantDelta { text } => {
             println!("#{} assistant delta: {text}", event.sequence);
         }
@@ -8503,6 +8521,19 @@ fn print_non_trace_session_event(event: &SessionEvent) {
                 event.sequence
             );
         }
+        SessionEventKind::PositionedAssistantResponseSegment {
+            turn_id,
+            output_position,
+            segment_id,
+            segment_order,
+            text,
+        } => {
+            println!(
+                "#{} assistant {turn_id}/{segment_id} position={} order={segment_order}: {text}",
+                event.sequence,
+                output_position.get()
+            );
+        }
         SessionEventKind::ToolCallRequested {
             tool_call_id,
             tool_name,
@@ -8512,6 +8543,21 @@ fn print_non_trace_session_event(event: &SessionEvent) {
             println!(
                 "#{} tool call requested: {tool_name} ({tool_call_id}) {}",
                 event.sequence, arguments_json
+            );
+        }
+        SessionEventKind::PositionedToolCallRequested {
+            turn_id,
+            output_position,
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            ..
+        } => {
+            println!(
+                "#{} tool call requested: {tool_name} ({tool_call_id}) turn={turn_id} position={} {}",
+                event.sequence,
+                output_position.get(),
+                arguments_json
             );
         }
         SessionEventKind::ToolInvocationResultRecorded { record } => {
@@ -10346,6 +10392,7 @@ mod context_compaction_tests {
                 session_id,
                 kind: SessionLiveEventKind::ToolRequestDraft {
                     event: bcode_session_models::ToolRequestDraftEvent {
+                        output_position: None,
                         turn_id: "turn-1".to_owned(),
                         tool_call_id: "call-1".to_owned(),
                         tool_name: "filesystem.write".to_owned(),

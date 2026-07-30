@@ -139,7 +139,8 @@ done
 
 for fixture in \
   packages/session/fixtures/migrations/unknown-future-event-kind-v39.json \
-  packages/session/fixtures/migrations/future-schema-v42.json \
+  packages/session/fixtures/migrations/current-schema-v42.json \
+  packages/session/fixtures/migrations/future-schema-v43.json \
   packages/session/fixtures/migrations/malformed-json-v39.json \
   packages/session/fixtures/migrations/mismatched-session-id-v39.json \
   packages/session/fixtures/migrations/sequence-gap-v39.jsonl; do
@@ -151,7 +152,7 @@ done
 
 if find packages/session/fixtures/migrations -maxdepth 1 -type f \
     \( -name '*-v[0-9]*.json' -o -name '*-v[0-9]*.jsonl' \) \
-    | grep -Ev -- '-v(39|40|41|42)\.jsonl?$' >/tmp/bcode-old-session-fixture-names.txt \
+    | grep -Ev -- '-v(39|40|41|42|43)\.jsonl?$' >/tmp/bcode-old-session-fixture-names.txt \
   || ! python3 - <<'PY'
 from pathlib import Path
 import re
@@ -163,7 +164,7 @@ for pattern in ("*.json", "*.jsonl"):
             if not line.strip():
                 continue
             match = re.search(r'"schema_version"\s*:\s*(\d+)', line)
-            if match is None or int(match.group(1)) not in {39, 40, 41, 42}:
+            if match is None or int(match.group(1)) not in {39, 40, 41, 42, 43}:
                 invalid.append(f"{path}:{line_number}")
 if invalid:
     print("\n".join(invalid))
@@ -245,7 +246,7 @@ if ! rg -q 'create_verified_migration_backup' packages/server/src/session_migrat
   violations=1
 fi
 
-if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 5' packages/session/models/src/lib.rs \
+if ! rg -q 'CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 = 6' packages/session/models/src/lib.rs \
   || ! rg -q 'CURRENT_WRITER_EPOCH: u32 = bcode_session_migration_target::CURRENT_WRITER_EPOCH' packages/session-migration/src/inventory.rs \
   || ! rg -q 'CURRENT_WRITER_EPOCH.*CURRENT_SESSION_STORAGE_WRITER_EPOCH' packages/session-migration-target/src/lib.rs \
   || ! rg -q 'RELEASED_HISTORICAL_ROOTS' packages/session-migration/src/inventory.rs \
@@ -795,7 +796,7 @@ if ! rg -q 'unknown_historical_kind_fails_writable_migration' packages/session-m
   violations=1
 fi
 
-if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 18' packages/ipc/src/lib.rs \
+if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 19' packages/ipc/src/lib.rs \
   || ! rg -q 'PrepareSessionOpen' packages/ipc/src/lib.rs \
   || ! rg -q 'WaitSessionOpenProgress' packages/ipc/src/lib.rs \
   || ! rg -q 'SessionOpenPrepared' packages/ipc/src/lib.rs \
@@ -809,7 +810,7 @@ if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 18' packages/ipc/src/lib.rs \
   || ! rg -q 'migration_stage_families_and_terminal_failure_render_through_status_chrome' packages/tui/src/tests.rs \
   || ! rg -q 'session_open_progress_ignores_stale_session_updates' packages/tui/src/chat_loop.rs \
   || ! rg -q 'prepare_session_open_until_terminal' packages/client/src/lib.rs; then
-  echo "Session migration IPC violation: protocol-v18 prepare/wait routing, bounded revision waits, exact operation errors, codec coverage, and client APIs must remain present." >&2
+  echo "Session migration IPC violation: protocol-v19 prepare/wait routing, bounded revision waits, exact operation errors, codec coverage, and client APIs must remain present." >&2
   violations=1
 fi
 

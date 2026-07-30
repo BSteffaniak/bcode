@@ -84,7 +84,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 18;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 19;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -3573,6 +3573,39 @@ mod tests {
                 actual: 1,
                 expected: CURRENT_PROTOCOL_VERSION
             }
+        ));
+    }
+
+    #[tokio::test]
+    async fn unsupported_future_protocol_version_is_rejected() {
+        let actual = CURRENT_PROTOCOL_VERSION.saturating_add(1);
+        let envelope = Envelope {
+            version: ProtocolVersion(actual),
+            request_id: 1,
+            kind: EnvelopeKind::Response,
+            payload: encode(&Response::Ok(ResponsePayload::MessageSent))
+                .expect("response should encode"),
+        };
+        let encoded = encode(&envelope).expect("envelope should encode");
+        let mut frame = Vec::new();
+        frame.extend_from_slice(
+            &u32::try_from(encoded.len())
+                .expect("encoded envelope should fit u32")
+                .to_le_bytes(),
+        );
+        frame.extend_from_slice(&encoded);
+        let mut cursor = std::io::Cursor::new(frame);
+
+        let error = read_envelope_frame(&mut cursor)
+            .await
+            .expect_err("future protocol version should fail");
+
+        assert!(matches!(
+            error,
+            CodecError::UnsupportedVersion {
+                actual: rejected,
+                expected: CURRENT_PROTOCOL_VERSION
+            } if rejected == actual
         ));
     }
 

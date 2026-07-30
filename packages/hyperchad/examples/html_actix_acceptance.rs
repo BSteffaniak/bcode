@@ -29,6 +29,7 @@ fn acceptance_snapshot(session_id: SessionId) -> SessionViewSnapshot {
     snapshot.transcript.source_end_sequence = Some(500);
     snapshot.transcript.items = (0..500)
         .map(|index| TranscriptViewItem {
+            output_location: None,
             id: TranscriptViewItemId::new(format!("acceptance:{index}")),
             revision: 1,
             sequence: Some(index + 1),

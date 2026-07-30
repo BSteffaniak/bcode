@@ -37,6 +37,7 @@ fn transcript_fixture_item(
     kind: TranscriptViewItemKind,
 ) -> TranscriptViewItem {
     TranscriptViewItem {
+        output_location: None,
         id: TranscriptViewItemId::new(id),
         revision: 7,
         sequence: Some(7),
@@ -321,6 +322,7 @@ fn tool_fixture(status: ToolInvocationViewStatus) -> ToolInvocationView {
         tool_name: Some("fixture.tool".to_owned()),
         arguments_json: Some(r#"{"path":"/tmp/fixture"}"#.to_owned()),
         working_directory: Some("/tmp".into()),
+        request_draft: None,
         status,
         result_text: terminal.then(|| "fixture result".to_owned()),
         is_error: Some(status == ToolInvocationViewStatus::Failed),
@@ -711,6 +713,7 @@ fn plain_text_messages_do_not_parse_markdown() {
 #[test]
 fn user_and_assistant_messages_have_distinct_semantic_surfaces() {
     let user = TranscriptViewItem {
+        output_location: None,
         id: TranscriptViewItemId::new("user:surface"),
         sequence: Some(1),
         timestamp_ms: None,
@@ -721,6 +724,7 @@ fn user_and_assistant_messages_have_distinct_semantic_surfaces() {
         },
     };
     let assistant = TranscriptViewItem {
+        output_location: None,
         id: TranscriptViewItemId::new("assistant:surface"),
         sequence: Some(2),
         timestamp_ms: None,
@@ -743,6 +747,7 @@ fn user_and_assistant_messages_have_distinct_semantic_surfaces() {
 #[test]
 fn streaming_assistant_item_has_stable_identity_live_state_and_developer_metadata() {
     let item = TranscriptViewItem {
+        output_location: None,
         id: TranscriptViewItemId::new("assistant:stream"),
         sequence: Some(41),
         timestamp_ms: Some(42),
@@ -769,6 +774,7 @@ fn streaming_assistant_item_has_stable_identity_live_state_and_developer_metadat
 #[test]
 fn reasoning_item_uses_collapsed_semantic_disclosure() {
     let item = TranscriptViewItem {
+        output_location: None,
         id: TranscriptViewItemId::new("reasoning:details"),
         sequence: Some(1),
         timestamp_ms: None,
@@ -854,6 +860,7 @@ fn structured_reasoning_activity_renders_terminal_status_chrome() {
 #[test]
 fn reasoning_activity_chrome_remains_visible_without_readable_text() {
     let item = TranscriptViewItem {
+        output_location: None,
         id: TranscriptViewItemId::new("reasoning:test"),
         sequence: Some(1),
         timestamp_ms: None,
@@ -873,6 +880,7 @@ fn reasoning_activity_chrome_remains_visible_without_readable_text() {
 #[test]
 fn skill_transcript_item_renders_semantic_label_and_text() {
     let item = TranscriptViewItem {
+        output_location: None,
         id: TranscriptViewItemId::new("skill:test"),
         sequence: Some(1),
         timestamp_ms: None,
@@ -892,6 +900,7 @@ fn skill_transcript_item_renders_semantic_label_and_text() {
     assert!(rendered.contains("review: boom"));
 
     let context_item = TranscriptViewItem {
+        output_location: None,
         id: TranscriptViewItemId::new("skill:context"),
         sequence: Some(2),
         timestamp_ms: None,
@@ -910,6 +919,7 @@ fn skill_transcript_item_renders_semantic_label_and_text() {
     assert!(rendered.contains("loaded review"));
 
     let compaction_item = TranscriptViewItem {
+        output_location: None,
         id: TranscriptViewItemId::new("compaction:test"),
         sequence: Some(3),
         timestamp_ms: None,

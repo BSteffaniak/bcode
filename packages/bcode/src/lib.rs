@@ -4731,7 +4731,7 @@ impl BcodeBuilder {
 }
 
 /// Current renderer-neutral frontend event/snapshot schema version.
-pub const FRONTEND_CONTRACT_SCHEMA_VERSION: u32 = 2;
+pub const FRONTEND_CONTRACT_SCHEMA_VERSION: u32 = 3;
 
 /// Provider/plugin-independent transcript content for frontend snapshots.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4804,7 +4804,14 @@ impl From<&ModelMessage> for FrontendMessage {
 pub enum FrontendEvent {
     /// Provider turn started.
     TurnStarted,
-    /// Visible assistant text delta.
+    /// Positioned semantic output from a v2 provider.
+    Output {
+        /// Stable semantic output position within the turn.
+        position: bcode_session_models::TurnOutputPosition,
+        /// Provider-neutral output payload.
+        event: bcode_model::ProviderOutputEvent,
+    },
+    /// Visible assistant text delta from a legacy v1 provider.
     TextDelta(String),
     /// Ordered assistant text stream operation.
     ///
@@ -4903,6 +4910,10 @@ impl FrontendEvent {
     pub fn from_agent_event(event: &AgentEvent) -> Option<Self> {
         match event {
             AgentEvent::TurnStarted => Some(Self::TurnStarted),
+            AgentEvent::Output { position, event } => Some(Self::Output {
+                position: *position,
+                event: event.clone(),
+            }),
             AgentEvent::TextDelta(text) => Some(Self::TextDelta(text.clone())),
             AgentEvent::ReasoningDelta(text) => Some(Self::ReasoningDelta(text.clone())),
             AgentEvent::ReasoningActivity(event) => Some(Self::ReasoningActivity(event.clone())),
@@ -5148,6 +5159,18 @@ impl FrontendTurnSnapshot {
             | FrontendEvent::ToolCallDelta { .. }
             | FrontendEvent::RetryScheduled { .. }
             | FrontendEvent::ContextCompacted => {}
+            FrontendEvent::Output { event, .. } => match event {
+                bcode_model::ProviderOutputEvent::TextDelta { text } => self.text.push_str(text),
+                bcode_model::ProviderOutputEvent::ReasoningActivity { event } => {
+                    self.reasoning_events.push(event.clone());
+                    self.reasoning = project_reasoning_text(&self.reasoning_events);
+                }
+                bcode_model::ProviderOutputEvent::ToolCallFinished { call } => {
+                    self.tool_calls.push(call.clone());
+                }
+                bcode_model::ProviderOutputEvent::ToolCallStarted { .. }
+                | bcode_model::ProviderOutputEvent::ToolCallDelta { .. } => {}
+            },
             FrontendEvent::TextDelta(text) => self.text.push_str(text),
             FrontendEvent::TextStreamUpdated {
                 segment_id, update, ..
@@ -8635,6 +8658,25 @@ fn generation_steps(runtime: &AgentTurnResponse) -> Vec<GenerationStep> {
                         .max()
                         .unwrap_or_default();
                     model.started = true;
+                }
+            }
+            AgentEvent::Output { event, .. } => {
+                use bcode_model::ProviderOutputEvent;
+                model.started = true;
+                match event {
+                    ProviderOutputEvent::TextDelta { text } => model.text.push_str(text),
+                    ProviderOutputEvent::ReasoningActivity { event } => {
+                        model.reasoning_events.push(event.clone());
+                    }
+                    ProviderOutputEvent::ToolCallFinished { call } => {
+                        flush_generation_model(&mut steps, &mut model);
+                        steps.push(GenerationStep::ToolCall {
+                            round: model.round,
+                            call: call.clone(),
+                        });
+                    }
+                    ProviderOutputEvent::ToolCallStarted { .. }
+                    | ProviderOutputEvent::ToolCallDelta { .. } => {}
                 }
             }
             AgentEvent::TextDelta(delta) => {

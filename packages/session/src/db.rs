@@ -5925,11 +5925,16 @@ mod tests {
             (
                 "future-schema-v41.json",
                 include_str!("../fixtures/migrations/future-schema-v41.json"),
+                ExpectedHistory::PersistedEventError,
+            ),
+            (
+                "current-schema-v42.json",
+                include_str!("../fixtures/migrations/current-schema-v42.json"),
                 ExpectedHistory::Sequences(&[0]),
             ),
             (
-                "future-schema-v42.json",
-                include_str!("../fixtures/migrations/future-schema-v42.json"),
+                "future-schema-v43.json",
+                include_str!("../fixtures/migrations/future-schema-v43.json"),
                 ExpectedHistory::PersistedEventError,
             ),
             (

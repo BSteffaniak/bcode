@@ -31,8 +31,10 @@ pub use context_management::{
 /// Provider context setting for explicit catalog provider mapping.
 pub const CATALOG_PROVIDER_ID_SETTING: &str = "catalog_provider_id";
 
-/// Plugin service interface for model providers.
+/// Plugin service interface used by legacy flat provider output events.
 pub const MODEL_PROVIDER_INTERFACE_ID: &str = "bcode.model-provider/v1";
+/// Plugin service interface for positioned provider output events.
+pub const MODEL_PROVIDER_INTERFACE_ID_V2: &str = "bcode.model-provider/v2";
 
 /// Operation for provider capability discovery.
 pub const OP_CAPABILITIES: &str = "capabilities";
@@ -2209,11 +2211,37 @@ pub struct ImageRefContent {
     pub metadata: ImageMetadata,
 }
 
+pub use bcode_session_models::TurnOutputPosition;
+
+/// Positioned semantic output emitted by a v2 model-provider service.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ProviderOutputEvent {
+    /// Visible assistant text belonging to one positioned response segment.
+    TextDelta { text: String },
+    /// Provider-neutral structured reasoning activity operation.
+    ReasoningActivity {
+        event: bcode_session_models::ReasoningActivityEvent,
+    },
+    /// Provider began one positioned tool call.
+    ToolCallStarted { call_id: String, name: String },
+    /// Provider appended arguments to one positioned tool call.
+    ToolCallDelta { call_id: String, delta: String },
+    /// Provider completed one positioned tool call.
+    ToolCallFinished { call: ToolCall },
+}
+
 /// Normalized provider stream event.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ProviderTurnEvent {
     TurnStarted,
+    /// Positioned semantic output from a v2 provider.
+    Output {
+        position: TurnOutputPosition,
+        event: ProviderOutputEvent,
+    },
+    /// Legacy v1 assistant text delta without cross-type position.
     TextDelta {
         text: String,
     },
@@ -2274,6 +2302,23 @@ pub enum ProviderTurnEvent {
         stop_reason: StopReason,
     },
     Cancelled,
+}
+
+impl ProviderTurnEvent {
+    /// Create one positioned v2 provider output event.
+    #[must_use]
+    pub const fn output(position: TurnOutputPosition, event: ProviderOutputEvent) -> Self {
+        Self::Output { position, event }
+    }
+
+    /// Return positioned output when this is a v2 output envelope.
+    #[must_use]
+    pub const fn positioned_output(&self) -> Option<(TurnOutputPosition, &ProviderOutputEvent)> {
+        match self {
+            Self::Output { position, event } => Some((*position, event)),
+            _ => None,
+        }
+    }
 }
 
 impl fmt::Debug for ProviderTurnEvent {

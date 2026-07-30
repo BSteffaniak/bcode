@@ -419,6 +419,27 @@ enum PersistedSessionEventKind {
         segment_order: u32,
         text: String,
     },
+    PositionedAssistantResponseSegment {
+        turn_id: String,
+        output_position: bcode_session_models::TurnOutputPosition,
+        segment_id: String,
+        segment_order: u32,
+        text: String,
+    },
+    PositionedAssistantReasoningActivity {
+        turn_id: String,
+        output_position: bcode_session_models::TurnOutputPosition,
+        activity: bcode_session_models::ReasoningActivity,
+    },
+    PositionedToolCallRequested {
+        turn_id: String,
+        output_position: bcode_session_models::TurnOutputPosition,
+        tool_call_id: String,
+        producer_plugin_id: Option<String>,
+        tool_name: String,
+        arguments_json: String,
+        working_directory: Option<PathBuf>,
+    },
 }
 
 impl From<&SessionEventKind> for PersistedSessionEventKind {
@@ -705,6 +726,45 @@ impl From<&SessionEventKind> for PersistedSessionEventKind {
                 segment_id: segment_id.clone(),
                 segment_order: *segment_order,
                 text: text.clone(),
+            },
+            SessionEventKind::PositionedAssistantResponseSegment {
+                turn_id,
+                output_position,
+                segment_id,
+                segment_order,
+                text,
+            } => Self::PositionedAssistantResponseSegment {
+                turn_id: turn_id.clone(),
+                output_position: *output_position,
+                segment_id: segment_id.clone(),
+                segment_order: *segment_order,
+                text: text.clone(),
+            },
+            SessionEventKind::PositionedAssistantReasoningActivity {
+                turn_id,
+                output_position,
+                activity,
+            } => Self::PositionedAssistantReasoningActivity {
+                turn_id: turn_id.clone(),
+                output_position: *output_position,
+                activity: activity.clone(),
+            },
+            SessionEventKind::PositionedToolCallRequested {
+                turn_id,
+                output_position,
+                tool_call_id,
+                producer_plugin_id,
+                tool_name,
+                arguments_json,
+                working_directory,
+            } => Self::PositionedToolCallRequested {
+                turn_id: turn_id.clone(),
+                output_position: *output_position,
+                tool_call_id: tool_call_id.clone(),
+                producer_plugin_id: producer_plugin_id.clone(),
+                tool_name: tool_name.clone(),
+                arguments_json: arguments_json.clone(),
+                working_directory: working_directory.clone(),
             },
             SessionEventKind::WorkingDirectoryChanged {
                 old_working_directory,
@@ -1125,6 +1185,45 @@ impl PersistedSessionEventKind {
                 segment_order,
                 text,
             },
+            Self::PositionedAssistantResponseSegment {
+                turn_id,
+                output_position,
+                segment_id,
+                segment_order,
+                text,
+            } => SessionEventKind::PositionedAssistantResponseSegment {
+                turn_id,
+                output_position,
+                segment_id,
+                segment_order,
+                text,
+            },
+            Self::PositionedAssistantReasoningActivity {
+                turn_id,
+                output_position,
+                activity,
+            } => SessionEventKind::PositionedAssistantReasoningActivity {
+                turn_id,
+                output_position,
+                activity,
+            },
+            Self::PositionedToolCallRequested {
+                turn_id,
+                output_position,
+                tool_call_id,
+                producer_plugin_id,
+                tool_name,
+                arguments_json,
+                working_directory,
+            } => SessionEventKind::PositionedToolCallRequested {
+                turn_id,
+                output_position,
+                tool_call_id,
+                producer_plugin_id,
+                tool_name,
+                arguments_json,
+                working_directory,
+            },
         }
     }
 }
@@ -1154,6 +1253,53 @@ mod tests {
         let decoded = decode_session_event(&encoded).expect("decode assistant segment");
 
         assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn positioned_turn_outputs_round_trip_through_persistence() {
+        let position = bcode_session_models::TurnOutputPosition::new(3);
+        let variants = [
+            SessionEventKind::PositionedAssistantResponseSegment {
+                turn_id: "turn-1".to_owned(),
+                output_position: position,
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                text: "answer".to_owned(),
+            },
+            SessionEventKind::PositionedAssistantReasoningActivity {
+                turn_id: "turn-1".to_owned(),
+                output_position: position,
+                activity: bcode_session_models::ReasoningActivity {
+                    activity_id: "reasoning-1".to_owned(),
+                    order: 0,
+                    status: bcode_session_models::ReasoningActivityStatus::Completed,
+                    parts: Vec::new(),
+                    opaque: true,
+                },
+            },
+            SessionEventKind::PositionedToolCallRequested {
+                turn_id: "turn-1".to_owned(),
+                output_position: position,
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                tool_name: "filesystem.read".to_owned(),
+                arguments_json: r#"{"path":"src/lib.rs"}"#.to_owned(),
+                working_directory: Some(PathBuf::from("/tmp/project")),
+            },
+        ];
+        for (sequence, kind) in variants.into_iter().enumerate() {
+            let event = SessionEvent {
+                schema_version: CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                sequence: u64::try_from(sequence).unwrap_or(u64::MAX),
+                timestamp_ms: 11,
+                session_id: SessionId::new(),
+                provenance: None,
+                kind,
+            };
+            let encoded = encode_session_event(&event).expect("encode positioned output");
+            let decoded = decode_session_event(&encoded).expect("decode positioned output");
+            assert_eq!(decoded, event);
+        }
     }
 
     #[test]
