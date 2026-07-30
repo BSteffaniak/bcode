@@ -575,6 +575,105 @@ pub struct ListSessionSearchProvidersResponse {
     pub failures: Vec<SessionSearchProviderFailure>,
 }
 
+/// Deterministic provider plan for one exact portable request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionSearchPlan {
+    /// Providers selected in stable plugin-ID order.
+    pub providers: Vec<SessionSearchProviderInfo>,
+    /// Discovery, state, or capability failures excluded from execution.
+    pub failures: Vec<SessionSearchProviderFailure>,
+}
+
+/// Build a conservative query plan without broadcasting to redundant overlapping providers.
+///
+/// The first eligible provider for each requested content kind wins in stable plugin-ID order.
+/// Providers with disjoint requested coverage may therefore execute together, while redundant
+/// overlap is excluded. Empty content filters select one exact-capability provider.
+#[must_use]
+pub fn plan_session_search(
+    request: &SessionSearchRequest,
+    discovery: ListSessionSearchProvidersResponse,
+) -> SessionSearchPlan {
+    let mut providers = discovery.providers;
+    providers.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    let mut selected = Vec::new();
+    let mut failures = discovery.failures;
+    failures.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    let mut uncovered = request.filters.content_kinds.clone();
+
+    for provider in providers {
+        if !matches!(
+            provider.status.state,
+            SearchProviderState::Ready
+                | SearchProviderState::CatchingUp
+                | SearchProviderState::Degraded
+        ) {
+            failures.push(planning_failure(
+                provider.plugin_id,
+                SearchErrorCode::ProviderUnavailable,
+                "provider state is not queryable",
+            ));
+            continue;
+        }
+        let mut provider_request = request.clone();
+        if !request.filters.content_kinds.is_empty() {
+            provider_request.filters.content_kinds = request
+                .filters
+                .content_kinds
+                .intersection(&provider.capabilities.content_kinds)
+                .copied()
+                .collect();
+            if provider_request.filters.content_kinds.is_empty() {
+                continue;
+            }
+        }
+        if let Err(error) = provider.capabilities.supports_request(&provider_request) {
+            failures.push(planning_failure(
+                provider.plugin_id,
+                SearchErrorCode::UnsupportedQuery,
+                &error.to_string(),
+            ));
+            continue;
+        }
+        if uncovered.is_empty() {
+            if request.filters.content_kinds.is_empty() && selected.is_empty() {
+                selected.push(provider);
+            }
+            continue;
+        }
+        let covered = uncovered
+            .intersection(&provider.capabilities.content_kinds)
+            .copied()
+            .collect::<Vec<_>>();
+        if !covered.is_empty() {
+            for kind in covered {
+                uncovered.remove(&kind);
+            }
+            selected.push(provider);
+        }
+    }
+    failures.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    SessionSearchPlan {
+        providers: selected,
+        failures,
+    }
+}
+
+fn planning_failure(
+    plugin_id: String,
+    code: SearchErrorCode,
+    message: &str,
+) -> SessionSearchProviderFailure {
+    SessionSearchProviderFailure {
+        plugin_id,
+        error: SessionSearchServiceError {
+            code,
+            message: message.to_owned(),
+            retryable: false,
+        },
+    }
+}
+
 /// Provider execution status for one terminal search response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1079,6 +1178,100 @@ mod tests {
                 "provider does not cover all requested content kinds"
             ))
         ));
+    }
+
+    #[test]
+    fn query_plan_selects_stable_disjoint_coverage_without_redundant_broadcast() {
+        fn provider(
+            id: &str,
+            content: SearchContentKind,
+            state: SearchProviderState,
+        ) -> SessionSearchProviderInfo {
+            SessionSearchProviderInfo {
+                plugin_id: id.to_owned(),
+                capabilities: SessionSearchCapabilities {
+                    provider_id: id.to_owned(),
+                    execution: SearchExecutionKind::Indexed,
+                    content_kinds: std::iter::once(content).collect(),
+                    features: [
+                        SearchFeature::Terms,
+                        SearchFeature::StructuredFilters,
+                        SearchFeature::RelevanceSort,
+                    ]
+                    .into_iter()
+                    .collect(),
+                    max_hits: 20,
+                    max_batch_records: 20,
+                    max_batch_text_bytes: 1024,
+                },
+                status: SessionSearchStatus {
+                    provider_id: id.to_owned(),
+                    state,
+                    record_schema_version: CURRENT_SEARCH_RECORD_VERSION,
+                    normalization_version: CURRENT_NORMALIZATION_VERSION,
+                    policy_version: CURRENT_SEARCH_POLICY_VERSION,
+                    index_bytes: 0,
+                    quota_bytes: 1024,
+                    pending_sessions: 0,
+                    coverage: Vec::new(),
+                    degraded_reason: None,
+                },
+            }
+        }
+
+        let request = SessionSearchRequest {
+            query: text_query("needle"),
+            filters: SessionSearchFilters {
+                content_kinds: [
+                    SearchContentKind::UserMessage,
+                    SearchContentKind::ShellOutput,
+                ]
+                .into_iter()
+                .collect(),
+                ..SessionSearchFilters::default()
+            },
+            sort: SessionSearchSort::ProviderRelevance,
+            limit: 10,
+            cursor: None,
+            deadline_ms: None,
+        };
+        let plan = plan_session_search(
+            &request,
+            ListSessionSearchProvidersResponse {
+                providers: vec![
+                    provider(
+                        "z-redundant",
+                        SearchContentKind::UserMessage,
+                        SearchProviderState::Ready,
+                    ),
+                    provider(
+                        "b-shell",
+                        SearchContentKind::ShellOutput,
+                        SearchProviderState::CatchingUp,
+                    ),
+                    provider(
+                        "a-transcript",
+                        SearchContentKind::UserMessage,
+                        SearchProviderState::Ready,
+                    ),
+                    provider(
+                        "c-disabled",
+                        SearchContentKind::ShellOutput,
+                        SearchProviderState::Disabled,
+                    ),
+                ],
+                failures: Vec::new(),
+            },
+        );
+        assert_eq!(
+            plan.providers
+                .iter()
+                .map(|provider| provider.plugin_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-transcript", "b-shell"]
+        );
+        assert_eq!(plan.failures.len(), 1);
+        assert_eq!(plan.failures[0].plugin_id, "c-disabled");
     }
 
     #[test]
