@@ -1,0 +1,33 @@
+{
+  "provider_id": "example.search",
+  "batch_id": "batch-1",
+  "generation": {
+    "session_id": "00000000-0000-0000-0000-000000000001",
+    "fingerprint": "generation-1",
+    "last_sequence": 1
+  },
+  "expected_previous_sequence": 0,
+  "records": [
+    {
+      "schema_version": 1,
+      "record_id": "1:user-message:0",
+      "locator": {
+        "session_id": "00000000-0000-0000-0000-000000000001",
+        "sequence": 1,
+        "record_id": "1:user-message:0"
+      },
+      "timestamp_ms": 1000,
+      "content_kind": "user_message",
+      "field": "text",
+      "text": "hello",
+      "source_bytes": 5,
+      "normalized_bytes": 5,
+      "indexed_bytes": 5,
+      "truncated": false,
+      "source_range_start": 0,
+      "source_range_end": 5,
+      "normalization_version": 1,
+      "policy_version": 1
+    }
+  ]
+}

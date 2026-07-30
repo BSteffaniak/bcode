@@ -1,0 +1,11 @@
+{
+  "query": {
+    "type": "text",
+    "text": "database locked",
+    "mode": "phrase"
+  },
+  "filters": {},
+  "sort": "newest_first",
+  "limit": 20,
+  "deadline_ms": 1500
+}

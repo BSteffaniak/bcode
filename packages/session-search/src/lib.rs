@@ -313,6 +313,40 @@ impl SessionSearchRequest {
         }
         Ok(())
     }
+
+    /// Return the provider features required to execute this request exactly.
+    #[must_use]
+    pub fn required_features(&self) -> BTreeSet<SearchFeature> {
+        let mut features = BTreeSet::new();
+        collect_query_features(&self.query, &mut features);
+        if self.filters != SessionSearchFilters::default() {
+            features.insert(SearchFeature::StructuredFilters);
+        }
+        if self.sort == SessionSearchSort::ProviderRelevance {
+            features.insert(SearchFeature::RelevanceSort);
+        }
+        features
+    }
+}
+
+fn collect_query_features(query: &SessionSearchQuery, features: &mut BTreeSet<SearchFeature>) {
+    match query {
+        SessionSearchQuery::Text { mode, .. } => {
+            features.insert(match mode {
+                TextMatchMode::Terms => SearchFeature::Terms,
+                TextMatchMode::Phrase => SearchFeature::Phrase,
+                TextMatchMode::Prefix => SearchFeature::Prefix,
+                TextMatchMode::Regex => SearchFeature::Regex,
+                TextMatchMode::Fuzzy => SearchFeature::Fuzzy,
+            });
+        }
+        SessionSearchQuery::And { clauses } | SessionSearchQuery::Or { clauses } => {
+            for clause in clauses {
+                collect_query_features(clause, features);
+            }
+        }
+        SessionSearchQuery::Not { clause } => collect_query_features(clause, features),
+    }
 }
 
 /// Stable canonical locator returned by every search provider.
@@ -378,6 +412,89 @@ pub struct SessionSearchCapabilities {
     pub max_hits: usize,
     pub max_batch_records: usize,
     pub max_batch_text_bytes: usize,
+}
+
+impl SessionSearchCapabilities {
+    /// Validate advertised identities and portable contract limits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when identity, content coverage, or advertised limits are empty or exceed
+    /// the portable contract maxima.
+    pub fn validate(&self) -> Result<(), ContractValidationError> {
+        validate_nonempty_bounded("provider_id", &self.provider_id, MAX_CURSOR_BYTES)?;
+        if self.content_kinds.is_empty() {
+            return Err(ContractValidationError::EmptyField("content_kinds"));
+        }
+        validate_positive_limit("max_hits", self.max_hits, MAX_SEARCH_HITS)?;
+        validate_positive_limit(
+            "max_batch_records",
+            self.max_batch_records,
+            MAX_INGEST_RECORDS,
+        )?;
+        validate_positive_limit(
+            "max_batch_text_bytes",
+            self.max_batch_text_bytes,
+            MAX_INGEST_TEXT_BYTES,
+        )?;
+        Ok(())
+    }
+
+    /// Validate that this provider can execute a request without approximation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a query feature, content kind, cursor identity, or requested limit is
+    /// unsupported by this provider.
+    pub fn supports_request(
+        &self,
+        request: &SessionSearchRequest,
+    ) -> Result<(), ContractValidationError> {
+        self.validate()?;
+        request.validate()?;
+        if request.limit > self.max_hits {
+            return Err(ContractValidationError::LimitExceeded {
+                field: "provider_max_hits",
+                actual: request.limit,
+                maximum: self.max_hits,
+            });
+        }
+        if let Some(cursor) = &request.cursor
+            && cursor.provider_id != self.provider_id
+        {
+            return Err(ContractValidationError::InvalidProjection(
+                "cursor belongs to another provider",
+            ));
+        }
+        if !request.required_features().is_subset(&self.features) {
+            return Err(ContractValidationError::InvalidProjection(
+                "provider does not support all requested query features",
+            ));
+        }
+        if !request.filters.content_kinds.is_empty()
+            && !request.filters.content_kinds.is_subset(&self.content_kinds)
+        {
+            return Err(ContractValidationError::InvalidProjection(
+                "provider does not cover all requested content kinds",
+            ));
+        }
+        Ok(())
+    }
+}
+
+const fn validate_positive_limit(
+    field: &'static str,
+    actual: usize,
+    maximum: usize,
+) -> Result<(), ContractValidationError> {
+    if actual == 0 || actual > maximum {
+        return Err(ContractValidationError::LimitExceeded {
+            field,
+            actual,
+            maximum,
+        });
+    }
+    Ok(())
 }
 
 /// Provider lifecycle/degraded state.
@@ -579,14 +696,15 @@ impl ApplySearchRecordsRequest {
                     "record session differs from generation session",
                 ));
             }
+            validate_search_record(record)?;
             if !identities.insert(record.record_id.as_str()) {
                 return Err(ContractValidationError::InvalidBatch(
                     "duplicate record identity in batch",
                 ));
             }
-            if previous.is_some_and(|sequence| record.locator.sequence <= sequence) {
+            if previous.is_some_and(|sequence| record.locator.sequence < sequence) {
                 return Err(ContractValidationError::InvalidBatch(
-                    "record sequences must advance monotonically",
+                    "record sequences must not move backward",
                 ));
             }
             if self
@@ -610,6 +728,37 @@ impl ApplySearchRecordsRequest {
         }
         Ok(())
     }
+}
+
+/// Classify an ingestion delivery against a provider-persisted batch digest.
+///
+/// Providers persist the returned digest atomically with published derived records. This helper
+/// defines duplicate semantics only; it does not provide storage, retention, replay, or durable
+/// resume behavior.
+#[must_use]
+pub fn classify_batch_delivery(
+    request: &ApplySearchRecordsRequest,
+    persisted_digest: Option<&str>,
+) -> BatchDeliveryClassification {
+    let operation_digest = request.operation_digest_sha256();
+    match persisted_digest {
+        None => BatchDeliveryClassification::New { operation_digest },
+        Some(existing) if existing == operation_digest => {
+            BatchDeliveryClassification::Duplicate { operation_digest }
+        }
+        Some(_) => BatchDeliveryClassification::ConflictingDuplicate { operation_digest },
+    }
+}
+
+/// Duplicate-delivery classification for one provider-owned batch identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchDeliveryClassification {
+    /// No retained digest exists for this batch identity.
+    New { operation_digest: String },
+    /// The retained digest describes the same operation facts.
+    Duplicate { operation_digest: String },
+    /// The retained digest describes different operation facts for the same batch identity.
+    ConflictingDuplicate { operation_digest: String },
 }
 
 /// Durable provider acknowledgment after idempotent batch publication.
@@ -668,6 +817,41 @@ pub enum SearchErrorCode {
     FutureVersion,
     ConflictingDuplicate,
     Internal,
+}
+
+fn validate_search_record(record: &SessionSearchRecord) -> Result<(), ContractValidationError> {
+    validate_nonempty_bounded("record_id", &record.record_id, MAX_CURSOR_BYTES)?;
+    if record.locator.record_id.as_deref() != Some(record.record_id.as_str()) {
+        return Err(ContractValidationError::InvalidBatch(
+            "record identity differs from locator identity",
+        ));
+    }
+    if record.normalization_version != CURRENT_NORMALIZATION_VERSION
+        || record.policy_version != CURRENT_SEARCH_POLICY_VERSION
+    {
+        return Err(ContractValidationError::InvalidBatch(
+            "record normalization or policy version is unsupported",
+        ));
+    }
+    let text_bytes = record.text.as_ref().map_or(0, String::len);
+    if record.indexed_bytes != u64::try_from(text_bytes).unwrap_or(u64::MAX)
+        || record.indexed_bytes > record.normalized_bytes
+        || (!record.truncated && record.indexed_bytes < record.normalized_bytes)
+    {
+        return Err(ContractValidationError::InvalidBatch(
+            "record byte accounting is inconsistent",
+        ));
+    }
+    match (record.source_range_start, record.source_range_end) {
+        (Some(start), Some(end)) if start <= end && end <= record.source_bytes => {}
+        (None, None) => {}
+        _ => {
+            return Err(ContractValidationError::InvalidBatch(
+                "record source range is inconsistent",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_nonempty_bounded(
@@ -795,6 +979,177 @@ mod tests {
             request.validate(),
             Err(ContractValidationError::InvalidBatch(
                 "duplicate record identity in batch"
+            ))
+        ));
+    }
+
+    #[test]
+    fn batch_validation_allows_distinct_records_at_one_canonical_sequence() {
+        let session_id = SessionId::new();
+        let record = SessionSearchRecord {
+            schema_version: CURRENT_SEARCH_RECORD_VERSION,
+            record_id: "1:reasoning-0-0:0".to_owned(),
+            locator: SessionSearchLocator {
+                session_id,
+                sequence: 1,
+                record_id: Some("1:reasoning-0-0:0".to_owned()),
+            },
+            timestamp_ms: 1,
+            content_kind: SearchContentKind::AssistantReasoning,
+            field: Some(SearchField::Text),
+            text: Some("first".to_owned()),
+            attributes: BTreeMap::new(),
+            source_bytes: 5,
+            normalized_bytes: 5,
+            indexed_bytes: 5,
+            truncated: false,
+            source_range_start: Some(0),
+            source_range_end: Some(5),
+            normalization_version: CURRENT_NORMALIZATION_VERSION,
+            policy_version: CURRENT_SEARCH_POLICY_VERSION,
+        };
+        let request = ApplySearchRecordsRequest {
+            provider_id: "provider".to_owned(),
+            batch_id: "batch".to_owned(),
+            generation: SearchCanonicalGeneration {
+                session_id,
+                fingerprint: "generation".to_owned(),
+                last_sequence: Some(1),
+            },
+            expected_previous_sequence: None,
+            records: vec![
+                record.clone(),
+                SessionSearchRecord {
+                    record_id: "1:reasoning-0-1:0".to_owned(),
+                    locator: SessionSearchLocator {
+                        record_id: Some("1:reasoning-0-1:0".to_owned()),
+                        ..record.locator.clone()
+                    },
+                    ..record
+                },
+            ],
+        };
+        assert_eq!(request.validate(), Ok(()));
+    }
+
+    #[test]
+    fn capability_negotiation_rejects_unsupported_features_and_content() {
+        let capabilities = SessionSearchCapabilities {
+            provider_id: "provider".to_owned(),
+            execution: SearchExecutionKind::Indexed,
+            content_kinds: std::iter::once(SearchContentKind::UserMessage).collect(),
+            features: [
+                SearchFeature::Terms,
+                SearchFeature::StructuredFilters,
+                SearchFeature::RelevanceSort,
+            ]
+            .into_iter()
+            .collect(),
+            max_hits: 20,
+            max_batch_records: 20,
+            max_batch_text_bytes: 1024,
+        };
+        let request = SessionSearchRequest {
+            query: SessionSearchQuery::Text {
+                text: "needle".to_owned(),
+                mode: TextMatchMode::Regex,
+                fields: BTreeSet::new(),
+            },
+            filters: SessionSearchFilters {
+                content_kinds: std::iter::once(SearchContentKind::ToolOutput).collect(),
+                ..SessionSearchFilters::default()
+            },
+            sort: SessionSearchSort::ProviderRelevance,
+            limit: 10,
+            cursor: None,
+            deadline_ms: None,
+        };
+        assert!(matches!(
+            capabilities.supports_request(&request),
+            Err(ContractValidationError::InvalidProjection(
+                "provider does not support all requested query features"
+            ))
+        ));
+
+        let mut supported = capabilities;
+        supported.features.insert(SearchFeature::Regex);
+        assert!(matches!(
+            supported.supports_request(&request),
+            Err(ContractValidationError::InvalidProjection(
+                "provider does not cover all requested content kinds"
+            ))
+        ));
+    }
+
+    #[test]
+    fn duplicate_delivery_classification_uses_persisted_operation_digest() {
+        let fixture = include_str!("../tests/fixtures/apply-search-records-v1.json");
+        let request: ApplySearchRecordsRequest =
+            serde_json::from_str(fixture).expect("decode retained ingestion fixture");
+        let digest = request.operation_digest_sha256();
+        assert!(matches!(
+            classify_batch_delivery(&request, None),
+            BatchDeliveryClassification::New { operation_digest } if operation_digest == digest
+        ));
+        assert!(matches!(
+            classify_batch_delivery(&request, Some(&digest)),
+            BatchDeliveryClassification::Duplicate { operation_digest }
+                if operation_digest == digest
+        ));
+        assert!(matches!(
+            classify_batch_delivery(&request, Some("different")),
+            BatchDeliveryClassification::ConflictingDuplicate { operation_digest }
+                if operation_digest == digest
+        ));
+    }
+
+    #[test]
+    fn retained_v1_request_fixture_decodes_validates_and_reencodes() {
+        let fixture = include_str!("../tests/fixtures/session-search-request-v1.json");
+        let request: SessionSearchRequest =
+            serde_json::from_str(fixture).expect("decode retained request fixture");
+        request
+            .validate()
+            .expect("validate retained request fixture");
+        let expected: serde_json::Value =
+            serde_json::from_str(fixture).expect("decode fixture value");
+        let actual = serde_json::to_value(request).expect("encode request fixture");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn retained_v1_capabilities_fixture_decodes_validates_and_reencodes() {
+        let fixture = include_str!("../tests/fixtures/session-search-capabilities-v1.json");
+        let capabilities: SessionSearchCapabilities =
+            serde_json::from_str(fixture).expect("decode retained capabilities fixture");
+        capabilities
+            .validate()
+            .expect("validate retained capabilities fixture");
+        let expected: serde_json::Value =
+            serde_json::from_str(fixture).expect("decode fixture value");
+        let actual = serde_json::to_value(capabilities).expect("encode capabilities fixture");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn retained_v1_ingestion_fixture_decodes_validates_and_reencodes() {
+        let fixture = include_str!("../tests/fixtures/apply-search-records-v1.json");
+        let request: ApplySearchRecordsRequest =
+            serde_json::from_str(fixture).expect("decode retained ingestion fixture");
+        request
+            .validate()
+            .expect("validate retained ingestion fixture");
+        let expected: serde_json::Value =
+            serde_json::from_str(fixture).expect("decode fixture value");
+        let actual = serde_json::to_value(&request).expect("encode ingestion fixture");
+        assert_eq!(actual, expected);
+
+        let mut future = request;
+        future.records[0].schema_version = CURRENT_SEARCH_RECORD_VERSION.saturating_add(1);
+        assert!(matches!(
+            future.validate(),
+            Err(ContractValidationError::InvalidBatch(
+                "record schema version is unsupported"
             ))
         ));
     }

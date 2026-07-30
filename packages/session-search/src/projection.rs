@@ -6,10 +6,30 @@ use crate::{
     SessionSearchLocator, SessionSearchRecord,
 };
 use bcode_session_models::{
-    CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent, SessionEventKind,
+    CURRENT_SESSION_EVENT_SCHEMA_VERSION, ReasoningActivity, SessionEvent, SessionEventKind,
     ToolInvocationLifecycleStage, ToolInvocationResult,
 };
+use serde::Deserialize;
 use std::collections::BTreeMap;
+
+const SHELL_RUN_TOOL_NAME: &str = "shell.run";
+const SHELL_RUN_SCHEMA: &str = "bcode.shell.run";
+const SHELL_RUN_SCHEMA_VERSION: u32 = 1;
+
+/// Whether one sensitive content category is copied into derived search state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectionContentPolicy {
+    /// Do not copy this content category.
+    Exclude,
+    /// Copy this content category subject to projection bounds.
+    Include,
+}
+
+impl ProjectionContentPolicy {
+    const fn enabled(self) -> bool {
+        matches!(self, Self::Include)
+    }
+}
 
 /// Policy controlling which sensitive finalized content is copied into derived search records.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,20 +37,26 @@ pub struct SearchProjectionPolicy {
     /// Maximum UTF-8 bytes retained in one projected text record.
     pub max_text_bytes_per_record: usize,
     /// Copy finalized assistant reasoning into derived search state.
-    pub include_reasoning: bool,
+    pub reasoning: ProjectionContentPolicy,
+    /// Copy shell command text into derived search state.
+    pub shell_commands: ProjectionContentPolicy,
+    /// Copy finalized bounded shell output into derived search state.
+    pub shell_output: ProjectionContentPolicy,
     /// Copy tool argument payloads into derived search state.
-    pub include_tool_arguments: bool,
+    pub tool_arguments: ProjectionContentPolicy,
     /// Copy successful generic tool output into derived search state.
-    pub include_tool_output: bool,
+    pub tool_output: ProjectionContentPolicy,
 }
 
 impl Default for SearchProjectionPolicy {
     fn default() -> Self {
         Self {
             max_text_bytes_per_record: DEFAULT_MAX_TEXT_BYTES_PER_RECORD,
-            include_reasoning: false,
-            include_tool_arguments: false,
-            include_tool_output: false,
+            reasoning: ProjectionContentPolicy::Exclude,
+            shell_commands: ProjectionContentPolicy::Include,
+            shell_output: ProjectionContentPolicy::Exclude,
+            tool_arguments: ProjectionContentPolicy::Exclude,
+            tool_output: ProjectionContentPolicy::Exclude,
         }
     }
 }
@@ -48,6 +74,107 @@ pub enum ProjectionExclusion {
     EmptyAfterNormalization,
 }
 
+/// Projection disposition assigned explicitly to every persisted event variant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistedEventClassification {
+    /// The event has approved finalized text projected by default.
+    Searchable,
+    /// The event has finalized text that is projected only when its policy gate is enabled.
+    PolicyControlled,
+    /// The event is an incremental compatibility shape and is never independently indexed.
+    NonFinal,
+    /// The event is durable metadata but has no text record in the current policy version.
+    MetadataOnly,
+    /// The event owns opaque, renderer, trace, or inert content intentionally excluded from search.
+    Excluded,
+}
+
+/// Classify every persisted event variant for the current projection policy version.
+///
+/// This exhaustive match intentionally has no wildcard so adding a persisted event variant requires
+/// an explicit search projection decision.
+#[must_use]
+pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEventClassification {
+    match kind {
+        SessionEventKind::SessionCreated { name: Some(_), .. }
+        | SessionEventKind::UserMessage { .. }
+        | SessionEventKind::AssistantMessage { .. }
+        | SessionEventKind::SystemMessage { .. }
+        | SessionEventKind::ContextCompacted { .. }
+        | SessionEventKind::SessionRenamed { name: Some(_) }
+        | SessionEventKind::AssistantResponseSegment { .. } => {
+            PersistedEventClassification::Searchable
+        }
+        SessionEventKind::ToolCallRequested { .. }
+        | SessionEventKind::ToolInvocationResultRecorded {
+            record:
+                bcode_session_models::ToolInvocationResultRecord {
+                    is_error: false, ..
+                },
+        }
+        | SessionEventKind::AssistantReasoningMessage { .. }
+        | SessionEventKind::AssistantReasoningActivity { .. } => {
+            PersistedEventClassification::PolicyControlled
+        }
+        SessionEventKind::ToolInvocationResultRecorded {
+            record: bcode_session_models::ToolInvocationResultRecord { is_error: true, .. },
+        }
+        | SessionEventKind::ToolInvocationLifecycle {
+            event:
+                bcode_session_models::ToolInvocationLifecycleEvent {
+                    stage:
+                        ToolInvocationLifecycleStage::Failed | ToolInvocationLifecycleStage::Cancelled,
+                    message: Some(_),
+                    ..
+                },
+        } => PersistedEventClassification::Searchable,
+        SessionEventKind::AssistantDelta { .. }
+        | SessionEventKind::AssistantReasoningDelta { .. } => {
+            PersistedEventClassification::NonFinal
+        }
+        SessionEventKind::SessionCreated { name: None, .. }
+        | SessionEventKind::ClientAttached { .. }
+        | SessionEventKind::ClientDetached { .. }
+        | SessionEventKind::PermissionRequested { .. }
+        | SessionEventKind::PermissionResolved { .. }
+        | SessionEventKind::ModelChanged { .. }
+        | SessionEventKind::AgentChanged { .. }
+        | SessionEventKind::ModelTurnStarted { .. }
+        | SessionEventKind::ModelTurnFinished { .. }
+        | SessionEventKind::ModelUsage { .. }
+        | SessionEventKind::SessionRenamed { name: None }
+        | SessionEventKind::SkillInvoked { .. }
+        | SessionEventKind::SkillSuggested { .. }
+        | SessionEventKind::SkillActivated { .. }
+        | SessionEventKind::SkillDeactivated { .. }
+        | SessionEventKind::SkillContextLoaded { .. }
+        | SessionEventKind::SkillInvocationFailed { .. }
+        | SessionEventKind::RuntimeWorkStarted { .. }
+        | SessionEventKind::RuntimeWorkCancelRequested { .. }
+        | SessionEventKind::RuntimeWorkFinished { .. }
+        | SessionEventKind::RuntimeWorkProgress { .. }
+        | SessionEventKind::ModelTurnCancelRequested { .. }
+        | SessionEventKind::WorkingDirectoryChanged { .. }
+        | SessionEventKind::SessionImported { .. }
+        | SessionEventKind::SessionForked { .. }
+        | SessionEventKind::RalphLifecycle { .. }
+        | SessionEventKind::ReasoningChanged { .. }
+        | SessionEventKind::ToolExchangeRequested { .. }
+        | SessionEventKind::ToolExchangeResolved { .. }
+        | SessionEventKind::ProviderContextCompacted { .. }
+        | SessionEventKind::RequestContextObserved { .. }
+        | SessionEventKind::PluginStatusNote { .. }
+        | SessionEventKind::ToolInvocationLifecycle { .. }
+        | SessionEventKind::ExecutionSessionCreated { .. } => {
+            PersistedEventClassification::MetadataOnly
+        }
+        SessionEventKind::TraceEvent { .. }
+        | SessionEventKind::InertHistory { .. }
+        | SessionEventKind::ToolContribution { .. }
+        | SessionEventKind::ToolContributionPlaced { .. } => PersistedEventClassification::Excluded,
+    }
+}
+
 /// Result of classifying and projecting one finalized canonical event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EventProjection {
@@ -57,33 +184,111 @@ pub enum EventProjection {
     Excluded(ProjectionExclusion),
 }
 
-/// Normalize terminal-like text into a deterministic sanitized transcript.
-///
-/// This removes ANSI CSI and OSC control sequences, converts CRLF and standalone carriage returns
-/// to line feeds, applies backspaces to preceding characters, preserves tabs and line feeds, and
-/// removes other control characters. It does not emulate a terminal screen.
-#[must_use]
-pub fn normalize_terminal_text(source: &str) -> String {
-    let mut normalized = String::with_capacity(source.len());
-    let mut chars = source.chars().peekable();
+/// Result of bounded terminal-text normalization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedTerminalText {
+    /// Sanitized UTF-8 text retained for indexing.
+    pub text: String,
+    /// Source bytes inspected by the normalizer.
+    pub source_bytes_consumed: usize,
+    /// UTF-8 bytes produced from the inspected source before final indexing truncation.
+    pub normalized_bytes: usize,
+    /// Whether source bytes were omitted because the source inspection bound was reached.
+    pub source_truncated: bool,
+    /// Whether malformed UTF-8 was replaced with U+FFFD.
+    pub invalid_utf8_replaced: bool,
+}
 
-    while let Some(character) = chars.next() {
-        match character {
-            '\u{1b}' => consume_escape(&mut chars),
-            '\r' => {
-                if chars.peek() == Some(&'\n') {
-                    chars.next();
+/// Normalize terminal-like bytes into a bounded deterministic sanitized transcript.
+///
+/// The source inspection and retained output are both bounded by `maximum_bytes`. ANSI CSI and OSC
+/// controls are removed, CRLF and standalone carriage returns become line feeds, backspaces remove
+/// preceding retained characters, tabs and line feeds are preserved, and other controls are
+/// removed. Malformed UTF-8 is replaced with U+FFFD. This is a sanitized stream transcript, not a
+/// terminal-screen emulator.
+#[must_use]
+pub fn normalize_terminal_bytes(source: &[u8], maximum_bytes: usize) -> NormalizedTerminalText {
+    let source_limit = source.len().min(maximum_bytes);
+    let mut normalized = String::with_capacity(source_limit);
+    let mut index = 0;
+    let mut invalid_utf8_replaced = false;
+
+    while index < source_limit {
+        match source[index] {
+            0x1b => consume_escape_bytes(source, &mut index, source_limit),
+            b'\r' => {
+                index += 1;
+                if index < source_limit && source[index] == b'\n' {
+                    index += 1;
                 }
-                normalized.push('\n');
+                push_bounded(&mut normalized, '\n', maximum_bytes);
             }
-            '\n' | '\t' => normalized.push(character),
-            '\u{8}' => remove_previous_text_character(&mut normalized),
-            character if character.is_control() => {}
-            character => normalized.push(character),
+            b'\n' | b'\t' => {
+                push_bounded(&mut normalized, char::from(source[index]), maximum_bytes);
+                index += 1;
+            }
+            0x08 => {
+                remove_previous_text_character(&mut normalized);
+                index += 1;
+            }
+            byte if byte < 0x20 || byte == 0x7f => index += 1,
+            b' '..=b'~' => {
+                push_bounded(&mut normalized, char::from(source[index]), maximum_bytes);
+                index += 1;
+            }
+            _ => {
+                let remaining = &source[index..source_limit];
+                match std::str::from_utf8(remaining) {
+                    Ok(valid) => {
+                        if let Some(character) = valid.chars().next() {
+                            if !character.is_control() {
+                                push_bounded(&mut normalized, character, maximum_bytes);
+                            }
+                            index += character.len_utf8();
+                        } else {
+                            index = source_limit;
+                        }
+                    }
+                    Err(error) if error.valid_up_to() > 0 => {
+                        let Ok(valid) = std::str::from_utf8(&remaining[..error.valid_up_to()])
+                        else {
+                            index += 1;
+                            continue;
+                        };
+                        if let Some(character) = valid.chars().next() {
+                            if !character.is_control() {
+                                push_bounded(&mut normalized, character, maximum_bytes);
+                            }
+                            index += character.len_utf8();
+                        } else {
+                            index += error.error_len().unwrap_or(1).min(source_limit - index);
+                        }
+                    }
+                    Err(error) => {
+                        push_bounded(&mut normalized, '\u{fffd}', maximum_bytes);
+                        invalid_utf8_replaced = true;
+                        index += error.error_len().unwrap_or(1).min(source_limit - index);
+                    }
+                }
+            }
         }
     }
 
-    normalized
+    collapse_adjacent_duplicate_lines(&mut normalized, maximum_bytes);
+    let normalized_bytes = normalized.len();
+    NormalizedTerminalText {
+        text: normalized,
+        source_bytes_consumed: source_limit,
+        normalized_bytes,
+        source_truncated: source_limit < source.len(),
+        invalid_utf8_replaced,
+    }
+}
+
+/// Normalize terminal-like text into a deterministic sanitized transcript.
+#[must_use]
+pub fn normalize_terminal_text(source: &str) -> String {
+    normalize_terminal_bytes(source.as_bytes(), source.len()).text
 }
 
 /// Project one decoded canonical event according to an explicit bounded policy.
@@ -106,6 +311,7 @@ pub fn project_event(
             "future session event schema is unsupported",
         ));
     }
+    let _classification = classify_persisted_event(&event.kind);
 
     if let Some(projection) = project_transcript_event(event, policy) {
         return Ok(projection);
@@ -113,13 +319,20 @@ pub fn project_event(
     if let Some(projection) = project_tool_event(event, policy) {
         return Ok(projection);
     }
+    if let SessionEventKind::AssistantReasoningActivity { activity, .. } = &event.kind {
+        return Ok(if policy.reasoning.enabled() {
+            project_reasoning_activity(event, activity, policy.max_text_bytes_per_record)
+        } else {
+            EventProjection::Excluded(ProjectionExclusion::DisabledByPolicy)
+        });
+    }
 
     let projection = match &event.kind {
         SessionEventKind::AssistantDelta { .. }
         | SessionEventKind::AssistantReasoningDelta { .. } => {
             EventProjection::Excluded(ProjectionExclusion::NonFinalContent)
         }
-        SessionEventKind::AssistantReasoningMessage { text } if policy.include_reasoning => {
+        SessionEventKind::AssistantReasoningMessage { text } if policy.reasoning.enabled() => {
             project_text(
                 event,
                 "assistant-reasoning",
@@ -130,11 +343,61 @@ pub fn project_event(
                 policy.max_text_bytes_per_record,
             )
         }
-        SessionEventKind::AssistantReasoningMessage { .. }
-        | SessionEventKind::AssistantReasoningActivity { .. } => {
+        SessionEventKind::AssistantReasoningMessage { .. } => {
             EventProjection::Excluded(ProjectionExclusion::DisabledByPolicy)
         }
-        _ => EventProjection::Excluded(ProjectionExclusion::NoSearchableContent),
+        SessionEventKind::SessionCreated { name: None, .. }
+        | SessionEventKind::SessionRenamed { name: None }
+        | SessionEventKind::ClientAttached { .. }
+        | SessionEventKind::ClientDetached { .. }
+        | SessionEventKind::PermissionRequested { .. }
+        | SessionEventKind::PermissionResolved { .. }
+        | SessionEventKind::ModelChanged { .. }
+        | SessionEventKind::AgentChanged { .. }
+        | SessionEventKind::ModelTurnStarted { .. }
+        | SessionEventKind::ModelTurnFinished { .. }
+        | SessionEventKind::ModelUsage { .. }
+        | SessionEventKind::TraceEvent { .. }
+        | SessionEventKind::SkillInvoked { .. }
+        | SessionEventKind::SkillSuggested { .. }
+        | SessionEventKind::SkillActivated { .. }
+        | SessionEventKind::SkillDeactivated { .. }
+        | SessionEventKind::SkillContextLoaded { .. }
+        | SessionEventKind::SkillInvocationFailed { .. }
+        | SessionEventKind::RuntimeWorkStarted { .. }
+        | SessionEventKind::RuntimeWorkCancelRequested { .. }
+        | SessionEventKind::RuntimeWorkFinished { .. }
+        | SessionEventKind::RuntimeWorkProgress { .. }
+        | SessionEventKind::ModelTurnCancelRequested { .. }
+        | SessionEventKind::WorkingDirectoryChanged { .. }
+        | SessionEventKind::SessionImported { .. }
+        | SessionEventKind::SessionForked { .. }
+        | SessionEventKind::RalphLifecycle { .. }
+        | SessionEventKind::ReasoningChanged { .. }
+        | SessionEventKind::ToolExchangeRequested { .. }
+        | SessionEventKind::ToolExchangeResolved { .. }
+        | SessionEventKind::ProviderContextCompacted { .. }
+        | SessionEventKind::RequestContextObserved { .. }
+        | SessionEventKind::PluginStatusNote { .. }
+        | SessionEventKind::InertHistory { .. }
+        | SessionEventKind::ToolInvocationLifecycle { .. }
+        | SessionEventKind::ToolContribution { .. }
+        | SessionEventKind::ToolContributionPlaced { .. }
+        | SessionEventKind::ExecutionSessionCreated { .. } => {
+            EventProjection::Excluded(ProjectionExclusion::NoSearchableContent)
+        }
+        SessionEventKind::SessionCreated { name: Some(_), .. }
+        | SessionEventKind::SessionRenamed { name: Some(_) }
+        | SessionEventKind::UserMessage { .. }
+        | SessionEventKind::AssistantMessage { .. }
+        | SessionEventKind::SystemMessage { .. }
+        | SessionEventKind::ContextCompacted { .. }
+        | SessionEventKind::ToolCallRequested { .. }
+        | SessionEventKind::ToolInvocationResultRecorded { .. }
+        | SessionEventKind::AssistantReasoningActivity { .. }
+        | SessionEventKind::AssistantResponseSegment { .. } => {
+            unreachable!("searchable event variants must be handled by their focused projector")
+        }
     };
 
     Ok(projection)
@@ -166,6 +429,26 @@ fn project_transcript_event(
             SearchField::Text,
             text,
         ),
+        SessionEventKind::AssistantResponseSegment {
+            turn_id,
+            segment_id,
+            segment_order,
+            text,
+        } => {
+            return Some(project_text(
+                event,
+                &format!("assistant-segment-{segment_order}"),
+                SearchContentKind::AssistantMessage,
+                SearchField::Text,
+                text,
+                BTreeMap::from([
+                    ("turn_id".to_owned(), turn_id.clone()),
+                    ("segment_id".to_owned(), segment_id.clone()),
+                    ("segment_order".to_owned(), segment_order.to_string()),
+                ]),
+                policy.max_text_bytes_per_record,
+            ));
+        }
         SessionEventKind::SystemMessage { text } => (
             "system-message",
             SearchContentKind::SystemMessage,
@@ -203,7 +486,29 @@ fn project_tool_event(
             arguments_json,
             working_directory,
             ..
-        } if policy.include_tool_arguments => {
+        } if tool_name == SHELL_RUN_TOOL_NAME && policy.shell_commands.enabled() => {
+            Some(project_shell_command(
+                event,
+                tool_call_id,
+                arguments_json,
+                working_directory.as_ref(),
+                policy.max_text_bytes_per_record,
+            ))
+        }
+        SessionEventKind::ToolCallRequested { tool_name, .. }
+            if tool_name == SHELL_RUN_TOOL_NAME =>
+        {
+            Some(EventProjection::Excluded(
+                ProjectionExclusion::DisabledByPolicy,
+            ))
+        }
+        SessionEventKind::ToolCallRequested {
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            working_directory,
+            ..
+        } if policy.tool_arguments.enabled() => {
             let mut attributes = BTreeMap::from([
                 ("invocation_id".to_owned(), tool_call_id.clone()),
                 ("tool_name".to_owned(), tool_name.clone()),
@@ -225,7 +530,23 @@ fn project_tool_event(
             ))
         }
         SessionEventKind::ToolInvocationResultRecorded { record }
-            if record.is_error || policy.include_tool_output =>
+            if shell_result_metadata(record).is_some() && policy.shell_output.enabled() =>
+        {
+            Some(project_shell_result(
+                event,
+                record,
+                policy.max_text_bytes_per_record,
+            ))
+        }
+        SessionEventKind::ToolInvocationResultRecorded { record }
+            if shell_result_metadata(record).is_some() =>
+        {
+            Some(EventProjection::Excluded(
+                ProjectionExclusion::DisabledByPolicy,
+            ))
+        }
+        SessionEventKind::ToolInvocationResultRecorded { record }
+            if record.is_error || policy.tool_output.enabled() =>
         {
             Some(project_tool_result(event, record, policy))
         }
@@ -249,6 +570,228 @@ fn project_tool_event(
                 policy.max_text_bytes_per_record,
             ))
         }
+        _ => None,
+    }
+}
+
+#[derive(Deserialize)]
+struct ShellRunArgumentsProjection {
+    command: String,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+enum ShellRunResultProjection {
+    Terminal {
+        exit_code: Option<i32>,
+        timed_out: bool,
+        cancelled: bool,
+        duration_ms: Option<u64>,
+        output_tail: String,
+        output_truncated: bool,
+        output_bytes: Option<u64>,
+        retained_output_bytes: Option<u64>,
+    },
+    Captured {
+        exit_code: Option<i32>,
+        timed_out: bool,
+        cancelled: bool,
+        duration_ms: Option<u64>,
+        stdout: String,
+        stderr: String,
+        stdout_truncated: bool,
+        stderr_truncated: bool,
+        stdout_bytes: Option<u64>,
+        stderr_bytes: Option<u64>,
+    },
+}
+
+fn project_shell_command(
+    event: &SessionEvent,
+    invocation_id: &str,
+    arguments_json: &str,
+    working_directory: Option<&std::path::PathBuf>,
+    maximum_bytes: usize,
+) -> EventProjection {
+    let Ok(arguments) = serde_json::from_str::<ShellRunArgumentsProjection>(arguments_json) else {
+        return EventProjection::Excluded(ProjectionExclusion::NoSearchableContent);
+    };
+    let mut attributes = BTreeMap::from([
+        ("invocation_id".to_owned(), invocation_id.to_owned()),
+        ("tool_name".to_owned(), SHELL_RUN_TOOL_NAME.to_owned()),
+    ]);
+    if let Some(working_directory) = working_directory {
+        attributes.insert(
+            "working_directory".to_owned(),
+            working_directory.to_string_lossy().into_owned(),
+        );
+    }
+    project_text(
+        event,
+        "shell-command",
+        SearchContentKind::ShellCommand,
+        SearchField::Command,
+        &arguments.command,
+        attributes,
+        maximum_bytes,
+    )
+}
+
+fn shell_result_metadata(
+    record: &bcode_session_models::ToolInvocationResultRecord,
+) -> Option<ShellRunResultProjection> {
+    let Some(ToolInvocationResult::Artifact { artifact }) = &record.result else {
+        return None;
+    };
+    if artifact.schema != SHELL_RUN_SCHEMA || artifact.schema_version != SHELL_RUN_SCHEMA_VERSION {
+        return None;
+    }
+    serde_json::from_value(artifact.metadata.clone()).ok()
+}
+
+fn project_shell_result(
+    event: &SessionEvent,
+    record: &bcode_session_models::ToolInvocationResultRecord,
+    maximum_bytes: usize,
+) -> EventProjection {
+    let Some(result) = shell_result_metadata(record) else {
+        return EventProjection::Excluded(ProjectionExclusion::NoSearchableContent);
+    };
+    let mut records = Vec::new();
+    match result {
+        ShellRunResultProjection::Terminal {
+            exit_code,
+            timed_out,
+            cancelled,
+            duration_ms,
+            output_tail,
+            output_truncated,
+            output_bytes,
+            retained_output_bytes,
+        } => {
+            let attributes = shell_result_attributes(
+                &record.invocation_id,
+                exit_code,
+                timed_out,
+                cancelled,
+                duration_ms,
+                output_truncated,
+                output_bytes,
+                retained_output_bytes,
+            );
+            append_projected_records(
+                &mut records,
+                project_text(
+                    event,
+                    "shell-combined-output",
+                    SearchContentKind::ShellOutput,
+                    SearchField::Text,
+                    &output_tail,
+                    attributes,
+                    maximum_bytes,
+                ),
+            );
+        }
+        ShellRunResultProjection::Captured {
+            exit_code,
+            timed_out,
+            cancelled,
+            duration_ms,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+            stdout_bytes,
+            stderr_bytes,
+        } => {
+            let common = shell_result_attributes(
+                &record.invocation_id,
+                exit_code,
+                timed_out,
+                cancelled,
+                duration_ms,
+                stdout_truncated || stderr_truncated,
+                sum_optional(stdout_bytes, stderr_bytes),
+                None,
+            );
+            append_projected_records(
+                &mut records,
+                project_text(
+                    event,
+                    "shell-stdout",
+                    SearchContentKind::ShellOutput,
+                    SearchField::StandardOutput,
+                    &stdout,
+                    common.clone(),
+                    maximum_bytes,
+                ),
+            );
+            append_projected_records(
+                &mut records,
+                project_text(
+                    event,
+                    "shell-stderr",
+                    SearchContentKind::ShellOutput,
+                    SearchField::StandardError,
+                    &stderr,
+                    common,
+                    maximum_bytes,
+                ),
+            );
+        }
+    }
+    if records.is_empty() {
+        EventProjection::Excluded(ProjectionExclusion::EmptyAfterNormalization)
+    } else {
+        EventProjection::Records(records)
+    }
+}
+
+fn append_projected_records(target: &mut Vec<SessionSearchRecord>, projection: EventProjection) {
+    if let EventProjection::Records(mut records) = projection {
+        target.append(&mut records);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shell_result_attributes(
+    invocation_id: &str,
+    exit_code: Option<i32>,
+    timed_out: bool,
+    cancelled: bool,
+    duration_ms: Option<u64>,
+    source_truncated: bool,
+    output_bytes: Option<u64>,
+    retained_output_bytes: Option<u64>,
+) -> BTreeMap<String, String> {
+    let mut attributes = BTreeMap::from([
+        ("invocation_id".to_owned(), invocation_id.to_owned()),
+        ("tool_name".to_owned(), SHELL_RUN_TOOL_NAME.to_owned()),
+        ("timed_out".to_owned(), timed_out.to_string()),
+        ("cancelled".to_owned(), cancelled.to_string()),
+        ("source_truncated".to_owned(), source_truncated.to_string()),
+    ]);
+    if let Some(exit_code) = exit_code {
+        attributes.insert("exit_code".to_owned(), exit_code.to_string());
+    }
+    if let Some(duration_ms) = duration_ms {
+        attributes.insert("duration_ms".to_owned(), duration_ms.to_string());
+    }
+    if let Some(output_bytes) = output_bytes {
+        attributes.insert("output_bytes".to_owned(), output_bytes.to_string());
+    }
+    if let Some(retained_output_bytes) = retained_output_bytes {
+        attributes.insert(
+            "retained_output_bytes".to_owned(),
+            retained_output_bytes.to_string(),
+        );
+    }
+    attributes
+}
+
+const fn sum_optional(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.saturating_add(right)),
         _ => None,
     }
 }
@@ -287,6 +830,43 @@ fn project_tool_result(
     )
 }
 
+fn project_reasoning_activity(
+    event: &SessionEvent,
+    activity: &ReasoningActivity,
+    maximum_bytes: usize,
+) -> EventProjection {
+    let records = activity
+        .parts
+        .iter()
+        .map(|part| {
+            project_text(
+                event,
+                &format!("reasoning-{}-{}", activity.order, part.order),
+                SearchContentKind::AssistantReasoning,
+                SearchField::Text,
+                &part.text,
+                BTreeMap::from([
+                    ("activity_id".to_owned(), activity.activity_id.clone()),
+                    ("activity_order".to_owned(), activity.order.to_string()),
+                    ("part_id".to_owned(), part.part_id.clone()),
+                    ("part_order".to_owned(), part.order.to_string()),
+                ]),
+                maximum_bytes,
+            )
+        })
+        .filter_map(|projection| match projection {
+            EventProjection::Records(mut records) => records.pop(),
+            EventProjection::Excluded(_) => None,
+        })
+        .collect::<Vec<_>>();
+
+    if records.is_empty() {
+        EventProjection::Excluded(ProjectionExclusion::EmptyAfterNormalization)
+    } else {
+        EventProjection::Records(records)
+    }
+}
+
 fn project_text(
     event: &SessionEvent,
     record_kind: &str,
@@ -296,16 +876,19 @@ fn project_text(
     attributes: BTreeMap<String, String>,
     maximum_bytes: usize,
 ) -> EventProjection {
-    let normalized = normalize_terminal_text(source);
-    if normalized.trim().is_empty() {
+    let normalized = normalize_terminal_bytes(source.as_bytes(), maximum_bytes);
+    if normalized.text.trim().is_empty() {
         return EventProjection::Excluded(ProjectionExclusion::EmptyAfterNormalization);
     }
 
-    let normalized_bytes = normalized.len();
-    let indexed_text = truncate_utf8(&normalized, maximum_bytes);
-    let indexed_bytes = indexed_text.len();
+    let indexed_bytes = normalized.text.len();
     let record_id = format!("{}:{record_kind}:0", event.sequence);
     let source_bytes = u64::try_from(source.len()).unwrap_or(u64::MAX);
+    let source_range_end = u64::try_from(normalized.source_bytes_consumed).unwrap_or(u64::MAX);
+    let mut attributes = attributes;
+    if normalized.invalid_utf8_replaced {
+        attributes.insert("invalid_utf8_replaced".to_owned(), "true".to_owned());
+    }
 
     EventProjection::Records(vec![SessionSearchRecord {
         schema_version: CURRENT_SEARCH_RECORD_VERSION,
@@ -318,28 +901,82 @@ fn project_text(
         timestamp_ms: event.timestamp_ms,
         content_kind,
         field: Some(field),
-        text: Some(indexed_text.to_owned()),
+        text: Some(normalized.text),
         attributes,
         source_bytes,
-        normalized_bytes: u64::try_from(normalized_bytes).unwrap_or(u64::MAX),
+        normalized_bytes: u64::try_from(normalized.normalized_bytes).unwrap_or(u64::MAX),
         indexed_bytes: u64::try_from(indexed_bytes).unwrap_or(u64::MAX),
-        truncated: indexed_bytes < normalized_bytes,
+        truncated: normalized.source_truncated,
         source_range_start: Some(0),
-        source_range_end: Some(source_bytes),
+        source_range_end: Some(source_range_end),
         normalization_version: CURRENT_NORMALIZATION_VERSION,
         policy_version: CURRENT_SEARCH_POLICY_VERSION,
     }])
 }
 
-fn truncate_utf8(text: &str, maximum_bytes: usize) -> &str {
-    if text.len() <= maximum_bytes {
-        return text;
+fn collapse_adjacent_duplicate_lines(text: &mut String, maximum_bytes: usize) {
+    if !text.contains('\n') {
+        return;
     }
-    let mut end = maximum_bytes;
-    while !text.is_char_boundary(end) {
-        end = end.saturating_sub(1);
+    let trailing_newline = text.ends_with('\n');
+    let mut collapsed = String::with_capacity(text.len().min(maximum_bytes));
+    let mut previous: Option<&str> = None;
+    for line in text.split('\n') {
+        if previous == Some(line) && !line.is_empty() {
+            continue;
+        }
+        if !collapsed.is_empty() {
+            collapsed.push('\n');
+        }
+        collapsed.push_str(line);
+        previous = Some(line);
     }
-    &text[..end]
+    if trailing_newline && !collapsed.ends_with('\n') && collapsed.len() < maximum_bytes {
+        collapsed.push('\n');
+    }
+    *text = collapsed;
+}
+
+fn push_bounded(text: &mut String, character: char, maximum_bytes: usize) {
+    if text.len().saturating_add(character.len_utf8()) <= maximum_bytes {
+        text.push(character);
+    }
+}
+
+fn consume_escape_bytes(source: &[u8], index: &mut usize, source_limit: usize) {
+    *index += 1;
+    if *index >= source_limit {
+        return;
+    }
+    match source[*index] {
+        b'[' => {
+            *index += 1;
+            while *index < source_limit {
+                let byte = source[*index];
+                *index += 1;
+                if (b'@'..=b'~').contains(&byte) {
+                    break;
+                }
+            }
+        }
+        b']' => {
+            *index += 1;
+            while *index < source_limit {
+                match source[*index] {
+                    0x07 => {
+                        *index += 1;
+                        break;
+                    }
+                    0x1b if *index + 1 < source_limit && source[*index + 1] == b'\\' => {
+                        *index += 2;
+                        break;
+                    }
+                    _ => *index += 1,
+                }
+            }
+        }
+        _ => *index += 1,
+    }
 }
 
 const fn result_kind(result: &ToolInvocationResult) -> &'static str {
@@ -347,28 +984,6 @@ const fn result_kind(result: &ToolInvocationResult) -> &'static str {
         ToolInvocationResult::Text { .. } => "text",
         ToolInvocationResult::Json { .. } => "json",
         ToolInvocationResult::Artifact { .. } => "artifact",
-    }
-}
-
-fn consume_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
-    match chars.next() {
-        Some('[') => {
-            for character in chars.by_ref() {
-                if ('@'..='~').contains(&character) {
-                    break;
-                }
-            }
-        }
-        Some(']') => {
-            let mut escape = false;
-            for character in chars.by_ref() {
-                if character == '\u{7}' || (escape && character == '\\') {
-                    break;
-                }
-                escape = character == '\u{1b}';
-            }
-        }
-        Some(_) | None => {}
     }
 }
 
@@ -405,6 +1020,42 @@ mod tests {
     }
 
     #[test]
+    fn normalization_collapses_only_adjacent_exact_progress_duplicates() {
+        let source = b"working\rworking\rERROR one\rERROR two\rERROR two\rfinished";
+        let normalized = normalize_terminal_bytes(source, source.len());
+        assert_eq!(normalized.text, "working\nERROR one\nERROR two\nfinished");
+    }
+
+    #[test]
+    fn byte_normalization_is_bounded_and_replaces_invalid_utf8() {
+        let source = [b'a', 0xff, b'b', 0x1b, b'[', b'3', b'1', b'm', b'c'];
+        let normalized = normalize_terminal_bytes(&source, 6);
+        assert_eq!(normalized.text, "a�b");
+        assert_eq!(normalized.source_bytes_consumed, 6);
+        assert!(normalized.source_truncated);
+        assert!(normalized.invalid_utf8_replaced);
+        assert!(normalized.text.len() <= 6);
+    }
+
+    #[test]
+    fn byte_normalization_never_exceeds_bound_for_adversarial_inputs() {
+        let inputs = [
+            vec![0xff; 1024],
+            b"\x1b]8;;unterminated-secret".repeat(100),
+            b"progress\rprogress\rprogress".repeat(100),
+            "é🙂\u{8}\r\n".repeat(100).into_bytes(),
+        ];
+        for input in inputs {
+            for maximum in 1..64 {
+                let normalized = normalize_terminal_bytes(&input, maximum);
+                assert!(normalized.text.len() <= maximum);
+                assert!(normalized.source_bytes_consumed <= maximum);
+                assert!(std::str::from_utf8(normalized.text.as_bytes()).is_ok());
+            }
+        }
+    }
+
+    #[test]
     fn user_message_projection_is_stable_bounded_and_utf8_safe() {
         let event = event(
             7,
@@ -428,7 +1079,7 @@ mod tests {
         let record = &records[0];
         assert_eq!(record.record_id, "7:user-message:0");
         assert_eq!(record.text.as_deref(), Some("abé"));
-        assert_eq!(record.normalized_bytes, 5);
+        assert_eq!(record.normalized_bytes, 4);
         assert_eq!(record.indexed_bytes, 4);
         assert!(record.truncated);
         assert_eq!(
@@ -467,6 +1118,181 @@ mod tests {
             Ok(EventProjection::Excluded(
                 ProjectionExclusion::DisabledByPolicy
             ))
+        );
+    }
+
+    #[test]
+    fn finalized_reasoning_projects_ordered_parts_with_distinct_identities() {
+        use bcode_session_models::{
+            ReasoningActivityStatus, ReasoningContentKind, ReasoningContentRole, ReasoningPart,
+        };
+
+        let event = event(
+            11,
+            SessionEventKind::AssistantReasoningActivity {
+                turn_id: "turn-1".to_owned(),
+                activity: ReasoningActivity {
+                    activity_id: "activity-1".to_owned(),
+                    order: 2,
+                    status: ReasoningActivityStatus::Completed,
+                    parts: vec![
+                        ReasoningPart {
+                            part_id: "summary".to_owned(),
+                            kind: ReasoningContentKind::Summary,
+                            role: ReasoningContentRole::Milestone,
+                            order: 0,
+                            text: "first".to_owned(),
+                        },
+                        ReasoningPart {
+                            part_id: "detail".to_owned(),
+                            kind: ReasoningContentKind::Raw,
+                            role: ReasoningContentRole::Detail,
+                            order: 1,
+                            text: "second".to_owned(),
+                        },
+                    ],
+                    opaque: true,
+                },
+            },
+        );
+        let projection = project_event(
+            &event,
+            &SearchProjectionPolicy {
+                reasoning: ProjectionContentPolicy::Include,
+                ..SearchProjectionPolicy::default()
+            },
+        )
+        .expect("project reasoning");
+        let EventProjection::Records(records) = projection else {
+            panic!("reasoning must produce records");
+        };
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].record_id, "11:reasoning-2-0:0");
+        assert_eq!(records[1].record_id, "11:reasoning-2-1:0");
+        assert_eq!(records[0].locator.sequence, records[1].locator.sequence);
+        assert!(!records[0].attributes.contains_key("opaque"));
+    }
+
+    #[test]
+    fn assistant_response_segment_preserves_stable_segment_metadata() {
+        let event = event(
+            12,
+            SessionEventKind::AssistantResponseSegment {
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-1".to_owned(),
+                segment_order: 3,
+                text: "answer".to_owned(),
+            },
+        );
+        let projection = project_event(&event, &SearchProjectionPolicy::default())
+            .expect("project assistant segment");
+        let EventProjection::Records(records) = projection else {
+            panic!("assistant segment must produce a record");
+        };
+        assert_eq!(records[0].record_id, "12:assistant-segment-3:0");
+        assert_eq!(
+            records[0].attributes.get("segment_id").map(String::as_str),
+            Some("segment-1")
+        );
+    }
+
+    #[test]
+    fn shell_command_projects_from_typed_arguments_without_generic_argument_policy() {
+        let event = event(
+            13,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-shell".to_owned(),
+                producer_plugin_id: Some("bcode.shell".to_owned()),
+                tool_name: SHELL_RUN_TOOL_NAME.to_owned(),
+                arguments_json: serde_json::json!({"command": "printf hello"}).to_string(),
+                working_directory: Some(std::path::PathBuf::from("/workspace")),
+            },
+        );
+        let projection = project_event(&event, &SearchProjectionPolicy::default())
+            .expect("project shell command");
+        let EventProjection::Records(records) = projection else {
+            panic!("shell command must produce a record");
+        };
+        assert_eq!(records[0].content_kind, SearchContentKind::ShellCommand);
+        assert_eq!(records[0].field, Some(SearchField::Command));
+        assert_eq!(records[0].text.as_deref(), Some("printf hello"));
+        assert_eq!(
+            records[0]
+                .attributes
+                .get("working_directory")
+                .map(String::as_str),
+            Some("/workspace")
+        );
+    }
+
+    #[test]
+    fn shell_captured_output_projects_stdout_and_stderr_only_when_enabled() {
+        let metadata = serde_json::json!({
+            "mode": "captured",
+            "exit_code": 1,
+            "timed_out": false,
+            "cancelled": false,
+            "duration_ms": 25,
+            "stdout": "out",
+            "stderr": "error",
+            "stdout_truncated": false,
+            "stderr_truncated": true,
+            "stdout_bytes": 3,
+            "stderr_bytes": 99
+        });
+        let event = event(
+            14,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-shell".to_owned(),
+                    model_output: "model summary".to_owned(),
+                    is_error: true,
+                    presentation: None,
+                    result: Some(ToolInvocationResult::Artifact {
+                        artifact: Box::new(bcode_session_models::ToolArtifact {
+                            artifact_id: "shell-result".to_owned(),
+                            producer_plugin_id: "bcode.shell".to_owned(),
+                            schema: SHELL_RUN_SCHEMA.to_owned(),
+                            schema_version: SHELL_RUN_SCHEMA_VERSION,
+                            tool_call_id: Some("call-shell".to_owned()),
+                            title: None,
+                            metadata,
+                            refs: Vec::new(),
+                        }),
+                    }),
+                },
+            },
+        );
+        assert_eq!(
+            project_event(&event, &SearchProjectionPolicy::default()),
+            Ok(EventProjection::Excluded(
+                ProjectionExclusion::DisabledByPolicy
+            ))
+        );
+        let projection = project_event(
+            &event,
+            &SearchProjectionPolicy {
+                shell_output: ProjectionContentPolicy::Include,
+                ..SearchProjectionPolicy::default()
+            },
+        )
+        .expect("project shell output");
+        let EventProjection::Records(records) = projection else {
+            panic!("shell output must produce records");
+        };
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].field, Some(SearchField::StandardOutput));
+        assert_eq!(records[1].field, Some(SearchField::StandardError));
+        assert_eq!(
+            records[0].attributes.get("exit_code").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            records[0]
+                .attributes
+                .get("source_truncated")
+                .map(String::as_str),
+            Some("true")
         );
     }
 

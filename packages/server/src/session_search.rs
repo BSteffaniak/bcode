@@ -122,6 +122,34 @@ pub async fn search_provider(
             retryable: false,
         });
     }
+    let capabilities = state
+        .plugins
+        .invoke_service_json::<_, SessionSearchCapabilities>(
+            plugin_id,
+            SESSION_SEARCH_INTERFACE_ID,
+            OP_CAPABILITIES,
+            &(),
+        )
+        .await
+        .map_err(|error| SessionSearchServiceError {
+            code: SearchErrorCode::ProviderUnavailable,
+            message: bounded_message(&error.to_string()),
+            retryable: true,
+        })?;
+    if capabilities.provider_id != plugin_id {
+        return Err(SessionSearchServiceError {
+            code: SearchErrorCode::InvalidRequest,
+            message: "provider capability identity does not match selected plugin".to_owned(),
+            retryable: false,
+        });
+    }
+    capabilities
+        .supports_request(request)
+        .map_err(|error| SessionSearchServiceError {
+            code: SearchErrorCode::UnsupportedQuery,
+            message: bounded_message(&error.to_string()),
+            retryable: false,
+        })?;
     let response = state
         .plugins
         .invoke_service_json::<_, SessionSearchResponse>(
