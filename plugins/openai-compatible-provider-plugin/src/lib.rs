@@ -317,7 +317,7 @@ fn api_key_auth_method(storage_key: &str, prompt: &str) -> AuthMethodContributio
 
 fn openai_browser_auth_method() -> AuthMethodContribution {
     AuthMethodContribution::Interactive {
-        method_id: "browser".to_owned(),
+        method_id: "chatgpt".to_owned(),
         display_name: "ChatGPT browser OAuth".to_owned(),
         operation: OPENAI_AUTH_FLOW_OPERATION.to_owned(),
         credentials: openai_oauth_credential_storage(),
@@ -788,7 +788,7 @@ impl OpenAiCompatibleProviderPlugin {
             return ServiceResponse::error("invalid_auth_flow", error.to_string());
         }
         if request.provider_id != "openai"
-            || !matches!(request.method_id.as_str(), "browser" | "device")
+            || !matches!(request.method_id.as_str(), "chatgpt" | "device")
         {
             return ServiceResponse::error(
                 "unsupported_auth_method",
@@ -807,7 +807,7 @@ impl OpenAiCompatibleProviderPlugin {
         let method_id = request.method_id.clone();
         let state = Arc::clone(&self.state);
         let future = async move {
-            if method_id == "browser" {
+            if method_id == "chatgpt" {
                 Self::openai_browser_auth_flow(state, request).await
             } else {
                 Self::openai_device_auth_flow(state, request).await
@@ -9045,7 +9045,7 @@ mod tests {
             contributions[0]
                 .methods
                 .iter()
-                .any(|method| method.method_id() == "browser")
+                .any(|method| method.method_id() == "chatgpt")
         );
         assert!(
             contributions[0]
