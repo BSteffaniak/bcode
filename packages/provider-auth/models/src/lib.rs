@@ -174,7 +174,7 @@ impl AuthMethodContribution {
 pub struct AuthSecretField {
     /// Canonical credential ID delivered to the owning plugin, such as `api_key`.
     pub credential_id: String,
-    /// Backend key used in the selected vault profile, such as `EXA_API_KEY`.
+    /// Backend key used in the selected vault profile, such as `PROVIDER_API_KEY`.
     pub storage_key: String,
     /// Human-readable hidden prompt.
     pub prompt: String,
@@ -773,7 +773,7 @@ mod tests {
                 display_name: "API key".to_owned(),
                 fields: vec![AuthSecretField {
                     credential_id: "api_key".to_owned(),
-                    storage_key: "EXA_API_KEY".to_owned(),
+                    storage_key: "PROVIDER_API_KEY".to_owned(),
                     prompt: "Exa API key".to_owned(),
                     optional: false,
                     validation: AuthSecretValidation {

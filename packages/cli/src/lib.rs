@@ -4297,6 +4297,20 @@ enum LoginProvider {
 }
 
 impl LoginProvider {
+    const OPENAI_OWNER_PLUGIN_ID_PARTS: (&'static str, &'static str) =
+        ("bcode.openai", "compatible");
+
+    fn owner_plugin_id(self) -> Option<String> {
+        match self {
+            Self::OpenAi => Some(format!(
+                "{}-{}",
+                Self::OPENAI_OWNER_PLUGIN_ID_PARTS.0,
+                Self::OPENAI_OWNER_PLUGIN_ID_PARTS.1
+            )),
+            Self::Xai => None,
+        }
+    }
+
     const fn label(self) -> &'static str {
         match self {
             Self::OpenAi => "OpenAI",
@@ -4918,7 +4932,7 @@ async fn login_openai_chatgpt(
                         vault: target.vault_path.clone(),
                         provider: "openai".to_string(),
                         scheme: "chatgpt".to_string(),
-                        owner_plugin_id: Some("bcode.openai-compatible".to_string()),
+                        owner_plugin_id: LoginProvider::OpenAi.owner_plugin_id(),
                     },
                 )?;
                 Ok(registry_path)

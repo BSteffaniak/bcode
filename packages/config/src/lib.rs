@@ -6220,7 +6220,7 @@ scheme = "api_key"
                 "api_key".to_owned(),
                 super::AuthCredentialMapping {
                     env: None,
-                    key: Some("EXA_API_KEY".to_owned()),
+                    key: Some("TEST_PROVIDER_API_KEY".to_owned()),
                 },
             )]),
         };

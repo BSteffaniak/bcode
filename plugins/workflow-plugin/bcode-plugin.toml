@@ -87,7 +87,7 @@ type     = "array"
 
 [workflow_templates.configuration_schema.schema.properties.command_plan.properties.commands.items]
 additionalProperties = false
-required             = ["argv", "continue_on_nonzero"]
+required             = ["argv", "timeout_ms", "continue_on_nonzero"]
 type                 = "object"
 
 [workflow_templates.configuration_schema.schema.properties.command_plan.properties.commands.items.properties.argv]
@@ -101,6 +101,11 @@ type      = "string"
 
 [workflow_templates.configuration_schema.schema.properties.command_plan.properties.commands.items.properties.continue_on_nonzero]
 type = "boolean"
+
+[workflow_templates.configuration_schema.schema.properties.command_plan.properties.commands.items.properties.timeout_ms]
+maximum = 300000
+minimum = 1
+type    = "integer"
 
 [workflow_templates.configuration_schema.schema.properties.command_plan.properties.environment]
 additionalProperties = false
@@ -143,6 +148,26 @@ enum = ["required", "if_changes", "disabled"]
 maxLength = 256
 minLength = 1
 type      = ["string", "null"]
+
+[workflow_templates.configuration_schema.schema.properties.commit_completed]
+type = "boolean"
+
+[workflow_templates.configuration_schema.schema.properties.commit_result]
+additionalProperties = false
+required             = ["previous_head", "commit_hash", "paths"]
+type                 = ["object", "null"]
+
+[workflow_templates.configuration_schema.schema.properties.commit_result.properties.previous_head]
+type = "string"
+
+[workflow_templates.configuration_schema.schema.properties.commit_result.properties.commit_hash]
+type = "string"
+
+[workflow_templates.configuration_schema.schema.properties.commit_result.properties.paths]
+items       = { type = "string" }
+maxItems    = 10000
+type        = "array"
+uniqueItems = true
 
 [[workflow_templates.compilation_bindings]]
 configuration_path = "commit_message_skill"
@@ -197,13 +222,12 @@ edges = [
         "artifact_spill",
     ], properties = { preview_bytes = { type = "integer", minimum = 0, maximum = 65536 }, artifact_spill = { type = "boolean" } } } } } } } },
     { from = "verification", to = "verification_decision", kind = { kind = "direct" } },
-    { from = "verification_decision", to = "verified", kind = { kind = "conditional", predicate = { operation = "equals", version = 1, path = "passed", value = true }, expected = true } },
-    { from = "verification_decision", to = "verification_failed", kind = { kind = "conditional", predicate = { operation = "equals", version = 1, path = "passed", value = true }, expected = false } },
-    { from = "verified", to = "commit_policy", kind = { kind = "direct" }, transform = { version = 1, expression = { operation = "input", source = "state", path = "commit_behavior" }, output = { type_name = "bcode.workflow.commit-behavior/v1", schema = { type = "string", enum = [
+    { from = "verification_decision", to = "commit_policy", kind = { kind = "conditional", predicate = { operation = "equals", version = 1, path = "passed", value = true }, expected = true }, transform = { version = 1, expression = { operation = "input", source = "state", path = "commit_behavior" }, output = { type_name = "bcode.workflow.commit-behavior/v1", schema = { type = "string", enum = [
         "required",
         "if_changes",
         "disabled",
     ] } } } },
+    { from = "verification_decision", to = "verification_repeat", kind = { kind = "conditional", predicate = { operation = "equals", version = 1, path = "passed", value = true }, expected = false } },
     { from = "commit_policy", to = "commit_disabled", kind = { kind = "conditional", predicate = { operation = "equals", version = 1, path = "", value = "disabled" }, expected = true }, transform = { version = 1, expression = { operation = "constant", value = "disabled" }, output = { type_name = "bcode.workflow.commit-disabled/v1", schema = { type = "string", enum = [
         "disabled",
     ] } } } },
@@ -247,19 +271,17 @@ edges = [
         "paths",
     ], properties = { repo_path = { type = "string" }, expected_head = { type = "string" }, message = { type = "string" }, paths = { type = "array", minItems = 1, uniqueItems = true, items = { type = "string" } } } } } } },
     { from = "commit_decision", to = "no_changes", kind = { kind = "conditional", predicate = { operation = "equals", version = 1, path = "status", value = "ready" }, expected = false } },
-    { from = "git_commit", to = "commit_result", kind = { kind = "direct" } },
-    { from = "verification_failed", to = "verification_repeat", kind = { kind = "direct" } },
+    { from = "git_commit", to = "commit_result", kind = { kind = "direct" }, transform = { version = 1, expression = { operation = "merge", conflict = "keep_last", objects = [
+        { operation = "input", source = "state", path = "" },
+        { operation = "object", fields = { commit_completed = { operation = "constant", value = true }, commit_result = { operation = "input", source = "current", path = "" } } },
+    ] }, output = { type_name = "bcode.workflow.implementation-verification-commit-config/v1", schema = { type = "object" } } } },
+    { from = "commit_result", to = "implementation", kind = { kind = "back", predicate = { operation = "equals", version = 1, path = "commit_completed", value = true }, max_iterations = 100 }, transform = { version = 1, expression = { operation = "input", source = "current", path = "" }, output = { type_name = "bcode.workflow.implementation-verification-commit-config/v1", schema = { type = "object" } } } },
     { from = "verification_repeat", to = "implementation", kind = { kind = "back", predicate = { operation = "equals", version = 1, path = "passed", value = false }, max_iterations = 100 }, transform = { version = 1, expression = { operation = "input", source = "state", path = "" }, output = { type_name = "bcode.workflow.implementation-verification-commit-config/v1", schema = { type = "object" } } } },
     { from = "commit_disabled", to = "commit_disabled_repeat", kind = { kind = "direct" } },
     { from = "commit_disabled_repeat", to = "implementation", kind = { kind = "back", predicate = { operation = "equals", version = 1, path = "", value = "disabled" }, max_iterations = 100 }, transform = { version = 1, expression = { operation = "input", source = "state", path = "" }, output = { type_name = "bcode.workflow.implementation-verification-commit-config/v1", schema = { type = "object" } } } },
 ]
 entries = ["implementation"]
-exits = [
-    "commit_result",
-    "no_changes",
-    "verification_repeat",
-    "commit_disabled_repeat",
-]
+exits = ["no_changes", "verification_repeat", "commit_disabled_repeat"]
 name = "implementation-verification-commit"
 schema_version = 1
 
@@ -344,27 +366,23 @@ schema    = { type = "string", enum = ["disabled"] }
 type_name = "bcode.workflow.commit-disabled/v1"
 
 [workflow_templates.definition.nodes.commit_result]
-configuration = { gate_version = 1 }
-id            = "commit_result"
-kind          = "input"
-name          = "Retain exact Git commit result"
-resources     = []
+id        = "commit_result"
+kind      = "repeat"
+name      = "Retain exact Git commit result and repeat"
+resources = []
+
+[workflow_templates.definition.nodes.commit_result.configuration]
+max_iterations    = 100
+predicate         = { operation = "equals", version = 1, path = "commit_completed", value = true }
+predicate_version = 1
 
 [workflow_templates.definition.nodes.commit_result.input]
-schema = { type = "object", required = [
-    "previous_head",
-    "commit_hash",
-    "paths",
-], properties = { previous_head = { type = "string" }, commit_hash = { type = "string" }, paths = { type = "array", items = { type = "string" } } } }
-type_name = "bcode.git.commit-result/v1"
+schema    = { type = "object" }
+type_name = "bcode.workflow.implementation-verification-commit-config/v1"
 
 [workflow_templates.definition.nodes.commit_result.output]
-schema = { type = "object", required = [
-    "previous_head",
-    "commit_hash",
-    "paths",
-], properties = { previous_head = { type = "string" }, commit_hash = { type = "string" }, paths = { type = "array", items = { type = "string" } } } }
-type_name = "bcode.git.commit-result/v1"
+schema    = { type = "object" }
+type_name = "bcode.workflow.implementation-verification-commit-config/v1"
 
 [workflow_templates.definition.nodes.commit_decision]
 id        = "commit_decision"
@@ -830,12 +848,12 @@ name      = "Branch on verification result"
 resources = []
 
 [workflow_templates.definition.nodes.verification_decision.configuration]
-false_entries     = ["verification_failed"]
-false_nodes       = ["verification_failed"]
+false_entries     = ["verification_repeat"]
+false_nodes       = ["verification_repeat"]
 predicate         = { operation = "equals", version = 1, path = "passed", value = true }
 predicate_version = 1
-true_entries      = ["verified"]
-true_nodes        = ["verified"]
+true_entries      = ["commit_policy"]
+true_nodes        = ["commit_policy"]
 
 [workflow_templates.definition.nodes.verification_decision.input]
 schema = { type = "object", additionalProperties = false, required = [

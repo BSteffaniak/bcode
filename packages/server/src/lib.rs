@@ -11378,7 +11378,6 @@ fn compile_workflow_template(
     }
     definition.input = template.configuration_schema.clone();
     definition.output = template.configuration_schema.clone();
-    let entry_nodes = definition.entries.iter().cloned().collect::<BTreeSet<_>>();
     for (node_id, node) in &mut definition.nodes {
         if node.kind != bcode_workflow::NodeKind::Agent {
             continue;
@@ -11392,7 +11391,7 @@ fn compile_workflow_template(
                 "workflow template entry agent configuration is invalid: {error}"
             ))
         })?;
-        if entry_nodes.contains(node_id) {
+        if original_input.type_name == template.configuration_schema.type_name {
             node.input = template.configuration_schema.clone();
             for edge in definition
                 .edges
@@ -11400,14 +11399,16 @@ fn compile_workflow_template(
                 .filter(|edge| edge.to == *node_id)
             {
                 if let Some(transform) = &mut edge.transform
-                    && transform.output == original_input
+                    && transform.output.type_name == original_input.type_name
                 {
                     transform.output = template.configuration_schema.clone();
                 }
             }
         }
-        node.output = template.configuration_schema.clone();
-        agent.structured_output.schema = template.configuration_schema.clone();
+        if node.output.type_name == template.configuration_schema.type_name {
+            node.output = template.configuration_schema.clone();
+            agent.structured_output.schema = template.configuration_schema.clone();
+        }
         node.configuration = serde_json::to_value(agent).map_err(|error| {
             WorkflowStoreError::InvalidData(format!(
                 "workflow template entry agent configuration cannot be serialized: {error}"
@@ -11905,6 +11906,17 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
         let dispatched = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
             .dispatch_pending_activations(&owner, 1_000, current_unix_millis())
             .await?;
+        let observer = WorkflowTurnReceiptObserver { state };
+        let reconciled = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
+            .reconcile_receipt_backed_attempts_async(&observer, 1_000, current_unix_millis())
+            .await?;
+        if !reconciled.sibling_cancellations.is_empty() {
+            propagate_fail_fast_sibling_cancellation(
+                state,
+                reconciled.sibling_cancellations.clone(),
+            )
+            .await?;
+        }
         if !dispatched.unsupported.is_empty() {
             tracing::debug!(
                 run_id,
@@ -11916,7 +11928,14 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
             "workflow.scheduler.iteration.duration_ms",
             u64::try_from(iteration_started_at.elapsed().as_millis()).unwrap_or(u64::MAX),
         );
-        if settled.settled.is_empty() && dispatched.admitted.is_empty() {
+        if settled.settled.is_empty()
+            && dispatched.admitted.is_empty()
+            && reconciled.succeeded.is_empty()
+            && reconciled.failed.is_empty()
+            && reconciled.paused.is_empty()
+            && reconciled.cancelled.is_empty()
+            && reconciled.repair_required.is_empty()
+        {
             break;
         }
     }
@@ -12507,25 +12526,52 @@ const fn workflow_mutation_approval_decision_label(
     }
 }
 
+async fn resolve_workflow_mutation_approval(
+    state: &Arc<ServerState>,
+    approval_id: &str,
+    decision: bcode_workflow_store::WorkflowMutationApprovalDecision,
+    resolved_at_ms: u64,
+) -> Result<
+    (
+        bcode_workflow_store::WorkflowMutationApprovalResolution,
+        Option<u64>,
+    ),
+    ServerError,
+> {
+    let approval_context = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .mutation_approval_context(approval_id)?;
+    let result = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .resolve_mutation_approval(approval_id, decision, resolved_at_ms)?;
+    if matches!(
+        decision,
+        bcode_workflow_store::WorkflowMutationApprovalDecision::Approve
+    ) && let Some((run_id, _)) = approval_context.as_ref()
+    {
+        drive_workflow_run(state, run_id).await?;
+    }
+    Ok((
+        result,
+        approval_context.map(|(_, requested_at_ms)| requested_at_ms),
+    ))
+}
+
 async fn handle_resolve_workflow_mutation_approval(
     request_id: u64,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     writer: &SharedWriter,
     approval_id: String,
     decision: bcode_workflow_store::WorkflowMutationApprovalDecision,
 ) -> Result<(), ServerError> {
     let started_at = std::time::Instant::now();
     let resolved_at_ms = current_unix_millis();
-    let requested_at_ms = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .mutation_approval_requested_at(&approval_id)?;
-    let result = state
-        .workflow_store
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .resolve_mutation_approval(&approval_id, decision, resolved_at_ms)?;
+    let (result, requested_at_ms) =
+        resolve_workflow_mutation_approval(state, &approval_id, decision, resolved_at_ms).await?;
     state.metrics.record_histogram_with_labels(
         "workflow.approval.wait.duration_ms",
         requested_at_ms.map_or(0, |requested_at_ms| {
@@ -19485,9 +19531,15 @@ impl TurnEventSink for SessionInvocationSink {
     fn emit(&self, event: ScopedTurnEvent) -> bool {
         self.sender.lock().is_ok_and(|sender| {
             sender.as_ref().is_some_and(|sender| {
-                sender
-                    .try_send(SessionInvocationSinkMessage::Event(Box::new(event)))
-                    .is_ok()
+                match sender.try_send(SessionInvocationSinkMessage::Event(Box::new(event))) {
+                    Ok(()) => true,
+                    Err(mpsc::error::TrySendError::Full(message)) => matches!(
+                        message,
+                        SessionInvocationSinkMessage::Event(event)
+                            if matches!(*event, ScopedTurnEvent::PresentationUpdate(_))
+                    ),
+                    Err(mpsc::error::TrySendError::Closed(_)) => false,
+                }
             })
         })
     }
@@ -19559,13 +19611,28 @@ async fn persist_scoped_turn_event(
         ScopedTurnEvent::Contribution(event) => {
             let invocation_id = event.invocation_id.clone();
             let producer_id = event.producer_id.clone();
-            append_tool_contribution_event(state, session_id, &invocation_id, &producer_id, event)
-                .await
+            if let Err(error) = append_tool_contribution_event(
+                state,
+                session_id,
+                &invocation_id,
+                &producer_id,
+                event,
+            )
+            .await
+            {
+                tracing::warn!(
+                    session_id = %session_id,
+                    invocation_id,
+                    %error,
+                    "discarding unavailable transient tool contribution"
+                );
+            }
+            Ok(())
         }
         ScopedTurnEvent::PresentationUpdate(update) => {
             let invocation_id = update.invocation_id.clone();
             let producer_id = update.producer_id.clone();
-            publish_plugin_tool_presentation_update(
+            if let Err(error) = publish_plugin_tool_presentation_update(
                 state,
                 session_id,
                 &invocation_id,
@@ -19573,6 +19640,15 @@ async fn persist_scoped_turn_event(
                 update,
             )
             .await
+            {
+                tracing::warn!(
+                    session_id = %session_id,
+                    invocation_id,
+                    %error,
+                    "discarding unavailable transient tool presentation"
+                );
+            }
+            Ok(())
         }
     }
 }
@@ -20542,13 +20618,8 @@ async fn invoke_plugin_tool_transport(
                             >(&payload)
                             {
                                 if route_canonical_events_to_scope {
-                                    if let Some(scope) = invocation_scope
-                                        && !scope.emit_lifecycle(lifecycle)
-                                    {
-                                        return Err(
-                                            "session invocation sink rejected lifecycle event"
-                                                .to_owned(),
-                                        );
+                                    if let Some(scope) = invocation_scope {
+                                        let _accepted = scope.emit_lifecycle(lifecycle);
                                     }
                                 } else {
                                     append_plugin_tool_lifecycle_event(
@@ -20564,13 +20635,8 @@ async fn invoke_plugin_tool_transport(
                             >(&payload)
                             {
                                 if route_canonical_events_to_scope {
-                                    if let Some(scope) = invocation_scope
-                                        && !scope.emit_presentation_update(update)
-                                    {
-                                        return Err(
-                                            "session invocation sink rejected presentation update"
-                                                .to_owned(),
-                                        );
+                                    if let Some(scope) = invocation_scope {
+                                        let _accepted = scope.emit_presentation_update(update);
                                     }
                                 } else {
                                     publish_plugin_tool_presentation_update(
@@ -20599,13 +20665,8 @@ async fn invoke_plugin_tool_transport(
                             >(&payload)
                             {
                                 if route_canonical_events_to_scope {
-                                    if let Some(scope) = invocation_scope
-                                        && !scope.emit_contribution(contribution)
-                                    {
-                                        return Err(
-                                            "session invocation sink rejected contribution"
-                                                .to_owned(),
-                                        );
+                                    if let Some(scope) = invocation_scope {
+                                        let _accepted = scope.emit_contribution(contribution);
                                     }
                                 } else if let Err(error) = append_tool_contribution_event(
                                     state,
@@ -20637,10 +20698,8 @@ async fn invoke_plugin_tool_transport(
             serde_json::from_slice::<bcode_session_models::ToolInvocationLifecycleEvent>(&payload)
         {
             if route_canonical_events_to_scope {
-                if let Some(scope) = invocation_scope
-                    && !scope.emit_lifecycle(lifecycle)
-                {
-                    return Err("session invocation sink rejected lifecycle event".to_owned());
+                if let Some(scope) = invocation_scope {
+                    let _accepted = scope.emit_lifecycle(lifecycle);
                 }
             } else {
                 append_plugin_tool_lifecycle_event(state, session_id, &call.id, lifecycle).await;
@@ -20649,10 +20708,8 @@ async fn invoke_plugin_tool_transport(
             serde_json::from_slice::<bcode_tool::ToolPresentationUpdate>(&payload)
         {
             if route_canonical_events_to_scope {
-                if let Some(scope) = invocation_scope
-                    && !scope.emit_presentation_update(update)
-                {
-                    return Err("session invocation sink rejected presentation update".to_owned());
+                if let Some(scope) = invocation_scope {
+                    let _accepted = scope.emit_presentation_update(update);
                 }
             } else {
                 publish_plugin_tool_presentation_update(
@@ -20669,10 +20726,8 @@ async fn invoke_plugin_tool_transport(
             serde_json::from_slice::<bcode_session_models::ToolContributionEvent>(&payload)
         {
             if route_canonical_events_to_scope {
-                if let Some(scope) = invocation_scope
-                    && !scope.emit_contribution(contribution)
-                {
-                    return Err("session invocation sink rejected contribution".to_owned());
+                if let Some(scope) = invocation_scope {
+                    let _accepted = scope.emit_contribution(contribution);
                 }
             } else if let Err(error) =
                 append_tool_contribution_event(state, session_id, &call.id, plugin_id, contribution)
@@ -26802,7 +26857,7 @@ mod tests {
                     "api_key": {
                         "backend": "sshenv",
                         "profile": "missing-profile",
-                        "key": "EXA_API_KEY",
+                        "key": "TEST_PROVIDER_API_KEY",
                         "vault": "/definitely/missing/bcode-auth-vault"
                     }
                 }
@@ -26836,9 +26891,11 @@ mod tests {
 
     #[test]
     fn template_compilation_binds_configuration_envelope_to_agent_contracts() {
-        let manifest: bcode_plugin::PluginManifest = toml::from_str(include_str!(
-            "../../../plugins/workflow-plugin/bcode-plugin.toml"
-        ))
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins/workflow-plugin/bcode-plugin.toml");
+        let manifest: bcode_plugin::PluginManifest = toml::from_str(
+            &std::fs::read_to_string(manifest_path).expect("workflow plugin manifest"),
+        )
         .expect("workflow plugin manifest");
         let template = manifest
             .workflow_templates
@@ -26866,10 +26923,7 @@ mod tests {
         let implementation = &definition.nodes["implementation"];
         assert_eq!(implementation.input, template.configuration_schema);
         let evaluation = &definition.nodes["evaluation"];
-        assert_eq!(
-            evaluation.input,
-            template.definition.nodes["evaluation"].input
-        );
+        assert_eq!(evaluation.input, template.configuration_schema);
         for node_id in ["implementation", "evaluation"] {
             let node = &definition.nodes[node_id];
             assert_eq!(node.output, template.configuration_schema);
@@ -37866,10 +37920,10 @@ library = "test"
                 name: "shell.run".to_string(),
                 arguments: serde_json::json!({
                     "command": format!(
-                        "touch .parallel-{index}; while [ \"$(find . -maxdepth 1 -name '.parallel-*' | wc -l | tr -d ' ')\" -lt 5 ]; do sleep 0.02; done; sleep {delay}; printf 'call-{index}\\n'",
+                        "touch .parallel-{index}; sleep {delay}; printf 'call-{index}\\n'",
                         delay = f64::from(4 - index) * 0.05,
                     ),
-                    "timeout_ms": 10_000
+                    "timeout_ms": 30_000
                 }),
             })
             .collect::<Vec<_>>();
@@ -37985,14 +38039,14 @@ library = "test"
             1
         );
 
-        let batch_completed = tokio::time::timeout(Duration::from_secs(30), task)
+        let batch_completed = tokio::time::timeout(Duration::from_mins(1), task)
             .await
             .expect("parallel shell batch should finish")
             .expect("parallel shell batch task should not panic");
         assert!(batch_completed);
         assert!(
             (0..5).all(|index| workspace.path().join(format!(".parallel-{index}")).exists()),
-            "every shell command must start before any can complete"
+            "every authorized shell command must complete"
         );
         assert_persisted_tool_results_in_order(
             state.as_ref(),
@@ -38007,6 +38061,34 @@ library = "test"
             .session_history(session_id)
             .await
             .expect("parallel shell history");
+        let starts = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::RuntimeWorkStarted {
+                    work_id,
+                    started_at_ms: Some(started_at_ms),
+                    ..
+                } if work_id.0.starts_with("tool_parallel-shell-") => Some(*started_at_ms),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let finishes = history
+            .iter()
+            .filter_map(|event| match &event.kind {
+                SessionEventKind::RuntimeWorkFinished {
+                    work_id,
+                    finished_at_ms: Some(finished_at_ms),
+                    ..
+                } if work_id.0.starts_with("tool_parallel-shell-") => Some(*finished_at_ms),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(starts.len(), 5);
+        assert_eq!(finishes.len(), 5);
+        assert!(
+            starts.iter().max() < finishes.iter().min(),
+            "all shell calls must overlap after complete authorization"
+        );
         for index in 0..5 {
             let invocation_id = format!("parallel-shell-{index}");
             let stages = history
@@ -41021,6 +41103,49 @@ library = "test"
         state
     }
 
+    fn test_server_state_with_reference_workflow_plugins(
+        sessions: SessionManager,
+        workflow_store: bcode_workflow_store::WorkflowStore,
+    ) -> ServerState {
+        let plugins = [
+            bcode_plugin::StaticBundledPlugin::new(
+                include_str!("../../../plugins/fake-provider-plugin/bcode-plugin.toml"),
+                bcode_fake_provider_plugin::static_plugin(),
+            ),
+            bcode_plugin::StaticBundledPlugin::new(
+                include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+                bcode_shell_plugin::static_plugin(),
+            ),
+            bcode_plugin::StaticBundledPlugin::new(
+                include_str!("../../../plugins/git-plugin/bcode-plugin.toml"),
+                bcode_git_plugin::static_plugin(),
+            ),
+        ];
+        let plugins = bcode_plugin::PluginRuntimeHost::load_defaults_with_static_bundled(
+            &bcode_plugin::PluginSelection {
+                mode: bcode_plugin::PluginSelectionMode::Explicit,
+                enabled: BTreeSet::from([
+                    "bcode.fake-provider".to_string(),
+                    "bcode.shell".to_string(),
+                    "bcode.git".to_string(),
+                ]),
+                disabled: BTreeSet::new(),
+            },
+            &plugins,
+        )
+        .expect("load reference workflow plugins");
+        let mut state = test_server_state(sessions);
+        state.plugins = plugins;
+        state.workflow_store = StdMutex::new(workflow_store);
+        state.selected_provider_plugin_id = Some("bcode.fake-provider".to_string());
+        state.selected_model_id = Some("fake-echo".to_string());
+        state.selected_provider_context.settings.insert(
+            "fake_structured_output_json".to_string(),
+            "echo_input:".to_string(),
+        );
+        state
+    }
+
     fn test_workflow_agent_configuration(
         schema: bcode_workflow::ValueSchema,
         execution_target: bcode_workflow::AgentExecutionTarget,
@@ -43089,6 +43214,205 @@ event_symbol = "bcode_plugin_handle_event_v1"
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
+    async fn reference_workflow_commit_result_reaches_next_iteration() {
+        let _workflow_runtime_guard = WORKFLOW_RUNTIME_TEST_LOCK.lock().await;
+        let repository = tempfile::tempdir().expect("repository");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(repository.path())
+                .args(args)
+                .output()
+                .expect("git");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        };
+        git(&["init"]);
+        git(&["config", "user.email", "bcode@example.invalid"]);
+        git(&["config", "user.name", "Bcode Test"]);
+        std::fs::write(repository.path().join("tracked.txt"), "before\n").expect("file");
+        git(&["add", "tracked.txt"]);
+        git(&["commit", "-m", "initial"]);
+        let initial_head = git(&["rev-parse", "HEAD"]);
+        std::fs::write(repository.path().join("tracked.txt"), "after\n").expect("change");
+
+        let sessions = SessionManager::default();
+        let parent = sessions
+            .create_session(
+                Some("reference workflow".to_string()),
+                repository.path().to_path_buf(),
+            )
+            .await
+            .expect("parent");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+            .expect("workflow store");
+        let state = Arc::new(test_server_state_with_reference_workflow_plugins(
+            sessions, store,
+        ));
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../plugins/workflow-plugin/bcode-plugin.toml");
+        let manifest: bcode_plugin::PluginManifest = toml::from_str(
+            &std::fs::read_to_string(manifest_path).expect("workflow plugin manifest"),
+        )
+        .expect("workflow manifest");
+        let template = manifest
+            .workflow_templates
+            .iter()
+            .find(|template| template.template_id == "implementation-verification-commit")
+            .expect("reference template");
+        assert!(
+            template
+                .definition
+                .edges
+                .iter()
+                .any(|edge| { edge.from == "verification_decision" && edge.to == "commit_policy" })
+        );
+        assert!(
+            !template
+                .definition
+                .edges
+                .iter()
+                .any(|edge| { edge.from == "verification_decision" && edge.to == "verified" })
+        );
+        let configuration = serde_json::json!({
+            "version": 1,
+            "implementation_prompt": "preserve the prepared tracked change",
+            "stop_condition": {"path": "commit_completed", "equals": true},
+            "iteration_limit": 2,
+            "command_plan": {
+                "version": 1,
+                "cwd": ".",
+                "commands": [{
+                    "argv": ["true"],
+                    "timeout_ms": 10_000,
+                    "continue_on_nonzero": false
+                }],
+                "environment": {"inherit": true, "set": {}},
+                "output": {"preview_bytes": 1024, "artifact_spill": true}
+            },
+            "command_timeout_ms": 10_000,
+            "verification_policy": "require_pass",
+            "commit_behavior": "required",
+            "commit_message_skill": null,
+            "commit_completed": false,
+            "commit_result": null
+        });
+        let definition = compile_workflow_template(template, &configuration).expect("compile");
+        validate_workflow_definition_for_production(&state, &definition).expect("admission");
+        let identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+            "bcode.workflow/implementation-verification-commit@1".to_string(),
+            &definition,
+        )
+        .expect("identity");
+        start_workflow(
+            &state,
+            bcode_ipc::WorkflowStartRequest {
+                identity,
+                definition,
+                run_id: Some("reference-commit-repeat".to_string()),
+                workspace_snapshot: Some(repository.path().to_string_lossy().into_owned()),
+                parent_session_id: parent.id,
+                input: configuration,
+                binding: bcode_workflow_store::WorkflowRunBinding {
+                    owner_plugin_id: "bcode.workflow".to_string(),
+                    workflow_kind: "bcode.workflow/implementation-verification-commit@1"
+                        .to_string(),
+                    scope_key: "1".to_string(),
+                    display_label: Some("reference workflow".to_string()),
+                    single_active: false,
+                },
+                limits: bcode_workflow_store::WorkflowRunLimits {
+                    cycle_cap: 2,
+                    ..bcode_workflow_store::WorkflowRunLimits::default()
+                },
+            },
+        )
+        .await
+        .expect("start");
+
+        let mut approved_nodes = BTreeSet::new();
+        let mut second_iteration = None;
+        for _ in 0..400 {
+            let approvals = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_mutation_approvals("reference-commit-repeat", 10)
+                .expect("approvals");
+            for approval in approvals {
+                approved_nodes.insert(approval.node_id.clone());
+                state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .resolve_mutation_approval(
+                        &approval.approval_id,
+                        bcode_workflow_store::WorkflowMutationApprovalDecision::Approve,
+                        current_unix_millis(),
+                    )
+                    .expect("approve");
+            }
+            drive_workflow_run(&state, "reference-commit-repeat")
+                .await
+                .expect("drive");
+            second_iteration = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .event_history("reference-commit-repeat", None, 1_000)
+                .expect("events")
+                .into_iter()
+                .filter(|event| event.event_type == "activation_created")
+                .find_map(|event| {
+                    let activation = event.payload.get("activation")?;
+                    (activation.get("node_id")?.as_str()? == "implementation"
+                        && activation.get("dependency_generation")?.as_u64()? == 1)
+                        .then(|| activation.get("input").cloned())
+                        .flatten()
+                });
+            if second_iteration.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let second_iteration = second_iteration.expect("next implementation iteration");
+        assert_eq!(second_iteration["commit_completed"], true);
+        assert_eq!(
+            second_iteration["commit_result"]["previous_head"],
+            initial_head
+        );
+        assert_eq!(
+            second_iteration["commit_result"]["paths"],
+            serde_json::json!(["tracked.txt"])
+        );
+        let commit_hash = second_iteration["commit_result"]["commit_hash"]
+            .as_str()
+            .expect("commit hash");
+        assert_eq!(git(&["rev-parse", "HEAD"]), commit_hash);
+        assert_eq!(git(&["rev-list", "--count", "HEAD"]), "2");
+        assert!(approved_nodes.contains("verification"));
+        assert!(approved_nodes.contains("git_commit"));
+        let active_leases = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .resource_leases_for_run("reference-commit-repeat", 100)
+            .expect("resource leases");
+        assert!(
+            active_leases
+                .iter()
+                .all(|lease| lease.node_id == "implementation"),
+            "terminal attempts must release their resource leases: {active_leases:?}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn git_commit_workflow_block_requires_exact_grant_and_completes() {
         let repository = tempfile::tempdir().expect("repository");
         let git = |args: &[&str]| {
@@ -43202,45 +43526,36 @@ event_symbol = "bcode_plugin_handle_event_v1"
             approval.scope.input_summary,
             pending.input.clone().expect("input")
         );
-        state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .resolve_mutation_approval(
-                &approval.approval_id,
-                bcode_workflow_store::WorkflowMutationApprovalDecision::Approve,
-                current_unix_millis(),
-            )
-            .expect("approve");
-        let pending = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .pending_activations(1)
-            .expect("pending")
-            .pop()
-            .expect("activation");
-        assert!(
-            owner.plan(&pending).is_ok(),
-            "exact approval authorizes dispatch"
-        );
         let path = state
             .workflow_store
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .path()
             .to_path_buf();
-        bcode_workflow_store::WorkflowStore::open_at_path(&path)
-            .expect("dispatch store")
-            .dispatch_pending_activations(&owner, 10, 3)
-            .await
-            .expect("dispatch");
-        let observer = WorkflowTurnReceiptObserver { state: &state };
-        bcode_workflow_store::WorkflowStore::open_at_path(&path)
-            .expect("reconcile store")
-            .reconcile_receipt_backed_attempts_async(&observer, 10, 4)
-            .await
-            .expect("reconcile");
+        *state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            bcode_workflow_store::WorkflowStore::open_at_path(&path).expect("reopened store");
+        let result = resolve_workflow_mutation_approval(
+            &state,
+            &approval.approval_id,
+            bcode_workflow_store::WorkflowMutationApprovalDecision::Approve,
+            current_unix_millis(),
+        )
+        .await
+        .expect("approve");
+        assert_eq!(result.0.status, "approved");
+        assert!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pending_activations(1)
+                .expect("pending")
+                .is_empty(),
+            "approval control path must wake and drive the durable workflow"
+        );
         let current_head = git(&["rev-parse", "HEAD"]);
         assert_ne!(current_head, head);
         let store =

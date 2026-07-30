@@ -5027,7 +5027,7 @@ library = "libcommands.dylib"
                         display_name: "API key".to_owned(),
                         fields: vec![bcode_provider_auth_models::AuthSecretField {
                             credential_id: "api_key".to_owned(),
-                            storage_key: "EXA_API_KEY".to_owned(),
+                            storage_key: "TEST_PROVIDER_API_KEY".to_owned(),
                             prompt: "Exa API key".to_owned(),
                             optional: false,
                             validation: bcode_provider_auth_models::AuthSecretValidation::default(),

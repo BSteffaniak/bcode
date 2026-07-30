@@ -695,7 +695,7 @@ mod tests {
                         "api_key".to_owned(),
                         bcode_config::AuthCredentialMapping {
                             env: None,
-                            key: Some("EXA_API_KEY".to_owned()),
+                            key: Some("TEST_PROVIDER_API_KEY".to_owned()),
                         },
                     )]),
                 },
@@ -719,7 +719,7 @@ mod tests {
                 .map
                 .get("api_key")
                 .and_then(|mapping| mapping.key.as_deref()),
-            Some("EXA_API_KEY")
+            Some("TEST_PROVIDER_API_KEY")
         );
     }
 

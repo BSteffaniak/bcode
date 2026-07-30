@@ -405,7 +405,7 @@ mod tests {
             display_name: "API key".to_owned(),
             fields: vec![AuthSecretField {
                 credential_id: "api_key".to_owned(),
-                storage_key: "EXA_API_KEY".to_owned(),
+                storage_key: "TEST_PROVIDER_API_KEY".to_owned(),
                 prompt: "Exa API key".to_owned(),
                 optional: false,
                 validation: AuthSecretValidation::default(),
@@ -474,7 +474,7 @@ mod tests {
             .get_profile("exa")
             .expect("read raw")
             .expect("profile");
-        assert!(!raw.contains_key("EXA_API_KEY"));
+        assert!(!raw.contains_key("TEST_PROVIDER_API_KEY"));
         assert_eq!(
             raw.get("UNRELATED").map(|value| value.as_str()),
             Some("keep")

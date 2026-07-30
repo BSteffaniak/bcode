@@ -919,20 +919,96 @@ mod tests {
             ready["request"]
         );
         let commit_result = &template.definition.nodes["commit_result"];
-        assert_eq!(commit_result.kind, bcode_workflow::NodeKind::Input);
-        assert_eq!(commit_result.input, git_commit_block.output);
-        assert_eq!(commit_result.output, git_commit_block.output);
-        assert!(template.definition.edges.iter().any(|edge| {
-            edge.from == "git_commit"
-                && edge.to == "commit_result"
-                && edge.kind == bcode_workflow::EdgeKind::Direct
-        }));
-        assert!(
-            template
-                .definition
-                .exits
-                .contains(&"commit_result".to_string())
+        assert_eq!(commit_result.kind, bcode_workflow::NodeKind::Repeat);
+        assert_eq!(
+            commit_result.input.type_name,
+            template.configuration_schema.type_name
         );
+        assert_eq!(
+            commit_result.output.type_name,
+            template.configuration_schema.type_name
+        );
+        let commit_result_edge = template
+            .definition
+            .edges
+            .iter()
+            .find(|edge| edge.from == "git_commit" && edge.to == "commit_result")
+            .expect("commit result merge edge");
+        assert_eq!(commit_result_edge.kind, bcode_workflow::EdgeKind::Direct);
+        let commit_result_transform = commit_result_edge
+            .transform
+            .as_ref()
+            .expect("commit result state merge");
+        let state = serde_json::json!({
+            "version": 1,
+            "implementation_prompt": "implement",
+            "stop_condition": {"path": "condition_met", "equals": true},
+            "iteration_limit": 2,
+            "command_plan": {
+                "version": 1,
+                "cwd": ".",
+                "commands": [{
+                    "argv": ["true"],
+                    "timeout_ms": 1000,
+                    "continue_on_nonzero": false
+                }],
+                "environment": {"inherit": true, "set": {}},
+                "output": {"preview_bytes": 1024, "artifact_spill": true}
+            },
+            "command_timeout_ms": 1000,
+            "verification_policy": "require_pass",
+            "commit_behavior": "required",
+            "commit_message_skill": null,
+            "commit_completed": false,
+            "commit_result": null
+        });
+        let committed = serde_json::json!({
+            "previous_head": "abc",
+            "commit_hash": "def",
+            "paths": ["src/lib.rs"]
+        });
+        let merged = commit_result_transform
+            .evaluate(&[
+                bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                    value: &committed,
+                },
+                bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_STATE,
+                    value: &state,
+                },
+            ])
+            .expect("commit result merge");
+        assert_eq!(merged["commit_completed"], true);
+        assert_eq!(merged["commit_result"], committed);
+        assert!(template.definition.edges.iter().any(|edge| {
+            edge.from == "commit_result"
+                && edge.to == "implementation"
+                && matches!(edge.kind, bcode_workflow::EdgeKind::Back { .. })
+        }));
+        let repeat_edge = template
+            .definition
+            .edges
+            .iter()
+            .find(|edge| edge.from == "commit_result" && edge.to == "implementation")
+            .expect("commit repeat edge");
+        let repeated = repeat_edge
+            .transform
+            .as_ref()
+            .expect("commit repeat state projection")
+            .evaluate(&[
+                bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                    value: &merged,
+                },
+                bcode_workflow::WorkflowTransformInput {
+                    name: bcode_workflow::WORKFLOW_TRANSFORM_SOURCE_STATE,
+                    value: &state,
+                },
+            ])
+            .expect("next iteration state");
+        assert_eq!(repeated["commit_completed"], true);
+        assert_eq!(repeated["commit_result"], committed);
         let repeat = &template.definition.nodes["verification_repeat"];
         assert_eq!(repeat.kind, bcode_workflow::NodeKind::Repeat);
         assert_eq!(repeat.configuration["max_iterations"], 100);
@@ -979,7 +1055,6 @@ mod tests {
                 .cloned()
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([
-                "commit_result".to_string(),
                 "commit_disabled_repeat".to_string(),
                 "no_changes".to_string(),
                 "verification_repeat".to_string(),

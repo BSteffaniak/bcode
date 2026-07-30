@@ -1991,21 +1991,22 @@ impl WorkflowStore {
         }
     }
 
-    /// Load the request timestamp for one exact mutation approval without mutating it.
+    /// Load the owning run and request timestamp for one exact mutation approval without mutating it.
     ///
     /// # Errors
     ///
     /// Returns an error for malformed identity or database failure.
-    pub fn mutation_approval_requested_at(
+    pub fn mutation_approval_context(
         &self,
         approval_id: &str,
-    ) -> Result<Option<u64>, WorkflowStoreError> {
+    ) -> Result<Option<(String, u64)>, WorkflowStoreError> {
         validate_id("approval_id", approval_id)?;
         self.connection
             .query_row(
-                "SELECT requested_at_ms FROM workflow_mutation_approvals WHERE approval_id = ?1",
+                "SELECT run_id, requested_at_ms FROM workflow_mutation_approvals \
+                 WHERE approval_id = ?1",
                 [approval_id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
             .map_err(WorkflowStoreError::from)
@@ -2325,7 +2326,14 @@ impl WorkflowStore {
             };
             let existing = resource_lease(&transaction, &lease.lease_id)?;
             if let Some((existing, released_at_ms)) = existing {
-                if existing == lease && released_at_ms.is_none() {
+                if released_at_ms.is_none()
+                    && existing.run_id == lease.run_id
+                    && existing.node_id == lease.node_id
+                    && existing.activation_id == lease.activation_id
+                    && existing.resource_key == lease.resource_key
+                    && existing.mode == lease.mode
+                    && existing.expires_at_ms == lease.expires_at_ms
+                {
                     continue;
                 }
                 return Err(WorkflowStoreError::InvalidData(format!(
@@ -5628,6 +5636,34 @@ fn apply_attempt_observation(
     reconciled_at_ms: u64,
     summary: &mut ReceiptReconciliationSummary,
 ) -> Result<(), WorkflowStoreError> {
+    let current_status: String = transaction.query_row(
+        "SELECT status FROM workflow_attempts WHERE dispatch_identity = ?1",
+        [&request.dispatch_identity],
+        |row| row.get(0),
+    )?;
+    if matches!(
+        current_status.as_str(),
+        "succeeded" | "failed" | "paused" | "cancelled" | "repair_required"
+    ) {
+        let compatible = matches!(
+            observation,
+            AttemptObservation::Admitted | AttemptObservation::Running
+        ) || matches!(
+            (current_status.as_str(), &observation),
+            ("succeeded", AttemptObservation::Succeeded { .. })
+                | ("failed", AttemptObservation::Failed { .. })
+                | ("paused", AttemptObservation::Paused { .. })
+                | ("cancelled", AttemptObservation::Cancelled)
+                | ("repair_required", AttemptObservation::Unknown)
+        );
+        if compatible {
+            return Ok(());
+        }
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "terminal workflow attempt observation conflicts with persisted status: {} is {}",
+            request.dispatch_identity, current_status
+        )));
+    }
     if cancellation_requested_for_run(transaction, &request.run_id)?
         || sibling_cancellation_requested_for_attempt(transaction, &request.dispatch_identity)?
     {
@@ -5814,6 +5850,13 @@ fn transition_attempt(
             "attempt cannot transition during reconciliation: {}",
             request.dispatch_identity
         )));
+    }
+    if terminal_at_ms.is_some() {
+        transaction.execute(
+            "UPDATE workflow_resource_leases SET released_at_ms = ?2 \
+             WHERE run_id = ?1 AND activation_id = ?3 AND released_at_ms IS NULL",
+            (&request.run_id, terminal_at_ms, &request.activation_id),
+        )?;
     }
     Ok(())
 }

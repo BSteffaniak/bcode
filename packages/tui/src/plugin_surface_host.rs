@@ -572,6 +572,11 @@ mod tests {
         use bmux_tui::terminal::Terminal;
 
         let socket_dir = tempfile::tempdir().expect("socket dir");
+        let state_dir = tempfile::tempdir().expect("state dir");
+        let previous_state_dir = std::env::var_os("BCODE_STATE_DIR");
+        unsafe {
+            std::env::set_var("BCODE_STATE_DIR", state_dir.path());
+        }
         let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
         let server_endpoint = endpoint.clone();
         let plugin = bcode_plugin::StaticBundledPlugin::new(
@@ -675,6 +680,13 @@ mod tests {
         );
         client.server_stop().await.expect("stop server");
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server).await;
+        unsafe {
+            if let Some(previous) = previous_state_dir {
+                std::env::set_var("BCODE_STATE_DIR", previous);
+            } else {
+                std::env::remove_var("BCODE_STATE_DIR");
+            }
+        }
     }
 
     #[test]
