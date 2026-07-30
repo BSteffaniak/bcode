@@ -1893,6 +1893,59 @@ impl WorkflowEffectSummary {
     }
 }
 
+/// Severity of one portable workflow-authoring validation diagnostic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowValidationSeverity {
+    /// Publication or compilation cannot proceed.
+    Error,
+    /// Valid source has a non-blocking compatibility or availability concern.
+    Warning,
+}
+
+/// One renderer-neutral source-addressed authoring diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowValidationDiagnostic {
+    /// Stable machine-readable diagnostic code.
+    pub code: String,
+    /// Diagnostic severity.
+    pub severity: WorkflowValidationSeverity,
+    /// Dotted source-document path associated with the diagnostic.
+    pub document_path: String,
+    /// Bounded human-readable explanation.
+    pub message: String,
+    /// Bounded producer-neutral remediation guidance.
+    pub remediation: String,
+}
+
+/// Side-effect-free validation result for one portable authoring document.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowValidationReport {
+    /// Authoring contract version validated by this report.
+    pub authoring_version: u32,
+    /// Whether no error-severity diagnostics were produced.
+    pub valid: bool,
+    /// Canonical complete-source digest when validation succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_digest_sha256: Option<String>,
+    /// Canonical executable-source digest when validation succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_source_digest_sha256: Option<String>,
+    /// Stable diagnostics in deterministic order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<WorkflowValidationDiagnostic>,
+}
+
+impl WorkflowValidationReport {
+    /// Return whether publication may continue to catalog resolution and compilation.
+    #[must_use]
+    pub const fn is_valid(&self) -> bool {
+        self.valid
+    }
+}
+
 /// Portable source contract for one runtime-authored workflow.
 ///
 /// The embedded [`WorkflowDefinition`] is the single declarative graph model. Publication may apply
@@ -1931,6 +1984,46 @@ pub struct WorkflowAuthoringDocument {
 }
 
 impl WorkflowAuthoringDocument {
+    /// Return a structured, source-addressed validation report without external side effects.
+    #[must_use]
+    pub fn validation_report(&self) -> WorkflowValidationReport {
+        match self.validate() {
+            Ok(()) => WorkflowValidationReport {
+                authoring_version: self.schema_version,
+                valid: true,
+                source_digest_sha256: self.source_digest_sha256().ok(),
+                executable_source_digest_sha256: self.executable_source_digest_sha256().ok(),
+                diagnostics: Vec::new(),
+            },
+            Err(WorkflowError::Build { path, message }) => WorkflowValidationReport {
+                authoring_version: self.schema_version,
+                valid: false,
+                source_digest_sha256: None,
+                executable_source_digest_sha256: None,
+                diagnostics: vec![WorkflowValidationDiagnostic {
+                    code: authoring_diagnostic_code(&message).to_string(),
+                    severity: WorkflowValidationSeverity::Error,
+                    document_path: path,
+                    remediation: authoring_remediation(&message).to_string(),
+                    message,
+                }],
+            },
+            Err(error) => WorkflowValidationReport {
+                authoring_version: self.schema_version,
+                valid: false,
+                source_digest_sha256: None,
+                executable_source_digest_sha256: None,
+                diagnostics: vec![WorkflowValidationDiagnostic {
+                    code: "invalid_authoring_document".to_string(),
+                    severity: WorkflowValidationSeverity::Error,
+                    document_path: "workflow".to_string(),
+                    remediation: "Correct the source document and validate it again.".to_string(),
+                    message: error.to_string(),
+                }],
+            },
+        }
+    }
+
     /// Validate this portable authoring source without persistence or external side effects.
     ///
     /// # Errors
@@ -2148,6 +2241,40 @@ impl WorkflowAuthoringDocument {
     pub fn base_definition_identity(&self) -> Result<WorkflowDefinitionIdentity, WorkflowError> {
         self.validate()?;
         WorkflowDefinitionIdentity::for_definition(self.workflow_id.clone(), &self.definition)
+    }
+}
+
+fn authoring_diagnostic_code(message: &str) -> &'static str {
+    if message.contains("unsupported") && message.contains("version") {
+        "unsupported_version"
+    } else if message.contains("schema") || message.contains("Schema") {
+        "invalid_schema"
+    } else if message.contains("unknown") || message.contains("missing") {
+        "unknown_reference"
+    } else if message.contains("cycle") || message.contains("iteration") {
+        "invalid_control_flow"
+    } else if message.contains("exceed") || message.contains("too large") {
+        "authoring_bound_exceeded"
+    } else if message.contains("identity") || message.contains("name") {
+        "invalid_identity"
+    } else {
+        "invalid_authoring_document"
+    }
+}
+
+fn authoring_remediation(message: &str) -> &'static str {
+    if message.contains("unsupported") && message.contains("version") {
+        "Use a schema and contract version supported by the current workflow catalog."
+    } else if message.contains("schema") || message.contains("Schema") {
+        "Correct the declared schema or value so every workflow boundary is type compatible."
+    } else if message.contains("unknown") || message.contains("missing") {
+        "Reference an existing node, edge, schema target, or catalog contract."
+    } else if message.contains("cycle") || message.contains("iteration") {
+        "Use an explicit bounded back edge for cyclic control flow."
+    } else if message.contains("exceed") || message.contains("too large") {
+        "Reduce the document to the documented authoring bounds."
+    } else {
+        "Correct the source document at the reported path and validate it again."
     }
 }
 
@@ -6324,6 +6451,36 @@ mod tests {
         round_trip(&document.requirements);
         round_trip(&effect_summary);
         round_trip(&document);
+    }
+
+    #[test]
+    fn authoring_validation_report_is_structured_source_addressed_and_bounded() {
+        let valid = authored_document().validation_report();
+        assert!(valid.is_valid());
+        assert!(valid.source_digest_sha256.is_some());
+        assert!(valid.executable_source_digest_sha256.is_some());
+        assert!(valid.diagnostics.is_empty());
+        round_trip(&valid);
+
+        let mut invalid = authored_document();
+        invalid.bindings[0].target = WorkflowConfigurationTarget::NodeConfiguration {
+            node_id: "missing".to_string(),
+            path: "prompt".to_string(),
+        };
+        let report = invalid.validation_report();
+        assert!(!report.is_valid());
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(
+            report.diagnostics[0].severity,
+            WorkflowValidationSeverity::Error
+        );
+        assert_eq!(report.diagnostics[0].code, "unknown_reference");
+        assert_eq!(
+            report.diagnostics[0].document_path,
+            "bindings.target.node_id"
+        );
+        assert!(!report.diagnostics[0].remediation.is_empty());
+        round_trip(&report);
     }
 
     #[test]
