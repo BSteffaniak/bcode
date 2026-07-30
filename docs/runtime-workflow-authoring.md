@@ -165,7 +165,11 @@ documents never carry trusted grants. Presentation metadata and producer labels 
 Saved presets bind an exact revision and carry their own optimistic generation. They may hold bounded,
 validated non-secret configuration and permitted limit/workspace policy. Secrets remain approved
 references resolved for a request; inline secret material is not made durable implicitly. Starting a
-preset records the exact preset generation, revision, final configuration, and compiled definition.
+preset requires its exact generation and records the preset identity/generation, revision, final
+configuration, and compiled definition in the public start result. Exact-revision and active-revision
+starts use the same centralized resolver. Every start rechecks current catalog/production admission,
+requires the configured definition identity to equal the immutable published identity, then delegates
+to existing durable run admission and runtime scheduling.
 
 Validation, preview, and publication compilation accept a bounded server-side deadline and a stable
 caller operation identity. The daemon executes bounded pure computation away from the async request
@@ -176,6 +180,11 @@ so cancellation cannot leave a partial revision or active pointer. Client transp
 a separate observation deadline and cannot imply durable cancellation; callers that need explicit
 server cancellation use the operation identity.
 
+The IPC request loop treats validation diagnostics, unsupported future source, optimistic conflicts,
+invalid computation controls, and publication conflicts as request-scoped outcomes. Focused real
+connection tests send successful requests after each class of failure, proving these outcomes neither
+poison nor close the local application connection.
+
 ## Import and export
 
 Export uses a canonical versioned bundle containing an exact authored revision, schemas, bindings,
@@ -184,10 +193,21 @@ provider-private metadata, runtime receipts, attempts, artifact contents, and re
 Export is a read-only bounded operation.
 
 Import preview is side-effect free and runs the normal version, bounds, normalization, catalog,
-validation, compilation, and production-admission pipeline. Import mutation requires an explicit
-collision policy and applicable authorization. It either creates a new logical workflow or publishes
-a new revision of an explicitly selected workflow; it never silently merges identities or rewrites an
-existing revision.
+validation, compilation, and production-admission pipeline. Import requests carry an explicit
+collision policy: new-workflow import requires `require_new_workflow`, while existing-workflow draft
+import requires `require_existing_workflow_new_draft`. A mismatched policy fails before mutation.
+New-workflow import requires an explicit absent target identity; existing-workflow import requires an
+explicit new draft identity and never rewrites revisions or active pointers. Semantic round-trip tests
+export an immutable revision, preview it under a new logical identity, and prove the imported
+executable projection changes only that explicitly selected identity. Imported provenance is
+normalized to untrusted generated content and records the exact source revision.
+
+Existing-workflow import is a distinct versioned operation from new-workflow import. It requires an
+explicit target logical workflow and new draft identity, normalizes source provenance to untrusted
+generated content, validates and compiles through the standard import-preview pipeline, authorizes
+`ImportDraft` before mutation, and creates only a generation-1 mutable draft. A draft identity
+collision returns a typed `DraftAlreadyExists` outcome and never overwrites or treats an existing
+draft as an idempotent success. Existing revisions and the active pointer are unchanged.
 
 Every public and persisted authoring form has an explicit schema version. Unsupported future versions,
 unknown required variants, dialects, binding operations, or capability versions are rejected or
@@ -195,10 +215,59 @@ surfaced as incompatible; they are never guessed to mean an older form. Unknown 
 namespaces may be preserved or ignored only because they are explicitly non-semantic. An export bundle
 retains its declared version and cannot be relabeled during import.
 
+## Producer workflows for AI and UI clients
+
+All producers submit the same `WorkflowAuthoringDocument`; producer provenance is diagnostic and
+never changes compilation or authorization. SDK, plugin, CLI, frontend, and generated producers use
+the same lifecycle:
+
+1. Read the bounded authoring catalog and construct a version-current document from its normalized
+   node, block, agent, skill, schema, binding, and capability contracts.
+2. Call validation and compilation preview without mutation. Treat each structured diagnostic code,
+   document path, message, and remediation as data; an AI repair loop edits only the addressed source
+   and repeats until the report is valid, while a UI maps document paths to form or graph controls.
+3. Create or optimistically update a draft using its exact generation. On conflict, fetch the current
+   draft and require an explicit user/producer merge rather than silently overwriting it.
+4. Publish an exact validated generation, optionally compare-and-set the active revision, then use
+   immutable revision inspection to display current requirement availability separately from
+   publication facts.
+5. Start an exact revision, active revision, or exact preset generation through the daemon boundary;
+   renderer state and producer labels never affect authorization or dispatch.
+
+Generated and plugin producers remain untrusted even when they reproduce byte-equivalent executable
+semantics from an SDK document. They cannot carry grants, bypass application authorization, or turn
+provenance into actor identity.
+
 ## Persistence, reads, and maintenance
 
+Authored lifecycle observability uses bounded dimensions only. Validation and compilation record
+valid/invalid or compiled/rejected outcomes; publication records published/conflict; conflict counts
+use a fixed operation vocabulary; import preview records accepted/rejected; and start resolution
+records only the selection kind (`revision`, `active`, or `preset`). Metrics never label workflow,
+draft, revision, preset, document, schema, prompt, secret, producer, or generated-content values.
+
+Authored workflow inspection is one bounded, non-mutating aggregate query over indexed canonical rows.
+Its public contract deliberately uses content-minimized draft, revision, and preset summaries plus
+normalized publication-event fields. It omits authoring documents, schemas, node configuration,
+preset configuration, prompts, secret material, generated prose, producer payloads, and arbitrary
+event JSON. The architecture check mechanically requires these portable summary types and rejects
+content-bearing or persistence-owned aggregate diagnostics.
+
+It returns logical metadata and active pointer, bounded drafts, immutable revisions, presets,
+publication events, and normalized consistency issues. The diagnostic query can surface invalid
+active pointers, missing compiled definitions, orphaned presets, and drafts whose base revision is
+missing; it never repairs, replays, rewrites, or treats derived availability as canonical state.
+Generation conflicts remain typed mutation outcomes and are not inferred by read paths.
+
 Canonical authoring state lives beside durable execution state in
-`<state-dir>/workflows/workflow.db`. Normal create/update/publish transactions may mutate only after
+`<state-dir>/workflows/workflow.db`. Authored starts atomically record schema-versioned provenance on
+`workflow_runs`: the exact logical workflow, immutable revision, compiled definition identity,
+optional exact preset generation, and resolved validated configuration. This metadata is diagnostic
+only; authorization and dispatch continue to use normalized operation facts and the compiled
+runtime definition. Run creation fails closed when the provenance does not match canonical revision
+or preset rows, and caller-stable run identity retries must match the complete provenance.
+
+Normal create/update/publish transactions may mutate only after
 authorization. Normal get/list/validate/preview/status paths are bounded; read-only paths do not repair,
 reindex, activate, publish, or dispatch work.
 
@@ -229,9 +298,35 @@ values; they are not transport failures and leave the connection usable. Exact d
 and revision-bound preset create/update/delete operations use the same authorization boundary;
 preset updates and deletes retain generation conflict semantics and cannot change revision binding.
 
-Publish-and-start reports publication and run admission as separate outcomes. It may be a convenience
-request, but it cannot collapse their atomic boundaries or make a failed run admission appear to undo
-a completed publication.
+Immutable revision inspection returns publication facts and current requirement availability as
+separate fields. The availability report is a versioned, bounded, renderer-neutral derived value
+containing only normalized missing capability, plugin, block, agent-profile, and skill identities.
+It is recalculated from the current catalog on each bounded inspection and is never persisted into or
+used to rewrite the immutable revision. A host catalog change may therefore degrade the report while
+leaving publication facts byte-for-byte unchanged.
+
+Executable authoring identity is derived from the explicit portable
+`WorkflowExecutableAuthoringSemantics` projection. That projection contains configuration schemas and
+defaults, graph semantics, bindings, requirements, and run limits, while omitting user-facing
+metadata, producer provenance, and presentation payloads by construction. Tests change all omitted
+fields simultaneously and require both the executable digest and complete compiled preview to remain
+identical; the workflow architecture check requires this projection and regression coverage to stay
+present.
+
+Authored starts resolve exact revision, active revision, and exact preset generation through one
+daemon application function. It reads only immutable published revision rows; explicit older
+revisions remain startable while retained, and stale preset generations fail before admission. The
+selected immutable document is recompiled against the current host catalog and resolved
+configuration before authorization and run creation. Configuration-schema failures and unavailable
+required plugins, blocks, agents, skills, capabilities, or schema versions therefore fail closed
+without mutating publication state.
+
+Publish-and-start is one versioned application operation but preserves two durable outcomes. The
+publication result is either a typed optimistic conflict or a committed immutable revision with its
+active pointer result. Only after committed publication does the daemon attempt run admission; that
+second result is returned as either the exact authored-run start response or a structured public
+error. A failed run admission cannot appear to undo publication, and retry-safe caller run identities
+retain the normal complete-provenance conflict checks.
 
 ## Mechanical enforcement
 

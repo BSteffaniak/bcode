@@ -21,8 +21,46 @@ if [[ ! -f docs/runtime-workflow-authoring.md ]] \
   || ! rg -q 'WorkflowApplicationOperationFacts' docs/runtime-workflow-authoring.md \
   || ! rg -q 'Active-run pinning' docs/runtime-workflow-authoring.md \
   || ! rg -q 'Producer-neutral authoring' docs/runtime-workflow-authoring.md \
-  || ! rg -q 'Import and export' docs/runtime-workflow-authoring.md; then
+  || ! rg -q 'Import and export' docs/runtime-workflow-authoring.md \
+  || ! rg -q 'Producer workflows for AI and UI clients' docs/runtime-workflow-authoring.md; then
   echo "Workflow authoring architecture violation: source/compile/run, pinning, producer, and import boundaries must remain documented." >&2
+  violations=1
+fi
+
+if ! rg -q 'pub struct WorkflowExecutableAuthoringSemantics' packages/workflow/src/lib.rs \
+  || ! rg -q 'normalized\.executable_semantics\(\)' packages/workflow/src/lib.rs \
+  || ! rg -q 'authoring_digest_is_stable_and_presentation_is_not_executable_identity' packages/workflow/src/lib.rs \
+  || ! rg -q 'pub struct WorkflowRequirementAvailabilityReport' packages/workflow/src/lib.rs \
+  || ! rg -q 'WorkflowRevisionRequirementInspection' packages/ipc/src/lib.rs \
+  || ! rg -q 'AuthoredWorkflowInspection' packages/ipc/src/lib.rs \
+  || ! rg -q 'workflow_authoring_events' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'diagnose_authored_workflow' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'WorkflowImportCollisionPolicy' packages/ipc/src/lib.rs \
+  || ! rg -q 'export_preview_import_preserves_semantics_and_enforces_collision_policy' packages/server/src/lib.rs \
+  || ! rg -q 'producer_kind_does_not_change_compilation_or_local_authorization' packages/workflow/src/lib.rs \
+  || ! rg -q 'local_application_authorization_ignores_untrusted_producer_kind' packages/server/src/lib.rs; then
+  echo "Workflow authoring derived-state violation: executable identity, producer neutrality, current availability, and AI/UI workflow coverage must remain explicit." >&2
+  violations=1
+fi
+if ! rg -q 'pub struct WorkflowDraftInspectionSummary' packages/ipc/src/lib.rs \
+  || ! rg -q 'pub struct WorkflowRevisionInspectionSummary' packages/ipc/src/lib.rs \
+  || ! rg -q 'pub struct WorkflowPresetInspectionSummary' packages/ipc/src/lib.rs \
+  || rg -n 'pub struct AuthoredWorkflowInspection' -A7 packages/ipc/src/lib.rs \
+      | rg -q 'Workflow(Draft|Revision|Preset)Snapshot|serde_json::Value'; then
+  echo "Workflow diagnostic-data violation: aggregate inspection must use content-minimized summaries without documents, schemas, configuration, secrets, or prose." >&2
+  violations=1
+fi
+if ! rg -q 'record_histogram_with_exact_labels' packages/server/src/lib.rs \
+  || ! rg -q 'add_counter_with_exact_labels' packages/server/src/lib.rs \
+  || ! rg -q 'workflow.authoring.validation.duration_ms' packages/server/src/lib.rs \
+  || ! rg -q 'workflow.authoring.compilation.duration_ms' packages/server/src/lib.rs \
+  || ! rg -q 'workflow.authoring.publication.duration_ms' packages/server/src/lib.rs \
+  || ! rg -q 'workflow.authoring.conflicts_total' packages/server/src/lib.rs \
+  || ! rg -q 'workflow.authoring.import_preview.duration_ms' packages/server/src/lib.rs \
+  || ! rg -q 'workflow.authoring.start_resolution.duration_ms' packages/server/src/lib.rs \
+  || rg -n 'workflow\.authoring\.(validation|compilation|publication|conflicts|import_preview|start_resolution)' packages/server/src/lib.rs \
+      | rg -q '(workflow_id|draft_id|preset_id|document|prompt|schema|secret|message)'; then
+  echo "Workflow observability violation: authored lifecycle metrics and bounded labels must remain present and content-free." >&2
   violations=1
 fi
 

@@ -2051,6 +2051,25 @@ impl BcodeClient {
         }
     }
 
+    /// Publish one exact draft and then attempt separately reported durable run admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the operation before its
+    /// publication outcome can be produced.
+    pub async fn publish_and_start_workflow(
+        &self,
+        request: bcode_ipc::PublishAndStartWorkflowRequest,
+    ) -> Result<bcode_ipc::WorkflowPublishAndStartResult, ClientError> {
+        match self
+            .send_request(Request::PublishAndStartWorkflow(Box::new(request)))
+            .await?
+        {
+            ResponsePayload::WorkflowPublishAndStartResult { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Compare-and-set one immutable revision as active.
     ///
     /// # Errors
@@ -2177,6 +2196,100 @@ impl BcodeClient {
         }
     }
 
+    /// Export one exact immutable authored revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the revision is unavailable.
+    pub async fn export_workflow_revision(
+        &self,
+        request: bcode_ipc::ExportWorkflowRevisionRequest,
+    ) -> Result<bcode_workflow::WorkflowExportBundle, ClientError> {
+        match self
+            .send_request(Request::ExportWorkflowRevision(request))
+            .await?
+        {
+            ResponsePayload::WorkflowRevisionExported { bundle } => Ok(*bundle),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Preview one portable import without mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the bundle is incompatible.
+    pub async fn preview_workflow_import(
+        &self,
+        request: bcode_ipc::PreviewWorkflowImportRequest,
+    ) -> Result<bcode_workflow::WorkflowImportPreview, ClientError> {
+        match self
+            .send_request(Request::PreviewWorkflowImport(request))
+            .await?
+        {
+            ResponsePayload::WorkflowImportPreview { preview } => Ok(*preview),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Import one portable bundle as a new logical workflow and initial draft.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or import is incompatible/unauthorized.
+    pub async fn import_workflow(
+        &self,
+        request: bcode_ipc::ImportWorkflowRequest,
+    ) -> Result<
+        (
+            bcode_ipc::AuthoredWorkflowSnapshot,
+            bcode_ipc::WorkflowDraftSnapshot,
+        ),
+        ClientError,
+    > {
+        match self.send_request(Request::ImportWorkflow(request)).await? {
+            ResponsePayload::WorkflowImported { workflow, draft } => Ok((workflow, *draft)),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Import one portable bundle as a generation-1 draft in an existing logical workflow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or import is incompatible/unauthorized.
+    pub async fn import_workflow_draft(
+        &self,
+        request: bcode_ipc::ImportWorkflowDraftRequest,
+    ) -> Result<bcode_ipc::WorkflowDraftImportResult, ClientError> {
+        match self
+            .send_request(Request::ImportWorkflowDraft(request))
+            .await?
+        {
+            ResponsePayload::WorkflowDraftImported { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Resolve and start one immutable authored-workflow revision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when resolution, configuration, authorization, or durable run admission
+    /// fails.
+    pub async fn start_authored_workflow(
+        &self,
+        request: bcode_ipc::StartAuthoredWorkflowRequest,
+    ) -> Result<bcode_ipc::AuthoredWorkflowRunStartResponse, ClientError> {
+        match self
+            .send_request(Request::StartAuthoredWorkflow(request))
+            .await?
+        {
+            ResponsePayload::AuthoredWorkflowRunStarted(started) => Ok(started),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// List bounded logical authored workflows.
     ///
     /// # Errors
@@ -2216,6 +2329,27 @@ impl BcodeClient {
             .await?
         {
             ResponsePayload::AuthoredWorkflowDescription { workflow } => Ok(workflow),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Return one bounded aggregate authored-workflow inspection snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the identity/bound.
+    pub async fn inspect_authored_workflow(
+        &self,
+        workflow_id: String,
+        limit: usize,
+    ) -> Result<Option<bcode_ipc::AuthoredWorkflowInspection>, ClientError> {
+        match self
+            .send_request(Request::InspectAuthoredWorkflow { workflow_id, limit })
+            .await?
+        {
+            ResponsePayload::AuthoredWorkflowInspection { inspection } => {
+                Ok(inspection.map(|inspection| *inspection))
+            }
             _ => Err(ClientError::UnexpectedResponse),
         }
     }
@@ -2322,6 +2456,28 @@ impl BcodeClient {
             ResponsePayload::WorkflowRevisionDescription { revision } => {
                 Ok(revision.map(|revision| *revision))
             }
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Inspect immutable revision facts with current derived requirement availability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the identity.
+    pub async fn workflow_revision_requirement_inspection(
+        &self,
+        workflow_id: String,
+        revision: u64,
+    ) -> Result<Option<bcode_ipc::WorkflowRevisionRequirementInspection>, ClientError> {
+        match self
+            .send_request(Request::InspectWorkflowRevisionRequirements {
+                workflow_id,
+                revision,
+            })
+            .await?
+        {
+            ResponsePayload::WorkflowRevisionRequirementInspection { inspection } => Ok(inspection),
             _ => Err(ClientError::UnexpectedResponse),
         }
     }

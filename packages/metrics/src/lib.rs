@@ -981,6 +981,35 @@ impl MetricsRegistry {
         });
     }
 
+    /// Add `value` to a counter using exactly the supplied labels, without ambient context.
+    ///
+    /// Use this for deliberately low-cardinality product metrics whose contract excludes request,
+    /// client, session, or other ambient identity labels.
+    pub fn add_counter_with_exact_labels(
+        &self,
+        key: impl Into<String>,
+        value: u64,
+        labels: MetricLabels,
+    ) {
+        let MetricsRegistryInner::Enabled(inner) = &self.inner else {
+            return;
+        };
+        let key = key.into();
+        let Ok(mut state) = inner.lock() else {
+            return;
+        };
+        let counter = state.counters.entry(key.clone()).or_default();
+        *counter = counter.saturating_add(value);
+        state.observe_descriptor(&key, MetricKind::Counter, &labels);
+        state.push_event(MetricEvent {
+            unix_ms: current_unix_millis(),
+            name: key,
+            kind: MetricKind::Counter,
+            value: i64::try_from(value).unwrap_or(i64::MAX),
+            labels,
+        });
+    }
+
     fn record_database_operation(&self, observation: DatabaseMetricObservation<'_>) {
         let DatabaseMetricObservation {
             role,
@@ -1071,6 +1100,38 @@ impl MetricsRegistry {
         };
         let key = key.into();
         let labels = current_metrics_context().merged_labels(labels);
+        let Ok(mut state) = inner.lock() else {
+            return;
+        };
+        state
+            .histograms
+            .entry(key.clone())
+            .or_default()
+            .record(value);
+        state.observe_descriptor(&key, MetricKind::Histogram, &labels);
+        state.push_event(MetricEvent {
+            unix_ms: current_unix_millis(),
+            name: key,
+            kind: MetricKind::Histogram,
+            value: i64::try_from(value).unwrap_or(i64::MAX),
+            labels,
+        });
+    }
+
+    /// Record a histogram sample using exactly the supplied labels, without ambient context.
+    ///
+    /// Use this for deliberately low-cardinality product metrics whose contract excludes request,
+    /// client, session, or other ambient identity labels.
+    pub fn record_histogram_with_exact_labels(
+        &self,
+        key: impl Into<String>,
+        value: u64,
+        labels: MetricLabels,
+    ) {
+        let MetricsRegistryInner::Enabled(inner) = &self.inner else {
+            return;
+        };
+        let key = key.into();
         let Ok(mut state) = inner.lock() else {
             return;
         };

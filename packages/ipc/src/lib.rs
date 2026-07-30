@@ -84,7 +84,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 19;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 23;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -297,6 +297,8 @@ pub enum Request {
     UpdateWorkflowDraft(UpdateWorkflowDraftRequest),
     /// Publish one exact draft generation, optionally activating it atomically.
     PublishWorkflowDraft(PublishWorkflowDraftRequest),
+    /// Publish one exact draft and then independently attempt durable run admission.
+    PublishAndStartWorkflow(Box<PublishAndStartWorkflowRequest>),
     /// Compare-and-set one immutable revision as active.
     ActivateWorkflowRevision(ActivateWorkflowRevisionRequest),
     /// Archive or unarchive one logical workflow.
@@ -311,6 +313,16 @@ pub enum Request {
     UpdateWorkflowPreset(UpdateWorkflowPresetRequest),
     /// Delete one exact preset generation.
     DeleteWorkflowPreset(DeleteWorkflowPresetRequest),
+    /// Export one exact immutable authored revision.
+    ExportWorkflowRevision(ExportWorkflowRevisionRequest),
+    /// Preview one portable import without mutation.
+    PreviewWorkflowImport(PreviewWorkflowImportRequest),
+    /// Import one portable bundle as a new logical workflow and draft.
+    ImportWorkflow(ImportWorkflowRequest),
+    /// Import one portable bundle as a new draft in an existing logical workflow.
+    ImportWorkflowDraft(ImportWorkflowDraftRequest),
+    /// Resolve and start one immutable authored-workflow revision.
+    StartAuthoredWorkflow(StartAuthoredWorkflowRequest),
     /// List bounded logical authored workflows.
     ListAuthoredWorkflows {
         #[serde(default)]
@@ -320,6 +332,11 @@ pub enum Request {
     /// Get one logical authored workflow.
     GetAuthoredWorkflow {
         workflow_id: String,
+    },
+    /// Return one bounded aggregate authored-workflow inspection snapshot.
+    InspectAuthoredWorkflow {
+        workflow_id: String,
+        limit: usize,
     },
     /// List bounded drafts for one logical workflow.
     ListWorkflowDrafts {
@@ -342,6 +359,11 @@ pub enum Request {
     },
     /// Get one exact immutable published revision.
     GetWorkflowRevision {
+        workflow_id: String,
+        revision: u64,
+    },
+    /// Inspect one immutable revision together with current, non-canonical requirement availability.
+    InspectWorkflowRevisionRequirements {
         workflow_id: String,
         revision: u64,
     },
@@ -1399,6 +1421,98 @@ pub struct WorkflowRevisionSnapshot {
     pub published_at_ms: u64,
 }
 
+/// Immutable publication facts plus current derived requirement availability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRevisionRequirementInspection {
+    pub revision: Box<WorkflowRevisionSnapshot>,
+    pub current_availability: bcode_workflow::WorkflowRequirementAvailabilityReport,
+}
+
+/// One portable bounded authored lifecycle event with normalized, content-minimized facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAuthoringEventSnapshot {
+    pub event_seq: u64,
+    pub workflow_id: String,
+    pub event_type: String,
+    pub revision: Option<u64>,
+    pub definition_id: Option<String>,
+    pub definition_version: Option<u32>,
+    pub activated: Option<bool>,
+    pub created_at_ms: u64,
+}
+
+/// One portable authored-state consistency issue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "issue", rename_all = "snake_case")]
+pub enum WorkflowAuthoringIssueSnapshot {
+    InvalidActiveRevision {
+        revision: u64,
+    },
+    MissingCompiledDefinition {
+        revision: u64,
+        definition_id: String,
+        definition_version: u32,
+    },
+    OrphanedPreset {
+        preset_id: String,
+        revision: u64,
+    },
+    StaleDraftBase {
+        draft_id: String,
+        base_revision: u64,
+    },
+}
+
+/// Content-minimized mutable draft summary for public diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowDraftInspectionSummary {
+    pub identity: bcode_workflow::WorkflowDraftIdentity,
+    pub base_revision: Option<u64>,
+    pub generation: u64,
+    pub checksum_sha256: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// Content-minimized immutable revision summary for public diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRevisionInspectionSummary {
+    pub identity: bcode_workflow::WorkflowRevisionIdentity,
+    pub source_checksum_sha256: String,
+    pub executable_source_checksum_sha256: String,
+    pub definition_identity: bcode_workflow::WorkflowDefinitionIdentity,
+    pub published_at_ms: u64,
+}
+
+/// Content-minimized preset summary for public diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPresetInspectionSummary {
+    pub workflow_id: String,
+    pub preset_id: String,
+    pub revision: u64,
+    pub generation: u64,
+    pub has_run_limit_override: bool,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// Bounded aggregate authored-workflow inspection from canonical indexed rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredWorkflowInspection {
+    pub workflow: AuthoredWorkflowSnapshot,
+    pub drafts: Vec<WorkflowDraftInspectionSummary>,
+    pub revisions: Vec<WorkflowRevisionInspectionSummary>,
+    pub presets: Vec<WorkflowPresetInspectionSummary>,
+    pub events: Vec<WorkflowAuthoringEventSnapshot>,
+    pub issues: Vec<WorkflowAuthoringIssueSnapshot>,
+}
+
 /// Portable reusable revision-bound preset snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1464,6 +1578,40 @@ pub struct PublishWorkflowDraftRequest {
     pub expected_active_revision: Option<u64>,
     #[serde(default)]
     pub control: WorkflowComputationControl,
+}
+
+/// Publish one exact draft and then attempt a separately reported durable run admission.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishAndStartWorkflowRequest {
+    /// Exact publication operation.
+    pub publication: PublishWorkflowDraftRequest,
+    /// Caller-stable run identity when retrying run admission.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub parent_session_id: bcode_session_models::SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_snapshot: Option<String>,
+}
+
+/// Run-admission outcome following a successful publication.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRunAdmissionResult {
+    Started(Box<AuthoredWorkflowRunStartResponse>),
+    Failed(ErrorResponse),
+}
+
+/// Typed publish-and-start result preserving the publication boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowPublishAndStartResult {
+    PublicationConflict(WorkflowAuthoringConflict),
+    Published {
+        revision: Box<WorkflowRevisionSnapshot>,
+        active_revision: Option<u64>,
+        run_admission: WorkflowRunAdmissionResult,
+    },
 }
 
 /// Compare-and-set one exact immutable revision as active.
@@ -1572,6 +1720,118 @@ pub struct DeleteWorkflowPresetRequest {
 pub enum WorkflowPresetUpdateResult {
     Updated(WorkflowPresetSnapshot),
     Conflict(WorkflowAuthoringConflict),
+}
+
+/// Export one exact immutable authored revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExportWorkflowRevisionRequest {
+    pub workflow_id: String,
+    pub revision: u64,
+}
+
+/// Preview one portable import without mutation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewWorkflowImportRequest {
+    pub bundle: bcode_workflow::WorkflowExportBundle,
+    pub target_workflow_id: String,
+    pub control: WorkflowComputationControl,
+}
+
+/// Explicit collision policy for importing a bundle into authored state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowImportCollisionPolicy {
+    /// Require the target logical workflow identity to be absent.
+    RequireNewWorkflow,
+    /// Require the target logical workflow to exist and the requested draft identity to be absent.
+    RequireExistingWorkflowNewDraft,
+}
+
+/// Import one portable bundle as a new logical workflow and generation-1 draft.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportWorkflowRequest {
+    pub bundle: bcode_workflow::WorkflowExportBundle,
+    pub target_workflow_id: String,
+    pub draft_id: String,
+    /// Must be [`WorkflowImportCollisionPolicy::RequireNewWorkflow`].
+    pub collision_policy: WorkflowImportCollisionPolicy,
+    pub control: WorkflowComputationControl,
+}
+
+/// Import one portable bundle as a generation-1 draft in an existing logical workflow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportWorkflowDraftRequest {
+    pub bundle: bcode_workflow::WorkflowExportBundle,
+    pub workflow_id: String,
+    pub draft_id: String,
+    /// Must be [`WorkflowImportCollisionPolicy::RequireExistingWorkflowNewDraft`].
+    pub collision_policy: WorkflowImportCollisionPolicy,
+    pub control: WorkflowComputationControl,
+}
+
+/// Typed existing-workflow import outcome with collision-safe draft identity handling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowDraftImportResult {
+    Imported {
+        workflow: AuthoredWorkflowSnapshot,
+        draft: Box<WorkflowDraftSnapshot>,
+    },
+    DraftAlreadyExists {
+        workflow_id: String,
+        draft_id: String,
+    },
+}
+
+/// Exact published authored-workflow selection used for a durable run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuthoredWorkflowRunSelection {
+    Revision {
+        workflow_id: String,
+        revision: u64,
+    },
+    Active {
+        workflow_id: String,
+    },
+    Preset {
+        workflow_id: String,
+        preset_id: String,
+        preset_generation: u64,
+    },
+}
+
+/// Start a durable run from an immutable authored-workflow revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartAuthoredWorkflowRequest {
+    pub selection: AuthoredWorkflowRunSelection,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    pub parent_session_id: bcode_session_models::SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration: Option<serde_json::Value>,
+}
+
+/// Successful authored-workflow run start with exact durable provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredWorkflowRunStartResponse {
+    pub started: WorkflowRunStartResponse,
+    pub workflow_id: String,
+    pub revision: u64,
+    pub definition_identity: bcode_workflow::WorkflowDefinitionIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_generation: Option<u64>,
+    pub configuration: serde_json::Value,
 }
 
 /// Request to durably register one compiled workflow definition.
@@ -1847,6 +2107,9 @@ pub enum ResponsePayload {
     WorkflowPublicationResult {
         result: WorkflowPublicationResult,
     },
+    WorkflowPublishAndStartResult {
+        result: WorkflowPublishAndStartResult,
+    },
     WorkflowActivationResult {
         result: WorkflowAuthoringMutationResult,
     },
@@ -1868,6 +2131,20 @@ pub enum ResponsePayload {
     WorkflowPresetDeleteResult {
         result: WorkflowAuthoringMutationResult,
     },
+    WorkflowRevisionExported {
+        bundle: Box<bcode_workflow::WorkflowExportBundle>,
+    },
+    WorkflowImportPreview {
+        preview: Box<bcode_workflow::WorkflowImportPreview>,
+    },
+    WorkflowImported {
+        workflow: AuthoredWorkflowSnapshot,
+        draft: Box<WorkflowDraftSnapshot>,
+    },
+    WorkflowDraftImported {
+        result: WorkflowDraftImportResult,
+    },
+    AuthoredWorkflowRunStarted(AuthoredWorkflowRunStartResponse),
     AuthoredWorkflowList {
         page: WorkflowAuthoringPage<
             AuthoredWorkflowSnapshot,
@@ -1876,6 +2153,9 @@ pub enum ResponsePayload {
     },
     AuthoredWorkflowDescription {
         workflow: Option<AuthoredWorkflowSnapshot>,
+    },
+    AuthoredWorkflowInspection {
+        inspection: Option<Box<AuthoredWorkflowInspection>>,
     },
     WorkflowDraftList {
         page: WorkflowAuthoringPage<
@@ -1894,6 +2174,9 @@ pub enum ResponsePayload {
     },
     WorkflowRevisionDescription {
         revision: Option<Box<WorkflowRevisionSnapshot>>,
+    },
+    WorkflowRevisionRequirementInspection {
+        inspection: Option<WorkflowRevisionRequirementInspection>,
     },
     WorkflowPresetList {
         page: WorkflowAuthoringPage<
@@ -2988,6 +3271,50 @@ mod tests {
                 expected_active_revision: None,
                 control: WorkflowComputationControl::default(),
             }),
+            Request::PublishAndStartWorkflow(Box::new(PublishAndStartWorkflowRequest {
+                publication: PublishWorkflowDraftRequest {
+                    workflow_id: authoring_document.workflow_id.clone(),
+                    draft_id: "draft-1".to_string(),
+                    expected_generation: 1,
+                    configuration: None,
+                    activate: true,
+                    expected_active_revision: None,
+                    control: WorkflowComputationControl::default(),
+                },
+                run_id: Some("run-1".to_string()),
+                parent_session_id: bcode_session_models::SessionId::new(),
+                workspace_snapshot: Some("snapshot-1".to_string()),
+            })),
+            Request::ImportWorkflowDraft(ImportWorkflowDraftRequest {
+                bundle: bcode_workflow::WorkflowExportBundle {
+                    version: bcode_workflow::WORKFLOW_EXPORT_BUNDLE_VERSION,
+                    revision: bcode_workflow::WorkflowPortableRevision {
+                        identity: bcode_workflow::WorkflowRevisionIdentity {
+                            workflow_id: authoring_document.workflow_id.clone(),
+                            revision: 1,
+                        },
+                        source_checksum_sha256: authoring_document
+                            .source_digest_sha256()
+                            .expect("source digest"),
+                        executable_source_checksum_sha256: authoring_document
+                            .executable_source_digest_sha256()
+                            .expect("executable digest"),
+                        definition_identity:
+                            bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+                                authoring_document.workflow_id.clone(),
+                                &definition,
+                            )
+                            .expect("identity"),
+                        document: authoring_document.clone(),
+                        producer: authoring_document.producer.clone(),
+                        published_at_ms: 1,
+                    },
+                },
+                workflow_id: authoring_document.workflow_id.clone(),
+                draft_id: "imported-draft".to_string(),
+                collision_policy: WorkflowImportCollisionPolicy::RequireExistingWorkflowNewDraft,
+                control: WorkflowComputationControl::default(),
+            }),
             Request::ActivateWorkflowRevision(ActivateWorkflowRevisionRequest {
                 workflow_id: authoring_document.workflow_id.clone(),
                 revision: 1,
@@ -3036,8 +3363,54 @@ mod tests {
                 preset_id: "default".to_string(),
                 expected_generation: 2,
             }),
+            Request::ExportWorkflowRevision(ExportWorkflowRevisionRequest {
+                workflow_id: authoring_document.workflow_id.clone(),
+                revision: 1,
+            }),
+            Request::PreviewWorkflowImport(PreviewWorkflowImportRequest {
+                bundle: bcode_workflow::WorkflowExportBundle {
+                    version: bcode_workflow::WORKFLOW_EXPORT_BUNDLE_VERSION,
+                    revision: bcode_workflow::WorkflowPortableRevision {
+                        identity: bcode_workflow::WorkflowRevisionIdentity {
+                            workflow_id: authoring_document.workflow_id.clone(),
+                            revision: 1,
+                        },
+                        source_checksum_sha256: authoring_document
+                            .source_digest_sha256()
+                            .expect("source digest"),
+                        executable_source_checksum_sha256: authoring_document
+                            .executable_source_digest_sha256()
+                            .expect("executable digest"),
+                        definition_identity:
+                            bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+                                "authored/review",
+                                &authoring_document.definition,
+                            )
+                            .expect("definition identity"),
+                        document: authoring_document.clone(),
+                        producer: authoring_document.producer.clone(),
+                        published_at_ms: 1,
+                    },
+                },
+                target_workflow_id: "authored/imported".to_string(),
+                control: WorkflowComputationControl::default(),
+            }),
+            Request::StartAuthoredWorkflow(StartAuthoredWorkflowRequest {
+                selection: AuthoredWorkflowRunSelection::Revision {
+                    workflow_id: authoring_document.workflow_id.clone(),
+                    revision: 1,
+                },
+                run_id: Some("authored-run".to_string()),
+                parent_session_id: SessionId::new(),
+                workspace_snapshot: Some("snapshot".to_string()),
+                configuration: Some(serde_json::json!({})),
+            }),
             Request::ListAuthoredWorkflows {
                 cursor: None,
+                limit: 25,
+            },
+            Request::InspectAuthoredWorkflow {
+                workflow_id: "authored/review".to_string(),
                 limit: 25,
             },
             Request::GetAuthoredWorkflow {
@@ -3056,6 +3429,10 @@ mod tests {
                 workflow_id: "authored/review".to_string(),
                 cursor: None,
                 limit: 25,
+            },
+            Request::InspectWorkflowRevisionRequirements {
+                workflow_id: authoring_document.workflow_id.clone(),
+                revision: 1,
             },
             Request::GetWorkflowRevision {
                 workflow_id: "authored/review".to_string(),
@@ -3270,6 +3647,7 @@ mod tests {
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: None,
                 binding: None,
+                authored_provenance: None,
                 status: bcode_workflow_store::RunStatus::Running,
                 cancellation_requested_at_ms: None,
                 created_at_ms: 1,

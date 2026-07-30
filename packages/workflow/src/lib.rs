@@ -41,6 +41,9 @@ pub const WORKFLOW_DEFINITION_SCHEMA_VERSION: u32 = 1;
 /// Stable durable-production capability contract version.
 pub const WORKFLOW_PRODUCTION_CAPABILITY_VERSION: u32 = 1;
 
+/// Stable current-host requirement availability report version.
+pub const WORKFLOW_REQUIREMENT_AVAILABILITY_VERSION: u32 = 1;
+
 /// Stable deterministic predicate contract version.
 pub const WORKFLOW_PREDICATE_VERSION: u32 = 1;
 
@@ -1423,6 +1426,10 @@ const MAX_WORKFLOW_AUTHORING_PRESENTATION_BYTES: usize = 131_072;
 pub const WORKFLOW_AUTHORING_CATALOG_VERSION: u32 = 1;
 /// Portable workflow compilation preview contract version.
 pub const WORKFLOW_COMPILATION_PREVIEW_VERSION: u32 = 1;
+/// Portable authored-workflow export bundle contract version.
+pub const WORKFLOW_EXPORT_BUNDLE_VERSION: u32 = 1;
+/// Portable authored-workflow import preview contract version.
+pub const WORKFLOW_IMPORT_PREVIEW_VERSION: u32 = 1;
 /// Normalized authored-workflow application-operation fact version.
 pub const WORKFLOW_APPLICATION_OPERATION_FACTS_VERSION: u32 = 1;
 
@@ -1480,6 +1487,7 @@ pub enum WorkflowApplicationOperation {
     UpdatePreset,
     DeletePreset,
     ImportWorkflow,
+    ImportDraft,
     StartRevision,
     StartActiveRevision,
     StartPreset,
@@ -1494,6 +1502,7 @@ impl WorkflowApplicationOperation {
                 | Self::ForkDraft
                 | Self::UpdateDraft
                 | Self::DiscardDraft
+                | Self::ImportDraft
                 | Self::PublishDraft
                 | Self::PublishAndStart
         )
@@ -1707,6 +1716,91 @@ impl WorkflowRevisionListCursor {
         }
         Ok(())
     }
+}
+
+/// Portable exact immutable authored-workflow revision used by export/import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPortableRevision {
+    pub identity: WorkflowRevisionIdentity,
+    pub source_checksum_sha256: String,
+    pub executable_source_checksum_sha256: String,
+    pub definition_identity: WorkflowDefinitionIdentity,
+    pub document: WorkflowAuthoringDocument,
+    pub producer: WorkflowProducerProvenance,
+    pub published_at_ms: u64,
+}
+
+impl WorkflowPortableRevision {
+    /// Validate exact immutable revision identity and content digests.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity/content or mismatched source/definition digests.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        self.identity.validate()?;
+        self.document.validate()?;
+        self.producer.validate()?;
+        if self.document.workflow_id != self.identity.workflow_id
+            || self.document.source_digest_sha256()? != self.source_checksum_sha256
+            || self.document.executable_source_digest_sha256()?
+                != self.executable_source_checksum_sha256
+        {
+            return Err(authoring_error(
+                "revision",
+                "portable revision identity or source digests are inconsistent",
+            ));
+        }
+        if self.definition_identity.kind.trim().is_empty()
+            || self.definition_identity.definition_id.trim().is_empty()
+            || self.definition_identity.definition_version == 0
+        {
+            return Err(authoring_error(
+                "revision.definition_identity",
+                "portable revision definition identity is malformed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Canonical portable export bundle for one exact immutable revision.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowExportBundle {
+    pub version: u32,
+    pub revision: WorkflowPortableRevision,
+}
+
+impl WorkflowExportBundle {
+    /// Validate the bundle version and exact immutable content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported future versions or inconsistent revision content.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_EXPORT_BUNDLE_VERSION {
+            return Err(authoring_error(
+                "export.version",
+                format!(
+                    "unsupported workflow export version {}; expected {}",
+                    self.version, WORKFLOW_EXPORT_BUNDLE_VERSION
+                ),
+            ));
+        }
+        self.revision.validate()
+    }
+}
+
+/// Side-effect-free import validation and compilation result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowImportPreview {
+    pub version: u32,
+    pub bundle_version: u32,
+    pub source_identity: WorkflowRevisionIdentity,
+    pub target_workflow_id: String,
+    pub compilation: WorkflowCompilationPreview,
 }
 
 /// Stable logical identity for one runtime-authored workflow.
@@ -2341,6 +2435,35 @@ pub struct WorkflowAuthoringCatalogSnapshot {
     pub skills: BTreeSet<String>,
 }
 
+/// Kind of authored requirement evaluated against a current catalog snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRequirementKind {
+    Capability,
+    Plugin,
+    Block,
+    Agent,
+    Skill,
+}
+
+/// One missing current-host requirement, separate from immutable publication facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowUnavailableRequirement {
+    pub kind: WorkflowRequirementKind,
+    pub identity: String,
+}
+
+/// Bounded current-host availability report for immutable declared requirements.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRequirementAvailabilityReport {
+    pub version: u32,
+    pub available: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unavailable: Vec<WorkflowUnavailableRequirement>,
+}
+
 impl WorkflowAuthoringCatalogSnapshot {
     fn production_capabilities(&self) -> Result<WorkflowProductionCapabilities, WorkflowError> {
         let current = WorkflowProductionCapabilities::current();
@@ -2543,6 +2666,24 @@ pub struct WorkflowAuthoringDocument {
     /// Optional non-semantic producer-owned presentation hints.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub presentation: Option<WorkflowAuthoringPresentation>,
+}
+
+/// Explicit renderer-neutral projection of authored fields that can affect executable behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowExecutableAuthoringSemantics {
+    pub schema_version: u32,
+    pub workflow_id: String,
+    pub configuration_schema: ValueSchema,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_defaults: Option<serde_json::Value>,
+    pub definition: WorkflowDefinition,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<WorkflowConfigurationBinding>,
+    #[serde(default)]
+    pub requirements: WorkflowRequirementSummary,
+    #[serde(default)]
+    pub run_limits: WorkflowRunLimitPolicy,
 }
 
 impl WorkflowAuthoringDocument {
@@ -2882,6 +3023,25 @@ impl WorkflowAuthoringDocument {
         canonical_sha256(&self.normalized()?, "workflow")
     }
 
+    /// Return a projection containing only executable authoring semantics.
+    ///
+    /// This deliberately omits user-facing metadata, producer provenance, and presentation hints
+    /// so callers cannot accidentally use those fields to derive authorization, dispatch, or
+    /// compiled identity.
+    #[must_use]
+    pub fn executable_semantics(&self) -> WorkflowExecutableAuthoringSemantics {
+        WorkflowExecutableAuthoringSemantics {
+            schema_version: self.schema_version,
+            workflow_id: self.workflow_id.clone(),
+            configuration_schema: self.configuration_schema.clone(),
+            configuration_defaults: self.configuration_defaults.clone(),
+            definition: self.definition.clone(),
+            bindings: self.bindings.clone(),
+            requirements: self.requirements.clone(),
+            run_limits: self.run_limits.clone(),
+        }
+    }
+
     /// Return the canonical digest of executable source semantics.
     ///
     /// User-facing metadata, producer provenance, and presentation hints are deliberately excluded.
@@ -2895,16 +3055,7 @@ impl WorkflowAuthoringDocument {
     pub fn executable_source_digest_sha256(&self) -> Result<String, WorkflowError> {
         let normalized = self.normalized()?;
         canonical_sha256(
-            &(
-                normalized.schema_version,
-                normalized.workflow_id,
-                normalized.configuration_schema,
-                normalized.configuration_defaults,
-                normalized.definition,
-                normalized.bindings,
-                normalized.requirements,
-                normalized.run_limits,
-            ),
+            &normalized.executable_semantics(),
             "workflow.executable_source",
         )
     }
@@ -3259,11 +3410,10 @@ fn normalize_authored_definition(
     Ok(definition)
 }
 
-fn validate_declared_authoring_requirements(
-    declared: &WorkflowRequirementSummary,
+fn supported_authoring_capabilities(
     catalog: &WorkflowAuthoringCatalogSnapshot,
-) -> Result<(), WorkflowError> {
-    let supported_capabilities = BTreeSet::from([
+) -> BTreeSet<String> {
+    BTreeSet::from([
         format!(
             "workflow-production/v{}",
             catalog.capabilities.capability_version
@@ -3272,46 +3422,92 @@ fn validate_declared_authoring_requirements(
             "workflow-block/v{}",
             catalog.capabilities.workflow_block_interface_version
         ),
-    ]);
-    for capability in &declared.capabilities {
-        if !supported_capabilities.contains(capability) {
-            return Err(authoring_error(
-                "requirements.capabilities",
-                format!("required capability '{capability}' is unavailable"),
-            ));
-        }
-    }
-    for plugin in &declared.plugins {
-        if !catalog.plugins.contains(plugin) {
-            return Err(authoring_error(
-                "requirements.plugins",
-                format!("required plugin '{plugin}' is unavailable"),
-            ));
-        }
-    }
-    for block in &declared.blocks {
-        if !catalog.blocks.contains_key(block) {
-            return Err(authoring_error(
-                "requirements.blocks",
-                format!("required block '{block}' is unavailable"),
-            ));
-        }
-    }
-    for profile in &declared.agents {
-        if !catalog.agent_profiles.contains(profile) {
-            return Err(authoring_error(
-                "requirements.agents",
-                format!("required agent profile '{profile}' is unavailable"),
-            ));
-        }
-    }
-    for skill in &declared.skills {
-        if !catalog.skills.contains(skill) {
-            return Err(authoring_error(
-                "requirements.skills",
-                format!("required skill '{skill}' is unavailable"),
-            ));
-        }
+    ])
+}
+
+/// Evaluate immutable declared requirements against one current portable catalog snapshot.
+///
+/// This operation is side-effect free and returns only bounded normalized requirement identities.
+/// It does not mutate the authored document, published revision, catalog, or persistence.
+///
+/// # Errors
+///
+/// Returns an error when the requirements or catalog are malformed.
+pub fn workflow_requirement_availability(
+    declared: &WorkflowRequirementSummary,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+) -> Result<WorkflowRequirementAvailabilityReport, WorkflowError> {
+    declared.validate()?;
+    catalog.validate()?;
+    let supported_capabilities = supported_authoring_capabilities(catalog);
+    let mut unavailable = Vec::new();
+    let mut append_missing = |kind: WorkflowRequirementKind,
+                              required: &BTreeSet<String>,
+                              available: &BTreeSet<String>| {
+        unavailable.extend(
+            required
+                .difference(available)
+                .cloned()
+                .map(|identity| WorkflowUnavailableRequirement { kind, identity }),
+        );
+    };
+    append_missing(
+        WorkflowRequirementKind::Capability,
+        &declared.capabilities,
+        &supported_capabilities,
+    );
+    append_missing(
+        WorkflowRequirementKind::Plugin,
+        &declared.plugins,
+        &catalog.plugins,
+    );
+    let available_blocks: BTreeSet<String> = catalog.blocks.keys().cloned().collect();
+    append_missing(
+        WorkflowRequirementKind::Block,
+        &declared.blocks,
+        &available_blocks,
+    );
+    append_missing(
+        WorkflowRequirementKind::Agent,
+        &declared.agents,
+        &catalog.agent_profiles,
+    );
+    append_missing(
+        WorkflowRequirementKind::Skill,
+        &declared.skills,
+        &catalog.skills,
+    );
+    Ok(WorkflowRequirementAvailabilityReport {
+        version: WORKFLOW_REQUIREMENT_AVAILABILITY_VERSION,
+        available: unavailable.is_empty(),
+        unavailable,
+    })
+}
+
+fn validate_declared_authoring_requirements(
+    declared: &WorkflowRequirementSummary,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+) -> Result<(), WorkflowError> {
+    let report = workflow_requirement_availability(declared, catalog)?;
+    if let Some(unavailable) = report.unavailable.first() {
+        let path = match unavailable.kind {
+            WorkflowRequirementKind::Capability => "requirements.capabilities",
+            WorkflowRequirementKind::Plugin => "requirements.plugins",
+            WorkflowRequirementKind::Block => "requirements.blocks",
+            WorkflowRequirementKind::Agent => "requirements.agents",
+            WorkflowRequirementKind::Skill => "requirements.skills",
+        };
+        let label = match unavailable.kind {
+            WorkflowRequirementKind::Capability => "capability",
+            WorkflowRequirementKind::Plugin => "plugin",
+            WorkflowRequirementKind::Block => "block",
+            WorkflowRequirementKind::Agent => "agent profile",
+            WorkflowRequirementKind::Skill => "skill",
+        };
+        return Err(authoring_error(
+            path,
+            format!("required {label} '{}' is unavailable", unavailable.identity),
+        ));
     }
     Ok(())
 }
@@ -7664,6 +7860,17 @@ mod tests {
             .expect("presentation")
             .namespaces
             .insert("other.editor".to_string(), serde_json::json!({"x": 99}));
+        presented.metadata.title = "Different display title".to_string();
+        presented.metadata.description = Some("Presentation-only description".to_string());
+        presented.metadata.labels.insert(
+            "reviewer-visible".to_string(),
+            "presentation-only".to_string(),
+        );
+        presented.producer = WorkflowProducerProvenance {
+            kind: WorkflowProducerKind::Cli,
+            producer_id: Some("different-producer".to_string()),
+            source_revision: None,
+        };
         let presented_preview = presented.compilation_preview(
             &catalog,
             Some(&serde_json::json!({
@@ -7672,11 +7879,44 @@ mod tests {
             })),
         );
         assert_eq!(
-            presented_preview
-                .compiled
-                .expect("presented compiled")
-                .definition_identity,
-            compiled.definition_identity
+            presented_preview.compiled.expect("presented compiled"),
+            compiled.clone()
+        );
+    }
+
+    #[test]
+    fn producer_kind_does_not_change_compilation_or_local_authorization() {
+        let catalog = authoring_catalog();
+        let mut sdk = authored_document();
+        sdk.producer = WorkflowProducerProvenance {
+            kind: WorkflowProducerKind::Sdk,
+            producer_id: Some("portable-sdk".to_string()),
+            source_revision: None,
+        };
+        let mut plugin = sdk.clone();
+        plugin.producer = WorkflowProducerProvenance {
+            kind: WorkflowProducerKind::Plugin,
+            producer_id: Some("example.generator".to_string()),
+            source_revision: None,
+        };
+        let sdk_compiled = sdk
+            .compilation_preview(&catalog, None)
+            .compiled
+            .expect("sdk compilation");
+        let plugin_compiled = plugin
+            .compilation_preview(&catalog, None)
+            .compiled
+            .expect("plugin compilation");
+        assert_eq!(sdk_compiled, plugin_compiled);
+        assert_ne!(
+            sdk.source_digest_sha256().expect("sdk source"),
+            plugin.source_digest_sha256().expect("plugin source")
+        );
+        assert_eq!(
+            sdk.executable_source_digest_sha256().expect("sdk identity"),
+            plugin
+                .executable_source_digest_sha256()
+                .expect("plugin identity")
         );
     }
 
@@ -7725,6 +7965,26 @@ mod tests {
             compiled.permissions.maximum_capability,
             WorkflowToolCapability::Mutating
         );
+    }
+
+    #[test]
+    fn requirement_availability_is_structured_bounded_and_non_mutating() {
+        let document = authored_document();
+        let before = document.clone();
+        let mut catalog = authoring_catalog();
+        catalog.agent_profiles.clear();
+        let report = workflow_requirement_availability(&document.requirements, &catalog)
+            .expect("availability");
+        assert!(!report.available);
+        assert_eq!(
+            report.unavailable,
+            vec![WorkflowUnavailableRequirement {
+                kind: WorkflowRequirementKind::Agent,
+                identity: "review".to_string(),
+            }]
+        );
+        assert_eq!(document, before);
+        round_trip(&report);
     }
 
     #[test]
@@ -7872,6 +8132,17 @@ mod tests {
                 "other.editor".to_string(),
                 serde_json::json!({"collapsed": true}),
             );
+        presented.metadata.title = "Different title".to_string();
+        presented.metadata.description = Some("Different description".to_string());
+        presented
+            .metadata
+            .labels
+            .insert("display".to_string(), "different".to_string());
+        presented.producer = WorkflowProducerProvenance {
+            kind: WorkflowProducerKind::Plugin,
+            producer_id: Some("different.plugin".to_string()),
+            source_revision: None,
+        };
         assert_ne!(
             document.source_digest_sha256().expect("source digest"),
             presented.source_digest_sha256().expect("presented digest")

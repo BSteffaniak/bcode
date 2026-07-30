@@ -37,6 +37,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
+use std::future::Future;
 use std::io::{IsTerminal as _, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -265,20 +266,77 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Login { command } => handle_login_command(command).await?,
         Commands::Permission { command } => handle_permission_command(command).await?,
         Commands::RuntimeWork { command } => handle_runtime_work_command(command).await?,
-        Commands::Workflow { command } => handle_workflow_command(command).await?,
+        Commands::Workflow { command } => handle_workflow_command(Box::new(command)).await?,
         command => Box::pin(handle_session_io_command(command)).await?,
     }
     Ok(())
 }
 
 #[allow(clippy::too_many_lines)]
-async fn handle_workflow_command(command: WorkflowCommand) -> Result<(), CliError> {
+async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), CliError> {
     let client = BcodeClient::default_endpoint();
-    match command {
+    match *command {
         WorkflowCommand::CancelComputation { operation_id } => {
             print_json(&client.cancel_workflow_computation(operation_id).await?)?;
         }
-        WorkflowCommand::Author { command } => match command {
+        WorkflowCommand::Start {
+            selection,
+            parent_session_id,
+            run_id,
+            workspace_snapshot,
+            configuration,
+        } => {
+            let selection = match selection {
+                WorkflowStartSelection::Revision {
+                    workflow_id,
+                    revision,
+                } => bcode_ipc::AuthoredWorkflowRunSelection::Revision {
+                    workflow_id,
+                    revision,
+                },
+                WorkflowStartSelection::Active { workflow_id } => {
+                    bcode_ipc::AuthoredWorkflowRunSelection::Active { workflow_id }
+                }
+                WorkflowStartSelection::Preset {
+                    workflow_id,
+                    preset_id,
+                    preset_generation,
+                } => bcode_ipc::AuthoredWorkflowRunSelection::Preset {
+                    workflow_id,
+                    preset_id,
+                    preset_generation,
+                },
+            };
+            let configuration = configuration
+                .as_deref()
+                .map(read_bounded_json)
+                .transpose()?;
+            print_json(
+                &client
+                    .start_authored_workflow(bcode_ipc::StartAuthoredWorkflowRequest {
+                        selection,
+                        run_id,
+                        parent_session_id,
+                        workspace_snapshot,
+                        configuration,
+                    })
+                    .await?,
+            )?;
+        }
+        WorkflowCommand::Author { command } => {
+            handle_workflow_author_command(&client, command).await?;
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn handle_workflow_author_command(
+    client: &BcodeClient,
+    command: Box<WorkflowAuthorCommand>,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), CliError>> + Send + '_>> {
+    Box::pin(async move {
+        match *command {
             WorkflowAuthorCommand::Create { file, draft_id } => {
                 let document = read_workflow_authoring_document(&file)?;
                 print_json(
@@ -305,11 +363,14 @@ async fn handle_workflow_command(command: WorkflowCommand) -> Result<(), CliErro
             WorkflowAuthorCommand::Get { workflow_id } => {
                 print_json(&client.authored_workflow(workflow_id).await?)?;
             }
+            WorkflowAuthorCommand::Inspect { workflow_id, limit } => {
+                print_json(&client.inspect_authored_workflow(workflow_id, limit).await?)?;
+            }
             WorkflowAuthorCommand::Draft { command } => {
-                handle_workflow_draft_command(&client, command).await?;
+                handle_workflow_draft_command(client, command).await?;
             }
             WorkflowAuthorCommand::Revision { command } => {
-                handle_workflow_revision_command(&client, command).await?;
+                handle_workflow_revision_command(client, command).await?;
             }
             WorkflowAuthorCommand::Update {
                 file,
@@ -357,6 +418,43 @@ async fn handle_workflow_command(command: WorkflowCommand) -> Result<(), CliErro
                             control: workflow_computation_control(operation_id, timeout_ms),
                         })
                         .await?,
+                )?;
+            }
+            WorkflowAuthorCommand::PublishAndStart {
+                workflow_id,
+                draft_id,
+                expected_generation,
+                configuration,
+                activate,
+                expected_active_revision,
+                operation_id,
+                timeout_ms,
+                parent_session_id,
+                run_id,
+                workspace_snapshot,
+            } => {
+                let configuration = configuration
+                    .as_deref()
+                    .map(read_bounded_json)
+                    .transpose()?;
+                print_json(
+                    &Box::pin(client.publish_and_start_workflow(
+                        bcode_ipc::PublishAndStartWorkflowRequest {
+                            publication: bcode_ipc::PublishWorkflowDraftRequest {
+                                workflow_id,
+                                draft_id,
+                                expected_generation,
+                                configuration,
+                                activate,
+                                expected_active_revision,
+                                control: workflow_computation_control(operation_id, timeout_ms),
+                            },
+                            run_id,
+                            parent_session_id,
+                            workspace_snapshot,
+                        },
+                    ))
+                    .await?,
                 )?;
             }
             WorkflowAuthorCommand::Activate {
@@ -428,7 +526,73 @@ async fn handle_workflow_command(command: WorkflowCommand) -> Result<(), CliErro
                 )?;
             }
             WorkflowAuthorCommand::Preset { command } => {
-                handle_workflow_preset_command(&client, command).await?;
+                handle_workflow_preset_command(client, command).await?;
+            }
+            WorkflowAuthorCommand::Export {
+                workflow_id,
+                revision,
+            } => print_json(
+                &client
+                    .export_workflow_revision(bcode_ipc::ExportWorkflowRevisionRequest {
+                        workflow_id,
+                        revision,
+                    })
+                    .await?,
+            )?,
+            WorkflowAuthorCommand::ImportPreview {
+                file,
+                target_workflow_id,
+                operation_id,
+                timeout_ms,
+            } => {
+                let bundle = serde_json::from_value(read_bounded_json(&file)?)?;
+                print_json(
+                    &client
+                        .preview_workflow_import(bcode_ipc::PreviewWorkflowImportRequest {
+                            bundle,
+                            target_workflow_id,
+                            control: workflow_computation_control(operation_id, timeout_ms),
+                        })
+                        .await?,
+                )?;
+            }
+            WorkflowAuthorCommand::Import {
+                file,
+                target_workflow_id,
+                draft_id,
+                operation_id,
+                timeout_ms,
+            } => {
+                let bundle = serde_json::from_value(read_bounded_json(&file)?)?;
+                print_json(
+                    &client
+                        .import_workflow(bcode_ipc::ImportWorkflowRequest {
+                            bundle,
+                            target_workflow_id,
+                            draft_id,
+                            collision_policy:
+                                bcode_ipc::WorkflowImportCollisionPolicy::RequireNewWorkflow,
+                            control: workflow_computation_control(operation_id, timeout_ms),
+                        })
+                        .await?,
+                )?;
+            }
+            WorkflowAuthorCommand::ImportDraft {
+                file,
+                workflow_id,
+                draft_id,
+                operation_id,
+                timeout_ms,
+            } => {
+                handle_workflow_import_draft_command(
+                    client,
+                    file,
+                    workflow_id,
+                    draft_id,
+                    operation_id,
+                    timeout_ms,
+                )
+                .await?;
             }
             WorkflowAuthorCommand::Catalog => {
                 print_json(&client.workflow_authoring_catalog().await?)?;
@@ -475,9 +639,35 @@ async fn handle_workflow_command(command: WorkflowCommand) -> Result<(), CliErro
                         .await?,
                 )?;
             }
-        },
-    }
-    Ok(())
+        }
+        Ok(())
+    })
+}
+
+fn handle_workflow_import_draft_command(
+    client: &BcodeClient,
+    file: PathBuf,
+    workflow_id: String,
+    draft_id: String,
+    operation_id: Option<String>,
+    timeout_ms: u64,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), CliError>> + Send + '_>> {
+    Box::pin(async move {
+        let bundle = serde_json::from_value(read_bounded_json(&file)?)?;
+        print_json(
+            &client
+                .import_workflow_draft(bcode_ipc::ImportWorkflowDraftRequest {
+                    bundle,
+                    workflow_id,
+                    draft_id,
+                    collision_policy:
+                        bcode_ipc::WorkflowImportCollisionPolicy::RequireExistingWorkflowNewDraft,
+                    control: workflow_computation_control(operation_id, timeout_ms),
+                })
+                .await?,
+        )?;
+        Ok(())
+    })
 }
 
 async fn handle_workflow_draft_command(
@@ -524,6 +714,14 @@ async fn handle_workflow_revision_command(
                         .map(|revision| bcode_workflow::WorkflowRevisionListCursor { revision }),
                     limit,
                 )
+                .await?,
+        )?,
+        WorkflowRevisionCommand::Inspect {
+            workflow_id,
+            revision,
+        } => print_json(
+            &client
+                .workflow_revision_requirement_inspection(workflow_id, revision)
                 .await?,
         )?,
         WorkflowRevisionCommand::Get {
@@ -1237,12 +1435,50 @@ enum WorkflowCommand {
     /// Runtime-authored workflow operations.
     Author {
         #[command(subcommand)]
-        command: WorkflowAuthorCommand,
+        command: Box<WorkflowAuthorCommand>,
+    },
+    /// Start one immutable authored-workflow revision.
+    Start {
+        #[command(subcommand)]
+        selection: WorkflowStartSelection,
+        #[arg(long)]
+        parent_session_id: SessionId,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        workspace_snapshot: Option<String>,
+        #[arg(long, value_name = "FILE")]
+        configuration: Option<PathBuf>,
     },
     /// Cancel one exact in-flight validation or compilation operation.
     CancelComputation {
         #[arg(long)]
         operation_id: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkflowStartSelection {
+    /// Start one exact immutable revision.
+    Revision {
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long)]
+        revision: u64,
+    },
+    /// Resolve and start the current active revision.
+    Active {
+        #[arg(long)]
+        workflow_id: String,
+    },
+    /// Resolve and start one exact preset generation.
+    Preset {
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long)]
+        preset_id: String,
+        #[arg(long)]
+        preset_generation: u64,
     },
 }
 
@@ -1269,6 +1505,13 @@ enum WorkflowAuthorCommand {
     Get {
         #[arg(long)]
         workflow_id: String,
+    },
+    /// Inspect one bounded aggregate authored-workflow snapshot.
+    Inspect {
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
     },
     /// Read mutable workflow drafts.
     Draft {
@@ -1312,6 +1555,33 @@ enum WorkflowAuthorCommand {
         #[arg(long, default_value_t = bcode_ipc::DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS)]
         timeout_ms: u64,
     },
+    /// Publish one exact draft and then attempt separately reported durable run admission.
+    PublishAndStart {
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long)]
+        draft_id: String,
+        #[arg(long)]
+        expected_generation: u64,
+        #[arg(long, value_name = "FILE")]
+        configuration: Option<PathBuf>,
+        #[arg(long)]
+        activate: bool,
+        #[arg(long)]
+        expected_active_revision: Option<u64>,
+        /// Stable identity usable by `workflow cancel-computation`.
+        #[arg(long)]
+        operation_id: Option<String>,
+        /// Server-enforced compilation deadline.
+        #[arg(long, default_value_t = bcode_ipc::DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS)]
+        timeout_ms: u64,
+        #[arg(long)]
+        parent_session_id: SessionId,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        workspace_snapshot: Option<String>,
+    },
     /// Compare-and-set one published revision as active.
     Activate {
         #[arg(long)]
@@ -1352,6 +1622,50 @@ enum WorkflowAuthorCommand {
     Preset {
         #[command(subcommand)]
         command: WorkflowPresetCommand,
+    },
+    /// Export one exact immutable revision as portable JSON.
+    Export {
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long)]
+        revision: u64,
+    },
+    /// Preview one portable export bundle import without mutation.
+    ImportPreview {
+        #[arg(value_name = "FILE", default_value = "-")]
+        file: PathBuf,
+        #[arg(long)]
+        target_workflow_id: String,
+        #[arg(long)]
+        operation_id: Option<String>,
+        #[arg(long, default_value_t = bcode_ipc::DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS)]
+        timeout_ms: u64,
+    },
+    /// Import one portable bundle as a new logical workflow and initial draft.
+    Import {
+        #[arg(value_name = "FILE", default_value = "-")]
+        file: PathBuf,
+        #[arg(long)]
+        target_workflow_id: String,
+        #[arg(long)]
+        draft_id: String,
+        #[arg(long)]
+        operation_id: Option<String>,
+        #[arg(long, default_value_t = bcode_ipc::DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS)]
+        timeout_ms: u64,
+    },
+    /// Import one portable bundle as a new draft in an existing workflow.
+    ImportDraft {
+        #[arg(value_name = "FILE", default_value = "-")]
+        file: PathBuf,
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long)]
+        draft_id: String,
+        #[arg(long)]
+        operation_id: Option<String>,
+        #[arg(long, default_value_t = bcode_ipc::DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS)]
+        timeout_ms: u64,
     },
     /// Print the portable authoring catalog as JSON.
     Catalog,
@@ -1410,6 +1724,13 @@ enum WorkflowRevisionCommand {
         before_revision: Option<u64>,
         #[arg(long, default_value_t = 100)]
         limit: usize,
+    },
+    /// Inspect current requirement availability separately from immutable revision facts.
+    Inspect {
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long)]
+        revision: u64,
     },
     /// Get one exact immutable revision.
     Get {

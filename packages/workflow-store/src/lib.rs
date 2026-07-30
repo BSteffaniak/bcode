@@ -19,7 +19,9 @@ use std::pin::Pin;
 use thiserror::Error;
 
 const DATABASE_FILE: &str = "workflow.db";
-const SCHEMA_VERSION: u32 = 7;
+const SCHEMA_VERSION: u32 = 8;
+/// Current durable authored-run provenance contract version.
+pub const AUTHORED_WORKFLOW_RUN_PROVENANCE_VERSION: u32 = 1;
 const MAX_ID_BYTES: usize = 512;
 const MAX_DISPLAY_LABEL_BYTES: usize = 512;
 const MAX_INLINE_JSON_BYTES: usize = 1_048_576;
@@ -98,6 +100,54 @@ impl DispatchSideEffect {
     }
 }
 
+/// Exact authored-workflow source and resolved configuration used to create one durable run.
+///
+/// This is diagnostic provenance only. Runtime dispatch and authorization continue to use the
+/// compiled definition and normalized operation facts rather than this metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredWorkflowRunProvenance {
+    /// Provenance contract version.
+    pub version: u32,
+    /// Stable authored workflow identity.
+    pub workflow_id: String,
+    /// Exact immutable published revision.
+    pub revision: u64,
+    /// Exact compiled definition identity recorded redundantly for bounded consistency checks.
+    pub definition_identity: bcode_workflow::WorkflowDefinitionIdentity,
+    /// Optional exact preset identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_id: Option<String>,
+    /// Optional exact preset generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_generation: Option<u64>,
+    /// Exact resolved, schema-validated runtime configuration.
+    pub configuration: serde_json::Value,
+}
+
+impl AuthoredWorkflowRunProvenance {
+    /// Construct current-version authored-run provenance.
+    #[must_use]
+    pub const fn new(
+        workflow_id: String,
+        revision: u64,
+        definition_identity: bcode_workflow::WorkflowDefinitionIdentity,
+        preset_id: Option<String>,
+        preset_generation: Option<u64>,
+        configuration: serde_json::Value,
+    ) -> Self {
+        Self {
+            version: AUTHORED_WORKFLOW_RUN_PROVENANCE_VERSION,
+            workflow_id,
+            revision,
+            definition_identity,
+            preset_id,
+            preset_generation,
+            configuration,
+        }
+    }
+}
+
 /// Bounded run summary used by normal list/status paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowRunSummary {
@@ -108,6 +158,9 @@ pub struct WorkflowRunSummary {
     pub parent_session_id: Option<String>,
     #[serde(default)]
     pub binding: Option<WorkflowRunBinding>,
+    /// Exact authored source when this run originated from a published authored workflow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_provenance: Option<AuthoredWorkflowRunProvenance>,
     pub status: RunStatus,
     pub cancellation_requested_at_ms: Option<u64>,
     pub created_at_ms: u64,
@@ -284,6 +337,10 @@ pub struct NewWorkflowRun {
     /// Optional bounded product ownership and discovery association.
     #[serde(default)]
     pub binding: Option<WorkflowRunBinding>,
+    /// Optional exact authored source and resolved configuration. This is persisted atomically
+    /// with run creation and must be supplied only for published authored revisions.
+    #[serde(default)]
+    pub authored_provenance: Option<AuthoredWorkflowRunProvenance>,
     /// Optional bounded initial input validated against the definition input schema.
     pub input: Option<serde_json::Value>,
     /// Creation timestamp supplied by the host clock.
@@ -908,6 +965,38 @@ pub struct WorkflowDraft {
     pub producer: WorkflowProducerProvenance,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
+}
+
+/// One bounded immutable authored-workflow lifecycle event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowAuthoringEventRow {
+    pub event_seq: u64,
+    pub workflow_id: String,
+    pub event_type: String,
+    pub payload: serde_json::Value,
+    pub created_at_ms: u64,
+}
+
+/// One bounded consistency issue found without repairing authored state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "issue", rename_all = "snake_case")]
+pub enum WorkflowAuthoringIssue {
+    InvalidActiveRevision {
+        revision: u64,
+    },
+    MissingCompiledDefinition {
+        revision: u64,
+        definition_id: String,
+        definition_version: u32,
+    },
+    OrphanedPreset {
+        preset_id: String,
+        revision: u64,
+    },
+    StaleDraftBase {
+        draft_id: String,
+        base_revision: u64,
+    },
 }
 
 /// Immutable published authored-workflow revision.
@@ -2169,6 +2258,141 @@ impl WorkflowStore {
             .map(|items| finish_authoring_store_page(items, limit))
     }
 
+    /// Return bounded authored lifecycle events without replaying or mutating state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity/bound, malformed event JSON, or query failure.
+    pub fn workflow_authoring_events(
+        &self,
+        workflow_id: &str,
+        after_event_seq: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<WorkflowAuthoringEventRow>, WorkflowStoreError> {
+        validate_id("workflow_id", workflow_id)?;
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT event_seq, workflow_id, event_type, payload_json, created_at_ms \
+             FROM workflow_authoring_events WHERE workflow_id = ?1 AND event_seq > ?2 \
+             ORDER BY event_seq LIMIT ?3",
+        )?;
+        statement
+            .query_map((workflow_id, after_event_seq.unwrap_or(0), limit), |row| {
+                Ok((
+                    row.get::<_, u64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u64>(4)?,
+                ))
+            })?
+            .map(|row| {
+                let (event_seq, workflow_id, event_type, payload_json, created_at_ms) = row?;
+                Ok(WorkflowAuthoringEventRow {
+                    event_seq,
+                    workflow_id,
+                    event_type,
+                    payload: serde_json::from_str(&payload_json)?,
+                    created_at_ms,
+                })
+            })
+            .collect()
+    }
+
+    /// Diagnose bounded authored-state consistency without repair, replay, or mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity/bound or query failure.
+    pub fn diagnose_authored_workflow(
+        &self,
+        workflow_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkflowAuthoringIssue>, WorkflowStoreError> {
+        validate_id("workflow_id", workflow_id)?;
+        let limit = bounded_limit(limit)?;
+        let mut issues = Vec::new();
+        let active_revision: Option<u64> = self
+            .connection
+            .query_row(
+                "SELECT active_revision FROM authored_workflows WHERE workflow_id = ?1",
+                [workflow_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+        if let Some(revision) = active_revision {
+            let exists: bool = self.connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workflow_revisions WHERE workflow_id = ?1 AND revision = ?2)",
+                (workflow_id, revision),
+                |row| row.get(0),
+            )?;
+            if !exists {
+                issues.push(WorkflowAuthoringIssue::InvalidActiveRevision { revision });
+            }
+        }
+        if issues.len() < usize::try_from(limit).unwrap_or(usize::MAX) {
+            let remaining = limit.saturating_sub(i64::try_from(issues.len()).unwrap_or(limit));
+            let mut statement = self.connection.prepare(
+                "SELECT revision, definition_id, definition_version FROM workflow_revisions revision \
+                 WHERE workflow_id = ?1 AND NOT EXISTS(SELECT 1 FROM workflow_definitions definition \
+                   WHERE definition.definition_id = revision.definition_id \
+                     AND definition.version = revision.definition_version) \
+                 ORDER BY revision LIMIT ?2",
+            )?;
+            issues.extend(
+                statement
+                    .query_map((workflow_id, remaining), |row| {
+                        Ok(WorkflowAuthoringIssue::MissingCompiledDefinition {
+                            revision: row.get(0)?,
+                            definition_id: row.get(1)?,
+                            definition_version: row.get(2)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        let remaining = limit.saturating_sub(i64::try_from(issues.len()).unwrap_or(limit));
+        if remaining > 0 {
+            let mut statement = self.connection.prepare(
+                "SELECT preset_id, revision FROM workflow_presets preset WHERE workflow_id = ?1 \
+                 AND NOT EXISTS(SELECT 1 FROM workflow_revisions revision \
+                   WHERE revision.workflow_id = preset.workflow_id AND revision.revision = preset.revision) \
+                 ORDER BY preset_id LIMIT ?2",
+            )?;
+            issues.extend(
+                statement
+                    .query_map((workflow_id, remaining), |row| {
+                        Ok(WorkflowAuthoringIssue::OrphanedPreset {
+                            preset_id: row.get(0)?,
+                            revision: row.get(1)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        let remaining = limit.saturating_sub(i64::try_from(issues.len()).unwrap_or(limit));
+        if remaining > 0 {
+            let mut statement = self.connection.prepare(
+                "SELECT draft_id, base_revision FROM workflow_drafts draft WHERE workflow_id = ?1 \
+                 AND base_revision IS NOT NULL AND NOT EXISTS(SELECT 1 FROM workflow_revisions revision \
+                   WHERE revision.workflow_id = draft.workflow_id AND revision.revision = draft.base_revision) \
+                 ORDER BY draft_id LIMIT ?2",
+            )?;
+            issues.extend(
+                statement
+                    .query_map((workflow_id, remaining), |row| {
+                        Ok(WorkflowAuthoringIssue::StaleDraftBase {
+                            draft_id: row.get(0)?,
+                            base_revision: row.get(1)?,
+                        })
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?,
+            );
+        }
+        Ok(issues)
+    }
+
     /// Replace one preset using exact optimistic generation.
     ///
     /// # Errors
@@ -2359,7 +2583,8 @@ impl WorkflowStore {
             .query_row(
                 "SELECT definition_id, definition_version, workspace_snapshot, parent_session_id, \
                  input_json, deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap, \
-                 owner_plugin_id, workflow_kind, scope_key, display_label, single_active \
+                 owner_plugin_id, workflow_kind, scope_key, display_label, single_active, \
+                 authored_provenance_json \
                  FROM workflow_runs WHERE run_id = ?1",
                 [&run.run_id],
                 |row| {
@@ -2379,6 +2604,7 @@ impl WorkflowStore {
                         row.get::<_, Option<String>>(12)?,
                         row.get::<_, Option<String>>(13)?,
                         row.get::<_, bool>(14)?,
+                        row.get::<_, Option<String>>(15)?,
                     ))
                 },
             )
@@ -2399,12 +2625,16 @@ impl WorkflowStore {
             scope_key,
             display_label,
             single_active,
+            authored_provenance_json,
         )) = existing
         else {
             self.create_run(run)?;
             return Ok(true);
         };
         let input = input_json
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?;
+        let authored_provenance = authored_provenance_json
             .map(|value| serde_json::from_str(&value))
             .transpose()?;
         let limits = WorkflowRunLimits {
@@ -2436,6 +2666,7 @@ impl WorkflowStore {
             && workspace_snapshot == run.workspace_snapshot
             && parent_session_id == run.parent_session_id
             && existing_binding == run.binding
+            && authored_provenance == run.authored_provenance
             && input == run.input
             && limits == run.limits
         {
@@ -2459,6 +2690,9 @@ impl WorkflowStore {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        if let Some(provenance) = &run.authored_provenance {
+            validate_persisted_authored_run_provenance(&transaction, run, provenance)?;
+        }
         if let Some(binding) = &run.binding
             && binding.single_active
         {
@@ -2514,13 +2748,19 @@ impl WorkflowStore {
                     binding.single_active,
                 )
             });
+        let authored_provenance_json = run
+            .authored_provenance
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
         transaction.execute(
             "INSERT INTO workflow_runs \
              (run_id, definition_id, definition_version, workspace_snapshot, parent_session_id, \
               owner_plugin_id, workflow_kind, scope_key, display_label, single_active, \
-              input_json, status, deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap, \
-              created_at_ms, updated_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?18)",
+              authored_provenance_json, input_json, status, deadline_at_ms, node_execution_cap, \
+              concurrency_cap, cycle_cap, retry_cap, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
+                     ?17, ?18, ?19, ?19)",
             rusqlite::params![
                 &run.run_id,
                 &run.definition_id,
@@ -2532,6 +2772,7 @@ impl WorkflowStore {
                 scope_key,
                 display_label,
                 single_active,
+                &authored_provenance_json,
                 &input_json,
                 RunStatus::Running.as_str(),
                 run.limits.deadline_at_ms,
@@ -5640,7 +5881,8 @@ impl WorkflowStore {
             .query_row(
                 "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
                  parent_session_id, owner_plugin_id, workflow_kind, scope_key, display_label, \
-                 single_active, status, cancellation_requested_at_ms, created_at_ms, updated_at_ms \
+                 single_active, authored_provenance_json, status, cancellation_requested_at_ms, \
+                 created_at_ms, updated_at_ms \
                  FROM workflow_runs WHERE run_id = ?1",
                 [run_id],
                 run_summary_from_row,
@@ -5787,7 +6029,8 @@ impl WorkflowStore {
         let mut statement = self.connection.prepare(
             "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
              parent_session_id, owner_plugin_id, workflow_kind, scope_key, display_label, \
-             single_active, status, cancellation_requested_at_ms, created_at_ms, updated_at_ms \
+             single_active, authored_provenance_json, status, cancellation_requested_at_ms, \
+             created_at_ms, updated_at_ms \
              FROM workflow_runs ORDER BY updated_at_ms DESC, run_id LIMIT ?1",
         )?;
         statement
@@ -5818,7 +6061,8 @@ impl WorkflowStore {
             .query_row(
                 "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
                  parent_session_id, owner_plugin_id, workflow_kind, scope_key, display_label, \
-                 single_active, status, cancellation_requested_at_ms, created_at_ms, updated_at_ms \
+                 single_active, authored_provenance_json, status, cancellation_requested_at_ms, \
+                 created_at_ms, updated_at_ms \
                  FROM workflow_runs WHERE owner_plugin_id = ?1 AND workflow_kind = ?2 \
                  AND scope_key = ?3 ORDER BY updated_at_ms DESC, run_id LIMIT 1",
                 (&key.owner_plugin_id, &key.workflow_kind, &key.scope_key),
@@ -7486,6 +7730,7 @@ type RawRunSummary = (
     Option<String>,
     Option<String>,
     bool,
+    Option<String>,
     String,
     Option<u64>,
     u64,
@@ -7508,6 +7753,7 @@ fn run_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRunSumma
         row.get(11)?,
         row.get(12)?,
         row.get(13)?,
+        row.get(14)?,
     ))
 }
 
@@ -7523,11 +7769,15 @@ fn parse_run_summary(raw: RawRunSummary) -> Result<WorkflowRunSummary, WorkflowS
         scope_key,
         display_label,
         single_active,
+        authored_provenance_json,
         status,
         cancellation_requested_at_ms,
         created_at_ms,
         updated_at_ms,
     ) = raw;
+    let authored_provenance: Option<AuthoredWorkflowRunProvenance> = authored_provenance_json
+        .map(|value| serde_json::from_str(&value))
+        .transpose()?;
     let binding = match (owner_plugin_id, workflow_kind, scope_key) {
         (Some(owner_plugin_id), Some(workflow_kind), Some(scope_key)) => Some(WorkflowRunBinding {
             owner_plugin_id,
@@ -7543,6 +7793,22 @@ fn parse_run_summary(raw: RawRunSummary) -> Result<WorkflowRunSummary, WorkflowS
             ));
         }
     };
+    if let Some(provenance) = &authored_provenance
+        && (provenance.version != AUTHORED_WORKFLOW_RUN_PROVENANCE_VERSION
+            || provenance.revision == 0
+            || provenance.workflow_id.trim().is_empty()
+            || provenance.definition_identity.kind != provenance.workflow_id
+            || provenance.definition_identity.definition_id != definition_id
+            || provenance.definition_identity.definition_version != definition_version
+            || matches!(
+                (&provenance.preset_id, provenance.preset_generation),
+                (Some(_), None) | (None, Some(_))
+            ))
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "stored authored workflow run provenance is inconsistent".to_string(),
+        ));
+    }
     Ok(WorkflowRunSummary {
         run_id,
         definition_id,
@@ -7550,6 +7816,7 @@ fn parse_run_summary(raw: RawRunSummary) -> Result<WorkflowRunSummary, WorkflowS
         workspace_snapshot,
         parent_session_id,
         binding,
+        authored_provenance,
         status: parse_run_status(&status)?,
         cancellation_requested_at_ms,
         created_at_ms,
@@ -8114,6 +8381,119 @@ fn validate_run(run: &NewWorkflowRun) -> Result<(), WorkflowStoreError> {
     if let Some(binding) = &run.binding {
         validate_binding(binding)?;
     }
+    if let Some(provenance) = &run.authored_provenance {
+        validate_authored_run_provenance(run, provenance)?;
+    }
+    Ok(())
+}
+
+fn validate_authored_run_provenance(
+    run: &NewWorkflowRun,
+    provenance: &AuthoredWorkflowRunProvenance,
+) -> Result<(), WorkflowStoreError> {
+    if provenance.version != AUTHORED_WORKFLOW_RUN_PROVENANCE_VERSION {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "unsupported authored workflow run provenance version: {}",
+            provenance.version
+        )));
+    }
+    validate_id("authored workflow_id", &provenance.workflow_id)?;
+    if provenance.revision == 0 {
+        return Err(WorkflowStoreError::InvalidData(
+            "authored workflow revision must be positive".to_string(),
+        ));
+    }
+    validate_id(
+        "authored definition kind",
+        &provenance.definition_identity.kind,
+    )?;
+    if provenance.definition_identity.kind != provenance.workflow_id {
+        return Err(WorkflowStoreError::InvalidData(
+            "authored definition kind must match the authored workflow identity".to_string(),
+        ));
+    }
+    validate_id(
+        "authored definition_id",
+        &provenance.definition_identity.definition_id,
+    )?;
+    if provenance.definition_identity.definition_version == 0 {
+        return Err(WorkflowStoreError::InvalidData(
+            "authored definition version must be positive".to_string(),
+        ));
+    }
+    if provenance.definition_identity.definition_id != run.definition_id
+        || provenance.definition_identity.definition_version != run.definition_version
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "authored run provenance definition does not match the run definition".to_string(),
+        ));
+    }
+    match (&provenance.preset_id, provenance.preset_generation) {
+        (Some(preset_id), Some(generation)) => {
+            validate_id("authored preset_id", preset_id)?;
+            if generation == 0 {
+                return Err(WorkflowStoreError::InvalidData(
+                    "authored preset generation must be positive".to_string(),
+                ));
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(WorkflowStoreError::InvalidData(
+                "authored preset identity and generation must be present together".to_string(),
+            ));
+        }
+    }
+    bounded_json("authored run configuration", &provenance.configuration)?;
+    Ok(())
+}
+
+fn validate_persisted_authored_run_provenance(
+    transaction: &Transaction<'_>,
+    run: &NewWorkflowRun,
+    provenance: &AuthoredWorkflowRunProvenance,
+) -> Result<(), WorkflowStoreError> {
+    let revision = transaction
+        .query_row(
+            "SELECT definition_id, definition_version FROM workflow_revisions \
+             WHERE workflow_id = ?1 AND revision = ?2",
+            (&provenance.workflow_id, provenance.revision),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?)),
+        )
+        .optional()?;
+    let Some((definition_id, definition_version)) = revision else {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "authored workflow revision not found: {} v{}",
+            provenance.workflow_id, provenance.revision
+        )));
+    };
+    if definition_id != run.definition_id
+        || definition_version != run.definition_version
+        || provenance.definition_identity.definition_id != definition_id
+        || provenance.definition_identity.definition_version != definition_version
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "authored run provenance does not match the persisted revision definition".to_string(),
+        ));
+    }
+    if let (Some(preset_id), Some(preset_generation)) =
+        (&provenance.preset_id, provenance.preset_generation)
+    {
+        let preset = transaction
+            .query_row(
+                "SELECT revision, generation FROM workflow_presets \
+                 WHERE workflow_id = ?1 AND preset_id = ?2",
+                (&provenance.workflow_id, preset_id),
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?)),
+            )
+            .optional()?;
+        if preset != Some((provenance.revision, preset_generation)) {
+            return Err(WorkflowStoreError::InvalidData(
+                "authored run provenance does not match the persisted preset generation"
+                    .to_string(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -8614,6 +8994,7 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
              scope_key TEXT,\
              display_label TEXT,\
              single_active INTEGER NOT NULL DEFAULT 0,\
+             authored_provenance_json TEXT,\
              input_json TEXT,\
              status TEXT NOT NULL,\
              cancellation_requested_at_ms INTEGER,\
@@ -8896,6 +9277,24 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
     transaction.execute(
         "UPDATE workflow_store_contract SET schema_version = 7 \
          WHERE contract_id = 1 AND schema_version = 6",
+        [],
+    )?;
+    let run_columns = transaction
+        .prepare("PRAGMA table_info(workflow_runs)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !run_columns
+        .iter()
+        .any(|existing| existing == "authored_provenance_json")
+    {
+        transaction.execute(
+            "ALTER TABLE workflow_runs ADD COLUMN authored_provenance_json TEXT",
+            [],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE workflow_store_contract SET schema_version = 8 \
+         WHERE contract_id = 1 AND schema_version = 7",
         [],
     )?;
     let actual: u32 = transaction.query_row(
@@ -9283,6 +9682,7 @@ mod tests {
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: None,
                 binding: None,
+                authored_provenance: None,
                 input: Some(input),
                 created_at_ms: 10,
                 limits: WorkflowRunLimits::default(),
@@ -9375,6 +9775,7 @@ mod tests {
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: None,
                     binding: None,
+                    authored_provenance: None,
                     input: Some(input),
                     created_at_ms: 10,
                     limits: WorkflowRunLimits::default(),
@@ -9475,6 +9876,7 @@ mod tests {
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: None,
                     binding: None,
+                    authored_provenance: None,
                     input: Some(input),
                     created_at_ms: 10,
                     limits: WorkflowRunLimits::default(),
@@ -9521,6 +9923,7 @@ mod tests {
                     workspace_snapshot: "snapshot-1".to_string(),
                     parent_session_id: None,
                     binding: None,
+                    authored_provenance: None,
                     input: Some(input.clone()),
                     created_at_ms: 10,
                     limits: WorkflowRunLimits::default(),
@@ -9574,6 +9977,7 @@ mod tests {
                 workspace_snapshot: "snapshot-1".to_string(),
                 parent_session_id: None,
                 binding: None,
+                authored_provenance: None,
                 input: Some(input.clone()),
                 created_at_ms: 10,
                 limits: WorkflowRunLimits::default(),
@@ -9614,10 +10018,117 @@ mod tests {
             workspace_snapshot: "snapshot-1".to_string(),
             parent_session_id: Some("session-1".to_string()),
             binding: None,
+            authored_provenance: None,
             input: Some(serde_json::json!(1)),
             created_at_ms: 10,
             limits: WorkflowRunLimits::default(),
         }
+    }
+
+    fn authored_run_provenance() -> AuthoredWorkflowRunProvenance {
+        AuthoredWorkflowRunProvenance::new(
+            "authored/example".to_string(),
+            3,
+            bcode_workflow::WorkflowDefinitionIdentity {
+                kind: "authored/example".to_string(),
+                definition_id: "example".to_string(),
+                definition_version: 1,
+            },
+            Some("review".to_string()),
+            Some(4),
+            serde_json::json!({"message": "review"}),
+        )
+    }
+
+    fn persist_authored_run_provenance_fixture(store: &WorkflowStore) {
+        store
+            .connection
+            .execute(
+                "INSERT INTO authored_workflows \
+                 (workflow_id, title, archived, active_revision, created_at_ms, updated_at_ms) \
+                 VALUES ('authored/example', 'Example', 0, NULL, 1, 1)",
+                [],
+            )
+            .expect("authored workflow");
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_revisions \
+                 (workflow_id, revision, source_checksum_sha256, \
+                  executable_source_checksum_sha256, definition_id, definition_version, \
+                  document_json, producer_json, published_at_ms) \
+                 VALUES ('authored/example', 3, 'source', 'executable', 'example', 1, '{}', '{}', 2)",
+                [],
+            )
+            .expect("authored revision");
+        store
+            .connection
+            .execute(
+                "INSERT INTO workflow_presets \
+                 (workflow_id, preset_id, revision, name, generation, configuration_json, \
+                  run_limits_json, producer_json, created_at_ms, updated_at_ms) \
+                 VALUES ('authored/example', 'review', 3, 'Review', 4, '{}', NULL, '{}', 3, 3)",
+                [],
+            )
+            .expect("authored preset");
+    }
+
+    #[test]
+    fn authored_run_provenance_is_atomic_idempotent_and_restart_safe() {
+        let temp = tempfile::tempdir().expect("temp");
+        let run = NewWorkflowRun {
+            authored_provenance: Some(authored_run_provenance()),
+            ..new_run()
+        };
+        {
+            let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+            store
+                .persist_definition("example", 1, &definition("example"))
+                .expect("definition");
+            persist_authored_run_provenance_fixture(&store);
+            assert!(store.create_run_idempotent(&run).expect("create"));
+            assert!(!store.create_run_idempotent(&run).expect("repeat"));
+        }
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(
+            store
+                .run_summary("run-1")
+                .expect("summary")
+                .expect("run")
+                .authored_provenance,
+            run.authored_provenance
+        );
+        let conflicting = NewWorkflowRun {
+            authored_provenance: Some(AuthoredWorkflowRunProvenance {
+                configuration: serde_json::json!({"message": "different"}),
+                ..authored_run_provenance()
+            }),
+            ..run
+        };
+        assert!(store.create_run_idempotent(&conflicting).is_err());
+    }
+
+    #[test]
+    fn authored_run_provenance_definition_mismatch_fails_before_persistence() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        persist_authored_run_provenance_fixture(&store);
+        let run = NewWorkflowRun {
+            authored_provenance: Some(AuthoredWorkflowRunProvenance {
+                definition_identity: bcode_workflow::WorkflowDefinitionIdentity {
+                    kind: "authored/example".to_string(),
+                    definition_id: "different".to_string(),
+                    definition_version: 1,
+                },
+                ..authored_run_provenance()
+            }),
+            ..new_run()
+        };
+        assert!(store.create_run(&run).is_err());
+        assert!(store.run_summary("run-1").expect("summary").is_none());
     }
 
     #[test]
@@ -9696,6 +10207,7 @@ mod tests {
 
         for conflict in [
             NewWorkflowRun {
+                authored_provenance: None,
                 input: Some(serde_json::json!(2)),
                 ..run.clone()
             },
@@ -10194,6 +10706,7 @@ mod tests {
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
                 binding: None,
+                authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
                 created_at_ms: 1,
                 limits: WorkflowRunLimits::default(),
@@ -10279,6 +10792,7 @@ mod tests {
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
                 binding: None,
+                authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
                 created_at_ms: 1,
                 limits: WorkflowRunLimits::default(),
@@ -10363,6 +10877,7 @@ mod tests {
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
                 binding: None,
+                authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
                 created_at_ms: 1,
                 limits: WorkflowRunLimits {
@@ -10451,6 +10966,7 @@ mod tests {
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
                 binding: None,
+                authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
                 created_at_ms: 1,
                 limits: WorkflowRunLimits {
@@ -11964,6 +12480,7 @@ mod tests {
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
                 binding: None,
+                authored_provenance: None,
                 input: Some(serde_json::json!(3)),
                 created_at_ms: 1,
                 limits: WorkflowRunLimits::default(),
@@ -12445,6 +12962,7 @@ mod tests {
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
                 binding: None,
+                authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
                 limits: WorkflowRunLimits {
@@ -12617,6 +13135,7 @@ mod tests {
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
                 binding: None,
+                authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
                 limits: WorkflowRunLimits::default(),
@@ -12827,6 +13346,7 @@ mod tests {
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
                 binding: None,
+                authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
                 limits: WorkflowRunLimits::default(),
@@ -13038,6 +13558,7 @@ mod tests {
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
                 binding: None,
+                authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
                 limits: WorkflowRunLimits::default(),
@@ -13139,6 +13660,7 @@ mod tests {
                 workspace_snapshot: "snapshot".to_string(),
                 parent_session_id: None,
                 binding: None,
+                authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
                 limits: WorkflowRunLimits {
@@ -13419,6 +13941,7 @@ mod tests {
                     workspace_snapshot: "snapshot".to_string(),
                     parent_session_id: None,
                     binding: None,
+                    authored_provenance: None,
                     input: Some(value.clone()),
                     created_at_ms: 1,
                     limits: WorkflowRunLimits::default(),
@@ -13952,6 +14475,56 @@ mod tests {
     }
 
     #[test]
+    fn schema_seven_migrates_authored_run_provenance_column_to_schema_eight() {
+        let temp = tempfile::tempdir().expect("temp");
+        let workflows = temp.path().join("workflows");
+        std::fs::create_dir_all(&workflows).expect("workflows directory");
+        let path = workflows.join(DATABASE_FILE);
+        let connection = Connection::open(&path).expect("legacy database");
+        connection
+            .execute_batch(
+                "CREATE TABLE workflow_store_contract (\
+                     contract_id INTEGER PRIMARY KEY CHECK (contract_id = 1),\
+                     schema_version INTEGER NOT NULL\
+                 );\
+                 INSERT INTO workflow_store_contract (contract_id, schema_version) VALUES (1, 7);\
+                 CREATE TABLE workflow_runs (\
+                     run_id TEXT PRIMARY KEY NOT NULL,\
+                     owner_plugin_id TEXT,\
+                     workflow_kind TEXT,\
+                     scope_key TEXT,\
+                     updated_at_ms INTEGER NOT NULL\
+                 );",
+            )
+            .expect("legacy contract");
+        drop(connection);
+
+        let store = WorkflowStore::open_in_state_dir(temp.path()).expect("migrated store");
+        let columns = store
+            .connection
+            .prepare("PRAGMA table_info(workflow_runs)")
+            .expect("columns")
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("column rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("column names");
+        assert!(
+            columns
+                .iter()
+                .any(|column| column == "authored_provenance_json")
+        );
+        let version = store
+            .connection
+            .query_row(
+                "SELECT schema_version FROM workflow_store_contract WHERE contract_id = 1",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .expect("schema version");
+        assert_eq!(version, SCHEMA_VERSION);
+    }
+
+    #[test]
     fn initial_workflow_and_draft_creation_is_atomic() {
         let temp = tempfile::tempdir().expect("temp");
         let (workflow, draft, _) = authored_store_fixture();
@@ -14050,6 +14623,61 @@ mod tests {
             .expect("next draft page");
         assert!(!drafts.has_more);
         assert_eq!(drafts.items[0].draft_id, "draft-2");
+    }
+
+    #[test]
+    fn authored_inspection_is_bounded_non_mutating_and_reports_corruption() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (workflow, draft, catalog) = authored_store_fixture();
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store.create_authored_workflow(&workflow).expect("workflow");
+        store.create_workflow_draft(&draft).expect("draft");
+        let preview = draft.document.compilation_preview(&catalog, None);
+        store
+            .publish_workflow_draft(
+                &workflow.workflow_id,
+                &draft.draft_id,
+                1,
+                &preview,
+                true,
+                None,
+                3,
+            )
+            .expect("publish");
+        let events = store
+            .workflow_authoring_events(&workflow.workflow_id, None, 1)
+            .expect("events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "revision_published");
+        let before = store
+            .workflow_revision(&workflow.workflow_id, 1)
+            .expect("revision")
+            .expect("revision");
+        store
+            .connection
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("foreign keys");
+        store
+            .connection
+            .execute(
+                "UPDATE authored_workflows SET active_revision = 99 WHERE workflow_id = ?1",
+                [&workflow.workflow_id],
+            )
+            .expect("corrupt active pointer");
+        let issues = store
+            .diagnose_authored_workflow(&workflow.workflow_id, 1)
+            .expect("diagnostics");
+        assert_eq!(
+            issues,
+            vec![WorkflowAuthoringIssue::InvalidActiveRevision { revision: 99 }]
+        );
+        assert_eq!(
+            store
+                .workflow_revision(&workflow.workflow_id, 1)
+                .expect("revision")
+                .expect("revision"),
+            before
+        );
     }
 
     #[test]
