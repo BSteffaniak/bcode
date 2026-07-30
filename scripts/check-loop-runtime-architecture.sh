@@ -552,7 +552,7 @@ fi
 if ! grep -F 'runtime_work_status_label_preserves_semantic_activity' packages/session-view/models/src/tests.rs >/dev/null ||
    ! grep -F 'authoritative_runtime_work_snapshot_drives_tui_activity' packages/tui/src/app.rs >/dev/null ||
    ! grep -F 'runtime_work_terminal_state_leaves_sibling_active_and_rejects_late_revival' packages/session-view/src/lib.rs >/dev/null ||
-   ! grep -F 'terminal_runtime_work_without_visible_start_is_history_only' packages/session-view/src/lib.rs >/dev/null ||
+   ! grep -F 'terminal_runtime_work_without_visible_start_leaves_no_history' packages/session-view/src/lib.rs >/dev/null ||
    ! grep -F 'hyperchad_projection_keeps_active_sibling_and_does_not_revive_terminal_work' packages/hyperchad/src/lib.rs >/dev/null ||
    ! grep -F 'runtime_work_activity_is_excluded_from_model_context' packages/server/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: grouped activity or terminal late-event suppression coverage was removed." >&2
@@ -1379,6 +1379,23 @@ if ! grep -F 'struct SessionViewTerminalAdapter' packages/tui/src/session_view_t
   || ! grep -F 'raw_durable_handlers_cannot_create_or_finalize_terminal_rows' packages/tui/src/app.rs >/dev/null \
   || ! grep -F 'raw_live_handlers_cannot_create_or_finalize_terminal_rows' packages/tui/src/app.rs >/dev/null; then
   echo "Runtime architecture violation: the single SessionView-to-terminal adapter boundary or raw-handler non-mutation coverage was removed." >&2
+  violations=1
+fi
+
+if ! python3 - <<'PY'
+from pathlib import Path
+source = Path("packages/session-view/models/src/lib.rs").read_text()
+body = source.split("pub enum TranscriptViewItemKind {", 1)[1].split("\n}", 1)[0]
+for forbidden in ("Usage {", "RuntimeWork {"):
+    if forbidden in body:
+        raise SystemExit(f"forbidden metadata transcript variant remains: {forbidden}")
+view = Path("packages/session-view/src/lib.rs").read_text()
+for forbidden in ("TranscriptViewItemKind::Usage", "TranscriptViewItemKind::RuntimeWork"):
+    if forbidden in view:
+        raise SystemExit(f"forbidden metadata transcript projection remains: {forbidden}")
+PY
+then
+  echo "Runtime architecture violation: usage or runtime-work was reintroduced as transcript content." >&2
   violations=1
 fi
 

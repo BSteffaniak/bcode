@@ -2,12 +2,12 @@
 
 #[cfg(test)]
 use bcode_session_models::{SessionEvent, SessionEventKind};
-use bcode_session_models::{SessionTokenUsage, ToolArtifact, ToolInvocationResult};
+use bcode_session_models::{ToolArtifact, ToolInvocationResult};
 #[cfg(test)]
 use bcode_session_view::SessionView;
 use bcode_session_view_models::{
-    InteractionViewSummary, RuntimeWorkView, TextFormat, ToolInvocationView,
-    ToolInvocationViewStatus, ToolResultView, TranscriptViewItem, TranscriptViewItemKind,
+    InteractionViewSummary, TextFormat, ToolInvocationView, ToolInvocationViewStatus,
+    ToolResultView, TranscriptViewItem, TranscriptViewItemKind,
 };
 
 /// Generic timing metadata for a tool invocation.
@@ -69,11 +69,6 @@ pub enum TranscriptItemKind {
         is_error: bool,
         /// Generic timing metadata for the tool invocation.
         timing: ToolTiming,
-    },
-    /// Token usage telemetry for a model turn.
-    Usage {
-        /// Model turn identifier.
-        turn_id: String,
     },
     /// Permission request for a tool call.
     PermissionRequest {
@@ -297,7 +292,6 @@ impl TranscriptItem {
             TranscriptItemKind::UserMessage
             | TranscriptItemKind::AssistantMessage
             | TranscriptItemKind::ReasoningMessage
-            | TranscriptItemKind::Usage { .. }
             | TranscriptItemKind::PermissionResult { .. }
             | TranscriptItemKind::System
             | TranscriptItemKind::Meta
@@ -782,7 +776,6 @@ pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
                 .map_or("System", |_| "Plugin");
             message_text_item(role, message, item.streaming, TranscriptItemKind::System)
         }
-        TranscriptViewItemKind::Usage { usage } => model_usage_item(&usage.turn_id, &usage.usage),
         TranscriptViewItemKind::Compaction { compaction } => TranscriptItem::with_kind(
             "Compaction",
             compaction.text.clone(),
@@ -806,9 +799,6 @@ pub fn terminal_item_from_shared(item: &TranscriptViewItem) -> TranscriptItem {
         }
         TranscriptViewItemKind::Permission { permission } => {
             terminal_permission_item_from_shared(permission)
-        }
-        TranscriptViewItemKind::RuntimeWork { work } => {
-            terminal_runtime_work_item_from_shared(work)
         }
         TranscriptViewItemKind::Interaction { interaction } => {
             terminal_interaction_item_from_shared(interaction)
@@ -1030,25 +1020,6 @@ fn terminal_permission_item_from_shared(
     )
 }
 
-fn terminal_runtime_work_item_from_shared(work: &RuntimeWorkView) -> TranscriptItem {
-    let mut lines = vec![format!("{}: {:?}", work.work_id, work.status)];
-    if !work.label.is_empty() {
-        lines.push(format!("label: {}", work.label));
-    }
-    if let Some(message) = &work.message {
-        lines.push(format!("message: {message}"));
-    }
-    if let (Some(completed), Some(total)) = (work.completed_units, work.total_units) {
-        lines.push(format!("progress: {completed}/{total}"));
-    }
-    TranscriptItem::with_kind(
-        "Runtime work",
-        lines.join("\n"),
-        !work.is_terminal(),
-        TranscriptItemKind::Meta,
-    )
-}
-
 fn terminal_interaction_item_from_shared(interaction: &InteractionViewSummary) -> TranscriptItem {
     let state = if interaction.resolved {
         "resolved"
@@ -1071,33 +1042,6 @@ fn terminal_interaction_item_from_shared(interaction: &InteractionViewSummary) -
         format!("{label} ({state})\nAnswer in the active interaction panel.")
     };
     TranscriptItem::with_kind("Interaction", text, false, TranscriptItemKind::Generic)
-}
-
-/// Build a compact transcript item for model token usage.
-#[must_use]
-pub fn model_usage_item(turn_id: &str, usage: &SessionTokenUsage) -> TranscriptItem {
-    TranscriptItem::with_kind(
-        "Usage",
-        format!(
-            "input {} · output {} · total {} · cached {} · cache write {} · reasoning {}",
-            optional_u32(usage.input_tokens),
-            optional_u32(usage.output_tokens),
-            optional_u32(usage.metered_total_tokens()),
-            optional_u32(usage.cached_input_tokens),
-            optional_u32(usage.cache_write_input_tokens),
-            optional_u32(usage.reasoning_tokens),
-        ),
-        false,
-        TranscriptItemKind::Usage {
-            turn_id: turn_id.to_owned(),
-        },
-    )
-}
-
-/// Format optional token counts.
-#[must_use]
-pub fn optional_u32(value: Option<u32>) -> String {
-    value.map_or_else(|| "unknown".to_owned(), |value| value.to_string())
 }
 
 /// Format JSON-like values for transcript display.
@@ -1382,11 +1326,6 @@ mod tests {
 
     #[test]
     fn shared_generic_items_adapt_without_renderer_types_crossing_the_boundary() {
-        let usage = bcode_session_models::SessionTokenUsage {
-            input_tokens: Some(2),
-            output_tokens: Some(3),
-            ..bcode_session_models::SessionTokenUsage::default()
-        };
         let cases = [
             (
                 TranscriptViewItemKind::UserMessage {
@@ -1415,18 +1354,6 @@ mod tests {
                 },
                 "System",
                 TranscriptItemKind::System,
-            ),
-            (
-                TranscriptViewItemKind::Usage {
-                    usage: bcode_session_view_models::UsageView {
-                        turn_id: "turn-1".to_owned(),
-                        usage,
-                    },
-                },
-                "Usage",
-                TranscriptItemKind::Usage {
-                    turn_id: "turn-1".to_owned(),
-                },
             ),
         ];
 

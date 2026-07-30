@@ -804,7 +804,7 @@ if ! rg -q 'unknown_historical_kind_fails_writable_migration' packages/session-m
   violations=1
 fi
 
-if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 19' packages/ipc/src/lib.rs \
+if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 20' packages/ipc/src/lib.rs \
   || ! rg -q 'PrepareSessionOpen' packages/ipc/src/lib.rs \
   || ! rg -q 'WaitSessionOpenProgress' packages/ipc/src/lib.rs \
   || ! rg -q 'SessionOpenPrepared' packages/ipc/src/lib.rs \

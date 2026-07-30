@@ -117,12 +117,6 @@ impl TranscriptViewItemId {
         Self(format!("permission:{permission_id}"))
     }
 
-    /// Create an identifier for runtime work.
-    #[must_use]
-    pub fn runtime_work(work_id: &WorkId) -> Self {
-        Self(format!("runtime-work:{work_id}"))
-    }
-
     /// Create an identifier for an interaction.
     #[must_use]
     pub fn interaction(interaction_id: &str) -> Self {
@@ -258,7 +252,7 @@ pub struct SessionViewSnapshot {
 
 impl SessionViewSnapshot {
     /// Current snapshot schema version.
-    pub const SCHEMA_VERSION: u16 = 14;
+    pub const SCHEMA_VERSION: u16 = 15;
 
     /// Create an empty snapshot.
     #[must_use]
@@ -342,6 +336,9 @@ impl SessionViewSnapshot {
         }
 
         self.transcript.apply_patch(patch)?;
+        if let Some(latest_sequence) = patch.latest_sequence {
+            self.latest_sequence = Some(latest_sequence);
+        }
         for key in &patch.removed_contributions {
             self.contributions.remove(key);
         }
@@ -351,7 +348,9 @@ impl SessionViewSnapshot {
             .extend(patch.active_invocations.clone());
         self.tools.extend(patch.tools.clone());
         upsert_permissions(&mut self.permissions, &patch.permissions);
-        upsert_runtime_work(&mut self.runtime_work, &patch.runtime_work);
+        if let Some(runtime_work) = &patch.runtime_work {
+            self.runtime_work.clone_from(runtime_work);
+        }
         if let Some(active_skills) = &patch.active_skills {
             self.active_skills.clone_from(active_skills);
         }
@@ -382,6 +381,9 @@ pub struct SessionViewPatch {
     pub revision: ViewRevision,
     /// Target session identifier, when known.
     pub session_id: Option<SessionId>,
+    /// Latest durable sequence included in the target snapshot, when it advanced.
+    #[serde(default)]
+    pub latest_sequence: Option<u64>,
     /// Full snapshot reset used when an incremental patch would not be correctness-preserving.
     #[serde(default)]
     pub reset: Option<Box<SessionViewSnapshot>>,
@@ -400,8 +402,9 @@ pub struct SessionViewPatch {
     pub tools: BTreeMap<String, ToolInvocationView>,
     /// Permission updates.
     pub permissions: Vec<PermissionView>,
-    /// Runtime-work updates.
-    pub runtime_work: Vec<RuntimeWorkView>,
+    /// Active runtime-work replacement, when changed.
+    #[serde(default)]
+    pub runtime_work: Option<Vec<RuntimeWorkView>>,
     /// Active skill-set replacement, when changed.
     pub active_skills: Option<BTreeSet<String>>,
     /// Plugin status updates keyed by plugin and note identity.
@@ -418,7 +421,7 @@ pub struct SessionViewPatch {
 
 impl SessionViewPatch {
     /// Current patch schema version.
-    pub const SCHEMA_VERSION: u16 = 14;
+    pub const SCHEMA_VERSION: u16 = 15;
 
     /// Create an empty patch between two revisions.
     #[must_use]
@@ -428,6 +431,7 @@ impl SessionViewPatch {
             base_revision,
             revision,
             session_id: None,
+            latest_sequence: None,
             reset: None,
             transcript: Vec::new(),
             contributions: BTreeMap::new(),
@@ -436,7 +440,7 @@ impl SessionViewPatch {
             active_invocations: BTreeMap::new(),
             tools: BTreeMap::new(),
             permissions: Vec::new(),
-            runtime_work: Vec::new(),
+            runtime_work: None,
             active_skills: None,
             plugin_status: BTreeMap::new(),
             composer: None,
@@ -486,6 +490,9 @@ impl SessionViewPatch {
             patch.reset = Some(Box::new(next.clone()));
             return patch;
         }
+        if base.latest_sequence != next.latest_sequence {
+            patch.latest_sequence = next.latest_sequence;
+        }
         patch.contributions = changed_map_entries(&base.contributions, &next.contributions);
         patch.removed_contributions = removed_map_keys(&base.contributions, &next.contributions);
         patch.active_exchanges =
@@ -493,6 +500,12 @@ impl SessionViewPatch {
         patch.active_invocations =
             changed_map_entries(&base.active_invocations, &next.active_invocations);
         patch.tools = changed_map_entries(&base.tools, &next.tools);
+        if base.runtime_work != next.runtime_work {
+            patch.runtime_work = Some(next.runtime_work.clone());
+        }
+        if base.runtime != next.runtime {
+            patch.runtime = Some(next.runtime.clone());
+        }
         patch.plugin_status = changed_map_entries(&base.plugin_status, &next.plugin_status);
         patch
     }
@@ -732,17 +745,14 @@ fn snapshot_requires_reset(base: &SessionViewSnapshot, next: &SessionViewSnapsho
         || base.session_id != next.session_id
         || base.title != next.title
         || base.working_directory != next.working_directory
-        || base.latest_sequence != next.latest_sequence
         || map_has_removals(&base.active_exchanges, &next.active_exchanges)
         || map_has_removals(&base.active_invocations, &next.active_invocations)
         || map_has_removals(&base.tools, &next.tools)
         || base.permissions != next.permissions
-        || base.runtime_work != next.runtime_work
         || base.active_skills != next.active_skills
         || map_has_removals(&base.plugin_status, &next.plugin_status)
         || base.composer != next.composer
         || base.thinking != next.thinking
-        || base.runtime != next.runtime
         || base.interactions != next.interactions
         || base.session_summary != next.session_summary
 }
@@ -752,12 +762,6 @@ fn upsert_permissions(target: &mut Vec<PermissionView>, updates: &[PermissionVie
         upsert_by(target, update.clone(), |permission| {
             permission.permission_id.as_str()
         });
-    }
-}
-
-fn upsert_runtime_work(target: &mut Vec<RuntimeWorkView>, updates: &[RuntimeWorkView]) {
-    for update in updates {
-        upsert_by(target, update.clone(), |work| work.work_id.0.as_str());
     }
 }
 
@@ -962,10 +966,6 @@ pub enum TranscriptViewItemKind {
     ToolRequest { tool: Box<ToolInvocationView> },
     /// Permission request block.
     Permission { permission: PermissionView },
-    /// Runtime work status block.
-    RuntimeWork { work: RuntimeWorkView },
-    /// Provider-neutral model usage accounting.
-    Usage { usage: UsageView },
     /// Context compaction transcript note.
     Compaction { compaction: CompactionView },
     /// Interactive request block.
@@ -1012,15 +1012,6 @@ impl ReasoningActivityView {
             .collect::<Vec<_>>()
             .join("\n\n")
     }
-}
-
-/// Renderer-neutral model usage transcript item.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UsageView {
-    /// Model turn identifier.
-    pub turn_id: String,
-    /// Provider-neutral usage accounting.
-    pub usage: SessionTokenUsage,
 }
 
 /// Renderer-neutral context compaction transcript note.

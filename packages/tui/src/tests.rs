@@ -2406,7 +2406,7 @@ fn assistant_final_replaces_stream_when_usage_is_interleaved() {
     assert_eq!(assistant_items.len(), 1);
     assert_eq!(assistant_items[0].text(), "Fixed.");
     assert!(!assistant_items[0].streaming());
-    assert!(app.transcript().iter().any(|item| item.role() == "Usage"));
+    assert!(app.session_view_snapshot().runtime.latest_usage.is_some());
 }
 
 #[test]

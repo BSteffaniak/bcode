@@ -77,23 +77,7 @@ pub(super) fn unrepresented_active_invocations(
 pub(super) fn unrepresented_runtime_work(
     snapshot: &SessionViewSnapshot,
 ) -> Vec<bcode_session_view_models::RuntimeWorkView> {
-    let represented = snapshot
-        .transcript
-        .items
-        .iter()
-        .filter_map(|item| match &item.kind {
-            bcode_session_view_models::TranscriptViewItemKind::RuntimeWork { work } => {
-                Some(&work.work_id)
-            }
-            _ => None,
-        })
-        .collect::<BTreeSet<_>>();
-    snapshot
-        .runtime_work
-        .iter()
-        .filter(|work| !represented.contains(&work.work_id))
-        .cloned()
-        .collect()
+    snapshot.runtime_work.clone()
 }
 
 pub(super) fn active_invocations_section(

@@ -888,6 +888,68 @@ fn snapshot_patch_rejects_reset_revision_mismatch() {
 }
 
 #[test]
+fn removed_metadata_transcript_variants_fail_closed() {
+    for removed in [
+        serde_json::json!({"type": "usage", "usage": {"turn_id": "turn-1", "usage": {}}}),
+        serde_json::json!({
+            "type": "runtime_work",
+            "work": {
+                "work_id": "work-1",
+                "kind": "tool",
+                "label": "work",
+                "status": "running",
+                "cancellable": true,
+                "message": null,
+                "completed_units": null,
+                "total_units": null,
+                "updated_at_ms": null
+            }
+        }),
+    ] {
+        assert!(serde_json::from_value::<TranscriptViewItemKind>(removed).is_err());
+    }
+}
+
+#[test]
+fn runtime_state_changes_patch_without_transcript_operations_or_reset() {
+    let mut base = SessionViewSnapshot::empty();
+    base.revision = 1;
+    base.transcript.revision = 1;
+    base.latest_sequence = Some(1);
+    let mut next = base.clone();
+    next.revision = 2;
+    next.transcript.revision = 2;
+    next.latest_sequence = Some(2);
+    next.runtime.latest_usage = Some(bcode_session_models::SessionTokenUsage {
+        total_tokens: Some(15),
+        ..bcode_session_models::SessionTokenUsage::default()
+    });
+    next.runtime.cumulative_metered_tokens = 15;
+    next.runtime_work.push(RuntimeWorkView {
+        work_id: bcode_session_models::WorkId::new("work-1"),
+        kind: bcode_session_models::RuntimeWorkKind::Tool,
+        label: "work".to_owned(),
+        status: bcode_session_models::RuntimeWorkStatus::Running,
+        cancellable: true,
+        message: None,
+        completed_units: None,
+        total_units: None,
+        updated_at_ms: Some(2),
+    });
+
+    let patch = SessionViewPatch::between_snapshots(&base, &next);
+    assert!(patch.reset.is_none());
+    assert!(patch.transcript.is_empty());
+    assert_eq!(patch.latest_sequence, Some(2));
+    assert_eq!(patch.runtime.as_ref(), Some(&next.runtime));
+    assert_eq!(patch.runtime_work.as_ref(), Some(&next.runtime_work));
+
+    base.apply_patch(&patch)
+        .expect("runtime-state patch applies");
+    assert_eq!(base, next);
+}
+
+#[test]
 fn session_view_patch_deserializes_without_reset_field() {
     let patch: SessionViewPatch = serde_json::from_value(serde_json::json!({
         "schema_version": SessionViewPatch::SCHEMA_VERSION,

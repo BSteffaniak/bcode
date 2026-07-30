@@ -1618,9 +1618,6 @@ fn push_transcript_item_rows(
                 plugin_host,
             );
         }
-        TranscriptItemKind::Usage { turn_id } => {
-            push_usage_rows(rows, item, turn_id, width);
-        }
         TranscriptItemKind::PermissionRequest {
             permission_id,
             tool_call_id,
@@ -3170,10 +3167,6 @@ fn prefix_line(mut line: Line, prefix: &str, prefix_style: Style) -> Line {
     let mut spans = vec![Span::styled(prefix.to_owned(), prefix_style)];
     spans.append(&mut line.spans);
     Line::from_spans(spans)
-}
-
-fn push_usage_rows(rows: &mut Vec<Line>, item: &TranscriptItem, turn_id: &str, width: u16) {
-    push_meta_block(rows, &format!("Usage · {turn_id} · {}", item.text()), width);
 }
 
 fn push_permission_request_rows(

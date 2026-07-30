@@ -11,7 +11,7 @@ use super::transcript::{
     is_active_interaction_summary, item_label, message_content, should_render_transcript_item,
     transcript_item, transcript_item_body,
 };
-use super::usage::{runtime_usage, usage_transcript_item};
+use super::usage::runtime_usage;
 use super::*;
 use bcode_session_models::{RuntimeWorkStatus, ToolArtifact, WorkId};
 use bcode_session_view_models::{
@@ -81,40 +81,7 @@ fn non_tool_message_fixture_items() -> Vec<TranscriptViewItem> {
 }
 
 fn non_tool_status_fixture_items() -> Vec<TranscriptViewItem> {
-    use bcode_session_models::RuntimeWorkKind;
-
-    let mut items = Vec::new();
-    for (index, status) in [
-        RuntimeWorkStatus::Queued,
-        RuntimeWorkStatus::Running,
-        RuntimeWorkStatus::Cancelling,
-        RuntimeWorkStatus::Completed,
-        RuntimeWorkStatus::Failed,
-        RuntimeWorkStatus::TimedOut,
-        RuntimeWorkStatus::Cancelled,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        items.push(transcript_fixture_item(
-            &format!("fixture-runtime-{index}"),
-            status == RuntimeWorkStatus::Running,
-            TranscriptViewItemKind::RuntimeWork {
-                work: RuntimeWorkView {
-                    work_id: WorkId::new(format!("work-{index}")),
-                    kind: RuntimeWorkKind::Tool,
-                    label: format!("runtime {status:?}"),
-                    status,
-                    cancellable: true,
-                    message: Some("runtime detail".to_owned()),
-                    completed_units: Some(1),
-                    total_units: Some(2),
-                    updated_at_ms: Some(1),
-                },
-            },
-        ));
-    }
-    items
+    Vec::new()
 }
 
 fn non_tool_notice_fixture_items() -> Vec<TranscriptViewItem> {
@@ -290,23 +257,7 @@ fn non_tool_interaction_fixture_items() -> Vec<TranscriptViewItem> {
 }
 
 fn non_tool_usage_and_plugin_fixture_items() -> Vec<TranscriptViewItem> {
-    vec![transcript_fixture_item(
-        "fixture-usage",
-        false,
-        TranscriptViewItemKind::Usage {
-            usage: bcode_session_view_models::UsageView {
-                turn_id: "turn-fixture".to_owned(),
-                usage: bcode_session_models::SessionTokenUsage {
-                    input_tokens: Some(10),
-                    output_tokens: Some(5),
-                    total_tokens: Some(15),
-                    cached_input_tokens: None,
-                    cache_write_input_tokens: None,
-                    reasoning_tokens: None,
-                },
-            },
-        },
-    )]
+    Vec::new()
 }
 
 fn tool_fixture(status: ToolInvocationViewStatus) -> ToolInvocationView {
@@ -424,13 +375,7 @@ fn every_non_tool_transcript_state_survives_reconnect_snapshot_and_renders() {
         "assistant fixture",
         "reasoning fixture",
         "system fixture",
-        "Queued",
-        "Running",
-        "Cancelling",
-        "Completed",
         "Failed",
-        "TimedOut",
-        "Cancelled",
         "skill Invoked",
         "skill Suggested",
         "skill ContextLoaded",
@@ -445,7 +390,6 @@ fn every_non_tool_transcript_state_survives_reconnect_snapshot_and_renders() {
         "pending",
         "answered",
         "cancelled",
-        "Model usage",
     ] {
         assert!(
             text.contains(expected),
@@ -607,33 +551,17 @@ fn usage_and_context_render_compact_summaries_with_secondary_details() {
     let runtime = bcode_session_view_models::SessionRuntimeViewState {
         context_occupancy: Some(exact_context_occupancy(8_000)),
         cumulative_metered_tokens: 12_345,
-        latest_usage: Some(usage.clone()),
+        latest_usage: Some(usage),
         ..bcode_session_view_models::SessionRuntimeViewState::default()
     };
-    let usage = bcode_session_view_models::UsageView {
-        turn_id: "turn-1".to_owned(),
-        usage,
-    };
 
-    let runtime_containers = runtime_usage(&runtime);
-    let transcript_containers = usage_transcript_item(&usage);
-    let mut runtime_text = String::new();
-    let mut transcript_text = String::new();
-    for container in &runtime_containers {
-        container_text(container, &mut runtime_text);
-    }
-    for container in &transcript_containers {
-        container_text(container, &mut transcript_text);
-    }
+    let runtime_text = container_text_all(&runtime_usage(&runtime));
     assert!(runtime_text.contains("current context"));
     assert!(runtime_text.contains("8000 tokens"));
     assert!(runtime_text.contains("measured"));
     assert!(runtime_text.contains("12345 tokens"));
     assert!(runtime_text.contains("usage details"));
-    assert!(transcript_text.contains("Model usage"));
-    assert!(transcript_text.contains("125 tokens"));
-    assert!(transcript_text.contains("token breakdown"));
-    assert!(transcript_text.contains("cached input"));
+    assert!(runtime_text.contains("cached input"));
 }
 
 #[test]
@@ -2829,7 +2757,7 @@ fn worktree_artifact_fixture(schema: &str) -> Option<serde_json::Value> {
 }
 
 #[test]
-fn runtime_work_only_includes_operations_missing_from_transcript() {
+fn runtime_work_is_presented_from_runtime_state_outside_transcript() {
     let work = |id: &str| RuntimeWorkView {
         work_id: WorkId::new(id),
         kind: bcode_session_models::RuntimeWorkKind::Tool,
@@ -2842,18 +2770,11 @@ fn runtime_work_only_includes_operations_missing_from_transcript() {
         updated_at_ms: Some(1),
     };
     let mut snapshot = SessionViewSnapshot::empty();
-    snapshot.runtime_work = vec![work("represented"), work("orphan")];
-    snapshot.transcript.items.push(transcript_fixture_item(
-        "runtime:represented",
-        true,
-        TranscriptViewItemKind::RuntimeWork {
-            work: work("represented"),
-        },
-    ));
+    snapshot.runtime_work = vec![work("first"), work("second")];
 
-    let active = unrepresented_runtime_work(&snapshot);
-    assert_eq!(active.len(), 1);
-    assert_eq!(active[0].work_id, WorkId::new("orphan"));
+    let runtime_work = unrepresented_runtime_work(&snapshot);
+    assert_eq!(runtime_work, snapshot.runtime_work);
+    assert!(snapshot.transcript.items.is_empty());
 }
 
 #[test]

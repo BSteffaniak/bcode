@@ -2,7 +2,7 @@
 
 use super::theme::{color, radius, space, surface, typeface};
 use bcode_session_models::SessionTokenUsage;
-use bcode_session_view_models::{SessionRuntimeViewState, UsageView};
+use bcode_session_view_models::SessionRuntimeViewState;
 use hyperchad::template::{Containers, container};
 
 fn token_value(value: Option<u32>) -> String {
@@ -59,21 +59,6 @@ pub(super) fn runtime_usage(runtime: &SessionRuntimeViewState) -> Containers {
                         (usage_details(usage))
                     }
                 }
-            }
-        }
-    }
-}
-
-pub(super) fn usage_transcript_item(usage: &UsageView) -> Containers {
-    container! {
-        div {
-            div color=(color::STRONG) {
-                "Model usage · "
-                (usage.usage.metered_total_tokens().map_or_else(|| "total unavailable".to_owned(), |tokens| format!("{tokens} tokens")))
-            }
-            details margin-top=((space::S6)) {
-                summary color=(color::INFO) font-size=((typeface::DETAIL)) { "token breakdown" }
-                (usage_details(&usage.usage))
             }
         }
     }

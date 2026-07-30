@@ -17,7 +17,6 @@ use super::components::{
 use super::permissions::permission_history;
 use super::semantic_dom_id;
 use super::tools::render_tool_lifecycle_with_context;
-use super::usage::usage_transcript_item;
 
 const MAX_INLINE_MESSAGE_CHARS: usize = 100_000;
 
@@ -283,13 +282,6 @@ fn transcript_item_body_with_context(
         }
         TranscriptViewItemKind::ToolRequestDraft { draft } => tool_request_draft_body(draft),
         TranscriptViewItemKind::Permission { permission } => permission_history(permission),
-        TranscriptViewItemKind::Usage { usage } => usage_transcript_item(usage),
-        TranscriptViewItemKind::RuntimeWork { work } => container! {
-            div {
-                div color=(color::STRONG) { (work.message.as_deref().unwrap_or("Runtime work")) }
-                div color=(color::MUTED) font-size=((typeface::LABEL)) { (format!("{:?}", work.status)) }
-            }
-        },
         TranscriptViewItemKind::Interaction { interaction } => interaction_notice(interaction),
         TranscriptViewItemKind::ToolContribution {
             contribution,
@@ -329,8 +321,6 @@ pub(super) const fn item_label(kind: &TranscriptViewItemKind) -> &'static str {
         TranscriptViewItemKind::ToolRequest { .. } => "tool request",
         TranscriptViewItemKind::ToolRequestDraft { .. } => "tool request draft",
         TranscriptViewItemKind::Permission { .. } => "permission",
-        TranscriptViewItemKind::RuntimeWork { .. } => "runtime work",
-        TranscriptViewItemKind::Usage { .. } => "usage",
         TranscriptViewItemKind::Compaction { .. } => "compaction",
         TranscriptViewItemKind::Interaction { .. } => "interaction",
         TranscriptViewItemKind::Skill { skill } => match skill.status {

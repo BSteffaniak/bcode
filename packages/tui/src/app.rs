@@ -2902,9 +2902,7 @@ impl BmuxApp {
                 if application.live_activity() {
                     self.apply_shared_runtime_work_activity();
                 }
-                let shared_work = self.shared_runtime_work_item(&work_id.0);
-                let status = shared_work.as_ref().map_or(*status, |work| work.status);
-                let _ = (shared_work, status, message);
+                let _ = (work_id, status, message);
             }
             _ => {}
         }
@@ -3294,26 +3292,6 @@ impl BmuxApp {
             .find(|item| item.role == role && item.streaming)
     }
 
-    fn shared_runtime_work_item(
-        &self,
-        work_id: &str,
-    ) -> Option<bcode_session_view_models::RuntimeWorkView> {
-        self.session_view
-            .snapshot()
-            .transcript
-            .items
-            .iter()
-            .rev()
-            .find_map(|item| match &item.kind {
-                bcode_session_view_models::TranscriptViewItemKind::RuntimeWork { work }
-                    if work.work_id.0 == work_id =>
-                {
-                    Some(work.clone())
-                }
-                _ => None,
-            })
-    }
-
     fn apply_working_directory_changed(
         &mut self,
         _event_sequence: u64,
@@ -3463,25 +3441,16 @@ impl BmuxApp {
     fn push_model_usage(
         &mut self,
         _event_sequence: u64,
-        turn_id: &str,
+        _turn_id: &str,
         usage: &bcode_session_models::SessionTokenUsage,
         application: SessionEventApplication,
     ) {
         let projected_usage = self
             .session_view
             .snapshot()
-            .transcript
-            .items
-            .iter()
-            .rev()
-            .find_map(|item| match &item.kind {
-                bcode_session_view_models::TranscriptViewItemKind::Usage { usage }
-                    if usage.turn_id == turn_id =>
-                {
-                    Some(usage.usage.clone())
-                }
-                _ => None,
-            })
+            .runtime
+            .latest_usage
+            .clone()
             .unwrap_or_else(|| usage.clone());
         self.token_usage.absorb(&projected_usage);
         if application.live_activity()
@@ -5060,7 +5029,7 @@ mod tests {
     }
 
     #[test]
-    fn ralph_runtime_failure_notice_consumes_shared_projection() {
+    fn terminal_runtime_failure_does_not_create_transcript_content() {
         let session_id = bcode_session_models::SessionId::new();
         let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
         app.absorb_session_event(&bcode_session_models::SessionEvent {
@@ -5077,14 +5046,9 @@ mod tests {
             },
         });
 
-        let shared = app
-            .shared_runtime_work_item("ralph:loop")
-            .expect("shared runtime work item");
-        assert_eq!(shared.status, RuntimeWorkStatus::Failed);
-        assert_eq!(shared.message.as_deref(), Some("boom"));
-        let terminal = app.transcript().iter().last().expect("ralph work");
-        assert_eq!(terminal.role(), "Runtime work");
-        assert!(terminal.text().contains("boom"));
+        assert!(app.session_view_snapshot().runtime_work.is_empty());
+        assert!(app.session_view_snapshot().transcript.items.is_empty());
+        assert!(app.transcript().is_empty());
     }
 
     #[test]
@@ -5905,7 +5869,14 @@ mod tests {
         assert!(!assistants[0].streaming());
         assert_eq!(assistants[0].id(), render_id);
         assert_eq!(assistants[0].source_view_item_id(), Some(&source_id));
-        assert!(app.transcript().iter().any(|item| item.role() == "Usage"));
+        assert_eq!(
+            app.session_view_snapshot()
+                .runtime
+                .latest_usage
+                .as_ref()
+                .and_then(bcode_session_models::SessionTokenUsage::metered_total_tokens),
+            Some(6_176)
+        );
     }
 
     #[test]
