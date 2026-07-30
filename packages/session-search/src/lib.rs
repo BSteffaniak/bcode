@@ -8,8 +8,11 @@
 //! derived-record ingestion without exposing a backend query language, schema, score type, or
 //! pagination token. Providers never receive canonical storage paths or raw session event payloads.
 
+pub mod projection;
+
 use bcode_session_models::{SessionId, SessionInspectionCategory};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
@@ -29,6 +32,12 @@ pub const OP_REMOVE_SESSION: &str = "remove_session";
 /// Explicitly purge provider-owned derived state.
 pub const OP_PURGE: &str = "purge";
 
+/// Current terminal-text normalization algorithm version.
+pub const CURRENT_NORMALIZATION_VERSION: u16 = 1;
+/// Current allowlisted search projection policy version.
+pub const CURRENT_SEARCH_POLICY_VERSION: u16 = 1;
+/// Default maximum normalized text bytes projected from one canonical event.
+pub const DEFAULT_MAX_TEXT_BYTES_PER_RECORD: usize = 64 * 1024;
 /// Current search-record projection contract version.
 pub const CURRENT_SEARCH_RECORD_VERSION: u16 = 1;
 /// Maximum clauses in one provider-neutral query tree.
@@ -61,6 +70,8 @@ pub enum ContractValidationError {
     EmptyQuery,
     /// A query tree exceeds the maximum nesting depth.
     QueryDepthExceeded { maximum: usize },
+    /// Search projection policy is internally inconsistent or unsupported.
+    InvalidProjection(&'static str),
     /// Batch identities or checkpoints do not agree.
     InvalidBatch(&'static str),
 }
@@ -80,6 +91,9 @@ impl std::fmt::Display for ContractValidationError {
             Self::EmptyQuery => formatter.write_str("search query has no text predicate"),
             Self::QueryDepthExceeded { maximum } => {
                 write!(formatter, "search query nesting exceeds maximum {maximum}")
+            }
+            Self::InvalidProjection(message) => {
+                write!(formatter, "invalid search projection: {message}")
             }
             Self::InvalidBatch(message) => write!(formatter, "invalid search batch: {message}"),
         }
@@ -452,6 +466,7 @@ pub enum ProviderSearchOutcome {
     Partial,
     TimedOut,
     Cancelled,
+    ConflictingDuplicate,
     Unsupported,
     Stale,
     Degraded,
@@ -493,6 +508,10 @@ pub struct SessionSearchRecord {
     pub normalized_bytes: u64,
     pub indexed_bytes: u64,
     pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_range_start: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_range_end: Option<u64>,
     pub normalization_version: u16,
     pub policy_version: u16,
 }
@@ -509,6 +528,17 @@ pub struct ApplySearchRecordsRequest {
 }
 
 impl ApplySearchRecordsRequest {
+    /// Return a stable digest of canonical operation facts for conflicting-duplicate detection.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if serializing this owned portable request unexpectedly fails.
+    #[must_use]
+    pub fn operation_digest_sha256(&self) -> String {
+        let bytes = serde_json::to_vec(self).expect("serializing owned search batch cannot fail");
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
     /// Validate record count, byte limits, identities, and monotonic checkpoint facts.
     ///
     /// # Errors
@@ -586,9 +616,18 @@ impl ApplySearchRecordsRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApplySearchRecordsResponse {
     pub batch_id: String,
+    pub outcome: ApplyBatchOutcome,
     pub applied_records: usize,
-    pub duplicate: bool,
     pub indexed_through_sequence: u64,
+}
+
+/// Explicit duplicate-delivery outcome for one ingestion batch identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplyBatchOutcome {
+    Applied,
+    Duplicate,
+    ConflictingDuplicate,
 }
 
 /// Remove one session's provider-owned derived records.
@@ -727,6 +766,8 @@ mod tests {
             normalized_bytes: 5,
             indexed_bytes: 5,
             truncated: false,
+            source_range_start: Some(0),
+            source_range_end: Some(5),
             normalization_version: 1,
             policy_version: 1,
         };
