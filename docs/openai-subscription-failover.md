@@ -2,21 +2,23 @@
 
 Bcode can use multiple `ChatGPT`/Codex subscription logins for the same OpenAI-compatible provider. When one subscription reports quota or rate-limit exhaustion, Bcode tries the next configured subscription.
 
-## Friendly setup
+## Canonical setup
 
-Log in normally for the first subscription:
-
-```sh
-bcode login openai
-```
-
-Add another subscription:
+Enroll the primary subscription through OpenAI's plugin-registered browser flow:
 
 ```sh
-bcode login openai --add-subscription
+bcode auth login openai --method chatgpt
 ```
 
-`--add-subscription` implies `ChatGPT` OAuth mode. API-key pools are not supported yet, so `--api-key` and `--base-url` are rejected with `--add-subscription`.
+Use `--method device` for device-code enrollment. Add a named secondary subscription to the runtime failover pool:
+
+```sh
+bcode auth login openai --method chatgpt --profile openai-2 --pool openai
+```
+
+Pool enrollment does not replace the primary provider binding. API-key pools are not supported; provider-specific base URLs and models remain model/provider configuration rather than generic auth enrollment.
+
+The deprecated `bcode login openai` and `bcode login openai --add-subscription` commands remain temporary compatibility shims. New automation and documentation should use `bcode auth login`.
 
 Inspect the declared pool and any runtime cooldown state:
 
@@ -43,10 +45,10 @@ bcode auth pool profiles openai
 Refresh an existing secondary subscription token by passing its profile name:
 
 ```sh
-bcode login openai --add-subscription --profile openai-2
+bcode auth login openai --method chatgpt --profile openai-2 --pool openai
 ```
 
-Without `--profile`, `--add-subscription` registers the next new runtime profile, such as `openai-3`.
+With a new profile name, canonical `--pool openai` enrollment registers another runtime profile, such as `openai-3`; passing an existing profile refreshes that profile in place.
 
 Inspect banked reset credits:
 

@@ -125,12 +125,18 @@ fn runtime_subscription_auth_profile_config(
         owner_plugin_id: profile.owner_plugin_id.clone(),
         scheme: Some(profile.scheme.clone()),
         map: profile.map.clone(),
-        settings: BTreeMap::from([
-            ("provider".to_string(), profile.provider.clone()),
-            ("profile".to_string(), profile.storage_profile.clone()),
-            ("vault".to_string(), profile.vault.display().to_string()),
-            ("mode".to_string(), profile.scheme.clone()),
-        ]),
+        settings: {
+            let mut settings = BTreeMap::from([
+                ("provider".to_string(), profile.provider.clone()),
+                ("profile".to_string(), profile.storage_profile.clone()),
+                ("vault".to_string(), profile.vault.display().to_string()),
+                ("mode".to_string(), profile.scheme.clone()),
+            ]);
+            if let Some(device_seal) = &profile.device_seal {
+                settings.insert("device_seal".to_owned(), device_seal.clone());
+            }
+            settings
+        },
     }
 }
 
@@ -253,16 +259,22 @@ pub fn resolve_auth_provider_profile(
             owner_plugin_id: Some(owner_plugin_id.to_string()),
             scheme: Some(runtime_profile.scheme.clone()),
             map: runtime_profile.map.clone(),
-            settings: BTreeMap::from([
-                (
-                    "profile".to_string(),
-                    runtime_profile.storage_profile.clone(),
-                ),
-                (
-                    "vault".to_string(),
-                    runtime_profile.vault.display().to_string(),
-                ),
-            ]),
+            settings: {
+                let mut settings = BTreeMap::from([
+                    (
+                        "profile".to_string(),
+                        runtime_profile.storage_profile.clone(),
+                    ),
+                    (
+                        "vault".to_string(),
+                        runtime_profile.vault.display().to_string(),
+                    ),
+                ]);
+                if let Some(device_seal) = &runtime_profile.device_seal {
+                    settings.insert("device_seal".to_owned(), device_seal.clone());
+                }
+                settings
+            },
         },
         source: AuthProfileSource::Runtime,
     })
@@ -698,6 +710,7 @@ mod tests {
                             key: Some("TEST_PROVIDER_API_KEY".to_owned()),
                         },
                     )]),
+                    device_seal: Some("off".to_owned()),
                 },
             )]),
             ..bcode_config::RuntimeAuthSubscriptions::default()
@@ -713,6 +726,14 @@ mod tests {
         .expect("runtime profile resolves");
         assert_eq!(resolved.source, AuthProfileSource::Runtime);
         assert_eq!(resolved.profile.provider_id.as_deref(), Some("exa"));
+        assert_eq!(
+            resolved
+                .profile
+                .settings
+                .get("device_seal")
+                .map(String::as_str),
+            Some("off")
+        );
         assert_eq!(
             resolved
                 .profile

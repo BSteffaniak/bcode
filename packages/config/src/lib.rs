@@ -4046,6 +4046,9 @@ pub struct RuntimeAuthProfile {
     pub vault: PathBuf,
     #[serde(default)]
     pub map: BTreeMap<String, AuthCredentialMapping>,
+    /// Host-owned device-seal policy selection.
+    #[serde(default)]
+    pub device_seal: Option<String>,
 }
 
 /// Runtime subscriptions associated with one logical auth pool.
@@ -4077,6 +4080,9 @@ pub struct RuntimeAuthSubscriptionProfile {
     /// Canonical credential-to-vault mapping for this subscription.
     #[serde(default)]
     pub map: BTreeMap<String, AuthCredentialMapping>,
+    /// Host-owned device-seal policy selection.
+    #[serde(default)]
+    pub device_seal: Option<String>,
 }
 
 /// Return the runtime auth subscription registry path.
@@ -4132,6 +4138,7 @@ pub fn register_runtime_auth_subscription(
         storage_profile: profile.storage_profile.clone(),
         vault: profile.vault.clone(),
         map: profile.map.clone(),
+        device_seal: profile.device_seal.clone(),
     };
     let path = runtime_auth_subscriptions_path();
     let mut registry = load_runtime_auth_subscriptions();
@@ -6264,6 +6271,7 @@ mod tests {
                 storage_profile: "openai".to_owned(),
                 vault: temp.path().join("vault"),
                 map: BTreeMap::new(),
+                device_seal: None,
             },
         )
         .expect("primary profile");
@@ -6284,12 +6292,17 @@ mod tests {
                 scheme: "chatgpt".to_owned(),
                 owner_plugin_id: Some("bcode.openai-compatible".to_owned()),
                 map: map.clone(),
+                device_seal: Some("off".to_owned()),
             },
         )
         .expect("secondary subscription");
         let registry = load_runtime_auth_subscriptions();
         assert_eq!(registry.bindings["openai"].profile, "openai");
         assert_eq!(registry.profiles["openai-2"].map, map);
+        assert_eq!(
+            registry.profiles["openai-2"].device_seal.as_deref(),
+            Some("off")
+        );
         assert_eq!(registry.pools["openai"].profiles.len(), 1);
         restore_env("BCODE_AUTH_SUBSCRIPTIONS", previous);
     }
@@ -6325,6 +6338,7 @@ scheme = "api_key"
                     key: Some("TEST_PROVIDER_API_KEY".to_owned()),
                 },
             )]),
+            device_seal: None,
         };
         register_runtime_auth_profile("exa", profile).expect("persist runtime profile");
         let loaded = load_runtime_auth_subscriptions();
@@ -6358,6 +6372,7 @@ scheme = "api_key"
             storage_profile: "exa".to_owned(),
             vault: temp.path().join("vault"),
             map: BTreeMap::new(),
+            device_seal: None,
         };
         register_runtime_auth_profile("exa", profile.clone()).expect("initial persistence");
         let before = std::fs::read(&runtime_path).expect("runtime before");

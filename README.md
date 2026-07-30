@@ -380,6 +380,21 @@ disabled = ["bcode.vim-edit"]
 disabled = ["vim_edit.apply"]
 ```
 
+## Plugin authentication
+
+Enabled plugins register authentication providers and methods dynamically. The canonical workflow is:
+
+```sh
+bcode auth providers
+bcode auth login <provider> [--method <method>]
+bcode auth status <provider>
+bcode auth logout <provider>
+```
+
+Bcode owns hidden prompting, secure vault storage, ownership checks, device sealing, and invocation-scoped credential delivery. Provider plugins own credential declarations, OAuth/device flows, refresh, verification, and revocation. Provider-specific model IDs and base URLs remain model/provider configuration rather than auth enrollment.
+
+See [Dynamic Plugin Authentication Architecture](docs/dynamic-plugin-authentication.md) for contracts, profile precedence, lifecycle, failure behavior, and plugin-author guidance. Exa setup is documented in [`plugins/web-search-plugin/EXA.md`](plugins/web-search-plugin/EXA.md), and OpenAI multi-subscription behavior in [`docs/openai-subscription-failover.md`](docs/openai-subscription-failover.md).
+
 ## Auth vault device seals
 
 Bcode stores provider secrets in sshenv-backed auth vault profiles. By default, Bcode prefers a strict transparent device-only seal for those profiles: macOS uses a non-syncing `ThisDeviceOnly` Keychain item, Windows uses current-user DPAPI, and Linux uses TPM when available. If the seal cannot be applied and `device_seal = "preferred"`, Bcode continues with a warning; `device_seal = "required"` turns that into an error.
@@ -395,7 +410,7 @@ device_seal_strict = "true"
 # device_seal_backend = "macos-keychain-device-only"
 ```
 
-Run `bcode auth status` to inspect the configured mode and the backend recorded in vault metadata.
+Run `bcode auth status <provider>` to inspect an integrated provider profile. The legacy provider-less `bcode auth status` remains available for active declarative-profile diagnostics. See [Dynamic Plugin Authentication Architecture](docs/dynamic-plugin-authentication.md) for vault custody and runtime metadata rules.
 
 ## Session import
 
