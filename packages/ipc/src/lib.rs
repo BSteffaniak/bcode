@@ -19,10 +19,12 @@ pub use bcode_worktree_models::{
     WorktreeRemoveRequest, WorktreeRemoveResponse,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -2524,10 +2526,49 @@ pub fn endpoint_from_env_value(value: &str) -> Result<IpcEndpoint, serde_json::E
     serde_json::from_str(value)
 }
 
-/// Return the daemon namespace for this build and IPC protocol version.
+/// Return the daemon namespace for this executable and IPC protocol version.
 #[must_use]
 pub fn daemon_namespace() -> String {
-    format!("ipc-v{CURRENT_PROTOCOL_VERSION}-{BUILD_FINGERPRINT}")
+    format!("ipc-v{CURRENT_PROTOCOL_VERSION}-{}", daemon_fingerprint())
+}
+
+fn daemon_fingerprint() -> &'static str {
+    static FINGERPRINT: OnceLock<String> = OnceLock::new();
+    FINGERPRINT.get_or_init(|| {
+        current_executable_fingerprint().map_or_else(
+            || BUILD_FINGERPRINT.to_owned(),
+            |executable| combined_build_fingerprint(BUILD_FINGERPRINT, &executable),
+        )
+    })
+}
+
+fn combined_build_fingerprint(build: &str, executable: &str) -> String {
+    let mut hasher = Sha256::new();
+    for value in [build.as_bytes(), executable.as_bytes()] {
+        hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(value);
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    digest[..16].to_owned()
+}
+
+fn current_executable_fingerprint() -> Option<String> {
+    let executable = env::current_exe().ok()?;
+    executable_fingerprint_from_reader(fs::File::open(executable).ok()?).ok()
+}
+
+fn executable_fingerprint_from_reader(mut reader: impl std::io::Read) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let digest = format!("{:x}", hasher.finalize());
+    Ok(digest[..16].to_owned())
 }
 
 /// Return the default local IPC endpoint.
@@ -2587,6 +2628,46 @@ mod tests {
     };
     use bcode_skill_models::SkillActivationMode;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn executable_fingerprint_is_content_derived() {
+        let first = executable_fingerprint_from_reader(&b"first executable"[..]).unwrap();
+        let repeated = executable_fingerprint_from_reader(&b"first executable"[..]).unwrap();
+        let second = executable_fingerprint_from_reader(&b"second executable"[..]).unwrap();
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, second);
+        assert_eq!(first.len(), 16);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn daemon_fingerprint_uses_build_and_executable_identity() {
+        let baseline = combined_build_fingerprint("build-a", "executable-a");
+
+        assert_eq!(
+            baseline,
+            combined_build_fingerprint("build-a", "executable-a")
+        );
+        assert_ne!(
+            baseline,
+            combined_build_fingerprint("build-b", "executable-a")
+        );
+        assert_ne!(
+            baseline,
+            combined_build_fingerprint("build-a", "executable-b")
+        );
+        assert_eq!(baseline.len(), 16);
+        assert!(baseline.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn daemon_namespace_uses_the_current_daemon_fingerprint() {
+        assert_eq!(
+            daemon_namespace(),
+            format!("ipc-v{CURRENT_PROTOCOL_VERSION}-{}", daemon_fingerprint())
+        );
+    }
 
     #[test]
     #[cfg(windows)]
