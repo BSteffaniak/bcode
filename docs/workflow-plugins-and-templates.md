@@ -79,6 +79,41 @@ Denial, expiry, stale scope, or cancellation creates no dispatch. An approval ca
 
 `repair_required` means owner acceptance occurred but the terminal external outcome cannot be proven safely. The runtime must not automatically replay that operation. Normal status and history remain bounded and non-mutating; explicit doctor/reconciliation/repair uses persisted dispatch identity, receipts, and owner evidence to resolve ambiguity. Read-only or genuinely idempotent blocks may declare `idempotent_replay` only when the owner can safely reconcile duplicate delivery.
 
+## Runtime-authored workflows versus plugin templates
+
+A plugin template is immutable plugin-owned discovery data. Its manifest identity, configuration
+schema, requirements, and exact definition remain controlled by the plugin version that contributed
+it. Describing or starting a template does not create user-owned mutable source, a draft, a published
+authored revision, or an active-revision pointer.
+
+A runtime-authored workflow is instead a user/application-owned portable
+`WorkflowAuthoringDocument`. It may reference currently available plugin blocks, agents, or skills,
+but it cannot embed plugin instances or take ownership of their behavior. Draft, validation,
+publication, revision, preset, import/export, and execution semantics are defined in
+[`runtime-workflow-authoring.md`](runtime-workflow-authoring.md).
+
+A template can seed runtime authoring only through an explicit conversion or fork operation. That
+operation materializes a complete authoring document, records source provenance, validates current
+requirements, and creates a distinct logical workflow identity. Later plugin-template updates do not
+silently rewrite that draft or any published authored revision. Conversely, changing an authored
+workflow never mutates the contributing plugin manifest.
+
+Disabling a plugin removes its current blocks and templates from discovery. Existing authored
+revisions remain immutable but report the missing current requirement and fail closed on new starts
+that need the unavailable block. Existing runs remain pinned to their exact revision and definition;
+no renderer or plugin may migrate them implicitly.
+
 ## Authoring surface
 
-The workflow plugin contributes `workflow.author`. Template describe/configure presents exact identity, requirement diagnostics, configuration JSON, and external effect/reconciliation implications before start. Start remains disabled until requirements are available and configuration is present; daemon validation is authoritative even after local preview.
+The workflow plugin contributes `workflow.author`. Existing template describe/configure presents
+exact template identity, requirement diagnostics, configuration JSON, and external
+effect/reconciliation implications before start. Runtime authoring uses the same portable application
+contracts as CLI, SDK, frontend, plugin, and generated producers; the workflow plugin may adapt those
+contracts for terminal presentation but does not own draft, revision, validation, or publication
+semantics.
+
+Template start remains disabled until requirements are available and configuration is present; daemon
+validation is authoritative even after local preview. Authored workflow publication and start likewise
+use daemon-authoritative validation, production admission, authorization, and exact revision
+selection. Presentation metadata, producer provenance, and generated prose never affect block
+dispatch or permission facts.

@@ -1122,7 +1122,7 @@ impl WorkflowBlockInvocation {
 }
 
 /// Side-effect declaration for one plugin-owned workflow block.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowBlockEffect {
     ReadOnly,
@@ -1140,7 +1140,7 @@ pub struct WorkflowBlockAuthorization {
 }
 
 /// Durable idempotency and restart reconciliation declaration.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkflowBlockReconciliation {
     /// Repeating the same dispatch identity is safe and byte-equivalent.
@@ -1387,6 +1387,1098 @@ impl ValueSchema {
                 .expect("schemars workflow schema should serialize to JSON"),
         }
     }
+}
+
+/// Current portable runtime-workflow authoring document version.
+pub const WORKFLOW_AUTHORING_DOCUMENT_VERSION: u32 = 1;
+/// Current generic authoring configuration-binding contract version.
+pub const WORKFLOW_CONFIGURATION_BINDING_VERSION: u32 = 1;
+/// Current optional authoring-presentation contract version.
+pub const WORKFLOW_AUTHORING_PRESENTATION_VERSION: u32 = 1;
+/// Supported runtime-authored JSON Schema dialect.
+pub const WORKFLOW_AUTHORING_JSON_SCHEMA_DIALECT: &str =
+    "https://json-schema.org/draft/2020-12/schema";
+/// Maximum serialized authoring-document size.
+pub const MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES: usize = 1_048_576;
+/// Maximum serialized size of one runtime-defined schema.
+pub const MAX_WORKFLOW_AUTHORING_SCHEMA_BYTES: usize = 131_072;
+/// Maximum nesting depth of a runtime-defined schema or authoring JSON value.
+pub const MAX_WORKFLOW_AUTHORING_JSON_DEPTH: usize = 64;
+/// Maximum combined object-property declarations in one runtime-defined schema.
+pub const MAX_WORKFLOW_AUTHORING_SCHEMA_PROPERTIES: usize = 4_096;
+/// Maximum combined enum members in one runtime-defined schema.
+pub const MAX_WORKFLOW_AUTHORING_SCHEMA_ENUM_VALUES: usize = 4_096;
+/// Maximum local reference occurrences in one runtime-defined schema.
+pub const MAX_WORKFLOW_AUTHORING_SCHEMA_REFERENCES: usize = 4_096;
+
+const MAX_WORKFLOW_AUTHORING_ID_BYTES: usize = 256;
+const MAX_WORKFLOW_AUTHORING_TITLE_BYTES: usize = 256;
+const MAX_WORKFLOW_AUTHORING_DESCRIPTION_BYTES: usize = 4_096;
+const MAX_WORKFLOW_AUTHORING_LABELS: usize = 32;
+const MAX_WORKFLOW_AUTHORING_BINDINGS: usize = 4_096;
+const MAX_WORKFLOW_AUTHORING_REQUIREMENTS: usize = 4_096;
+const MAX_WORKFLOW_AUTHORING_PRESENTATION_NAMESPACES: usize = 32;
+const MAX_WORKFLOW_AUTHORING_PRESENTATION_BYTES: usize = 131_072;
+
+/// Stable logical identity for one runtime-authored workflow.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowIdentity {
+    /// Opaque stable workflow identity.
+    pub workflow_id: String,
+}
+
+impl WorkflowIdentity {
+    /// Validate this logical workflow identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the identity is empty, too large, or contains unsupported bytes.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        validate_authoring_id("workflow_id", &self.workflow_id)
+    }
+}
+
+/// Stable identity for one mutable authored-workflow draft.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowDraftIdentity {
+    /// Owning logical workflow identity.
+    pub workflow_id: String,
+    /// Opaque draft identity within the logical workflow.
+    pub draft_id: String,
+}
+
+impl WorkflowDraftIdentity {
+    /// Validate this draft identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either identity is malformed.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        validate_authoring_id("workflow_id", &self.workflow_id)?;
+        validate_authoring_id("draft_id", &self.draft_id)
+    }
+}
+
+/// Exact immutable published revision identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRevisionIdentity {
+    /// Owning logical workflow identity.
+    pub workflow_id: String,
+    /// Monotonically increasing published revision number.
+    pub revision: u64,
+}
+
+impl WorkflowRevisionIdentity {
+    /// Validate this published revision identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the workflow identity is malformed or the revision is zero.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        validate_authoring_id("workflow_id", &self.workflow_id)?;
+        if self.revision == 0 {
+            return Err(authoring_error(
+                "revision",
+                "published revision must be greater than zero",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Normalized class of producer that created authoring state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowProducerKind {
+    /// Direct human-authored input.
+    #[default]
+    Human,
+    /// Bcode command-line producer.
+    Cli,
+    /// Portable frontend producer.
+    Frontend,
+    /// SDK client producer.
+    Sdk,
+    /// Plugin producer.
+    Plugin,
+    /// Untrusted generated producer, including AI-backed generation.
+    Generated,
+}
+
+/// Bounded diagnostic provenance for authored workflow state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowProducerProvenance {
+    /// Producer class. This value never grants trust or authorization.
+    pub kind: WorkflowProducerKind,
+    /// Optional bounded producer identifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub producer_id: Option<String>,
+    /// Optional source revision from which this state was derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<WorkflowRevisionIdentity>,
+}
+
+impl WorkflowProducerProvenance {
+    /// Validate bounded diagnostic provenance.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a producer ID or source revision is malformed.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if let Some(producer_id) = &self.producer_id {
+            validate_authoring_id("producer.producer_id", producer_id)?;
+        }
+        if let Some(source_revision) = &self.source_revision {
+            source_revision.validate()?;
+        }
+        Ok(())
+    }
+}
+
+/// User-facing metadata that does not determine execution semantics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAuthoringMetadata {
+    /// Bounded display title.
+    pub title: String,
+    /// Optional bounded description.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Bounded deterministic labels for discovery.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+}
+
+impl WorkflowAuthoringMetadata {
+    fn validate(&self) -> Result<(), WorkflowError> {
+        if self.title.trim().is_empty() || self.title.len() > MAX_WORKFLOW_AUTHORING_TITLE_BYTES {
+            return Err(authoring_error(
+                "metadata.title",
+                format!("title must contain 1..={MAX_WORKFLOW_AUTHORING_TITLE_BYTES} bytes"),
+            ));
+        }
+        if self
+            .description
+            .as_ref()
+            .is_some_and(|description| description.len() > MAX_WORKFLOW_AUTHORING_DESCRIPTION_BYTES)
+        {
+            return Err(authoring_error(
+                "metadata.description",
+                format!("description exceeds {MAX_WORKFLOW_AUTHORING_DESCRIPTION_BYTES} bytes"),
+            ));
+        }
+        if self.labels.len() > MAX_WORKFLOW_AUTHORING_LABELS {
+            return Err(authoring_error(
+                "metadata.labels",
+                format!("labels exceed {MAX_WORKFLOW_AUTHORING_LABELS} entries"),
+            ));
+        }
+        for (key, value) in &self.labels {
+            validate_authoring_id("metadata.labels.key", key)?;
+            if value.trim().is_empty() || value.len() > MAX_WORKFLOW_AUTHORING_ID_BYTES {
+                return Err(authoring_error(
+                    "metadata.labels.value",
+                    format!(
+                        "label values must contain 1..={MAX_WORKFLOW_AUTHORING_ID_BYTES} bytes"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Optional namespaced authoring hints that never affect executable identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAuthoringPresentation {
+    /// Presentation contract version.
+    pub version: u32,
+    /// Producer-owned portable or ignorable presentation payloads.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub namespaces: BTreeMap<String, serde_json::Value>,
+}
+
+impl WorkflowAuthoringPresentation {
+    fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_AUTHORING_PRESENTATION_VERSION {
+            return Err(authoring_error(
+                "presentation.version",
+                format!(
+                    "unsupported presentation version {}; expected {}",
+                    self.version, WORKFLOW_AUTHORING_PRESENTATION_VERSION
+                ),
+            ));
+        }
+        if self.namespaces.len() > MAX_WORKFLOW_AUTHORING_PRESENTATION_NAMESPACES {
+            return Err(authoring_error(
+                "presentation.namespaces",
+                format!(
+                    "presentation namespaces exceed {MAX_WORKFLOW_AUTHORING_PRESENTATION_NAMESPACES} entries"
+                ),
+            ));
+        }
+        for (namespace, value) in &self.namespaces {
+            validate_authoring_id("presentation.namespace", namespace)?;
+            validate_authoring_json_value("presentation.namespaces", value)?;
+        }
+        let bytes = serde_json::to_vec(self).map_err(|error| {
+            authoring_error(
+                "presentation",
+                format!("presentation cannot be serialized: {error}"),
+            )
+        })?;
+        if bytes.len() > MAX_WORKFLOW_AUTHORING_PRESENTATION_BYTES {
+            return Err(authoring_error(
+                "presentation",
+                format!("presentation exceeds {MAX_WORKFLOW_AUTHORING_PRESENTATION_BYTES} bytes"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Portable upper bounds applied when a published workflow run is admitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRunLimitPolicy {
+    /// Maximum optional run duration in milliseconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_duration_ms: Option<u64>,
+    /// Maximum total node attempts in a run.
+    pub node_execution_cap: u32,
+    /// Maximum concurrently running nodes.
+    pub concurrency_cap: u32,
+    /// Maximum cycle/repeat activations.
+    pub cycle_cap: u32,
+    /// Maximum attempts per activation.
+    pub retry_cap: u32,
+}
+
+impl Default for WorkflowRunLimitPolicy {
+    fn default() -> Self {
+        Self {
+            maximum_duration_ms: None,
+            node_execution_cap: 1_000,
+            concurrency_cap: 8,
+            cycle_cap: 100,
+            retry_cap: 3,
+        }
+    }
+}
+
+impl WorkflowRunLimitPolicy {
+    fn validate(&self) -> Result<(), WorkflowError> {
+        if self.maximum_duration_ms == Some(0)
+            || self.node_execution_cap == 0
+            || self.concurrency_cap == 0
+            || self.cycle_cap == 0
+            || self.retry_cap == 0
+            || self.concurrency_cap > self.node_execution_cap
+        {
+            return Err(authoring_error(
+                "run_limits",
+                "run-limit values must be non-zero and concurrency cannot exceed the node-execution cap",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Declared target populated from runtime workflow configuration during compilation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowConfigurationTarget {
+    /// Populate a declared field in one node's configuration object.
+    NodeConfiguration { node_id: String, path: String },
+    /// Populate a declared agent selection field.
+    AgentSelection { node_id: String, field: String },
+    /// Populate one declared skill selection slot.
+    SkillSelection { node_id: String, slot: String },
+    /// Populate a plugin-block input default field.
+    PluginBlockInput { node_id: String, path: String },
+    /// Populate a declared edge predicate or transform field.
+    EdgeConfiguration { edge_index: usize, path: String },
+    /// Populate one portable run-limit field.
+    RunLimit { field: String },
+    /// Populate one initial workflow input-default field.
+    InputDefault { path: String },
+}
+
+/// One bounded versioned generic configuration binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowConfigurationBinding {
+    /// Binding contract version.
+    pub version: u32,
+    /// Dotted path in the validated configuration value.
+    pub configuration_path: String,
+    /// Explicit declared compilation target.
+    pub target: WorkflowConfigurationTarget,
+    /// Optional bounded deterministic transform.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<WorkflowTransform>,
+}
+
+impl WorkflowConfigurationBinding {
+    fn validate(&self, definition: &WorkflowDefinition) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_CONFIGURATION_BINDING_VERSION {
+            return Err(authoring_error(
+                "bindings.version",
+                format!(
+                    "unsupported binding version {}; expected {}",
+                    self.version, WORKFLOW_CONFIGURATION_BINDING_VERSION
+                ),
+            ));
+        }
+        validate_authoring_path("bindings.configuration_path", &self.configuration_path)?;
+        match &self.target {
+            WorkflowConfigurationTarget::NodeConfiguration { node_id, path }
+            | WorkflowConfigurationTarget::PluginBlockInput { node_id, path } => {
+                validate_authoring_node_target(definition, node_id, path)?;
+            }
+            WorkflowConfigurationTarget::AgentSelection { node_id, field }
+            | WorkflowConfigurationTarget::SkillSelection {
+                node_id,
+                slot: field,
+            } => {
+                validate_authoring_node_target(definition, node_id, field)?;
+                if definition
+                    .node(node_id)
+                    .is_none_or(|node| node.kind != NodeKind::Agent)
+                {
+                    return Err(authoring_error(
+                        "bindings.target.node_id",
+                        format!("binding target '{node_id}' is not an agent node"),
+                    ));
+                }
+            }
+            WorkflowConfigurationTarget::EdgeConfiguration { edge_index, path } => {
+                if *edge_index >= definition.edges.len() {
+                    return Err(authoring_error(
+                        "bindings.target.edge_index",
+                        format!("binding references unknown edge index {edge_index}"),
+                    ));
+                }
+                validate_authoring_path("bindings.target.path", path)?;
+            }
+            WorkflowConfigurationTarget::RunLimit { field } => {
+                if !matches!(
+                    field.as_str(),
+                    "maximum_duration_ms"
+                        | "node_execution_cap"
+                        | "concurrency_cap"
+                        | "cycle_cap"
+                        | "retry_cap"
+                ) {
+                    return Err(authoring_error(
+                        "bindings.target.field",
+                        format!("unknown run-limit field '{field}'"),
+                    ));
+                }
+            }
+            WorkflowConfigurationTarget::InputDefault { path } => {
+                validate_authoring_path("bindings.target.path", path)?;
+            }
+        }
+        if let Some(transform) = &self.transform {
+            transform.validate()?;
+            validate_runtime_value_schema("bindings.transform.output", &transform.output)?;
+        }
+        Ok(())
+    }
+}
+
+/// Exact normalized requirements declared by an authored workflow.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRequirementSummary {
+    /// Required production capability contract versions or named capabilities.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub capabilities: BTreeSet<String>,
+    /// Required plugin identities.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub plugins: BTreeSet<String>,
+    /// Required exact block references, encoded as stable owner/block/version identities.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub blocks: BTreeSet<String>,
+    /// Required portable agent profile identities.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub agents: BTreeSet<String>,
+    /// Required skill identities.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub skills: BTreeSet<String>,
+}
+
+impl WorkflowRequirementSummary {
+    fn validate(&self) -> Result<(), WorkflowError> {
+        let count = self.capabilities.len()
+            + self.plugins.len()
+            + self.blocks.len()
+            + self.agents.len()
+            + self.skills.len();
+        if count > MAX_WORKFLOW_AUTHORING_REQUIREMENTS {
+            return Err(authoring_error(
+                "requirements",
+                format!("requirements exceed {MAX_WORKFLOW_AUTHORING_REQUIREMENTS} entries"),
+            ));
+        }
+        for value in self
+            .capabilities
+            .iter()
+            .chain(&self.plugins)
+            .chain(&self.blocks)
+            .chain(&self.agents)
+            .chain(&self.skills)
+        {
+            validate_authoring_id("requirements", value)?;
+        }
+        Ok(())
+    }
+}
+
+/// Renderer-neutral aggregate effects exposed before publication or start.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowEffectSummary {
+    /// Maximum tool capability requested by the compiled workflow.
+    pub maximum_capability: WorkflowToolCapability,
+    /// Exact block effect classes present in the workflow.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub block_effects: BTreeSet<WorkflowBlockEffect>,
+    /// Exact restart reconciliation classes present in the workflow.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub reconciliation: BTreeSet<WorkflowBlockReconciliation>,
+    /// Normalized aggregate resource claims.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub resources: Vec<ResourceClaim>,
+}
+
+impl WorkflowEffectSummary {
+    /// Return an effect summary with deterministic, duplicate-free resource claims.
+    #[must_use]
+    pub fn normalized(mut self) -> Self {
+        self.resources.sort();
+        self.resources.dedup();
+        self
+    }
+
+    /// Validate bounded normalized effect facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a resource identity is empty, oversized, duplicated, or out of
+    /// canonical order.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.resources.len() > MAX_WORKFLOW_AUTHORING_REQUIREMENTS {
+            return Err(authoring_error(
+                "effects.resources",
+                format!("resource claims exceed {MAX_WORKFLOW_AUTHORING_REQUIREMENTS} entries"),
+            ));
+        }
+        for resource in &self.resources {
+            validate_authoring_id("effects.resources.resource", &resource.resource)?;
+        }
+        if self.resources.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(authoring_error(
+                "effects.resources",
+                "resource claims must be unique and in canonical order",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Portable source contract for one runtime-authored workflow.
+///
+/// The embedded [`WorkflowDefinition`] is the single declarative graph model. Publication may apply
+/// the declared bindings and then validates the resulting exact definition; authoring does not
+/// introduce a parallel graph interpretation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAuthoringDocument {
+    /// Authoring source schema version.
+    pub schema_version: u32,
+    /// Stable logical workflow identity.
+    pub workflow_id: String,
+    /// User-facing non-authoritative metadata.
+    pub metadata: WorkflowAuthoringMetadata,
+    /// Runtime configuration schema.
+    pub configuration_schema: ValueSchema,
+    /// Optional bounded defaults validated against `configuration_schema`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configuration_defaults: Option<serde_json::Value>,
+    /// Existing host-neutral declarative graph contract.
+    pub definition: WorkflowDefinition,
+    /// Bounded generic runtime configuration bindings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<WorkflowConfigurationBinding>,
+    /// Exact declared requirements used for catalog resolution.
+    #[serde(default)]
+    pub requirements: WorkflowRequirementSummary,
+    /// Portable run-admission limit policy.
+    #[serde(default)]
+    pub run_limits: WorkflowRunLimitPolicy,
+    /// Diagnostic producer provenance that never changes trust or authorization.
+    pub producer: WorkflowProducerProvenance,
+    /// Optional non-semantic producer-owned presentation hints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presentation: Option<WorkflowAuthoringPresentation>,
+}
+
+impl WorkflowAuthoringDocument {
+    /// Validate this portable authoring source without persistence or external side effects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, malformed identities, invalid graph structure,
+    /// invalid or unbounded schemas, duplicate binding targets, unknown references, remote schema
+    /// references, oversized content, invalid defaults, or unsupported future state.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.schema_version != WORKFLOW_AUTHORING_DOCUMENT_VERSION {
+            return Err(authoring_error(
+                "schema_version",
+                format!(
+                    "unsupported workflow authoring document version {}; expected {}",
+                    self.schema_version, WORKFLOW_AUTHORING_DOCUMENT_VERSION
+                ),
+            ));
+        }
+        validate_authoring_id("workflow_id", &self.workflow_id)?;
+        self.metadata.validate()?;
+        self.producer.validate()?;
+        self.run_limits.validate()?;
+        self.requirements.validate()?;
+        self.definition.validate()?;
+        validate_runtime_value_schema("configuration_schema", &self.configuration_schema)?;
+        validate_runtime_value_schema("definition.input", &self.definition.input)?;
+        validate_runtime_value_schema("definition.output", &self.definition.output)?;
+        for (node_id, node) in &self.definition.nodes {
+            validate_runtime_value_schema(
+                &format!("definition.nodes.{node_id}.input"),
+                &node.input,
+            )?;
+            validate_runtime_value_schema(
+                &format!("definition.nodes.{node_id}.output"),
+                &node.output,
+            )?;
+            validate_authoring_json_value(
+                &format!("definition.nodes.{node_id}.configuration"),
+                &node.configuration,
+            )?;
+        }
+        for (edge_index, edge) in self.definition.edges.iter().enumerate() {
+            if let Some(transform) = &edge.transform {
+                validate_runtime_value_schema(
+                    &format!("definition.edges.{edge_index}.transform.output"),
+                    &transform.output,
+                )?;
+            }
+        }
+        if let Some(defaults) = &self.configuration_defaults {
+            validate_authoring_json_value("configuration_defaults", defaults)?;
+            let validator =
+                jsonschema::validator_for(&self.configuration_schema.schema).map_err(|error| {
+                    authoring_error(
+                        "configuration_schema",
+                        format!("invalid configuration schema: {error}"),
+                    )
+                })?;
+            if let Err(error) = validator.validate(defaults) {
+                return Err(authoring_error(
+                    "configuration_defaults",
+                    format!("defaults do not match configuration schema: {error}"),
+                ));
+            }
+        }
+        if self.bindings.len() > MAX_WORKFLOW_AUTHORING_BINDINGS {
+            return Err(authoring_error(
+                "bindings",
+                format!("bindings exceed {MAX_WORKFLOW_AUTHORING_BINDINGS} entries"),
+            ));
+        }
+        let mut binding_targets = BTreeSet::new();
+        for binding in &self.bindings {
+            binding.validate(&self.definition)?;
+            let target = serde_json::to_string(&binding.target).map_err(|error| {
+                authoring_error(
+                    "bindings.target",
+                    format!("binding target cannot be serialized: {error}"),
+                )
+            })?;
+            if !binding_targets.insert(target) {
+                return Err(authoring_error(
+                    "bindings.target",
+                    "configuration binding targets must be unique",
+                ));
+            }
+        }
+        if let Some(presentation) = &self.presentation {
+            presentation.validate()?;
+        }
+        let bytes = serde_json::to_vec(self).map_err(|error| {
+            authoring_error(
+                "workflow",
+                format!("authoring document cannot be serialized: {error}"),
+            )
+        })?;
+        if bytes.len() > MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES {
+            return Err(authoring_error(
+                "workflow",
+                format!("authoring document exceeds {MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES} bytes"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Return a normalized source document with every semantically unordered collection in stable
+    /// order. Edge-index binding targets are remapped to the normalized edge order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the source is invalid or an edge target cannot be remapped uniquely.
+    pub fn normalized(&self) -> Result<Self, WorkflowError> {
+        self.validate()?;
+        let mut normalized = self.clone();
+        normalized.definition.entries.sort();
+        normalized.definition.entries.dedup();
+        normalized.definition.exits.sort();
+        normalized.definition.exits.dedup();
+        for node in normalized.definition.nodes.values_mut() {
+            node.resources.sort();
+            node.resources.dedup();
+        }
+        let mut indexed_edges = normalized
+            .definition
+            .edges
+            .drain(..)
+            .enumerate()
+            .map(|(index, edge)| {
+                canonical_json_value(&edge, "definition.edges")
+                    .map(|sort_key| (index, sort_key, edge))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        indexed_edges.sort_by(|(_, left_key, _), (_, right_key, _)| left_key.cmp(right_key));
+        let mut remap = BTreeMap::new();
+        for (new_index, (old_index, _, _)) in indexed_edges.iter().enumerate() {
+            remap.insert(*old_index, new_index);
+        }
+        normalized.definition.edges = indexed_edges.into_iter().map(|(_, _, edge)| edge).collect();
+        for binding in &mut normalized.bindings {
+            if let WorkflowConfigurationTarget::EdgeConfiguration { edge_index, .. } =
+                &mut binding.target
+            {
+                *edge_index = *remap.get(edge_index).ok_or_else(|| {
+                    authoring_error(
+                        "bindings.target.edge_index",
+                        "edge binding target could not be normalized",
+                    )
+                })?;
+            }
+        }
+        let mut indexed_bindings = normalized
+            .bindings
+            .drain(..)
+            .map(|binding| {
+                canonical_json_value(&binding.target, "bindings.target")
+                    .map(|sort_key| (sort_key, binding))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        indexed_bindings.sort_by(|(left_key, left), (right_key, right)| {
+            left_key
+                .cmp(right_key)
+                .then_with(|| left.configuration_path.cmp(&right.configuration_path))
+        });
+        normalized.bindings = indexed_bindings
+            .into_iter()
+            .map(|(_, binding)| binding)
+            .collect();
+        normalized.validate()?;
+        Ok(normalized)
+    }
+
+    /// Return the canonical digest of the complete validated source document.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when validation, normalization, or canonical serialization fails.
+    pub fn source_digest_sha256(&self) -> Result<String, WorkflowError> {
+        canonical_sha256(&self.normalized()?, "workflow")
+    }
+
+    /// Return the canonical digest of executable source semantics.
+    ///
+    /// User-facing metadata, producer provenance, and presentation hints are deliberately excluded.
+    /// Configuration schemas, defaults, graph semantics, bindings, requirements, and run limits are
+    /// included. Publication later derives the exact compiled-definition identity after applying
+    /// bindings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when validation, normalization, or canonical serialization fails.
+    pub fn executable_source_digest_sha256(&self) -> Result<String, WorkflowError> {
+        let normalized = self.normalized()?;
+        canonical_sha256(
+            &(
+                normalized.schema_version,
+                normalized.workflow_id,
+                normalized.configuration_schema,
+                normalized.configuration_defaults,
+                normalized.definition,
+                normalized.bindings,
+                normalized.requirements,
+                normalized.run_limits,
+            ),
+            "workflow.executable_source",
+        )
+    }
+
+    /// Return the current exact base-definition identity before configuration bindings are applied.
+    ///
+    /// This is useful for source diagnostics only. Publication must derive its final executable
+    /// identity from the fully bound compiled definition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the document or embedded base definition is invalid.
+    pub fn base_definition_identity(&self) -> Result<WorkflowDefinitionIdentity, WorkflowError> {
+        self.validate()?;
+        WorkflowDefinitionIdentity::for_definition(self.workflow_id.clone(), &self.definition)
+    }
+}
+
+fn authoring_error(path: impl Into<String>, message: impl Into<String>) -> WorkflowError {
+    WorkflowError::Build {
+        path: path.into(),
+        message: message.into(),
+    }
+}
+
+fn validate_authoring_id(path: &str, value: &str) -> Result<(), WorkflowError> {
+    if value.trim().is_empty()
+        || value.len() > MAX_WORKFLOW_AUTHORING_ID_BYTES
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b':' | b'/' | b'@')
+        })
+    {
+        return Err(authoring_error(
+            path,
+            format!(
+                "identity must contain 1..={MAX_WORKFLOW_AUTHORING_ID_BYTES} ASCII identity bytes"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_authoring_path(path: &str, value: &str) -> Result<(), WorkflowError> {
+    if value.trim().is_empty()
+        || value.len() > MAX_WORKFLOW_AUTHORING_ID_BYTES
+        || value.split('.').any(|part| {
+            part.is_empty()
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        })
+    {
+        return Err(authoring_error(
+            path,
+            "path must be a bounded dotted sequence of identity components",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_authoring_node_target(
+    definition: &WorkflowDefinition,
+    node_id: &str,
+    path: &str,
+) -> Result<(), WorkflowError> {
+    validate_authoring_id("bindings.target.node_id", node_id)?;
+    validate_authoring_path("bindings.target.path", path)?;
+    if definition.node(node_id).is_none() {
+        return Err(authoring_error(
+            "bindings.target.node_id",
+            format!("binding references unknown node '{node_id}'"),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct RuntimeSchemaCounts {
+    properties: usize,
+    enum_values: usize,
+    references: usize,
+}
+
+fn validate_runtime_value_schema(path: &str, schema: &ValueSchema) -> Result<(), WorkflowError> {
+    if schema.type_name.trim().is_empty()
+        || schema.type_name.len() > MAX_WORKFLOW_AUTHORING_ID_BYTES
+    {
+        return Err(authoring_error(
+            format!("{path}.type_name"),
+            format!("schema type name must contain 1..={MAX_WORKFLOW_AUTHORING_ID_BYTES} bytes"),
+        ));
+    }
+    let bytes = serde_json::to_vec(&schema.schema)
+        .map_err(|error| authoring_error(path, format!("schema cannot be serialized: {error}")))?;
+    if bytes.len() > MAX_WORKFLOW_AUTHORING_SCHEMA_BYTES {
+        return Err(authoring_error(
+            path,
+            format!("schema exceeds {MAX_WORKFLOW_AUTHORING_SCHEMA_BYTES} bytes"),
+        ));
+    }
+    if let Some(dialect) = schema.schema.get("$schema")
+        && dialect.as_str() != Some(WORKFLOW_AUTHORING_JSON_SCHEMA_DIALECT)
+    {
+        return Err(authoring_error(
+            format!("{path}.$schema"),
+            format!(
+                "unsupported JSON Schema dialect; expected {WORKFLOW_AUTHORING_JSON_SCHEMA_DIALECT}"
+            ),
+        ));
+    }
+    let mut counts = RuntimeSchemaCounts::default();
+    validate_runtime_schema_value(path, &schema.schema, 0, &mut counts)?;
+    validate_local_schema_references(path, &schema.schema)?;
+    jsonschema::validator_for(&schema.schema)
+        .map_err(|error| authoring_error(path, format!("invalid JSON Schema: {error}")))?;
+    Ok(())
+}
+
+fn validate_runtime_schema_value(
+    path: &str,
+    value: &serde_json::Value,
+    depth: usize,
+    counts: &mut RuntimeSchemaCounts,
+) -> Result<(), WorkflowError> {
+    if depth > MAX_WORKFLOW_AUTHORING_JSON_DEPTH {
+        return Err(authoring_error(
+            path,
+            format!("JSON depth exceeds {MAX_WORKFLOW_AUTHORING_JSON_DEPTH}"),
+        ));
+    }
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                validate_runtime_schema_value(path, item, depth + 1, counts)?;
+            }
+        }
+        serde_json::Value::Object(fields) => {
+            if let Some(properties) = fields
+                .get("properties")
+                .and_then(serde_json::Value::as_object)
+            {
+                counts.properties = counts.properties.saturating_add(properties.len());
+            }
+            if let Some(values) = fields.get("enum").and_then(serde_json::Value::as_array) {
+                counts.enum_values = counts.enum_values.saturating_add(values.len());
+            }
+            if let Some(reference) = fields.get("$ref") {
+                let reference = reference
+                    .as_str()
+                    .ok_or_else(|| authoring_error(path, "schema $ref values must be strings"))?;
+                if !reference.starts_with("#/") {
+                    return Err(authoring_error(
+                        path,
+                        "remote and non-local schema references are unsupported",
+                    ));
+                }
+                counts.references = counts.references.saturating_add(1);
+            }
+            if counts.properties > MAX_WORKFLOW_AUTHORING_SCHEMA_PROPERTIES
+                || counts.enum_values > MAX_WORKFLOW_AUTHORING_SCHEMA_ENUM_VALUES
+                || counts.references > MAX_WORKFLOW_AUTHORING_SCHEMA_REFERENCES
+            {
+                return Err(authoring_error(
+                    path,
+                    format!(
+                        "schema exceeds property, enum, or local-reference bounds ({MAX_WORKFLOW_AUTHORING_SCHEMA_PROPERTIES}/{MAX_WORKFLOW_AUTHORING_SCHEMA_ENUM_VALUES}/{MAX_WORKFLOW_AUTHORING_SCHEMA_REFERENCES})"
+                    ),
+                ));
+            }
+            for item in fields.values() {
+                validate_runtime_schema_value(path, item, depth + 1, counts)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_local_schema_references(
+    path: &str,
+    root: &serde_json::Value,
+) -> Result<(), WorkflowError> {
+    fn decode_pointer_component(component: &str) -> String {
+        component.replace("~1", "/").replace("~0", "~")
+    }
+
+    fn resolve<'a>(root: &'a serde_json::Value, reference: &str) -> Option<&'a serde_json::Value> {
+        let pointer = reference.strip_prefix('#')?;
+        if pointer.is_empty() {
+            return Some(root);
+        }
+        root.pointer(pointer)
+    }
+
+    fn walk(
+        path: &str,
+        root: &serde_json::Value,
+        value: &serde_json::Value,
+        active: &mut BTreeSet<String>,
+        expansions: &mut usize,
+    ) -> Result<(), WorkflowError> {
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(path, root, item, active, expansions)?;
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                if let Some(reference) = fields.get("$ref").and_then(serde_json::Value::as_str) {
+                    *expansions = expansions.saturating_add(1);
+                    if *expansions > MAX_WORKFLOW_AUTHORING_SCHEMA_REFERENCES {
+                        return Err(authoring_error(
+                            path,
+                            format!(
+                                "local schema reference expansion exceeds {MAX_WORKFLOW_AUTHORING_SCHEMA_REFERENCES}"
+                            ),
+                        ));
+                    }
+                    let target = resolve(root, reference).ok_or_else(|| {
+                        authoring_error(
+                            path,
+                            format!("unresolved local schema reference '{reference}'"),
+                        )
+                    })?;
+                    if !active.insert(reference.to_string()) {
+                        return Err(authoring_error(
+                            path,
+                            format!(
+                                "recursive local schema reference '{reference}' is unsupported"
+                            ),
+                        ));
+                    }
+                    walk(path, root, target, active, expansions)?;
+                    active.remove(reference);
+                }
+                for (key, item) in fields {
+                    if key != "$ref" {
+                        walk(path, root, item, active, expansions)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    // Validate pointer escaping explicitly so malformed `~` sequences cannot be accepted by a
+    // tolerant resolver and interpreted differently by another implementation.
+    fn validate_pointer_syntax(path: &str, value: &serde_json::Value) -> Result<(), WorkflowError> {
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    validate_pointer_syntax(path, item)?;
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                if let Some(reference) = fields.get("$ref").and_then(serde_json::Value::as_str) {
+                    for component in reference.strip_prefix("#/").unwrap_or_default().split('/') {
+                        let decoded = decode_pointer_component(component);
+                        let reencoded = decoded.replace('~', "~0").replace('/', "~1");
+                        if reencoded != component {
+                            return Err(authoring_error(
+                                path,
+                                format!("malformed local schema reference '{reference}'"),
+                            ));
+                        }
+                    }
+                }
+                for item in fields.values() {
+                    validate_pointer_syntax(path, item)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    validate_pointer_syntax(path, root)?;
+    let mut expansions = 0;
+    walk(path, root, root, &mut BTreeSet::new(), &mut expansions)
+}
+
+fn validate_authoring_json_value(
+    path: &str,
+    value: &serde_json::Value,
+) -> Result<(), WorkflowError> {
+    fn walk(path: &str, value: &serde_json::Value, depth: usize) -> Result<(), WorkflowError> {
+        if depth > MAX_WORKFLOW_AUTHORING_JSON_DEPTH {
+            return Err(authoring_error(
+                path,
+                format!("JSON depth exceeds {MAX_WORKFLOW_AUTHORING_JSON_DEPTH}"),
+            ));
+        }
+        match value {
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(path, item, depth + 1)?;
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for item in fields.values() {
+                    walk(path, item, depth + 1)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    walk(path, value, 0)
+}
+
+fn canonical_json_value<T: Serialize>(value: &T, path: &str) -> Result<String, WorkflowError> {
+    fn normalize(value: serde_json::Value) -> serde_json::Value {
+        match value {
+            serde_json::Value::Array(items) => {
+                serde_json::Value::Array(items.into_iter().map(normalize).collect())
+            }
+            serde_json::Value::Object(fields) => {
+                let sorted = fields
+                    .into_iter()
+                    .map(|(key, value)| (key, normalize(value)))
+                    .collect::<BTreeMap<_, _>>();
+                serde_json::Value::Object(sorted.into_iter().collect())
+            }
+            scalar => scalar,
+        }
+    }
+    let value = serde_json::to_value(value).map_err(|error| {
+        authoring_error(path, format!("value cannot be canonicalized: {error}"))
+    })?;
+    serde_json::to_string(&normalize(value)).map_err(|error| {
+        authoring_error(
+            path,
+            format!("canonical value cannot be serialized: {error}"),
+        )
+    })
+}
+
+fn canonical_sha256<T: Serialize>(value: &T, path: &str) -> Result<String, WorkflowError> {
+    let encoded = canonical_json_value(value, path)?;
+    let digest = Sha256::digest(encoded.as_bytes());
+    let mut result = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut result, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    Ok(result)
 }
 
 /// Maximum tool capability a workflow node may request.
@@ -1701,7 +2793,9 @@ fn policy_audit_identity(request: &WorkflowPolicyRequest, grant_id: Option<&str>
 }
 
 /// Shared read or exclusive write claim for a workflow resource.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ResourceAccess {
     Read,
@@ -1709,7 +2803,7 @@ pub enum ResourceAccess {
 }
 
 /// One named workflow resource claim.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema)]
 pub struct ResourceClaim {
     /// Stable resource identity such as `repository` or `worktree:review-1`.
     pub resource: String,
@@ -4974,6 +6068,383 @@ fn ensure_acyclic(
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
+
+    fn authored_document() -> WorkflowAuthoringDocument {
+        let value_schema = ValueSchema {
+            type_name: "example.value/v1".to_string(),
+            schema: serde_json::json!({
+                "$schema": WORKFLOW_AUTHORING_JSON_SCHEMA_DIALECT,
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["message"],
+                "properties": {"message": {"type": "string"}}
+            }),
+        };
+        WorkflowAuthoringDocument {
+            schema_version: WORKFLOW_AUTHORING_DOCUMENT_VERSION,
+            workflow_id: "workflow/example".to_string(),
+            metadata: WorkflowAuthoringMetadata {
+                title: "Example workflow".to_string(),
+                description: Some("Portable authored workflow fixture".to_string()),
+                labels: BTreeMap::from([("purpose".to_string(), "test".to_string())]),
+            },
+            configuration_schema: value_schema.clone(),
+            configuration_defaults: Some(serde_json::json!({"message": "hello"})),
+            definition: WorkflowDefinition {
+                schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
+                name: "example".to_string(),
+                input: value_schema.clone(),
+                output: value_schema.clone(),
+                nodes: BTreeMap::from([(
+                    "agent".to_string(),
+                    NodeDefinition {
+                        id: "agent".to_string(),
+                        name: "Agent".to_string(),
+                        kind: NodeKind::Agent,
+                        input: value_schema.clone(),
+                        output: value_schema,
+                        resources: vec![ResourceClaim::read("repository")],
+                        configuration: serde_json::json!({}),
+                    },
+                )]),
+                entries: vec!["agent".to_string()],
+                exits: vec!["agent".to_string()],
+                edges: Vec::new(),
+            },
+            bindings: vec![WorkflowConfigurationBinding {
+                version: WORKFLOW_CONFIGURATION_BINDING_VERSION,
+                configuration_path: "message".to_string(),
+                target: WorkflowConfigurationTarget::AgentSelection {
+                    node_id: "agent".to_string(),
+                    field: "prompt".to_string(),
+                },
+                transform: None,
+            }],
+            requirements: WorkflowRequirementSummary {
+                capabilities: BTreeSet::from(["workflow.agent/v1".to_string()]),
+                plugins: BTreeSet::new(),
+                blocks: BTreeSet::new(),
+                agents: BTreeSet::from(["review".to_string()]),
+                skills: BTreeSet::new(),
+            },
+            run_limits: WorkflowRunLimitPolicy::default(),
+            producer: WorkflowProducerProvenance {
+                kind: WorkflowProducerKind::Generated,
+                producer_id: Some("test-generator".to_string()),
+                source_revision: Some(WorkflowRevisionIdentity {
+                    workflow_id: "workflow/source".to_string(),
+                    revision: 1,
+                }),
+            },
+            presentation: Some(WorkflowAuthoringPresentation {
+                version: WORKFLOW_AUTHORING_PRESENTATION_VERSION,
+                namespaces: BTreeMap::from([(
+                    "bcode.graph".to_string(),
+                    serde_json::json!({"agent": {"x": 10, "y": 20}}),
+                )]),
+            }),
+        }
+    }
+
+    #[test]
+    fn authoring_document_round_trips_and_rejects_unknown_or_future_state() {
+        let document = authored_document();
+        document.validate().expect("valid authoring document");
+        let encoded = serde_json::to_value(&document).expect("serialize");
+        assert_eq!(
+            serde_json::from_value::<WorkflowAuthoringDocument>(encoded.clone())
+                .expect("deserialize"),
+            document
+        );
+
+        let mut future = encoded.clone();
+        future["schema_version"] = serde_json::json!(WORKFLOW_AUTHORING_DOCUMENT_VERSION + 1);
+        let error = serde_json::from_value::<WorkflowAuthoringDocument>(future)
+            .expect("deserialize future version")
+            .validate()
+            .expect_err("future version must fail closed");
+        assert!(error.to_string().contains("unsupported workflow authoring"));
+
+        let mut unknown = encoded;
+        unknown["unknown_future_field"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<WorkflowAuthoringDocument>(unknown).is_err());
+    }
+
+    #[test]
+    fn authoring_digest_is_stable_and_presentation_is_not_executable_identity() {
+        let document = authored_document();
+        let encoded = serde_json::to_string(&document).expect("serialize");
+        let decoded: WorkflowAuthoringDocument =
+            serde_json::from_str(&encoded).expect("deserialize");
+        assert_eq!(
+            document.source_digest_sha256().expect("source digest"),
+            decoded.source_digest_sha256().expect("decoded digest")
+        );
+
+        let mut presented = document.clone();
+        presented
+            .presentation
+            .as_mut()
+            .expect("presentation")
+            .namespaces
+            .insert(
+                "other.editor".to_string(),
+                serde_json::json!({"collapsed": true}),
+            );
+        assert_ne!(
+            document.source_digest_sha256().expect("source digest"),
+            presented.source_digest_sha256().expect("presented digest")
+        );
+        assert_eq!(
+            document
+                .executable_source_digest_sha256()
+                .expect("identity"),
+            presented
+                .executable_source_digest_sha256()
+                .expect("presented identity")
+        );
+
+        let mut semantic = document.clone();
+        semantic
+            .definition
+            .nodes
+            .get_mut("agent")
+            .expect("node")
+            .name = "Changed".to_string();
+        assert_ne!(
+            document
+                .executable_source_digest_sha256()
+                .expect("identity"),
+            semantic
+                .executable_source_digest_sha256()
+                .expect("changed identity")
+        );
+    }
+
+    #[test]
+    fn authoring_normalization_canonicalizes_unordered_graph_source() {
+        let mut first = authored_document();
+        first
+            .definition
+            .nodes
+            .get_mut("agent")
+            .expect("node")
+            .resources = vec![ResourceClaim::write("z"), ResourceClaim::read("a")];
+        let mut second = first.clone();
+        second
+            .definition
+            .nodes
+            .get_mut("agent")
+            .expect("node")
+            .resources
+            .reverse();
+        assert_eq!(
+            first.source_digest_sha256().expect("first digest"),
+            second.source_digest_sha256().expect("second digest")
+        );
+        assert_eq!(
+            first.normalized().expect("first normalized"),
+            second.normalized().expect("second normalized")
+        );
+    }
+
+    #[test]
+    fn authoring_schema_local_references_resolve_and_fail_closed() {
+        let mut local = authored_document();
+        local.configuration_schema.schema = serde_json::json!({
+            "$schema": WORKFLOW_AUTHORING_JSON_SCHEMA_DIALECT,
+            "$defs": {"message": {"type": "string"}},
+            "type": "object",
+            "required": ["message"],
+            "properties": {"message": {"$ref": "#/$defs/message"}}
+        });
+        local.validate().expect("bounded local reference");
+
+        let mut missing = local;
+        missing.configuration_schema.schema["properties"]["message"]["$ref"] =
+            serde_json::json!("#/$defs/missing");
+        assert!(missing.validate().is_err());
+
+        let mut recursive = authored_document();
+        recursive.configuration_defaults = None;
+        recursive.configuration_schema.schema = serde_json::json!({
+            "$defs": {"recursive": {"$ref": "#/$defs/recursive"}},
+            "$ref": "#/$defs/recursive"
+        });
+        let error = recursive
+            .validate()
+            .expect_err("recursive local reference must fail closed");
+        assert!(error.to_string().contains("recursive"));
+    }
+
+    fn round_trip<T>(value: &T)
+    where
+        T: Serialize + DeserializeOwned + PartialEq + fmt::Debug,
+    {
+        let encoded = serde_json::to_vec(value).expect("serialize contract");
+        assert_eq!(
+            serde_json::from_slice::<T>(&encoded).expect("deserialize contract"),
+            *value
+        );
+    }
+
+    #[test]
+    fn authoring_public_contracts_round_trip_independently() {
+        let document = authored_document();
+        let workflow_identity = WorkflowIdentity {
+            workflow_id: document.workflow_id.clone(),
+        };
+        let draft_identity = WorkflowDraftIdentity {
+            workflow_id: document.workflow_id.clone(),
+            draft_id: "draft/one".to_string(),
+        };
+        let revision_identity = WorkflowRevisionIdentity {
+            workflow_id: document.workflow_id.clone(),
+            revision: 1,
+        };
+        let effect_summary = WorkflowEffectSummary {
+            maximum_capability: WorkflowToolCapability::Mutating,
+            block_effects: BTreeSet::from([WorkflowBlockEffect::Mutating]),
+            reconciliation: BTreeSet::from([WorkflowBlockReconciliation::RepairRequired]),
+            resources: vec![ResourceClaim::write("repository")],
+        }
+        .normalized();
+        effect_summary.validate().expect("effect summary");
+
+        round_trip(&workflow_identity);
+        round_trip(&draft_identity);
+        round_trip(&revision_identity);
+        round_trip(&WorkflowProducerKind::Generated);
+        round_trip(&document.producer);
+        round_trip(&document.metadata);
+        round_trip(document.presentation.as_ref().expect("presentation"));
+        round_trip(&document.run_limits);
+        round_trip(&document.bindings[0].target);
+        round_trip(&document.bindings[0]);
+        round_trip(&document.requirements);
+        round_trip(&effect_summary);
+        round_trip(&document);
+    }
+
+    #[test]
+    fn authoring_validation_rejects_malformed_identity_graph_and_binding_references() {
+        let mut malformed = authored_document();
+        malformed.workflow_id = "bad identity".to_string();
+        assert!(malformed.validate().is_err());
+
+        let mut mismatched_node = authored_document();
+        mismatched_node
+            .definition
+            .nodes
+            .get_mut("agent")
+            .expect("node")
+            .id = "other".to_string();
+        assert!(mismatched_node.validate().is_err());
+
+        let mut unknown_node = authored_document();
+        unknown_node.bindings[0].target = WorkflowConfigurationTarget::NodeConfiguration {
+            node_id: "missing".to_string(),
+            path: "prompt".to_string(),
+        };
+        assert!(unknown_node.validate().is_err());
+
+        let mut duplicate_target = authored_document();
+        duplicate_target
+            .bindings
+            .push(duplicate_target.bindings[0].clone());
+        assert!(duplicate_target.validate().is_err());
+
+        let mut unbounded_cycle = authored_document();
+        unbounded_cycle.definition.edges.push(EdgeDefinition {
+            from: "agent".to_string(),
+            to: "agent".to_string(),
+            kind: EdgeKind::Direct,
+            transform: None,
+        });
+        assert!(unbounded_cycle.validate().is_err());
+    }
+
+    #[test]
+    fn authoring_validation_bounds_dynamic_schemas_and_json_content() {
+        let mut remote_reference = authored_document();
+        remote_reference.configuration_schema.schema =
+            serde_json::json!({"$ref": "https://example.invalid/schema.json"});
+        let error = remote_reference
+            .validate()
+            .expect_err("remote reference must fail");
+        assert!(error.to_string().contains("remote"));
+
+        let mut unsupported_dialect = authored_document();
+        unsupported_dialect.configuration_schema.schema["$schema"] =
+            serde_json::json!("https://json-schema.org/draft/2019-09/schema");
+        assert!(unsupported_dialect.validate().is_err());
+
+        let mut too_many_properties = authored_document();
+        let properties = (0..=MAX_WORKFLOW_AUTHORING_SCHEMA_PROPERTIES)
+            .map(|index| {
+                (
+                    format!("property_{index}"),
+                    serde_json::json!({"type": "string"}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        too_many_properties.configuration_schema.schema = serde_json::json!({
+            "type": "object",
+            "properties": properties
+        });
+        assert!(too_many_properties.validate().is_err());
+
+        let mut too_deep = serde_json::json!(null);
+        for _ in 0..=MAX_WORKFLOW_AUTHORING_JSON_DEPTH {
+            too_deep = serde_json::json!([too_deep]);
+        }
+        let mut deep_presentation = authored_document();
+        deep_presentation
+            .presentation
+            .as_mut()
+            .expect("presentation")
+            .namespaces
+            .insert("deep".to_string(), too_deep);
+        assert!(deep_presentation.validate().is_err());
+
+        let mut oversized = authored_document();
+        oversized.metadata.description =
+            Some("x".repeat(MAX_WORKFLOW_AUTHORING_DESCRIPTION_BYTES + 1));
+        assert!(oversized.validate().is_err());
+    }
+
+    #[test]
+    fn authoring_identity_and_provenance_contracts_are_bounded() {
+        WorkflowIdentity {
+            workflow_id: "workflow/one".to_string(),
+        }
+        .validate()
+        .expect("workflow identity");
+        WorkflowDraftIdentity {
+            workflow_id: "workflow/one".to_string(),
+            draft_id: "draft/one".to_string(),
+        }
+        .validate()
+        .expect("draft identity");
+        WorkflowRevisionIdentity {
+            workflow_id: "workflow/one".to_string(),
+            revision: 1,
+        }
+        .validate()
+        .expect("revision identity");
+        assert!(
+            WorkflowRevisionIdentity {
+                workflow_id: "workflow/one".to_string(),
+                revision: 0,
+            }
+            .validate()
+            .is_err()
+        );
+
+        let mut provenance = authored_document().producer;
+        provenance.producer_id = Some("x".repeat(MAX_WORKFLOW_AUTHORING_ID_BYTES + 1));
+        assert!(provenance.validate().is_err());
+    }
 
     #[test]
     #[should_panic(expected = "agent execution target requires an agent node")]

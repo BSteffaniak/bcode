@@ -16,6 +16,36 @@ if rg -n 'workflow\.db|CREATE TABLE.*workflow_(runs|attempts|activations|outputs
 fi
 rm -f /tmp/bcode-workflow-architecture-violations
 
+if [[ ! -f docs/runtime-workflow-authoring.md ]] \
+  || ! rg -q 'WorkflowAuthoringDocument' docs/runtime-workflow-authoring.md \
+  || ! rg -q 'Active-run pinning' docs/runtime-workflow-authoring.md \
+  || ! rg -q 'Producer-neutral authoring' docs/runtime-workflow-authoring.md \
+  || ! rg -q 'Import and export' docs/runtime-workflow-authoring.md; then
+  echo "Workflow authoring architecture violation: source/compile/run, pinning, producer, and import boundaries must remain documented." >&2
+  violations=1
+fi
+
+# Workflow authoring models live with the renderer-neutral workflow contracts. Keep implementation
+# packages and third-party frontend/database frameworks out of that owner before authoring types land,
+# so future additions fail mechanically at the package boundary rather than during review.
+if rg -n '^[[:space:]]*(bcode_(client|daemon|hyperchad|ipc|model_provider_runtime|plugin_runtime|server|tui|workflow_store)|ratatui|rusqlite|sqlx)[[:space:]]*=' \
+  packages/workflow/Cargo.toml \
+  >/tmp/bcode-workflow-authoring-dependency-violations 2>/dev/null; then
+  echo "Workflow authoring contract violation: portable workflow contracts must not depend on frontend, daemon, persistence, provider implementation, or plugin runtime packages." >&2
+  cat /tmp/bcode-workflow-authoring-dependency-violations >&2
+  violations=1
+fi
+rm -f /tmp/bcode-workflow-authoring-dependency-violations
+
+if rg -n '(^|[^[:alnum:]_])(bcode_(client|daemon|hyperchad|ipc|model_provider_runtime|plugin_runtime|server|tui|workflow_store)|ratatui|rusqlite|sqlx)::' \
+  packages/workflow/src --glob '*.rs' \
+  >/tmp/bcode-workflow-authoring-source-violations 2>/dev/null; then
+  echo "Workflow authoring contract violation: workflow-owned source imports frontend, daemon, database, provider-private, or plugin-runtime implementation types." >&2
+  cat /tmp/bcode-workflow-authoring-source-violations >&2
+  violations=1
+fi
+rm -f /tmp/bcode-workflow-authoring-source-violations
+
 if ! rg -q 'pub fn production_admission' packages/workflow/src/lib.rs \
   || ! rg -q 'WorkflowProductionCapabilities::current' packages/server/src/lib.rs \
   || ! rg -q 'validate_workflow_definition_for_production' packages/server/src/lib.rs; then

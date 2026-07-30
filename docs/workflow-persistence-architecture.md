@@ -14,9 +14,39 @@ not construct alternate workflow roots or maintain competing workflow state file
 
 The workflow database is authoritative for normalized definitions, runs, activations, attempts,
 validated outputs, artifact references, decisions, grants, resource leases, dispatch receipts,
-and workflow event/projection checkpoints. Canonical session transcript databases remain
-independent and contain only compact generic relationships or user-facing status events where a
-real integration requires them; detailed workflow rows never belong in session history.
+and workflow event/projection checkpoints. It is also the sole canonical store for runtime-authored
+logical workflows, mutable drafts and their generations, immutable published revisions, active
+revision pointers, revision-bound presets, authoring/publication events, and exact links from authored
+revisions to compiled definitions. These records extend the existing database; authoring clients,
+plugins, sessions, and renderers must not create another workflow catalog or draft store. Canonical
+session transcript databases remain independent and contain only compact generic relationships or
+user-facing status events where a real integration requires them; detailed workflow rows never belong
+in session history.
+
+## Runtime-authored workflow lifecycle
+
+The authoritative source/compile/run boundary is defined in
+[`runtime-workflow-authoring.md`](runtime-workflow-authoring.md). A mutable draft uses optimistic
+concurrency and is never executable authority. Publishing atomically records an immutable authored
+revision, its exact compiled `WorkflowDefinition` link, a publication event, and an optional
+compare-and-set active-revision update. A failed publish leaves none of those records partially
+visible.
+
+Published revision rows are append-only. Activating another revision changes only the logical
+workflow's convenience pointer. Every authored run records the exact logical workflow revision and
+compiled definition selected at admission, so later draft edits, publication, activation, archive, or
+preset changes cannot rewrite an active or historical run.
+
+Presets are mutable generation-checked configuration records bound to one exact published revision.
+They are not part of revision identity and do not carry grants or inline secrets. Starting from a
+preset persists the exact preset generation, resolved revision, validated final configuration, and
+compiled definition used by the run.
+
+Normal workflow, draft, revision, preset, validation, preview, and status reads are bounded and
+non-mutating. Validation reports, current requirement availability, and catalog projections are
+derived rather than canonical. Missing definition links, invalid active pointers, future versions, or
+inconsistent revision relationships surface degraded or repair-required state; normal reads do not
+reconstruct or repair them.
 
 ## Durable production admission
 
