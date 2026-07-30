@@ -2800,14 +2800,14 @@ mod tests {
             .execute(db.database())
             .await
             .expect("set future writer epoch");
-        manager
+        let handle = manager
             .inner
             .lock()
             .await
             .sessions
             .remove(&session.id)
             .expect("remove cached actor handle");
-        manager.inner.lock().await.leases.remove(&session.id);
+        handle.shutdown().await.expect("shutdown cached actor");
 
         let history = manager
             .session_history(session.id)

@@ -3728,6 +3728,53 @@ pub fn set_openai_compatible_sshenv_auth_mode(
     mode: AuthMode,
     base_url: Option<&str>,
 ) -> Result<PathBuf, ConfigError> {
+    let method = auth_mode_setting(&mode);
+    set_openai_compatible_sshenv_auth_method(OpenAiCompatibleAuthConfigUpdate {
+        provider,
+        profile,
+        vault,
+        model_id,
+        mode,
+        method,
+        base_url,
+    })
+}
+
+/// Options for writing OpenAI-compatible provider configuration after enrollment.
+pub struct OpenAiCompatibleAuthConfigUpdate<'a> {
+    /// Provider ID registered by the OpenAI-compatible plugin.
+    pub provider: &'a str,
+    /// Auth profile to select.
+    pub profile: String,
+    /// Credential vault path.
+    pub vault: PathBuf,
+    /// Optional model selection.
+    pub model_id: Option<String>,
+    /// Provider auth mode.
+    pub mode: AuthMode,
+    /// Registered auth method ID.
+    pub method: &'a str,
+    /// Optional provider API base URL.
+    pub base_url: Option<&'a str>,
+}
+
+/// Configure an OpenAI-compatible provider auth profile with a registered auth method.
+///
+/// # Errors
+///
+/// Returns an error when the config cannot be read, updated, or written.
+pub fn set_openai_compatible_sshenv_auth_method(
+    options: OpenAiCompatibleAuthConfigUpdate<'_>,
+) -> Result<PathBuf, ConfigError> {
+    let OpenAiCompatibleAuthConfigUpdate {
+        provider,
+        profile,
+        vault,
+        model_id,
+        mode,
+        method,
+        base_url,
+    } = options;
     update_writable_config(|config| {
         let vault_setting = vault.display().to_string();
         let mode_setting = auth_mode_setting(&mode);
@@ -3763,7 +3810,7 @@ pub fn set_openai_compatible_sshenv_auth_mode(
                 backend: "sshenv".to_string(),
                 provider_id: Some(provider.to_string()),
                 owner_plugin_id: Some("bcode.openai-compatible".to_string()),
-                scheme: Some(mode_setting.to_string()),
+                scheme: Some(method.to_string()),
                 map: auth_map,
                 settings,
             },
@@ -6243,7 +6290,8 @@ mod tests {
         load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
         load_runtime_auth_subscriptions, merge_config_values,
         plugin_selection_with_default_plugin_ids, register_runtime_auth_profile,
-        register_runtime_auth_subscription, upsert_agent_permission_rule,
+        register_runtime_auth_subscription, set_openai_compatible_sshenv_auth_method,
+        upsert_agent_permission_rule,
     };
     use bcode_agent_policy_models::Action;
     use bcode_plugin::{PluginSelection, PluginSelectionMode};
@@ -6251,6 +6299,109 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn compatible_provider_configuration_matrix_preserves_provider_settings() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("bcode.toml");
+        let previous = std::env::var_os("BCODE_CONFIG");
+        unsafe {
+            std::env::set_var("BCODE_CONFIG", &config_path);
+        }
+
+        set_openai_compatible_sshenv_auth_method(super::OpenAiCompatibleAuthConfigUpdate {
+            provider: "openai",
+            profile: "openai".to_owned(),
+            vault: temp.path().join("vault"),
+            model_id: Some("gpt-5".to_owned()),
+            mode: super::AuthMode::ApiKey,
+            method: "api_key",
+            base_url: Some("https://openai.example/v1"),
+        })
+        .expect("write OpenAI compatibility configuration");
+        let openai = super::read_config(&config_path).expect("read OpenAI configuration");
+        let profile = &openai.auth.profiles["openai"];
+        assert_eq!(profile.provider_id.as_deref(), Some("openai"));
+        assert_eq!(
+            profile.owner_plugin_id.as_deref(),
+            Some("bcode.openai-compatible")
+        );
+        assert_eq!(profile.scheme.as_deref(), Some("api_key"));
+        assert_eq!(
+            profile.settings.get("base_url").map(String::as_str),
+            Some("https://openai.example/v1")
+        );
+        assert_eq!(openai.model.model_id.as_deref(), Some("gpt-5"));
+        assert_eq!(
+            openai
+                .auth
+                .openai
+                .as_ref()
+                .map(|auth| auth.profile.as_str()),
+            Some("openai")
+        );
+
+        set_openai_compatible_sshenv_auth_method(super::OpenAiCompatibleAuthConfigUpdate {
+            provider: "xai",
+            profile: "xai-work".to_owned(),
+            vault: temp.path().join("vault"),
+            model_id: Some("grok-4".to_owned()),
+            mode: super::AuthMode::ApiKey,
+            method: "api_key",
+            base_url: Some("https://api.x.ai/v1"),
+        })
+        .expect("write xAI compatibility configuration");
+        let xai = super::read_config(&config_path).expect("read xAI configuration");
+        let profile = &xai.auth.profiles["xai-work"];
+        assert_eq!(profile.provider_id.as_deref(), Some("xai"));
+        assert_eq!(
+            profile.owner_plugin_id.as_deref(),
+            Some("bcode.openai-compatible")
+        );
+        assert_eq!(profile.scheme.as_deref(), Some("api_key"));
+        assert_eq!(
+            profile.settings.get("base_url").map(String::as_str),
+            Some("https://api.x.ai/v1")
+        );
+        assert_eq!(xai.model.model_id.as_deref(), Some("grok-4"));
+        assert_eq!(
+            xai.auth.openai.as_ref().map(|auth| auth.profile.as_str()),
+            Some("openai")
+        );
+
+        restore_env("BCODE_CONFIG", previous);
+    }
+
+    #[test]
+    fn compatible_device_login_persists_registered_method_scheme() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let config_path = temp.path().join("bcode.toml");
+        let previous = std::env::var_os("BCODE_CONFIG");
+        unsafe {
+            std::env::set_var("BCODE_CONFIG", &config_path);
+        }
+        set_openai_compatible_sshenv_auth_method(super::OpenAiCompatibleAuthConfigUpdate {
+            provider: "openai",
+            profile: "openai".to_owned(),
+            vault: temp.path().join("vault"),
+            model_id: Some("gpt-5".to_owned()),
+            mode: super::AuthMode::ChatGpt,
+            method: "device",
+            base_url: None,
+        })
+        .expect("write compatibility configuration");
+        let config = super::read_config(&config_path).expect("read compatibility configuration");
+        let profile = &config.auth.profiles["openai"];
+        assert_eq!(profile.scheme.as_deref(), Some("device"));
+        assert_eq!(
+            profile.settings.get("mode").map(String::as_str),
+            Some("chatgpt")
+        );
+        assert_eq!(config.model.model_id.as_deref(), Some("gpt-5"));
+        restore_env("BCODE_CONFIG", previous);
+    }
 
     #[test]
     fn runtime_subscription_persists_owned_profile_without_rebinding_primary() {

@@ -69,7 +69,7 @@ fi
 # Freeze them until provider capabilities replace them; do not permit another concrete-ID branch.
 provider_branch_count="$(
   rg -n 'Some\("bcode\.(openai-compatible|bedrock)"\) =>' packages/server/src/lib.rs \
-    | awk -F: '$1 < 18000 {count += 1} END {print count + 0}'
+    | awk -F: '$1 < 19000 {count += 1} END {print count + 0}'
 )"
 if [[ "$provider_branch_count" != "3" ]]; then
   echo "Runtime architecture violation: expected exactly three recorded provider-ID branches, found $provider_branch_count." >&2
@@ -1087,7 +1087,7 @@ if ! grep -F 'pub struct PluginInteractionAdapterCapability' packages/plugin-sdk
    ! grep -F 'with_interaction_adapters' packages/client/src/lib.rs >/dev/null ||
    ! grep -F 'client_supports_exchange' packages/server/src/lib.rs >/dev/null ||
    ! grep -F 'has_exchange_consumer' packages/server/src/lib.rs >/dev/null ||
-   ! grep -F 'bundled_interaction_adapter(' packages/tui/src/effects.rs >/dev/null ||
+   ! grep -F 'interaction_adapter_for_exchange(' packages/tui/src/effects.rs >/dev/null ||
    ! grep -F 'SessionEventKind::ToolExchangeRequested { request }' packages/tui/src/chat_loop.rs >/dev/null ||
    ! grep -F 'local_interaction_adapter(&exchange)' packages/hyperchad/src/lib.rs >/dev/null; then
   echo "Runtime architecture violation: renderer-local exchange adapter routing was removed." >&2

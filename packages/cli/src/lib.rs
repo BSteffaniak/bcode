@@ -3935,10 +3935,60 @@ struct AuthProviderLoginOptions<'a> {
     verify: bool,
 }
 
-async fn auth_provider_login(
+struct AuthProviderLoginResult {
+    resolved: bcode_provider_auth::ResolvedAuthProfile,
+    persisted_runtime: bool,
+}
+
+fn compatible_login_profile(
+    provider_id: &str,
+    explicit_profile: Option<&str>,
+    allocate_pool_profile: bool,
+) -> Result<String, CliError> {
+    if let Some(profile) = explicit_profile {
+        return Ok(profile.to_owned());
+    }
+    if !allocate_pool_profile {
+        return Ok(provider_id.to_owned());
+    }
+    let config = bcode_config::load_config()?;
+    let runtime = bcode_config::load_runtime_auth_subscriptions();
+    let profile = next_compatible_pool_profile(&config, &runtime, provider_id, None);
+    println!("Adding new OpenAI subscription auth profile '{profile}'.");
+    Ok(profile)
+}
+
+fn next_compatible_pool_profile(
+    config: &bcode_config::BcodeConfig,
+    runtime: &bcode_config::RuntimeAuthSubscriptions,
+    provider_id: &str,
+    explicit_profile: Option<&str>,
+) -> String {
+    if let Some(profile) = explicit_profile {
+        return profile.to_owned();
+    }
+    for index in 2_u64.. {
+        let candidate = format!("{provider_id}-{index}");
+        if !config.auth.profiles.contains_key(&candidate)
+            && !runtime.profiles.contains_key(&candidate)
+            && !runtime.pools.values().any(|pool| {
+                pool.profiles
+                    .iter()
+                    .any(|profile| profile.auth_profile == candidate)
+            })
+        {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded subscription profile search should return")
+}
+
+async fn enroll_registered_auth_provider(
     provider_id: &str,
     options: AuthProviderLoginOptions<'_>,
-) -> Result<(), CliError> {
+    supplied: BTreeMap<String, String>,
+    replace_owned: bool,
+) -> Result<AuthProviderLoginResult, CliError> {
     let AuthProviderLoginOptions {
         explicit_profile,
         explicit_vault,
@@ -3979,14 +4029,20 @@ async fn auth_provider_login(
                 &provider,
                 method,
                 &resolved,
-                BTreeMap::new(),
-                false,
+                supplied,
+                replace_owned,
             )?;
             if verify {
                 run_auth_interactive_flow(&host, &provider, method, &resolved, true, false).await?;
             }
         }
         bcode_provider_auth_models::AuthMethodContribution::Interactive { .. } => {
+            if !supplied.is_empty() {
+                return Err(CliError::LoginProfile(format!(
+                    "Provider '{provider_id}' selected method '{}' does not accept supplied secret fields.",
+                    method.method_id()
+                )));
+            }
             run_auth_interactive_flow(&host, &provider, method, &resolved, verify, false).await?;
         }
     }
@@ -3995,11 +4051,23 @@ async fn auth_provider_login(
     } else if persist_runtime {
         persist_prepared_runtime_profile(&resolved)?;
     }
+    host.deactivate_all()?;
+    Ok(AuthProviderLoginResult {
+        resolved,
+        persisted_runtime: pool.is_some() || persist_runtime,
+    })
+}
+
+async fn auth_provider_login(
+    provider_id: &str,
+    options: AuthProviderLoginOptions<'_>,
+) -> Result<(), CliError> {
+    let result =
+        enroll_registered_auth_provider(provider_id, options, BTreeMap::new(), false).await?;
     println!(
         "Authentication saved for provider '{provider_id}' in profile '{}'.",
-        resolved.profile_name
+        result.resolved.profile_name
     );
-    host.deactivate_all()?;
     Ok(())
 }
 
@@ -4500,13 +4568,7 @@ fn auth_login(
         bcode_provider_auth::security::device_seal_policy_for_auth_profile(auth_profile);
     let api_key = rpassword::prompt_password(format!("{api_key_env}: "))?;
     let target = LoginTarget {
-        auth_profile: auth_profile_name.clone(),
         storage_profile: storage_profile.clone(),
-        vault_path: vault_path.clone(),
-        api_key_env: Some(api_key_env.clone()),
-        config_update: LoginConfigUpdate::Declarative,
-        device_seal_policy,
-        recipient_key: recipient_key_hint.clone(),
     };
     upsert_auth_profile_secrets(
         &store,
@@ -4530,6 +4592,10 @@ fn auth_login(
 
 async fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
     eprintln!("warning: `bcode login` is deprecated; use `bcode auth login <provider>` instead");
+    run_compatible_login(compatible_login_plan(command)?).await
+}
+
+fn compatible_login_plan(command: LoginCommand) -> Result<CompatibleLoginPlan, CliError> {
     match command {
         LoginCommand::Openai {
             api_key,
@@ -4543,32 +4609,29 @@ async fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
             recipient_key,
             no_device_seal,
             model,
-        } => {
-            login_openai(OpenAiLoginOptions {
-                api_key,
-                base_url,
-                mode: OpenAiLoginMode {
-                    auth: if add_subscription {
-                        OpenAiLoginKind::AddSubscription
-                    } else if chatgpt {
-                        OpenAiLoginKind::ChatGpt
-                    } else {
-                        OpenAiLoginKind::Auto
-                    },
-                    flow: if headless && !browser {
-                        OpenAiLoginFlow::DeviceCode
-                    } else {
-                        OpenAiLoginFlow::Browser
-                    },
+        } => plan_openai_login(OpenAiLoginOptions {
+            api_key,
+            base_url,
+            mode: OpenAiLoginMode {
+                auth: if add_subscription {
+                    OpenAiLoginKind::AddSubscription
+                } else if chatgpt {
+                    OpenAiLoginKind::ChatGpt
+                } else {
+                    OpenAiLoginKind::Auto
                 },
-                profile,
-                vault,
-                recipient_key,
-                no_device_seal,
-                model,
-            })
-            .await?;
-        }
+                flow: if headless && !browser {
+                    OpenAiLoginFlow::DeviceCode
+                } else {
+                    OpenAiLoginFlow::Browser
+                },
+            },
+            profile,
+            vault,
+            recipient_key,
+            no_device_seal,
+            model,
+        }),
         LoginCommand::Xai {
             api_key,
             base_url,
@@ -4577,19 +4640,16 @@ async fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
             recipient_key,
             no_device_seal,
             model,
-        } => {
-            login_xai(XaiLoginOptions {
-                api_key,
-                base_url,
-                profile,
-                vault,
-                recipient_key,
-                no_device_seal,
-                model,
-            })?;
-        }
+        } => Ok(plan_xai_login(XaiLoginOptions {
+            api_key,
+            base_url,
+            profile,
+            vault,
+            recipient_key,
+            no_device_seal,
+            model,
+        })),
     }
-    Ok(())
 }
 
 struct OpenAiLoginOptions {
@@ -4634,6 +4694,92 @@ struct XaiLoginOptions {
     recipient_key: Option<String>,
     no_device_seal: bool,
     model: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CompatibleLoginPlan {
+    provider: LoginProvider,
+    method_id: &'static str,
+    explicit_profile: Option<String>,
+    pool: Option<&'static str>,
+    supplied: BTreeMap<String, String>,
+    replace_owned: bool,
+    no_device_seal: bool,
+    vault: Option<PathBuf>,
+    recipient_key: Option<String>,
+    model: Option<String>,
+    base_url: Option<String>,
+    mode: AuthMode,
+    add_subscription: bool,
+}
+
+fn plan_openai_login(options: OpenAiLoginOptions) -> Result<CompatibleLoginPlan, CliError> {
+    if options.mode.auth.is_add_subscription()
+        && (options.api_key.is_some() || options.base_url.is_some())
+    {
+        return Err(CliError::LoginProfile(
+            "`bcode login openai --add-subscription` adds ChatGPT subscription OAuth accounts; API-key pooled auth is not supported yet. Remove --api-key/--base-url or omit --add-subscription.".to_string(),
+        ));
+    }
+    let method_id = if options.api_key.is_some()
+        || (options.base_url.is_some() && !options.mode.auth.is_chatgpt())
+    {
+        "api_key"
+    } else {
+        match options.mode.flow {
+            OpenAiLoginFlow::Browser => "chatgpt",
+            OpenAiLoginFlow::DeviceCode => "device",
+        }
+    };
+    let mut supplied = BTreeMap::new();
+    if let Some(api_key) = options.api_key {
+        supplied.insert("api_key".to_owned(), api_key);
+    }
+    Ok(CompatibleLoginPlan {
+        provider: LoginProvider::OpenAi,
+        method_id,
+        explicit_profile: options.profile,
+        pool: options.mode.auth.is_add_subscription().then_some("openai"),
+        supplied,
+        replace_owned: method_id == "api_key",
+        no_device_seal: options.no_device_seal,
+        vault: options.vault,
+        recipient_key: options.recipient_key,
+        model: options.model,
+        base_url: options.base_url,
+        mode: if method_id == "api_key" {
+            AuthMode::ApiKey
+        } else {
+            AuthMode::ChatGpt
+        },
+        add_subscription: options.mode.auth.is_add_subscription(),
+    })
+}
+
+fn plan_xai_login(options: XaiLoginOptions) -> CompatibleLoginPlan {
+    let mut supplied = BTreeMap::new();
+    if let Some(api_key) = options.api_key {
+        supplied.insert("api_key".to_owned(), api_key);
+    }
+    CompatibleLoginPlan {
+        provider: LoginProvider::Xai,
+        method_id: "api_key",
+        explicit_profile: options.profile,
+        pool: None,
+        supplied,
+        replace_owned: true,
+        no_device_seal: options.no_device_seal,
+        vault: options.vault,
+        recipient_key: options.recipient_key,
+        model: options.model,
+        base_url: Some(
+            options
+                .base_url
+                .unwrap_or_else(|| "https://api.x.ai/v1".to_owned()),
+        ),
+        mode: AuthMode::ApiKey,
+        add_subscription: false,
+    }
 }
 
 fn enroll_registered_secret_values(
@@ -4687,109 +4833,42 @@ fn enroll_registered_secret_values(
     .map_err(|error| CliError::LoginProfile(error.to_string()))
 }
 
-fn enroll_registered_secret_fields(
-    provider_id: &str,
-    profile: Option<&str>,
-    vault: Option<PathBuf>,
-    recipient_key: Option<&str>,
-    device_seal_off: bool,
-    supplied: BTreeMap<String, String>,
-) -> Result<bcode_provider_auth::ResolvedAuthProfile, CliError> {
-    let mut host = load_cli_plugin_host()?;
-    let provider = registered_auth_provider(&host, provider_id)?;
-    let method = selected_auth_method(&provider, Some("api_key"))?;
-    if !matches!(
-        method,
-        bcode_provider_auth_models::AuthMethodContribution::SecretFields { .. }
-    ) {
-        return Err(CliError::LoginProfile(format!(
-            "Provider '{provider_id}' api_key method is not a generic secret-field method."
-        )));
-    }
-    let (mut resolved, persist_runtime) =
-        resolve_or_prepare_auth_profile(&provider, method, profile, vault, recipient_key)?;
-    if device_seal_off {
-        resolved
-            .profile
-            .settings
-            .insert("device_seal".to_owned(), "off".to_owned());
-    }
-    enroll_registered_secret_values(provider_id, &provider, method, &resolved, supplied, true)?;
-    if persist_runtime {
-        persist_prepared_runtime_profile(&resolved)?;
-    }
-    host.deactivate_all()?;
-    Ok(resolved)
-}
-
-async fn run_registered_auth_method(
-    provider_id: &str,
-    method_id: &str,
-    profile: Option<&str>,
-    vault: Option<PathBuf>,
-    recipient_key: Option<&str>,
-    device_seal_off: bool,
-    persist_runtime: bool,
-) -> Result<(bcode_provider_auth::ResolvedAuthProfile, bool), CliError> {
-    let mut host = load_cli_plugin_host()?;
-    let provider = registered_auth_provider(&host, provider_id)?;
-    let method = selected_auth_method(&provider, Some(method_id))?;
-    let (mut resolved, should_persist_runtime) =
-        resolve_or_prepare_auth_profile(&provider, method, profile, vault, recipient_key)?;
-    if device_seal_off {
-        resolved
-            .profile
-            .settings
-            .insert("device_seal".to_owned(), "off".to_owned());
-    }
-    run_auth_interactive_flow(&host, &provider, method, &resolved, false, false).await?;
-    if persist_runtime && should_persist_runtime {
-        persist_prepared_runtime_profile(&resolved)?;
-    }
-    host.deactivate_all()?;
-    Ok((resolved, should_persist_runtime))
-}
-
-async fn login_openai(options: OpenAiLoginOptions) -> Result<(), CliError> {
-    if options.mode.auth.is_add_subscription()
-        && (options.api_key.is_some() || options.base_url.is_some())
-    {
-        return Err(CliError::LoginProfile(
-            "`bcode login openai --add-subscription` adds ChatGPT subscription OAuth accounts; API-key pooled auth is not supported yet. Remove --api-key/--base-url or omit --add-subscription.".to_string(),
-        ));
-    }
-    let mut target = if options.mode.auth.is_add_subscription() {
-        resolve_add_subscription_login_target(options.profile.clone(), options.vault.clone())
+async fn run_compatible_login(plan: CompatibleLoginPlan) -> Result<(), CliError> {
+    let compatible_profile = if plan.add_subscription {
+        Some(compatible_login_profile(
+            plan.provider.subcommand(),
+            plan.explicit_profile.as_deref(),
+            true,
+        )?)
     } else {
-        resolve_login_target(
-            LoginProvider::OpenAi,
-            options.profile.clone(),
-            options.vault.clone(),
-            options.recipient_key.as_deref(),
-        )?
+        plan.explicit_profile.clone()
     };
-    if options.no_device_seal {
-        target.device_seal_policy = bcode_provider_auth::security::AuthDeviceSealPolicy::Off;
-    }
-    if options.api_key.is_some() || (options.base_url.is_some() && !options.mode.auth.is_chatgpt())
-    {
-        login_compatible_api_key_via_registry(
-            &target,
-            options.api_key,
-            options.base_url.as_deref(),
-            options.model,
-            LoginProvider::OpenAi,
-        )
-    } else {
-        login_openai_chatgpt_via_registry(
-            target,
-            options.model,
-            options.mode.flow,
-            options.mode.auth.is_add_subscription(),
-            options.no_device_seal,
-        )
-        .await
-    }
+    let result = enroll_registered_auth_provider(
+        plan.provider.subcommand(),
+        AuthProviderLoginOptions {
+            explicit_profile: compatible_profile.as_deref(),
+            explicit_vault: plan.vault.clone(),
+            recipient_key: plan.recipient_key.as_deref(),
+            no_device_seal: plan.no_device_seal,
+            pool: plan.pool,
+            requested_method: Some(plan.method_id),
+            verify: false,
+        },
+        plan.supplied,
+        plan.replace_owned,
+    )
+    .await?;
+    apply_legacy_login_configuration(LegacyLoginConfiguration {
+        provider: plan.provider,
+        resolved: &result.resolved,
+        persisted_runtime: result.persisted_runtime,
+        model: plan.model,
+        base_url: plan.base_url.as_deref(),
+        mode: plan.mode,
+        method_id: plan.method_id,
+        add_subscription: plan.add_subscription,
+    });
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4819,184 +4898,11 @@ impl LoginProvider {
             Self::Xai => "xai",
         }
     }
-
-    const fn wrapper_example(self) -> &'static str {
-        match self {
-            Self::OpenAi => "bcode-openai login openai",
-            Self::Xai => "bcode-xai login xai",
-        }
-    }
-
-    const fn explicit_example(self) -> &'static str {
-        match self {
-            Self::OpenAi => "bcode login openai --profile openai",
-            Self::Xai => "bcode login xai --profile xai",
-        }
-    }
-
-    fn accepts_config_provider(self, provider: &str) -> bool {
-        match self {
-            Self::OpenAi => !matches!(provider, "xai" | "grok"),
-            Self::Xai => matches!(provider, "xai" | "grok"),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LoginConfigUpdate {
-    Declarative,
-    Writable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LoginTarget {
-    auth_profile: String,
     storage_profile: String,
-    vault_path: PathBuf,
-    api_key_env: Option<String>,
-    config_update: LoginConfigUpdate,
-    device_seal_policy: bcode_provider_auth::security::AuthDeviceSealPolicy,
-    recipient_key: Option<String>,
-}
-
-fn resolve_login_target(
-    provider: LoginProvider,
-    explicit_profile: Option<String>,
-    explicit_vault: Option<PathBuf>,
-    explicit_recipient_key: Option<&str>,
-) -> Result<LoginTarget, CliError> {
-    if let Some(profile) = explicit_profile {
-        let config = bcode_config::load_config().ok();
-        if let Some(auth_profile) = config
-            .as_ref()
-            .and_then(|config| config.auth.profiles.get(&profile))
-        {
-            return login_target_from_declarative_auth_profile(
-                provider,
-                &profile,
-                auth_profile,
-                explicit_vault,
-                explicit_recipient_key,
-            );
-        }
-        let vault_path = explicit_vault.unwrap_or_else(bcode_config::default_auth_vault_path);
-        return Ok(LoginTarget {
-            auth_profile: profile.clone(),
-            storage_profile: profile,
-            vault_path,
-            api_key_env: None,
-            config_update: LoginConfigUpdate::Writable,
-            device_seal_policy: bcode_provider_auth::security::AuthDeviceSealPolicy::Preferred,
-            recipient_key: explicit_recipient_key.map(ToString::to_string),
-        });
-    }
-
-    let config = bcode_config::load_config()?;
-    let auth_profile = active_login_auth_profile(&config).ok_or_else(|| {
-        CliError::LoginProfile(format!(
-            "No active {} auth profile found.\n\nRun a provider wrapper such as:\n  {}\n\nOr pass one explicitly:\n  {}",
-            provider.label(),
-            provider.wrapper_example(),
-            provider.explicit_example()
-        ))
-    })?;
-    let Some(configured_auth_profile) = config.auth.profiles.get(&auth_profile) else {
-        return Err(CliError::LoginProfile(format!(
-            "Active {} auth profile '{auth_profile}' is selected, but it is not declared in [auth.profiles.{auth_profile}].\n\nUpdate the active config or pass a profile explicitly:\n  bcode login {} --profile {auth_profile}",
-            provider.label(),
-            provider.subcommand()
-        )));
-    };
-    login_target_from_declarative_auth_profile(
-        provider,
-        &auth_profile,
-        configured_auth_profile,
-        explicit_vault,
-        explicit_recipient_key,
-    )
-}
-
-fn resolve_add_subscription_login_target(
-    explicit_profile: Option<String>,
-    explicit_vault: Option<PathBuf>,
-) -> LoginTarget {
-    let config = bcode_config::load_config().unwrap_or_default();
-    let registry = bcode_config::load_runtime_auth_subscriptions();
-    let profile = explicit_profile.map_or_else(
-        || next_subscription_profile_name(&config, &registry),
-        |profile| {
-            if runtime_subscription_profile_exists(&registry, "openai", &profile) {
-                println!(
-                    "Refreshing existing OpenAI subscription auth profile '{profile}' in runtime auth state."
-                );
-            }
-            profile
-        },
-    );
-    let vault_path = explicit_vault.unwrap_or_else(|| {
-        runtime_subscription_vault(&registry, "openai", &profile)
-            .unwrap_or_else(bcode_config::default_auth_vault_path)
-    });
-    LoginTarget {
-        auth_profile: profile.clone(),
-        storage_profile: profile,
-        vault_path,
-        api_key_env: None,
-        config_update: LoginConfigUpdate::Writable,
-        device_seal_policy: bcode_provider_auth::security::AuthDeviceSealPolicy::Preferred,
-        recipient_key: None,
-    }
-}
-
-fn runtime_subscription_profile_exists(
-    registry: &bcode_config::RuntimeAuthSubscriptions,
-    pool: &str,
-    profile: &str,
-) -> bool {
-    registry.pools.get(pool).is_some_and(|pool| {
-        pool.profiles
-            .iter()
-            .any(|candidate| candidate.auth_profile == profile)
-    })
-}
-
-fn runtime_subscription_vault(
-    registry: &bcode_config::RuntimeAuthSubscriptions,
-    pool: &str,
-    profile: &str,
-) -> Option<PathBuf> {
-    registry
-        .pools
-        .get(pool)?
-        .profiles
-        .iter()
-        .find(|candidate| candidate.auth_profile == profile)
-        .map(|candidate| candidate.vault.clone())
-}
-
-fn next_subscription_profile_name(
-    config: &bcode_config::BcodeConfig,
-    registry: &bcode_config::RuntimeAuthSubscriptions,
-) -> String {
-    if !config.auth.profiles.contains_key("openai")
-        && !runtime_subscription_profile_exists(registry, "openai", "openai")
-    {
-        return "openai".to_string();
-    }
-    for index in 2.. {
-        let candidate = format!("openai-{index}");
-        if !config.auth.profiles.contains_key(&candidate)
-            && !runtime_subscription_profile_exists(registry, "openai", &candidate)
-        {
-            if index > 2 {
-                println!(
-                    "Adding new OpenAI subscription auth profile '{candidate}'. To refresh an existing subscription instead, pass `--profile openai-2` (or the profile shown by `bcode auth pool status openai`)."
-                );
-            }
-            return candidate;
-        }
-    }
-    unreachable!("unbounded subscription profile search should return")
 }
 
 fn active_login_auth_profile(config: &bcode_config::BcodeConfig) -> Option<String> {
@@ -5004,62 +4910,6 @@ fn active_login_auth_profile(config: &bcode_config::BcodeConfig) -> Option<Strin
         .ok()
         .filter(|profile| !profile.trim().is_empty())
         .or_else(|| config.resolved_model_selection().auth_profile)
-}
-
-fn login_target_from_declarative_auth_profile(
-    provider: LoginProvider,
-    auth_profile_name: &str,
-    auth_profile: &bcode_config::AuthProfileConfig,
-    explicit_vault: Option<PathBuf>,
-    explicit_recipient_key: Option<&str>,
-) -> Result<LoginTarget, CliError> {
-    if auth_profile.backend != "sshenv" {
-        return Err(CliError::LoginProfile(format!(
-            "Auth profile '{auth_profile_name}' uses backend '{}', but `bcode login {}` can only update sshenv-backed auth profiles.",
-            auth_profile.backend,
-            provider.subcommand()
-        )));
-    }
-    if let Some(config_provider) = auth_profile.settings.get("provider")
-        && !provider.accepts_config_provider(config_provider)
-    {
-        return Err(CliError::LoginProfile(format!(
-            "Auth profile '{auth_profile_name}' is configured for provider '{config_provider}', not {}.",
-            provider.label()
-        )));
-    }
-    let storage_profile = auth_profile
-        .settings
-        .get("profile")
-        .cloned()
-        .unwrap_or_else(|| auth_profile_name.to_string());
-    let api_key_env = auth_profile
-        .map
-        .get("api_key")
-        .and_then(|mapping| mapping.env.as_ref().or(mapping.key.as_ref()))
-        .or_else(|| auth_profile.settings.get("api_key_env"))
-        .filter(|value| !value.trim().is_empty())
-        .cloned();
-    let vault_path = auth_profile
-        .settings
-        .get("vault")
-        .map(PathBuf::from)
-        .or(explicit_vault)
-        .unwrap_or_else(bcode_config::default_auth_vault_path);
-    let recipient_key = explicit_recipient_key
-        .map(ToString::to_string)
-        .or_else(|| auth_profile.settings.get("recipient_key").cloned());
-    Ok(LoginTarget {
-        auth_profile: auth_profile_name.to_string(),
-        storage_profile,
-        vault_path,
-        api_key_env,
-        config_update: LoginConfigUpdate::Declarative,
-        device_seal_policy: bcode_provider_auth::security::device_seal_policy_for_auth_profile(
-            auth_profile,
-        ),
-        recipient_key,
-    })
 }
 
 fn apply_auth_device_seal_policy(
@@ -5231,140 +5081,72 @@ fn upsert_auth_profile_secrets(
         })
 }
 
-fn login_compatible_api_key_via_registry(
-    target: &LoginTarget,
-    api_key: Option<String>,
-    base_url: Option<&str>,
-    model: Option<String>,
+struct LegacyLoginConfiguration<'a> {
     provider: LoginProvider,
-) -> Result<(), CliError> {
-    let mut supplied = BTreeMap::new();
-    if let Some(api_key) = api_key {
-        supplied.insert("api_key".to_owned(), api_key);
-    }
-    enroll_registered_secret_fields(
-        provider.subcommand(),
-        Some(&target.auth_profile),
-        Some(target.vault_path.clone()),
-        target.recipient_key.as_deref(),
-        target.device_seal_policy == bcode_provider_auth::security::AuthDeviceSealPolicy::Off,
-        supplied,
-    )?;
-    let prefix = provider.prefix();
-    report_login_completion(
-        &format!("{prefix} API credentials saved"),
-        target,
-        prefix,
-        || {
-            bcode_config::set_openai_compatible_sshenv_auth_mode(
-                provider.subcommand(),
-                target.auth_profile.clone(),
-                target.vault_path.clone(),
-                model,
-                AuthMode::ApiKey,
-                base_url,
-            )
-        },
-    );
-    Ok(())
-}
-
-fn login_xai(options: XaiLoginOptions) -> Result<(), CliError> {
-    let mut target = resolve_login_target(
-        LoginProvider::Xai,
-        options.profile,
-        options.vault,
-        options.recipient_key.as_deref(),
-    )?;
-    if options.no_device_seal {
-        target.device_seal_policy = bcode_provider_auth::security::AuthDeviceSealPolicy::Off;
-    }
-    let base_url = options
-        .base_url
-        .unwrap_or_else(|| "https://api.x.ai/v1".to_owned());
-    login_compatible_api_key_via_registry(
-        &target,
-        options.api_key,
-        Some(&base_url),
-        options.model,
-        LoginProvider::Xai,
-    )
-}
-
-async fn login_openai_chatgpt_via_registry(
-    target: LoginTarget,
+    resolved: &'a bcode_provider_auth::ResolvedAuthProfile,
+    persisted_runtime: bool,
     model: Option<String>,
-    flow: OpenAiLoginFlow,
+    base_url: Option<&'a str>,
+    mode: AuthMode,
+    method_id: &'a str,
     add_subscription: bool,
-    no_device_seal: bool,
-) -> Result<(), CliError> {
-    let method_id = match flow {
-        OpenAiLoginFlow::Browser => "chatgpt",
-        OpenAiLoginFlow::DeviceCode => "device",
-    };
-    let (resolved, _) = run_registered_auth_method(
-        "openai",
-        method_id,
-        Some(&target.auth_profile),
-        Some(target.vault_path.clone()),
-        target.recipient_key.as_deref(),
-        no_device_seal,
-        !add_subscription,
-    )
-    .await?;
-    report_login_completion(
-        "OpenAI ChatGPT subscription login saved",
-        &target,
-        "OPENAI",
-        || {
-            if add_subscription {
-                bcode_config::register_runtime_auth_subscription(
-                    "openai",
-                    runtime_pool_profile(&resolved),
-                )
-            } else {
-                bcode_config::set_openai_sshenv_auth_mode(
-                    target.auth_profile.clone(),
-                    target.vault_path.clone(),
-                    model,
-                    AuthMode::ChatGpt,
-                )
-            }
-        },
-    );
-    Ok(())
 }
 
-fn report_login_completion(
-    saved_message: &str,
-    target: &LoginTarget,
-    provider: &str,
-    update_config: impl FnOnce() -> Result<PathBuf, bcode_config::ConfigError>,
-) {
-    println!("{saved_message}");
-    println!("Auth profile: {}", target.auth_profile);
-    println!(
-        "Credentials saved to sshenv vault profile: {}",
-        target.storage_profile
-    );
-    if let Some(api_key_env) = &target.api_key_env {
-        println!("API key environment variable: {api_key_env}");
+fn apply_legacy_login_configuration(options: LegacyLoginConfiguration<'_>) {
+    let LegacyLoginConfiguration {
+        provider,
+        resolved,
+        persisted_runtime,
+        model,
+        base_url,
+        mode,
+        method_id,
+        add_subscription,
+    } = options;
+    println!("{} authentication saved", provider.label());
+    println!("Auth profile: {}", resolved.profile_name);
+    let storage_profile = resolved
+        .profile
+        .settings
+        .get("profile")
+        .map_or(resolved.profile_name.as_str(), String::as_str);
+    println!("Credentials saved to sshenv vault profile: {storage_profile}");
+    if resolved.source == bcode_provider_auth::AuthProfileSource::Declarative {
+        println!("Config is declarative; no config file update needed.");
+        return;
     }
-    match target.config_update {
-        LoginConfigUpdate::Declarative => {
-            println!("Config is declarative; no config file update needed.");
+    if persisted_runtime {
+        println!("Runtime auth metadata updated.");
+    }
+    let vault = resolved
+        .profile
+        .settings
+        .get("vault")
+        .map_or_else(bcode_config::default_auth_vault_path, PathBuf::from);
+    let update = if add_subscription {
+        Ok(bcode_config::runtime_auth_subscriptions_path())
+    } else {
+        bcode_config::set_openai_compatible_sshenv_auth_method(
+            bcode_config::OpenAiCompatibleAuthConfigUpdate {
+                provider: provider.subcommand(),
+                profile: resolved.profile_name.clone(),
+                vault,
+                model_id: model,
+                mode,
+                method: method_id,
+                base_url,
+            },
+        )
+    };
+    match update {
+        Ok(config_path) => println!("Config updated: {}", display_from_current_dir(&config_path)),
+        Err(error) => {
+            println!("Config update failed: {error}");
+            println!(
+                "Credentials were saved. To use them, run a provider wrapper with a declarative {} auth profile or update a writable config.",
+                provider.prefix()
+            );
         }
-        LoginConfigUpdate::Writable => match update_config() {
-            Ok(config_path) => {
-                println!("Config updated: {}", display_from_current_dir(&config_path));
-            }
-            Err(error) => {
-                println!("Config update failed: {error}");
-                println!(
-                    "Credentials were saved. To use them, run a provider wrapper with a declarative {provider} auth profile or update a writable config."
-                );
-            }
-        },
     }
 }
 
@@ -9324,16 +9106,224 @@ mod auth_cli_tests {
         }
     }
 
+    fn parse_compatible_login_plan(arguments: &[&str]) -> Result<CompatibleLoginPlan, CliError> {
+        use clap::{CommandFactory as _, FromArgMatches as _};
+        let matches = Cli::command()
+            .try_get_matches_from(arguments)
+            .expect("compatibility command parses");
+        let cli = Cli::from_arg_matches(&matches).expect("compatibility command decodes");
+        let Some(Commands::Login { command }) = cli.command else {
+            panic!("expected compatibility login command");
+        };
+        compatible_login_plan(command)
+    }
+
+    struct CompatibleLoginCase<'a> {
+        arguments: &'a [&'a str],
+        provider: LoginProvider,
+        method: &'a str,
+        profile: Option<&'a str>,
+        pool: Option<&'a str>,
+        add_subscription: bool,
+        replace_owned: bool,
+    }
+
+    #[test]
+    fn compatibility_login_command_matrix_translates_to_registered_enrollment() {
+        let cases = [
+            CompatibleLoginCase {
+                arguments: &["bcode", "login", "openai", "--api-key", "openai-secret"],
+                provider: LoginProvider::OpenAi,
+                method: "api_key",
+                profile: None,
+                pool: None,
+                add_subscription: false,
+                replace_owned: true,
+            },
+            CompatibleLoginCase {
+                arguments: &["bcode", "login", "openai", "--chatgpt", "--browser"],
+                provider: LoginProvider::OpenAi,
+                method: "chatgpt",
+                profile: None,
+                pool: None,
+                add_subscription: false,
+                replace_owned: false,
+            },
+            CompatibleLoginCase {
+                arguments: &["bcode", "login", "openai", "--headless"],
+                provider: LoginProvider::OpenAi,
+                method: "device",
+                profile: None,
+                pool: None,
+                add_subscription: false,
+                replace_owned: false,
+            },
+            CompatibleLoginCase {
+                arguments: &[
+                    "bcode",
+                    "login",
+                    "openai",
+                    "--add-subscription",
+                    "--profile",
+                    "openai-2",
+                ],
+                provider: LoginProvider::OpenAi,
+                method: "chatgpt",
+                profile: Some("openai-2"),
+                pool: Some("openai"),
+                add_subscription: true,
+                replace_owned: false,
+            },
+            CompatibleLoginCase {
+                arguments: &[
+                    "bcode",
+                    "login",
+                    "openai",
+                    "--add-subscription",
+                    "--profile",
+                    "openai-2",
+                    "--headless",
+                ],
+                provider: LoginProvider::OpenAi,
+                method: "device",
+                profile: Some("openai-2"),
+                pool: Some("openai"),
+                add_subscription: true,
+                replace_owned: false,
+            },
+            CompatibleLoginCase {
+                arguments: &["bcode", "login", "xai", "--api-key", "xai-secret"],
+                provider: LoginProvider::Xai,
+                method: "api_key",
+                profile: None,
+                pool: None,
+                add_subscription: false,
+                replace_owned: true,
+            },
+        ];
+        for case in cases {
+            let plan =
+                parse_compatible_login_plan(case.arguments).expect("valid compatibility plan");
+            assert_eq!(plan.provider, case.provider, "{:?}", case.arguments);
+            assert_eq!(plan.method_id, case.method, "{:?}", case.arguments);
+            assert_eq!(
+                plan.explicit_profile.as_deref(),
+                case.profile,
+                "{:?}",
+                case.arguments
+            );
+            assert_eq!(plan.pool, case.pool, "{:?}", case.arguments);
+            assert_eq!(
+                plan.add_subscription, case.add_subscription,
+                "{:?}",
+                case.arguments
+            );
+            assert_eq!(
+                plan.replace_owned, case.replace_owned,
+                "{:?}",
+                case.arguments
+            );
+        }
+    }
+
+    #[test]
+    fn compatibility_login_preserves_profile_wrapper_model_url_and_device_seal_options() {
+        let plan = parse_compatible_login_plan(&[
+            "bcode",
+            "login",
+            "openai",
+            "--api-key",
+            "secret",
+            "--profile",
+            "work",
+            "--vault",
+            "/tmp/auth-vault",
+            "--recipient-key",
+            "recipient",
+            "--no-device-seal",
+            "--model",
+            "gpt-5",
+            "--base-url",
+            "https://openai.example/v1",
+        ])
+        .expect("OpenAI compatibility plan");
+        assert_eq!(plan.explicit_profile.as_deref(), Some("work"));
+        assert_eq!(plan.vault.as_deref(), Some(Path::new("/tmp/auth-vault")));
+        assert_eq!(plan.recipient_key.as_deref(), Some("recipient"));
+        assert!(plan.no_device_seal);
+        assert_eq!(plan.model.as_deref(), Some("gpt-5"));
+        assert_eq!(plan.base_url.as_deref(), Some("https://openai.example/v1"));
+        assert_eq!(
+            plan.supplied.get("api_key").map(String::as_str),
+            Some("secret")
+        );
+
+        let xai = parse_compatible_login_plan(&[
+            "bcode",
+            "login",
+            "xai",
+            "--api-key",
+            "secret",
+            "--model",
+            "grok-4",
+        ])
+        .expect("xAI compatibility plan");
+        assert_eq!(xai.model.as_deref(), Some("grok-4"));
+        assert_eq!(xai.base_url.as_deref(), Some("https://api.x.ai/v1"));
+    }
+
+    #[test]
+    fn compatibility_login_rejects_api_key_subscription_pool() {
+        let error = parse_compatible_login_plan(&[
+            "bcode",
+            "login",
+            "openai",
+            "--add-subscription",
+            "--api-key",
+            "secret",
+        ])
+        .expect_err("API-key pool must remain unsupported");
+        assert!(
+            error
+                .to_string()
+                .contains("API-key pooled auth is not supported")
+        );
+    }
+
+    #[test]
+    fn compatibility_pool_profile_selection_preserves_refresh_and_allocates_next_name() {
+        let config = bcode_config::BcodeConfig::default();
+        let runtime = bcode_config::RuntimeAuthSubscriptions::default();
+        assert_eq!(
+            compatible_login_profile("openai", Some("openai-2"), true).expect("explicit profile"),
+            "openai-2"
+        );
+        assert_eq!(
+            next_compatible_pool_profile(&config, &runtime, "openai", None),
+            "openai-2"
+        );
+
+        let mut runtime = runtime;
+        runtime.profiles.insert(
+            "openai-2".to_owned(),
+            bcode_config::RuntimeAuthProfile::default(),
+        );
+        assert_eq!(
+            next_compatible_pool_profile(&config, &runtime, "openai", None),
+            "openai-3"
+        );
+    }
+
     #[test]
     fn runtime_pool_profile_preserves_registered_method_and_device_seal_policy() {
         let resolved = bcode_provider_auth::ResolvedAuthProfile {
             profile_name: "openai-2".to_owned(),
             provider_id: "openai".to_owned(),
-            owner_plugin_id: "bcode.openai-compatible".to_owned(),
+            owner_plugin_id: "bcode.test-openai-compatible".to_owned(),
             profile: bcode_config::AuthProfileConfig {
                 backend: "sshenv".to_owned(),
                 provider_id: Some("openai".to_owned()),
-                owner_plugin_id: Some("bcode.openai-compatible".to_owned()),
+                owner_plugin_id: Some("bcode.test-openai-compatible".to_owned()),
                 scheme: Some("device".to_owned()),
                 map: BTreeMap::from([(
                     "access_token".to_owned(),
