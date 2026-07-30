@@ -189,6 +189,15 @@ pub async fn search_provider(
             message: error.to_string(),
             retryable: true,
         })?;
+    validate_provider_response(plugin_id, request, &response)?;
+    Ok(response)
+}
+
+fn validate_provider_response(
+    plugin_id: &str,
+    request: &SessionSearchRequest,
+    response: &SessionSearchResponse,
+) -> Result<(), SessionSearchServiceError> {
     if response.provider_id != plugin_id {
         return Err(SessionSearchServiceError {
             code: SearchErrorCode::InvalidRequest,
@@ -236,7 +245,7 @@ pub async fn search_provider(
             retryable: false,
         });
     }
-    Ok(response)
+    Ok(())
 }
 
 /// Execute one bounded terminal federated search using deterministic grouped provider ordering.
@@ -302,15 +311,12 @@ pub async fn search_federated_with_routes(
             let result = if remaining.is_zero() {
                 Err(timeout_error())
             } else {
-                match tokio::time::timeout(
+                tokio::time::timeout(
                     remaining,
                     search_provider(state, &provider.plugin_id, &provider_request),
                 )
                 .await
-                {
-                    Ok(result) => result,
-                    Err(_) => Err(timeout_error()),
-                }
+                .unwrap_or_else(|_| Err(timeout_error()))
             };
             (
                 provider.plugin_id,

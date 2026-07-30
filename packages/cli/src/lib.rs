@@ -927,6 +927,24 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Search optional derived providers without opening canonical session storage.
+    Search {
+        query: String,
+        /// Restrict search to semantic content categories.
+        #[arg(long = "content", value_enum)]
+        content: Vec<SessionSearchContentArg>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        /// Overall provider deadline in milliseconds.
+        #[arg(long, default_value_t = 5_000)]
+        deadline_ms: u64,
+        /// Hydrate exact canonical event locators through bounded daemon reads.
+        #[arg(long)]
+        hydrate: bool,
+        /// Print hits, provider coverage, and failures as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Export complete canonical events through the daemon-owned strict history boundary.
     Export {
         session_id: SessionId,
@@ -1003,6 +1021,47 @@ enum SessionImportCommand {
         source: String,
         external_session_id: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SessionSearchContentArg {
+    SessionTitle,
+    UserMessage,
+    AssistantMessage,
+    AssistantReasoning,
+    SystemMessage,
+    ShellCommand,
+    ShellOutput,
+    ToolArguments,
+    ToolOutput,
+    ToolError,
+    Permission,
+    RuntimeDiagnostic,
+    Compaction,
+    TraceMetadata,
+    ArtifactMetadata,
+}
+
+impl From<SessionSearchContentArg> for bcode_session_search::SearchContentKind {
+    fn from(value: SessionSearchContentArg) -> Self {
+        match value {
+            SessionSearchContentArg::SessionTitle => Self::SessionTitle,
+            SessionSearchContentArg::UserMessage => Self::UserMessage,
+            SessionSearchContentArg::AssistantMessage => Self::AssistantMessage,
+            SessionSearchContentArg::AssistantReasoning => Self::AssistantReasoning,
+            SessionSearchContentArg::SystemMessage => Self::SystemMessage,
+            SessionSearchContentArg::ShellCommand => Self::ShellCommand,
+            SessionSearchContentArg::ShellOutput => Self::ShellOutput,
+            SessionSearchContentArg::ToolArguments => Self::ToolArguments,
+            SessionSearchContentArg::ToolOutput => Self::ToolOutput,
+            SessionSearchContentArg::ToolError => Self::ToolError,
+            SessionSearchContentArg::Permission => Self::Permission,
+            SessionSearchContentArg::RuntimeDiagnostic => Self::RuntimeDiagnostic,
+            SessionSearchContentArg::Compaction => Self::Compaction,
+            SessionSearchContentArg::TraceMetadata => Self::TraceMetadata,
+            SessionSearchContentArg::ArtifactMetadata => Self::ArtifactMetadata,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1486,6 +1545,14 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
             limit,
             json,
         } => session_inspect(session_id, category, after, before, limit, json).await?,
+        SessionCommand::Search {
+            query,
+            content,
+            limit,
+            deadline_ms,
+            hydrate,
+            json,
+        } => session_search(query, content, limit, deadline_ms, hydrate, json).await?,
         SessionCommand::Export { session_id, format } => {
             session_export(session_id, format).await?;
         }
@@ -7127,6 +7194,87 @@ async fn session_inspect(
     Ok(())
 }
 
+async fn session_search(
+    query: String,
+    content: Vec<SessionSearchContentArg>,
+    limit: usize,
+    deadline_ms: u64,
+    hydrate: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let request = bcode_session_search::SessionSearchRequest {
+        query: bcode_session_search::SessionSearchQuery::Text {
+            text: query,
+            mode: bcode_session_search::TextMatchMode::Terms,
+            fields: BTreeSet::new(),
+        },
+        filters: bcode_session_search::SessionSearchFilters {
+            content_kinds: content.into_iter().map(Into::into).collect(),
+            ..bcode_session_search::SessionSearchFilters::default()
+        },
+        sort: bcode_session_search::SessionSearchSort::ProviderRelevance,
+        limit,
+        cursor: None,
+        deadline_ms: Some(deadline_ms),
+    };
+    let (response, hydrated_hits) = BcodeClient::default_endpoint()
+        .session_search(request, Vec::new(), hydrate)
+        .await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "response": response,
+                "hydrated_hits": hydrated_hits,
+            }))?
+        );
+        return Ok(());
+    }
+    for hit in &response.hits {
+        println!(
+            "{} #{} {:?}: {}",
+            hit.locator.session_id,
+            hit.locator.sequence,
+            hit.content_kind,
+            hit.preview.as_deref().unwrap_or("<no provider preview>")
+        );
+    }
+    for provider in &response.providers {
+        eprintln!(
+            "provider {}: {:?}, query_complete={}, coverage_complete={}, elapsed={}ms",
+            provider.provider_id,
+            provider.outcome,
+            provider.query_complete,
+            provider.coverage_complete,
+            provider.elapsed_ms
+        );
+    }
+    for failure in &response.failures {
+        eprintln!(
+            "provider {} failed ({:?}): {}",
+            failure.plugin_id, failure.error.code, failure.error.message
+        );
+    }
+    for hydrated in &hydrated_hits {
+        if hydrated.outcome != bcode_session_search::SearchHitHydrationOutcome::Hydrated {
+            eprintln!(
+                "hydration {} #{}: {:?}{}",
+                hydrated.hit.locator.session_id,
+                hydrated.hit.locator.sequence,
+                hydrated.outcome,
+                hydrated
+                    .message
+                    .as_deref()
+                    .map_or_else(String::new, |message| format!(" ({message})"))
+            );
+        }
+    }
+    if !response.query_complete || !response.coverage_complete {
+        eprintln!("search result is partial; inspect provider status/failures above");
+    }
+    Ok(())
+}
+
 async fn session_export(
     session_id: SessionId,
     format: SessionExportFormat,
@@ -9545,6 +9693,40 @@ mod web_command_tests {
             assert!(rendered.contains("schema 39"));
             assert!(rendered.contains("upgrade Bcode"));
         }
+    }
+
+    #[test]
+    fn session_search_command_parses_bounded_content_and_hydration_options() {
+        let cli = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "search",
+            "database locked",
+            "--content",
+            "user-message",
+            "--content",
+            "shell-output",
+            "--limit",
+            "15",
+            "--deadline-ms",
+            "1200",
+            "--hydrate",
+            "--json",
+        ])
+        .expect("search command should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Session {
+                command: SessionCommand::Search {
+                    content,
+                    limit: 15,
+                    deadline_ms: 1200,
+                    hydrate: true,
+                    json: true,
+                    ..
+                }
+            }) if content.len() == 2
+        ));
     }
 
     #[test]

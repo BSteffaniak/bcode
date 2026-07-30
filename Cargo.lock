@@ -1488,6 +1488,7 @@ dependencies = [
  "bcode_session_import",
  "bcode_session_migration",
  "bcode_session_models",
+ "bcode_session_search",
  "bcode_settings",
  "bcode_tui",
  "bcode_worktree_models",
