@@ -12377,11 +12377,16 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
             .settle_pending_control_nodes(run_id, 1_000, current_unix_millis())?;
         let owner = WorkflowActivationOwner { state };
         let dispatched = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-            .dispatch_pending_activations(&owner, 1_000, current_unix_millis())
+            .dispatch_pending_activations_for_run(&owner, run_id, 1_000, current_unix_millis())
             .await?;
         let observer = WorkflowTurnReceiptObserver { state };
         let reconciled = bcode_workflow_store::WorkflowStore::open_at_path(&store_path)?
-            .reconcile_receipt_backed_attempts_async(&observer, 1_000, current_unix_millis())
+            .reconcile_receipt_backed_attempts_for_run_async(
+                &observer,
+                run_id,
+                1_000,
+                current_unix_millis(),
+            )
             .await?;
         if !reconciled.sibling_cancellations.is_empty() {
             propagate_fail_fast_sibling_cancellation(

@@ -3546,6 +3546,32 @@ impl WorkflowStore {
         .await
     }
 
+    /// Admit and dispatch pending executable activations for one exact run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the run identity or bound is invalid, or when discovery, owner
+    /// planning/dispatch, admission, receipt persistence, or durable state access fails.
+    pub async fn dispatch_pending_activations_for_run<O>(
+        &mut self,
+        owner: &O,
+        run_id: &str,
+        limit: usize,
+        dispatched_at_ms: u64,
+    ) -> Result<ActivationDispatchSummary, WorkflowStoreError>
+    where
+        O: ActivationDispatchOwner + ?Sized,
+    {
+        let pending = self.pending_activations_for_run(run_id, limit)?;
+        self.dispatch_activations_with_fault(
+            owner,
+            &NoopWorkflowDispatchFault,
+            pending,
+            dispatched_at_ms,
+        )
+        .await
+    }
+
     /// Dispatch pending activations with deterministic post-boundary fault injection.
     ///
     /// # Errors
@@ -3564,6 +3590,21 @@ impl WorkflowStore {
         F: WorkflowDispatchFault + ?Sized,
     {
         let pending = self.pending_activations(limit)?;
+        self.dispatch_activations_with_fault(owner, fault, pending, dispatched_at_ms)
+            .await
+    }
+
+    async fn dispatch_activations_with_fault<O, F>(
+        &mut self,
+        owner: &O,
+        fault: &F,
+        pending: Vec<PendingActivation>,
+        dispatched_at_ms: u64,
+    ) -> Result<ActivationDispatchSummary, WorkflowStoreError>
+    where
+        O: ActivationDispatchOwner + ?Sized,
+        F: WorkflowDispatchFault + ?Sized,
+    {
         let mut summary = ActivationDispatchSummary::default();
         for activation in pending {
             let Some(plan) = owner.plan(&activation)? else {
@@ -4090,7 +4131,22 @@ impl WorkflowStore {
         &self,
         limit: usize,
     ) -> Result<Vec<AttemptReconciliationRequest>, WorkflowStoreError> {
-        receipt_backed_attempts(&self.connection, bounded_limit(limit)?)
+        receipt_backed_attempts(&self.connection, None, bounded_limit(limit)?)
+    }
+
+    /// Return bounded receipt-backed attempts for one exact run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the run identity or bound is invalid, receipt data is malformed, or
+    /// the query fails.
+    pub fn active_attempts_for_run(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<AttemptReconciliationRequest>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        receipt_backed_attempts(&self.connection, Some(run_id), bounded_limit(limit)?)
     }
 
     /// Report whether the exact prepared attempt has a committed owner receipt.
@@ -4164,7 +4220,7 @@ impl WorkflowStore {
         O: AttemptStatusObserver + ?Sized,
     {
         let limit = bounded_limit(limit)?;
-        let requests = receipt_backed_attempts(&self.connection, limit)?;
+        let requests = receipt_backed_attempts(&self.connection, None, limit)?;
         let observations = requests
             .iter()
             .map(|request| observer.observe(request).map(|status| (request, status)))
@@ -4199,7 +4255,43 @@ impl WorkflowStore {
         O: AsyncAttemptStatusObserver + ?Sized,
     {
         let limit = bounded_limit(limit)?;
-        let requests = receipt_backed_attempts(&self.connection, limit)?;
+        let requests = receipt_backed_attempts(&self.connection, None, limit)?;
+        self.reconcile_attempt_requests_async(observer, requests, reconciled_at_ms)
+            .await
+    }
+
+    /// Asynchronously reconcile receipt-backed attempts for one exact run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the run identity or bound is invalid, or when bounded
+    /// discovery/observation or a durable transition fails.
+    pub async fn reconcile_receipt_backed_attempts_for_run_async<O>(
+        &mut self,
+        observer: &O,
+        run_id: &str,
+        limit: usize,
+        reconciled_at_ms: u64,
+    ) -> Result<ReceiptReconciliationSummary, WorkflowStoreError>
+    where
+        O: AsyncAttemptStatusObserver + ?Sized,
+    {
+        validate_id("run_id", run_id)?;
+        let limit = bounded_limit(limit)?;
+        let requests = receipt_backed_attempts(&self.connection, Some(run_id), limit)?;
+        self.reconcile_attempt_requests_async(observer, requests, reconciled_at_ms)
+            .await
+    }
+
+    async fn reconcile_attempt_requests_async<O>(
+        &mut self,
+        observer: &O,
+        requests: Vec<AttemptReconciliationRequest>,
+        reconciled_at_ms: u64,
+    ) -> Result<ReceiptReconciliationSummary, WorkflowStoreError>
+    where
+        O: AsyncAttemptStatusObserver + ?Sized,
+    {
         let mut observations = Vec::with_capacity(requests.len());
         for request in requests {
             let observation = if cancellation_requested_for_run(&self.connection, &request.run_id)?
@@ -5414,8 +5506,31 @@ impl WorkflowStore {
         limit: usize,
     ) -> Result<Vec<PendingActivation>, WorkflowStoreError> {
         let limit = bounded_limit(limit)?;
-        let mut statement = self.connection.prepare(
-            "SELECT activation.run_id, activation.node_id, activation.activation_id, \
+        self.pending_activations_matching(None, limit)
+    }
+
+    /// Return bounded pending activations for one exact run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the run identity or bound is invalid, persisted definitions are
+    /// malformed, a node is missing, or the bounded query fails.
+    pub fn pending_activations_for_run(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<PendingActivation>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let limit = bounded_limit(limit)?;
+        self.pending_activations_matching(Some(run_id), limit)
+    }
+
+    fn pending_activations_matching(
+        &self,
+        run_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<PendingActivation>, WorkflowStoreError> {
+        let sql = "SELECT activation.run_id, activation.node_id, activation.activation_id, \
              activation.dependency_generation, activation.input_json, activation.created_at_ms, \
              definition.definition_json \
              FROM workflow_activations activation \
@@ -5424,10 +5539,12 @@ impl WorkflowStore {
                AND definition.version = run.definition_version \
              WHERE activation.status = 'pending' AND run.status = 'running' \
                AND run.cancellation_requested_at_ms IS NULL \
-             ORDER BY activation.created_at_ms, activation.run_id, activation.node_id LIMIT ?1",
-        )?;
+               AND (?1 = '' OR activation.run_id = ?1) \
+             ORDER BY activation.created_at_ms, activation.run_id, activation.node_id LIMIT ?2";
+        let mut statement = self.connection.prepare(sql)?;
+        let parameters: [&dyn rusqlite::ToSql; 2] = [&run_id.unwrap_or(""), &limit];
         statement
-            .query_map([limit], |row| {
+            .query_map(parameters, |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -6490,15 +6607,17 @@ fn receipt_backed_attempt(
 
 fn receipt_backed_attempts(
     connection: &Connection,
+    run_id: Option<&str>,
     limit: i64,
 ) -> Result<Vec<AttemptReconciliationRequest>, WorkflowStoreError> {
     let mut statement = connection.prepare(
         "SELECT run_id, node_id, activation_id, attempt, dispatch_identity, side_effect, \
          receipt_json FROM workflow_attempts WHERE status IN ('admitted', 'running', 'cancelling') \
-         AND receipt_json IS NOT NULL ORDER BY prepared_at_ms, dispatch_identity LIMIT ?1",
+         AND receipt_json IS NOT NULL AND (?1 = '' OR run_id = ?1) \
+         ORDER BY prepared_at_ms, dispatch_identity LIMIT ?2",
     )?;
     statement
-        .query_map([limit], attempt_reconciliation_row)?
+        .query_map((run_id.unwrap_or(""), limit), attempt_reconciliation_row)?
         .map(|row| attempt_reconciliation_request(row?))
         .collect()
 }
@@ -9460,6 +9579,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_scoped_dispatch_ignores_unrelated_pending_activation() {
+        use std::sync::Mutex;
+
+        struct Owner(Mutex<Vec<String>>);
+        impl ActivationDispatchOwner for Owner {
+            fn plan(
+                &self,
+                _activation: &PendingActivation,
+            ) -> Result<Option<ActivationDispatchPlan>, WorkflowStoreError> {
+                Ok(Some(ActivationDispatchPlan {
+                    side_effect: DispatchSideEffect::ReadOnly,
+                    intent: serde_json::json!({"operation": "review"}),
+                }))
+            }
+
+            fn dispatch<'a>(
+                &'a self,
+                request: &'a PreparedActivationDispatch,
+            ) -> Pin<
+                Box<dyn Future<Output = Result<serde_json::Value, WorkflowStoreError>> + Send + 'a>,
+            > {
+                Box::pin(async move {
+                    self.0
+                        .lock()
+                        .expect("observed runs")
+                        .push(request.activation.run_id.clone());
+                    Ok(serde_json::json!({"accepted": true}))
+                })
+            }
+        }
+
+        let (_temp, mut store) = initialized_store();
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "run-2".to_string(),
+                created_at_ms: 20,
+                ..new_run()
+            })
+            .expect("second run");
+        let owner = Owner(Mutex::new(Vec::new()));
+
+        let summary = store
+            .dispatch_pending_activations_for_run(&owner, "run-2", 10, 21)
+            .await
+            .expect("run-scoped dispatch");
+
+        assert_eq!(summary.admitted.len(), 1);
+        assert_eq!(*owner.0.lock().expect("observed runs"), ["run-2"]);
+        assert_eq!(
+            store
+                .pending_activations_for_run("run-1", 10)
+                .expect("first pending")
+                .len(),
+            1
+        );
+        assert!(
+            store
+                .pending_activations_for_run("run-2", 10)
+                .expect("second pending")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn owner_dispatch_persists_intent_before_call_and_receipt_after_acceptance() {
         use std::sync::Mutex;
 
@@ -10253,6 +10436,102 @@ mod tests {
             .expect("prepare")
             .expect("next attempt");
         assert_eq!(prepared.attempt, 2);
+    }
+
+    #[tokio::test]
+    async fn run_scoped_async_reconciliation_ignores_unrelated_owner_failure() {
+        struct Observer;
+        impl AsyncAttemptStatusObserver for Observer {
+            fn observe_async<'a>(
+                &'a self,
+                request: &'a AttemptReconciliationRequest,
+            ) -> Pin<
+                Box<
+                    dyn Future<Output = Result<AttemptObservation, WorkflowStoreError>> + Send + 'a,
+                >,
+            > {
+                Box::pin(async move {
+                    if request.run_id == "run-1" {
+                        return Err(WorkflowStoreError::InvalidData(
+                            "stale unrelated workflow output is invalid".to_string(),
+                        ));
+                    }
+                    Ok(AttemptObservation::Running)
+                })
+            }
+        }
+
+        let (_temp, mut store) = initialized_store();
+        let stale_identity =
+            prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::Mutating);
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "run-2".to_string(),
+                created_at_ms: 20,
+                ..new_run()
+            })
+            .expect("second run");
+        let second_activation = activation_identity("run-2", "review", 0);
+        let attempt = PreparedAttempt {
+            run_id: "run-2".to_string(),
+            node_id: "review".to_string(),
+            activation_id: second_activation.clone(),
+            attempt: 1,
+            side_effect: DispatchSideEffect::Mutating,
+            intent: serde_json::json!({"operation": "review"}),
+            prepared_at_ms: 21,
+        };
+        let second_identity = store.prepare_attempt(&attempt).expect("prepare second");
+        store
+            .persist_dispatch_receipt(&DispatchReceipt {
+                run_id: attempt.run_id,
+                node_id: attempt.node_id,
+                activation_id: attempt.activation_id,
+                attempt: 1,
+                dispatch_identity: second_identity.clone(),
+                receipt: serde_json::json!({"turn_id": "turn-2"}),
+                admitted_at_ms: 22,
+            })
+            .expect("second receipt");
+
+        let summary = store
+            .reconcile_receipt_backed_attempts_for_run_async(&Observer, "run-2", 10, 23)
+            .await
+            .expect("unrelated failure must not fail run-scoped reconciliation");
+
+        assert!(summary.succeeded.is_empty());
+        assert_eq!(
+            store
+                .attempt_history("run-1", None, 10)
+                .expect("stale attempt")
+                .pop()
+                .expect("stale attempt")
+                .status,
+            "admitted"
+        );
+        assert_eq!(
+            store
+                .attempt_history("run-2", None, 10)
+                .expect("second attempt")
+                .pop()
+                .expect("second attempt")
+                .status,
+            "running"
+        );
+        assert_eq!(
+            store
+                .active_attempts_for_run("run-1", 10)
+                .expect("stale active attempt")[0]
+                .dispatch_identity,
+            stale_identity
+        );
+        assert_eq!(
+            store
+                .active_attempts_for_run("run-2", 10)
+                .expect("second active attempt")[0]
+                .dispatch_identity,
+            second_identity
+        );
     }
 
     #[tokio::test]
