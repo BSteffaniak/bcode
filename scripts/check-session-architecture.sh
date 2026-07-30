@@ -788,6 +788,14 @@ if ! rg -q 'KnownLegacy \{ writer_epoch \} => Err\(SessionError::StorageMigratio
   violations=1
 fi
 
+if ! rg -q 'first_non_current_event_schema' packages/session/src/db.rs \
+  || ! rg -q 'first_non_current_event_schema_uses_bounded_scalar_detection' packages/session/src/db.rs \
+  || ! rg -q 'current_writer_with_released_historical_events' packages/server/src/lib.rs \
+  || ! rg -q 'requires_event_normalization' packages/server/src/session_migration_execution.rs \
+  || ! rg -q 'current_writer_schema_40_session_migrates_on_real_open_ipc' packages/server/src/lib.rs; then
+  echo "Session migration event-schema classification violation: current-writer stores with released historical event schemas must be routed through explicit first-open migration." >&2
+  violations=1
+fi
 if ! rg -q 'unknown_historical_kind_fails_writable_migration' packages/session-migration/src/execution.rs \
   || ! rg -q 'legacy_session_migrates_across_real_attach_and_send_ipc' packages/server/src/lib.rs \
   || ! rg -q 'failed_explicit_migration_preserves_projection_and_writer_contract' packages/session/src/db.rs \

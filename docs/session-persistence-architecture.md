@@ -210,7 +210,8 @@ Normal first load is serialized per session. The manager inspects the migration 
 storage contract without mutation, then follows one of these paths:
 
 * Current storage: acquire a compatible runtime lease and recheck compatibility while ownership is
-  held.
+  held. If its canonical envelope schemas are released historical inputs rather than current, route
+  first open through the same exclusive migration operation before strict current decoding.
 * Known legacy storage: acquire exclusive maintenance ownership and the maintenance write lock,
   reopen and reclassify, migrate atomically, validate write readiness, and transition maintenance
   ownership directly into a compatible runtime lease.

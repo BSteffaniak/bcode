@@ -8023,6 +8023,23 @@ fn session_migration_failure_outcome(
     }
 }
 
+async fn current_writer_with_released_historical_events(
+    state: &ServerState,
+    session_id: SessionId,
+    source_writer_epoch: Option<u32>,
+) -> Option<u32> {
+    if source_writer_epoch.is_some() {
+        return source_writer_epoch;
+    }
+    let root = state.sessions.session_store_root()?;
+    let db = bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, &root)
+        .await
+        .ok()?;
+    let schema = db.first_non_current_event_schema().await.ok()??;
+    bcode_session_migration::is_released_historical_event_schema(schema)
+        .then_some(bcode_session::db::CURRENT_SESSION_STORAGE_WRITER_EPOCH)
+}
+
 async fn handle_prepare_session_open(
     request_id: u64,
     state: &Arc<ServerState>,
@@ -8038,6 +8055,9 @@ async fn handle_prepare_session_open(
         } => u32::try_from(source).ok(),
         _ => None,
     };
+    let source_writer_epoch =
+        current_writer_with_released_historical_events(state, session_id, source_writer_epoch)
+            .await;
     if let Some(source_writer_epoch) = source_writer_epoch {
         if let Err(error) = state.session_migrations.plan(source_writer_epoch) {
             return send_response(
@@ -27438,7 +27458,7 @@ mod tests {
     use crate::context_compaction::*;
     use bcode_session_models::{CURRENT_SESSION_EVENT_SCHEMA_VERSION, SessionEvent};
     use std::sync::Mutex as TestMutex;
-    use switchy::database::DatabaseValue;
+    use switchy::database::{DatabaseValue, query::FilterableQuery};
     use tracing_subscriber::fmt::MakeWriter;
 
     #[cfg(unix)]
@@ -39255,6 +39275,135 @@ library = "test"
         )
         .expect("migration overlap sidecar");
         (session.id, current_session_id)
+    }
+
+    async fn create_current_writer_with_legacy_schema_ipc_sessions(
+        session_root: &Path,
+        workspace: &Path,
+    ) -> (SessionId, SessionId) {
+        let sessions = SessionManager::persistent(session_root).expect("persistent sessions");
+        let current_session_id = create_current_session(&sessions, workspace).await;
+        let session = sessions
+            .create_session(
+                Some("legacy schema IPC".to_owned()),
+                workspace.to_path_buf(),
+            )
+            .await
+            .expect("session");
+        let db =
+            bcode_session::db::SessionDb::open_existing_turso_in_root(session.id, session_root)
+                .await
+                .expect("session database");
+        db.database()
+            .update("events")
+            .value("schema_version", DatabaseValue::Int64(40))
+            .execute(db.database())
+            .await
+            .expect("event schema should become historical");
+        let rows = db.canonical_rows_page(0, 16).await.expect("canonical rows");
+        for row in rows {
+            let payload = row.payload.replace(
+                &format!(
+                    "\"schema_version\":{}",
+                    bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION
+                ),
+                "\"schema_version\":40",
+            );
+            db.database()
+                .update("events")
+                .value("payload", payload)
+                .where_eq(
+                    "event_seq",
+                    DatabaseValue::Int64(i64::try_from(row.sequence).expect("event sequence")),
+                )
+                .execute(db.database())
+                .await
+                .expect("historical payload schema");
+        }
+        drop(db);
+        drop(sessions);
+        (session.id, current_session_id)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn current_writer_schema_40_session_migrates_on_real_open_ipc() {
+        let workspace = tempfile::tempdir().expect("IPC workspace");
+        let session_root = workspace.path().join("sessions");
+        let (session_id, current_session_id) =
+            create_current_writer_with_legacy_schema_ipc_sessions(&session_root, workspace.path())
+                .await;
+
+        let sessions = SessionManager::persistent(&session_root).expect("restored sessions");
+        let state = Arc::new(test_server_state(sessions));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let mut connection = client
+            .connect("schema-40-migration-test")
+            .await
+            .expect("connect");
+        assert_current_session_prepares_and_attaches_without_migration(
+            &mut connection,
+            state.as_ref(),
+            current_session_id,
+        )
+        .await;
+
+        let terminal = prepare_session_until_terminal(&mut connection, session_id).await;
+        assert_eq!(
+            terminal.outcome,
+            Some(bcode_session_models::SessionOpenTerminalOutcome::Ready)
+        );
+        connection
+            .attach_session_recent(session_id, 16)
+            .await
+            .expect("schema-40 attach should migrate transparently");
+        let migrated =
+            bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, &session_root)
+                .await
+                .expect("migrated database");
+        assert_eq!(
+            migrated
+                .first_non_current_event_schema()
+                .await
+                .expect("event schema query"),
+            None
+        );
+        server.abort();
+    }
+
+    async fn prepare_session_until_terminal(
+        connection: &mut bcode_client::ClientConnection,
+        session_id: SessionId,
+    ) -> bcode_session_models::SessionOpenOperationSnapshot {
+        let mut snapshot = connection
+            .prepare_session_open(session_id)
+            .await
+            .expect("prepare session");
+        while snapshot.outcome.is_none() {
+            snapshot = connection
+                .wait_session_open_progress(
+                    session_id,
+                    snapshot.operation_id,
+                    snapshot.revision,
+                    Duration::from_secs(5),
+                )
+                .await
+                .expect("wait for migration");
+        }
+        snapshot
     }
 
     #[cfg(unix)]

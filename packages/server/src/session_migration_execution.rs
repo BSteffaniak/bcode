@@ -212,10 +212,23 @@ pub async fn migrate_owned_session_storage(
         .await?
         .storage_compatibility()
         .await?;
+    let requires_event_normalization = if matches!(
+        compatibility,
+        db::SessionStorageCompatibility::Current { .. }
+    ) {
+        db::SessionDb::open_existing_turso_in_root(session_id, root)
+            .await?
+            .first_non_current_event_schema()
+            .await?
+            .is_some_and(bcode_session_migration::is_released_historical_event_schema)
+    } else {
+        false
+    };
     if matches!(
         compatibility,
         db::SessionStorageCompatibility::KnownLegacy { .. }
-    ) {
+    ) || requires_event_normalization
+    {
         execute_owned_legacy_storage(
             OwnedLegacyMigration {
                 session_id,

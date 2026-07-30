@@ -1342,6 +1342,29 @@ impl SessionDb {
         &**self.db
     }
 
+    /// Return the oldest non-current canonical event schema, if any.
+    ///
+    /// This bounded scalar query does not decode payloads, replay history, or mutate storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the query fails or its row is malformed.
+    pub async fn first_non_current_event_schema(&self) -> SessionDbResult<Option<u16>> {
+        let current = bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION;
+        let query = format!(
+            "SELECT MIN(schema_version) AS schema_version FROM events WHERE schema_version != {current}"
+        );
+        let row = self.db.query_raw(&query).await?.into_iter().next();
+        row.as_ref()
+            .and_then(|row| optional_i64(row, "schema_version"))
+            .map(i64_to_u64)
+            .map(u16::try_from)
+            .transpose()
+            .map_err(|_| SessionDbError::InvalidRow {
+                column: "events.schema_version".to_owned(),
+            })
+    }
+
     /// Return a bounded, non-decoding inventory of canonical event envelopes.
     ///
     /// This diagnosis path reads only indexed scalar columns and never deserializes payloads,
@@ -4128,6 +4151,43 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn first_non_current_event_schema_uses_bounded_scalar_detection() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session DB");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::SessionCreated {
+                name: None,
+                working_directory: std::path::PathBuf::from("."),
+            },
+        ))
+        .await
+        .expect("append current event");
+        assert_eq!(
+            db.first_non_current_event_schema()
+                .await
+                .expect("schema query"),
+            None
+        );
+        db.database()
+            .update("events")
+            .value("schema_version", DatabaseValue::Int64(40))
+            .execute(db.database())
+            .await
+            .expect("install historical schema marker");
+        assert_eq!(
+            db.first_non_current_event_schema()
+                .await
+                .expect("schema query"),
+            Some(40)
+        );
     }
 
     #[tokio::test]
