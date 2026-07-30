@@ -8,9 +8,9 @@ if ! rg -q 'state_dir\.join\("workflows"\)\.join\(DATABASE_FILE\)' packages/work
   violations=1
 fi
 
-if rg -n 'workflow\.db|CREATE TABLE.*workflow_(runs|attempts|activations|outputs)' \
-  packages/session plugins/loop-plugin --glob '*.rs' >/tmp/bcode-workflow-architecture-violations 2>/dev/null; then
-  echo "Workflow persistence ownership violation: session/loop code must not own workflow database paths or tables." >&2
+if rg -n 'workflow\.db|CREATE TABLE.*(workflow_(runs|attempts|activations|outputs|drafts|revisions|presets|authoring_events)|authored_workflows)' \
+  packages/session packages/tui packages/hyperchad plugins --glob '*.rs' >/tmp/bcode-workflow-architecture-violations 2>/dev/null; then
+  echo "Workflow persistence ownership violation: session, loop, frontend, and plugin code must not own workflow database paths or tables." >&2
   cat /tmp/bcode-workflow-architecture-violations >&2
   violations=1
 fi
@@ -45,6 +45,25 @@ if rg -n '(^|[^[:alnum:]_])(bcode_(client|daemon|hyperchad|ipc|model_provider_ru
   violations=1
 fi
 rm -f /tmp/bcode-workflow-authoring-source-violations
+
+if ! rg -q 'pub struct WorkflowAuthoringDocument' packages/workflow/src/lib.rs \
+  || ! rg -q 'pub struct WorkflowAuthoringCatalogSnapshot' packages/workflow/src/lib.rs \
+  || ! rg -q 'pub struct WorkflowCompilationPreview' packages/workflow/src/lib.rs; then
+  echo "Workflow authoring contract violation: required portable authoring contracts are missing." >&2
+  violations=1
+fi
+
+# The authored lifecycle snapshot/request declarations precede the legacy exact-definition request.
+# Keep this public authoring contract region independent of persistence implementation types.
+awk '/pub struct AuthoredWorkflowSnapshot/{capture=1} /pub struct WorkflowDefinitionRegistrationRequest/{capture=0} capture' \
+  packages/ipc/src/lib.rs \
+  | rg -n 'bcode_workflow_store|rusqlite|ratatui|bcode_tui|bcode_server' \
+  >/tmp/bcode-workflow-authoring-ipc-violations 2>/dev/null && {
+  echo "Workflow authoring IPC violation: portable authoring snapshots or requests expose implementation types." >&2
+  cat /tmp/bcode-workflow-authoring-ipc-violations >&2
+  violations=1
+}
+rm -f /tmp/bcode-workflow-authoring-ipc-violations
 
 if ! rg -q 'pub fn production_admission' packages/workflow/src/lib.rs \
   || ! rg -q 'WorkflowProductionCapabilities::current' packages/server/src/lib.rs \

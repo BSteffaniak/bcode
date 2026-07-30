@@ -1419,6 +1419,10 @@ const MAX_WORKFLOW_AUTHORING_BINDINGS: usize = 4_096;
 const MAX_WORKFLOW_AUTHORING_REQUIREMENTS: usize = 4_096;
 const MAX_WORKFLOW_AUTHORING_PRESENTATION_NAMESPACES: usize = 32;
 const MAX_WORKFLOW_AUTHORING_PRESENTATION_BYTES: usize = 131_072;
+/// Portable workflow-authoring catalog contract version.
+pub const WORKFLOW_AUTHORING_CATALOG_VERSION: u32 = 1;
+/// Portable workflow compilation preview contract version.
+pub const WORKFLOW_COMPILATION_PREVIEW_VERSION: u32 = 1;
 
 /// Stable logical identity for one runtime-authored workflow.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1697,8 +1701,8 @@ pub enum WorkflowConfigurationTarget {
     NodeConfiguration { node_id: String, path: String },
     /// Populate a declared agent selection field.
     AgentSelection { node_id: String, field: String },
-    /// Populate one declared skill selection slot.
-    SkillSelection { node_id: String, slot: String },
+    /// Populate one declared indexed skill selection.
+    SkillSelection { node_id: String, index: usize },
     /// Populate a plugin-block input default field.
     PluginBlockInput { node_id: String, path: String },
     /// Populate a declared edge predicate or transform field.
@@ -1737,16 +1741,47 @@ impl WorkflowConfigurationBinding {
         }
         validate_authoring_path("bindings.configuration_path", &self.configuration_path)?;
         match &self.target {
-            WorkflowConfigurationTarget::NodeConfiguration { node_id, path }
-            | WorkflowConfigurationTarget::PluginBlockInput { node_id, path } => {
+            WorkflowConfigurationTarget::NodeConfiguration { node_id, path } => {
                 validate_authoring_node_target(definition, node_id, path)?;
             }
-            WorkflowConfigurationTarget::AgentSelection { node_id, field }
-            | WorkflowConfigurationTarget::SkillSelection {
-                node_id,
-                slot: field,
-            } => {
+            WorkflowConfigurationTarget::PluginBlockInput { node_id, path } => {
+                validate_authoring_node_target(definition, node_id, path)?;
+                if definition
+                    .node(node_id)
+                    .is_none_or(|node| node.kind != NodeKind::PluginBlock)
+                {
+                    return Err(authoring_error(
+                        "bindings.target.node_id",
+                        format!("binding target '{node_id}' is not a plugin-block node"),
+                    ));
+                }
+            }
+            WorkflowConfigurationTarget::AgentSelection { node_id, field } => {
                 validate_authoring_node_target(definition, node_id, field)?;
+                if !matches!(field.as_str(), "agent_profile" | "provider" | "model") {
+                    return Err(authoring_error(
+                        "bindings.target.field",
+                        format!("unsupported agent selection field '{field}'"),
+                    ));
+                }
+                if definition
+                    .node(node_id)
+                    .is_none_or(|node| node.kind != NodeKind::Agent)
+                {
+                    return Err(authoring_error(
+                        "bindings.target.node_id",
+                        format!("binding target '{node_id}' is not an agent node"),
+                    ));
+                }
+            }
+            WorkflowConfigurationTarget::SkillSelection { node_id, index } => {
+                validate_authoring_id("bindings.target.node_id", node_id)?;
+                if *index >= 32 {
+                    return Err(authoring_error(
+                        "bindings.target.index",
+                        "skill selection index must be less than 32",
+                    ));
+                }
                 if definition
                     .node(node_id)
                     .is_none_or(|node| node.kind != NodeKind::Agent)
@@ -1946,6 +1981,248 @@ impl WorkflowValidationReport {
     }
 }
 
+/// Portable renderer-neutral production capability summary for authoring clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAuthoringCapabilitySummary {
+    pub capability_version: u32,
+    pub definition_schema_version: u32,
+    pub predicate_version: u32,
+    pub transform_version: Option<u32>,
+    pub automatic_retry_policy_version: Option<u32>,
+    pub agent_configuration_version: u32,
+    pub workflow_block_interface_version: u32,
+    pub node_kinds: BTreeMap<String, WorkflowCapabilitySupport>,
+    pub edge_kinds: BTreeMap<String, WorkflowCapabilitySupport>,
+    pub parallel_join_policies: BTreeSet<ParallelFailurePolicy>,
+    pub automatic_retry: WorkflowCapabilitySupport,
+    pub fan_out: WorkflowCapabilitySupport,
+    pub transforms: WorkflowCapabilitySupport,
+    pub artifact_references: WorkflowCapabilitySupport,
+    pub agent_execution_targets: BTreeSet<AgentExecutionTarget>,
+    pub schema_dialects: BTreeSet<String>,
+}
+
+impl From<&WorkflowProductionCapabilities> for WorkflowAuthoringCapabilitySummary {
+    fn from(capabilities: &WorkflowProductionCapabilities) -> Self {
+        Self {
+            capability_version: capabilities.capability_version,
+            definition_schema_version: capabilities.definition_schema_version,
+            predicate_version: capabilities.predicate_version,
+            transform_version: capabilities.transform_version,
+            automatic_retry_policy_version: capabilities.automatic_retry_policy_version,
+            agent_configuration_version: capabilities.agent_configuration_version,
+            workflow_block_interface_version: capabilities.workflow_block_interface_version,
+            node_kinds: capabilities
+                .node_kinds
+                .iter()
+                .map(|(kind, support)| (node_kind_name(*kind).to_string(), *support))
+                .collect(),
+            edge_kinds: capabilities
+                .edge_kinds
+                .iter()
+                .map(|(kind, support)| (workflow_edge_kind_name(*kind).to_string(), *support))
+                .collect(),
+            parallel_join_policies: capabilities.parallel_join_policies.clone(),
+            automatic_retry: capabilities.automatic_retry,
+            fan_out: capabilities.fan_out,
+            transforms: capabilities.transforms,
+            artifact_references: capabilities.artifact_references,
+            agent_execution_targets: capabilities.agent_execution_targets.clone(),
+            schema_dialects: BTreeSet::from([WORKFLOW_AUTHORING_JSON_SCHEMA_DIALECT.to_string()]),
+        }
+    }
+}
+
+/// Portable catalog snapshot consumed by pure workflow authoring validation and compilation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAuthoringCatalogSnapshot {
+    /// Catalog contract version.
+    pub version: u32,
+    /// Portable durable-production capabilities represented by this snapshot.
+    pub capabilities: WorkflowAuthoringCapabilitySummary,
+    /// Loaded plugin identities available for authored references.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub plugins: BTreeSet<String>,
+    /// Exact plugin block contracts keyed by [`workflow_block_catalog_key`].
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub blocks: BTreeMap<String, WorkflowBlockDefinition>,
+    /// Portable configured agent profile identities.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub agent_profiles: BTreeSet<String>,
+    /// Portable available skill identities.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub skills: BTreeSet<String>,
+}
+
+impl WorkflowAuthoringCatalogSnapshot {
+    fn production_capabilities(&self) -> Result<WorkflowProductionCapabilities, WorkflowError> {
+        let current = WorkflowProductionCapabilities::current();
+        let expected = WorkflowAuthoringCapabilitySummary::from(&current);
+        if self.capabilities != expected {
+            return Err(authoring_error(
+                "catalog.capabilities",
+                "catalog production capabilities do not match the exact supported contract",
+            ));
+        }
+        Ok(current)
+    }
+
+    /// Validate bounded catalog identity and exact block-key consistency.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsupported catalog version, malformed identities, excessive
+    /// entries, invalid block contracts, or block keys that do not match their exact contract.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_AUTHORING_CATALOG_VERSION {
+            return Err(authoring_error(
+                "catalog.version",
+                format!(
+                    "unsupported workflow authoring catalog version {}; expected {}",
+                    self.version, WORKFLOW_AUTHORING_CATALOG_VERSION
+                ),
+            ));
+        }
+        self.production_capabilities()?;
+        let entry_count =
+            self.plugins.len() + self.blocks.len() + self.agent_profiles.len() + self.skills.len();
+        if entry_count > MAX_WORKFLOW_AUTHORING_REQUIREMENTS {
+            return Err(authoring_error(
+                "catalog",
+                format!("catalog exceeds {MAX_WORKFLOW_AUTHORING_REQUIREMENTS} entries"),
+            ));
+        }
+        for value in self
+            .plugins
+            .iter()
+            .chain(self.agent_profiles.iter())
+            .chain(self.skills.iter())
+        {
+            validate_authoring_id("catalog.identity", value)?;
+        }
+        for (key, block) in &self.blocks {
+            block.validate()?;
+            validate_runtime_value_schema("catalog.blocks.input", &block.input)?;
+            validate_runtime_value_schema("catalog.blocks.output", &block.output)?;
+            if key != &workflow_block_catalog_key(block) {
+                return Err(authoring_error(
+                    "catalog.blocks",
+                    format!("catalog block key '{key}' does not match its exact contract"),
+                ));
+            }
+            if !self.plugins.contains(&block.plugin_id) {
+                return Err(authoring_error(
+                    "catalog.blocks",
+                    format!(
+                        "catalog block '{}' references unavailable plugin '{}'",
+                        block.block_id, block.plugin_id
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Return the stable exact catalog key for one plugin workflow block.
+#[must_use]
+pub fn workflow_block_catalog_key(block: &WorkflowBlockDefinition) -> String {
+    format!(
+        "{}/{}@{}",
+        block.plugin_id, block.block_id, block.block_version
+    )
+}
+
+/// Portable renderer-neutral production admission result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAuthoringProductionAdmission {
+    pub capabilities: WorkflowAuthoringCapabilitySummary,
+    pub diagnostics: Vec<WorkflowCapabilityDiagnostic>,
+}
+
+impl WorkflowAuthoringProductionAdmission {
+    /// Return whether the exact compiled definition is fully supported.
+    #[must_use]
+    pub const fn is_supported(&self) -> bool {
+        self.diagnostics.is_empty()
+    }
+}
+
+impl From<&WorkflowProductionAdmission> for WorkflowAuthoringProductionAdmission {
+    fn from(admission: &WorkflowProductionAdmission) -> Self {
+        Self {
+            capabilities: WorkflowAuthoringCapabilitySummary::from(&admission.capabilities),
+            diagnostics: admission.diagnostics.clone(),
+        }
+    }
+}
+
+/// Exact authorization implications exposed before publication or execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPermissionPreview {
+    /// Maximum tool capability requested by any compiled node.
+    pub maximum_capability: WorkflowToolCapability,
+    /// Nodes whose owner contract requires an exact explicit grant.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub explicit_grant_nodes: Vec<String>,
+    /// Mutating nodes that retain runtime approval before dispatch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mutation_approval_nodes: Vec<String>,
+}
+
+/// Successful side-effect-free compilation result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowCompiledAuthoringPreview {
+    /// Canonical validated runtime configuration after defaults are applied.
+    pub configuration: serde_json::Value,
+    /// Exact normalized compiled definition.
+    pub definition: WorkflowDefinition,
+    /// Exact compiled definition identity.
+    pub definition_identity: WorkflowDefinitionIdentity,
+    /// Production admission result for the exact definition.
+    pub production_admission: WorkflowAuthoringProductionAdmission,
+    /// Exact resolved requirements, including references derived from compiled nodes.
+    pub requirements: WorkflowRequirementSummary,
+    /// Aggregate effect, resource, and reconciliation facts.
+    pub effects: WorkflowEffectSummary,
+    /// Exact authorization implications.
+    pub permissions: WorkflowPermissionPreview,
+    /// Bound portable run-limit policy.
+    pub run_limits: WorkflowRunLimitPolicy,
+    /// Per-node plugin input defaults that remain execution input rather than node policy.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub plugin_input_defaults: BTreeMap<String, serde_json::Value>,
+    /// Bound initial workflow input defaults.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub input_defaults: serde_json::Value,
+}
+
+/// Side-effect-free portable compilation preview.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowCompilationPreview {
+    /// Preview contract version.
+    pub version: u32,
+    /// Source validation and compilation diagnostics.
+    pub validation: WorkflowValidationReport,
+    /// Successful exact compilation details, absent when diagnostics contain errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compiled: Option<WorkflowCompiledAuthoringPreview>,
+}
+
+impl WorkflowCompilationPreview {
+    /// Return whether this preview contains an admitted exact definition.
+    #[must_use]
+    pub const fn is_compiled(&self) -> bool {
+        self.compiled.is_some() && self.validation.is_valid()
+    }
+}
+
 /// Portable source contract for one runtime-authored workflow.
 ///
 /// The embedded [`WorkflowDefinition`] is the single declarative graph model. Publication may apply
@@ -2022,6 +2299,123 @@ impl WorkflowAuthoringDocument {
                 }],
             },
         }
+    }
+
+    /// Compile and preview this authored workflow using only portable catalog and configuration data.
+    ///
+    /// This operation is deterministic and side-effect free. It performs no persistence, dispatch,
+    /// model, tool, shell, Git, or network operation.
+    #[must_use]
+    pub fn compilation_preview(
+        &self,
+        catalog: &WorkflowAuthoringCatalogSnapshot,
+        configuration: Option<&serde_json::Value>,
+    ) -> WorkflowCompilationPreview {
+        let mut validation = self.validation_report();
+        if !validation.is_valid() {
+            return WorkflowCompilationPreview {
+                version: WORKFLOW_COMPILATION_PREVIEW_VERSION,
+                validation,
+                compiled: None,
+            };
+        }
+        match self.compile_for_preview(catalog, configuration) {
+            Ok(compiled) => WorkflowCompilationPreview {
+                version: WORKFLOW_COMPILATION_PREVIEW_VERSION,
+                validation,
+                compiled: Some(compiled),
+            },
+            Err(error) => {
+                validation.valid = false;
+                validation.source_digest_sha256 = None;
+                validation.executable_source_digest_sha256 = None;
+                validation.diagnostics.push(validation_diagnostic(error));
+                WorkflowCompilationPreview {
+                    version: WORKFLOW_COMPILATION_PREVIEW_VERSION,
+                    validation,
+                    compiled: None,
+                }
+            }
+        }
+    }
+
+    fn compile_for_preview(
+        &self,
+        catalog: &WorkflowAuthoringCatalogSnapshot,
+        configuration: Option<&serde_json::Value>,
+    ) -> Result<WorkflowCompiledAuthoringPreview, WorkflowError> {
+        self.validate()?;
+        catalog.validate()?;
+        let configuration =
+            merge_authoring_configuration(self.configuration_defaults.as_ref(), configuration)?;
+        validate_value_against_schema("configuration", &configuration, &self.configuration_schema)?;
+        let normalized = self.normalized()?;
+        let mut definition = normalized.definition;
+        let mut run_limits = normalized.run_limits;
+        let mut plugin_input_defaults = BTreeMap::new();
+        let mut input_defaults = serde_json::json!({});
+        for binding in &normalized.bindings {
+            let source =
+                authoring_value_at_path(&configuration, &binding.configuration_path)?.clone();
+            let value = if let Some(transform) = &binding.transform {
+                transform.evaluate(&[WorkflowTransformInput {
+                    name: WORKFLOW_TRANSFORM_SOURCE_CURRENT,
+                    value: &source,
+                }])?
+            } else {
+                source
+            };
+            apply_authoring_binding(
+                &mut definition,
+                &mut run_limits,
+                &mut plugin_input_defaults,
+                &mut input_defaults,
+                binding,
+                value,
+            )?;
+        }
+        let definition = normalize_authored_definition(definition)?;
+        if input_defaults == serde_json::json!({}) {
+            input_defaults = serde_json::Value::Null;
+        } else {
+            validate_value_against_schema("input_defaults", &input_defaults, &definition.input)?;
+        }
+        run_limits.validate()?;
+        let (requirements, effects, permissions) = resolve_authoring_catalog(
+            &definition,
+            &normalized.requirements,
+            &plugin_input_defaults,
+            catalog,
+        )?;
+        let production_capabilities = catalog.production_capabilities()?;
+        let production_admission = definition.production_admission(&production_capabilities)?;
+        if !production_admission.is_supported() {
+            let diagnostic = production_admission
+                .diagnostics
+                .first()
+                .expect("unsupported admission must include a diagnostic");
+            return Err(authoring_error(
+                diagnostic.node_id.as_ref().map_or_else(
+                    || "definition".to_string(),
+                    |node| format!("definition.nodes.{node}"),
+                ),
+                format!("{}: {}", diagnostic.code, diagnostic.message),
+            ));
+        }
+        let definition_identity =
+            WorkflowDefinitionIdentity::for_definition(self.workflow_id.clone(), &definition)?;
+        Ok(WorkflowCompiledAuthoringPreview {
+            configuration,
+            definition,
+            definition_identity,
+            production_admission: WorkflowAuthoringProductionAdmission::from(&production_admission),
+            requirements,
+            effects,
+            permissions,
+            run_limits,
+            plugin_input_defaults,
+            input_defaults,
+        })
     }
 
     /// Validate this portable authoring source without persistence or external side effects.
@@ -2242,6 +2636,547 @@ impl WorkflowAuthoringDocument {
         self.validate()?;
         WorkflowDefinitionIdentity::for_definition(self.workflow_id.clone(), &self.definition)
     }
+}
+
+fn validation_diagnostic(error: WorkflowError) -> WorkflowValidationDiagnostic {
+    match error {
+        WorkflowError::Build { path, message } => WorkflowValidationDiagnostic {
+            code: authoring_diagnostic_code(&message).to_string(),
+            severity: WorkflowValidationSeverity::Error,
+            document_path: path,
+            remediation: authoring_remediation(&message).to_string(),
+            message,
+        },
+        error => WorkflowValidationDiagnostic {
+            code: "authoring_compilation_failed".to_string(),
+            severity: WorkflowValidationSeverity::Error,
+            document_path: "workflow".to_string(),
+            remediation: "Correct the source document and compile it again.".to_string(),
+            message: error.to_string(),
+        },
+    }
+}
+
+fn merge_authoring_configuration(
+    defaults: Option<&serde_json::Value>,
+    supplied: Option<&serde_json::Value>,
+) -> Result<serde_json::Value, WorkflowError> {
+    fn merge(target: &mut serde_json::Value, supplied: &serde_json::Value) {
+        match (target, supplied) {
+            (serde_json::Value::Object(target), serde_json::Value::Object(supplied)) => {
+                for (key, value) in supplied {
+                    if let Some(existing) = target.get_mut(key) {
+                        merge(existing, value);
+                    } else {
+                        target.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            (target, supplied) => *target = supplied.clone(),
+        }
+    }
+    let mut configuration = defaults.cloned().unwrap_or_else(|| serde_json::json!({}));
+    if let Some(supplied) = supplied {
+        validate_authoring_json_value("configuration", supplied)?;
+        merge(&mut configuration, supplied);
+    }
+    validate_authoring_json_value("configuration", &configuration)?;
+    Ok(configuration)
+}
+
+fn validate_value_against_schema(
+    path: &str,
+    value: &serde_json::Value,
+    schema: &ValueSchema,
+) -> Result<(), WorkflowError> {
+    validate_runtime_value_schema(path, schema)?;
+    let validator = jsonschema::validator_for(&schema.schema)
+        .map_err(|error| authoring_error(path, format!("invalid schema: {error}")))?;
+    validator
+        .validate(value)
+        .map_err(|error| authoring_error(path, format!("value does not match schema: {error}")))
+}
+
+fn authoring_value_at_path<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> Result<&'a serde_json::Value, WorkflowError> {
+    path.split('.').try_fold(value, |current, component| {
+        current.get(component).ok_or_else(|| {
+            authoring_error(
+                format!("configuration.{path}"),
+                format!("configuration path '{path}' is missing"),
+            )
+        })
+    })
+}
+
+fn set_authoring_json_path(
+    root: &mut serde_json::Value,
+    path: &str,
+    value: serde_json::Value,
+) -> Result<(), WorkflowError> {
+    let components = path.split('.').collect::<Vec<_>>();
+    let Some((last, parents)) = components.split_last() else {
+        return Err(authoring_error(
+            "bindings.target.path",
+            "target path is empty",
+        ));
+    };
+    let mut current = root;
+    for component in parents {
+        let object = current.as_object_mut().ok_or_else(|| {
+            authoring_error(
+                "bindings.target.path",
+                format!("target path '{path}' traverses a non-object value"),
+            )
+        })?;
+        current = object
+            .entry((*component).to_string())
+            .or_insert_with(|| serde_json::json!({}));
+    }
+    current
+        .as_object_mut()
+        .ok_or_else(|| {
+            authoring_error(
+                "bindings.target.path",
+                format!("target path '{path}' has a non-object parent"),
+            )
+        })?
+        .insert((*last).to_string(), value);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_authoring_binding(
+    definition: &mut WorkflowDefinition,
+    run_limits: &mut WorkflowRunLimitPolicy,
+    plugin_input_defaults: &mut BTreeMap<String, serde_json::Value>,
+    input_defaults: &mut serde_json::Value,
+    binding: &WorkflowConfigurationBinding,
+    value: serde_json::Value,
+) -> Result<(), WorkflowError> {
+    match &binding.target {
+        WorkflowConfigurationTarget::NodeConfiguration { node_id, path } => {
+            let node = definition.nodes.get_mut(node_id).ok_or_else(|| {
+                authoring_error(
+                    "bindings.target.node_id",
+                    format!("binding references unknown node '{node_id}'"),
+                )
+            })?;
+            set_authoring_json_path(&mut node.configuration, path, value)?;
+        }
+        WorkflowConfigurationTarget::AgentSelection { node_id, field } => {
+            apply_authoring_agent_selection(definition, node_id, field, &value)?;
+        }
+        WorkflowConfigurationTarget::SkillSelection { node_id, index } => {
+            apply_authoring_skill_selection(definition, node_id, *index, value)?;
+        }
+        WorkflowConfigurationTarget::PluginBlockInput { node_id, path } => {
+            let defaults = plugin_input_defaults
+                .entry(node_id.clone())
+                .or_insert_with(|| serde_json::json!({}));
+            set_authoring_json_path(defaults, path, value)?;
+        }
+        WorkflowConfigurationTarget::EdgeConfiguration { edge_index, path } => {
+            let edge = definition.edges.get_mut(*edge_index).ok_or_else(|| {
+                authoring_error(
+                    "bindings.target.edge_index",
+                    format!("binding references unknown edge index {edge_index}"),
+                )
+            })?;
+            let mut encoded = serde_json::to_value(&*edge).map_err(|error| {
+                authoring_error(
+                    "bindings.target.edge",
+                    format!("edge cannot be serialized: {error}"),
+                )
+            })?;
+            set_authoring_json_path(&mut encoded, path, value)?;
+            *edge = serde_json::from_value(encoded).map_err(|error| {
+                authoring_error(
+                    "bindings.target.edge",
+                    format!("bound edge is invalid: {error}"),
+                )
+            })?;
+        }
+        WorkflowConfigurationTarget::RunLimit { field } => {
+            let value = value.as_u64().ok_or_else(|| {
+                authoring_error(
+                    "bindings.target.run_limit",
+                    format!("run-limit field '{field}' requires an unsigned integer"),
+                )
+            })?;
+            match field.as_str() {
+                "maximum_duration_ms" => run_limits.maximum_duration_ms = Some(value),
+                "node_execution_cap" => run_limits.node_execution_cap = bounded_u32(field, value)?,
+                "concurrency_cap" => run_limits.concurrency_cap = bounded_u32(field, value)?,
+                "cycle_cap" => run_limits.cycle_cap = bounded_u32(field, value)?,
+                "retry_cap" => run_limits.retry_cap = bounded_u32(field, value)?,
+                _ => {
+                    return Err(authoring_error(
+                        "bindings.target.field",
+                        format!("unknown run-limit field '{field}'"),
+                    ));
+                }
+            }
+        }
+        WorkflowConfigurationTarget::InputDefault { path } => {
+            set_authoring_json_path(input_defaults, path, value)?;
+        }
+    }
+    Ok(())
+}
+
+fn apply_authoring_agent_selection(
+    definition: &mut WorkflowDefinition,
+    node_id: &str,
+    field: &str,
+    value: &serde_json::Value,
+) -> Result<(), WorkflowError> {
+    let node = definition.nodes.get_mut(node_id).ok_or_else(|| {
+        authoring_error(
+            "bindings.target.node_id",
+            format!("binding references unknown node '{node_id}'"),
+        )
+    })?;
+    let mut agent: WorkflowAgentConfiguration = serde_json::from_value(node.configuration.clone())
+        .map_err(|error| {
+            authoring_error(
+                format!("definition.nodes.{node_id}.configuration"),
+                format!("agent configuration is invalid: {error}"),
+            )
+        })?;
+    match field {
+        "agent_profile" => agent.agent_profile = authoring_non_empty_string(field, value)?,
+        "provider" => agent.provider = authoring_optional_string(field, value)?,
+        "model" => agent.model = authoring_optional_string(field, value)?,
+        _ => {
+            return Err(authoring_error(
+                "bindings.target.field",
+                format!("unsupported agent selection field '{field}'"),
+            ));
+        }
+    }
+    agent.validate()?;
+    node.configuration = serde_json::to_value(agent).map_err(|error| {
+        authoring_error(
+            format!("definition.nodes.{node_id}.configuration"),
+            format!("agent configuration cannot be serialized: {error}"),
+        )
+    })?;
+    Ok(())
+}
+
+fn apply_authoring_skill_selection(
+    definition: &mut WorkflowDefinition,
+    node_id: &str,
+    index: usize,
+    value: serde_json::Value,
+) -> Result<(), WorkflowError> {
+    let node = definition.nodes.get_mut(node_id).ok_or_else(|| {
+        authoring_error(
+            "bindings.target.node_id",
+            format!("binding references unknown node '{node_id}'"),
+        )
+    })?;
+    let mut agent: WorkflowAgentConfiguration = serde_json::from_value(node.configuration.clone())
+        .map_err(|error| {
+            authoring_error(
+                format!("definition.nodes.{node_id}.configuration"),
+                format!("agent configuration is invalid: {error}"),
+            )
+        })?;
+    let selection: AgentSkillSelection = serde_json::from_value(value).map_err(|error| {
+        authoring_error(
+            "bindings.target.skill",
+            format!("skill selection is invalid: {error}"),
+        )
+    })?;
+    if index > agent.skills.len() {
+        return Err(authoring_error(
+            "bindings.target.index",
+            "skill selection index cannot leave gaps",
+        ));
+    }
+    if index == agent.skills.len() {
+        agent.skills.push(selection);
+    } else {
+        agent.skills[index] = selection;
+    }
+    agent.validate()?;
+    node.configuration = serde_json::to_value(agent).map_err(|error| {
+        authoring_error(
+            format!("definition.nodes.{node_id}.configuration"),
+            format!("agent configuration cannot be serialized: {error}"),
+        )
+    })?;
+    Ok(())
+}
+
+fn authoring_non_empty_string(
+    field: &str,
+    value: &serde_json::Value,
+) -> Result<String, WorkflowError> {
+    let value = value.as_str().ok_or_else(|| {
+        authoring_error(
+            "bindings.target",
+            format!("binding field '{field}' requires a string"),
+        )
+    })?;
+    if value.trim().is_empty() {
+        return Err(authoring_error(
+            "bindings.target",
+            format!("binding field '{field}' requires a non-empty string"),
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn authoring_optional_string(
+    field: &str,
+    value: &serde_json::Value,
+) -> Result<Option<String>, WorkflowError> {
+    if value.is_null() {
+        Ok(None)
+    } else {
+        authoring_non_empty_string(field, value).map(Some)
+    }
+}
+
+fn bounded_u32(field: &str, value: u64) -> Result<u32, WorkflowError> {
+    u32::try_from(value).map_err(|_| {
+        authoring_error(
+            "bindings.target.run_limit",
+            format!("run-limit field '{field}' exceeds u32"),
+        )
+    })
+}
+
+fn normalize_authored_definition(
+    mut definition: WorkflowDefinition,
+) -> Result<WorkflowDefinition, WorkflowError> {
+    definition.entries.sort();
+    definition.entries.dedup();
+    definition.exits.sort();
+    definition.exits.dedup();
+    for node in definition.nodes.values_mut() {
+        node.resources = normalize_resource_claims(node.resources.clone())?;
+    }
+    let mut keyed_edges = definition
+        .edges
+        .drain(..)
+        .map(|edge| canonical_json_value(&edge, "definition.edges").map(|key| (key, edge)))
+        .collect::<Result<Vec<_>, _>>()?;
+    keyed_edges.sort_by(|(left, _), (right, _)| left.cmp(right));
+    keyed_edges.dedup_by(|(left, _), (right, _)| left == right);
+    definition.edges = keyed_edges.into_iter().map(|(_, edge)| edge).collect();
+    definition.validate()?;
+    Ok(definition)
+}
+
+fn validate_declared_authoring_requirements(
+    declared: &WorkflowRequirementSummary,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+) -> Result<(), WorkflowError> {
+    let supported_capabilities = BTreeSet::from([
+        format!(
+            "workflow-production/v{}",
+            catalog.capabilities.capability_version
+        ),
+        format!(
+            "workflow-block/v{}",
+            catalog.capabilities.workflow_block_interface_version
+        ),
+    ]);
+    for capability in &declared.capabilities {
+        if !supported_capabilities.contains(capability) {
+            return Err(authoring_error(
+                "requirements.capabilities",
+                format!("required capability '{capability}' is unavailable"),
+            ));
+        }
+    }
+    for plugin in &declared.plugins {
+        if !catalog.plugins.contains(plugin) {
+            return Err(authoring_error(
+                "requirements.plugins",
+                format!("required plugin '{plugin}' is unavailable"),
+            ));
+        }
+    }
+    for block in &declared.blocks {
+        if !catalog.blocks.contains_key(block) {
+            return Err(authoring_error(
+                "requirements.blocks",
+                format!("required block '{block}' is unavailable"),
+            ));
+        }
+    }
+    for profile in &declared.agents {
+        if !catalog.agent_profiles.contains(profile) {
+            return Err(authoring_error(
+                "requirements.agents",
+                format!("required agent profile '{profile}' is unavailable"),
+            ));
+        }
+    }
+    for skill in &declared.skills {
+        if !catalog.skills.contains(skill) {
+            return Err(authoring_error(
+                "requirements.skills",
+                format!("required skill '{skill}' is unavailable"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn resolve_authoring_catalog(
+    definition: &WorkflowDefinition,
+    declared: &WorkflowRequirementSummary,
+    plugin_input_defaults: &BTreeMap<String, serde_json::Value>,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+) -> Result<
+    (
+        WorkflowRequirementSummary,
+        WorkflowEffectSummary,
+        WorkflowPermissionPreview,
+    ),
+    WorkflowError,
+> {
+    validate_declared_authoring_requirements(declared, catalog)?;
+
+    let mut requirements = declared.clone();
+    let mut effects = WorkflowEffectSummary::default();
+    let mut permissions = WorkflowPermissionPreview::default();
+    for (node_id, node) in &definition.nodes {
+        effects.resources.extend(node.resources.clone());
+        match node.kind {
+            NodeKind::Agent => {
+                let agent: WorkflowAgentConfiguration =
+                    serde_json::from_value(node.configuration.clone()).map_err(|error| {
+                        authoring_error(
+                            format!("definition.nodes.{node_id}.configuration"),
+                            format!("agent configuration is invalid: {error}"),
+                        )
+                    })?;
+                agent.validate()?;
+                if !catalog.agent_profiles.contains(&agent.agent_profile) {
+                    return Err(authoring_error(
+                        format!("definition.nodes.{node_id}.configuration.agent_profile"),
+                        format!("agent profile '{}' is unavailable", agent.agent_profile),
+                    ));
+                }
+                requirements.agents.insert(agent.agent_profile.clone());
+                for skill in &agent.skills {
+                    if skill.mode != AgentSkillActivationMode::Disabled
+                        && !catalog.skills.contains(&skill.skill_id)
+                    {
+                        return Err(authoring_error(
+                            format!("definition.nodes.{node_id}.configuration.skills"),
+                            format!("skill '{}' is unavailable", skill.skill_id),
+                        ));
+                    }
+                    if skill.mode != AgentSkillActivationMode::Disabled {
+                        requirements.skills.insert(skill.skill_id.clone());
+                    }
+                }
+                effects.maximum_capability = effects.maximum_capability.max(agent.tool_capability);
+                permissions.maximum_capability =
+                    permissions.maximum_capability.max(agent.tool_capability);
+            }
+            NodeKind::PluginBlock => resolve_authoring_plugin_block(
+                node_id,
+                node,
+                plugin_input_defaults.get(node_id),
+                catalog,
+                &mut requirements,
+                &mut effects,
+                &mut permissions,
+            )?,
+            NodeKind::Task
+            | NodeKind::Branch
+            | NodeKind::Repeat
+            | NodeKind::Retry
+            | NodeKind::Parallel
+            | NodeKind::FanOut
+            | NodeKind::Input
+            | NodeKind::Approval => {}
+        }
+    }
+    for node_id in plugin_input_defaults.keys() {
+        if definition
+            .node(node_id)
+            .is_none_or(|node| node.kind != NodeKind::PluginBlock)
+        {
+            return Err(authoring_error(
+                format!("plugin_input_defaults.{node_id}"),
+                "plugin input defaults reference a non-plugin-block node",
+            ));
+        }
+    }
+    let effects = effects.normalized();
+    effects.validate()?;
+    permissions.explicit_grant_nodes.sort();
+    permissions.explicit_grant_nodes.dedup();
+    permissions.mutation_approval_nodes.sort();
+    permissions.mutation_approval_nodes.dedup();
+    requirements.validate()?;
+    Ok((requirements, effects, permissions))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_authoring_plugin_block(
+    node_id: &str,
+    node: &NodeDefinition,
+    input_defaults: Option<&serde_json::Value>,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+    requirements: &mut WorkflowRequirementSummary,
+    effects: &mut WorkflowEffectSummary,
+    permissions: &mut WorkflowPermissionPreview,
+) -> Result<(), WorkflowError> {
+    let block: WorkflowBlockDefinition = serde_json::from_value(node.configuration.clone())
+        .map_err(|error| {
+            authoring_error(
+                format!("definition.nodes.{node_id}.configuration"),
+                format!("plugin block configuration is invalid: {error}"),
+            )
+        })?;
+    block.validate()?;
+    let key = workflow_block_catalog_key(&block);
+    if catalog.blocks.get(&key) != Some(&block) {
+        return Err(authoring_error(
+            format!("definition.nodes.{node_id}.configuration"),
+            format!("exact plugin block '{key}' is unavailable"),
+        ));
+    }
+    if let Some(defaults) = input_defaults {
+        validate_value_against_schema(
+            &format!("plugin_input_defaults.{node_id}"),
+            defaults,
+            &block.input,
+        )?;
+    }
+    requirements.plugins.insert(block.plugin_id.clone());
+    requirements.blocks.insert(key);
+    effects.block_effects.insert(block.effect);
+    effects.reconciliation.insert(block.reconciliation);
+    effects.resources.extend(block.resources.clone());
+    effects.maximum_capability = effects
+        .maximum_capability
+        .max(block.authorization.capability);
+    permissions.maximum_capability = permissions
+        .maximum_capability
+        .max(block.authorization.capability);
+    if block.authorization.explicit_grant_required {
+        permissions.explicit_grant_nodes.push(node_id.to_string());
+    }
+    if block.effect == WorkflowBlockEffect::Mutating {
+        permissions
+            .mutation_approval_nodes
+            .push(node_id.to_string());
+    }
+    Ok(())
 }
 
 fn authoring_diagnostic_code(message: &str) -> &'static str {
@@ -6196,6 +7131,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::AtomicUsize;
 
+    #[allow(clippy::too_many_lines)]
     fn authored_document() -> WorkflowAuthoringDocument {
         let value_schema = ValueSchema {
             type_name: "example.value/v1".to_string(),
@@ -6204,7 +7140,10 @@ mod tests {
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["message"],
-                "properties": {"message": {"type": "string"}}
+                "properties": {
+                    "message": {"type": "string"},
+                    "duration_ms": {"type": "integer", "minimum": 1}
+                }
             }),
         };
         WorkflowAuthoringDocument {
@@ -6216,7 +7155,10 @@ mod tests {
                 labels: BTreeMap::from([("purpose".to_string(), "test".to_string())]),
             },
             configuration_schema: value_schema.clone(),
-            configuration_defaults: Some(serde_json::json!({"message": "hello"})),
+            configuration_defaults: Some(serde_json::json!({
+                "message": "review",
+                "duration_ms": 60000
+            })),
             definition: WorkflowDefinition {
                 schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
                 name: "example".to_string(),
@@ -6229,26 +7171,62 @@ mod tests {
                         name: "Agent".to_string(),
                         kind: NodeKind::Agent,
                         input: value_schema.clone(),
-                        output: value_schema,
+                        output: value_schema.clone(),
                         resources: vec![ResourceClaim::read("repository")],
-                        configuration: serde_json::json!({}),
+                        configuration: serde_json::to_value(WorkflowAgentConfiguration {
+                            version: WORKFLOW_AGENT_CONFIGURATION_VERSION,
+                            execution_target: AgentExecutionTarget::FreshIsolated,
+                            agent_profile: "review".to_string(),
+                            provider: None,
+                            model: None,
+                            structured_output: AgentStructuredOutputPolicy {
+                                schema: value_schema,
+                                strict: true,
+                            },
+                            read_only: true,
+                            tool_capability: WorkflowToolCapability::ReadOnly,
+                            tool_allowlist: Vec::new(),
+                            timeout_ms: 30_000,
+                            skills: Vec::new(),
+                            prompt_mode: "json_input".to_string(),
+                            system_prompt: "Review the structured input.".to_string(),
+                        })
+                        .expect("agent configuration"),
                     },
                 )]),
                 entries: vec!["agent".to_string()],
                 exits: vec!["agent".to_string()],
                 edges: Vec::new(),
             },
-            bindings: vec![WorkflowConfigurationBinding {
-                version: WORKFLOW_CONFIGURATION_BINDING_VERSION,
-                configuration_path: "message".to_string(),
-                target: WorkflowConfigurationTarget::AgentSelection {
-                    node_id: "agent".to_string(),
-                    field: "prompt".to_string(),
+            bindings: vec![
+                WorkflowConfigurationBinding {
+                    version: WORKFLOW_CONFIGURATION_BINDING_VERSION,
+                    configuration_path: "message".to_string(),
+                    target: WorkflowConfigurationTarget::AgentSelection {
+                        node_id: "agent".to_string(),
+                        field: "agent_profile".to_string(),
+                    },
+                    transform: None,
                 },
-                transform: None,
-            }],
+                WorkflowConfigurationBinding {
+                    version: WORKFLOW_CONFIGURATION_BINDING_VERSION,
+                    configuration_path: "duration_ms".to_string(),
+                    target: WorkflowConfigurationTarget::RunLimit {
+                        field: "maximum_duration_ms".to_string(),
+                    },
+                    transform: None,
+                },
+                WorkflowConfigurationBinding {
+                    version: WORKFLOW_CONFIGURATION_BINDING_VERSION,
+                    configuration_path: "message".to_string(),
+                    target: WorkflowConfigurationTarget::InputDefault {
+                        path: "message".to_string(),
+                    },
+                    transform: None,
+                },
+            ],
             requirements: WorkflowRequirementSummary {
-                capabilities: BTreeSet::from(["workflow.agent/v1".to_string()]),
+                capabilities: BTreeSet::from(["workflow-production/v1".to_string()]),
                 plugins: BTreeSet::new(),
                 blocks: BTreeSet::new(),
                 agents: BTreeSet::from(["review".to_string()]),
@@ -6271,6 +7249,250 @@ mod tests {
                 )]),
             }),
         }
+    }
+
+    fn authoring_catalog() -> WorkflowAuthoringCatalogSnapshot {
+        WorkflowAuthoringCatalogSnapshot {
+            version: WORKFLOW_AUTHORING_CATALOG_VERSION,
+            capabilities: WorkflowAuthoringCapabilitySummary::from(
+                &WorkflowProductionCapabilities::current(),
+            ),
+            plugins: BTreeSet::new(),
+            blocks: BTreeMap::new(),
+            agent_profiles: BTreeSet::from(["build".to_string(), "review".to_string()]),
+            skills: BTreeSet::new(),
+        }
+    }
+
+    fn authored_mutating_block_document() -> (
+        WorkflowAuthoringDocument,
+        WorkflowAuthoringCatalogSnapshot,
+        WorkflowBlockDefinition,
+    ) {
+        let mut document = authored_document();
+        let block = WorkflowBlockDefinition {
+            block_id: "example.commit".to_string(),
+            block_version: 1,
+            plugin_id: "bcode.example".to_string(),
+            operation: "example.commit".to_string(),
+            input: document.definition.input.clone(),
+            output: document.definition.output.clone(),
+            effect: WorkflowBlockEffect::Mutating,
+            resources: vec![ResourceClaim::write("repository")],
+            authorization: WorkflowBlockAuthorization {
+                capability: WorkflowToolCapability::Mutating,
+                explicit_grant_required: true,
+            },
+            timeout_ms: 30_000,
+            cancellation_supported: true,
+            reconciliation: WorkflowBlockReconciliation::RepairRequired,
+        };
+        document.definition.nodes = BTreeMap::from([(
+            "commit".to_string(),
+            NodeDefinition {
+                id: "commit".to_string(),
+                name: "Commit".to_string(),
+                kind: NodeKind::PluginBlock,
+                input: block.input.clone(),
+                output: block.output.clone(),
+                resources: block.resources.clone(),
+                configuration: serde_json::to_value(&block).expect("block configuration"),
+            },
+        )]);
+        document.definition.entries = vec!["commit".to_string()];
+        document.definition.exits = vec!["commit".to_string()];
+        document.bindings = vec![WorkflowConfigurationBinding {
+            version: WORKFLOW_CONFIGURATION_BINDING_VERSION,
+            configuration_path: "message".to_string(),
+            target: WorkflowConfigurationTarget::PluginBlockInput {
+                node_id: "commit".to_string(),
+                path: "message".to_string(),
+            },
+            transform: None,
+        }];
+        document.requirements = WorkflowRequirementSummary::default();
+        let mut catalog = authoring_catalog();
+        catalog.plugins.insert(block.plugin_id.clone());
+        catalog
+            .blocks
+            .insert(workflow_block_catalog_key(&block), block.clone());
+        (document, catalog, block)
+    }
+
+    #[test]
+    fn authoring_compilation_preview_binds_and_admits_exact_definition() {
+        let document = authored_document();
+        let catalog = authoring_catalog();
+        let preview = document.compilation_preview(
+            &catalog,
+            Some(&serde_json::json!({
+                "message": "build",
+                "duration_ms": 45000
+            })),
+        );
+        assert!(
+            preview.is_compiled(),
+            "{:?}",
+            preview.validation.diagnostics
+        );
+        let compiled = preview.compiled.as_ref().expect("compiled preview");
+        let agent: WorkflowAgentConfiguration = serde_json::from_value(
+            compiled
+                .definition
+                .node("agent")
+                .expect("agent")
+                .configuration
+                .clone(),
+        )
+        .expect("agent configuration");
+        assert_eq!(agent.agent_profile, "build");
+        assert_eq!(compiled.run_limits.maximum_duration_ms, Some(45_000));
+        assert_eq!(
+            compiled.input_defaults,
+            serde_json::json!({"message": "build"})
+        );
+        assert!(compiled.production_admission.is_supported());
+        assert!(compiled.requirements.agents.contains("build"));
+        assert_eq!(
+            compiled.effects.maximum_capability,
+            WorkflowToolCapability::ReadOnly
+        );
+        assert_eq!(
+            compiled.permissions.maximum_capability,
+            WorkflowToolCapability::ReadOnly
+        );
+        assert_eq!(
+            compiled.definition_identity,
+            WorkflowDefinitionIdentity::for_definition(
+                document.workflow_id.clone(),
+                &compiled.definition
+            )
+            .expect("definition identity")
+        );
+        round_trip(&catalog);
+        round_trip(&preview);
+
+        let mut presented = document;
+        presented
+            .presentation
+            .as_mut()
+            .expect("presentation")
+            .namespaces
+            .insert("other.editor".to_string(), serde_json::json!({"x": 99}));
+        let presented_preview = presented.compilation_preview(
+            &catalog,
+            Some(&serde_json::json!({
+                "message": "build",
+                "duration_ms": 45000
+            })),
+        );
+        assert_eq!(
+            presented_preview
+                .compiled
+                .expect("presented compiled")
+                .definition_identity,
+            compiled.definition_identity
+        );
+    }
+
+    #[test]
+    fn authoring_compilation_preview_resolves_exact_mutation_facts() {
+        let (document, catalog, block) = authored_mutating_block_document();
+        let preview = document.compilation_preview(&catalog, None);
+        assert!(
+            preview.is_compiled(),
+            "{:?}",
+            preview.validation.diagnostics
+        );
+        let compiled = preview.compiled.expect("compiled preview");
+        assert_eq!(
+            compiled.plugin_input_defaults["commit"],
+            serde_json::json!({"message": "review"})
+        );
+        assert!(compiled.requirements.plugins.contains(&block.plugin_id));
+        assert!(
+            compiled
+                .requirements
+                .blocks
+                .contains(&workflow_block_catalog_key(&block))
+        );
+        assert_eq!(
+            compiled.effects.block_effects,
+            BTreeSet::from([WorkflowBlockEffect::Mutating])
+        );
+        assert_eq!(
+            compiled.effects.reconciliation,
+            BTreeSet::from([WorkflowBlockReconciliation::RepairRequired])
+        );
+        assert_eq!(
+            compiled.effects.resources,
+            vec![ResourceClaim::write("repository")]
+        );
+        assert_eq!(
+            compiled.permissions.explicit_grant_nodes,
+            vec!["commit".to_string()]
+        );
+        assert_eq!(
+            compiled.permissions.mutation_approval_nodes,
+            vec!["commit".to_string()]
+        );
+        assert_eq!(
+            compiled.permissions.maximum_capability,
+            WorkflowToolCapability::Mutating
+        );
+    }
+
+    #[test]
+    fn authoring_compilation_preview_fails_closed_for_catalog_and_admission() {
+        let document = authored_document();
+        let mut missing = authoring_catalog();
+        missing.agent_profiles.remove("review");
+        let preview = document.compilation_preview(&missing, None);
+        assert!(!preview.is_compiled());
+        assert!(
+            preview.validation.diagnostics[0]
+                .message
+                .contains("unavailable")
+        );
+
+        let mut unsupported = authored_document();
+        unsupported.bindings.retain(|binding| {
+            !matches!(
+                binding.target,
+                WorkflowConfigurationTarget::AgentSelection { .. }
+                    | WorkflowConfigurationTarget::SkillSelection { .. }
+            )
+        });
+        unsupported.requirements.agents.clear();
+        unsupported
+            .definition
+            .nodes
+            .get_mut("agent")
+            .expect("node")
+            .kind = NodeKind::Task;
+        let preview = unsupported.compilation_preview(&authoring_catalog(), None);
+        assert!(!preview.is_compiled());
+        assert!(
+            preview.validation.diagnostics[0]
+                .message
+                .contains("in_process_only_node"),
+            "{:?}",
+            preview.validation.diagnostics
+        );
+
+        let (block_document, mut mismatched, block) = authored_mutating_block_document();
+        let mut changed = block;
+        changed.operation = "example.changed".to_string();
+        mismatched
+            .blocks
+            .insert(workflow_block_catalog_key(&changed), changed);
+        let preview = block_document.compilation_preview(&mismatched, None);
+        assert!(!preview.is_compiled());
+        assert!(
+            preview.validation.diagnostics[0]
+                .message
+                .contains("exact plugin block")
+        );
     }
 
     #[test]

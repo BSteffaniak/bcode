@@ -265,8 +265,85 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
         Commands::Login { command } => handle_login_command(command).await?,
         Commands::Permission { command } => handle_permission_command(command).await?,
         Commands::RuntimeWork { command } => handle_runtime_work_command(command).await?,
+        Commands::Workflow { command } => handle_workflow_command(command).await?,
         command => Box::pin(handle_session_io_command(command)).await?,
     }
+    Ok(())
+}
+
+async fn handle_workflow_command(command: WorkflowCommand) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    match command {
+        WorkflowCommand::Author { command } => match command {
+            WorkflowAuthorCommand::Catalog => {
+                print_json(&client.workflow_authoring_catalog().await?)?;
+            }
+            WorkflowAuthorCommand::Validate { file } => {
+                let document = read_workflow_authoring_document(&file)?;
+                print_json(&client.validate_workflow_authoring(document).await?)?;
+            }
+            WorkflowAuthorCommand::Preview {
+                file,
+                configuration,
+            } => {
+                if file == Path::new("-") && configuration.as_deref() == Some(Path::new("-")) {
+                    return Err(CliError::InvalidArguments(
+                        "workflow document and configuration cannot both read from stdin"
+                            .to_string(),
+                    ));
+                }
+                let document = read_workflow_authoring_document(&file)?;
+                let configuration = configuration
+                    .as_deref()
+                    .map(read_bounded_json)
+                    .transpose()?;
+                print_json(
+                    &client
+                        .preview_workflow_compilation(document, configuration)
+                        .await?,
+                )?;
+            }
+        },
+    }
+    Ok(())
+}
+
+fn read_workflow_authoring_document(
+    path: &Path,
+) -> Result<bcode_workflow::WorkflowAuthoringDocument, CliError> {
+    serde_json::from_value(read_bounded_json(path)?).map_err(CliError::Json)
+}
+
+fn read_bounded_json(path: &Path) -> Result<serde_json::Value, CliError> {
+    let mut bytes = Vec::new();
+    if path == Path::new("-") {
+        std::io::stdin()
+            .take((bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES + 1) as u64)
+            .read_to_end(&mut bytes)?;
+    } else {
+        let metadata = fs::metadata(path)?;
+        if metadata.len()
+            > u64::try_from(bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES)
+                .unwrap_or(u64::MAX)
+        {
+            return Err(CliError::InvalidArguments(format!(
+                "workflow JSON exceeds {} bytes",
+                bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES
+            )));
+        }
+        bytes = fs::read(path)?;
+    }
+    if bytes.len() > bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES {
+        return Err(CliError::InvalidArguments(format!(
+            "workflow JSON exceeds {} bytes",
+            bcode_workflow::MAX_WORKFLOW_AUTHORING_DOCUMENT_BYTES
+        )));
+    }
+    serde_json::from_slice(&bytes).map_err(CliError::Json)
+}
+
+fn print_json<T: Serialize>(value: &T) -> Result<(), CliError> {
+    println!("{}", serde_json::to_string_pretty(value)?);
     Ok(())
 }
 
@@ -594,7 +671,8 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
         | Commands::Auth { .. }
         | Commands::Login { .. }
         | Commands::Permission { .. }
-        | Commands::RuntimeWork { .. } => unreachable!("handled by handle_cli"),
+        | Commands::RuntimeWork { .. }
+        | Commands::Workflow { .. } => unreachable!("handled by handle_cli"),
         #[cfg(feature = "web-renderer")]
         Commands::Web { .. } => unreachable!("handled by handle_cli"),
     }
@@ -799,6 +877,10 @@ enum Commands {
         #[command(subcommand)]
         command: PermissionCommand,
     },
+    Workflow {
+        #[command(subcommand)]
+        command: WorkflowCommand,
+    },
     RuntimeWork {
         #[command(subcommand)]
         command: RuntimeWorkCommand,
@@ -824,6 +906,34 @@ impl Default for Commands {
     fn default() -> Self {
         Self::Tui { session_id: None }
     }
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkflowCommand {
+    /// Runtime-authored workflow operations.
+    Author {
+        #[command(subcommand)]
+        command: WorkflowAuthorCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum WorkflowAuthorCommand {
+    /// Print the portable authoring catalog as JSON.
+    Catalog,
+    /// Validate one authoring document from a JSON file or stdin (`-`).
+    Validate {
+        #[arg(value_name = "FILE", default_value = "-")]
+        file: PathBuf,
+    },
+    /// Compile and preview one authoring document without persistence or dispatch.
+    Preview {
+        #[arg(value_name = "FILE", default_value = "-")]
+        file: PathBuf,
+        /// Optional runtime configuration JSON file or stdin (`-`).
+        #[arg(long, value_name = "FILE")]
+        configuration: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

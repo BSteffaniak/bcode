@@ -3258,6 +3258,9 @@ fn workflow_store_error_response(error: &WorkflowStoreError) -> ErrorResponse {
         WorkflowStoreError::TargetInputValidation(_) => {
             ErrorResponse::new("workflow_target_input_invalid", error.to_string())
         }
+        WorkflowStoreError::AuthoringConflict { .. } => {
+            ErrorResponse::new("workflow_authoring_conflict", error.to_string())
+        }
         WorkflowStoreError::Database(_)
         | WorkflowStoreError::Io(_)
         | WorkflowStoreError::Serialization(_)
@@ -3500,6 +3503,17 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::RuntimeWorkHistory { .. } => "runtime_work_history",
         Request::ListRuntimeWork { .. } => "list_runtime_work",
         Request::CancelRuntimeWork { .. } => "cancel_runtime_work",
+        Request::ListAuthoredWorkflows { .. } => "list_authored_workflows",
+        Request::GetAuthoredWorkflow { .. } => "get_authored_workflow",
+        Request::ListWorkflowDrafts { .. } => "list_workflow_drafts",
+        Request::GetWorkflowDraft { .. } => "get_workflow_draft",
+        Request::ListWorkflowRevisions { .. } => "list_workflow_revisions",
+        Request::GetWorkflowRevision { .. } => "get_workflow_revision",
+        Request::ListWorkflowPresets { .. } => "list_workflow_presets",
+        Request::GetWorkflowPreset { .. } => "get_workflow_preset",
+        Request::WorkflowAuthoringCatalog => "workflow_authoring_catalog",
+        Request::ValidateWorkflowAuthoring { .. } => "validate_workflow_authoring",
+        Request::PreviewWorkflowCompilation { .. } => "preview_workflow_compilation",
         Request::ListWorkflowTemplates { .. } => "list_workflow_templates",
         Request::DescribeWorkflowTemplate { .. } => "describe_workflow_template",
         Request::StartWorkflowTemplate(_) => "start_workflow_template",
@@ -3979,6 +3993,157 @@ async fn handle_request_inner(
             work_id,
         } => {
             handle_cancel_runtime_work(request_id, client_id, state, writer, session_id, work_id)
+                .await
+        }
+        Request::ListAuthoredWorkflows { limit } => {
+            let workflows = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .list_authored_workflows(limit)?
+                .into_iter()
+                .map(authored_workflow_snapshot)
+                .collect();
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::AuthoredWorkflowList { workflows }),
+            )
+            .await
+        }
+        Request::GetAuthoredWorkflow { workflow_id } => {
+            let workflow = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .authored_workflow(&workflow_id)?
+                .map(authored_workflow_snapshot);
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::AuthoredWorkflowDescription { workflow }),
+            )
+            .await
+        }
+        Request::ListWorkflowDrafts { workflow_id, limit } => {
+            let drafts = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .list_workflow_drafts(&workflow_id, limit)?
+                .into_iter()
+                .map(workflow_draft_snapshot)
+                .collect();
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowDraftList { drafts }),
+            )
+            .await
+        }
+        Request::GetWorkflowDraft {
+            workflow_id,
+            draft_id,
+        } => {
+            let draft = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .workflow_draft(&workflow_id, &draft_id)?
+                .map(workflow_draft_snapshot)
+                .map(Box::new);
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowDraftDescription { draft }),
+            )
+            .await
+        }
+        Request::ListWorkflowRevisions { workflow_id, limit } => {
+            let revisions = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .list_workflow_revisions(&workflow_id, limit)?
+                .into_iter()
+                .map(workflow_revision_snapshot)
+                .collect();
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRevisionList { revisions }),
+            )
+            .await
+        }
+        Request::GetWorkflowRevision {
+            workflow_id,
+            revision,
+        } => {
+            let revision = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .workflow_revision(&workflow_id, revision)?
+                .map(workflow_revision_snapshot)
+                .map(Box::new);
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowRevisionDescription { revision }),
+            )
+            .await
+        }
+        Request::ListWorkflowPresets { workflow_id, limit } => {
+            let presets = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .list_workflow_presets(&workflow_id, limit)?
+                .into_iter()
+                .map(workflow_preset_snapshot)
+                .collect();
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowPresetList { presets }),
+            )
+            .await
+        }
+        Request::GetWorkflowPreset {
+            workflow_id,
+            preset_id,
+        } => {
+            let preset = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .workflow_preset(&workflow_id, &preset_id)?
+                .map(workflow_preset_snapshot);
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowPresetDescription { preset }),
+            )
+            .await
+        }
+        Request::WorkflowAuthoringCatalog => {
+            handle_workflow_authoring_catalog(request_id, state, writer).await
+        }
+        Request::ValidateWorkflowAuthoring { document } => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::WorkflowAuthoringValidated {
+                    report: document.validation_report(),
+                }),
+            )
+            .await
+        }
+        Request::PreviewWorkflowCompilation {
+            document,
+            configuration,
+        } => {
+            handle_preview_workflow_compilation(request_id, state, writer, document, configuration)
                 .await
         }
         Request::ListWorkflowTemplates { limit } => {
@@ -11452,6 +11617,151 @@ async fn handle_cancel_session_turn(
         writer,
         request_id,
         Response::Ok(ResponsePayload::TurnCancellationRequested { cancelled }),
+    )
+    .await
+}
+
+fn authored_workflow_snapshot(
+    workflow: bcode_workflow_store::AuthoredWorkflow,
+) -> bcode_ipc::AuthoredWorkflowSnapshot {
+    bcode_ipc::AuthoredWorkflowSnapshot {
+        workflow_id: workflow.workflow_id,
+        title: workflow.title,
+        description: workflow.description,
+        archived: workflow.archived,
+        active_revision: workflow.active_revision,
+        created_at_ms: workflow.created_at_ms,
+        updated_at_ms: workflow.updated_at_ms,
+    }
+}
+
+fn workflow_draft_snapshot(
+    draft: bcode_workflow_store::WorkflowDraft,
+) -> bcode_ipc::WorkflowDraftSnapshot {
+    bcode_ipc::WorkflowDraftSnapshot {
+        identity: bcode_workflow::WorkflowDraftIdentity {
+            workflow_id: draft.workflow_id,
+            draft_id: draft.draft_id,
+        },
+        base_revision: draft.base_revision,
+        generation: draft.generation,
+        checksum_sha256: draft.checksum_sha256,
+        document: draft.document,
+        producer: draft.producer,
+        created_at_ms: draft.created_at_ms,
+        updated_at_ms: draft.updated_at_ms,
+    }
+}
+
+fn workflow_revision_snapshot(
+    revision: bcode_workflow_store::PublishedWorkflowRevision,
+) -> bcode_ipc::WorkflowRevisionSnapshot {
+    bcode_ipc::WorkflowRevisionSnapshot {
+        identity: bcode_workflow::WorkflowRevisionIdentity {
+            workflow_id: revision.workflow_id,
+            revision: revision.revision,
+        },
+        source_checksum_sha256: revision.source_checksum_sha256,
+        executable_source_checksum_sha256: revision.executable_source_checksum_sha256,
+        definition_identity: revision.definition_identity,
+        document: revision.document,
+        producer: revision.producer,
+        published_at_ms: revision.published_at_ms,
+    }
+}
+
+fn workflow_preset_snapshot(
+    preset: bcode_workflow_store::WorkflowPreset,
+) -> bcode_ipc::WorkflowPresetSnapshot {
+    bcode_ipc::WorkflowPresetSnapshot {
+        workflow_id: preset.workflow_id,
+        preset_id: preset.preset_id,
+        revision: preset.revision,
+        name: preset.name,
+        generation: preset.generation,
+        configuration: preset.configuration,
+        run_limits: preset.run_limits,
+        producer: preset.producer,
+        created_at_ms: preset.created_at_ms,
+        updated_at_ms: preset.updated_at_ms,
+    }
+}
+
+async fn workflow_authoring_catalog_snapshot(
+    state: &ServerState,
+) -> Result<bcode_workflow::WorkflowAuthoringCatalogSnapshot, ServerError> {
+    let plugins = state
+        .plugins
+        .registry()
+        .manifests()
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let blocks = state
+        .plugins
+        .registry()
+        .workflow_blocks()
+        .into_iter()
+        .map(|block| (bcode_workflow::workflow_block_catalog_key(&block), block))
+        .collect::<BTreeMap<_, _>>();
+    let agent_profiles = list_agent_profiles(state)
+        .await
+        .into_iter()
+        .flat_map(|agent| std::iter::once(agent.id).chain(agent.aliases))
+        .collect::<BTreeSet<_>>();
+    let skills = state.skills.as_ref().map_or_else(BTreeSet::new, |skills| {
+        skills
+            .list()
+            .skills
+            .into_iter()
+            .map(|skill| skill.id.to_string())
+            .collect()
+    });
+    let catalog = bcode_workflow::WorkflowAuthoringCatalogSnapshot {
+        version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+        capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+            &bcode_workflow::WorkflowProductionCapabilities::current(),
+        ),
+        plugins,
+        blocks,
+        agent_profiles,
+        skills,
+    };
+    catalog
+        .validate()
+        .map_err(|error| ServerError::WorkflowCapabilityUnavailable(error.to_string()))?;
+    Ok(catalog)
+}
+
+async fn handle_workflow_authoring_catalog(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+) -> Result<(), ServerError> {
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowAuthoringCatalog {
+            catalog: workflow_authoring_catalog_snapshot(state).await?,
+        }),
+    )
+    .await
+}
+
+async fn handle_preview_workflow_compilation(
+    request_id: u64,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    document: bcode_workflow::WorkflowAuthoringDocument,
+    configuration: Option<serde_json::Value>,
+) -> Result<(), ServerError> {
+    let catalog = workflow_authoring_catalog_snapshot(state).await?;
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowCompilationPreview {
+            preview: Box::new(document.compilation_preview(&catalog, configuration.as_ref())),
+        }),
     )
     .await
 }
@@ -27057,6 +27367,96 @@ mod tests {
         assert!(missing.contains("client build fingerprint \"\""));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn authoring_catalog_validation_and_preview_are_non_mutating_and_connection_safe() {
+        let sessions = SessionManager::default();
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+            .expect("workflow store");
+        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+            sessions, store,
+        ));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            let stream = listener.accept().await.expect("client connection");
+            handle_client(stream, server_state)
+                .await
+                .expect("handle client");
+        });
+        let mut stream = LocalIpcStream::connect(&endpoint).await.expect("connect");
+
+        let send = async |stream: &mut LocalIpcStream, id, request: Request| {
+            let envelope = bcode_ipc::request_envelope(id, &request).expect("request envelope");
+            bcode_ipc::send_envelope(stream, &envelope)
+                .await
+                .expect("send request");
+            let response = bcode_ipc::recv_envelope(stream)
+                .await
+                .expect("receive response");
+            bcode_ipc::decode_response(&response.payload).expect("decode response")
+        };
+
+        let catalog = send(&mut stream, 1, Request::WorkflowAuthoringCatalog).await;
+        let Response::Ok(ResponsePayload::WorkflowAuthoringCatalog { catalog }) = catalog else {
+            panic!("unexpected catalog response: {catalog:?}");
+        };
+        assert!(catalog.plugins.contains("bcode.fake-provider"));
+        assert!(catalog.agent_profiles.contains("build"));
+
+        let mut invalid = test_workflow_authoring_document();
+        invalid.schema_version += 1;
+        let validation = send(
+            &mut stream,
+            2,
+            Request::ValidateWorkflowAuthoring { document: invalid },
+        )
+        .await;
+        let Response::Ok(ResponsePayload::WorkflowAuthoringValidated { report }) = validation
+        else {
+            panic!("unexpected validation response: {validation:?}");
+        };
+        assert!(!report.is_valid());
+        assert_eq!(report.diagnostics[0].code, "unsupported_version");
+
+        let preview = send(
+            &mut stream,
+            3,
+            Request::PreviewWorkflowCompilation {
+                document: test_workflow_authoring_document(),
+                configuration: None,
+            },
+        )
+        .await;
+        let Response::Ok(ResponsePayload::WorkflowCompilationPreview { preview }) = preview else {
+            panic!("unexpected preview response: {preview:?}");
+        };
+        assert!(
+            preview.is_compiled(),
+            "{:?}",
+            preview.validation.diagnostics
+        );
+
+        assert!(matches!(
+            send(&mut stream, 4, Request::Ping).await,
+            Response::Ok(ResponsePayload::Pong)
+        ));
+        assert!(
+            state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .list_authored_workflows(10)
+                .expect("authored workflows")
+                .is_empty()
+        );
+        drop(stream);
+        server.await.expect("server task");
+    }
+
     #[test]
     fn template_compilation_binds_configuration_envelope_to_agent_contracts() {
         let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -41387,6 +41787,67 @@ library = "test"
             system_prompt: String::new(),
         })
         .expect("test workflow agent configuration")
+    }
+
+    fn test_workflow_authoring_document() -> bcode_workflow::WorkflowAuthoringDocument {
+        let schema = bcode_workflow::ValueSchema {
+            type_name: "example.request/v1".to_string(),
+            schema: serde_json::json!({
+                "$schema": bcode_workflow::WORKFLOW_AUTHORING_JSON_SCHEMA_DIALECT,
+                "type": "object",
+                "additionalProperties": false
+            }),
+        };
+        bcode_workflow::WorkflowAuthoringDocument {
+            schema_version: bcode_workflow::WORKFLOW_AUTHORING_DOCUMENT_VERSION,
+            workflow_id: "authored/ipc-test".to_string(),
+            metadata: bcode_workflow::WorkflowAuthoringMetadata {
+                title: "IPC authoring test".to_string(),
+                description: None,
+                labels: BTreeMap::new(),
+            },
+            configuration_schema: schema.clone(),
+            configuration_defaults: Some(serde_json::json!({})),
+            definition: bcode_workflow::WorkflowDefinition {
+                schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+                name: "ipc-authoring".to_string(),
+                input: schema.clone(),
+                output: schema.clone(),
+                nodes: BTreeMap::from([(
+                    "agent".to_string(),
+                    bcode_workflow::NodeDefinition {
+                        id: "agent".to_string(),
+                        name: "Agent".to_string(),
+                        kind: bcode_workflow::NodeKind::Agent,
+                        input: schema.clone(),
+                        output: schema.clone(),
+                        resources: Vec::new(),
+                        configuration: test_workflow_agent_configuration(
+                            schema,
+                            bcode_workflow::AgentExecutionTarget::FreshIsolated,
+                        ),
+                    },
+                )]),
+                entries: vec!["agent".to_string()],
+                exits: vec!["agent".to_string()],
+                edges: Vec::new(),
+            },
+            bindings: Vec::new(),
+            requirements: bcode_workflow::WorkflowRequirementSummary {
+                capabilities: BTreeSet::from(["workflow-production/v1".to_string()]),
+                plugins: BTreeSet::from(["bcode.fake-provider".to_string()]),
+                blocks: BTreeSet::new(),
+                agents: BTreeSet::from(["build".to_string()]),
+                skills: BTreeSet::new(),
+            },
+            run_limits: bcode_workflow::WorkflowRunLimitPolicy::default(),
+            producer: bcode_workflow::WorkflowProducerProvenance {
+                kind: bcode_workflow::WorkflowProducerKind::Sdk,
+                producer_id: Some("server-test".to_string()),
+                source_revision: None,
+            },
+            presentation: None,
+        }
     }
 
     fn test_server_state_with_fake_provider_and_workflow_store(

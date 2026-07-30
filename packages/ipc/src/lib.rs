@@ -285,6 +285,56 @@ pub enum Request {
         session_id: SessionId,
         work_id: WorkId,
     },
+    /// List bounded logical authored workflows.
+    ListAuthoredWorkflows {
+        limit: usize,
+    },
+    /// Get one logical authored workflow.
+    GetAuthoredWorkflow {
+        workflow_id: String,
+    },
+    /// List bounded drafts for one logical workflow.
+    ListWorkflowDrafts {
+        workflow_id: String,
+        limit: usize,
+    },
+    /// Get one exact mutable draft.
+    GetWorkflowDraft {
+        workflow_id: String,
+        draft_id: String,
+    },
+    /// List bounded immutable published revisions.
+    ListWorkflowRevisions {
+        workflow_id: String,
+        limit: usize,
+    },
+    /// Get one exact immutable published revision.
+    GetWorkflowRevision {
+        workflow_id: String,
+        revision: u64,
+    },
+    /// List bounded revision-bound presets.
+    ListWorkflowPresets {
+        workflow_id: String,
+        limit: usize,
+    },
+    /// Get one exact revision-bound preset.
+    GetWorkflowPreset {
+        workflow_id: String,
+        preset_id: String,
+    },
+    /// Return the portable runtime-workflow authoring catalog.
+    WorkflowAuthoringCatalog,
+    /// Validate one portable workflow authoring document without mutation.
+    ValidateWorkflowAuthoring {
+        document: bcode_workflow::WorkflowAuthoringDocument,
+    },
+    /// Compile and preview one authored workflow without mutation or dispatch.
+    PreviewWorkflowCompilation {
+        document: bcode_workflow::WorkflowAuthoringDocument,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        configuration: Option<serde_json::Value>,
+    },
     /// List bounded plugin-owned workflow templates and requirement diagnostics.
     ListWorkflowTemplates {
         limit: usize,
@@ -1233,6 +1283,119 @@ pub struct WorkflowTemplateStartRequest {
     pub limits: bcode_workflow_store::WorkflowRunLimits,
 }
 
+/// Portable logical authored-workflow snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuthoredWorkflowSnapshot {
+    pub workflow_id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub archived: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_revision: Option<u64>,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// Portable mutable authored-workflow draft snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowDraftSnapshot {
+    pub identity: bcode_workflow::WorkflowDraftIdentity,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_revision: Option<u64>,
+    pub generation: u64,
+    pub checksum_sha256: String,
+    pub document: bcode_workflow::WorkflowAuthoringDocument,
+    pub producer: bcode_workflow::WorkflowProducerProvenance,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// Portable immutable published-revision snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowRevisionSnapshot {
+    pub identity: bcode_workflow::WorkflowRevisionIdentity,
+    pub source_checksum_sha256: String,
+    pub executable_source_checksum_sha256: String,
+    pub definition_identity: bcode_workflow::WorkflowDefinitionIdentity,
+    pub document: bcode_workflow::WorkflowAuthoringDocument,
+    pub producer: bcode_workflow::WorkflowProducerProvenance,
+    pub published_at_ms: u64,
+}
+
+/// Portable reusable revision-bound preset snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPresetSnapshot {
+    pub workflow_id: String,
+    pub preset_id: String,
+    pub revision: u64,
+    pub name: String,
+    pub generation: u64,
+    pub configuration: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_limits: Option<bcode_workflow::WorkflowRunLimitPolicy>,
+    pub producer: bcode_workflow::WorkflowProducerProvenance,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+}
+
+/// Portable optimistic authoring conflict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowAuthoringConflict {
+    pub entity_id: String,
+    pub expected_generation: u64,
+    pub current_generation: u64,
+}
+
+/// One typed authored-workflow creation request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateAuthoredWorkflowRequest {
+    pub document: bcode_workflow::WorkflowAuthoringDocument,
+    pub draft_id: String,
+}
+
+/// One generation-checked draft replacement request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateWorkflowDraftRequest {
+    pub workflow_id: String,
+    pub draft_id: String,
+    pub expected_generation: u64,
+    pub document: bcode_workflow::WorkflowAuthoringDocument,
+    pub producer: bcode_workflow::WorkflowProducerProvenance,
+}
+
+/// One exact draft publication request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublishWorkflowDraftRequest {
+    pub workflow_id: String,
+    pub draft_id: String,
+    pub expected_generation: u64,
+    pub configuration: Option<serde_json::Value>,
+    pub activate: bool,
+    pub expected_active_revision: Option<u64>,
+}
+
+/// One preset create/update payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowPresetMutation {
+    pub workflow_id: String,
+    pub preset_id: String,
+    pub revision: u64,
+    pub name: String,
+    pub configuration: serde_json::Value,
+    pub run_limits: Option<bcode_workflow::WorkflowRunLimitPolicy>,
+    pub producer: bcode_workflow::WorkflowProducerProvenance,
+}
+
 /// Request to durably register one compiled workflow definition.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowDefinitionRegistrationRequest {
@@ -1492,6 +1655,39 @@ pub enum ResponsePayload {
     },
     RuntimeWorkCancellationRequested {
         cancelled: bool,
+    },
+    AuthoredWorkflowList {
+        workflows: Vec<AuthoredWorkflowSnapshot>,
+    },
+    AuthoredWorkflowDescription {
+        workflow: Option<AuthoredWorkflowSnapshot>,
+    },
+    WorkflowDraftList {
+        drafts: Vec<WorkflowDraftSnapshot>,
+    },
+    WorkflowDraftDescription {
+        draft: Option<Box<WorkflowDraftSnapshot>>,
+    },
+    WorkflowRevisionList {
+        revisions: Vec<WorkflowRevisionSnapshot>,
+    },
+    WorkflowRevisionDescription {
+        revision: Option<Box<WorkflowRevisionSnapshot>>,
+    },
+    WorkflowPresetList {
+        presets: Vec<WorkflowPresetSnapshot>,
+    },
+    WorkflowPresetDescription {
+        preset: Option<WorkflowPresetSnapshot>,
+    },
+    WorkflowAuthoringCatalog {
+        catalog: bcode_workflow::WorkflowAuthoringCatalogSnapshot,
+    },
+    WorkflowAuthoringValidated {
+        report: bcode_workflow::WorkflowValidationReport,
+    },
+    WorkflowCompilationPreview {
+        preview: Box<bcode_workflow::WorkflowCompilationPreview>,
     },
     WorkflowTemplateList {
         templates: Vec<WorkflowTemplateDescription>,
@@ -2447,7 +2643,64 @@ mod tests {
         .expect("workflow")
         .definition()
         .clone();
-        let requests = [
+        let authoring_document = bcode_workflow::WorkflowAuthoringDocument {
+            schema_version: bcode_workflow::WORKFLOW_AUTHORING_DOCUMENT_VERSION,
+            workflow_id: "authored/review".to_string(),
+            metadata: bcode_workflow::WorkflowAuthoringMetadata {
+                title: "Review".to_string(),
+                description: None,
+                labels: std::collections::BTreeMap::new(),
+            },
+            configuration_schema: bcode_workflow::ValueSchema::of::<serde_json::Value>(),
+            configuration_defaults: None,
+            definition: definition.clone(),
+            bindings: Vec::new(),
+            requirements: bcode_workflow::WorkflowRequirementSummary::default(),
+            run_limits: bcode_workflow::WorkflowRunLimitPolicy::default(),
+            producer: bcode_workflow::WorkflowProducerProvenance {
+                kind: bcode_workflow::WorkflowProducerKind::Sdk,
+                producer_id: Some("ipc-test".to_string()),
+                source_revision: None,
+            },
+            presentation: None,
+        };
+        let requests = vec![
+            Request::ListAuthoredWorkflows { limit: 25 },
+            Request::GetAuthoredWorkflow {
+                workflow_id: "authored/review".to_string(),
+            },
+            Request::ListWorkflowDrafts {
+                workflow_id: "authored/review".to_string(),
+                limit: 25,
+            },
+            Request::GetWorkflowDraft {
+                workflow_id: "authored/review".to_string(),
+                draft_id: "draft-1".to_string(),
+            },
+            Request::ListWorkflowRevisions {
+                workflow_id: "authored/review".to_string(),
+                limit: 25,
+            },
+            Request::GetWorkflowRevision {
+                workflow_id: "authored/review".to_string(),
+                revision: 1,
+            },
+            Request::ListWorkflowPresets {
+                workflow_id: "authored/review".to_string(),
+                limit: 25,
+            },
+            Request::GetWorkflowPreset {
+                workflow_id: "authored/review".to_string(),
+                preset_id: "default".to_string(),
+            },
+            Request::WorkflowAuthoringCatalog,
+            Request::ValidateWorkflowAuthoring {
+                document: authoring_document.clone(),
+            },
+            Request::PreviewWorkflowCompilation {
+                document: authoring_document,
+                configuration: Some(serde_json::json!({})),
+            },
             Request::RegisterWorkflowDefinition(WorkflowDefinitionRegistrationRequest {
                 definition_id: "review".to_string(),
                 version: 1,
@@ -2576,6 +2829,45 @@ mod tests {
             let encoded = encode_request(&request).expect("encode request");
             assert_eq!(decode_request(&encoded).expect("decode request"), request);
         }
+
+        let response = Response::Ok(ResponsePayload::WorkflowAuthoringCatalog {
+            catalog: bcode_workflow::WorkflowAuthoringCatalogSnapshot {
+                version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
+                capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
+                    &bcode_workflow::WorkflowProductionCapabilities::current(),
+                ),
+                plugins: std::collections::BTreeSet::new(),
+                blocks: std::collections::BTreeMap::new(),
+                agent_profiles: std::collections::BTreeSet::from(["build".to_string()]),
+                skills: std::collections::BTreeSet::new(),
+            },
+        });
+        let encoded = encode_response(&response).expect("encode authoring catalog");
+        assert_eq!(
+            decode_response(&encoded).expect("decode authoring catalog"),
+            response
+        );
+
+        let response = Response::Ok(ResponsePayload::WorkflowAuthoringValidated {
+            report: bcode_workflow::WorkflowValidationReport {
+                authoring_version: bcode_workflow::WORKFLOW_AUTHORING_DOCUMENT_VERSION,
+                valid: false,
+                source_digest_sha256: None,
+                executable_source_digest_sha256: None,
+                diagnostics: vec![bcode_workflow::WorkflowValidationDiagnostic {
+                    code: "invalid_schema".to_string(),
+                    severity: bcode_workflow::WorkflowValidationSeverity::Error,
+                    document_path: "configuration_schema".to_string(),
+                    message: "invalid schema".to_string(),
+                    remediation: "correct the schema".to_string(),
+                }],
+            },
+        });
+        let encoded = encode_response(&response).expect("encode validation report");
+        assert_eq!(
+            decode_response(&encoded).expect("decode validation report"),
+            response
+        );
 
         let response = Response::Ok(ResponsePayload::WorkflowDefinitionRegistered {
             definition: bcode_workflow_store::StoredWorkflowDefinition {
