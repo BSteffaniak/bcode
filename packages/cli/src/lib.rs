@@ -945,6 +945,23 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// List discovered provider capabilities, versions, quota, and coverage.
+    SearchStatus {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explain provider selection for a query without invoking provider searches.
+    SearchExplain {
+        query: String,
+        #[arg(long = "content", value_enum)]
+        content: Vec<SessionSearchContentArg>,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = 5_000)]
+        deadline_ms: u64,
+        #[arg(long)]
+        json: bool,
+    },
     /// Export complete canonical events through the daemon-owned strict history boundary.
     Export {
         session_id: SessionId,
@@ -1553,6 +1570,14 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
             hydrate,
             json,
         } => session_search(query, content, limit, deadline_ms, hydrate, json).await?,
+        SessionCommand::SearchStatus { json } => session_search_status(json).await?,
+        SessionCommand::SearchExplain {
+            query,
+            content,
+            limit,
+            deadline_ms,
+            json,
+        } => session_search_explain(query, content, limit, deadline_ms, json).await?,
         SessionCommand::Export { session_id, format } => {
             session_export(session_id, format).await?;
         }
@@ -7194,15 +7219,13 @@ async fn session_inspect(
     Ok(())
 }
 
-async fn session_search(
+fn session_search_request(
     query: String,
     content: Vec<SessionSearchContentArg>,
     limit: usize,
     deadline_ms: u64,
-    hydrate: bool,
-    json: bool,
-) -> Result<(), CliError> {
-    let request = bcode_session_search::SessionSearchRequest {
+) -> bcode_session_search::SessionSearchRequest {
+    bcode_session_search::SessionSearchRequest {
         query: bcode_session_search::SessionSearchQuery::Text {
             text: query,
             mode: bcode_session_search::TextMatchMode::Terms,
@@ -7216,7 +7239,18 @@ async fn session_search(
         limit,
         cursor: None,
         deadline_ms: Some(deadline_ms),
-    };
+    }
+}
+
+async fn session_search(
+    query: String,
+    content: Vec<SessionSearchContentArg>,
+    limit: usize,
+    deadline_ms: u64,
+    hydrate: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let request = session_search_request(query, content, limit, deadline_ms);
     let (response, hydrated_hits) = BcodeClient::default_endpoint()
         .session_search(request, Vec::new(), hydrate)
         .await?;
@@ -7271,6 +7305,78 @@ async fn session_search(
     }
     if !response.query_complete || !response.coverage_complete {
         eprintln!("search result is partial; inspect provider status/failures above");
+    }
+    Ok(())
+}
+
+async fn session_search_status(json: bool) -> Result<(), CliError> {
+    let response = BcodeClient::default_endpoint()
+        .session_search_providers()
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+        return Ok(());
+    }
+    for provider in response.providers {
+        println!(
+            "{}: {:?}, index={}/{}, pending={}, schema={}/{}/{}",
+            provider.plugin_id,
+            provider.status.state,
+            provider.status.index_bytes,
+            provider.status.quota_bytes,
+            provider.status.pending_sessions,
+            provider.status.record_schema_version,
+            provider.status.normalization_version,
+            provider.status.policy_version
+        );
+        for coverage in provider.status.coverage {
+            println!(
+                "  session {} through {:?}, complete={}, skipped={}, truncated={}",
+                coverage.generation.session_id,
+                coverage.indexed_through_sequence,
+                coverage.complete,
+                coverage.skipped_records,
+                coverage.truncated_records
+            );
+        }
+    }
+    for failure in response.failures {
+        eprintln!(
+            "provider {} failed ({:?}): {}",
+            failure.plugin_id, failure.error.code, failure.error.message
+        );
+    }
+    Ok(())
+}
+
+async fn session_search_explain(
+    query: String,
+    content: Vec<SessionSearchContentArg>,
+    limit: usize,
+    deadline_ms: u64,
+    json: bool,
+) -> Result<(), CliError> {
+    let plan = BcodeClient::default_endpoint()
+        .session_search_explain(
+            session_search_request(query, content, limit, deadline_ms),
+            Vec::new(),
+        )
+        .await?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+        return Ok(());
+    }
+    for provider in plan.providers {
+        println!(
+            "selected {}: {:?}, content={:?}",
+            provider.plugin_id, provider.status.state, provider.capabilities.content_kinds
+        );
+    }
+    for failure in plan.failures {
+        eprintln!(
+            "excluded {} ({:?}): {}",
+            failure.plugin_id, failure.error.code, failure.error.message
+        );
     }
     Ok(())
 }

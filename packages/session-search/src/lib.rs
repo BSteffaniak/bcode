@@ -665,7 +665,7 @@ impl SessionSearchContentRoute {
 }
 
 /// Deterministic provider plan for one exact portable request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSearchPlan {
     /// Providers selected in stable plugin-ID order.
     pub providers: Vec<SessionSearchProviderInfo>,

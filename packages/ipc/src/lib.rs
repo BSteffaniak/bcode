@@ -610,6 +610,12 @@ pub enum Request {
         #[serde(default)]
         hydrate: bool,
     },
+    SessionSearchProviders,
+    SessionSearchExplain {
+        request: bcode_session_search::SessionSearchRequest,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        routes: Vec<bcode_session_search::SessionSearchContentRoute>,
+    },
 }
 
 /// Server stop request policy.
@@ -1630,6 +1636,12 @@ pub enum ResponsePayload {
         response: bcode_session_search::FederatedSessionSearchResponse,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         hydrated_hits: Vec<bcode_session_search::HydratedSessionSearchHit>,
+    },
+    SessionSearchProviders {
+        response: bcode_session_search::ListSessionSearchProvidersResponse,
+    },
+    SessionSearchPlan {
+        plan: bcode_session_search::SessionSearchPlan,
     },
 }
 

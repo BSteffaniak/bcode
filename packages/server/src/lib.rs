@@ -3456,6 +3456,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionHistoryAround { .. } => "session_history_around",
         Request::SessionInspection { .. } => "session_inspection",
         Request::SessionSearch { .. } => "session_search",
+        Request::SessionSearchProviders => "session_search_providers",
+        Request::SessionSearchExplain { .. } => "session_search_explain",
         Request::PrepareSessionOpen { .. } => "prepare_session_open",
         Request::WaitSessionOpenProgress { .. } => "wait_session_open_progress",
         Request::AttachSession { .. } => "attach_session",
@@ -3776,6 +3778,29 @@ async fn handle_request_inner(
             routes,
             hydrate,
         } => handle_session_search(request_id, state, writer, request, routes, hydrate).await,
+        Request::SessionSearchProviders => {
+            let response = session_search::list_providers(state).await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionSearchProviders { response }),
+            )
+            .await
+        }
+        Request::SessionSearchExplain { request, routes } => {
+            let discovery = session_search::list_providers(state).await;
+            let plan = if routes.is_empty() {
+                bcode_session_search::plan_session_search(&request, discovery)
+            } else {
+                bcode_session_search::plan_session_search_with_routes(&request, discovery, &routes)
+            };
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionSearchPlan { plan }),
+            )
+            .await
+        }
         Request::PrepareSessionOpen { session_id } => {
             handle_prepare_session_open(request_id, state, writer, session_id).await
         }
@@ -26386,6 +26411,8 @@ const fn response_payload_kind(response: &Response) -> &'static str {
             ResponsePayload::SessionHistoryAround { .. } => "session_history_around",
             ResponsePayload::SessionInspection { .. } => "session_inspection",
             ResponsePayload::SessionSearch { .. } => "session_search",
+            ResponsePayload::SessionSearchProviders { .. } => "session_search_providers",
+            ResponsePayload::SessionSearchPlan { .. } => "session_search_plan",
             ResponsePayload::SessionList { .. } => "session_list",
             ResponsePayload::SessionCatalogRefreshed { .. } => "session_catalog_refreshed",
             ResponsePayload::PermissionList { .. } => "permission_list",

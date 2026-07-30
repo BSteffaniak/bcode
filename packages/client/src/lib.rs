@@ -1789,6 +1789,39 @@ impl BcodeClient {
         }
     }
 
+    /// Return discovered session-search provider capabilities, status, coverage, and failures.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn session_search_providers(
+        &self,
+    ) -> Result<bcode_session_search::ListSessionSearchProvidersResponse, ClientError> {
+        match self.send_request(Request::SessionSearchProviders).await? {
+            ResponsePayload::SessionSearchProviders { response } => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Explain deterministic provider selection without invoking provider searches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn session_search_explain(
+        &self,
+        request: bcode_session_search::SessionSearchRequest,
+        routes: Vec<bcode_session_search::SessionSearchContentRoute>,
+    ) -> Result<bcode_session_search::SessionSearchPlan, ClientError> {
+        match self
+            .send_request(Request::SessionSearchExplain { request, routes })
+            .await?
+        {
+            ResponsePayload::SessionSearchPlan { plan } => Ok(plan),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Send a user message to a session.
     ///
     /// # Errors
