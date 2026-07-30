@@ -38,6 +38,10 @@ use bcode_model_provider_runtime::{
 use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
 use bcode_provider_auth::auth_pool_state;
+use bcode_provider_auth_models::{
+    AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION, AuthMethodContribution, AuthProviderContribution,
+    AuthSecretField, AuthSecretValidation,
+};
 use reqwest::Client;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -176,14 +180,70 @@ impl TurnState {
 }
 
 impl ConcurrentRustPlugin for OpenAiCompatibleProviderPlugin {
+    fn register_auth_providers_concurrent(
+        &self,
+        registrar: AuthRegistrar,
+    ) -> Result<(), PluginError> {
+        register_auth_providers(registrar)
+    }
+
     fn invoke_service_concurrent(&self, context: NativeServiceContext) -> ServiceResponse {
         self.invoke_provider_service(&context)
     }
 }
 
 impl RustPlugin for OpenAiCompatibleProviderPlugin {
+    fn register_auth_providers(&mut self, registrar: AuthRegistrar) -> Result<(), PluginError> {
+        register_auth_providers(registrar)
+    }
+
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         self.invoke_provider_service(&context)
+    }
+}
+
+fn register_auth_providers(registrar: AuthRegistrar) -> Result<(), PluginError> {
+    for contribution in [
+        api_key_auth_provider("openai", "OpenAI", "BCODE_OPENAI_API_KEY", "OpenAI API key"),
+        api_key_auth_provider("xai", "xAI", "BCODE_XAI_API_KEY", "xAI API key"),
+    ] {
+        registrar.register(&contribution).map_err(|error| {
+            PluginError::failed(format!(
+                "failed to register {} authentication: {error}",
+                contribution.display_name
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+fn api_key_auth_provider(
+    provider_id: &str,
+    display_name: &str,
+    storage_key: &str,
+    prompt: &str,
+) -> AuthProviderContribution {
+    AuthProviderContribution {
+        schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+        provider_id: provider_id.to_owned(),
+        display_name: display_name.to_owned(),
+        methods: vec![AuthMethodContribution::SecretFields {
+            method_id: "api_key".to_owned(),
+            display_name: "API key".to_owned(),
+            fields: vec![AuthSecretField {
+                credential_id: "api_key".to_owned(),
+                storage_key: storage_key.to_owned(),
+                prompt: prompt.to_owned(),
+                optional: false,
+                validation: AuthSecretValidation {
+                    min_bytes: Some(1),
+                    max_bytes: Some(512),
+                    required_prefix: None,
+                },
+            }],
+            supports_verification: false,
+            supports_revocation: false,
+        }],
     }
 }
 
@@ -7809,8 +7869,64 @@ mod tests {
     use bcode_plugin_sdk::{PluginConfigContext, ServiceCancellation};
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::thread;
+
+    static AUTH_REGISTRATIONS: StdMutex<Vec<Vec<u8>>> = StdMutex::new(Vec::new());
+
+    extern "C" fn collect_auth_registration(
+        payload: *const u8,
+        payload_len: usize,
+        _user_data: *mut std::ffi::c_void,
+    ) {
+        let payload = unsafe { std::slice::from_raw_parts(payload, payload_len) };
+        AUTH_REGISTRATIONS
+            .lock()
+            .expect("auth registration collector")
+            .push(payload.to_vec());
+    }
+
+    #[test]
+    fn auth_providers_register_openai_and_xai_api_key_methods() {
+        AUTH_REGISTRATIONS
+            .lock()
+            .expect("auth registration collector")
+            .clear();
+        register_auth_providers(AuthRegistrar::new(
+            Some(collect_auth_registration),
+            std::ptr::null_mut(),
+        ))
+        .expect("auth registration");
+        let registrations = AUTH_REGISTRATIONS
+            .lock()
+            .expect("auth registration collector");
+        let contributions = registrations
+            .iter()
+            .map(|payload| {
+                serde_json::from_slice::<AuthProviderContribution>(payload)
+                    .expect("contribution decodes")
+            })
+            .collect::<Vec<_>>();
+        drop(registrations);
+        assert_eq!(contributions.len(), 2);
+        for (contribution, provider_id, storage_key) in [
+            (&contributions[0], "openai", "BCODE_OPENAI_API_KEY"),
+            (&contributions[1], "xai", "BCODE_XAI_API_KEY"),
+        ] {
+            contribution.validate().expect("valid contribution");
+            assert_eq!(contribution.provider_id, provider_id);
+            let AuthMethodContribution::SecretFields {
+                method_id, fields, ..
+            } = &contribution.methods[0]
+            else {
+                panic!("API-key registration must use generic secret fields");
+            };
+            assert_eq!(method_id, "api_key");
+            assert_eq!(fields[0].credential_id, "api_key");
+            assert_eq!(fields[0].storage_key, storage_key);
+        }
+    }
 
     #[derive(Default)]
     struct OpenAiPluginInvoker {

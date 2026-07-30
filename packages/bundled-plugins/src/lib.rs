@@ -614,6 +614,40 @@ mod tests {
         assert!(!registration.requires_daemon);
     }
 
+    #[cfg(feature = "static-bundled-openai-compatible-provider-plugin")]
+    #[test]
+    fn openai_compatible_bundle_registers_api_key_auth_providers() {
+        let static_plugins = super::static_bundled_plugins();
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &static_plugins,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .expect("static plugin manifests parse");
+        let mut host = bcode_plugin::PluginHost::load_static_plugins_best_effort(&selected);
+        for provider_id in ["openai", "xai"] {
+            let provider = host.auth_provider(provider_id).expect("auth provider");
+            assert_eq!(provider.plugin_id, "bcode.openai-compatible");
+            assert_eq!(provider.contribution.methods.len(), 1);
+            assert_eq!(provider.contribution.methods[0].method_id(), "api_key");
+        }
+        host.deactivate_all().expect("deactivate static plugins");
+    }
+
+    #[cfg(feature = "static-bundled-web-search-plugin")]
+    #[test]
+    fn disabled_web_search_bundle_does_not_register_exa_auth_provider() {
+        let static_plugins = super::static_bundled_plugins();
+        let selection = bcode_plugin::PluginSelection {
+            mode: bcode_plugin::PluginSelectionMode::All,
+            enabled: std::collections::BTreeSet::new(),
+            disabled: std::collections::BTreeSet::from(["bcode.web-search".to_owned()]),
+        };
+        let selected = bcode_plugin::filter_selected_static_plugins(&static_plugins, &selection)
+            .expect("static plugin manifests parse");
+        let host = bcode_plugin::PluginHost::load_static_plugins_best_effort(&selected);
+        assert!(host.auth_provider("exa").is_none());
+    }
+
     #[cfg(feature = "static-bundled-web-search-plugin")]
     #[test]
     fn web_search_bundle_registers_exa_auth_provider() {
