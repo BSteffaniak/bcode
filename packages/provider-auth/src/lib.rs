@@ -124,12 +124,12 @@ fn runtime_subscription_auth_profile_config(
         provider_id: Some(profile.provider.clone()),
         owner_plugin_id: profile.owner_plugin_id.clone(),
         scheme: Some(profile.scheme.clone()),
-        map: BTreeMap::new(),
+        map: profile.map.clone(),
         settings: BTreeMap::from([
             ("provider".to_string(), profile.provider.clone()),
             ("profile".to_string(), profile.storage_profile.clone()),
             ("vault".to_string(), profile.vault.display().to_string()),
-            ("mode".to_string(), "chatgpt".to_string()),
+            ("mode".to_string(), profile.scheme.clone()),
         ]),
     }
 }

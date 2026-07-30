@@ -3570,10 +3570,10 @@ fn format_duration(seconds: u64) -> String {
 
 fn all_subscriptions_exhausted_message(skipped_profiles: &[String]) -> String {
     if skipped_profiles.is_empty() {
-        "all configured OpenAI subscriptions are currently quota-limited; add another subscription with `bcode login openai --add-subscription` or try again after reset".to_string()
+        "all configured OpenAI subscriptions are currently quota-limited; add another subscription with `bcode auth login openai --method chatgpt --pool openai --profile openai-2` or try again after reset".to_string()
     } else {
         format!(
-            "all configured OpenAI subscriptions are currently quota-limited; skipped cooldown profiles: {}; add another subscription with `bcode login openai --add-subscription` or try again after reset",
+            "all configured OpenAI subscriptions are currently quota-limited; skipped cooldown profiles: {}; add another subscription with `bcode auth login openai --method chatgpt --pool openai --profile openai-2` or try again after reset",
             skipped_profiles.join(", ")
         )
     }
@@ -3592,7 +3592,7 @@ async fn verify_model_inner(
             "missing_openai_auth",
             ProviderErrorCategory::Auth,
             format!(
-                "run `bcode login openai` or configure OpenAI-compatible API-key auth; auth diagnostics: source={}, mode={}, detail={}",
+                "run `bcode auth login openai` or configure OpenAI-compatible API-key auth; auth diagnostics: source={}, mode={}, detail={}",
                 settings.auth_diagnostics.source,
                 settings.auth_diagnostics.mode,
                 settings.auth_diagnostics.detail
@@ -3601,7 +3601,7 @@ async fn verify_model_inner(
         error.failure = Some(Box::new(openai_failure_context(
             &settings,
             bcode_model::ProviderFailureCapability::ModelVerification,
-            "run `bcode login openai`/`bcode login xai` or configure the documented API-key environment variable",
+            "run `bcode auth login openai`/`bcode auth login xai` or configure the documented API-key environment variable",
         )));
         return Err(error);
     }
@@ -3940,12 +3940,12 @@ async fn stream_chat_completion_inner(
         let mut error = provider_error(
             "missing_openai_auth",
             ProviderErrorCategory::Auth,
-            "run `bcode login openai` (or `bcode login xai`) for ChatGPT subscription auth or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY (or BCODE_XAI_API_KEY/XAI_API_KEY) for API-key auth",
+            "run `bcode auth login openai` (or `bcode auth login xai`) for ChatGPT subscription auth or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY (or BCODE_XAI_API_KEY/XAI_API_KEY) for API-key auth",
         );
         error.failure = Some(Box::new(openai_failure_context(
             &settings,
             bcode_model::ProviderFailureCapability::ModelInvocation,
-            "run `bcode login openai`/`bcode login xai` or configure the documented API-key environment variable",
+            "run `bcode auth login openai`/`bcode auth login xai` or configure the documented API-key environment variable",
         )));
         return Err(error);
     }
@@ -7292,7 +7292,7 @@ fn validation_failure_message(
         );
     }
     format!(
-        "OpenAI-compatible provider authentication is not configured ({}); run `bcode login openai` (or `bcode login xai`) or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY (or BCODE_XAI_API_KEY/XAI_API_KEY)",
+        "OpenAI-compatible provider authentication is not configured ({}); run `bcode auth login openai` (or `bcode auth login xai`) or set BCODE_OPENAI_API_KEY/OPENAI_API_KEY (or BCODE_XAI_API_KEY/XAI_API_KEY)",
         settings.auth_diagnostics.detail
     )
 }
@@ -7999,12 +7999,12 @@ impl OpenAiCompatibleProviderPlugin {
                     let mut error = provider_error(
                         "missing_refresh_token",
                         ProviderErrorCategory::Auth,
-                        "saved ChatGPT/Codex access token is expired or expiring soon and no refresh token is saved; run `bcode login openai` again",
+                        "saved ChatGPT/Codex access token is expired or expiring soon and no refresh token is saved; run `bcode auth login openai --method chatgpt` again",
                     );
                     error.failure = Some(Box::new(openai_failure_context(
                         settings,
                         bcode_model::ProviderFailureCapability::TokenRefresh,
-                        "run `bcode login openai` again to replace the expired credential",
+                        "run `bcode auth login openai --method chatgpt` again to replace the expired credential",
                     )));
                     return Err(error);
                 }
@@ -8168,7 +8168,7 @@ fn set_codex_secret(
                 bcode_model::ProviderFailureCapability::CredentialStorage,
                 bcode_model::ProviderFailureSourceKind::CredentialStore,
                 format!("sshenv:{profile}:{key}"),
-                "unlock or repair the credential store, then run `bcode login openai` again",
+                "unlock or repair the credential store, then run `bcode auth login openai --method chatgpt` again",
             ))
         })
 }

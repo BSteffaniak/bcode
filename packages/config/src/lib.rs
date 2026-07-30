@@ -4074,6 +4074,9 @@ pub struct RuntimeAuthSubscriptionProfile {
     /// Plugin that owns this runtime profile when known.
     #[serde(default)]
     pub owner_plugin_id: Option<String>,
+    /// Canonical credential-to-vault mapping for this subscription.
+    #[serde(default)]
+    pub map: BTreeMap<String, AuthCredentialMapping>,
 }
 
 /// Return the runtime auth subscription registry path.
@@ -4104,8 +4107,48 @@ pub fn register_runtime_auth_subscription(
     pool: &str,
     profile: RuntimeAuthSubscriptionProfile,
 ) -> Result<PathBuf, ConfigError> {
+    let owner_plugin_id =
+        profile
+            .owner_plugin_id
+            .clone()
+            .ok_or_else(|| ConfigError::Composition {
+                message: "runtime auth subscription requires plugin ownership".to_owned(),
+            })?;
+    if profile.auth_profile.trim().is_empty()
+        || profile.storage_profile.trim().is_empty()
+        || profile.provider.trim().is_empty()
+        || profile.scheme.trim().is_empty()
+    {
+        return Err(ConfigError::Composition {
+            message: "runtime auth subscription requires non-empty profile, storage profile, provider, and scheme"
+                .to_owned(),
+        });
+    }
+    let runtime_profile = RuntimeAuthProfile {
+        provider_id: profile.provider.clone(),
+        owner_plugin_id,
+        backend: "sshenv".to_owned(),
+        scheme: profile.scheme.clone(),
+        storage_profile: profile.storage_profile.clone(),
+        vault: profile.vault.clone(),
+        map: profile.map.clone(),
+    };
     let path = runtime_auth_subscriptions_path();
     let mut registry = load_runtime_auth_subscriptions();
+    if let Some(existing) = registry.profiles.get(&profile.auth_profile)
+        && (existing.provider_id != runtime_profile.provider_id
+            || existing.owner_plugin_id != runtime_profile.owner_plugin_id)
+    {
+        return Err(ConfigError::Composition {
+            message: format!(
+                "runtime auth profile '{}' ownership conflicts with existing metadata",
+                profile.auth_profile
+            ),
+        });
+    }
+    registry
+        .profiles
+        .insert(profile.auth_profile.clone(), runtime_profile);
     let pool_entry =
         registry
             .pools
@@ -6193,7 +6236,7 @@ mod tests {
         load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
         load_runtime_auth_subscriptions, merge_config_values,
         plugin_selection_with_default_plugin_ids, register_runtime_auth_profile,
-        upsert_agent_permission_rule,
+        register_runtime_auth_subscription, upsert_agent_permission_rule,
     };
     use bcode_agent_policy_models::Action;
     use bcode_plugin::{PluginSelection, PluginSelectionMode};
@@ -6201,6 +6244,55 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn runtime_subscription_persists_owned_profile_without_rebinding_primary() {
+        let _guard = ENV_LOCK.lock().expect("environment lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let runtime_path = temp.path().join("auth-runtime.json");
+        let previous = std::env::var_os("BCODE_AUTH_SUBSCRIPTIONS");
+        unsafe {
+            std::env::set_var("BCODE_AUTH_SUBSCRIPTIONS", &runtime_path);
+        }
+        register_runtime_auth_profile(
+            "openai",
+            super::RuntimeAuthProfile {
+                provider_id: "openai".to_owned(),
+                owner_plugin_id: "bcode.openai-compatible".to_owned(),
+                backend: "sshenv".to_owned(),
+                scheme: "chatgpt".to_owned(),
+                storage_profile: "openai".to_owned(),
+                vault: temp.path().join("vault"),
+                map: BTreeMap::new(),
+            },
+        )
+        .expect("primary profile");
+        let map = BTreeMap::from([(
+            "access_token".to_owned(),
+            super::AuthCredentialMapping {
+                env: None,
+                key: Some("BCODE_OPENAI_CODEX_ACCESS_TOKEN".to_owned()),
+            },
+        )]);
+        register_runtime_auth_subscription(
+            "openai",
+            super::RuntimeAuthSubscriptionProfile {
+                auth_profile: "openai-2".to_owned(),
+                storage_profile: "openai-2".to_owned(),
+                vault: temp.path().join("vault"),
+                provider: "openai".to_owned(),
+                scheme: "chatgpt".to_owned(),
+                owner_plugin_id: Some("bcode.openai-compatible".to_owned()),
+                map: map.clone(),
+            },
+        )
+        .expect("secondary subscription");
+        let registry = load_runtime_auth_subscriptions();
+        assert_eq!(registry.bindings["openai"].profile, "openai");
+        assert_eq!(registry.profiles["openai-2"].map, map);
+        assert_eq!(registry.pools["openai"].profiles.len(), 1);
+        restore_env("BCODE_AUTH_SUBSCRIPTIONS", previous);
+    }
 
     #[test]
     fn runtime_auth_profile_persistence_is_non_secret_and_does_not_mutate_declarative_config() {

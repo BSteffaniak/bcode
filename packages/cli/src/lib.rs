@@ -778,6 +778,7 @@ enum Commands {
         #[command(subcommand)]
         command: AuthCommand,
     },
+    /// Deprecated compatibility login commands. Use `bcode auth login <provider>`.
     Login {
         #[command(subcommand)]
         command: LoginCommand,
@@ -1064,6 +1065,9 @@ enum AuthCommand {
         vault: Option<PathBuf>,
         #[arg(long)]
         recipient_key: Option<String>,
+        /// Add the enrolled profile to this runtime authentication pool without changing the provider binding.
+        #[arg(long)]
+        pool: Option<String>,
         /// Explicit provider-local authentication method ID.
         #[arg(long)]
         method: Option<String>,
@@ -1229,6 +1233,7 @@ enum AuthPrimeCommand {
 
 #[derive(Debug, Subcommand)]
 enum LoginCommand {
+    /// Deprecated: use `bcode auth login openai` (for example, `--method chatgpt`).
     Openai {
         /// Store an `OpenAI` platform API key instead of using `ChatGPT` subscription OAuth.
         #[arg(long)]
@@ -1261,7 +1266,7 @@ enum LoginCommand {
         #[arg(long)]
         model: Option<String>,
     },
-    /// Login for xAI (Grok) using the OpenAI-compatible provider.
+    /// Deprecated: use `bcode auth login xai`.
     Xai {
         /// Store an xAI API key.
         #[arg(long)]
@@ -1559,6 +1564,7 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
             profile,
             vault,
             recipient_key,
+            pool,
             method,
             verify,
         } => {
@@ -1568,6 +1574,7 @@ async fn handle_auth_command(command: AuthCommand) -> Result<(), CliError> {
                     profile.as_deref(),
                     vault,
                     recipient_key.as_deref(),
+                    pool.as_deref(),
                     method.as_deref(),
                     verify,
                 )
@@ -3517,6 +3524,36 @@ fn resolve_or_prepare_auth_profile(
     }
 }
 
+fn persist_runtime_pool_profile(
+    pool: &str,
+    resolved: &bcode_provider_auth::ResolvedAuthProfile,
+) -> Result<(), CliError> {
+    let storage_profile = resolved
+        .profile
+        .settings
+        .get("profile")
+        .cloned()
+        .unwrap_or_else(|| resolved.profile_name.clone());
+    let vault = resolved
+        .profile
+        .settings
+        .get("vault")
+        .map_or_else(bcode_config::default_auth_vault_path, PathBuf::from);
+    bcode_config::register_runtime_auth_subscription(
+        pool,
+        bcode_config::RuntimeAuthSubscriptionProfile {
+            auth_profile: resolved.profile_name.clone(),
+            storage_profile,
+            vault,
+            provider: resolved.provider_id.clone(),
+            scheme: resolved.profile.scheme.clone().unwrap_or_default(),
+            owner_plugin_id: Some(resolved.owner_plugin_id.clone()),
+            map: resolved.profile.map.clone(),
+        },
+    )?;
+    Ok(())
+}
+
 fn persist_prepared_runtime_profile(
     resolved: &bcode_provider_auth::ResolvedAuthProfile,
 ) -> Result<(), CliError> {
@@ -3551,6 +3588,7 @@ async fn auth_provider_login(
     explicit_profile: Option<&str>,
     explicit_vault: Option<PathBuf>,
     recipient_key: Option<&str>,
+    pool: Option<&str>,
     requested_method: Option<&str>,
     verify: bool,
 ) -> Result<(), CliError> {
@@ -3604,7 +3642,9 @@ async fn auth_provider_login(
             run_auth_interactive_flow(&host, &provider, method, &resolved, verify, false).await?;
         }
     }
-    if persist_runtime {
+    if let Some(pool) = pool {
+        persist_runtime_pool_profile(pool, &resolved)?;
+    } else if persist_runtime {
         persist_prepared_runtime_profile(&resolved)?;
     }
     println!(
@@ -4141,6 +4181,7 @@ fn auth_login(
 }
 
 async fn handle_login_command(command: LoginCommand) -> Result<(), CliError> {
+    eprintln!("warning: `bcode login` is deprecated; use `bcode auth login <provider>` instead");
     match command {
         LoginCommand::Openai {
             api_key,
@@ -4315,11 +4356,12 @@ async fn run_registered_auth_method(
     vault: Option<PathBuf>,
     recipient_key: Option<&str>,
     device_seal_off: bool,
+    persist_runtime: bool,
 ) -> Result<(bcode_provider_auth::ResolvedAuthProfile, bool), CliError> {
     let mut host = load_cli_plugin_host()?;
     let provider = registered_auth_provider(&host, provider_id)?;
     let method = selected_auth_method(&provider, Some(method_id))?;
-    let (mut resolved, persist_runtime) =
+    let (mut resolved, should_persist_runtime) =
         resolve_or_prepare_auth_profile(&provider, method, profile, vault, recipient_key)?;
     if device_seal_off {
         resolved
@@ -4328,11 +4370,11 @@ async fn run_registered_auth_method(
             .insert("device_seal".to_owned(), "off".to_owned());
     }
     run_auth_interactive_flow(&host, &provider, method, &resolved, false, false).await?;
-    if persist_runtime {
+    if persist_runtime && should_persist_runtime {
         persist_prepared_runtime_profile(&resolved)?;
     }
     host.deactivate_all()?;
-    Ok((resolved, persist_runtime))
+    Ok((resolved, should_persist_runtime))
 }
 
 async fn login_openai(options: OpenAiLoginOptions) -> Result<(), CliError> {
@@ -4890,6 +4932,28 @@ fn login_xai(options: XaiLoginOptions) -> Result<(), CliError> {
     )
 }
 
+fn openai_chatgpt_credential_map() -> BTreeMap<String, bcode_config::AuthCredentialMapping> {
+    [
+        ("access_token", "BCODE_OPENAI_CODEX_ACCESS_TOKEN"),
+        ("refresh_token", "BCODE_OPENAI_CODEX_REFRESH_TOKEN"),
+        ("id_token", "BCODE_OPENAI_CODEX_ID_TOKEN"),
+        ("expires_at", "BCODE_OPENAI_CODEX_EXPIRES_AT"),
+        ("account_id", "BCODE_OPENAI_CODEX_ACCOUNT_ID"),
+        ("auth_mode", "BCODE_OPENAI_AUTH_MODE"),
+    ]
+    .into_iter()
+    .map(|(credential_id, key)| {
+        (
+            credential_id.to_owned(),
+            bcode_config::AuthCredentialMapping {
+                env: None,
+                key: Some(key.to_owned()),
+            },
+        )
+    })
+    .collect()
+}
+
 async fn login_openai_chatgpt_via_registry(
     target: LoginTarget,
     model: Option<String>,
@@ -4908,6 +4972,7 @@ async fn login_openai_chatgpt_via_registry(
         Some(target.vault_path.clone()),
         target.recipient_key.as_deref(),
         no_device_seal,
+        !add_subscription,
     )
     .await?;
     report_login_completion(
@@ -4925,6 +4990,7 @@ async fn login_openai_chatgpt_via_registry(
                         provider: "openai".to_string(),
                         scheme: "chatgpt".to_string(),
                         owner_plugin_id: LoginProvider::OpenAi.owner_plugin_id(),
+                        map: openai_chatgpt_credential_map(),
                     },
                 )
             } else {
@@ -8656,6 +8722,41 @@ mod auth_cli_tests {
             "device"
         );
         assert!(selected_auth_method(&provider, Some("missing")).is_err());
+    }
+
+    #[test]
+    fn cli_shape_accepts_generic_pool_enrollment() {
+        use clap::{CommandFactory as _, FromArgMatches as _};
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "bcode",
+                "auth",
+                "login",
+                "openai",
+                "--method",
+                "chatgpt",
+                "--profile",
+                "openai-2",
+                "--pool",
+                "openai",
+            ])
+            .expect("pool enrollment parses");
+        let cli = Cli::from_arg_matches(&matches).expect("pool enrollment decodes");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth {
+                command: AuthCommand::Login {
+                    provider: Some(provider),
+                    profile: Some(profile),
+                    pool: Some(pool),
+                    method: Some(method),
+                    ..
+                }
+            }) if provider == "openai"
+                && profile == "openai-2"
+                && pool == "openai"
+                && method == "chatgpt"
+        ));
     }
 
     #[test]
