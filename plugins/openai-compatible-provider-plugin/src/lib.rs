@@ -39,9 +39,13 @@ use bcode_plugin_sdk::path::display_from_current_dir;
 use bcode_plugin_sdk::prelude::*;
 use bcode_provider_auth::auth_pool_state;
 use bcode_provider_auth_models::{
-    AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION, AuthMethodContribution, AuthProviderContribution,
-    AuthSecretField, AuthSecretValidation,
+    AUTH_FLOW_SCHEMA_VERSION, AUTH_INTERFACE_ID, AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+    AuthCredentialStorage, AuthDiagnostic, AuthDiagnosticSeverity, AuthFlowEffect,
+    AuthFlowOperation, AuthFlowRequest, AuthFlowResponse, AuthFlowStatus, AuthMethodContribution,
+    AuthProviderContribution, AuthSecretField, AuthSecretValidation,
 };
+use rand::TryRngCore as _;
+use rand::rngs::OsRng;
 use reqwest::Client;
 use reqwest::header::HeaderMap;
 use serde::{Deserialize, Serialize};
@@ -62,6 +66,13 @@ const DEFAULT_XAI_MODEL_ID: &str = "grok-4.3"; // from https://docs.x.ai/develop
 const PROVIDER_ID: &str = "bcode.openai-compatible";
 const OPENAI_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const OPENAI_CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const OPENAI_CODEX_DEVICE_USER_CODE_URL: &str =
+    "https://auth.openai.com/api/accounts/deviceauth/usercode";
+const OPENAI_CODEX_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+const OPENAI_CODEX_DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
+const OPENAI_CODEX_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+const OPENAI_AUTH_FLOW_OPERATION: &str = "flow";
+const OPENAI_AUTH_MAX_POLLS: u16 = 300;
 const OPENAI_CODEX_API_ENDPOINT: &str = "https://chatgpt.com/backend-api/codex/responses";
 const OPENAI_DIALECT_SETTING: &str = "dialect";
 const OPENAI_NAMESPACED_DIALECT_SETTING: &str = "openai.dialect";
@@ -130,7 +141,7 @@ impl bcode_model::ProviderRequestExtension for OpenAiResponsesRequestOptions {
 
 /// OpenAI-compatible model provider plugin.
 pub struct OpenAiCompatibleProviderPlugin {
-    state: Mutex<OpenAiCompatibleProviderState>,
+    state: Arc<Mutex<OpenAiCompatibleProviderState>>,
     runtime: Result<ProviderRuntime, String>,
 }
 
@@ -138,12 +149,13 @@ pub struct OpenAiCompatibleProviderPlugin {
 struct OpenAiCompatibleProviderState {
     next_turn: u64,
     turns: BTreeMap<String, TurnState>,
+    auth_flows: BTreeMap<String, OpenAiAuthFlowState>,
 }
 
 impl Default for OpenAiCompatibleProviderPlugin {
     fn default() -> Self {
         Self {
-            state: Mutex::default(),
+            state: Arc::default(),
             runtime: ProviderRuntime::new().map_err(|error| error.to_string()),
         }
     }
@@ -154,6 +166,41 @@ struct TurnState {
     events: Arc<Mutex<VecDeque<ProviderTurnEvent>>>,
     cancelled: Arc<AtomicBool>,
     cancel_notify: Arc<Notify>,
+}
+
+#[derive(Debug)]
+enum OpenAiAuthFlowState {
+    Device {
+        profile: String,
+        device_auth_id: String,
+        user_code: String,
+        interval_millis: u64,
+        polls: u16,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiDeviceUserCodeResponse {
+    device_auth_id: String,
+    user_code: String,
+    interval: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiDeviceTokenResponse {
+    authorization_code: String,
+    code_verifier: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiAuthTokenResponse {
+    access_token: String,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
 }
 
 impl TurnState {
@@ -204,8 +251,21 @@ impl RustPlugin for OpenAiCompatibleProviderPlugin {
 
 fn register_auth_providers(registrar: AuthRegistrar) -> Result<(), PluginError> {
     for contribution in [
-        api_key_auth_provider("openai", "OpenAI", "BCODE_OPENAI_API_KEY", "OpenAI API key"),
-        api_key_auth_provider("xai", "xAI", "BCODE_XAI_API_KEY", "xAI API key"),
+        AuthProviderContribution {
+            schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+            provider_id: "openai".to_owned(),
+            display_name: "OpenAI".to_owned(),
+            methods: vec![
+                api_key_auth_method("BCODE_OPENAI_API_KEY", "OpenAI API key"),
+                openai_device_auth_method(),
+            ],
+        },
+        AuthProviderContribution {
+            schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
+            provider_id: "xai".to_owned(),
+            display_name: "xAI".to_owned(),
+            methods: vec![api_key_auth_method("BCODE_XAI_API_KEY", "xAI API key")],
+        },
     ] {
         registrar.register(&contribution).map_err(|error| {
             PluginError::failed(format!(
@@ -217,34 +277,188 @@ fn register_auth_providers(registrar: AuthRegistrar) -> Result<(), PluginError> 
     Ok(())
 }
 
-fn api_key_auth_provider(
-    provider_id: &str,
-    display_name: &str,
-    storage_key: &str,
-    prompt: &str,
-) -> AuthProviderContribution {
-    AuthProviderContribution {
-        schema_version: AUTH_PROVIDER_CONTRIBUTION_SCHEMA_VERSION,
-        provider_id: provider_id.to_owned(),
-        display_name: display_name.to_owned(),
-        methods: vec![AuthMethodContribution::SecretFields {
-            method_id: "api_key".to_owned(),
-            display_name: "API key".to_owned(),
-            fields: vec![AuthSecretField {
-                credential_id: "api_key".to_owned(),
-                storage_key: storage_key.to_owned(),
-                prompt: prompt.to_owned(),
-                optional: false,
-                validation: AuthSecretValidation {
-                    min_bytes: Some(1),
-                    max_bytes: Some(512),
-                    required_prefix: None,
-                },
-            }],
-            supports_verification: false,
-            supports_revocation: false,
+fn api_key_auth_method(storage_key: &str, prompt: &str) -> AuthMethodContribution {
+    AuthMethodContribution::SecretFields {
+        method_id: "api_key".to_owned(),
+        display_name: "API key".to_owned(),
+        fields: vec![AuthSecretField {
+            credential_id: "api_key".to_owned(),
+            storage_key: storage_key.to_owned(),
+            prompt: prompt.to_owned(),
+            optional: false,
+            validation: AuthSecretValidation {
+                min_bytes: Some(1),
+                max_bytes: Some(512),
+                required_prefix: None,
+            },
+        }],
+        supports_verification: false,
+        supports_revocation: false,
+    }
+}
+
+fn openai_device_auth_method() -> AuthMethodContribution {
+    AuthMethodContribution::Interactive {
+        method_id: "device".to_owned(),
+        display_name: "ChatGPT device code".to_owned(),
+        operation: OPENAI_AUTH_FLOW_OPERATION.to_owned(),
+        credentials: openai_oauth_credential_storage(),
+        supports_revocation: false,
+    }
+}
+
+fn openai_oauth_credential_storage() -> Vec<AuthCredentialStorage> {
+    [
+        ("access_token", "BCODE_OPENAI_CODEX_ACCESS_TOKEN"),
+        ("refresh_token", "BCODE_OPENAI_CODEX_REFRESH_TOKEN"),
+        ("id_token", "BCODE_OPENAI_CODEX_ID_TOKEN"),
+        ("expires_at", "BCODE_OPENAI_CODEX_EXPIRES_AT"),
+        ("account_id", "BCODE_OPENAI_CODEX_ACCOUNT_ID"),
+        ("auth_mode", "BCODE_OPENAI_AUTH_MODE"),
+    ]
+    .into_iter()
+    .map(|(credential_id, storage_key)| AuthCredentialStorage {
+        credential_id: credential_id.to_owned(),
+        storage_key: storage_key.to_owned(),
+    })
+    .collect()
+}
+
+fn random_urlsafe(bytes: usize) -> Result<String, String> {
+    let mut random = vec![0_u8; bytes];
+    OsRng
+        .try_fill_bytes(&mut random)
+        .map_err(|error| format!("secure random generation failed: {error}"))?;
+    Ok(URL_SAFE_NO_PAD.encode(random))
+}
+
+fn auth_flow_failure(message: &str) -> AuthFlowResponse {
+    AuthFlowResponse {
+        schema_version: AUTH_FLOW_SCHEMA_VERSION,
+        status: AuthFlowStatus::Failed,
+        state: None,
+        effects: Vec::new(),
+        credentials: BTreeMap::new(),
+        diagnostics: vec![AuthDiagnostic {
+            code: "openai_auth_failed".to_owned(),
+            severity: AuthDiagnosticSeverity::Error,
+            message: sanitize_provider_diagnostic(message),
+            remediation: Some("Retry `bcode auth login openai --method device`.".to_owned()),
         }],
     }
+}
+
+fn auth_flow_success(token: OpenAiAuthTokenResponse, _profile: &str) -> AuthFlowResponse {
+    let expires_at =
+        unix_timestamp_secs().saturating_add(token.expires_in.unwrap_or(3_600).saturating_sub(60));
+    let account_id = token
+        .id_token
+        .as_deref()
+        .and_then(chatgpt_account_id_from_access_token)
+        .or_else(|| chatgpt_account_id_from_access_token(&token.access_token));
+    let mut credentials = BTreeMap::from([
+        ("access_token".to_owned(), token.access_token),
+        ("expires_at".to_owned(), expires_at.to_string()),
+        ("auth_mode".to_owned(), "chatgpt".to_owned()),
+    ]);
+    if let Some(refresh_token) = token.refresh_token {
+        credentials.insert("refresh_token".to_owned(), refresh_token);
+    }
+    if let Some(id_token) = token.id_token {
+        credentials.insert("id_token".to_owned(), id_token);
+    }
+    if let Some(account_id) = account_id {
+        credentials.insert("account_id".to_owned(), account_id);
+    }
+    AuthFlowResponse {
+        schema_version: AUTH_FLOW_SCHEMA_VERSION,
+        status: AuthFlowStatus::Succeeded,
+        state: None,
+        effects: vec![AuthFlowEffect::Message {
+            message: "OpenAI ChatGPT authentication completed.".to_owned(),
+        }],
+        credentials,
+        diagnostics: Vec::new(),
+    }
+}
+
+fn unix_timestamp_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+}
+
+async fn start_openai_device_auth_at(
+    endpoint: &str,
+) -> Result<OpenAiDeviceUserCodeResponse, String> {
+    let response = Client::new()
+        .post(endpoint)
+        .header("User-Agent", format!("bcode/{}", env!("CARGO_PKG_VERSION")))
+        .json(&serde_json::json!({ "client_id": OPENAI_CODEX_CLIENT_ID }))
+        .send()
+        .await
+        .map_err(|error| format!("OpenAI device authorization request failed: {error}"))?;
+    decode_openai_auth_response(response, "device authorization").await
+}
+
+async fn poll_openai_device_auth_at(
+    endpoint: &str,
+    device_auth_id: &str,
+    user_code: &str,
+) -> Result<Option<OpenAiDeviceTokenResponse>, String> {
+    let response = Client::new()
+        .post(endpoint)
+        .header("User-Agent", format!("bcode/{}", env!("CARGO_PKG_VERSION")))
+        .json(&serde_json::json!({
+            "device_auth_id": device_auth_id,
+            "user_code": user_code,
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("OpenAI device authorization polling failed: {error}"))?;
+    if matches!(response.status().as_u16(), 403 | 404) {
+        return Ok(None);
+    }
+    decode_openai_auth_response(response, "device authorization polling")
+        .await
+        .map(Some)
+}
+
+async fn exchange_openai_code_at(
+    endpoint: &str,
+    redirect_uri: &str,
+    verifier: &str,
+    code: &str,
+) -> Result<OpenAiAuthTokenResponse, String> {
+    let response = Client::new()
+        .post(endpoint)
+        .form(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", OPENAI_CODEX_CLIENT_ID),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("code_verifier", verifier),
+        ])
+        .send()
+        .await
+        .map_err(|error| format!("OpenAI OAuth token exchange failed: {error}"))?;
+    decode_openai_auth_response(response, "OAuth token exchange").await
+}
+
+async fn decode_openai_auth_response<T: serde::de::DeserializeOwned>(
+    response: reqwest::Response,
+    operation: &str,
+) -> Result<T, String> {
+    let status = response.status();
+    let body = response
+        .text()
+        .await
+        .map_err(|error| format!("OpenAI {operation} response failed: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("OpenAI {operation} failed with HTTP {status}"));
+    }
+    serde_json::from_str(&body)
+        .map_err(|error| format!("OpenAI {operation} response was invalid: {error}"))
 }
 
 fn openai_request_projection(request: &ModelTurnRequest) -> ProviderRequestProjection {
@@ -334,7 +548,221 @@ fn prompt_cache_point_count(request: &ModelTurnRequest) -> usize {
 }
 
 impl OpenAiCompatibleProviderPlugin {
+    fn invoke_auth_service(&self, request: &ServiceRequest) -> ServiceResponse {
+        if request.operation != OPENAI_AUTH_FLOW_OPERATION {
+            return ServiceResponse::error(
+                "unsupported_operation",
+                "unsupported OpenAI authentication operation",
+            );
+        }
+        let request = match request.payload_json::<AuthFlowRequest>() {
+            Ok(request) => request,
+            Err(error) => return ServiceResponse::error("invalid_auth_flow", error.to_string()),
+        };
+        if let Err(error) = request.validate() {
+            return ServiceResponse::error("invalid_auth_flow", error.to_string());
+        }
+        if request.provider_id != "openai" || request.method_id != "device" {
+            return ServiceResponse::error(
+                "unsupported_auth_method",
+                "unsupported OpenAI authentication provider or method",
+            );
+        }
+        let runtime = match &self.runtime {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                return ServiceResponse::error(
+                    "auth_runtime_unavailable",
+                    format!("OpenAI authentication runtime unavailable: {error}"),
+                );
+            }
+        };
+        match runtime.block_on(Self::openai_device_auth_flow(
+            Arc::clone(&self.state),
+            request,
+        )) {
+            Ok(Ok(response)) => json_response(&response),
+            Ok(Err(error)) => json_response(&auth_flow_failure(&error)),
+            Err(error) => ServiceResponse::error("auth_runtime_failed", error.to_string()),
+        }
+    }
+
+    async fn openai_device_auth_flow(
+        state: Arc<Mutex<OpenAiCompatibleProviderState>>,
+        request: AuthFlowRequest,
+    ) -> Result<AuthFlowResponse, String> {
+        match request.operation {
+            AuthFlowOperation::Begin => {
+                Self::begin_openai_device_auth_at(
+                    Arc::clone(&state),
+                    request.profile,
+                    OPENAI_CODEX_DEVICE_USER_CODE_URL.to_owned(),
+                )
+                .await
+            }
+            AuthFlowOperation::Continue => {
+                let state_id = request.state.clone().ok_or("missing device flow state")?;
+                match Self::continue_openai_device_auth_at(
+                    Arc::clone(&state),
+                    state_id.clone(),
+                    OPENAI_CODEX_DEVICE_TOKEN_URL.to_owned(),
+                    OPENAI_CODEX_TOKEN_URL.to_owned(),
+                )
+                .await
+                {
+                    Ok(response) => Ok(response),
+                    Err(error) => {
+                        Self::remove_auth_flow(&state, &state_id)?;
+                        Err(error)
+                    }
+                }
+            }
+            AuthFlowOperation::Cancel => {
+                let state_id = request
+                    .state
+                    .as_deref()
+                    .ok_or("missing device flow state")?;
+                state
+                    .lock()
+                    .map_err(|_| "OpenAI auth state is unavailable".to_owned())?
+                    .auth_flows
+                    .remove(state_id);
+                Ok(AuthFlowResponse {
+                    schema_version: AUTH_FLOW_SCHEMA_VERSION,
+                    status: AuthFlowStatus::Cancelled,
+                    state: None,
+                    effects: Vec::new(),
+                    credentials: BTreeMap::new(),
+                    diagnostics: Vec::new(),
+                })
+            }
+        }
+    }
+
+    async fn begin_openai_device_auth_at(
+        state: Arc<Mutex<OpenAiCompatibleProviderState>>,
+        profile: String,
+        endpoint: String,
+    ) -> Result<AuthFlowResponse, String> {
+        let device = start_openai_device_auth_at(&endpoint).await?;
+        let interval_millis = device
+            .interval
+            .parse::<u64>()
+            .unwrap_or(5)
+            .max(1)
+            .saturating_add(3)
+            .saturating_mul(1_000)
+            .min(bcode_provider_auth_models::MAX_AUTH_WAIT_MILLIS);
+        let state_id = random_urlsafe(24)?;
+        state
+            .lock()
+            .map_err(|_| "OpenAI auth state is unavailable".to_owned())?
+            .auth_flows
+            .insert(
+                state_id.clone(),
+                OpenAiAuthFlowState::Device {
+                    profile,
+                    device_auth_id: device.device_auth_id,
+                    user_code: device.user_code.clone(),
+                    interval_millis,
+                    polls: 0,
+                },
+            );
+        Ok(AuthFlowResponse {
+            schema_version: AUTH_FLOW_SCHEMA_VERSION,
+            status: AuthFlowStatus::Pending,
+            state: Some(state_id),
+            effects: vec![
+                AuthFlowEffect::DisplayDeviceCode {
+                    verification_url: OPENAI_CODEX_DEVICE_VERIFICATION_URL.to_owned(),
+                    user_code: device.user_code,
+                    expires_in_seconds: None,
+                },
+                AuthFlowEffect::Wait {
+                    millis: interval_millis,
+                },
+            ],
+            credentials: BTreeMap::new(),
+            diagnostics: Vec::new(),
+        })
+    }
+
+    async fn continue_openai_device_auth_at(
+        state: Arc<Mutex<OpenAiCompatibleProviderState>>,
+        state_id: String,
+        poll_endpoint: String,
+        token_endpoint: String,
+    ) -> Result<AuthFlowResponse, String> {
+        let (profile, device_auth_id, user_code, interval_millis, polls) = {
+            let mut auth_state = state
+                .lock()
+                .map_err(|_| "OpenAI auth state is unavailable".to_owned())?;
+            let Some(OpenAiAuthFlowState::Device {
+                profile,
+                device_auth_id,
+                user_code,
+                interval_millis,
+                polls,
+            }) = auth_state.auth_flows.get_mut(&state_id)
+            else {
+                return Err("OpenAI device flow state is missing or expired".to_owned());
+            };
+            *polls = polls.saturating_add(1);
+            let result = (
+                profile.clone(),
+                device_auth_id.clone(),
+                user_code.clone(),
+                *interval_millis,
+                *polls,
+            );
+            drop(auth_state);
+            result
+        };
+        if polls > OPENAI_AUTH_MAX_POLLS {
+            Self::remove_auth_flow(&state, &state_id)?;
+            return Err("OpenAI device authorization timed out".to_owned());
+        }
+        match poll_openai_device_auth_at(&poll_endpoint, &device_auth_id, &user_code).await? {
+            Some(code) => {
+                let token = exchange_openai_code_at(
+                    &token_endpoint,
+                    OPENAI_CODEX_DEVICE_REDIRECT_URI,
+                    &code.code_verifier,
+                    &code.authorization_code,
+                )
+                .await?;
+                Self::remove_auth_flow(&state, &state_id)?;
+                Ok(auth_flow_success(token, &profile))
+            }
+            None => Ok(AuthFlowResponse {
+                schema_version: AUTH_FLOW_SCHEMA_VERSION,
+                status: AuthFlowStatus::Pending,
+                state: Some(state_id.clone()),
+                effects: vec![AuthFlowEffect::Wait {
+                    millis: interval_millis,
+                }],
+                credentials: BTreeMap::new(),
+                diagnostics: Vec::new(),
+            }),
+        }
+    }
+
+    fn remove_auth_flow(
+        state: &Arc<Mutex<OpenAiCompatibleProviderState>>,
+        state_id: &str,
+    ) -> Result<(), String> {
+        state
+            .lock()
+            .map_err(|_| "OpenAI auth state is unavailable".to_owned())?
+            .auth_flows
+            .remove(state_id);
+        Ok(())
+    }
+
     fn invoke_provider_service(&self, context: &NativeServiceContext) -> ServiceResponse {
+        if context.request.interface_id == AUTH_INTERFACE_ID {
+            return self.invoke_auth_service(&context.request);
+        }
         if context.request.interface_id != MODEL_PROVIDER_INTERFACE_ID {
             return ServiceResponse::error(
                 "unsupported_interface",
@@ -7887,6 +8315,221 @@ mod tests {
             .push(payload.to_vec());
     }
 
+    #[derive(Clone)]
+    struct AuthMockServer {
+        base_url: String,
+        requests: Arc<Mutex<Vec<String>>>,
+        thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
+    }
+
+    impl AuthMockServer {
+        fn start(responses: Vec<(&'static str, &'static str)>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind auth server");
+            let address = listener.local_addr().expect("auth server address");
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let worker_requests = Arc::clone(&requests);
+            let thread = thread::spawn(move || {
+                for (status, body) in responses {
+                    let (mut stream, _) = listener.accept().expect("accept auth request");
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .expect("auth read timeout");
+                    let mut request = vec![0_u8; 16 * 1024];
+                    let size = stream.read(&mut request).expect("read auth request");
+                    worker_requests
+                        .lock()
+                        .expect("auth requests")
+                        .push(String::from_utf8_lossy(&request[..size]).into_owned());
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream
+                        .write_all(response.as_bytes())
+                        .expect("write auth response");
+                }
+            });
+            Self {
+                base_url: format!("http://{address}"),
+                requests,
+                thread: Arc::new(Mutex::new(Some(thread))),
+            }
+        }
+
+        fn endpoint(&self, path: &str) -> String {
+            format!("{}{path}", self.base_url)
+        }
+
+        fn finish(&self) {
+            let thread = self.thread.lock().expect("auth thread").take();
+            if let Some(thread) = thread {
+                thread.join().expect("auth server thread");
+            }
+        }
+    }
+
+    #[test]
+    fn device_auth_timeout_clears_transient_state_without_network_or_credentials() {
+        let state = Arc::new(Mutex::new(OpenAiCompatibleProviderState::default()));
+        state.lock().expect("auth state").auth_flows.insert(
+            "failure-state".to_owned(),
+            OpenAiAuthFlowState::Device {
+                profile: "openai".to_owned(),
+                device_auth_id: "device".to_owned(),
+                user_code: "code".to_owned(),
+                interval_millis: 1_000,
+                polls: OPENAI_AUTH_MAX_POLLS,
+            },
+        );
+        let runtime = ProviderRuntime::new().expect("runtime");
+        let error = runtime
+            .block_on(OpenAiCompatibleProviderPlugin::openai_device_auth_flow(
+                Arc::clone(&state),
+                AuthFlowRequest {
+                    schema_version: AUTH_FLOW_SCHEMA_VERSION,
+                    provider_id: "openai".to_owned(),
+                    method_id: "device".to_owned(),
+                    profile: "openai".to_owned(),
+                    operation: AuthFlowOperation::Continue,
+                    state: Some("failure-state".to_owned()),
+                    input: None,
+                    verify: false,
+                    revoke: false,
+                },
+            ))
+            .expect("failure runtime")
+            .expect_err("device timeout");
+        assert!(error.contains("timed out"));
+        assert!(state.lock().expect("auth state").auth_flows.is_empty());
+    }
+
+    #[test]
+    fn device_auth_cancel_removes_transient_state_without_credentials() {
+        let state = Arc::new(Mutex::new(OpenAiCompatibleProviderState::default()));
+        state.lock().expect("auth state").auth_flows.insert(
+            "cancel-state".to_owned(),
+            OpenAiAuthFlowState::Device {
+                profile: "openai".to_owned(),
+                device_auth_id: "device".to_owned(),
+                user_code: "code".to_owned(),
+                interval_millis: 1_000,
+                polls: 0,
+            },
+        );
+        let runtime = ProviderRuntime::new().expect("runtime");
+        let response = runtime
+            .block_on(OpenAiCompatibleProviderPlugin::openai_device_auth_flow(
+                Arc::clone(&state),
+                AuthFlowRequest {
+                    schema_version: AUTH_FLOW_SCHEMA_VERSION,
+                    provider_id: "openai".to_owned(),
+                    method_id: "device".to_owned(),
+                    profile: "openai".to_owned(),
+                    operation: AuthFlowOperation::Cancel,
+                    state: Some("cancel-state".to_owned()),
+                    input: None,
+                    verify: false,
+                    revoke: false,
+                },
+            ))
+            .expect("cancel runtime")
+            .expect("cancel flow");
+        response.validate().expect("valid cancellation");
+        assert_eq!(response.status, AuthFlowStatus::Cancelled);
+        assert!(response.credentials.is_empty());
+        assert!(state.lock().expect("auth state").auth_flows.is_empty());
+    }
+
+    #[test]
+    fn device_auth_flow_normalizes_pending_success_credentials_and_cancel() {
+        let server = AuthMockServer::start(vec![
+            (
+                "200 OK",
+                r#"{"device_auth_id":"device-1","user_code":"CODE-1","interval":"1"}"#,
+            ),
+            ("403 Forbidden", r#"{"error":"pending"}"#),
+            (
+                "200 OK",
+                r#"{"authorization_code":"authorization-1","code_verifier":"verifier-1"}"#,
+            ),
+            (
+                "200 OK",
+                r#"{"access_token":"access-1","refresh_token":"refresh-1","expires_in":3600}"#,
+            ),
+        ]);
+        let state = Arc::new(Mutex::new(OpenAiCompatibleProviderState::default()));
+        let runtime = ProviderRuntime::new().expect("runtime");
+        let begin = runtime
+            .block_on(OpenAiCompatibleProviderPlugin::begin_openai_device_auth_at(
+                Arc::clone(&state),
+                "openai".to_owned(),
+                server.endpoint("/usercode"),
+            ))
+            .expect("begin runtime")
+            .expect("begin flow");
+        begin.validate().expect("valid begin response");
+        assert_eq!(begin.status, AuthFlowStatus::Pending);
+        assert!(matches!(
+            begin.effects.first(),
+            Some(AuthFlowEffect::DisplayDeviceCode { user_code, .. }) if user_code == "CODE-1"
+        ));
+        let state_id = begin.state.expect("flow state");
+
+        let pending = runtime
+            .block_on(
+                OpenAiCompatibleProviderPlugin::continue_openai_device_auth_at(
+                    Arc::clone(&state),
+                    state_id.clone(),
+                    server.endpoint("/poll"),
+                    server.endpoint("/token"),
+                ),
+            )
+            .expect("pending runtime")
+            .expect("pending flow");
+        pending.validate().expect("valid pending response");
+        assert_eq!(pending.status, AuthFlowStatus::Pending);
+
+        let success = runtime
+            .block_on(
+                OpenAiCompatibleProviderPlugin::continue_openai_device_auth_at(
+                    Arc::clone(&state),
+                    state_id.clone(),
+                    server.endpoint("/poll"),
+                    server.endpoint("/token"),
+                ),
+            )
+            .expect("success runtime")
+            .expect("success flow");
+        success.validate().expect("valid success response");
+        assert_eq!(success.status, AuthFlowStatus::Succeeded);
+        assert_eq!(
+            success.credentials.get("access_token"),
+            Some(&"access-1".to_owned())
+        );
+        assert_eq!(
+            success.credentials.get("refresh_token"),
+            Some(&"refresh-1".to_owned())
+        );
+        assert_eq!(
+            success.credentials.get("auth_mode"),
+            Some(&"chatgpt".to_owned())
+        );
+        assert!(
+            !state
+                .lock()
+                .expect("auth state")
+                .auth_flows
+                .contains_key(&state_id)
+        );
+        server.finish();
+        let requests = server.requests.lock().expect("auth requests");
+        assert_eq!(requests.len(), 4);
+        assert!(requests[0].contains("deviceauth") || requests[0].contains("/usercode"));
+        assert!(requests[3].contains("code=authorization-1"));
+        assert!(!requests.iter().any(|request| request.contains("access-1")));
+        drop(requests);
+    }
+
     #[test]
     fn auth_providers_register_openai_and_xai_api_key_methods() {
         AUTH_REGISTRATIONS
@@ -7910,6 +8553,13 @@ mod tests {
             .collect::<Vec<_>>();
         drop(registrations);
         assert_eq!(contributions.len(), 2);
+        assert_eq!(contributions[0].methods.len(), 2);
+        assert!(
+            contributions[0]
+                .methods
+                .iter()
+                .any(|method| method.method_id() == "device")
+        );
         for (contribution, provider_id, storage_key) in [
             (&contributions[0], "openai", "BCODE_OPENAI_API_KEY"),
             (&contributions[1], "xai", "BCODE_XAI_API_KEY"),

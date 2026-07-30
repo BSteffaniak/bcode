@@ -2101,6 +2101,7 @@ dependencies = [
  "bcode_provider_auth_models",
  "bcode_session_models",
  "httpdate",
+ "rand 0.9.5",
  "reqwest",
  "serde",
  "serde_json",

@@ -24,6 +24,7 @@ bcode_provider_auth = { workspace = true }
 bcode_provider_auth_models = { workspace = true }
 bcode_session_models = { workspace = true }
 httpdate = { workspace = true }
+rand = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }

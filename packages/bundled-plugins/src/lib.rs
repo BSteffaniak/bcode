@@ -624,12 +624,14 @@ mod tests {
         )
         .expect("static plugin manifests parse");
         let mut host = bcode_plugin::PluginHost::load_static_plugins_best_effort(&selected);
-        for provider_id in ["openai", "xai"] {
-            let provider = host.auth_provider(provider_id).expect("auth provider");
-            assert_eq!(provider.plugin_id, "bcode.openai-compatible");
-            assert_eq!(provider.contribution.methods.len(), 1);
-            assert_eq!(provider.contribution.methods[0].method_id(), "api_key");
-        }
+        let openai = host.auth_provider("openai").expect("OpenAI auth provider");
+        assert_eq!(openai.plugin_id, "bcode.openai-compatible");
+        assert_eq!(openai.contribution.methods[0].method_id(), "api_key");
+        assert_eq!(openai.contribution.methods[1].method_id(), "device");
+        let xai = host.auth_provider("xai").expect("xAI auth provider");
+        assert_eq!(xai.plugin_id, "bcode.openai-compatible");
+        assert_eq!(xai.contribution.methods.len(), 1);
+        assert_eq!(xai.contribution.methods[0].method_id(), "api_key");
         host.deactivate_all().expect("deactivate static plugins");
     }
 

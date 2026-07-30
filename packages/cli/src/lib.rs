@@ -3753,12 +3753,16 @@ async fn run_auth_interactive_flow(
             match effect {
                 bcode_provider_auth_models::AuthFlowEffect::OpenBrowser { url } => {
                     println!("Open in browser: {url}");
+                    open_browser(url);
                 }
                 bcode_provider_auth_models::AuthFlowEffect::DisplayDeviceCode {
                     verification_url,
                     user_code,
                     ..
-                } => println!("Open {verification_url} and enter code {user_code}"),
+                } => {
+                    println!("Open {verification_url} and enter code {user_code}");
+                    open_browser(verification_url);
+                }
                 bcode_provider_auth_models::AuthFlowEffect::Prompt {
                     prompt_id,
                     message,
