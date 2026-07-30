@@ -3455,6 +3455,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionHistoryPage { .. } => "session_history_page",
         Request::SessionHistoryAround { .. } => "session_history_around",
         Request::SessionInspection { .. } => "session_inspection",
+        Request::SessionSearch { .. } => "session_search",
         Request::PrepareSessionOpen { .. } => "prepare_session_open",
         Request::WaitSessionOpenProgress { .. } => "wait_session_open_progress",
         Request::AttachSession { .. } => "attach_session",
@@ -3770,6 +3771,11 @@ async fn handle_request_inner(
         Request::SessionInspection { session_id, query } => {
             handle_session_inspection(request_id, client_id, state, writer, session_id, query).await
         }
+        Request::SessionSearch {
+            request,
+            routes,
+            hydrate,
+        } => handle_session_search(request_id, state, writer, request, routes, hydrate).await,
         Request::PrepareSessionOpen { session_id } => {
             handle_prepare_session_open(request_id, state, writer, session_id).await
         }
@@ -8033,6 +8039,45 @@ async fn handle_session_history_around(
                 writer,
                 request_id,
                 Response::Err(session_error_response(&error)),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_session_search(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    request: bcode_session_search::SessionSearchRequest,
+    routes: Vec<bcode_session_search::SessionSearchContentRoute>,
+    hydrate: bool,
+) -> Result<(), ServerError> {
+    match session_search::search_federated_with_routes(state, &request, &routes).await {
+        Ok(response) => {
+            let hydrated_hits = if hydrate {
+                session_search::hydrate_hits(state, response.hits.clone()).await
+            } else {
+                Vec::new()
+            };
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionSearch {
+                    response,
+                    hydrated_hits,
+                }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    format!("session_search_{:?}", error.code).to_lowercase(),
+                    error.message,
+                )),
             )
             .await
         }
@@ -26340,6 +26385,7 @@ const fn response_payload_kind(response: &Response) -> &'static str {
             ResponsePayload::SessionHistoryPage { .. } => "session_history_page",
             ResponsePayload::SessionHistoryAround { .. } => "session_history_around",
             ResponsePayload::SessionInspection { .. } => "session_inspection",
+            ResponsePayload::SessionSearch { .. } => "session_search",
             ResponsePayload::SessionList { .. } => "session_list",
             ResponsePayload::SessionCatalogRefreshed { .. } => "session_catalog_refreshed",
             ResponsePayload::PermissionList { .. } => "permission_list",

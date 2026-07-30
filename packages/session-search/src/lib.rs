@@ -362,7 +362,7 @@ pub struct SessionSearchLocator {
 
 /// One bounded provider hit. `provider_score` is opaque and comparable only within this provider's
 /// response.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSearchHit {
     pub locator: SessionSearchLocator,
     pub content_kind: SearchContentKind,
@@ -370,7 +370,7 @@ pub struct SessionSearchHit {
     pub provider_id: String,
     pub provider_rank: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub provider_score: Option<f64>,
+    pub provider_score: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preview: Option<String>,
     #[serde(default)]
@@ -908,7 +908,7 @@ pub enum ProviderSearchOutcome {
 }
 
 /// Bounded terminal provider response.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSearchResponse {
     pub provider_id: String,
     pub outcome: ProviderSearchOutcome,
@@ -940,7 +940,7 @@ pub struct FederatedProviderReport {
 }
 
 /// One validated provider contribution awaiting deterministic federation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FederatedProviderContribution {
     pub report: FederatedProviderReport,
     pub hits: Vec<SessionSearchHit>,
@@ -990,8 +990,31 @@ pub fn aggregate_federated_search(
     }
 }
 
+/// Canonical hydration outcome for one provider hit locator.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchHitHydrationOutcome {
+    Hydrated,
+    StaleLocator,
+    SessionMissing,
+    RepairRequired,
+    Incompatible,
+    Unavailable,
+}
+
+/// One provider hit paired with exact bounded canonical hydration state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HydratedSessionSearchHit {
+    pub hit: SessionSearchHit,
+    pub outcome: SearchHitHydrationOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event: Option<Box<bcode_session_models::SessionEvent>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 /// Deterministic bounded terminal aggregate from multiple providers.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FederatedSessionSearchResponse {
     /// Deduplicated hits grouped in stable provider-ID/rank order.
     pub hits: Vec<SessionSearchHit>,

@@ -1756,6 +1756,39 @@ impl BcodeClient {
         }
     }
 
+    /// Run one bounded terminal federated session search and optionally hydrate exact locators.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn session_search(
+        &self,
+        request: bcode_session_search::SessionSearchRequest,
+        routes: Vec<bcode_session_search::SessionSearchContentRoute>,
+        hydrate: bool,
+    ) -> Result<
+        (
+            bcode_session_search::FederatedSessionSearchResponse,
+            Vec<bcode_session_search::HydratedSessionSearchHit>,
+        ),
+        ClientError,
+    > {
+        match self
+            .send_request(Request::SessionSearch {
+                request,
+                routes,
+                hydrate,
+            })
+            .await?
+        {
+            ResponsePayload::SessionSearch {
+                response,
+                hydrated_hits,
+            } => Ok((response, hydrated_hits)),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Send a user message to a session.
     ///
     /// # Errors

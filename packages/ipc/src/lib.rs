@@ -603,6 +603,13 @@ pub enum Request {
         session_id: SessionId,
         query: SessionInspectionQuery,
     },
+    SessionSearch {
+        request: bcode_session_search::SessionSearchRequest,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        routes: Vec<bcode_session_search::SessionSearchContentRoute>,
+        #[serde(default)]
+        hydrate: bool,
+    },
 }
 
 /// Server stop request policy.
@@ -1616,6 +1623,14 @@ pub enum ResponsePayload {
         session_id: SessionId,
         outcome: SessionOwnershipReleaseOutcome,
     },
+    SessionInspection {
+        page: SessionInspectionPage,
+    },
+    SessionSearch {
+        response: bcode_session_search::FederatedSessionSearchResponse,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        hydrated_hits: Vec<bcode_session_search::HydratedSessionSearchHit>,
+    },
 }
 
 /// Stable reasons runtime ownership cannot currently be released.
@@ -1639,9 +1654,6 @@ pub enum SessionOwnershipReleaseOutcome {
     AlreadyUnowned,
     Blocked {
         blockers: Vec<SessionOwnershipBlocker>,
-    },
-    SessionInspection {
-        page: SessionInspectionPage,
     },
 }
 
@@ -2586,6 +2598,88 @@ mod tests {
             decode_response(&encoded).expect("decode response"),
             response
         );
+    }
+
+    #[test]
+    fn session_search_contract_round_trips_portably() {
+        use bcode_session_search::{
+            FederatedProviderReport, FederatedSessionSearchResponse, HydratedSessionSearchHit,
+            ProviderSearchOutcome, SearchContentKind, SearchField, SearchHitHydrationOutcome,
+            SessionSearchContentRoute, SessionSearchFilters, SessionSearchHit,
+            SessionSearchLocator, SessionSearchQuery, SessionSearchRequest, SessionSearchRouteMode,
+            SessionSearchSort, TextMatchMode,
+        };
+        use std::collections::BTreeSet;
+
+        let session_id = SessionId::new();
+        let search_request = SessionSearchRequest {
+            query: SessionSearchQuery::Text {
+                text: "needle".to_owned(),
+                mode: TextMatchMode::Terms,
+                fields: BTreeSet::new(),
+            },
+            filters: SessionSearchFilters {
+                content_kinds: std::iter::once(SearchContentKind::UserMessage).collect(),
+                ..SessionSearchFilters::default()
+            },
+            sort: SessionSearchSort::ProviderRelevance,
+            limit: 10,
+            cursor: None,
+            deadline_ms: Some(1000),
+        };
+        let request = Request::SessionSearch {
+            request: search_request,
+            routes: vec![SessionSearchContentRoute {
+                content_kinds: std::iter::once(SearchContentKind::UserMessage).collect(),
+                mode: SessionSearchRouteMode::Primary,
+                provider_ids: vec!["provider".to_owned()],
+            }],
+            hydrate: true,
+        };
+        let decoded: Request =
+            decode_typed_stable(&encode_typed_stable(&request).expect("encode")).expect("decode");
+        assert_eq!(decoded, request);
+
+        let hit = SessionSearchHit {
+            locator: SessionSearchLocator {
+                session_id,
+                sequence: 1,
+                record_id: Some("1:user-message:0".to_owned()),
+            },
+            content_kind: SearchContentKind::UserMessage,
+            matched_field: SearchField::Text,
+            provider_id: "provider".to_owned(),
+            provider_rank: 0,
+            provider_score: Some("bm25:1.25".to_owned()),
+            preview: Some("needle".to_owned()),
+            preview_truncated: false,
+        };
+        let response = Response::Ok(ResponsePayload::SessionSearch {
+            response: FederatedSessionSearchResponse {
+                hits: vec![hit.clone()],
+                query_complete: true,
+                coverage_complete: true,
+                providers: vec![FederatedProviderReport {
+                    provider_id: "provider".to_owned(),
+                    outcome: ProviderSearchOutcome::Complete,
+                    elapsed_ms: 2,
+                    query_complete: true,
+                    coverage_complete: true,
+                    searched_content: vec![SearchContentKind::UserMessage],
+                    excluded_content: Vec::new(),
+                }],
+                failures: Vec::new(),
+            },
+            hydrated_hits: vec![HydratedSessionSearchHit {
+                hit,
+                outcome: SearchHitHydrationOutcome::StaleLocator,
+                event: None,
+                message: Some("canonical event locator is no longer present".to_owned()),
+            }],
+        });
+        let decoded: Response =
+            decode_typed_stable(&encode_typed_stable(&response).expect("encode")).expect("decode");
+        assert_eq!(decoded, response);
     }
 
     #[test]

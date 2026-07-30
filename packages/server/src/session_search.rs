@@ -2,10 +2,11 @@
 
 use bcode_session_search::{
     FederatedProviderContribution, FederatedProviderReport, FederatedSessionSearchResponse,
-    ListSessionSearchProvidersResponse, MAX_FEDERATED_PROVIDERS, OP_CAPABILITIES, OP_SEARCH,
-    OP_STATUS, SESSION_SEARCH_INTERFACE_ID, SearchErrorCode, SessionSearchCapabilities,
-    SessionSearchContentRoute, SessionSearchProviderFailure, SessionSearchProviderInfo,
-    SessionSearchRequest, SessionSearchResponse, SessionSearchServiceError, SessionSearchStatus,
+    HydratedSessionSearchHit, ListSessionSearchProvidersResponse, MAX_FEDERATED_PROVIDERS,
+    OP_CAPABILITIES, OP_SEARCH, OP_STATUS, SESSION_SEARCH_INTERFACE_ID, SearchErrorCode,
+    SearchHitHydrationOutcome, SessionSearchCapabilities, SessionSearchContentRoute,
+    SessionSearchProviderFailure, SessionSearchProviderInfo, SessionSearchRequest,
+    SessionSearchResponse, SessionSearchServiceError, SessionSearchStatus,
     aggregate_federated_search, plan_session_search, plan_session_search_with_routes,
 };
 use futures::future::join_all;
@@ -349,6 +350,82 @@ pub async fn search_federated_with_routes(
         failures,
         request.limit,
     ))
+}
+
+/// Hydrate provider locators through exact bounded canonical reads.
+///
+/// Each hit performs a zero-neighbor around-sequence read. A missing anchor is stale and never
+/// substituted with another event. The returned vector preserves grouped hit order.
+pub async fn hydrate_hits(
+    state: &ServerState,
+    hits: Vec<bcode_session_search::SessionSearchHit>,
+) -> Vec<HydratedSessionSearchHit> {
+    let reads = hits.into_iter().map(|hit| async move {
+        let result = state
+            .sessions
+            .session_history_around(
+                hit.locator.session_id,
+                bcode_session_models::SessionHistoryAroundQuery {
+                    sequence: hit.locator.sequence,
+                    before: 0,
+                    after: 0,
+                },
+            )
+            .await;
+        match result {
+            Ok(window) if window.anchor_present => {
+                let event = window
+                    .events
+                    .into_iter()
+                    .find(|event| event.sequence == hit.locator.sequence);
+                if let Some(event) = event {
+                    HydratedSessionSearchHit {
+                        hit,
+                        outcome: SearchHitHydrationOutcome::Hydrated,
+                        event: Some(Box::new(event)),
+                        message: None,
+                    }
+                } else {
+                    stale_hydration(hit)
+                }
+            }
+            Ok(_) => stale_hydration(hit),
+            Err(error) => hydration_error(hit, &error),
+        }
+    });
+    join_all(reads).await
+}
+
+fn stale_hydration(hit: bcode_session_search::SessionSearchHit) -> HydratedSessionSearchHit {
+    HydratedSessionSearchHit {
+        hit,
+        outcome: SearchHitHydrationOutcome::StaleLocator,
+        event: None,
+        message: Some("canonical event locator is no longer present".to_owned()),
+    }
+}
+
+fn hydration_error(
+    hit: bcode_session_search::SessionSearchHit,
+    error: &bcode_session::SessionError,
+) -> HydratedSessionSearchHit {
+    let outcome = match error {
+        bcode_session::SessionError::NotFound(_) => SearchHitHydrationOutcome::SessionMissing,
+        bcode_session::SessionError::ProjectionStale { .. }
+        | bcode_session::SessionError::Db(_)
+        | bcode_session::SessionError::DbUnavailable(_) => {
+            SearchHitHydrationOutcome::RepairRequired
+        }
+        bcode_session::SessionError::StorageMigrationRequired { .. }
+        | bcode_session::SessionError::Lease(_) => SearchHitHydrationOutcome::Incompatible,
+        _ => SearchHitHydrationOutcome::Unavailable,
+    };
+    HydratedSessionSearchHit {
+        hit,
+        outcome,
+        event: None,
+        message: Some(bounded_message(&error.to_string())),
+    }
 }
 
 fn request_for_provider(
