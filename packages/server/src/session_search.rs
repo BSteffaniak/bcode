@@ -1,11 +1,15 @@
 //! Session-search provider discovery and typed service routing.
 
 use bcode_session_search::{
-    ListSessionSearchProvidersResponse, OP_CAPABILITIES, OP_SEARCH, OP_STATUS,
-    SESSION_SEARCH_INTERFACE_ID, SearchErrorCode, SessionSearchCapabilities,
-    SessionSearchProviderFailure, SessionSearchProviderInfo, SessionSearchRequest,
-    SessionSearchResponse, SessionSearchServiceError, SessionSearchStatus,
+    FederatedProviderContribution, FederatedProviderReport, FederatedSessionSearchResponse,
+    ListSessionSearchProvidersResponse, MAX_FEDERATED_PROVIDERS, OP_CAPABILITIES, OP_SEARCH,
+    OP_STATUS, SESSION_SEARCH_INTERFACE_ID, SearchErrorCode, SessionSearchCapabilities,
+    SessionSearchContentRoute, SessionSearchProviderFailure, SessionSearchProviderInfo,
+    SessionSearchRequest, SessionSearchResponse, SessionSearchServiceError, SessionSearchStatus,
+    aggregate_federated_search, plan_session_search, plan_session_search_with_routes,
 };
+use futures::future::join_all;
+use std::time::{Duration, Instant};
 
 use crate::ServerState;
 
@@ -34,7 +38,18 @@ pub async fn list_providers(state: &ServerState) -> ListSessionSearchProvidersRe
             )
             .await;
         let capabilities = match capabilities {
-            Ok(capabilities) if capabilities.provider_id == plugin_id => capabilities,
+            Ok(capabilities) if capabilities.provider_id == plugin_id => {
+                if let Err(error) = capabilities.validate() {
+                    failures.push(provider_failure(
+                        plugin_id,
+                        SearchErrorCode::InvalidRequest,
+                        &error.to_string(),
+                        false,
+                    ));
+                    continue;
+                }
+                capabilities
+            }
             Ok(_) => {
                 failures.push(provider_failure(
                     plugin_id,
@@ -65,6 +80,15 @@ pub async fn list_providers(state: &ServerState) -> ListSessionSearchProvidersRe
             .await;
         match status {
             Ok(status) if status.provider_id == plugin_id => {
+                if let Err(error) = status.validate() {
+                    failures.push(provider_failure(
+                        plugin_id,
+                        SearchErrorCode::FutureVersion,
+                        &error.to_string(),
+                        false,
+                    ));
+                    continue;
+                }
                 providers.push(SessionSearchProviderInfo {
                     plugin_id,
                     capabilities,
@@ -189,7 +213,166 @@ pub async fn search_provider(
             retryable: false,
         });
     }
+    if response.hits.iter().any(|hit| {
+        hit.preview
+            .as_ref()
+            .is_some_and(|preview| preview.len() > bcode_session_search::MAX_HIT_PREVIEW_BYTES)
+    }) {
+        return Err(SessionSearchServiceError {
+            code: SearchErrorCode::InvalidRequest,
+            message: "provider returned an oversized hit preview".to_owned(),
+            retryable: false,
+        });
+    }
+    if response
+        .next_cursor
+        .as_ref()
+        .is_some_and(|cursor| cursor.provider_id != plugin_id)
+    {
+        return Err(SessionSearchServiceError {
+            code: SearchErrorCode::InvalidRequest,
+            message: "provider returned a cursor owned by another provider".to_owned(),
+            retryable: false,
+        });
+    }
     Ok(response)
+}
+
+/// Execute one bounded terminal federated search using deterministic grouped provider ordering.
+///
+/// Canonical hit hydration is intentionally separate: this function returns provider locators and
+/// bounded previews only. Dropping timed-out invocation futures bounds waiting, but does not claim
+/// transport-level cancellation or durable resume semantics.
+///
+/// # Errors
+///
+/// Returns an invalid-request error when the portable request is invalid. Provider-specific
+/// failures are retained in the successful aggregate response.
+pub async fn search_federated(
+    state: &ServerState,
+    request: &SessionSearchRequest,
+) -> Result<FederatedSessionSearchResponse, SessionSearchServiceError> {
+    search_federated_with_routes(state, request, &[]).await
+}
+
+/// Execute a bounded terminal federated search using explicit backend-neutral content routes.
+///
+/// # Errors
+///
+/// Returns an invalid-request error when the request is invalid; provider failures remain in the
+/// terminal aggregate.
+pub async fn search_federated_with_routes(
+    state: &ServerState,
+    request: &SessionSearchRequest,
+    routes: &[SessionSearchContentRoute],
+) -> Result<FederatedSessionSearchResponse, SessionSearchServiceError> {
+    request
+        .validate()
+        .map_err(|error| SessionSearchServiceError {
+            code: SearchErrorCode::InvalidRequest,
+            message: bounded_message(&error.to_string()),
+            retryable: false,
+        })?;
+    let discovery = list_providers(state).await;
+    let plan = if routes.is_empty() {
+        plan_session_search(request, discovery)
+    } else {
+        plan_session_search_with_routes(request, discovery, routes)
+    };
+    let mut failures = plan.failures;
+    let mut providers = plan.providers;
+    if providers.len() > MAX_FEDERATED_PROVIDERS {
+        for provider in providers.drain(MAX_FEDERATED_PROVIDERS..) {
+            failures.push(provider_failure(
+                provider.plugin_id,
+                SearchErrorCode::QuotaExceeded,
+                "federated provider concurrency limit exceeded",
+                false,
+            ));
+        }
+    }
+    let deadline = Duration::from_millis(request.deadline_ms.unwrap_or(5_000).max(1));
+    let started = Instant::now();
+    let calls = providers.into_iter().map(|provider| {
+        let provider_request = request_for_provider(request, &provider);
+        async move {
+            let provider_started = Instant::now();
+            let remaining = deadline.saturating_sub(started.elapsed());
+            let result = if remaining.is_zero() {
+                Err(timeout_error())
+            } else {
+                match tokio::time::timeout(
+                    remaining,
+                    search_provider(state, &provider.plugin_id, &provider_request),
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(_) => Err(timeout_error()),
+                }
+            };
+            (
+                provider.plugin_id,
+                u64::try_from(provider_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                result,
+            )
+        }
+    });
+    let mut completed = join_all(calls).await;
+    completed.sort_by(|left, right| left.0.cmp(&right.0));
+
+    let mut contributions = Vec::new();
+    for (provider_id, elapsed_ms, result) in completed {
+        match result {
+            Ok(response) => {
+                contributions.push(FederatedProviderContribution {
+                    report: FederatedProviderReport {
+                        provider_id,
+                        outcome: response.outcome,
+                        elapsed_ms,
+                        query_complete: response.query_complete,
+                        coverage_complete: response.coverage_complete,
+                        searched_content: response.searched_content,
+                        excluded_content: response.excluded_content,
+                    },
+                    hits: response.hits,
+                });
+            }
+            Err(error) => failures.push(SessionSearchProviderFailure {
+                plugin_id: provider_id,
+                error,
+            }),
+        }
+    }
+    Ok(aggregate_federated_search(
+        contributions,
+        failures,
+        request.limit,
+    ))
+}
+
+fn request_for_provider(
+    request: &SessionSearchRequest,
+    provider: &SessionSearchProviderInfo,
+) -> SessionSearchRequest {
+    let mut provider_request = request.clone();
+    if !request.filters.content_kinds.is_empty() {
+        provider_request.filters.content_kinds = request
+            .filters
+            .content_kinds
+            .intersection(&provider.capabilities.content_kinds)
+            .copied()
+            .collect();
+    }
+    provider_request
+}
+
+fn timeout_error() -> SessionSearchServiceError {
+    SessionSearchServiceError {
+        code: SearchErrorCode::DeadlineExceeded,
+        message: "session-search provider deadline exceeded".to_owned(),
+        retryable: true,
+    }
 }
 
 fn provider_failure(

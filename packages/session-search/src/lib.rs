@@ -19,6 +19,8 @@ use std::path::PathBuf;
 /// Versioned plugin service interface for session-search providers.
 pub const SESSION_SEARCH_INTERFACE_ID: &str = "bcode.session_search/v1";
 
+/// Maximum providers invoked concurrently for one federated search.
+pub const MAX_FEDERATED_PROVIDERS: usize = 8;
 /// Query a provider for bounded search hits.
 pub const OP_SEARCH: &str = "search";
 /// Return provider capabilities.
@@ -552,6 +554,44 @@ pub struct SessionSearchStatus {
     pub degraded_reason: Option<String>,
 }
 
+impl SessionSearchStatus {
+    /// Validate provider identity and shared projection compatibility.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty identity, unsupported shared versions, invalid quota accounting,
+    /// or incomplete/degraded states without an explanatory reason.
+    pub fn validate(&self) -> Result<(), ContractValidationError> {
+        validate_nonempty_bounded("provider_id", &self.provider_id, MAX_CURSOR_BYTES)?;
+        if self.record_schema_version != CURRENT_SEARCH_RECORD_VERSION
+            || self.normalization_version != CURRENT_NORMALIZATION_VERSION
+            || self.policy_version != CURRENT_SEARCH_POLICY_VERSION
+        {
+            return Err(ContractValidationError::InvalidProjection(
+                "provider status uses unsupported projection versions",
+            ));
+        }
+        if self.index_bytes > self.quota_bytes {
+            return Err(ContractValidationError::InvalidProjection(
+                "provider index bytes exceed declared quota",
+            ));
+        }
+        if matches!(
+            self.state,
+            SearchProviderState::Degraded
+                | SearchProviderState::QuotaExceeded
+                | SearchProviderState::Corrupt
+        ) && self
+            .degraded_reason
+            .as_deref()
+            .is_none_or(|reason| reason.trim().is_empty())
+        {
+            return Err(ContractValidationError::EmptyField("degraded_reason"));
+        }
+        Ok(())
+    }
+}
+
 /// One discovered provider with normalized capabilities and current status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSearchProviderInfo {
@@ -575,6 +615,55 @@ pub struct ListSessionSearchProvidersResponse {
     pub failures: Vec<SessionSearchProviderFailure>,
 }
 
+/// Provider selection behavior for one configured content route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSearchRouteMode {
+    /// Select only the first eligible provider in configured order.
+    Primary,
+    /// Select the first currently eligible provider in configured fallback order.
+    Fallback,
+    /// Select every eligible configured provider for intentional overlapping coverage.
+    Parallel,
+    /// Select configured providers only when they add requested content not already routed.
+    Disjoint,
+}
+
+/// Backend-neutral configured route for a set of semantic content kinds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchContentRoute {
+    pub content_kinds: BTreeSet<SearchContentKind>,
+    pub mode: SessionSearchRouteMode,
+    /// Provider plugin IDs in explicit route priority order.
+    pub provider_ids: Vec<String>,
+}
+
+impl SessionSearchContentRoute {
+    /// Validate route scope and provider ordering.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for empty content/provider sets, duplicate provider IDs, or oversized IDs.
+    pub fn validate(&self) -> Result<(), ContractValidationError> {
+        if self.content_kinds.is_empty() {
+            return Err(ContractValidationError::EmptyField("route_content_kinds"));
+        }
+        if self.provider_ids.is_empty() {
+            return Err(ContractValidationError::EmptyField("route_provider_ids"));
+        }
+        let mut unique = BTreeSet::new();
+        for provider_id in &self.provider_ids {
+            validate_nonempty_bounded("route_provider_id", provider_id, MAX_CURSOR_BYTES)?;
+            if !unique.insert(provider_id) {
+                return Err(ContractValidationError::InvalidProjection(
+                    "route contains a duplicate provider identity",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Deterministic provider plan for one exact portable request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionSearchPlan {
@@ -591,6 +680,136 @@ pub struct SessionSearchPlan {
 /// overlap is excluded. Empty content filters select one exact-capability provider.
 #[must_use]
 pub fn plan_session_search(
+    request: &SessionSearchRequest,
+    discovery: ListSessionSearchProvidersResponse,
+) -> SessionSearchPlan {
+    plan_session_search_with_routes(request, discovery, &[])
+}
+
+/// Build a deterministic query plan using explicit content routes.
+#[must_use]
+pub fn plan_session_search_with_routes(
+    request: &SessionSearchRequest,
+    discovery: ListSessionSearchProvidersResponse,
+    routes: &[SessionSearchContentRoute],
+) -> SessionSearchPlan {
+    if routes.is_empty() {
+        return plan_session_search_default(request, discovery);
+    }
+    let mut available = discovery
+        .providers
+        .into_iter()
+        .map(|provider| (provider.plugin_id.clone(), provider))
+        .collect::<BTreeMap<_, _>>();
+    let mut selected = BTreeMap::new();
+    let mut failures = discovery.failures;
+    let requested = &request.filters.content_kinds;
+    let mut routed_content = BTreeSet::new();
+
+    for route in routes {
+        if let Err(error) = route.validate() {
+            failures.push(planning_failure(
+                "route".to_owned(),
+                SearchErrorCode::InvalidRequest,
+                &error.to_string(),
+            ));
+            continue;
+        }
+        let applicable_content = if requested.is_empty() {
+            route.content_kinds.clone()
+        } else {
+            route
+                .content_kinds
+                .intersection(requested)
+                .copied()
+                .collect()
+        };
+        if applicable_content.is_empty() {
+            continue;
+        }
+        let mut eligible = Vec::new();
+        for provider_id in &route.provider_ids {
+            let Some(provider) = available.get(provider_id) else {
+                failures.push(planning_failure(
+                    provider_id.clone(),
+                    SearchErrorCode::ProviderUnavailable,
+                    "configured route provider is unavailable",
+                ));
+                continue;
+            };
+            let provider_content = applicable_content
+                .intersection(&provider.capabilities.content_kinds)
+                .copied()
+                .collect::<BTreeSet<_>>();
+            if provider_content.is_empty()
+                || !provider_is_eligible(request, provider, &provider_content)
+            {
+                continue;
+            }
+            eligible.push((provider_id.clone(), provider_content));
+        }
+        match route.mode {
+            SessionSearchRouteMode::Primary | SessionSearchRouteMode::Fallback => {
+                if let Some((provider_id, content)) = eligible.into_iter().next() {
+                    routed_content.extend(content);
+                    if let Some(provider) = available.remove(&provider_id) {
+                        selected.insert(provider_id, provider);
+                    }
+                }
+            }
+            SessionSearchRouteMode::Parallel => {
+                for (provider_id, content) in eligible {
+                    routed_content.extend(content);
+                    if let Some(provider) = available.remove(&provider_id) {
+                        selected.insert(provider_id, provider);
+                    }
+                }
+            }
+            SessionSearchRouteMode::Disjoint => {
+                for (provider_id, content) in eligible {
+                    let added = content
+                        .difference(&routed_content)
+                        .copied()
+                        .collect::<BTreeSet<_>>();
+                    if !added.is_empty() {
+                        routed_content.extend(added);
+                        if let Some(provider) = available.remove(&provider_id) {
+                            selected.insert(provider_id, provider);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    failures.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    SessionSearchPlan {
+        providers: selected.into_values().collect(),
+        failures,
+    }
+}
+
+fn provider_is_eligible(
+    request: &SessionSearchRequest,
+    provider: &SessionSearchProviderInfo,
+    content: &BTreeSet<SearchContentKind>,
+) -> bool {
+    if !matches!(
+        provider.status.state,
+        SearchProviderState::Ready
+            | SearchProviderState::CatchingUp
+            | SearchProviderState::Degraded
+    ) {
+        return false;
+    }
+    let mut provider_request = request.clone();
+    provider_request.filters.content_kinds.clone_from(content);
+    provider
+        .capabilities
+        .supports_request(&provider_request)
+        .is_ok()
+}
+
+fn plan_session_search_default(
     request: &SessionSearchRequest,
     discovery: ListSessionSearchProvidersResponse,
 ) -> SessionSearchPlan {
@@ -704,6 +923,84 @@ pub struct SessionSearchResponse {
     pub excluded_content: Vec<SearchContentKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// One provider's terminal contribution to a federated search.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FederatedProviderReport {
+    pub provider_id: String,
+    pub outcome: ProviderSearchOutcome,
+    pub elapsed_ms: u64,
+    pub query_complete: bool,
+    pub coverage_complete: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub searched_content: Vec<SearchContentKind>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_content: Vec<SearchContentKind>,
+}
+
+/// One validated provider contribution awaiting deterministic federation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FederatedProviderContribution {
+    pub report: FederatedProviderReport,
+    pub hits: Vec<SessionSearchHit>,
+}
+
+/// Deterministically aggregate grouped provider contributions and explicit failures.
+///
+/// Contributions are sorted by provider identity, hits by provider-local rank, and duplicate
+/// canonical locators retain the first provider contribution. Provider scores are never compared.
+#[must_use]
+pub fn aggregate_federated_search(
+    mut contributions: Vec<FederatedProviderContribution>,
+    mut failures: Vec<SessionSearchProviderFailure>,
+    limit: usize,
+) -> FederatedSessionSearchResponse {
+    contributions.sort_by(|left, right| left.report.provider_id.cmp(&right.report.provider_id));
+    failures.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
+    let mut seen = BTreeSet::new();
+    let mut hits = Vec::new();
+    let mut providers = Vec::new();
+    for mut contribution in contributions {
+        contribution.hits.sort_by_key(|hit| hit.provider_rank);
+        for hit in contribution.hits {
+            if hits.len() == limit {
+                break;
+            }
+            if seen.insert(hit.locator.clone()) {
+                hits.push(hit);
+            }
+        }
+        providers.push(contribution.report);
+    }
+    let query_complete = failures.is_empty()
+        && !providers.is_empty()
+        && providers.iter().all(|provider| provider.query_complete);
+    let coverage_complete = query_complete
+        && providers.iter().all(|provider| {
+            provider.coverage_complete
+                && matches!(provider.outcome, ProviderSearchOutcome::Complete)
+        });
+    FederatedSessionSearchResponse {
+        hits,
+        query_complete,
+        coverage_complete,
+        providers,
+        failures,
+    }
+}
+
+/// Deterministic bounded terminal aggregate from multiple providers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FederatedSessionSearchResponse {
+    /// Deduplicated hits grouped in stable provider-ID/rank order.
+    pub hits: Vec<SessionSearchHit>,
+    pub query_complete: bool,
+    pub coverage_complete: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub providers: Vec<FederatedProviderReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failures: Vec<SessionSearchProviderFailure>,
 }
 
 /// Backend-neutral normalized record projected from finalized canonical semantic state.
@@ -1178,6 +1475,185 @@ mod tests {
                 "provider does not cover all requested content kinds"
             ))
         ));
+    }
+
+    #[test]
+    fn aggregation_is_stable_deduplicated_and_partial_on_failure() {
+        let session_id = SessionId::new();
+        let hit = |provider_id: &str, sequence: u64, rank: u32| SessionSearchHit {
+            locator: SessionSearchLocator {
+                session_id,
+                sequence,
+                record_id: Some(format!("record-{sequence}")),
+            },
+            content_kind: SearchContentKind::UserMessage,
+            matched_field: SearchField::Text,
+            provider_id: provider_id.to_owned(),
+            provider_rank: rank,
+            provider_score: None,
+            preview: None,
+            preview_truncated: false,
+        };
+        let contribution =
+            |provider_id: &str, hits: Vec<SessionSearchHit>| FederatedProviderContribution {
+                report: FederatedProviderReport {
+                    provider_id: provider_id.to_owned(),
+                    outcome: ProviderSearchOutcome::Complete,
+                    elapsed_ms: 1,
+                    query_complete: true,
+                    coverage_complete: true,
+                    searched_content: vec![SearchContentKind::UserMessage],
+                    excluded_content: Vec::new(),
+                },
+                hits,
+            };
+        let response = aggregate_federated_search(
+            vec![
+                contribution(
+                    "b-provider",
+                    vec![hit("b-provider", 1, 0), hit("b-provider", 2, 1)],
+                ),
+                contribution("a-provider", vec![hit("a-provider", 1, 0)]),
+            ],
+            vec![planning_failure(
+                "c-provider".to_owned(),
+                SearchErrorCode::DeadlineExceeded,
+                "deadline exceeded",
+            )],
+            2,
+        );
+        assert_eq!(response.providers[0].provider_id, "a-provider");
+        assert_eq!(response.hits.len(), 2);
+        assert_eq!(response.hits[0].provider_id, "a-provider");
+        assert_eq!(response.hits[1].locator.sequence, 2);
+        assert!(!response.query_complete);
+        assert!(!response.coverage_complete);
+        assert_eq!(response.failures[0].plugin_id, "c-provider");
+    }
+
+    #[test]
+    fn explicit_routes_support_fallback_parallel_and_disjoint_selection() {
+        let request = SessionSearchRequest {
+            query: text_query("needle"),
+            filters: SessionSearchFilters {
+                content_kinds: [
+                    SearchContentKind::UserMessage,
+                    SearchContentKind::ShellOutput,
+                ]
+                .into_iter()
+                .collect(),
+                ..SessionSearchFilters::default()
+            },
+            sort: SessionSearchSort::ProviderRelevance,
+            limit: 10,
+            cursor: None,
+            deadline_ms: None,
+        };
+        let make_provider =
+            |id: &str, content: BTreeSet<SearchContentKind>| SessionSearchProviderInfo {
+                plugin_id: id.to_owned(),
+                capabilities: SessionSearchCapabilities {
+                    provider_id: id.to_owned(),
+                    execution: SearchExecutionKind::Indexed,
+                    content_kinds: content,
+                    features: [
+                        SearchFeature::Terms,
+                        SearchFeature::StructuredFilters,
+                        SearchFeature::RelevanceSort,
+                    ]
+                    .into_iter()
+                    .collect(),
+                    max_hits: 20,
+                    max_batch_records: 20,
+                    max_batch_text_bytes: 1024,
+                },
+                status: SessionSearchStatus {
+                    provider_id: id.to_owned(),
+                    state: SearchProviderState::Ready,
+                    record_schema_version: CURRENT_SEARCH_RECORD_VERSION,
+                    normalization_version: CURRENT_NORMALIZATION_VERSION,
+                    policy_version: CURRENT_SEARCH_POLICY_VERSION,
+                    index_bytes: 0,
+                    quota_bytes: 1024,
+                    pending_sessions: 0,
+                    coverage: Vec::new(),
+                    degraded_reason: None,
+                },
+            };
+        let discovery = ListSessionSearchProvidersResponse {
+            providers: vec![
+                make_provider(
+                    "fallback",
+                    std::iter::once(SearchContentKind::UserMessage).collect(),
+                ),
+                make_provider(
+                    "parallel",
+                    std::iter::once(SearchContentKind::UserMessage).collect(),
+                ),
+                make_provider(
+                    "shell",
+                    std::iter::once(SearchContentKind::ShellOutput).collect(),
+                ),
+            ],
+            failures: Vec::new(),
+        };
+        let routes = vec![
+            SessionSearchContentRoute {
+                content_kinds: std::iter::once(SearchContentKind::UserMessage).collect(),
+                mode: SessionSearchRouteMode::Fallback,
+                provider_ids: vec!["missing".to_owned(), "fallback".to_owned()],
+            },
+            SessionSearchContentRoute {
+                content_kinds: std::iter::once(SearchContentKind::UserMessage).collect(),
+                mode: SessionSearchRouteMode::Parallel,
+                provider_ids: vec!["parallel".to_owned()],
+            },
+            SessionSearchContentRoute {
+                content_kinds: std::iter::once(SearchContentKind::ShellOutput).collect(),
+                mode: SessionSearchRouteMode::Disjoint,
+                provider_ids: vec!["shell".to_owned()],
+            },
+        ];
+        let plan = plan_session_search_with_routes(&request, discovery, &routes);
+        assert_eq!(
+            plan.providers
+                .iter()
+                .map(|provider| provider.plugin_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fallback", "parallel", "shell"]
+        );
+        assert!(
+            plan.failures
+                .iter()
+                .any(|failure| failure.plugin_id == "missing")
+        );
+    }
+
+    #[test]
+    fn status_validation_rejects_incompatible_versions_and_unexplained_degradation() {
+        let mut status = SessionSearchStatus {
+            provider_id: "provider".to_owned(),
+            state: SearchProviderState::Ready,
+            record_schema_version: CURRENT_SEARCH_RECORD_VERSION,
+            normalization_version: CURRENT_NORMALIZATION_VERSION,
+            policy_version: CURRENT_SEARCH_POLICY_VERSION,
+            index_bytes: 0,
+            quota_bytes: 1024,
+            pending_sessions: 0,
+            coverage: Vec::new(),
+            degraded_reason: None,
+        };
+        assert_eq!(status.validate(), Ok(()));
+        status.record_schema_version = CURRENT_SEARCH_RECORD_VERSION.saturating_add(1);
+        assert!(status.validate().is_err());
+        status.record_schema_version = CURRENT_SEARCH_RECORD_VERSION;
+        status.state = SearchProviderState::Degraded;
+        assert!(matches!(
+            status.validate(),
+            Err(ContractValidationError::EmptyField("degraded_reason"))
+        ));
+        status.degraded_reason = Some("checkpoint is stale".to_owned());
+        assert_eq!(status.validate(), Ok(()));
     }
 
     #[test]
