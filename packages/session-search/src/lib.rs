@@ -54,6 +54,10 @@ pub const MAX_HIT_PREVIEW_BYTES: usize = 4 * 1024;
 pub const MAX_INGEST_RECORDS: usize = 256;
 /// Maximum normalized text bytes in one ingestion batch.
 pub const MAX_INGEST_TEXT_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum total UTF-8 payload bytes in one ingestion batch, including record metadata.
+pub const MAX_INGEST_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum cumulative normalized text bytes accepted for one canonical session.
+pub const MAX_SESSION_INGEST_TEXT_BYTES: u64 = 256 * 1024 * 1024;
 /// Maximum UTF-8 bytes in one opaque cursor.
 pub const MAX_CURSOR_BYTES: usize = 2 * 1024;
 
@@ -505,11 +509,13 @@ const fn validate_positive_limit(
 pub enum SearchProviderState {
     Ready,
     CatchingUp,
+    Stale,
     Rebuilding,
     Degraded,
     QuotaExceeded,
     Corrupt,
     Disabled,
+    Unavailable,
 }
 
 /// Trustworthy canonical generation associated with one provider checkpoint.
@@ -578,9 +584,11 @@ impl SessionSearchStatus {
         }
         if matches!(
             self.state,
-            SearchProviderState::Degraded
+            SearchProviderState::Stale
+                | SearchProviderState::Degraded
                 | SearchProviderState::QuotaExceeded
                 | SearchProviderState::Corrupt
+                | SearchProviderState::Unavailable
         ) && self
             .degraded_reason
             .as_deref()
@@ -606,6 +614,23 @@ pub struct SessionSearchProviderInfo {
 pub struct SessionSearchProviderFailure {
     pub plugin_id: String,
     pub error: SessionSearchServiceError,
+    #[serde(default)]
+    pub stage: SessionSearchProviderStage,
+    #[serde(default)]
+    pub elapsed_ms: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<SearchContentKind>,
+}
+
+/// Point in discovery/planning/execution where a provider did not contribute.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSearchProviderStage {
+    Discovery,
+    Planning,
+    #[default]
+    Execution,
+    Hydration,
 }
 
 /// Bounded application-level provider discovery response.
@@ -613,6 +638,58 @@ pub struct SessionSearchProviderFailure {
 pub struct ListSessionSearchProvidersResponse {
     pub providers: Vec<SessionSearchProviderInfo>,
     pub failures: Vec<SessionSearchProviderFailure>,
+}
+
+/// Query execution class used for provider routing and deadline policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSearchExecutionClass {
+    /// Latency-sensitive search that excludes cold scan providers.
+    #[default]
+    Ordinary,
+    /// Explicit search that may invoke scan providers for large/cold content.
+    Deep,
+}
+
+/// Backend-neutral policy applied while building a provider query plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchPlanPolicy {
+    #[serde(default)]
+    pub execution_class: SessionSearchExecutionClass,
+    /// Maximum age of an incomplete/catching-up checkpoint accepted for indexed providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maximum_staleness_sequences: Option<u64>,
+    /// Deadline for each selected provider, bounded again by the request's overall deadline.
+    pub per_provider_deadline_ms: u64,
+}
+
+impl Default for SessionSearchPlanPolicy {
+    fn default() -> Self {
+        Self {
+            execution_class: SessionSearchExecutionClass::Ordinary,
+            maximum_staleness_sequences: Some(0),
+            per_provider_deadline_ms: 2_000,
+        }
+    }
+}
+
+impl SessionSearchPlanPolicy {
+    /// Validate plan-level execution and deadline bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the per-provider deadline is zero or exceeds the request deadline.
+    pub fn validate(&self, request: &SessionSearchRequest) -> Result<(), ContractValidationError> {
+        let overall = request.deadline_ms.unwrap_or(5_000).max(1);
+        if self.per_provider_deadline_ms == 0 || self.per_provider_deadline_ms > overall {
+            return Err(ContractValidationError::LimitExceeded {
+                field: "per_provider_deadline_ms",
+                actual: usize::try_from(self.per_provider_deadline_ms).unwrap_or(usize::MAX),
+                maximum: usize::try_from(overall).unwrap_or(usize::MAX),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Provider selection behavior for one configured content route.
@@ -671,6 +748,8 @@ pub struct SessionSearchPlan {
     pub providers: Vec<SessionSearchProviderInfo>,
     /// Discovery, state, or capability failures excluded from execution.
     pub failures: Vec<SessionSearchProviderFailure>,
+    /// Validated per-provider deadline applied by the coordinator.
+    pub per_provider_deadline_ms: u64,
 }
 
 /// Build a conservative query plan without broadcasting to redundant overlapping providers.
@@ -683,7 +762,12 @@ pub fn plan_session_search(
     request: &SessionSearchRequest,
     discovery: ListSessionSearchProvidersResponse,
 ) -> SessionSearchPlan {
-    plan_session_search_with_routes(request, discovery, &[])
+    plan_session_search_with_policy_and_routes(
+        request,
+        discovery,
+        &SessionSearchPlanPolicy::default(),
+        &[],
+    )
 }
 
 /// Build a deterministic query plan using explicit content routes.
@@ -693,9 +777,49 @@ pub fn plan_session_search_with_routes(
     discovery: ListSessionSearchProvidersResponse,
     routes: &[SessionSearchContentRoute],
 ) -> SessionSearchPlan {
-    if routes.is_empty() {
-        return plan_session_search_default(request, discovery);
+    plan_session_search_with_policy_and_routes(
+        request,
+        discovery,
+        &SessionSearchPlanPolicy::default(),
+        routes,
+    )
+}
+
+/// Build a deterministic query plan using explicit execution/freshness policy and content routes.
+#[must_use]
+pub fn plan_session_search_with_policy_and_routes(
+    request: &SessionSearchRequest,
+    mut discovery: ListSessionSearchProvidersResponse,
+    policy: &SessionSearchPlanPolicy,
+    routes: &[SessionSearchContentRoute],
+) -> SessionSearchPlan {
+    if let Err(error) = policy.validate(request) {
+        discovery.failures.push(planning_failure(
+            "policy".to_owned(),
+            SearchErrorCode::InvalidRequest,
+            &error.to_string(),
+        ));
+        return SessionSearchPlan {
+            providers: Vec::new(),
+            failures: discovery.failures,
+            per_provider_deadline_ms: policy.per_provider_deadline_ms,
+        };
     }
+    discovery = filter_discovery_for_policy(discovery, policy);
+    let mut plan = if routes.is_empty() {
+        plan_session_search_default(request, discovery)
+    } else {
+        plan_session_search_routed(request, discovery, routes)
+    };
+    plan.per_provider_deadline_ms = policy.per_provider_deadline_ms;
+    plan
+}
+
+fn plan_session_search_routed(
+    request: &SessionSearchRequest,
+    discovery: ListSessionSearchProvidersResponse,
+    routes: &[SessionSearchContentRoute],
+) -> SessionSearchPlan {
     let mut available = discovery
         .providers
         .into_iter()
@@ -708,10 +832,11 @@ pub fn plan_session_search_with_routes(
 
     for route in routes {
         if let Err(error) = route.validate() {
-            failures.push(planning_failure(
+            failures.push(planning_failure_with_content(
                 "route".to_owned(),
                 SearchErrorCode::InvalidRequest,
                 &error.to_string(),
+                Vec::new(),
             ));
             continue;
         }
@@ -785,6 +910,7 @@ pub fn plan_session_search_with_routes(
     SessionSearchPlan {
         providers: selected.into_values().collect(),
         failures,
+        per_provider_deadline_ms: 0,
     }
 }
 
@@ -875,13 +1001,84 @@ fn plan_session_search_default(
     SessionSearchPlan {
         providers: selected,
         failures,
+        per_provider_deadline_ms: 0,
     }
+}
+
+fn filter_discovery_for_policy(
+    discovery: ListSessionSearchProvidersResponse,
+    policy: &SessionSearchPlanPolicy,
+) -> ListSessionSearchProvidersResponse {
+    let mut providers = Vec::new();
+    let mut failures = discovery.failures;
+    for provider in discovery.providers {
+        let exclusion = if matches!(provider.status.state, SearchProviderState::Stale) {
+            Some((
+                SearchErrorCode::StaleIndex,
+                "provider index is explicitly stale",
+            ))
+        } else if matches!(provider.status.state, SearchProviderState::Unavailable) {
+            Some((
+                SearchErrorCode::ProviderUnavailable,
+                "provider is configured but unavailable",
+            ))
+        } else if matches!(
+            policy.execution_class,
+            SessionSearchExecutionClass::Ordinary
+        ) && matches!(provider.capabilities.execution, SearchExecutionKind::Scan)
+        {
+            Some((
+                SearchErrorCode::UnsupportedQuery,
+                "cold scan provider requires explicit deep search",
+            ))
+        } else if coverage_exceeds_staleness(&provider.status, policy.maximum_staleness_sequences) {
+            Some((
+                SearchErrorCode::StaleIndex,
+                "provider coverage exceeds the configured freshness threshold",
+            ))
+        } else {
+            None
+        };
+        if let Some((code, message)) = exclusion {
+            failures.push(planning_failure(provider.plugin_id, code, message));
+        } else {
+            providers.push(provider);
+        }
+    }
+    ListSessionSearchProvidersResponse {
+        providers,
+        failures,
+    }
+}
+
+fn coverage_exceeds_staleness(
+    status: &SessionSearchStatus,
+    maximum_staleness_sequences: Option<u64>,
+) -> bool {
+    let Some(maximum) = maximum_staleness_sequences else {
+        return false;
+    };
+    status.coverage.iter().any(|coverage| {
+        coverage.generation.last_sequence.is_some_and(|tail| {
+            let indexed = coverage.indexed_through_sequence.unwrap_or_default();
+            tail.saturating_sub(indexed) > maximum
+        })
+    })
 }
 
 fn planning_failure(
     plugin_id: String,
     code: SearchErrorCode,
     message: &str,
+) -> SessionSearchProviderFailure {
+    planning_failure_with_content(plugin_id, code, message, Vec::new())
+}
+
+fn planning_failure_with_content(
+    plugin_id: String,
+    code: SearchErrorCode,
+    message: &str,
+    content: Vec<SearchContentKind>,
 ) -> SessionSearchProviderFailure {
     SessionSearchProviderFailure {
         plugin_id,
@@ -890,6 +1087,9 @@ fn planning_failure(
             message: message.to_owned(),
             retryable: false,
         },
+        stage: SessionSearchProviderStage::Planning,
+        elapsed_ms: 0,
+        content,
     }
 }
 
@@ -1060,6 +1260,13 @@ pub struct ApplySearchRecordsRequest {
     pub generation: SearchCanonicalGeneration,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_previous_sequence: Option<u64>,
+    /// Normalized text bytes accepted for this session before this batch.
+    ///
+    /// Providers compare this value with their atomically retained session accounting. It bounds a
+    /// session independently of individual record and batch limits; it is not a durable resume
+    /// cursor.
+    #[serde(default)]
+    pub expected_previous_session_text_bytes: u64,
     pub records: Vec<SessionSearchRecord>,
 }
 
@@ -1079,8 +1286,9 @@ impl ApplySearchRecordsRequest {
     ///
     /// # Errors
     ///
-    /// Returns an error when the batch is empty/oversized, identities conflict, text exceeds the
-    /// aggregate bound, or record sequences are not monotonic and within the declared generation.
+    /// Returns an error when the batch is empty/oversized, identities conflict, text or serialized
+    /// payload exceeds its aggregate bound, cumulative session text exceeds its bound, or record
+    /// sequences are not monotonic and within the declared generation.
     pub fn validate(&self) -> Result<(), ContractValidationError> {
         validate_nonempty_bounded("provider_id", &self.provider_id, MAX_CURSOR_BYTES)?;
         validate_nonempty_bounded("batch_id", &self.batch_id, MAX_CURSOR_BYTES)?;
@@ -1143,6 +1351,31 @@ impl ApplySearchRecordsRequest {
                 field: "record_text_bytes",
                 actual: text_bytes,
                 maximum: MAX_INGEST_TEXT_BYTES,
+            });
+        }
+        let session_text_bytes = self
+            .expected_previous_session_text_bytes
+            .checked_add(u64::try_from(text_bytes).unwrap_or(u64::MAX))
+            .ok_or_else(|| ContractValidationError::LimitExceeded {
+                field: "session_text_bytes",
+                actual: usize::MAX,
+                maximum: usize::try_from(MAX_SESSION_INGEST_TEXT_BYTES).unwrap_or(usize::MAX),
+            })?;
+        if session_text_bytes > MAX_SESSION_INGEST_TEXT_BYTES {
+            return Err(ContractValidationError::LimitExceeded {
+                field: "session_text_bytes",
+                actual: usize::try_from(session_text_bytes).unwrap_or(usize::MAX),
+                maximum: usize::try_from(MAX_SESSION_INGEST_TEXT_BYTES).unwrap_or(usize::MAX),
+            });
+        }
+        let payload_bytes = serde_json::to_vec(self)
+            .map_err(|_| ContractValidationError::InvalidBatch("batch serialization failed"))?
+            .len();
+        if payload_bytes > MAX_INGEST_PAYLOAD_BYTES {
+            return Err(ContractValidationError::LimitExceeded {
+                field: "batch_payload_bytes",
+                actual: payload_bytes,
+                maximum: MAX_INGEST_PAYLOAD_BYTES,
             });
         }
         Ok(())
@@ -1383,6 +1616,7 @@ mod tests {
                 last_sequence: Some(2),
             },
             expected_previous_sequence: Some(0),
+            expected_previous_session_text_bytes: 0,
             records: vec![
                 record.clone(),
                 SessionSearchRecord {
@@ -1436,6 +1670,7 @@ mod tests {
                 last_sequence: Some(1),
             },
             expected_previous_sequence: None,
+            expected_previous_session_text_bytes: 0,
             records: vec![
                 record.clone(),
                 SessionSearchRecord {
@@ -1653,6 +1888,24 @@ mod tests {
     }
 
     #[test]
+    fn provider_failures_report_stage_elapsed_and_requested_content() {
+        let failure = planning_failure_with_content(
+            "provider".to_owned(),
+            SearchErrorCode::StaleIndex,
+            "stale",
+            vec![SearchContentKind::UserMessage],
+        );
+        assert_eq!(failure.stage, SessionSearchProviderStage::Planning);
+        assert_eq!(failure.elapsed_ms, 0);
+        assert_eq!(failure.content, vec![SearchContentKind::UserMessage]);
+
+        let encoded = serde_json::to_value(&failure).expect("encode provider failure");
+        assert_eq!(encoded["stage"], "planning");
+        assert_eq!(encoded["elapsed_ms"], 0);
+        assert_eq!(encoded["content"][0], "user_message");
+    }
+
+    #[test]
     fn status_validation_rejects_incompatible_versions_and_unexplained_degradation() {
         let mut status = SessionSearchStatus {
             provider_id: "provider".to_owned(),
@@ -1677,6 +1930,113 @@ mod tests {
         ));
         status.degraded_reason = Some("checkpoint is stale".to_owned());
         assert_eq!(status.validate(), Ok(()));
+        status.state = SearchProviderState::Stale;
+        status.degraded_reason = None;
+        assert!(matches!(
+            status.validate(),
+            Err(ContractValidationError::EmptyField("degraded_reason"))
+        ));
+        status.state = SearchProviderState::Unavailable;
+        status.degraded_reason = Some("configured binary is unavailable".to_owned());
+        assert_eq!(status.validate(), Ok(()));
+    }
+
+    #[test]
+    fn plan_policy_excludes_cold_and_stale_providers_from_ordinary_search() {
+        fn provider(
+            id: &str,
+            execution: SearchExecutionKind,
+            indexed_through_sequence: u64,
+        ) -> SessionSearchProviderInfo {
+            let session_id = SessionId::new();
+            SessionSearchProviderInfo {
+                plugin_id: id.to_owned(),
+                capabilities: SessionSearchCapabilities {
+                    provider_id: id.to_owned(),
+                    execution,
+                    content_kinds: std::iter::once(SearchContentKind::UserMessage).collect(),
+                    features: [
+                        SearchFeature::Terms,
+                        SearchFeature::StructuredFilters,
+                        SearchFeature::RelevanceSort,
+                    ]
+                    .into_iter()
+                    .collect(),
+                    max_hits: 20,
+                    max_batch_records: 20,
+                    max_batch_text_bytes: 1024,
+                },
+                status: SessionSearchStatus {
+                    provider_id: id.to_owned(),
+                    state: SearchProviderState::Ready,
+                    record_schema_version: CURRENT_SEARCH_RECORD_VERSION,
+                    normalization_version: CURRENT_NORMALIZATION_VERSION,
+                    policy_version: CURRENT_SEARCH_POLICY_VERSION,
+                    index_bytes: 0,
+                    quota_bytes: 1024,
+                    pending_sessions: 0,
+                    coverage: vec![SessionSearchCoverage {
+                        generation: SearchCanonicalGeneration {
+                            session_id,
+                            fingerprint: "generation".to_owned(),
+                            last_sequence: Some(10),
+                        },
+                        content_kinds: std::iter::once(SearchContentKind::UserMessage).collect(),
+                        indexed_through_sequence: Some(indexed_through_sequence),
+                        complete: indexed_through_sequence == 10,
+                        skipped_records: 0,
+                        truncated_records: 0,
+                        exclusions: Vec::new(),
+                    }],
+                    degraded_reason: None,
+                },
+            }
+        }
+
+        let request = SessionSearchRequest {
+            query: text_query("needle"),
+            filters: SessionSearchFilters {
+                content_kinds: std::iter::once(SearchContentKind::UserMessage).collect(),
+                ..SessionSearchFilters::default()
+            },
+            sort: SessionSearchSort::ProviderRelevance,
+            limit: 10,
+            cursor: None,
+            deadline_ms: Some(5_000),
+        };
+        let discovery = ListSessionSearchProvidersResponse {
+            providers: vec![
+                provider("fresh", SearchExecutionKind::Indexed, 10),
+                provider("stale", SearchExecutionKind::Indexed, 7),
+                provider("scan", SearchExecutionKind::Scan, 10),
+            ],
+            failures: Vec::new(),
+        };
+        let policy = SessionSearchPlanPolicy {
+            execution_class: SessionSearchExecutionClass::Ordinary,
+            maximum_staleness_sequences: Some(1),
+            per_provider_deadline_ms: 1_000,
+        };
+        let plan =
+            plan_session_search_with_policy_and_routes(&request, discovery.clone(), &policy, &[]);
+        assert_eq!(
+            plan.providers
+                .iter()
+                .map(|provider| provider.plugin_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fresh"]
+        );
+        assert_eq!(plan.per_provider_deadline_ms, 1_000);
+        assert_eq!(plan.failures.len(), 2);
+
+        let deep = SessionSearchPlanPolicy {
+            execution_class: SessionSearchExecutionClass::Deep,
+            maximum_staleness_sequences: None,
+            per_provider_deadline_ms: 4_000,
+        };
+        let plan = plan_session_search_with_policy_and_routes(&request, discovery, &deep, &[]);
+        assert!(plan.failures.is_empty());
+        assert_eq!(plan.per_provider_deadline_ms, 4_000);
     }
 
     #[test]
@@ -1821,6 +2181,39 @@ mod tests {
             serde_json::from_str(fixture).expect("decode fixture value");
         let actual = serde_json::to_value(capabilities).expect("encode capabilities fixture");
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn ingestion_validation_bounds_cumulative_session_text() {
+        let fixture = include_str!("../tests/fixtures/apply-search-records-v1.json");
+        let mut request: ApplySearchRecordsRequest =
+            serde_json::from_str(fixture).expect("decode retained ingestion fixture");
+        request.expected_previous_session_text_bytes = MAX_SESSION_INGEST_TEXT_BYTES - 4;
+        assert!(matches!(
+            request.validate(),
+            Err(ContractValidationError::LimitExceeded {
+                field: "session_text_bytes",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn ingestion_validation_bounds_serialized_payload_metadata() {
+        let fixture = include_str!("../tests/fixtures/apply-search-records-v1.json");
+        let mut request: ApplySearchRecordsRequest =
+            serde_json::from_str(fixture).expect("decode retained ingestion fixture");
+        request.records[0].attributes.insert(
+            "oversized-metadata".to_owned(),
+            "x".repeat(MAX_INGEST_PAYLOAD_BYTES),
+        );
+        assert!(matches!(
+            request.validate(),
+            Err(ContractValidationError::LimitExceeded {
+                field: "batch_payload_bytes",
+                ..
+            })
+        ));
     }
 
     #[test]

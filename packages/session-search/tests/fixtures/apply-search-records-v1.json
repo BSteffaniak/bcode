@@ -7,6 +7,7 @@
     "last_sequence": 1
   },
   "expected_previous_sequence": 0,
+  "expected_previous_session_text_bytes": 0,
   "records": [
     {
       "schema_version": 1,

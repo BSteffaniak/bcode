@@ -1660,6 +1660,8 @@ pub enum PluginLoadError {
     },
     #[error("plugin '{plugin_id}' service invocation failed with code {code}")]
     ServiceInvokeFailed { plugin_id: String, code: i32 },
+    #[error("plugin '{plugin_id}' service invocation timed out after {timeout_ms} ms")]
+    ServiceInvocationTimeout { plugin_id: String, timeout_ms: u64 },
     #[error("failed to encode plugin event: {0}")]
     EventEncode(#[source] serde_json::Error),
     #[error("plugin '{plugin_id}' event handler failed with code {code}")]
@@ -2963,6 +2965,7 @@ pub struct PluginRuntimeHost {
     executors: Arc<BTreeMap<String, Arc<PluginExecutorHandle>>>,
     event_dispatchers: Arc<BTreeMap<String, Arc<PluginEventDispatcher>>>,
     configs: Arc<BTreeMap<String, ResolvedPluginConfig>>,
+    selection: Arc<PluginSelection>,
     command_registry: Arc<bcode_command::CommandRegistry>,
     auth_provider_registry: Arc<AuthProviderRegistry>,
     resources: Arc<PluginResourceLimiter>,
@@ -2988,7 +2991,12 @@ impl PluginRuntimeHost {
         selection: &PluginSelection,
         static_plugins: &[StaticBundledPlugin],
     ) -> Result<Self, PluginLoadError> {
-        PluginHost::load_defaults_with_static_bundled(selection, static_plugins).map(Self::from)
+        PluginHost::load_defaults_with_static_bundled(selection, static_plugins)
+            .map(Self::from)
+            .map(|mut runtime| {
+                runtime.selection = Arc::new(selection.clone());
+                runtime
+            })
     }
 
     /// Discover, load, activate, and start plugin executors from default roots plus static bundled registrations and config.
@@ -3003,6 +3011,23 @@ impl PluginRuntimeHost {
     ) -> Result<Self, PluginLoadError> {
         PluginHost::load_defaults_with_static_bundled_and_config(selection, static_plugins, configs)
             .map(Self::from)
+            .map(|mut runtime| {
+                runtime.selection = Arc::new(selection.clone());
+                runtime
+            })
+    }
+
+    /// Return a clone with the resolved selection inventory attached.
+    #[must_use]
+    pub fn with_selection(mut self, selection: PluginSelection) -> Self {
+        self.selection = Arc::new(selection);
+        self
+    }
+
+    /// Return the resolved plugin selection, including configured disabled and unavailable IDs.
+    #[must_use]
+    pub fn selection(&self) -> &PluginSelection {
+        &self.selection
     }
 
     /// Return the immutable plugin registry.
@@ -3197,6 +3222,45 @@ impl PluginRuntimeHost {
             None,
         )
         .await
+    }
+
+    /// Invoke a service operation with explicit scope and a cancellation-propagating timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plugin is not loaded, invocation fails, or the deadline elapses.
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn invoke_service_scoped_with_timeout(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
+        scope: PluginInvocationScope,
+        timeout: std::time::Duration,
+    ) -> Result<ServiceResponse, PluginLoadError> {
+        let timeout_ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        let mut invocation = self
+            .invoke_service_with_events_scoped(plugin_id, interface_id, operation, payload, scope)
+            .await?;
+        let cancellation = invocation.cancel.clone();
+        let timed = tokio::time::timeout(timeout, async {
+            loop {
+                if let StreamingServiceInvocationEvent::Response(response) =
+                    invocation.next_event().await?
+                {
+                    return response;
+                }
+            }
+        })
+        .await;
+        timed.unwrap_or_else(|_| {
+            cancellation.cancel();
+            Err(PluginLoadError::ServiceInvocationTimeout {
+                plugin_id: plugin_id.to_owned(),
+                timeout_ms,
+            })
+        })
     }
 
     /// Invoke a service operation with explicit ownership scope and a duplex bridge.
@@ -3456,6 +3520,38 @@ impl PluginRuntimeHost {
         decode_service_response(response)
     }
 
+    /// Invoke a typed service operation with explicit scope and cancellation-propagating timeout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when encoding, invocation, timeout, service response, or decoding fails.
+    pub async fn invoke_service_json_scoped_with_timeout<Q, R>(
+        &self,
+        plugin_id: &str,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        request: &Q,
+        scope: PluginInvocationScope,
+        timeout: std::time::Duration,
+    ) -> Result<R, PluginServiceCallError>
+    where
+        Q: Serialize + Sync,
+        R: DeserializeOwned,
+    {
+        let payload = serde_json::to_vec(request).map_err(PluginServiceCallError::RequestEncode)?;
+        let response = self
+            .invoke_service_scoped_with_timeout(
+                plugin_id,
+                interface_id,
+                operation,
+                payload,
+                scope,
+                timeout,
+            )
+            .await?;
+        decode_service_response(response)
+    }
+
     /// Invoke a service operation by service interface ID with JSON payloads.
     ///
     /// # Errors
@@ -3615,6 +3711,7 @@ impl From<PluginHost> for PluginRuntimeHost {
             executors: Arc::new(executors),
             event_dispatchers: Arc::new(event_dispatchers),
             configs: Arc::new(configs),
+            selection: Arc::new(PluginSelection::default()),
             command_registry: Arc::new(command_registry),
             auth_provider_registry: Arc::new(auth_provider_registry),
             resources: Arc::default(),
@@ -5850,6 +5947,38 @@ library = "libexample_plugin.dylib"
                 .expect("example provider registered");
             assert_eq!(provider.plugin_id, "example.hello");
         }
+    }
+
+    #[tokio::test]
+    async fn scoped_timeout_propagates_cancellation_to_static_plugin() {
+        let manifest = toml::from_str::<PluginManifest>(include_str!(
+            "../../../examples/hello-plugin/bcode-plugin.toml"
+        ))
+        .expect("hello manifest should parse");
+        let host =
+            PluginHost::load_static_plugins(&[(manifest, bcode_hello_plugin::static_plugin())])
+                .expect("static hello host should load");
+        let runtime = PluginRuntimeHost::from(host);
+        let started = Instant::now();
+        let error = runtime
+            .invoke_service_scoped_with_timeout(
+                "example.hello",
+                "example-hello/v1",
+                "wait-cancelled",
+                Vec::new(),
+                PluginInvocationScope::Global,
+                Duration::from_millis(25),
+            )
+            .await
+            .expect_err("wait operation should time out");
+        assert!(matches!(
+            error,
+            PluginLoadError::ServiceInvocationTimeout {
+                plugin_id,
+                timeout_ms: 25
+            } if plugin_id == "example.hello"
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

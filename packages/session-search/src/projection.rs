@@ -46,6 +46,14 @@ pub struct SearchProjectionPolicy {
     pub tool_arguments: ProjectionContentPolicy,
     /// Copy successful generic tool output into derived search state.
     pub tool_output: ProjectionContentPolicy,
+    /// Copy permission request/decision summaries into derived search state.
+    pub permissions: ProjectionContentPolicy,
+    /// Copy runtime-work labels, progress, and terminal diagnostics into derived search state.
+    pub runtime_diagnostics: ProjectionContentPolicy,
+    /// Copy allowlisted trace summaries without trace blobs or storage paths.
+    pub trace_metadata: ProjectionContentPolicy,
+    /// Copy allowlisted tool artifact identity/schema metadata without opaque metadata or URIs.
+    pub artifact_metadata: ProjectionContentPolicy,
 }
 
 impl Default for SearchProjectionPolicy {
@@ -57,6 +65,10 @@ impl Default for SearchProjectionPolicy {
             shell_output: ProjectionContentPolicy::Exclude,
             tool_arguments: ProjectionContentPolicy::Exclude,
             tool_output: ProjectionContentPolicy::Exclude,
+            permissions: ProjectionContentPolicy::Exclude,
+            runtime_diagnostics: ProjectionContentPolicy::Exclude,
+            trace_metadata: ProjectionContentPolicy::Exclude,
+            artifact_metadata: ProjectionContentPolicy::Exclude,
         }
     }
 }
@@ -94,6 +106,7 @@ pub enum PersistedEventClassification {
 /// This exhaustive match intentionally has no wildcard so adding a persisted event variant requires
 /// an explicit search projection decision.
 #[must_use]
+#[allow(clippy::unnested_or_patterns)]
 pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEventClassification {
     match kind {
         SessionEventKind::SessionCreated { name: Some(_), .. }
@@ -106,10 +119,22 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
             PersistedEventClassification::Searchable
         }
         SessionEventKind::ToolCallRequested { .. }
+        | SessionEventKind::PermissionRequested { .. }
+        | SessionEventKind::PermissionResolved { .. }
+        | SessionEventKind::RuntimeWorkStarted { .. }
+        | SessionEventKind::RuntimeWorkFinished { .. }
+        | SessionEventKind::RuntimeWorkProgress { .. }
+        | SessionEventKind::TraceEvent { .. }
         | SessionEventKind::ToolInvocationResultRecorded {
             record:
                 bcode_session_models::ToolInvocationResultRecord {
-                    is_error: false, ..
+                    result:
+                        Some(ToolInvocationResult::Artifact { .. })
+                        | None
+                        | Some(ToolInvocationResult::Text { .. })
+                        | Some(ToolInvocationResult::Json { .. }),
+                    is_error: false,
+                    ..
                 },
         }
         | SessionEventKind::AssistantReasoningMessage { .. }
@@ -135,8 +160,6 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         SessionEventKind::SessionCreated { name: None, .. }
         | SessionEventKind::ClientAttached { .. }
         | SessionEventKind::ClientDetached { .. }
-        | SessionEventKind::PermissionRequested { .. }
-        | SessionEventKind::PermissionResolved { .. }
         | SessionEventKind::ModelChanged { .. }
         | SessionEventKind::AgentChanged { .. }
         | SessionEventKind::ModelTurnStarted { .. }
@@ -149,10 +172,7 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         | SessionEventKind::SkillDeactivated { .. }
         | SessionEventKind::SkillContextLoaded { .. }
         | SessionEventKind::SkillInvocationFailed { .. }
-        | SessionEventKind::RuntimeWorkStarted { .. }
         | SessionEventKind::RuntimeWorkCancelRequested { .. }
-        | SessionEventKind::RuntimeWorkFinished { .. }
-        | SessionEventKind::RuntimeWorkProgress { .. }
         | SessionEventKind::ModelTurnCancelRequested { .. }
         | SessionEventKind::WorkingDirectoryChanged { .. }
         | SessionEventKind::SessionImported { .. }
@@ -168,8 +188,7 @@ pub const fn classify_persisted_event(kind: &SessionEventKind) -> PersistedEvent
         | SessionEventKind::ExecutionSessionCreated { .. } => {
             PersistedEventClassification::MetadataOnly
         }
-        SessionEventKind::TraceEvent { .. }
-        | SessionEventKind::InertHistory { .. }
+        SessionEventKind::InertHistory { .. }
         | SessionEventKind::ToolContribution { .. }
         | SessionEventKind::ToolContributionPlaced { .. } => PersistedEventClassification::Excluded,
     }
@@ -316,6 +335,9 @@ pub fn project_event(
     if let Some(projection) = project_transcript_event(event, policy) {
         return Ok(projection);
     }
+    if let Some(projection) = project_sensitive_metadata_event(event, policy) {
+        return Ok(projection);
+    }
     if let Some(projection) = project_tool_event(event, policy) {
         return Ok(projection);
     }
@@ -350,24 +372,18 @@ pub fn project_event(
         | SessionEventKind::SessionRenamed { name: None }
         | SessionEventKind::ClientAttached { .. }
         | SessionEventKind::ClientDetached { .. }
-        | SessionEventKind::PermissionRequested { .. }
-        | SessionEventKind::PermissionResolved { .. }
         | SessionEventKind::ModelChanged { .. }
         | SessionEventKind::AgentChanged { .. }
         | SessionEventKind::ModelTurnStarted { .. }
         | SessionEventKind::ModelTurnFinished { .. }
         | SessionEventKind::ModelUsage { .. }
-        | SessionEventKind::TraceEvent { .. }
         | SessionEventKind::SkillInvoked { .. }
         | SessionEventKind::SkillSuggested { .. }
         | SessionEventKind::SkillActivated { .. }
         | SessionEventKind::SkillDeactivated { .. }
         | SessionEventKind::SkillContextLoaded { .. }
         | SessionEventKind::SkillInvocationFailed { .. }
-        | SessionEventKind::RuntimeWorkStarted { .. }
         | SessionEventKind::RuntimeWorkCancelRequested { .. }
-        | SessionEventKind::RuntimeWorkFinished { .. }
-        | SessionEventKind::RuntimeWorkProgress { .. }
         | SessionEventKind::ModelTurnCancelRequested { .. }
         | SessionEventKind::WorkingDirectoryChanged { .. }
         | SessionEventKind::SessionImported { .. }
@@ -392,6 +408,12 @@ pub fn project_event(
         | SessionEventKind::AssistantMessage { .. }
         | SessionEventKind::SystemMessage { .. }
         | SessionEventKind::ContextCompacted { .. }
+        | SessionEventKind::PermissionRequested { .. }
+        | SessionEventKind::PermissionResolved { .. }
+        | SessionEventKind::RuntimeWorkStarted { .. }
+        | SessionEventKind::RuntimeWorkFinished { .. }
+        | SessionEventKind::RuntimeWorkProgress { .. }
+        | SessionEventKind::TraceEvent { .. }
         | SessionEventKind::ToolCallRequested { .. }
         | SessionEventKind::ToolInvocationResultRecorded { .. }
         | SessionEventKind::AssistantReasoningActivity { .. }
@@ -401,6 +423,370 @@ pub fn project_event(
     };
 
     Ok(projection)
+}
+
+#[allow(clippy::too_many_lines)]
+fn project_sensitive_metadata_event(
+    event: &SessionEvent,
+    policy: &SearchProjectionPolicy,
+) -> Option<EventProjection> {
+    match &event.kind {
+        SessionEventKind::PermissionRequested {
+            permission_id,
+            tool_call_id,
+            tool_name,
+            policy_source,
+            policy_reason,
+            ..
+        } => Some(if policy.permissions.enabled() {
+            let mut text = format!("permission requested for {tool_name}");
+            if let Some(reason) = policy_reason {
+                text.push_str(": ");
+                text.push_str(reason);
+            }
+            project_text(
+                event,
+                "permission-requested",
+                SearchContentKind::Permission,
+                SearchField::Text,
+                &text,
+                BTreeMap::from([
+                    ("permission_id".to_owned(), permission_id.clone()),
+                    ("invocation_id".to_owned(), tool_call_id.clone()),
+                    ("tool_name".to_owned(), tool_name.clone()),
+                    (
+                        "policy_source".to_owned(),
+                        policy_source.clone().unwrap_or_default(),
+                    ),
+                ]),
+                policy.max_text_bytes_per_record,
+            )
+        } else {
+            EventProjection::Excluded(ProjectionExclusion::DisabledByPolicy)
+        }),
+        SessionEventKind::PermissionResolved {
+            permission_id,
+            approved,
+        } => Some(if policy.permissions.enabled() {
+            project_text(
+                event,
+                "permission-resolved",
+                SearchContentKind::Permission,
+                SearchField::Text,
+                if *approved {
+                    "permission approved"
+                } else {
+                    "permission denied"
+                },
+                BTreeMap::from([
+                    ("permission_id".to_owned(), permission_id.clone()),
+                    ("approved".to_owned(), approved.to_string()),
+                ]),
+                policy.max_text_bytes_per_record,
+            )
+        } else {
+            EventProjection::Excluded(ProjectionExclusion::DisabledByPolicy)
+        }),
+        SessionEventKind::RuntimeWorkStarted {
+            work_id,
+            kind,
+            label,
+            plugin_id,
+            service_interface,
+            operation,
+            ..
+        } => Some(if policy.runtime_diagnostics.enabled() {
+            let mut attributes = BTreeMap::from([
+                ("work_id".to_owned(), work_id.to_string()),
+                ("work_kind".to_owned(), format!("{kind:?}").to_lowercase()),
+            ]);
+            insert_optional_attribute(&mut attributes, "plugin_id", plugin_id.as_ref());
+            insert_optional_attribute(
+                &mut attributes,
+                "service_interface",
+                service_interface.as_ref(),
+            );
+            insert_optional_attribute(&mut attributes, "operation", operation.as_ref());
+            project_text(
+                event,
+                "runtime-work-started",
+                SearchContentKind::RuntimeDiagnostic,
+                SearchField::Text,
+                label,
+                attributes,
+                policy.max_text_bytes_per_record,
+            )
+        } else {
+            EventProjection::Excluded(ProjectionExclusion::DisabledByPolicy)
+        }),
+        SessionEventKind::RuntimeWorkProgress {
+            work_id,
+            message,
+            completed_units,
+            total_units,
+            ..
+        } => Some(if policy.runtime_diagnostics.enabled() {
+            let mut attributes = BTreeMap::from([("work_id".to_owned(), work_id.to_string())]);
+            insert_optional_display_attribute(
+                &mut attributes,
+                "completed_units",
+                completed_units.as_ref(),
+            );
+            insert_optional_display_attribute(&mut attributes, "total_units", total_units.as_ref());
+            project_text(
+                event,
+                "runtime-work-progress",
+                SearchContentKind::RuntimeDiagnostic,
+                SearchField::Text,
+                message,
+                attributes,
+                policy.max_text_bytes_per_record,
+            )
+        } else {
+            EventProjection::Excluded(ProjectionExclusion::DisabledByPolicy)
+        }),
+        SessionEventKind::RuntimeWorkFinished {
+            work_id,
+            status,
+            message,
+            ..
+        } => Some(if policy.runtime_diagnostics.enabled() {
+            let status_text = format!("{status:?}").to_lowercase();
+            let text = message
+                .as_ref()
+                .map_or_else(|| format!("runtime work {status_text}"), Clone::clone);
+            project_text(
+                event,
+                "runtime-work-finished",
+                SearchContentKind::RuntimeDiagnostic,
+                SearchField::Text,
+                &text,
+                BTreeMap::from([
+                    ("work_id".to_owned(), work_id.to_string()),
+                    ("status".to_owned(), status_text),
+                ]),
+                policy.max_text_bytes_per_record,
+            )
+        } else {
+            EventProjection::Excluded(ProjectionExclusion::DisabledByPolicy)
+        }),
+        SessionEventKind::TraceEvent { trace } => Some(if policy.trace_metadata.enabled() {
+            project_trace_metadata(event, trace, policy.max_text_bytes_per_record)
+        } else {
+            EventProjection::Excluded(ProjectionExclusion::DisabledByPolicy)
+        }),
+        SessionEventKind::ToolInvocationResultRecorded { record } => {
+            let Some(ToolInvocationResult::Artifact { artifact }) = &record.result else {
+                return None;
+            };
+            Some(if policy.artifact_metadata.enabled() {
+                project_artifact_metadata(
+                    event,
+                    &record.invocation_id,
+                    artifact,
+                    policy.max_text_bytes_per_record,
+                )
+            } else if record.is_error || policy.tool_output.enabled() {
+                return None;
+            } else {
+                EventProjection::Excluded(ProjectionExclusion::DisabledByPolicy)
+            })
+        }
+        _ => None,
+    }
+}
+
+fn insert_optional_attribute(
+    attributes: &mut BTreeMap<String, String>,
+    key: &str,
+    value: Option<&String>,
+) {
+    if let Some(value) = value {
+        attributes.insert(key.to_owned(), value.clone());
+    }
+}
+
+fn insert_optional_display_attribute<T: std::fmt::Display>(
+    attributes: &mut BTreeMap<String, String>,
+    key: &str,
+    value: Option<&T>,
+) {
+    if let Some(value) = value {
+        attributes.insert(key.to_owned(), value.to_string());
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn project_trace_metadata(
+    event: &SessionEvent,
+    trace: &bcode_session_models::SessionTraceEvent,
+    maximum_bytes: usize,
+) -> EventProjection {
+    use bcode_session_models::SessionTracePayload;
+
+    let (summary, mut attributes) = match &trace.payload {
+        SessionTracePayload::ModelRequestBuilt {
+            provider,
+            model,
+            agent_id,
+            ..
+        } => (
+            format!("model request built for {provider} {model}"),
+            BTreeMap::from([
+                ("provider".to_owned(), provider.clone()),
+                ("model".to_owned(), model.clone()),
+                ("agent".to_owned(), agent_id.clone()),
+            ]),
+        ),
+        SessionTracePayload::ProviderRound {
+            provider,
+            stop_reason,
+            error,
+            ..
+        } => (
+            error
+                .as_ref()
+                .map_or_else(|| format!("provider round {provider}"), Clone::clone),
+            BTreeMap::from([
+                ("provider".to_owned(), provider.clone()),
+                (
+                    "stop_reason".to_owned(),
+                    stop_reason.clone().unwrap_or_default(),
+                ),
+            ]),
+        ),
+        SessionTracePayload::ProviderEvent { event_type, detail } => (
+            detail.clone().unwrap_or_else(|| event_type.clone()),
+            BTreeMap::from([("event_type".to_owned(), event_type.clone())]),
+        ),
+        SessionTracePayload::ToolInvocationStarted {
+            tool_call_id,
+            plugin_id,
+            tool_name,
+            ..
+        } => (
+            format!("tool invocation started: {tool_name}"),
+            BTreeMap::from([
+                ("invocation_id".to_owned(), tool_call_id.clone()),
+                ("plugin_id".to_owned(), plugin_id.clone()),
+                ("tool_name".to_owned(), tool_name.clone()),
+            ]),
+        ),
+        SessionTracePayload::ToolPolicyEvaluated {
+            tool_call_id,
+            agent_id,
+            decision,
+            reason,
+        } => (
+            reason.clone().unwrap_or_else(|| decision.clone()),
+            BTreeMap::from([
+                ("invocation_id".to_owned(), tool_call_id.clone()),
+                ("agent".to_owned(), agent_id.clone()),
+                ("decision".to_owned(), decision.clone()),
+            ]),
+        ),
+        SessionTracePayload::ToolPermissionWait {
+            permission_id,
+            tool_call_id,
+            approved,
+            ..
+        } => (
+            "tool permission wait".to_owned(),
+            BTreeMap::from([
+                ("permission_id".to_owned(), permission_id.clone()),
+                ("invocation_id".to_owned(), tool_call_id.clone()),
+                (
+                    "approved".to_owned(),
+                    approved.map_or_else(String::new, |value| value.to_string()),
+                ),
+            ]),
+        ),
+        SessionTracePayload::ToolInvocationFinished {
+            tool_call_id,
+            is_error,
+            ..
+        } => (
+            if *is_error {
+                "tool invocation failed"
+            } else {
+                "tool invocation finished"
+            }
+            .to_owned(),
+            BTreeMap::from([
+                ("invocation_id".to_owned(), tool_call_id.clone()),
+                ("is_error".to_owned(), is_error.to_string()),
+            ]),
+        ),
+        SessionTracePayload::ContextCompaction {
+            reason,
+            compacted,
+            message,
+            ..
+        } => (
+            message.clone().unwrap_or_else(|| reason.clone()),
+            BTreeMap::from([("compacted".to_owned(), compacted.to_string())]),
+        ),
+        SessionTracePayload::ProviderStreamEvent(stream_event) => (
+            format!("provider stream event: {stream_event:?}"),
+            BTreeMap::new(),
+        ),
+    };
+    attributes.insert("trace_phase".to_owned(), format!("{:?}", trace.phase));
+    if let Some(turn_id) = &trace.turn_id {
+        attributes.insert("turn_id".to_owned(), turn_id.clone());
+    }
+    project_text(
+        event,
+        "trace-metadata",
+        SearchContentKind::TraceMetadata,
+        SearchField::Text,
+        &summary,
+        attributes,
+        maximum_bytes,
+    )
+}
+
+fn project_artifact_metadata(
+    event: &SessionEvent,
+    invocation_id: &str,
+    artifact: &bcode_session_models::ToolArtifact,
+    maximum_bytes: usize,
+) -> EventProjection {
+    let summary = artifact.title.as_ref().map_or_else(
+        || format!("tool artifact {}", artifact.schema),
+        |title| format!("{title} ({})", artifact.schema),
+    );
+    let mut attributes = BTreeMap::from([
+        ("invocation_id".to_owned(), invocation_id.to_owned()),
+        ("artifact_id".to_owned(), artifact.artifact_id.clone()),
+        (
+            "producer_plugin_id".to_owned(),
+            artifact.producer_plugin_id.clone(),
+        ),
+        ("artifact_schema".to_owned(), artifact.schema.clone()),
+        (
+            "artifact_schema_version".to_owned(),
+            artifact.schema_version.to_string(),
+        ),
+        (
+            "artifact_ref_count".to_owned(),
+            artifact.refs.len().to_string(),
+        ),
+    ]);
+    insert_optional_attribute(
+        &mut attributes,
+        "tool_call_id",
+        artifact.tool_call_id.as_ref(),
+    );
+    project_text(
+        event,
+        "artifact-metadata",
+        SearchContentKind::ArtifactMetadata,
+        SearchField::Text,
+        &summary,
+        attributes,
+        maximum_bytes,
+    )
 }
 
 fn project_transcript_event(
@@ -649,6 +1035,7 @@ fn shell_result_metadata(
     serde_json::from_value(artifact.metadata.clone()).ok()
 }
 
+#[allow(clippy::too_many_lines)]
 fn project_shell_result(
     event: &SessionEvent,
     record: &bcode_session_models::ToolInvocationResultRecord,
@@ -679,16 +1066,23 @@ fn project_shell_result(
                 output_bytes,
                 retained_output_bytes,
             );
+            let projection = project_text(
+                event,
+                "shell-combined-output",
+                SearchContentKind::ShellOutput,
+                SearchField::Text,
+                &output_tail,
+                attributes,
+                maximum_bytes,
+            );
             append_projected_records(
                 &mut records,
-                project_text(
-                    event,
-                    "shell-combined-output",
-                    SearchContentKind::ShellOutput,
-                    SearchField::Text,
-                    &output_tail,
-                    attributes,
-                    maximum_bytes,
+                with_source_accounting(
+                    projection,
+                    output_bytes,
+                    retained_output_bytes
+                        .or_else(|| Some(u64::try_from(output_tail.len()).unwrap_or(u64::MAX))),
+                    output_truncated,
                 ),
             );
         }
@@ -714,28 +1108,40 @@ fn project_shell_result(
                 sum_optional(stdout_bytes, stderr_bytes),
                 None,
             );
-            append_projected_records(
-                &mut records,
-                project_text(
-                    event,
-                    "shell-stdout",
-                    SearchContentKind::ShellOutput,
-                    SearchField::StandardOutput,
-                    &stdout,
-                    common.clone(),
-                    maximum_bytes,
-                ),
+            let stdout_projection = project_text(
+                event,
+                "shell-stdout",
+                SearchContentKind::ShellOutput,
+                SearchField::StandardOutput,
+                &stdout,
+                common.clone(),
+                maximum_bytes,
             );
             append_projected_records(
                 &mut records,
-                project_text(
-                    event,
-                    "shell-stderr",
-                    SearchContentKind::ShellOutput,
-                    SearchField::StandardError,
-                    &stderr,
-                    common,
-                    maximum_bytes,
+                with_source_accounting(
+                    stdout_projection,
+                    stdout_bytes,
+                    Some(u64::try_from(stdout.len()).unwrap_or(u64::MAX)),
+                    stdout_truncated,
+                ),
+            );
+            let stderr_projection = project_text(
+                event,
+                "shell-stderr",
+                SearchContentKind::ShellOutput,
+                SearchField::StandardError,
+                &stderr,
+                common,
+                maximum_bytes,
+            );
+            append_projected_records(
+                &mut records,
+                with_source_accounting(
+                    stderr_projection,
+                    stderr_bytes,
+                    Some(u64::try_from(stderr.len()).unwrap_or(u64::MAX)),
+                    stderr_truncated,
                 ),
             );
         }
@@ -745,6 +1151,33 @@ fn project_shell_result(
     } else {
         EventProjection::Records(records)
     }
+}
+
+fn with_source_accounting(
+    projection: EventProjection,
+    total_source_bytes: Option<u64>,
+    retained_source_bytes: Option<u64>,
+    upstream_truncated: bool,
+) -> EventProjection {
+    let EventProjection::Records(mut records) = projection else {
+        return projection;
+    };
+    for record in &mut records {
+        let inspected_bytes = record.source_range_end.unwrap_or_default();
+        let retained_bytes = retained_source_bytes.unwrap_or(record.source_bytes);
+        record.source_bytes = total_source_bytes.unwrap_or(retained_bytes);
+        record.source_range_end = Some(inspected_bytes.min(retained_bytes));
+        record.truncated = upstream_truncated
+            || record.truncated
+            || record
+                .source_range_end
+                .is_some_and(|end| end < record.source_bytes);
+        record.attributes.insert(
+            "retained_source_bytes".to_owned(),
+            retained_bytes.to_string(),
+        );
+    }
+    EventProjection::Records(records)
 }
 
 fn append_projected_records(target: &mut Vec<SessionSearchRecord>, projection: EventProjection) {
@@ -998,6 +1431,74 @@ fn remove_previous_text_character(text: &mut String) {
 mod tests {
     use super::*;
     use bcode_session_models::{SessionId, TurnAdmissionMetadata};
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct NormalizationFixture {
+        schema_version: u16,
+        cases: Vec<NormalizationFixtureCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct NormalizationFixtureCase {
+        name: String,
+        input_text: Option<String>,
+        input_hex: Option<String>,
+        input_repeat_text: Option<String>,
+        input_repeat_count: Option<usize>,
+        maximum_bytes: usize,
+        expected_text: Option<String>,
+        expected_text_repeat: Option<String>,
+        expected_text_repeat_count: Option<usize>,
+        expected_source_bytes_consumed: usize,
+        expected_source_truncated: bool,
+        expected_invalid_utf8_replaced: bool,
+    }
+
+    impl NormalizationFixtureCase {
+        fn input(&self) -> Vec<u8> {
+            match (
+                self.input_text.as_ref(),
+                self.input_hex.as_ref(),
+                self.input_repeat_text.as_ref(),
+            ) {
+                (Some(text), None, None) => text.as_bytes().to_vec(),
+                (None, Some(hex), None) => decode_hex(hex),
+                (None, None, Some(text)) => text
+                    .repeat(self.input_repeat_count.expect("repeat fixture count"))
+                    .into_bytes(),
+                _ => panic!("fixture '{}' has an invalid input specification", self.name),
+            }
+        }
+
+        fn expected_text(&self) -> String {
+            match (
+                self.expected_text.as_ref(),
+                self.expected_text_repeat.as_ref(),
+            ) {
+                (Some(text), None) => text.clone(),
+                (None, Some(text)) => text.repeat(
+                    self.expected_text_repeat_count
+                        .expect("expected repeat fixture count"),
+                ),
+                _ => panic!(
+                    "fixture '{}' has an invalid expected text specification",
+                    self.name
+                ),
+            }
+        }
+    }
+
+    fn decode_hex(hex: &str) -> Vec<u8> {
+        assert_eq!(hex.len() % 2, 0, "hex fixture must contain byte pairs");
+        hex.as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let pair = std::str::from_utf8(pair).expect("fixture hex is ASCII");
+                u8::from_str_radix(pair, 16).expect("fixture hex byte")
+            })
+            .collect()
+    }
 
     fn event(sequence: u64, kind: SessionEventKind) -> SessionEvent {
         SessionEvent {
@@ -1007,6 +1508,41 @@ mod tests {
             session_id: SessionId::new(),
             provenance: None,
             kind,
+        }
+    }
+
+    #[test]
+    fn normalization_v1_matches_retained_golden_fixtures() {
+        let fixture: NormalizationFixture = serde_json::from_str(include_str!(
+            "../tests/fixtures/terminal-normalization-v1.json"
+        ))
+        .expect("normalization fixture must deserialize");
+        assert_eq!(fixture.schema_version, CURRENT_NORMALIZATION_VERSION);
+
+        for case in fixture.cases {
+            let input = case.input();
+            let normalized = normalize_terminal_bytes(&input, case.maximum_bytes);
+            assert_eq!(normalized.text, case.expected_text(), "case: {}", case.name);
+            assert_eq!(
+                normalized.source_bytes_consumed, case.expected_source_bytes_consumed,
+                "case: {}",
+                case.name
+            );
+            assert_eq!(
+                normalized.source_truncated, case.expected_source_truncated,
+                "case: {}",
+                case.name
+            );
+            assert_eq!(
+                normalized.invalid_utf8_replaced, case.expected_invalid_utf8_replaced,
+                "case: {}",
+                case.name
+            );
+            assert!(
+                normalized.text.len() <= case.maximum_bytes,
+                "case: {}",
+                case.name
+            );
         }
     }
 
@@ -1035,6 +1571,31 @@ mod tests {
         assert!(normalized.source_truncated);
         assert!(normalized.invalid_utf8_replaced);
         assert!(normalized.text.len() <= 6);
+    }
+
+    #[test]
+    fn byte_normalization_is_bounded_for_deterministic_arbitrary_bytes() {
+        let mut state = 0x4d59_5df4_d0f3_3173_u64;
+        for case_index in 0..2_048_usize {
+            let length = case_index % 1_025;
+            let mut input = Vec::with_capacity(length);
+            for _ in 0..length {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                input.push(state.to_le_bytes()[4]);
+            }
+            let maximum = case_index % 257;
+            let normalized = normalize_terminal_bytes(&input, maximum);
+            assert!(normalized.text.len() <= maximum);
+            assert!(normalized.source_bytes_consumed <= maximum.min(input.len()));
+            assert_eq!(normalized.normalized_bytes, normalized.text.len());
+            assert!(std::str::from_utf8(normalized.text.as_bytes()).is_ok());
+            assert_eq!(normalized.source_truncated, input.len() > maximum);
+
+            let repeated = normalize_terminal_bytes(&input, maximum);
+            assert_eq!(normalized, repeated);
+        }
     }
 
     #[test]
@@ -1283,6 +1844,23 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert_eq!(records[0].field, Some(SearchField::StandardOutput));
         assert_eq!(records[1].field, Some(SearchField::StandardError));
+        assert_eq!(records[0].source_bytes, 3);
+        assert_eq!(records[0].source_range_start, Some(0));
+        assert_eq!(records[0].source_range_end, Some(3));
+        assert!(!records[0].truncated);
+        assert_eq!(records[1].source_bytes, 99);
+        assert_eq!(records[1].source_range_start, Some(0));
+        assert_eq!(records[1].source_range_end, Some(5));
+        assert!(records[1].truncated);
+        assert_eq!(records[1].normalized_bytes, 5);
+        assert_eq!(records[1].indexed_bytes, 5);
+        assert_eq!(
+            records[1]
+                .attributes
+                .get("retained_source_bytes")
+                .map(String::as_str),
+            Some("5")
+        );
         assert_eq!(
             records[0].attributes.get("exit_code").map(String::as_str),
             Some("1")
@@ -1294,6 +1872,177 @@ mod tests {
                 .map(String::as_str),
             Some("true")
         );
+    }
+
+    #[test]
+    fn sensitive_metadata_categories_are_independently_gated_and_allowlisted() {
+        let permission = event(
+            20,
+            SessionEventKind::PermissionRequested {
+                permission_id: "permission-1".to_owned(),
+                tool_call_id: "call-1".to_owned(),
+                producer_plugin_id: Some("plugin".to_owned()),
+                tool_name: "filesystem.write".to_owned(),
+                arguments_json: r#"{"secret":"do-not-index"}"#.to_owned(),
+                batch: None,
+                policy_source: Some("agent-policy".to_owned()),
+                policy_reason: Some("requires approval".to_owned()),
+            },
+        );
+        assert_eq!(
+            project_event(&permission, &SearchProjectionPolicy::default()),
+            Ok(EventProjection::Excluded(
+                ProjectionExclusion::DisabledByPolicy
+            ))
+        );
+        let projection = project_event(
+            &permission,
+            &SearchProjectionPolicy {
+                permissions: ProjectionContentPolicy::Include,
+                ..SearchProjectionPolicy::default()
+            },
+        )
+        .expect("project permission");
+        let EventProjection::Records(records) = projection else {
+            panic!("permission must produce one record");
+        };
+        assert_eq!(records[0].content_kind, SearchContentKind::Permission);
+        assert!(
+            !records[0]
+                .text
+                .as_deref()
+                .unwrap_or_default()
+                .contains("secret")
+        );
+
+        let runtime = event(
+            21,
+            SessionEventKind::RuntimeWorkProgress {
+                work_id: bcode_session_models::WorkId::new("work-1"),
+                message: "indexing session".to_owned(),
+                progress_at_ms: Some(123),
+                completed_units: Some(2),
+                total_units: Some(4),
+            },
+        );
+        let projection = project_event(
+            &runtime,
+            &SearchProjectionPolicy {
+                runtime_diagnostics: ProjectionContentPolicy::Include,
+                ..SearchProjectionPolicy::default()
+            },
+        )
+        .expect("project runtime diagnostic");
+        let EventProjection::Records(records) = projection else {
+            panic!("runtime diagnostic must produce one record");
+        };
+        assert_eq!(
+            records[0].content_kind,
+            SearchContentKind::RuntimeDiagnostic
+        );
+        assert_eq!(
+            records[0]
+                .attributes
+                .get("completed_units")
+                .map(String::as_str),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn trace_and_artifact_projection_excludes_blob_paths_and_opaque_metadata() {
+        let trace = event(
+            22,
+            SessionEventKind::TraceEvent {
+                trace: Box::new(bcode_session_models::SessionTraceEvent {
+                    timestamp_ms: 123,
+                    turn_id: Some("turn-1".to_owned()),
+                    phase: bcode_session_models::SessionTracePhase::ModelRequestBuilt,
+                    payload: bcode_session_models::SessionTracePayload::ModelRequestBuilt {
+                        provider: "provider".to_owned(),
+                        model: "model".to_owned(),
+                        agent_id: "agent".to_owned(),
+                        message_count: 1,
+                        tool_count: 1,
+                        system_prompt_chars: 10,
+                        prompt_cache_mode: "none".to_owned(),
+                        conversation_reuse_mode: "none".to_owned(),
+                        uses_previous_provider_response: false,
+                        metadata: BTreeMap::from([(
+                            "secret".to_owned(),
+                            "do-not-index".to_owned(),
+                        )]),
+                        request: Some(bcode_session_models::TraceBlobRef {
+                            sha256: "digest".to_owned(),
+                            path: "/secret/request.json".to_owned(),
+                            content_type: "application/json".to_owned(),
+                            byte_len: 100,
+                            redaction: bcode_session_models::TraceRedaction::Automatic,
+                            completeness: bcode_session_models::TraceBlobCompleteness::Complete,
+                        }),
+                    },
+                }),
+            },
+        );
+        let trace_projection = project_event(
+            &trace,
+            &SearchProjectionPolicy {
+                trace_metadata: ProjectionContentPolicy::Include,
+                ..SearchProjectionPolicy::default()
+            },
+        )
+        .expect("project trace metadata");
+        let EventProjection::Records(trace_records) = trace_projection else {
+            panic!("trace must produce one record");
+        };
+        let encoded = serde_json::to_string(&trace_records).expect("encode trace records");
+        assert!(!encoded.contains("do-not-index"));
+        assert!(!encoded.contains("/secret/request.json"));
+
+        let artifact = event(
+            23,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-1".to_owned(),
+                    model_output: "visible model output".to_owned(),
+                    is_error: false,
+                    presentation: None,
+                    result: Some(ToolInvocationResult::Artifact {
+                        artifact: Box::new(bcode_session_models::ToolArtifact {
+                            artifact_id: "artifact-1".to_owned(),
+                            producer_plugin_id: "plugin".to_owned(),
+                            schema: "example.artifact".to_owned(),
+                            schema_version: 1,
+                            tool_call_id: Some("call-1".to_owned()),
+                            title: Some("Report".to_owned()),
+                            metadata: serde_json::json!({"secret": "do-not-index"}),
+                            refs: vec![bcode_session_models::ToolArtifactRef {
+                                key: "payload".to_owned(),
+                                content_type: Some("text/plain".to_owned()),
+                                storage_uri: Some("file:///secret/artifact".to_owned()),
+                                byte_len: Some(100),
+                                metadata: None,
+                            }],
+                        }),
+                    }),
+                },
+            },
+        );
+        let artifact_projection = project_event(
+            &artifact,
+            &SearchProjectionPolicy {
+                artifact_metadata: ProjectionContentPolicy::Include,
+                ..SearchProjectionPolicy::default()
+            },
+        )
+        .expect("project artifact metadata");
+        let EventProjection::Records(artifact_records) = artifact_projection else {
+            panic!("artifact must produce one record");
+        };
+        let encoded = serde_json::to_string(&artifact_records).expect("encode artifact records");
+        assert!(!encoded.contains("do-not-index"));
+        assert!(!encoded.contains("file:///secret/artifact"));
+        assert!(!encoded.contains("visible model output"));
     }
 
     #[test]

@@ -134,18 +134,30 @@ session reads using stable locators. Missing or stale locators are surfaced rath
 ## Federation and query planning
 
 A session-search coordinator at the application boundary discovers provider capabilities and plans
-queries across configured content routes. Routes may identify primary, fallback, parallel, or
-disjoint-coverage providers. Queries are not broadcast blindly when providers overlap.
+queries across configured content routes. The generic plugin runtime retains its resolved selection
+inventory so explicitly disabled or configured-unavailable search providers can be reported before
+loading; non-loaded providers are identified only by the `session-search` plugin naming convention or
+a plugin-owned `session_search_provider = true` configuration marker. Routes may identify primary,
+fallback, parallel, or disjoint-coverage providers. Queries are not broadcast blindly when providers
+overlap.
 
-Eligible providers may execute concurrently with end-to-end cancellation, bounded concurrency,
-per-provider deadlines, and an overall deadline. Fast indexed results are not held indefinitely by
-cold or deep scans. Provider scores are opaque and are not treated as directly comparable across
-backends. Results are grouped or combined using backend-neutral rank information, then deduplicated
-by canonical locator.
+Eligible providers may execute concurrently with bounded concurrency, independently configured
+per-provider deadlines capped by an overall deadline, and end-to-end cancellation. Timed provider
+calls cancel the generic runtime invocation token propagated through the plugin ABI before returning
+their terminal timeout; dropping a future alone is not treated as cancellation. Planning has an
+explicit execution class: ordinary search excludes scan providers and applies a configured canonical
+sequence-lag threshold, while deep search may select scan providers and relax freshness only when
+requested. Fast indexed results are not held indefinitely by cold or deep scans. Provider scores are
+opaque and are not treated as directly comparable across backends. Results are grouped or combined
+using backend-neutral rank information, then deduplicated by canonical locator.
 
-Every response reports what was searched and what was not, including provider completion, timeout,
-failure, unsupported features, stale checkpoints, content exclusions, truncation, quotas, and
-covered ranges. Query-execution completeness and corpus-coverage completeness are distinct.
+Every v1 response is one bounded terminal aggregate; partial provider response streaming is deferred.
+Every provider contribution or failure identifies its terminal stage, elapsed time, requested/searched
+or hydration-affected content, completion, timeout/failure classification, stale checkpoints, content
+exclusions, truncation, quotas, and covered ranges. Failed canonical hydration adds a hydration-stage
+stale-provider outcome and makes query/coverage completeness false rather than leaving a successful
+provider report unqualified. Query-execution completeness and corpus-coverage completeness are
+distinct.
 
 ## Ingestion and maintenance
 
@@ -177,12 +189,24 @@ search semantics do not depend on that choice.
 
 Reasoning, command text, tool arguments, shell output, other tool output, permissions, diagnostics,
 traces, and artifacts have independent policy controls. Sensitive/high-volume categories use
-conservative defaults and explicit limits.
+conservative defaults and explicit limits. Trace projection includes only allowlisted semantic
+summaries and identifiers; trace blobs, blob paths, opaque metadata, and request/output payloads are
+excluded. Artifact projection includes only identity, producer, schema, title, and reference count;
+opaque metadata, storage URIs, and artifact bytes are excluded.
 
-Providers enforce bounded records, batches, responses, snippets, writer memory, concurrency,
-invocation/session content, and total derived storage. Reaching a quota preserves valid derived data,
-stops or narrows advancement, and reports incomplete coverage. It does not silently claim
-completeness or mutate canonical history.
+Projection records report original source bytes, retained/inspected source ranges, normalized bytes,
+indexed bytes, truncation, and normalization/policy versions. Split shell stdout/stderr records retain
+their own canonical byte totals rather than inheriting an invocation-wide total; aggregate invocation
+bytes remain explicit metadata.
+
+Provider ingestion has three independent content bounds before a batch may cross the plugin boundary:
+individual normalized record text, aggregate normalized text and serialized payload for one invocation,
+and cumulative normalized text for one canonical session. The session aggregate is carried as an
+expected prior byte count that providers compare with atomically retained accounting; it is quota
+coordination, not a durable-resume cursor. Providers additionally enforce writer-memory and total
+derived-storage quotas. Reaching a quota preserves valid derived data, stops or narrows advancement,
+and reports incomplete coverage. It does not silently claim completeness or mutate canonical
+history.
 
 Provider paths are canonicalized and confined to authorized derived-state roots. Public errors,
 diagnostics, logs, and metrics are bounded and secret-safe. Remote providers require separately

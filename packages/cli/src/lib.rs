@@ -7186,8 +7186,13 @@ async fn session_search(
     }
     for failure in &response.failures {
         eprintln!(
-            "provider {} failed ({:?}): {}",
-            failure.plugin_id, failure.error.code, failure.error.message
+            "provider {} {:?} ({:?}, elapsed={}ms, content={:?}): {}",
+            failure.plugin_id,
+            failure.stage,
+            failure.error.code,
+            failure.elapsed_ms,
+            failure.content,
+            failure.error.message
         );
     }
     for hydrated in &hydrated_hits {
@@ -7243,8 +7248,12 @@ async fn session_search_status(json: bool) -> Result<(), CliError> {
     }
     for failure in response.failures {
         eprintln!(
-            "provider {} failed ({:?}): {}",
-            failure.plugin_id, failure.error.code, failure.error.message
+            "provider {} {:?} ({:?}, elapsed={}ms): {}",
+            failure.plugin_id,
+            failure.stage,
+            failure.error.code,
+            failure.elapsed_ms,
+            failure.error.message
         );
     }
     Ok(())

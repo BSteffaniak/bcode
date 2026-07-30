@@ -3031,7 +3031,9 @@ async fn run_with_static_bundled_inner(
     } else {
         MetricsRegistry::disabled()
     };
-    let plugins = plugins.with_metrics(metrics.clone());
+    let plugins = plugins
+        .with_selection(plugin_selection.clone())
+        .with_metrics(metrics.clone());
     let sessions = SessionManager::persistent_lazy_with_metrics_and_lease_owner(
         bcode_config::default_session_store_dir(),
         metrics.clone(),
@@ -8244,9 +8246,16 @@ async fn handle_session_search(
     hydrate: bool,
 ) -> Result<(), ServerError> {
     match session_search::search_federated_with_routes(state, &request, &routes).await {
-        Ok(response) => {
+        Ok(mut response) => {
             let hydrated_hits = if hydrate {
-                session_search::hydrate_hits(state, response.hits.clone()).await
+                let started = std::time::Instant::now();
+                let hydrated = session_search::hydrate_hits(state, response.hits.clone()).await;
+                session_search::report_hydration_outcomes(
+                    &mut response,
+                    &hydrated,
+                    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                );
+                hydrated
             } else {
                 Vec::new()
             };

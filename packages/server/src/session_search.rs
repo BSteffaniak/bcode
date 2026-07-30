@@ -7,7 +7,7 @@ use bcode_session_search::{
     SearchHitHydrationOutcome, SessionSearchCapabilities, SessionSearchContentRoute,
     SessionSearchProviderFailure, SessionSearchProviderInfo, SessionSearchRequest,
     SessionSearchResponse, SessionSearchServiceError, SessionSearchStatus,
-    aggregate_federated_search, plan_session_search, plan_session_search_with_routes,
+    aggregate_federated_search, plan_session_search_with_policy_and_routes,
 };
 use futures::future::join_all;
 use std::time::{Duration, Instant};
@@ -18,6 +18,7 @@ use crate::ServerState;
 ///
 /// Provider-local failures are returned as normalized entries so one malformed or unavailable
 /// provider does not conceal healthy providers.
+#[allow(clippy::too_many_lines)]
 pub async fn list_providers(state: &ServerState) -> ListSessionSearchProvidersResponse {
     let provider_ids = state
         .plugins
@@ -28,7 +29,7 @@ pub async fn list_providers(state: &ServerState) -> ListSessionSearchProvidersRe
         .unwrap_or_default();
     let mut providers = Vec::new();
     let mut failures = Vec::new();
-    for plugin_id in provider_ids {
+    for plugin_id in provider_ids.iter().cloned() {
         let capabilities = state
             .plugins
             .invoke_service_json::<_, SessionSearchCapabilities>(
@@ -110,10 +111,49 @@ pub async fn list_providers(state: &ServerState) -> ListSessionSearchProvidersRe
             )),
         }
     }
+    for plugin_id in &state.plugins.selection().disabled {
+        if !provider_ids.contains(plugin_id)
+            && looks_like_session_search_provider(plugin_id, state.plugins.configs().get(plugin_id))
+        {
+            failures.push(provider_failure(
+                plugin_id.clone(),
+                SearchErrorCode::ProviderUnavailable,
+                "session-search provider is explicitly disabled by configuration",
+                false,
+            ));
+        }
+    }
+    for plugin_id in &state.plugins.selection().enabled {
+        if !provider_ids.contains(plugin_id)
+            && !state.plugins.plugin_ids().contains(plugin_id)
+            && looks_like_session_search_provider(plugin_id, state.plugins.configs().get(plugin_id))
+        {
+            failures.push(provider_failure(
+                plugin_id.clone(),
+                SearchErrorCode::ProviderUnavailable,
+                "configured session-search provider is unavailable or failed to load",
+                true,
+            ));
+        }
+    }
+    failures.sort_by(|left, right| left.plugin_id.cmp(&right.plugin_id));
     ListSessionSearchProvidersResponse {
         providers,
         failures,
     }
+}
+
+fn looks_like_session_search_provider(
+    plugin_id: &str,
+    config: Option<&bcode_plugin::ResolvedPluginConfig>,
+) -> bool {
+    plugin_id.contains("session-search")
+        || config.is_some_and(|config| {
+            config
+                .config
+                .get("session_search_provider")
+                .is_some_and(|value| matches!(value, serde_json::Value::Bool(true)))
+        })
 }
 
 /// Invoke one exact provider through the backend-neutral search contract.
@@ -126,6 +166,15 @@ pub async fn search_provider(
     state: &ServerState,
     plugin_id: &str,
     request: &SessionSearchRequest,
+) -> Result<SessionSearchResponse, SessionSearchServiceError> {
+    search_provider_with_timeout(state, plugin_id, request, Duration::from_secs(30)).await
+}
+
+async fn search_provider_with_timeout(
+    state: &ServerState,
+    plugin_id: &str,
+    request: &SessionSearchRequest,
+    timeout: Duration,
 ) -> Result<SessionSearchResponse, SessionSearchServiceError> {
     request
         .validate()
@@ -175,18 +224,41 @@ pub async fn search_provider(
             message: bounded_message(&error.to_string()),
             retryable: false,
         })?;
+    let payload = serde_json::to_vec(request).map_err(|error| SessionSearchServiceError {
+        code: SearchErrorCode::InvalidRequest,
+        message: bounded_message(&error.to_string()),
+        retryable: false,
+    })?;
     let response = state
         .plugins
-        .invoke_service_json::<_, SessionSearchResponse>(
+        .invoke_service_scoped_with_timeout(
             plugin_id,
             SESSION_SEARCH_INTERFACE_ID,
             OP_SEARCH,
-            request,
+            payload,
+            bcode_plugin::PluginInvocationScope::Global,
+            timeout,
         )
         .await
+        .map_err(|error| {
+            let deadline = matches!(
+                error,
+                bcode_plugin::PluginLoadError::ServiceInvocationTimeout { .. }
+            );
+            SessionSearchServiceError {
+                code: if deadline {
+                    SearchErrorCode::DeadlineExceeded
+                } else {
+                    SearchErrorCode::ProviderUnavailable
+                },
+                message: bounded_message(&error.to_string()),
+                retryable: true,
+            }
+        })?;
+    let response = bcode_plugin::decode_service_response::<SessionSearchResponse>(response)
         .map_err(|error| SessionSearchServiceError {
             code: SearchErrorCode::ProviderUnavailable,
-            message: error.to_string(),
+            message: bounded_message(&error.to_string()),
             retryable: true,
         })?;
     validate_provider_response(plugin_id, request, &response)?;
@@ -216,6 +288,15 @@ fn validate_provider_response(
             retryable: false,
         });
     }
+    validate_provider_hits(plugin_id, response)?;
+    validate_provider_diagnostics_and_cursor(plugin_id, response)?;
+    Ok(())
+}
+
+fn validate_provider_hits(
+    plugin_id: &str,
+    response: &SessionSearchResponse,
+) -> Result<(), SessionSearchServiceError> {
     if response.hits.iter().any(|hit| hit.provider_id != plugin_id) {
         return Err(SessionSearchServiceError {
             code: SearchErrorCode::InvalidRequest,
@@ -234,6 +315,60 @@ fn validate_provider_response(
             retryable: false,
         });
     }
+    for (index, hit) in response.hits.iter().enumerate() {
+        if hit.provider_rank == 0
+            || usize::try_from(hit.provider_rank).map_or(true, |rank| rank > response.hits.len())
+        {
+            return Err(SessionSearchServiceError {
+                code: SearchErrorCode::InvalidRequest,
+                message: "provider returned an invalid hit rank".to_owned(),
+                retryable: false,
+            });
+        }
+        if index > 0 && hit.provider_rank <= response.hits[index - 1].provider_rank {
+            return Err(SessionSearchServiceError {
+                code: SearchErrorCode::InvalidRequest,
+                message: "provider hit ranks are not strictly increasing".to_owned(),
+                retryable: false,
+            });
+        }
+        if hit.provider_score.as_ref().is_some_and(|score| {
+            score.is_empty() || score.len() > bcode_session_search::MAX_CURSOR_BYTES
+        }) {
+            return Err(SessionSearchServiceError {
+                code: SearchErrorCode::InvalidRequest,
+                message: "provider returned an invalid opaque score".to_owned(),
+                retryable: false,
+            });
+        }
+        if hit.locator.record_id.as_ref().is_some_and(|record_id| {
+            record_id.is_empty() || record_id.len() > bcode_session_search::MAX_CURSOR_BYTES
+        }) {
+            return Err(SessionSearchServiceError {
+                code: SearchErrorCode::InvalidRequest,
+                message: "provider returned an invalid record identity".to_owned(),
+                retryable: false,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider_diagnostics_and_cursor(
+    plugin_id: &str,
+    response: &SessionSearchResponse,
+) -> Result<(), SessionSearchServiceError> {
+    if response
+        .message
+        .as_ref()
+        .is_some_and(|message| message.len() > bcode_session_search::MAX_HIT_PREVIEW_BYTES)
+    {
+        return Err(SessionSearchServiceError {
+            code: SearchErrorCode::InvalidRequest,
+            message: "provider returned an oversized diagnostic message".to_owned(),
+            retryable: false,
+        });
+    }
     if response
         .next_cursor
         .as_ref()
@@ -245,14 +380,26 @@ fn validate_provider_response(
             retryable: false,
         });
     }
+    if response.next_cursor.as_ref().is_some_and(|cursor| {
+        cursor.query_fingerprint.is_empty()
+            || cursor.query_fingerprint.len() > bcode_session_search::MAX_CURSOR_BYTES
+            || cursor.value.is_empty()
+            || cursor.value.len() > bcode_session_search::MAX_CURSOR_BYTES
+    }) {
+        return Err(SessionSearchServiceError {
+            code: SearchErrorCode::InvalidRequest,
+            message: "provider returned an invalid cursor payload".to_owned(),
+            retryable: false,
+        });
+    }
     Ok(())
 }
 
 /// Execute one bounded terminal federated search using deterministic grouped provider ordering.
 ///
 /// Canonical hit hydration is intentionally separate: this function returns provider locators and
-/// bounded previews only. Dropping timed-out invocation futures bounds waiting, but does not claim
-/// transport-level cancellation or durable resume semantics.
+/// bounded previews only. Per-provider timeouts propagate cancellation through the generic plugin
+/// runtime and ABI. This terminal aggregate does not claim durable resume semantics.
 ///
 /// # Errors
 ///
@@ -276,6 +423,27 @@ pub async fn search_federated_with_routes(
     request: &SessionSearchRequest,
     routes: &[SessionSearchContentRoute],
 ) -> Result<FederatedSessionSearchResponse, SessionSearchServiceError> {
+    search_federated_with_policy_and_routes(
+        state,
+        request,
+        &bcode_session_search::SessionSearchPlanPolicy::default(),
+        routes,
+    )
+    .await
+}
+
+/// Execute a bounded terminal federated search with explicit execution/freshness policy.
+///
+/// # Errors
+///
+/// Returns an invalid-request error when request or plan policy validation fails; provider failures
+/// remain in the terminal aggregate.
+pub async fn search_federated_with_policy_and_routes(
+    state: &ServerState,
+    request: &SessionSearchRequest,
+    policy: &bcode_session_search::SessionSearchPlanPolicy,
+    routes: &[SessionSearchContentRoute],
+) -> Result<FederatedSessionSearchResponse, SessionSearchServiceError> {
     request
         .validate()
         .map_err(|error| SessionSearchServiceError {
@@ -284,11 +452,8 @@ pub async fn search_federated_with_routes(
             retryable: false,
         })?;
     let discovery = list_providers(state).await;
-    let plan = if routes.is_empty() {
-        plan_session_search(request, discovery)
-    } else {
-        plan_session_search_with_routes(request, discovery, routes)
-    };
+    let plan = plan_session_search_with_policy_and_routes(request, discovery, policy, routes);
+    let per_provider_deadline = Duration::from_millis(plan.per_provider_deadline_ms.max(1));
     let mut failures = plan.failures;
     let mut providers = plan.providers;
     if providers.len() > MAX_FEDERATED_PROVIDERS {
@@ -308,12 +473,18 @@ pub async fn search_federated_with_routes(
         async move {
             let provider_started = Instant::now();
             let remaining = deadline.saturating_sub(started.elapsed());
-            let result = if remaining.is_zero() {
+            let call_deadline = remaining.min(per_provider_deadline);
+            let result = if call_deadline.is_zero() {
                 Err(timeout_error())
             } else {
                 tokio::time::timeout(
-                    remaining,
-                    search_provider(state, &provider.plugin_id, &provider_request),
+                    call_deadline,
+                    search_provider_with_timeout(
+                        state,
+                        &provider.plugin_id,
+                        &provider_request,
+                        call_deadline,
+                    ),
                 )
                 .await
                 .unwrap_or_else(|_| Err(timeout_error()))
@@ -348,6 +519,9 @@ pub async fn search_federated_with_routes(
             Err(error) => failures.push(SessionSearchProviderFailure {
                 plugin_id: provider_id,
                 error,
+                stage: bcode_session_search::SessionSearchProviderStage::Execution,
+                elapsed_ms,
+                content: provider_request_content_for_failure(request),
             }),
         }
     }
@@ -356,6 +530,50 @@ pub async fn search_federated_with_routes(
         failures,
         request.limit,
     ))
+}
+
+pub fn report_hydration_outcomes(
+    response: &mut FederatedSessionSearchResponse,
+    hydrated_hits: &[HydratedSessionSearchHit],
+    elapsed_ms: u64,
+) {
+    use bcode_session_search::SessionSearchProviderStage;
+
+    let mut affected = std::collections::BTreeMap::<
+        String,
+        std::collections::BTreeSet<bcode_session_search::SearchContentKind>,
+    >::new();
+    for hydrated in hydrated_hits {
+        if hydrated.outcome != SearchHitHydrationOutcome::Hydrated {
+            affected
+                .entry(hydrated.hit.provider_id.clone())
+                .or_default()
+                .insert(hydrated.hit.content_kind);
+        }
+    }
+    for (provider_id, content) in affected {
+        response.failures.push(SessionSearchProviderFailure {
+            plugin_id: provider_id,
+            error: SessionSearchServiceError {
+                code: SearchErrorCode::StaleIndex,
+                message: "one or more provider locators could not be hydrated canonically"
+                    .to_owned(),
+                retryable: false,
+            },
+            stage: SessionSearchProviderStage::Hydration,
+            elapsed_ms,
+            content: content.into_iter().collect(),
+        });
+    }
+    if !response.failures.is_empty() {
+        response.query_complete = false;
+        response.coverage_complete = false;
+    }
+    response.failures.sort_by(|left, right| {
+        left.plugin_id
+            .cmp(&right.plugin_id)
+            .then(left.stage.cmp(&right.stage))
+    });
 }
 
 /// Hydrate provider locators through exact bounded canonical reads.
@@ -434,6 +652,12 @@ fn hydration_error(
     }
 }
 
+fn provider_request_content_for_failure(
+    request: &SessionSearchRequest,
+) -> Vec<bcode_session_search::SearchContentKind> {
+    request.filters.content_kinds.iter().copied().collect()
+}
+
 fn request_for_provider(
     request: &SessionSearchRequest,
     provider: &SessionSearchProviderInfo,
@@ -471,6 +695,9 @@ fn provider_failure(
             message: bounded_message(message),
             retryable,
         },
+        stage: bcode_session_search::SessionSearchProviderStage::Discovery,
+        elapsed_ms: 0,
+        content: Vec::new(),
     }
 }
 
@@ -489,6 +716,138 @@ fn bounded_message(message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bcode_session_models::SessionId;
+    use bcode_session_search::{
+        ProviderSearchOutcome, SearchContentKind, SearchField, SessionSearchHit,
+        SessionSearchLocator,
+    };
+
+    fn request() -> SessionSearchRequest {
+        SessionSearchRequest {
+            query: bcode_session_search::SessionSearchQuery::Text {
+                text: "needle".to_owned(),
+                mode: bcode_session_search::TextMatchMode::Terms,
+                fields: std::collections::BTreeSet::new(),
+            },
+            filters: bcode_session_search::SessionSearchFilters::default(),
+            sort: bcode_session_search::SessionSearchSort::ProviderRelevance,
+            limit: 2,
+            cursor: None,
+            deadline_ms: Some(100),
+        }
+    }
+
+    fn response() -> SessionSearchResponse {
+        SessionSearchResponse {
+            provider_id: "provider".to_owned(),
+            outcome: ProviderSearchOutcome::Complete,
+            hits: vec![SessionSearchHit {
+                locator: SessionSearchLocator {
+                    session_id: SessionId::new(),
+                    sequence: 1,
+                    record_id: Some("record-1".to_owned()),
+                },
+                content_kind: SearchContentKind::UserMessage,
+                matched_field: SearchField::Text,
+                provider_id: "provider".to_owned(),
+                provider_rank: 1,
+                provider_score: Some("opaque".to_owned()),
+                preview: Some("match".to_owned()),
+                preview_truncated: false,
+            }],
+            next_cursor: None,
+            query_complete: true,
+            coverage_complete: true,
+            searched_content: vec![SearchContentKind::UserMessage],
+            excluded_content: Vec::new(),
+            message: None,
+        }
+    }
+
+    #[test]
+    fn malformed_provider_response_fields_are_rejected() {
+        let request = request();
+        let mut malformed = response();
+        malformed.hits[0].provider_rank = 0;
+        assert!(validate_provider_response("provider", &request, &malformed).is_err());
+
+        let mut malformed = response();
+        malformed.hits[0].provider_score =
+            Some("x".repeat(bcode_session_search::MAX_CURSOR_BYTES + 1));
+        assert!(validate_provider_response("provider", &request, &malformed).is_err());
+
+        let mut malformed = response();
+        malformed.message = Some("x".repeat(bcode_session_search::MAX_HIT_PREVIEW_BYTES + 1));
+        assert!(validate_provider_response("provider", &request, &malformed).is_err());
+
+        let mut malformed = response();
+        malformed.next_cursor = Some(bcode_session_search::SearchCursor {
+            provider_id: "provider".to_owned(),
+            query_fingerprint: String::new(),
+            value: "cursor".to_owned(),
+        });
+        assert!(validate_provider_response("provider", &request, &malformed).is_err());
+    }
+
+    #[test]
+    fn valid_provider_response_is_accepted() {
+        assert_eq!(
+            validate_provider_response("provider", &request(), &response()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn stale_hydration_is_reported_as_provider_failure() {
+        let provider_response = response();
+        let hit = provider_response.hits[0].clone();
+        let mut aggregate = bcode_session_search::FederatedSessionSearchResponse {
+            hits: vec![hit.clone()],
+            query_complete: true,
+            coverage_complete: true,
+            providers: Vec::new(),
+            failures: Vec::new(),
+        };
+        let hydrated = vec![HydratedSessionSearchHit {
+            hit,
+            outcome: SearchHitHydrationOutcome::StaleLocator,
+            event: None,
+            message: Some("stale".to_owned()),
+        }];
+        report_hydration_outcomes(&mut aggregate, &hydrated, 12);
+        assert!(!aggregate.query_complete);
+        assert!(!aggregate.coverage_complete);
+        assert_eq!(aggregate.failures.len(), 1);
+        assert_eq!(
+            aggregate.failures[0].stage,
+            bcode_session_search::SessionSearchProviderStage::Hydration
+        );
+        assert_eq!(aggregate.failures[0].elapsed_ms, 12);
+        assert_eq!(
+            aggregate.failures[0].content,
+            vec![SearchContentKind::UserMessage]
+        );
+    }
+
+    #[test]
+    fn configured_session_search_provider_inventory_is_identified_conservatively() {
+        let config = bcode_plugin::ResolvedPluginConfig::new(
+            serde_json::json!({"session_search_provider": true}),
+            serde_json::json!({"session_search_provider": true}),
+        );
+        assert!(looks_like_session_search_provider(
+            "custom.provider",
+            Some(&config)
+        ));
+        assert!(looks_like_session_search_provider(
+            "example.session-search",
+            None
+        ));
+        assert!(!looks_like_session_search_provider(
+            "unrelated.plugin",
+            None
+        ));
+    }
 
     #[test]
     fn provider_errors_are_utf8_safely_bounded() {

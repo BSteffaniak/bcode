@@ -65,11 +65,11 @@ if rg -n 'bcode\.(loop|filesystem|shell|question|worktree|vim-edit|web-search|oc
   violations=1
 fi
 
-# These three provider-ID branches are existing domain leaks recorded in the migration ledger.
-# Freeze them until provider capabilities replace them; do not permit another concrete-ID branch.
+# These three provider-ID branches are recorded compatibility behavior. Freeze the exact count until
+# provider capabilities replace them; line movement must not make the guard report their removal.
 provider_branch_count="$(
   rg -n 'Some\("bcode\.(openai-compatible|bedrock)"\) =>' packages/server/src/lib.rs \
-    | awk -F: '$1 < 19000 {count += 1} END {print count + 0}'
+    | awk 'END {print NR + 0}'
 )"
 if [[ "$provider_branch_count" != "3" ]]; then
   echo "Runtime architecture violation: expected exactly three recorded provider-ID branches, found $provider_branch_count." >&2

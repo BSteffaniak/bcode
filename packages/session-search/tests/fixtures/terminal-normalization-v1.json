@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "clean transcript text",
+      "input_text": "user: hello\nassistant: hi\n",
+      "maximum_bytes": 128,
+      "expected_text": "user: hello\nassistant: hi\n",
+      "expected_source_bytes_consumed": 26,
+      "expected_source_truncated": false,
+      "expected_invalid_utf8_replaced": false
+    },
+    {
+      "name": "ANSI OSC hyperlink and terminal title controls",
+      "input_text": "start\u001b[31m red\u001b[0m\n\u001b]0;secret terminal title\u0007link: \u001b]8;;https://secret.example/token\u0007label\u001b]8;;\u0007",
+      "maximum_bytes": 256,
+      "expected_text": "start red\nlink: label",
+      "expected_source_bytes_consumed": 96,
+      "expected_source_truncated": false,
+      "expected_invalid_utf8_replaced": false
+    },
+    {
+      "name": "repeated progress lines",
+      "input_text": "working\rworking\rERROR one\rERROR two\rERROR two\rfinished",
+      "maximum_bytes": 256,
+      "expected_text": "working\nERROR one\nERROR two\nfinished",
+      "expected_source_bytes_consumed": 54,
+      "expected_source_truncated": false,
+      "expected_invalid_utf8_replaced": false
+    },
+    {
+      "name": "backspaces",
+      "input_text": "abc\b\bd\nkeep\n\bX",
+      "maximum_bytes": 128,
+      "expected_text": "ad\nkeep\nX",
+      "expected_source_bytes_consumed": 14,
+      "expected_source_truncated": false,
+      "expected_invalid_utf8_replaced": false
+    },
+    {
+      "name": "Unicode boundaries",
+      "input_text": "naïve café 🙂 世界",
+      "maximum_bytes": 18,
+      "expected_text": "naïve café 🙂 ",
+      "expected_source_bytes_consumed": 18,
+      "expected_source_truncated": true,
+      "expected_invalid_utf8_replaced": false
+    },
+    {
+      "name": "malformed UTF-8",
+      "input_hex": "61ff62c32863",
+      "maximum_bytes": 32,
+      "expected_text": "a�b�(c",
+      "expected_source_bytes_consumed": 6,
+      "expected_source_truncated": false,
+      "expected_invalid_utf8_replaced": true
+    },
+    {
+      "name": "huge output",
+      "input_repeat_text": "x",
+      "input_repeat_count": 100000,
+      "maximum_bytes": 4096,
+      "expected_text_repeat": "x",
+      "expected_text_repeat_count": 4096,
+      "expected_source_bytes_consumed": 4096,
+      "expected_source_truncated": true,
+      "expected_invalid_utf8_replaced": false
+    },
+    {
+      "name": "sensitive-looking visible values",
+      "input_text": "token=sk-test-not-a-real-secret\npassword=hunter2\n",
+      "maximum_bytes": 128,
+      "expected_text": "token=sk-test-not-a-real-secret\npassword=hunter2\n",
+      "expected_source_bytes_consumed": 49,
+      "expected_source_truncated": false,
+      "expected_invalid_utf8_replaced": false
+    }
+  ]
+}
