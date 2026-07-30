@@ -313,6 +313,15 @@ async fn handle_plugin_command(command: PluginCommand) -> Result<(), CliError> {
 }
 
 #[cfg(feature = "web-renderer")]
+fn random_web_access_token() -> Result<String, CliError> {
+    let mut data = [0_u8; 32];
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut data)
+        .map_err(|error| CliError::HyperChadRender(error.to_string()))?;
+    Ok(URL_SAFE_NO_PAD.encode(data))
+}
+
+#[cfg(feature = "web-renderer")]
 async fn handle_web_command(
     bind: std::net::IpAddr,
     requested_port: Option<u16>,
