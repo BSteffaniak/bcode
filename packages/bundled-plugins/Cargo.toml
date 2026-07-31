@@ -35,6 +35,7 @@ bcode_ralph_plugin                      = { workspace = true, optional = true }
 bcode_read_plugin                       = { workspace = true, optional = true }
 bcode_shell_plugin                      = { workspace = true, optional = true }
 bcode_skills_plugin                     = { workspace = true, optional = true }
+bcode_tantivy_session_search_plugin     = { workspace = true, optional = true }
 bcode_vim_edit_plugin                   = { workspace = true, optional = true }
 bcode_web_search_plugin                 = { workspace = true, optional = true }
 bcode_workflow_plugin                   = { workspace = true, optional = true }
@@ -182,6 +183,10 @@ static-bundled-shell-plugin = [
 static-bundled-skills-plugin = [
     "dep:bcode_skills_plugin",
     "bcode_skills_plugin/static-bundled",
+]
+static-bundled-tantivy-session-search-plugin = [
+    "dep:bcode_tantivy_session_search_plugin",
+    "bcode_tantivy_session_search_plugin/static-bundled",
 ]
 static-bundled-vim-edit-plugin = [
     "dep:bcode_vim_edit_plugin",

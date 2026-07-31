@@ -1,0 +1,24 @@
+id      = "bcode.tantivy-session-search"
+name    = "Bcode Tantivy Session Search"
+version = "0.0.1"
+
+categories = ["search", "session", "transcript"]
+
+[[services]]
+class        = "service"
+description  = "Optional local indexed search over bounded projected session records"
+interface_id = "bcode.session_search/v1"
+name         = "Tantivy Session Search"
+
+[config]
+categories = ["search", "session"]
+section    = "plugin.bcode.tantivy-session-search"
+
+[concurrency]
+type = "concurrent"
+
+[runtime]
+abi_version  = 3
+event_symbol = "bcode_plugin_handle_event_v1"
+library      = "libbcode_tantivy_session_search_plugin.dylib"
+type         = "native"

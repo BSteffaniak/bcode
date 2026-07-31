@@ -161,16 +161,41 @@ distinct.
 
 ## Ingestion and maintenance
 
-Canonical append succeeds or fails independently of search. Only after a successful append may a
-bounded coordinator mark a session dirty. Repeated notifications are coalesced, and providers catch
-up from bounded canonical pages using idempotent batches.
+Canonical append succeeds or fails independently of search. Only the existing post-commit mutation
+notification may mark a session dirty. The server coalesces loaded-provider notifications in a
+bounded 1,024-session set; duplicates collapse and overflow/subscriber lag records an explicit
+rescan-required bit rather than allocating unbounded work. A detached worker discovers providers,
+reads at most each provider's advertised record limit from forward canonical history, applies the
+allowlisted finalized-event projection, validates the portable batch, and invokes `apply_batch`.
+The worker also enforces advertised text limits and can advance through an event-only page using an
+explicit indexed-through sequence without fabricating searchable records. A scheduling slice drains at
+most 16 pages per provider, requeues remaining work, and retries failed sessions after 100 ms, keeping
+catch-up bounded and detached from canonical interaction. Bounded operational metrics record dirty-batch
+size, page events, batch records/text bytes, per-session duration, completion/failure, retry, and slice
+requeue without session IDs or provider-controlled labels. Retry classification treats stale generation,
+checkpoint conflict, quota exhaustion, disabled content, invalid requests, and typed response
+incompatibility as terminal for the dirty item; only transient transport/service failures retry.
+Provider-side expected sequence/text checks remain the atomic stale-write guard. Provider coverage
+includes retained indexed text bytes alongside the sequence checkpoint so the next bounded batch can
+satisfy cumulative limits.
+That checkpoint is provider-owned durable state, not a reconnect-safe transport cursor; the transport
+defines no retention, acknowledgment replay, or conflict protocol beyond each idempotent invocation.
 
 Provider-owned checkpoints advance only after derived data is durably published. Checkpoints bind to
-trustworthy canonical generation/fingerprint data and projection, normalization, and content-policy
-versions. Mismatch produces stale or rebuild-required state; it never causes silent reuse or merge.
+a versioned SHA-256 of stable canonical session identity, creation identity, and import/fork lineage
+facts/cutoffs, plus projection, normalization, and content-policy versions. Mutable title, activity,
+working-directory, and client-count fields do not change generation. Mismatch produces terminal stale
+or rebuild-required state before paging; it never causes silent reuse or merge.
 
 Historical backfill, full rebuild, policy-change reindexing, and purge are explicit cancellable
-maintenance operations. They do not run from daemon startup, catalog listing, attach, ordinary
+maintenance operations. Canonical deletion remains authoritative and occurs first; after success the
+server best-effort invokes each loaded provider's typed `remove_session` with the expected generation,
+without rolling canonical deletion back on provider failure. The Tantivy provider's rebuild operation
+is deliberately provider-local: an exact provider-specific confirmation detaches live reader/writer
+state, removes only the canonicalized confined derived root, and creates an empty index and checkpoint
+at current versions. It does not read
+or replay canonical history; daemon-owned maintenance must refill it through bounded idempotent
+batches. These operations do not run from daemon startup, catalog listing, attach, ordinary
 history, rendering, model-context construction, or ordinary search. Search failure, quota
 exhaustion, corruption, or provider absence never delays or rolls back canonical session writes.
 
@@ -204,13 +229,20 @@ individual normalized record text, aggregate normalized text and serialized payl
 and cumulative normalized text for one canonical session. The session aggregate is carried as an
 expected prior byte count that providers compare with atomically retained accounting; it is quota
 coordination, not a durable-resume cursor. Providers additionally enforce writer-memory and total
-derived-storage quotas. Reaching a quota preserves valid derived data, stops or narrows advancement,
-and reports incomplete coverage. It does not silently claim completeness or mutate canonical
-history.
+derived-storage quotas. The Tantivy provider enables LZ4 postings and Zstd columnar compression while
+keeping Tantivy default features, stopwords, and stemming disabled; a deterministic release benchmark
+records the resulting latency, commit, reopen, and storage-amplification behavior in
+`docs/session-search-baseline.md`. Reaching a quota preserves valid derived data, stops or narrows
+advancement, and reports incomplete coverage. It does not silently claim completeness or mutate
+canonical history.
 
-Provider paths are canonicalized and confined to authorized derived-state roots. Public errors,
-diagnostics, logs, and metrics are bounded and secret-safe. Remote providers require separately
-approved configuration and authorization before receiving session content.
+Provider paths are canonicalized and confined to authorized derived-state roots. A provider root must
+identify a non-root directory rather than a file, traversal, filesystem root, or symbolic-link
+provider boundary; destructive operations revalidate that boundary before deletion. Provider errors
+are passed through the shared provider diagnostic sanitizer before entering portable failures so
+credential-shaped headers, assignments, URLs, JSON/form values, bearer/basic tokens, and AWS keys
+are redacted before bounded truncation. Remote providers require separately approved configuration
+and authorization before receiving session content.
 
 ## Frontend and skill boundary
 

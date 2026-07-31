@@ -1,18 +1,508 @@
 //! Session-search provider discovery and typed service routing.
 
 use bcode_session_search::{
-    FederatedProviderContribution, FederatedProviderReport, FederatedSessionSearchResponse,
-    HydratedSessionSearchHit, ListSessionSearchProvidersResponse, MAX_FEDERATED_PROVIDERS,
-    OP_CAPABILITIES, OP_SEARCH, OP_STATUS, SESSION_SEARCH_INTERFACE_ID, SearchErrorCode,
+    ApplySearchRecordsRequest, ApplySearchRecordsResponse, FederatedProviderContribution,
+    FederatedProviderReport, FederatedSessionSearchResponse, HydratedSessionSearchHit,
+    ListSessionSearchProvidersResponse, MAX_FEDERATED_PROVIDERS, OP_APPLY_BATCH, OP_CAPABILITIES,
+    OP_REMOVE_SESSION, OP_SEARCH, OP_STATUS, RemoveSessionSearchRequest,
+    SESSION_SEARCH_INTERFACE_ID, SearchCanonicalGeneration, SearchErrorCode, SearchFeature,
     SearchHitHydrationOutcome, SessionSearchCapabilities, SessionSearchContentRoute,
     SessionSearchProviderFailure, SessionSearchProviderInfo, SessionSearchRequest,
     SessionSearchResponse, SessionSearchServiceError, SessionSearchStatus,
     aggregate_federated_search, plan_session_search_with_policy_and_routes,
 };
 use futures::future::join_all;
+use sha2::{Digest as _, Sha256};
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, Notify};
 
 use crate::ServerState;
+
+const MAX_DIRTY_SESSION_SEARCH_SESSIONS: usize = 1_024;
+const MAX_INCREMENTAL_BATCHES_PER_SESSION: usize = 16;
+const INCREMENTAL_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+pub(crate) async fn remove_session_from_providers(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+    expected_generation_fingerprint: Option<String>,
+) {
+    let provider_ids = state
+        .plugins
+        .registry()
+        .service_registry()
+        .providers_for(SESSION_SEARCH_INTERFACE_ID)
+        .cloned()
+        .unwrap_or_default();
+    for provider_id in provider_ids {
+        let payload = match serde_json::to_vec(&RemoveSessionSearchRequest {
+            session_id,
+            expected_generation_fingerprint: expected_generation_fingerprint.clone(),
+        }) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::warn!(
+                    target: "bcode_server::session_search",
+                    %session_id,
+                    provider_id,
+                    error = %bounded_message(&error.to_string()),
+                    "canonical session was deleted but provider cleanup request could not encode"
+                );
+                continue;
+            }
+        };
+        let result = state
+            .plugins
+            .invoke_service(
+                &provider_id,
+                SESSION_SEARCH_INTERFACE_ID,
+                OP_REMOVE_SESSION,
+                payload,
+            )
+            .await;
+        match result {
+            Ok(response) if response.error.is_none() => state
+                .metrics
+                .increment_counter("server.session_search.remove_session_completed_total"),
+            Ok(response) => {
+                state
+                    .metrics
+                    .increment_counter("server.session_search.remove_session_failed_total");
+                let error = response.error.map_or_else(
+                    || "unknown provider error".to_owned(),
+                    |error| format!("{}: {}", error.code, error.message),
+                );
+                tracing::warn!(
+                    target: "bcode_server::session_search",
+                    %session_id,
+                    provider_id,
+                    error = %bounded_message(&error),
+                    "canonical session was deleted but provider cleanup was rejected"
+                );
+            }
+            Err(error) => {
+                state
+                    .metrics
+                    .increment_counter("server.session_search.remove_session_failed_total");
+                tracing::warn!(
+                    target: "bcode_server::session_search",
+                    %session_id,
+                    provider_id,
+                    error = %bounded_message(&error.to_string()),
+                    "canonical session was deleted but provider cleanup failed"
+                );
+            }
+        }
+    }
+}
+
+pub(crate) fn generation_fingerprint(summary: &bcode_session_models::SessionSummary) -> String {
+    canonical_generation_fingerprint(summary)
+}
+
+#[derive(Debug, Default)]
+struct DirtySessionSearchState {
+    sessions: BTreeSet<bcode_session_models::SessionId>,
+    rescan_required: bool,
+}
+
+/// Bounded, coalescing handoff from committed canonical mutations to asynchronous search work.
+#[derive(Debug, Default)]
+pub(crate) struct SessionSearchDirtyQueue {
+    state: Mutex<DirtySessionSearchState>,
+    notify: Notify,
+}
+
+impl SessionSearchDirtyQueue {
+    pub(crate) async fn mark_committed(&self, session_id: bcode_session_models::SessionId) {
+        let mut state = self.state.lock().await;
+        if state.sessions.contains(&session_id) {
+            return;
+        }
+        if state.sessions.len() >= MAX_DIRTY_SESSION_SEARCH_SESSIONS {
+            state.rescan_required = true;
+            return;
+        }
+        state.sessions.insert(session_id);
+        drop(state);
+        self.notify.notify_one();
+    }
+
+    pub(crate) async fn mark_rescan_required(&self) {
+        self.state.lock().await.rescan_required = true;
+    }
+
+    async fn take(&self) -> Vec<bcode_session_models::SessionId> {
+        let mut state = self.state.lock().await;
+        std::mem::take(&mut state.sessions).into_iter().collect()
+    }
+
+    pub(crate) async fn notified(&self) {
+        self.notify.notified().await;
+    }
+
+    #[cfg(test)]
+    async fn snapshot(&self) -> (Vec<bcode_session_models::SessionId>, bool) {
+        let state = self.state.lock().await;
+        (
+            state.sessions.iter().copied().collect(),
+            state.rescan_required,
+        )
+    }
+}
+
+#[derive(Debug)]
+struct IngestionError {
+    message: String,
+    retryable: bool,
+}
+
+impl IngestionError {
+    fn retryable(error: impl std::fmt::Display) -> Self {
+        Self {
+            message: error.to_string(),
+            retryable: true,
+        }
+    }
+
+    fn permanent(error: impl std::fmt::Display) -> Self {
+        Self {
+            message: error.to_string(),
+            retryable: false,
+        }
+    }
+}
+
+impl std::fmt::Display for IngestionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+fn classify_ingestion_call_error(error: bcode_plugin::PluginServiceCallError) -> IngestionError {
+    match &error {
+        bcode_plugin::PluginServiceCallError::Service { code, .. }
+            if matches!(
+                code.as_str(),
+                "stale_generation"
+                    | "checkpoint_conflict"
+                    | "quota_exceeded"
+                    | "content_disabled"
+                    | "invalid_request"
+            ) =>
+        {
+            IngestionError::permanent(error)
+        }
+        bcode_plugin::PluginServiceCallError::RequestEncode(_)
+        | bcode_plugin::PluginServiceCallError::ResponseDecode(_) => {
+            IngestionError::permanent(error)
+        }
+        bcode_plugin::PluginServiceCallError::Service { .. }
+        | bcode_plugin::PluginServiceCallError::Invoke(_) => IngestionError::retryable(error),
+    }
+}
+
+pub(crate) async fn process_dirty_sessions(state: &ServerState) {
+    let session_ids = state.session_search_dirty.take().await;
+    state.metrics.record_histogram(
+        "server.session_search.dirty_batch_sessions",
+        u64::try_from(session_ids.len()).unwrap_or(u64::MAX),
+    );
+    for session_id in session_ids {
+        let started = Instant::now();
+        match ingest_session_tail(state, session_id).await {
+            Ok(()) => {
+                state
+                    .metrics
+                    .increment_counter("server.session_search.ingestion_session_completed_total");
+            }
+            Err(error) => {
+                state
+                    .metrics
+                    .increment_counter("server.session_search.ingestion_session_failed_total");
+                tracing::warn!(
+                    target: "bcode_server::session_search",
+                    %session_id,
+                    retryable = error.retryable,
+                    error = %bounded_message(&error.to_string()),
+                    "asynchronous session-search ingestion failed"
+                );
+                if error.retryable {
+                    tokio::time::sleep(INCREMENTAL_RETRY_DELAY).await;
+                    state.session_search_dirty.mark_committed(session_id).await;
+                    state.metrics.increment_counter(
+                        "server.session_search.ingestion_session_requeued_total",
+                    );
+                } else {
+                    state.metrics.increment_counter(
+                        "server.session_search.ingestion_session_terminal_failed_total",
+                    );
+                }
+            }
+        }
+        state.metrics.record_histogram(
+            "server.session_search.ingestion_session_duration_ms",
+            u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        );
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn ingest_session_tail(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+) -> Result<(), IngestionError> {
+    let inventory = list_providers(state).await;
+    let providers = inventory
+        .providers
+        .into_iter()
+        .filter(|provider| {
+            provider
+                .capabilities
+                .features
+                .contains(&SearchFeature::IncrementalIngestion)
+        })
+        .collect::<Vec<_>>();
+    if providers.is_empty() {
+        return Ok(());
+    }
+    let summary = state
+        .sessions
+        .session_summary(session_id)
+        .await
+        .map_err(IngestionError::retryable)?;
+    for provider in providers {
+        ingest_provider_pages(state, session_id, &summary, &provider).await?;
+    }
+    Ok(())
+}
+
+async fn ingest_provider_pages(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+    summary: &bcode_session_models::SessionSummary,
+    provider: &SessionSearchProviderInfo,
+) -> Result<(), IngestionError> {
+    let checkpoint = provider
+        .status
+        .coverage
+        .iter()
+        .find(|coverage| coverage.generation.session_id == session_id);
+    let generation = canonical_generation_fingerprint(summary);
+    if checkpoint.is_some_and(|coverage| coverage.generation.fingerprint != generation) {
+        return Err(IngestionError::permanent(
+            "provider checkpoint generation differs from canonical session identity; explicit rebuild is required",
+        ));
+    }
+    let mut previous_sequence = checkpoint.and_then(|coverage| coverage.indexed_through_sequence);
+    let mut previous_text_bytes = checkpoint.map_or(0, |coverage| coverage.indexed_text_bytes);
+    for _ in 0..MAX_INCREMENTAL_BATCHES_PER_SESSION {
+        let Some((indexed_through_sequence, indexed_text_bytes)) = ingest_provider_page(
+            state,
+            session_id,
+            provider,
+            &generation,
+            previous_sequence,
+            previous_text_bytes,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        previous_sequence = Some(indexed_through_sequence);
+        previous_text_bytes = indexed_text_bytes;
+    }
+    state.session_search_dirty.mark_committed(session_id).await;
+    state
+        .metrics
+        .increment_counter("server.session_search.ingestion_slice_requeued_total");
+    Ok(())
+}
+
+fn canonical_generation_fingerprint(summary: &bcode_session_models::SessionSummary) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"bcode-session-search-generation-v1\0");
+    digest.update(summary.id.to_string().as_bytes());
+    digest.update(summary.created_at_ms.to_le_bytes());
+    if let Some(import) = &summary.import {
+        digest.update(b"import\0");
+        digest.update(import.source_id.as_bytes());
+        digest.update(b"\0");
+        digest.update(import.external_session_id.as_bytes());
+        digest.update(import.imported_at_ms.to_le_bytes());
+    } else {
+        digest.update(b"native\0");
+    }
+    if let Some(fork) = &summary.fork {
+        digest.update(b"fork\0");
+        digest.update(fork.source_session_id.to_string().as_bytes());
+        digest.update(
+            fork.source_cutoff_sequence
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        digest.update(
+            fork.source_prompt_sequence
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        digest.update(fork.forked_at_ms.to_le_bytes());
+        digest.update(match fork.kind {
+            bcode_session_models::SessionForkKind::Fork => b"fork".as_slice(),
+            bcode_session_models::SessionForkKind::Clone => b"clone".as_slice(),
+        });
+    }
+    format!("{:x}", digest.finalize())
+}
+
+#[allow(clippy::too_many_lines)]
+async fn ingest_provider_page(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+    provider: &SessionSearchProviderInfo,
+    generation: &str,
+    previous_sequence: Option<u64>,
+    previous_text_bytes: u64,
+) -> Result<Option<(u64, u64)>, IngestionError> {
+    let page = state
+        .sessions
+        .session_history_page(
+            session_id,
+            bcode_session_models::SessionHistoryQuery {
+                cursor: Some(bcode_session_models::SessionHistoryCursor {
+                    sequence: previous_sequence.map_or(0, |sequence| sequence.saturating_add(1)),
+                }),
+                limit: provider.capabilities.max_batch_records,
+                direction: bcode_session_models::SessionHistoryDirection::Forward,
+            },
+        )
+        .await
+        .map_err(IngestionError::retryable)?;
+    state.metrics.record_histogram(
+        "server.session_search.ingestion_page_events",
+        u64::try_from(page.events.len()).unwrap_or(u64::MAX),
+    );
+    if page.events.is_empty() {
+        return Ok(None);
+    }
+    let canonical_tail = state
+        .sessions
+        .session_history_page(
+            session_id,
+            bcode_session_models::SessionHistoryQuery {
+                cursor: None,
+                limit: 1,
+                direction: bcode_session_models::SessionHistoryDirection::Backward,
+            },
+        )
+        .await
+        .map_err(IngestionError::retryable)?
+        .events
+        .last()
+        .map(|event| event.sequence);
+    let generation = generation.to_owned();
+    let mut records = Vec::new();
+    let mut batch_text_bytes = 0_usize;
+    for event in &page.events {
+        let projected = match bcode_session_search::projection::project_event(
+            event,
+            &bcode_session_search::projection::SearchProjectionPolicy::default(),
+        )
+        .map_err(IngestionError::retryable)?
+        {
+            bcode_session_search::projection::EventProjection::Records(projected) => projected,
+            bcode_session_search::projection::EventProjection::Excluded(_) => continue,
+        };
+        let projected_text_bytes = projected.iter().fold(0_usize, |total, record| {
+            total.saturating_add(usize::try_from(record.indexed_bytes).unwrap_or(usize::MAX))
+        });
+        if records.len().saturating_add(projected.len()) > provider.capabilities.max_batch_records
+            || batch_text_bytes.saturating_add(projected_text_bytes)
+                > provider.capabilities.max_batch_text_bytes
+        {
+            break;
+        }
+        records.extend(projected);
+        batch_text_bytes = batch_text_bytes.saturating_add(projected_text_bytes);
+    }
+    if records.is_empty() {
+        let Some(indexed_through_sequence) = page.events.last().map(|event| event.sequence) else {
+            return Ok(None);
+        };
+        let request = ApplySearchRecordsRequest {
+            provider_id: provider.plugin_id.clone(),
+            batch_id: format!(
+                "{session_id}:{}:{indexed_through_sequence}",
+                previous_sequence.map_or(0, |sequence| sequence.saturating_add(1))
+            ),
+            generation: SearchCanonicalGeneration {
+                session_id,
+                fingerprint: generation.clone(),
+                last_sequence: canonical_tail,
+            },
+            expected_previous_sequence: previous_sequence,
+            expected_previous_session_text_bytes: previous_text_bytes,
+            indexed_through_sequence: Some(indexed_through_sequence),
+            records,
+        };
+        request.validate().map_err(IngestionError::permanent)?;
+        state
+            .plugins
+            .invoke_service_json::<_, ApplySearchRecordsResponse>(
+                &provider.plugin_id,
+                SESSION_SEARCH_INTERFACE_ID,
+                OP_APPLY_BATCH,
+                &request,
+            )
+            .await
+            .map_err(classify_ingestion_call_error)?;
+        return Ok(Some((indexed_through_sequence, previous_text_bytes)));
+    }
+    let last_sequence = records.last().map(|record| record.locator.sequence);
+    let request = ApplySearchRecordsRequest {
+        provider_id: provider.plugin_id.clone(),
+        batch_id: format!(
+            "{session_id}:{}:{}",
+            previous_sequence.map_or(0, |sequence| sequence.saturating_add(1)),
+            last_sequence.unwrap_or(0)
+        ),
+        generation: SearchCanonicalGeneration {
+            session_id,
+            fingerprint: generation,
+            last_sequence: canonical_tail,
+        },
+        expected_previous_sequence: previous_sequence,
+        expected_previous_session_text_bytes: previous_text_bytes,
+        indexed_through_sequence: page.events.last().map(|event| event.sequence),
+        records,
+    };
+    request.validate().map_err(IngestionError::permanent)?;
+    let indexed_through_sequence = request.indexed_through_sequence.unwrap_or(0);
+    state.metrics.record_histogram(
+        "server.session_search.ingestion_batch_records",
+        u64::try_from(request.records.len()).unwrap_or(u64::MAX),
+    );
+    state.metrics.record_histogram(
+        "server.session_search.ingestion_batch_text_bytes",
+        u64::try_from(batch_text_bytes).unwrap_or(u64::MAX),
+    );
+    let indexed_text_bytes =
+        previous_text_bytes.saturating_add(request.records.iter().fold(0_u64, |total, record| {
+            total.saturating_add(record.normalized_bytes)
+        }));
+    state
+        .plugins
+        .invoke_service_json::<_, ApplySearchRecordsResponse>(
+            &provider.plugin_id,
+            SESSION_SEARCH_INTERFACE_ID,
+            OP_APPLY_BATCH,
+            &request,
+        )
+        .await
+        .map_err(classify_ingestion_call_error)?;
+    Ok(Some((indexed_through_sequence, indexed_text_bytes)))
+}
 
 /// Discover loaded session-search providers and query their typed capabilities/status.
 ///
@@ -62,11 +552,12 @@ pub async fn list_providers(state: &ServerState) -> ListSessionSearchProvidersRe
                 continue;
             }
             Err(error) => {
+                let (code, retryable) = classify_provider_call_error(&error);
                 failures.push(provider_failure(
                     plugin_id,
-                    SearchErrorCode::ProviderUnavailable,
+                    code,
                     &error.to_string(),
-                    true,
+                    retryable,
                 ));
                 continue;
             }
@@ -103,12 +594,15 @@ pub async fn list_providers(state: &ServerState) -> ListSessionSearchProvidersRe
                 "provider status identity does not match plugin registration",
                 false,
             )),
-            Err(error) => failures.push(provider_failure(
-                plugin_id,
-                SearchErrorCode::ProviderUnavailable,
-                &error.to_string(),
-                true,
-            )),
+            Err(error) => {
+                let (code, retryable) = classify_provider_call_error(&error);
+                failures.push(provider_failure(
+                    plugin_id,
+                    code,
+                    &error.to_string(),
+                    retryable,
+                ));
+            }
         }
     }
     for plugin_id in &state.plugins.selection().disabled {
@@ -140,6 +634,23 @@ pub async fn list_providers(state: &ServerState) -> ListSessionSearchProvidersRe
     ListSessionSearchProvidersResponse {
         providers,
         failures,
+    }
+}
+
+const fn classify_provider_call_error(
+    error: &bcode_plugin::PluginServiceCallError,
+) -> (SearchErrorCode, bool) {
+    match error {
+        bcode_plugin::PluginServiceCallError::ResponseDecode(_) => {
+            (SearchErrorCode::FutureVersion, false)
+        }
+        bcode_plugin::PluginServiceCallError::RequestEncode(_) => {
+            (SearchErrorCode::InvalidRequest, false)
+        }
+        bcode_plugin::PluginServiceCallError::Service { .. }
+        | bcode_plugin::PluginServiceCallError::Invoke(_) => {
+            (SearchErrorCode::ProviderUnavailable, true)
+        }
     }
 }
 
@@ -702,25 +1213,468 @@ fn provider_failure(
 }
 
 fn bounded_message(message: &str) -> String {
-    const MAX_ERROR_BYTES: usize = 4 * 1024;
-    if message.len() <= MAX_ERROR_BYTES {
-        return message.to_owned();
-    }
-    let mut end = MAX_ERROR_BYTES;
-    while !message.is_char_boundary(end) {
-        end = end.saturating_sub(1);
-    }
-    format!("{}…", &message[..end])
+    bcode_model_provider_runtime::sanitize_provider_diagnostic(message)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bcode_plugin::{PluginHost, PluginManifest};
+    use bcode_plugin_sdk::{
+        NativeServiceContext, ServiceCancellationWaitCallback, ServiceEventCallback,
+        ServiceResponse, StaticPluginVtable,
+    };
     use bcode_session_models::SessionId;
     use bcode_session_search::{
-        ProviderSearchOutcome, SearchContentKind, SearchField, SessionSearchHit,
-        SessionSearchLocator,
+        CURRENT_NORMALIZATION_VERSION, CURRENT_SEARCH_POLICY_VERSION,
+        CURRENT_SEARCH_RECORD_VERSION, ProviderSearchOutcome, SearchContentKind,
+        SearchExecutionKind, SearchFeature, SearchField, SearchProviderState,
+        SessionSearchCapabilities, SessionSearchContentRoute, SessionSearchHit,
+        SessionSearchLocator, SessionSearchPlanPolicy, SessionSearchRouteMode, SessionSearchStatus,
     };
+    use std::collections::BTreeSet;
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    const FAST_PROVIDER_ID: &str = "test.fast-session-search";
+    const SLOW_PROVIDER_ID: &str = "test.slow-session-search";
+    const MALFORMED_PROVIDER_ID: &str = "test.malformed-session-search";
+    const FUTURE_PROVIDER_ID: &str = "test.future-session-search";
+    const FUTURE_CAPABILITY_PROVIDER_ID: &str = "test.future-capability-session-search";
+    const CRASH_PROVIDER_ID: &str = "test.crash-session-search";
+    const FAST_PROVIDER_MANIFEST: &str = concat!(
+        "id = \"test.fast-session-search\"\n",
+        "name = \"Session Search Integration Provider\"\n",
+        "version = \"0.0.1\"\n\n",
+        "[[services]]\n",
+        "interface_id = \"bcode.session_search/v1\"\n",
+        "name = \"Session Search Integration Provider\"\n\n",
+        "[concurrency]\n",
+        "type = \"concurrent\"\n\n",
+        "[runtime]\n",
+        "type = \"native\"\n",
+        "library = \"libsession_search_integration_provider.dylib\"\n",
+        "abi_version = 3\n",
+        "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
+    );
+    const SLOW_PROVIDER_MANIFEST: &str = concat!(
+        "id = \"test.slow-session-search\"\n",
+        "name = \"Session Search Integration Provider\"\n",
+        "version = \"0.0.1\"\n\n",
+        "[[services]]\n",
+        "interface_id = \"bcode.session_search/v1\"\n",
+        "name = \"Session Search Integration Provider\"\n\n",
+        "[concurrency]\n",
+        "type = \"concurrent\"\n\n",
+        "[runtime]\n",
+        "type = \"native\"\n",
+        "library = \"libsession_search_integration_provider.dylib\"\n",
+        "abi_version = 3\n",
+        "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
+    );
+    const MALFORMED_PROVIDER_MANIFEST: &str = concat!(
+        "id = \"test.malformed-session-search\"\n",
+        "name = \"Session Search Integration Provider\"\n",
+        "version = \"0.0.1\"\n\n",
+        "[[services]]\n",
+        "interface_id = \"bcode.session_search/v1\"\n",
+        "name = \"Session Search Integration Provider\"\n\n",
+        "[concurrency]\n",
+        "type = \"concurrent\"\n\n",
+        "[runtime]\n",
+        "type = \"native\"\n",
+        "library = \"libsession_search_integration_provider.dylib\"\n",
+        "abi_version = 3\n",
+        "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
+    );
+    const FAST_SEQUENCE: u64 = 11;
+    static SLOW_SEARCH_STARTED: AtomicBool = AtomicBool::new(false);
+    static SLOW_SEARCH_CANCELLED: AtomicBool = AtomicBool::new(false);
+    static SLOW_SEARCH_FINISHED: AtomicBool = AtomicBool::new(false);
+    static APPLY_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static REMOVE_SESSION_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SEARCH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    const FUTURE_PROVIDER_MANIFEST: &str = concat!(
+        "id = \"test.future-session-search\"\n",
+        "name = \"Session Search Future Provider\"\n",
+        "version = \"0.0.1\"\n\n",
+        "[[services]]\n",
+        "interface_id = \"bcode.session_search/v1\"\n",
+        "name = \"Session Search Future Provider\"\n\n",
+        "[concurrency]\n",
+        "type = \"concurrent\"\n\n",
+        "[runtime]\n",
+        "type = \"native\"\n",
+        "library = \"libsession_search_future_provider.dylib\"\n",
+        "abi_version = 3\n",
+        "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
+    );
+    const FUTURE_CAPABILITY_PROVIDER_MANIFEST: &str = concat!(
+        "id = \"test.future-capability-session-search\"\n",
+        "name = \"Session Search Future Capability Provider\"\n",
+        "version = \"0.0.1\"\n\n",
+        "[[services]]\n",
+        "interface_id = \"bcode.session_search/v1\"\n",
+        "name = \"Session Search Future Capability Provider\"\n\n",
+        "[concurrency]\n",
+        "type = \"concurrent\"\n\n",
+        "[runtime]\n",
+        "type = \"native\"\n",
+        "library = \"libsession_search_future_capability_provider.dylib\"\n",
+        "abi_version = 3\n",
+        "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
+    );
+    const CRASH_PROVIDER_MANIFEST: &str = concat!(
+        "id = \"test.crash-session-search\"\n",
+        "name = \"Session Search Crash Provider\"\n",
+        "version = \"0.0.1\"\n\n",
+        "[[services]]\n",
+        "interface_id = \"bcode.session_search/v1\"\n",
+        "name = \"Session Search Crash Provider\"\n\n",
+        "[concurrency]\n",
+        "type = \"concurrent\"\n\n",
+        "[runtime]\n",
+        "type = \"native\"\n",
+        "library = \"libsession_search_crash_provider.dylib\"\n",
+        "abi_version = 3\n",
+        "event_symbol = \"bcode_plugin_handle_event_v1\"\n"
+    );
+
+    #[derive(Debug, Clone, Copy)]
+    enum TestProviderBehavior {
+        Fast,
+        Slow,
+        Malformed,
+        FutureStatus,
+        FutureCapability,
+        Crash,
+        RejectCleanup,
+    }
+
+    #[derive(Debug)]
+    struct TestProviderInstance {
+        provider_id: &'static str,
+        behavior: TestProviderBehavior,
+    }
+
+    fn provider_manifest(provider_id: &str) -> PluginManifest {
+        toml::from_str(match provider_id {
+            FAST_PROVIDER_ID => FAST_PROVIDER_MANIFEST,
+            SLOW_PROVIDER_ID => SLOW_PROVIDER_MANIFEST,
+            MALFORMED_PROVIDER_ID => MALFORMED_PROVIDER_MANIFEST,
+            FUTURE_PROVIDER_ID => FUTURE_PROVIDER_MANIFEST,
+            FUTURE_CAPABILITY_PROVIDER_ID => FUTURE_CAPABILITY_PROVIDER_MANIFEST,
+            CRASH_PROVIDER_ID => CRASH_PROVIDER_MANIFEST,
+            _ => panic!("unknown test provider {provider_id}"),
+        })
+        .expect("test provider manifest")
+    }
+
+    fn fast_provider_manifest_export(
+        cached: &'static OnceLock<Option<std::ffi::CString>>,
+    ) -> *const std::ffi::c_char {
+        bcode_plugin_sdk::static_manifest_export(FAST_PROVIDER_MANIFEST, cached)
+    }
+
+    fn slow_provider_manifest_export(
+        cached: &'static OnceLock<Option<std::ffi::CString>>,
+    ) -> *const std::ffi::c_char {
+        bcode_plugin_sdk::static_manifest_export(SLOW_PROVIDER_MANIFEST, cached)
+    }
+
+    fn malformed_provider_manifest_export(
+        cached: &'static OnceLock<Option<std::ffi::CString>>,
+    ) -> *const std::ffi::c_char {
+        bcode_plugin_sdk::static_manifest_export(MALFORMED_PROVIDER_MANIFEST, cached)
+    }
+
+    fn future_provider_manifest_export(
+        cached: &'static OnceLock<Option<std::ffi::CString>>,
+    ) -> *const std::ffi::c_char {
+        bcode_plugin_sdk::static_manifest_export(FUTURE_PROVIDER_MANIFEST, cached)
+    }
+
+    fn future_capability_provider_manifest_export(
+        cached: &'static OnceLock<Option<std::ffi::CString>>,
+    ) -> *const std::ffi::c_char {
+        bcode_plugin_sdk::static_manifest_export(FUTURE_CAPABILITY_PROVIDER_MANIFEST, cached)
+    }
+
+    fn crash_provider_manifest_export(
+        cached: &'static OnceLock<Option<std::ffi::CString>>,
+    ) -> *const std::ffi::c_char {
+        bcode_plugin_sdk::static_manifest_export(CRASH_PROVIDER_MANIFEST, cached)
+    }
+
+    fn provider_capabilities(provider_id: &str) -> SessionSearchCapabilities {
+        SessionSearchCapabilities {
+            provider_id: provider_id.to_owned(),
+            execution: SearchExecutionKind::Indexed,
+            content_kinds: BTreeSet::from([SearchContentKind::UserMessage]),
+            features: BTreeSet::from([
+                SearchFeature::Terms,
+                SearchFeature::StructuredFilters,
+                SearchFeature::RelevanceSort,
+                SearchFeature::IncrementalIngestion,
+            ]),
+            max_hits: bcode_session_search::MAX_SEARCH_HITS,
+            max_batch_records: bcode_session_search::MAX_INGEST_RECORDS,
+            max_batch_text_bytes: bcode_session_search::MAX_INGEST_TEXT_BYTES,
+        }
+    }
+
+    fn provider_status(provider_id: &str) -> SessionSearchStatus {
+        SessionSearchStatus {
+            provider_id: provider_id.to_owned(),
+            state: SearchProviderState::Ready,
+            record_schema_version: CURRENT_SEARCH_RECORD_VERSION,
+            normalization_version: CURRENT_NORMALIZATION_VERSION,
+            policy_version: CURRENT_SEARCH_POLICY_VERSION,
+            index_bytes: 0,
+            quota_bytes: 1,
+            document_count: 0,
+            pending_sessions: 0,
+            coverage: Vec::new(),
+            degraded_reason: None,
+        }
+    }
+
+    fn provider_search_response(
+        provider_id: &str,
+        request: &SessionSearchRequest,
+    ) -> SessionSearchResponse {
+        SessionSearchResponse {
+            provider_id: provider_id.to_owned(),
+            outcome: ProviderSearchOutcome::Complete,
+            hits: vec![SessionSearchHit {
+                locator: SessionSearchLocator {
+                    session_id: SessionId::new(),
+                    sequence: FAST_SEQUENCE,
+                    record_id: Some(format!("{provider_id}-record")),
+                },
+                content_kind: SearchContentKind::UserMessage,
+                matched_field: SearchField::Text,
+                provider_id: provider_id.to_owned(),
+                provider_rank: 1,
+                provider_score: Some("opaque".to_owned()),
+                preview: Some("needle".to_owned()),
+                preview_truncated: false,
+            }],
+            next_cursor: None,
+            query_complete: true,
+            coverage_complete: true,
+            searched_content: request.filters.content_kinds.iter().copied().collect(),
+            excluded_content: Vec::new(),
+            message: None,
+        }
+    }
+
+    fn service_response(value: &impl serde::Serialize) -> ServiceResponse {
+        ServiceResponse::json(value).expect("test service response encodes")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn test_provider_service(
+        instance: *const c_void,
+        input_ptr: *const u8,
+        input_len: usize,
+        output: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+        event_callback: Option<ServiceEventCallback>,
+        event_user_data: *mut c_void,
+        _bridge_callback: Option<bcode_plugin_sdk::ServiceBridgeCallback>,
+        _bridge_user_data: *mut c_void,
+        cancellation_callback: Option<ServiceCancellationWaitCallback>,
+        cancellation_user_data: *mut c_void,
+    ) -> i32 {
+        let provider = unsafe { &*instance.cast::<TestProviderInstance>() };
+        let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+        let Ok(context) = serde_json::from_slice::<NativeServiceContext>(input) else {
+            return bcode_plugin_sdk::SERVICE_STATUS_DECODE_FAILED;
+        };
+        let response = match context.request.operation.as_str() {
+            OP_CAPABILITIES
+                if matches!(provider.behavior, TestProviderBehavior::FutureCapability) =>
+            {
+                let mut value = serde_json::to_value(provider_capabilities(provider.provider_id))
+                    .expect("capabilities encode");
+                value["features"] = serde_json::json!(["terms", "future_semantic_search"]);
+                service_response(&value)
+            }
+            OP_CAPABILITIES => service_response(&provider_capabilities(provider.provider_id)),
+            OP_STATUS => {
+                let mut status = provider_status(provider.provider_id);
+                if matches!(provider.behavior, TestProviderBehavior::FutureStatus) {
+                    status.record_schema_version = CURRENT_SEARCH_RECORD_VERSION.saturating_add(1);
+                }
+                service_response(&status)
+            }
+            OP_APPLY_BATCH => {
+                let request = context
+                    .request
+                    .payload_json::<ApplySearchRecordsRequest>()
+                    .expect("apply batch request");
+                APPLY_BATCH_CALLS.fetch_add(1, Ordering::SeqCst);
+                service_response(&ApplySearchRecordsResponse {
+                    batch_id: request.batch_id,
+                    outcome: bcode_session_search::ApplyBatchOutcome::Applied,
+                    applied_records: request.records.len(),
+                    indexed_through_sequence: request
+                        .records
+                        .last()
+                        .map_or(0, |record| record.locator.sequence),
+                })
+            }
+            OP_REMOVE_SESSION => {
+                let _request = context
+                    .request
+                    .payload_json::<RemoveSessionSearchRequest>()
+                    .expect("remove session request");
+                REMOVE_SESSION_CALLS.fetch_add(1, Ordering::SeqCst);
+                if matches!(provider.behavior, TestProviderBehavior::RejectCleanup) {
+                    ServiceResponse::error(
+                        "cleanup_rejected",
+                        "credential=super-secret cleanup rejection",
+                    )
+                } else {
+                    service_response(&serde_json::json!({}))
+                }
+            }
+            OP_SEARCH => match provider.behavior {
+                TestProviderBehavior::Malformed
+                | TestProviderBehavior::FutureStatus
+                | TestProviderBehavior::FutureCapability => ServiceResponse::text("not-json"),
+                TestProviderBehavior::Crash => {
+                    return bcode_plugin_sdk::SERVICE_STATUS_PLUGIN_UNAVAILABLE;
+                }
+                TestProviderBehavior::Fast | TestProviderBehavior::RejectCleanup => {
+                    match context.request.payload_json::<SessionSearchRequest>() {
+                        Ok(request) => service_response(&provider_search_response(
+                            provider.provider_id,
+                            &request,
+                        )),
+                        Err(error) => ServiceResponse::error("invalid_request", error.to_string()),
+                    }
+                }
+                TestProviderBehavior::Slow => {
+                    SLOW_SEARCH_STARTED.store(true, Ordering::SeqCst);
+                    let cancelled = cancellation_callback
+                        .is_some_and(|callback| callback(5_000, cancellation_user_data));
+                    SLOW_SEARCH_CANCELLED.store(cancelled, Ordering::SeqCst);
+                    SLOW_SEARCH_FINISHED.store(true, Ordering::SeqCst);
+                    if cancelled {
+                        ServiceResponse::error("cancelled", "cancelled by host")
+                    } else {
+                        ServiceResponse::error(
+                            "not_cancelled",
+                            "host cancellation was not observed",
+                        )
+                    }
+                }
+            },
+            operation => ServiceResponse::error(
+                "unsupported_operation",
+                format!("unsupported operation {operation}"),
+            ),
+        };
+        bcode_plugin_sdk::write_service_response(
+            &response,
+            output,
+            output_capacity,
+            output_len,
+            bcode_plugin_sdk::ServiceEventEmitter::new(event_callback, event_user_data),
+        )
+    }
+
+    fn test_activate(_: *const c_void) -> i32 {
+        bcode_plugin_sdk::EXIT_OK
+    }
+
+    fn test_deactivate(_: *const c_void) -> i32 {
+        bcode_plugin_sdk::EXIT_OK
+    }
+
+    fn test_handle_event(_: *const c_void, _: *const u8, _: usize) -> i32 {
+        bcode_plugin_sdk::EVENT_STATUS_OK
+    }
+
+    fn provider_vtable(
+        provider_id: &'static str,
+        behavior: TestProviderBehavior,
+    ) -> StaticPluginVtable {
+        let instance = Box::leak(Box::new(TestProviderInstance {
+            provider_id,
+            behavior,
+        }));
+        let manifest = match provider_id {
+            FAST_PROVIDER_ID => fast_provider_manifest_export,
+            SLOW_PROVIDER_ID => slow_provider_manifest_export,
+            MALFORMED_PROVIDER_ID => malformed_provider_manifest_export,
+            FUTURE_PROVIDER_ID => future_provider_manifest_export,
+            FUTURE_CAPABILITY_PROVIDER_ID => future_capability_provider_manifest_export,
+            CRASH_PROVIDER_ID => crash_provider_manifest_export,
+            _ => panic!("unknown test provider {provider_id}"),
+        };
+        StaticPluginVtable {
+            instance: std::ptr::from_ref(instance).cast(),
+            manifest,
+            activate: test_activate,
+            register_commands: None,
+            register_auth_providers: None,
+            deactivate: test_deactivate,
+            invoke_service_streaming: test_provider_service,
+            cli_registration: None,
+            handle_event: test_handle_event,
+        }
+    }
+
+    fn state_with_providers(
+        providers: &[(&'static str, TestProviderBehavior)],
+    ) -> crate::ServerState {
+        let loaded = providers
+            .iter()
+            .map(|(provider_id, behavior)| {
+                (
+                    provider_manifest(provider_id),
+                    provider_vtable(provider_id, *behavior),
+                )
+            })
+            .collect::<Vec<_>>();
+        let plugins = PluginHost::load_static_plugins(&loaded)
+            .expect("load test providers")
+            .into();
+        crate::tests::test_server_state_with_plugins(
+            bcode_session::SessionManager::persistent_lazy(
+                tempfile::tempdir().expect("session root").keep(),
+            ),
+            plugins,
+        )
+    }
+
+    fn parallel_routes() -> Vec<SessionSearchContentRoute> {
+        vec![SessionSearchContentRoute {
+            content_kinds: BTreeSet::from([SearchContentKind::UserMessage]),
+            mode: SessionSearchRouteMode::Parallel,
+            provider_ids: vec![FAST_PROVIDER_ID.to_owned(), SLOW_PROVIDER_ID.to_owned()],
+        }]
+    }
+
+    fn reset_slow_provider_state() {
+        SLOW_SEARCH_STARTED.store(false, Ordering::SeqCst);
+        SLOW_SEARCH_CANCELLED.store(false, Ordering::SeqCst);
+        SLOW_SEARCH_FINISHED.store(false, Ordering::SeqCst);
+    }
+
+    async fn wait_for_slow_provider_to_finish() {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !SLOW_SEARCH_FINISHED.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
 
     fn request() -> SessionSearchRequest {
         SessionSearchRequest {
@@ -849,11 +1803,457 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn federated_runtime_preserves_fast_results_when_slow_provider_times_out() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        reset_slow_provider_state();
+        let state = state_with_providers(&[
+            (FAST_PROVIDER_ID, TestProviderBehavior::Fast),
+            (SLOW_PROVIDER_ID, TestProviderBehavior::Slow),
+        ]);
+        let mut request = request();
+        request.deadline_ms = Some(250);
+        let policy = SessionSearchPlanPolicy {
+            per_provider_deadline_ms: 40,
+            ..SessionSearchPlanPolicy::default()
+        };
+
+        let started = std::time::Instant::now();
+        let response =
+            search_federated_with_policy_and_routes(&state, &request, &policy, &parallel_routes())
+                .await
+                .expect("federated search");
+
+        assert!(started.elapsed() < Duration::from_millis(200));
+        assert!(SLOW_SEARCH_STARTED.load(Ordering::SeqCst));
+        assert!(SLOW_SEARCH_CANCELLED.load(Ordering::SeqCst));
+        assert!(SLOW_SEARCH_FINISHED.load(Ordering::SeqCst));
+        assert_eq!(response.hits.len(), 1);
+        assert_eq!(response.hits[0].provider_id, FAST_PROVIDER_ID);
+        assert!(response.providers.iter().any(|provider| {
+            provider.provider_id == FAST_PROVIDER_ID
+                && provider.outcome == ProviderSearchOutcome::Complete
+        }));
+        assert!(response.failures.iter().any(|failure| {
+            failure.plugin_id == SLOW_PROVIDER_ID
+                && failure.error.code == SearchErrorCode::DeadlineExceeded
+                && failure.stage == bcode_session_search::SessionSearchProviderStage::Execution
+        }));
+        assert!(!response.query_complete);
+        assert!(!response.coverage_complete);
+    }
+
+    #[tokio::test]
+    async fn federated_runtime_rejects_malformed_provider_without_losing_healthy_results() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        let state = state_with_providers(&[
+            (FAST_PROVIDER_ID, TestProviderBehavior::Fast),
+            (MALFORMED_PROVIDER_ID, TestProviderBehavior::Malformed),
+        ]);
+        let mut routes = parallel_routes();
+        routes[0].provider_ids[1] = MALFORMED_PROVIDER_ID.to_owned();
+        let response = search_federated_with_policy_and_routes(
+            &state,
+            &request(),
+            &SessionSearchPlanPolicy {
+                per_provider_deadline_ms: 100,
+                ..SessionSearchPlanPolicy::default()
+            },
+            &routes,
+        )
+        .await
+        .expect("federated search");
+
+        assert_eq!(response.hits.len(), 1);
+        assert_eq!(response.hits[0].provider_id, FAST_PROVIDER_ID);
+        assert!(response.failures.iter().any(|failure| {
+            failure.plugin_id == MALFORMED_PROVIDER_ID
+                && failure.error.code == SearchErrorCode::ProviderUnavailable
+        }));
+        assert!(!response.query_complete);
+        assert!(!response.coverage_complete);
+    }
+
+    #[tokio::test]
+    async fn canonical_deletion_cleanup_is_explicit_and_provider_scoped() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        REMOVE_SESSION_CALLS.store(0, Ordering::SeqCst);
+        let state = state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Fast)]);
+        let session_id = SessionId::new();
+        remove_session_from_providers(&state, session_id, Some("generation".to_owned())).await;
+        assert_eq!(REMOVE_SESSION_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn provider_cleanup_rejection_is_non_fatal() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        REMOVE_SESSION_CALLS.store(0, Ordering::SeqCst);
+        let state =
+            state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::RejectCleanup)]);
+        remove_session_from_providers(&state, SessionId::new(), Some("generation".to_owned()))
+            .await;
+        assert_eq!(REMOVE_SESSION_CALLS.load(Ordering::SeqCst), 1);
+    }
+
     #[test]
-    fn provider_errors_are_utf8_safely_bounded() {
-        let message = "é".repeat(3_000);
+    fn canonical_generation_fingerprint_binds_identity_import_and_fork_provenance() {
+        let session_id = SessionId::new();
+        let mut summary = bcode_session_models::SessionSummary {
+            id: session_id,
+            name: None,
+            explicit_name: None,
+            derived_title: None,
+            title_source: bcode_session_models::SessionTitleSource::EmptyDraft,
+            client_count: 0,
+            created_at_ms: 10,
+            updated_at_ms: 20,
+            working_directory: std::path::PathBuf::new(),
+            import: None,
+            fork: None,
+            execution: None,
+        };
+        let native = canonical_generation_fingerprint(&summary);
+        summary.updated_at_ms = 999;
+        assert_eq!(canonical_generation_fingerprint(&summary), native);
+        summary.import = Some(bcode_session_models::SessionImportSummary {
+            source_id: "source".to_owned(),
+            source_display_name: "Source".to_owned(),
+            external_session_id: "external".to_owned(),
+            imported_at_ms: 30,
+        });
+        let imported = canonical_generation_fingerprint(&summary);
+        assert_ne!(imported, native);
+        summary.fork = Some(bcode_session_models::SessionForkSummary {
+            source_session_id: SessionId::new(),
+            source_title: None,
+            source_cutoff_sequence: Some(4),
+            source_prompt_sequence: Some(2),
+            forked_at_ms: 40,
+            kind: bcode_session_models::SessionForkKind::Fork,
+        });
+        assert_ne!(canonical_generation_fingerprint(&summary), imported);
+    }
+
+    #[tokio::test]
+    async fn dirty_session_processing_projects_bounded_records_and_applies_provider_batch() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        let state = state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Fast)]);
+        let working_directory = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(
+                Some("ingestion".to_owned()),
+                working_directory.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        state
+            .sessions
+            .append_context_compacted(session.id, "searchable bounded summary".to_owned(), 0)
+            .await
+            .expect("append event");
+        state.session_search_dirty.mark_committed(session.id).await;
+
+        process_dirty_sessions(&state).await;
+
+        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 1);
+        assert!(state.session_search_dirty.snapshot().await.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn incremental_ingestion_drains_multiple_bounded_pages() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        let state = state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Fast)]);
+        let working_directory = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(
+                Some("multi-page ingestion".to_owned()),
+                working_directory.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        for sequence in 0..300 {
+            state
+                .sessions
+                .append_context_compacted(session.id, format!("summary {sequence}"), 0)
+                .await
+                .expect("append event");
+        }
+        state.session_search_dirty.mark_committed(session.id).await;
+
+        process_dirty_sessions(&state).await;
+
+        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 2);
+        assert!(state.session_search_dirty.snapshot().await.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dirty_session_queue_coalesces_and_bounds_committed_notifications() {
+        let queue = SessionSearchDirtyQueue::default();
+        let first = SessionId::new();
+        queue.mark_committed(first).await;
+        queue.mark_committed(first).await;
+        let (sessions, rescan_required) = queue.snapshot().await;
+        assert_eq!(sessions, vec![first]);
+        assert!(!rescan_required);
+
+        for _ in 1..MAX_DIRTY_SESSION_SEARCH_SESSIONS {
+            queue.mark_committed(SessionId::new()).await;
+        }
+        queue.mark_committed(SessionId::new()).await;
+        let (sessions, rescan_required) = queue.snapshot().await;
+        assert_eq!(sessions.len(), MAX_DIRTY_SESSION_SEARCH_SESSIONS);
+        assert!(rescan_required);
+    }
+
+    #[tokio::test]
+    async fn dirty_session_queue_stays_empty_without_committed_mutations() {
+        let queue = SessionSearchDirtyQueue::default();
+        let (sessions, rescan_required) = queue.snapshot().await;
+        assert!(sessions.is_empty());
+        assert!(!rescan_required);
+    }
+
+    #[tokio::test]
+    async fn all_search_disabled_preserves_complete_session_investigation_boundary() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        let root = tempfile::tempdir().expect("session root");
+        let sessions = bcode_session::SessionManager::persistent(root.path()).expect("sessions");
+        let state = crate::tests::test_server_state_with_plugins(
+            sessions,
+            bcode_plugin::PluginHost::default().into(),
+        );
+        let working_directory = root.path().join("workspace");
+        std::fs::create_dir(&working_directory).expect("working directory");
+
+        let inventory = list_providers(&state).await;
+        assert!(inventory.providers.is_empty());
+        assert!(inventory.failures.is_empty());
+
+        let session = state
+            .sessions
+            .create_session(
+                Some("disabled search".to_owned()),
+                working_directory.clone(),
+            )
+            .await
+            .expect("create session");
+        let appended = state
+            .sessions
+            .append_context_compacted(session.id, "bounded summary".to_owned(), 0)
+            .await
+            .expect("append event");
+        assert_eq!(appended.session_id, session.id);
+
+        let listed = state.sessions.list_sessions(&working_directory).await;
+        assert!(listed.iter().any(|summary| summary.id == session.id));
+        let opened = state
+            .sessions
+            .prepare_session_open(session.id)
+            .await
+            .expect("prepare open");
+        assert_eq!(
+            opened.outcome,
+            Some(bcode_session_models::SessionOpenTerminalOutcome::Ready)
+        );
+
+        let attached = state
+            .sessions
+            .attach_session_recent(session.id, bcode_session_models::ClientId::new(), 10)
+            .await
+            .expect("attach recent");
+        assert!(
+            attached
+                .history
+                .iter()
+                .any(|event| event.sequence == appended.sequence)
+        );
+        let page = state
+            .sessions
+            .session_history_page(
+                session.id,
+                bcode_session_models::SessionHistoryQuery {
+                    cursor: None,
+                    limit: 10,
+                    direction: bcode_session_models::SessionHistoryDirection::Backward,
+                },
+            )
+            .await
+            .expect("history page");
+        assert!(
+            page.events
+                .iter()
+                .any(|event| event.sequence == appended.sequence)
+        );
+
+        let exported = state
+            .sessions
+            .session_history(session.id)
+            .await
+            .expect("explicit export history");
+        assert!(
+            exported
+                .iter()
+                .any(|event| event.sequence == appended.sequence)
+        );
+        let inspection = state
+            .sessions
+            .session_inspection_page(
+                session.id,
+                bcode_session_models::SessionInspectionQuery {
+                    category: bcode_session_models::SessionInspectionCategory::Compactions,
+                    cursor: None,
+                    limit: 10,
+                    direction: bcode_session_models::SessionHistoryDirection::Backward,
+                },
+            )
+            .await
+            .expect("structured inspection");
+        assert!(
+            inspection
+                .events
+                .iter()
+                .any(|event| event.sequence == appended.sequence)
+        );
+    }
+
+    #[tokio::test]
+    async fn future_provider_status_is_isolated_as_incompatible() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        let state = state_with_providers(&[
+            (FAST_PROVIDER_ID, TestProviderBehavior::Fast),
+            (FUTURE_PROVIDER_ID, TestProviderBehavior::FutureStatus),
+        ]);
+        let inventory = list_providers(&state).await;
+        assert_eq!(inventory.providers.len(), 1);
+        assert_eq!(inventory.providers[0].plugin_id, FAST_PROVIDER_ID);
+        assert_eq!(inventory.failures.len(), 1);
+        assert_eq!(inventory.failures[0].plugin_id, FUTURE_PROVIDER_ID);
+        assert_eq!(
+            inventory.failures[0].error.code,
+            SearchErrorCode::FutureVersion
+        );
+        assert!(!inventory.failures[0].error.retryable);
+    }
+
+    #[tokio::test]
+    async fn future_capability_enum_is_isolated_as_incompatible() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        let state = state_with_providers(&[
+            (FAST_PROVIDER_ID, TestProviderBehavior::Fast),
+            (
+                FUTURE_CAPABILITY_PROVIDER_ID,
+                TestProviderBehavior::FutureCapability,
+            ),
+        ]);
+        let inventory = list_providers(&state).await;
+        assert_eq!(inventory.providers.len(), 1);
+        assert_eq!(inventory.providers[0].plugin_id, FAST_PROVIDER_ID);
+        assert_eq!(inventory.failures.len(), 1);
+        assert_eq!(
+            inventory.failures[0].plugin_id,
+            FUTURE_CAPABILITY_PROVIDER_ID
+        );
+        assert_eq!(
+            inventory.failures[0].error.code,
+            SearchErrorCode::FutureVersion
+        );
+        assert!(!inventory.failures[0].error.retryable);
+    }
+
+    #[tokio::test]
+    async fn unavailable_provider_service_is_isolated_without_losing_healthy_results() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        let state = state_with_providers(&[
+            (FAST_PROVIDER_ID, TestProviderBehavior::Fast),
+            (CRASH_PROVIDER_ID, TestProviderBehavior::Crash),
+        ]);
+        let routes = vec![SessionSearchContentRoute {
+            content_kinds: BTreeSet::from([SearchContentKind::UserMessage]),
+            mode: SessionSearchRouteMode::Parallel,
+            provider_ids: vec![FAST_PROVIDER_ID.to_owned(), CRASH_PROVIDER_ID.to_owned()],
+        }];
+        let response = search_federated_with_policy_and_routes(
+            &state,
+            &request(),
+            &SessionSearchPlanPolicy {
+                per_provider_deadline_ms: 100,
+                ..SessionSearchPlanPolicy::default()
+            },
+            &routes,
+        )
+        .await
+        .expect("federated search");
+        assert_eq!(response.hits.len(), 1);
+        assert_eq!(response.hits[0].provider_id, FAST_PROVIDER_ID);
+        assert!(response.failures.iter().any(|failure| {
+            failure.plugin_id == CRASH_PROVIDER_ID
+                && failure.error.code == SearchErrorCode::ProviderUnavailable
+                && failure.error.retryable
+        }));
+        assert!(!response.query_complete);
+        assert!(!response.coverage_complete);
+    }
+
+    #[tokio::test]
+    async fn timed_out_provider_cannot_reopen_terminal_federated_outcome() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        reset_slow_provider_state();
+        let state = state_with_providers(&[(SLOW_PROVIDER_ID, TestProviderBehavior::Slow)]);
+        let mut request = request();
+        request.deadline_ms = Some(100);
+        let routes = vec![SessionSearchContentRoute {
+            content_kinds: BTreeSet::from([SearchContentKind::UserMessage]),
+            mode: SessionSearchRouteMode::Primary,
+            provider_ids: vec![SLOW_PROVIDER_ID.to_owned()],
+        }];
+        let response = search_federated_with_policy_and_routes(
+            &state,
+            &request,
+            &SessionSearchPlanPolicy {
+                per_provider_deadline_ms: 25,
+                ..SessionSearchPlanPolicy::default()
+            },
+            &routes,
+        )
+        .await
+        .expect("federated search");
+        let terminal = serde_json::to_vec(&response).expect("terminal response encodes");
+
+        wait_for_slow_provider_to_finish().await;
+
+        assert!(SLOW_SEARCH_CANCELLED.load(Ordering::SeqCst));
+        assert!(SLOW_SEARCH_FINISHED.load(Ordering::SeqCst));
+        assert_eq!(
+            serde_json::to_vec(&response).expect("terminal response re-encodes"),
+            terminal
+        );
+        assert!(response.hits.is_empty());
+        assert_eq!(response.providers.len(), 0);
+        assert_eq!(response.failures.len(), 1);
+        assert_eq!(
+            response.failures[0].error.code,
+            SearchErrorCode::DeadlineExceeded
+        );
+        assert!(!response.query_complete);
+        assert!(!response.coverage_complete);
+    }
+
+    #[test]
+    fn provider_errors_are_secret_safe_and_utf8_safely_bounded() {
+        let secret = "sk-session-search-secret";
+        let message = format!(
+            "Authorization: Bearer {secret} api_key=query-secret {}",
+            "é".repeat(5_000)
+        );
         let bounded = bounded_message(&message);
-        assert!(bounded.len() <= 4 * 1024 + "…".len());
-        assert!(bounded.ends_with('…'));
+        assert!(!bounded.contains(secret));
+        assert!(!bounded.contains("query-secret"));
+        assert!(bounded.contains("[REDACTED]"));
+        assert!(bounded.chars().count() <= 4_110);
+        assert!(bounded.ends_with("…[TRUNCATED]"));
     }
 }

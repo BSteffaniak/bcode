@@ -325,6 +325,7 @@ pub struct ServerState {
     session_migrations: bcode_session_migration::SessionMigrationService,
     pub session_catalog: Arc<session_catalog::SessionCatalog>,
     pub plugins: bcode_plugin::PluginRuntimeHost,
+    session_search_dirty: session_search::SessionSearchDirtyQueue,
     model_catalog: bcode_model_catalog::ModelCatalogResolver,
     selected_provider_plugin_id: Option<String>,
     selected_model_id: Option<String>,
@@ -1526,6 +1527,7 @@ impl ServerState {
             session_migrations,
             session_catalog: Arc::new(session_catalog::SessionCatalog::default()),
             plugins,
+            session_search_dirty: session_search::SessionSearchDirtyQueue::default(),
             model_catalog: init
                 .model_catalog
                 .expect("server model catalog resolver must be initialized"),
@@ -2074,6 +2076,16 @@ impl ServerState {
         }
     }
 
+    fn start_session_search_ingestion(self: &Arc<Self>) {
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                state.session_search_dirty.notified().await;
+                session_search::process_dirty_sessions(&state).await;
+            }
+        });
+    }
+
     fn start_catalog_event_forwarder(self: &Arc<Self>) {
         if self
             .catalog_events_started
@@ -2099,10 +2111,20 @@ impl ServerState {
             loop {
                 match mutations.recv().await {
                     Ok(mutation) => {
+                        let session_id = mutation.session_id;
                         state
                             .session_catalog
                             .upsert_native_session(mutation.summary)
                             .await;
+                        if state
+                            .plugins
+                            .registry()
+                            .service_registry()
+                            .providers_for(bcode_session_search::SESSION_SEARCH_INTERFACE_ID)
+                            .is_some_and(|providers| !providers.is_empty())
+                        {
+                            state.session_search_dirty.mark_committed(session_id).await;
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                         tracing::warn!(
@@ -2111,6 +2133,15 @@ impl ServerState {
                             "session mutation subscriber lagged; refreshing native catalog"
                         );
                         state.session_catalog.refresh_native_now(&state).await;
+                        if state
+                            .plugins
+                            .registry()
+                            .service_registry()
+                            .providers_for(bcode_session_search::SESSION_SEARCH_INTERFACE_ID)
+                            .is_some_and(|providers| !providers.is_empty())
+                        {
+                            state.session_search_dirty.mark_rescan_required().await;
+                        }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -3284,6 +3315,7 @@ async fn run_with_static_bundled_inner(
         },
     ));
     state.start_catalog_event_forwarder();
+    state.start_session_search_ingestion();
     state.model_catalog.spawn_refresh();
     interrupt_stale_ralph_runs_best_effort(&state);
     restore_workflow_runtime_work(&state).await;
@@ -8111,6 +8143,9 @@ async fn handle_delete_session(
     }
     match state.sessions.delete_session(session_id).await {
         Ok(session) => {
+            let generation = session_search::generation_fingerprint(&session);
+            session_search::remove_session_from_providers(state, session_id, Some(generation))
+                .await;
             state
                 .session_model_selections
                 .lock()
@@ -46202,13 +46237,36 @@ library = "test"
             .expect("test skill registry")
     }
 
+    pub fn test_server_state_with_plugins(
+        sessions: SessionManager,
+        plugins: bcode_plugin::PluginRuntimeHost,
+    ) -> ServerState {
+        test_server_state_with_plugins_and_ralph_store(
+            sessions,
+            plugins,
+            bcode_ralph::RalphStateStore::default(),
+        )
+    }
+
     fn test_server_state_with_ralph_store(
         sessions: SessionManager,
         ralph_store: bcode_ralph::RalphStateStore,
     ) -> ServerState {
-        ServerState::new(
+        test_server_state_with_plugins_and_ralph_store(
             sessions,
             bcode_plugin::PluginHost::default().into(),
+            ralph_store,
+        )
+    }
+
+    fn test_server_state_with_plugins_and_ralph_store(
+        sessions: SessionManager,
+        plugins: bcode_plugin::PluginRuntimeHost,
+        ralph_store: bcode_ralph::RalphStateStore,
+    ) -> ServerState {
+        ServerState::new(
+            sessions,
+            plugins,
             ServerStateInit {
                 model_catalog: Some(bcode_model_catalog::ModelCatalogResolver::embedded()),
                 selected_provider_plugin_id: None,

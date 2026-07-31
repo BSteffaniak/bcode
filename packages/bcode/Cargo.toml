@@ -223,6 +223,12 @@ static-bundled-skills-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-skills-plugin",
 ]
+static-bundled-tantivy-session-search-plugin = [
+    "bundled-plugins",
+    "cli",
+    "bcode_bundled_plugins/static-bundled-tantivy-session-search-plugin",
+    "bcode_cli/static-bundled-tantivy-session-search-plugin",
+]
 static-bundled-web-search-plugin = [
     "bundled-plugins",
     "bcode_bundled_plugins/static-bundled-web-search-plugin",

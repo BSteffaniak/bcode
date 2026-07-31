@@ -33,6 +33,8 @@ pub const OP_APPLY_BATCH: &str = "apply_batch";
 pub const OP_REMOVE_SESSION: &str = "remove_session";
 /// Explicitly purge provider-owned derived state.
 pub const OP_PURGE: &str = "purge";
+/// Explicitly discard and recreate provider-owned derived state for historical backfill.
+pub const OP_REBUILD: &str = "rebuild";
 
 /// Current terminal-text normalization algorithm version.
 pub const CURRENT_NORMALIZATION_VERSION: u16 = 1;
@@ -535,6 +537,9 @@ pub struct SessionSearchCoverage {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub indexed_through_sequence: Option<u64>,
     pub complete: bool,
+    /// Normalized text bytes durably accepted for this session.
+    #[serde(default)]
+    pub indexed_text_bytes: u64,
     #[serde(default)]
     pub skipped_records: u64,
     #[serde(default)]
@@ -553,6 +558,9 @@ pub struct SessionSearchStatus {
     pub policy_version: u16,
     pub index_bytes: u64,
     pub quota_bytes: u64,
+    /// Number of provider-owned derived documents currently retained.
+    #[serde(default)]
+    pub document_count: u64,
     pub pending_sessions: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub coverage: Vec<SessionSearchCoverage>,
@@ -1267,6 +1275,12 @@ pub struct ApplySearchRecordsRequest {
     /// cursor.
     #[serde(default)]
     pub expected_previous_session_text_bytes: u64,
+    /// Canonical sequence durably accounted for by this batch, including intentionally excluded
+    /// events that produced no records.
+    ///
+    /// Older v1 senders may omit this field; providers then advance through the final record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_through_sequence: Option<u64>,
     pub records: Vec<SessionSearchRecord>,
 }
 
@@ -1289,6 +1303,7 @@ impl ApplySearchRecordsRequest {
     /// Returns an error when the batch is empty/oversized, identities conflict, text or serialized
     /// payload exceeds its aggregate bound, cumulative session text exceeds its bound, or record
     /// sequences are not monotonic and within the declared generation.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), ContractValidationError> {
         validate_nonempty_bounded("provider_id", &self.provider_id, MAX_CURSOR_BYTES)?;
         validate_nonempty_bounded("batch_id", &self.batch_id, MAX_CURSOR_BYTES)?;
@@ -1297,9 +1312,9 @@ impl ApplySearchRecordsRequest {
             &self.generation.fingerprint,
             MAX_CURSOR_BYTES,
         )?;
-        if self.records.is_empty() {
+        if self.records.is_empty() && self.indexed_through_sequence.is_none() {
             return Err(ContractValidationError::InvalidBatch(
-                "records must not be empty",
+                "records must not be empty unless the batch advances through excluded events",
             ));
         }
         if self.records.len() > MAX_INGEST_RECORDS {
@@ -1345,6 +1360,23 @@ impl ApplySearchRecordsRequest {
             }
             previous = Some(record.locator.sequence);
             text_bytes = text_bytes.saturating_add(record.text.as_ref().map_or(0, String::len));
+        }
+        let final_record_sequence = self.records.last().map(|record| record.locator.sequence);
+        if self
+            .indexed_through_sequence
+            .is_some_and(|sequence| final_record_sequence.is_some_and(|record| sequence < record))
+        {
+            return Err(ContractValidationError::InvalidBatch(
+                "indexed-through sequence precedes final record",
+            ));
+        }
+        if self.generation.last_sequence.is_some_and(|tail| {
+            self.indexed_through_sequence
+                .is_some_and(|sequence| sequence > tail)
+        }) {
+            return Err(ContractValidationError::InvalidBatch(
+                "indexed-through sequence exceeds declared generation tail",
+            ));
         }
         if text_bytes > MAX_INGEST_TEXT_BYTES {
             return Err(ContractValidationError::LimitExceeded {
@@ -1444,6 +1476,25 @@ pub struct RemoveSessionSearchRequest {
 pub struct PurgeSessionSearchRequest {
     pub provider_id: String,
     pub confirmation: String,
+}
+
+/// Explicit provider-owned rebuild request.
+///
+/// Rebuild discards all current derived state and recreates an empty compatible index. Canonical
+/// records must subsequently be supplied through bounded ingestion batches.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebuildSessionSearchRequest {
+    pub provider_id: String,
+    pub confirmation: String,
+}
+
+/// Durable acknowledgment that a provider-owned rebuild completed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebuildSessionSearchResponse {
+    pub provider_id: String,
+    pub record_schema_version: u16,
+    pub normalization_version: u16,
+    pub policy_version: u16,
 }
 
 /// Typed provider-owned service error returned inside a successful plugin transport response.
@@ -1617,6 +1668,7 @@ mod tests {
             },
             expected_previous_sequence: Some(0),
             expected_previous_session_text_bytes: 0,
+            indexed_through_sequence: None,
             records: vec![
                 record.clone(),
                 SessionSearchRecord {
@@ -1671,6 +1723,7 @@ mod tests {
             },
             expected_previous_sequence: None,
             expected_previous_session_text_bytes: 0,
+            indexed_through_sequence: None,
             records: vec![
                 record.clone(),
                 SessionSearchRecord {
@@ -1833,6 +1886,7 @@ mod tests {
                     policy_version: CURRENT_SEARCH_POLICY_VERSION,
                     index_bytes: 0,
                     quota_bytes: 1024,
+                    document_count: 0,
                     pending_sessions: 0,
                     coverage: Vec::new(),
                     degraded_reason: None,
@@ -1915,6 +1969,7 @@ mod tests {
             policy_version: CURRENT_SEARCH_POLICY_VERSION,
             index_bytes: 0,
             quota_bytes: 1024,
+            document_count: 0,
             pending_sessions: 0,
             coverage: Vec::new(),
             degraded_reason: None,
@@ -1974,6 +2029,7 @@ mod tests {
                     policy_version: CURRENT_SEARCH_POLICY_VERSION,
                     index_bytes: 0,
                     quota_bytes: 1024,
+                    document_count: 0,
                     pending_sessions: 0,
                     coverage: vec![SessionSearchCoverage {
                         generation: SearchCanonicalGeneration {
@@ -1984,6 +2040,7 @@ mod tests {
                         content_kinds: std::iter::once(SearchContentKind::UserMessage).collect(),
                         indexed_through_sequence: Some(indexed_through_sequence),
                         complete: indexed_through_sequence == 10,
+                        indexed_text_bytes: 0,
                         skipped_records: 0,
                         truncated_records: 0,
                         exclusions: Vec::new(),
@@ -2071,6 +2128,7 @@ mod tests {
                     policy_version: CURRENT_SEARCH_POLICY_VERSION,
                     index_bytes: 0,
                     quota_bytes: 1024,
+                    document_count: 0,
                     pending_sessions: 0,
                     coverage: Vec::new(),
                     degraded_reason: None,
@@ -2237,6 +2295,29 @@ mod tests {
                 "record schema version is unsupported"
             ))
         ));
+    }
+
+    #[test]
+    fn rebuild_contract_round_trips_without_backend_details() {
+        let request = RebuildSessionSearchRequest {
+            provider_id: "bcode.example-session-search".to_owned(),
+            confirmation: "provider-owned-confirmation".to_owned(),
+        };
+        let encoded = serde_json::to_vec(&request).expect("encode request");
+        let decoded: RebuildSessionSearchRequest =
+            serde_json::from_slice(&encoded).expect("decode request");
+        assert_eq!(decoded, request);
+
+        let response = RebuildSessionSearchResponse {
+            provider_id: request.provider_id,
+            record_schema_version: CURRENT_SEARCH_RECORD_VERSION,
+            normalization_version: CURRENT_NORMALIZATION_VERSION,
+            policy_version: CURRENT_SEARCH_POLICY_VERSION,
+        };
+        let encoded = serde_json::to_vec(&response).expect("encode response");
+        let decoded: RebuildSessionSearchResponse =
+            serde_json::from_slice(&encoded).expect("decode response");
+        assert_eq!(decoded, response);
     }
 
     #[test]

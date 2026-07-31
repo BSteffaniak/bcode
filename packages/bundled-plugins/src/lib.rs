@@ -150,6 +150,8 @@ fn append_static_bundled_plugins(plugins: &mut Vec<bcode_plugin::StaticBundledPl
     plugins.push(read_plugin());
     #[cfg(feature = "static-bundled-shell-plugin")]
     plugins.push(shell_plugin());
+    #[cfg(feature = "static-bundled-tantivy-session-search-plugin")]
+    plugins.push(tantivy_session_search_plugin());
     #[cfg(feature = "static-bundled-skills-plugin")]
     plugins.push(skills_plugin());
     #[cfg(feature = "static-bundled-vim-edit-plugin")]
@@ -327,6 +329,14 @@ fn shell_plugin() -> bcode_plugin::StaticBundledPlugin {
     bcode_plugin::StaticBundledPlugin::new(
         include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
         bcode_shell_plugin::static_plugin(),
+    )
+}
+
+#[cfg(feature = "static-bundled-tantivy-session-search-plugin")]
+fn tantivy_session_search_plugin() -> bcode_plugin::StaticBundledPlugin {
+    bcode_plugin::StaticBundledPlugin::new(
+        include_str!("../../../plugins/tantivy-session-search-plugin/bcode-plugin.toml"),
+        bcode_tantivy_session_search_plugin::static_plugin(),
     )
 }
 

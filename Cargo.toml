@@ -27,6 +27,7 @@ members = [
     "plugins/vim-edit-plugin",
     "plugins/workflow-plugin",
     "plugins/model-plugin",
+    "plugins/tantivy-session-search-plugin",
     "plugins/skills-plugin",
     "plugins/worktree-plugin",
     "packages/agent-policy",
@@ -179,6 +180,7 @@ bcode_skill                             = { version = "0.0.1-alpha.0", default-f
 bcode_skill_models                      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/skill/models" }
 bcode_skills_plugin                     = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/skills-plugin" }
 bcode_syntax_render                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/syntax-render" }
+bcode_tantivy_session_search_plugin     = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/tantivy-session-search-plugin" }
 bcode_tesseract_ocr                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tesseract-ocr" }
 bcode_tesseract_sys                     = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tesseract-sys" }
 bcode_tool                              = { version = "0.0.1-alpha.0", default-features = false, path = "packages/tool" }
@@ -332,6 +334,11 @@ syntect = { version = "5.3.0", default-features = false, features = [
 ] }
 sysinfo = { version = "0.39.6", default-features = false, features = [
     "system",
+] }
+tantivy = { version = "0.26.1", default-features = false, features = [
+    "columnar-zstd-compression",
+    "lz4-compression",
+    "mmap",
 ] }
 tempfile = { version = "3.27.0", default-features = false }
 test-log = { version = "0.2.20", default-features = false }

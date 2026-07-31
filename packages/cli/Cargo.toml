@@ -125,6 +125,7 @@ static-bundled-ralph-plugin = [
 ]
 static-bundled-read-plugin = ["_static-bundled"]
 static-bundled-shell-plugin = ["_static-bundled"]
+static-bundled-tantivy-session-search-plugin = ["_static-bundled"]
 static-bundled-web-search-plugin = ["_static-bundled"]
 static-bundled-workflow-plugin = [
     "_static-bundled",

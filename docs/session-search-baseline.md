@@ -217,5 +217,39 @@ explicit revision:
   deadline-bounded, and report incomplete coverage rather than block ordinary results.
 
 The 50,000-event page baseline currently exceeds the 100 ms target. That is recorded as a known gap,
-not relaxed into the budget. Provider index/corpus amplification must be measured separately before a
-backend is accepted.
+not relaxed into the budget.
+
+## Tantivy transcript-provider benchmark
+
+Run on 2026-07-28 with:
+
+```sh
+cargo test --release -p bcode_tantivy_session_search_plugin \
+  benchmark_tantivy_provider_query_ingestion_open_and_amplification \
+  -- --ignored --nocapture
+```
+
+The deterministic synthetic transcript corpus contains 25,000 event-level records in 100 bounded
+250-record batches, 26,811,315 normalized UTF-8 bytes, repeated natural-language context, and
+selective searchable tokens. The provider used its minimum configured 15 MiB writer cache and the
+same LZ4 postings/Zstd columnar compression features used by production builds.
+
+Observed release results on the development machine:
+
+* total ingestion including 100 durable commits: 6.608 seconds, or 3,783 records/second;
+* commit latency: 60.871 ms p50 and 93.786 ms p95 per 250-record batch;
+* warm 20-hit query latency over the 25,000-record corpus: 0.236 ms p50 and 0.329 ms p95;
+* provider reopen with retained checkpoint/index reconciliation: 1.926 ms;
+* index bytes: 4,693,199 bytes, or 17.5% of normalized source bytes;
+* configured writer memory: 15 MiB; process RSS was not isolated from the Rust test harness, so no
+  measured peak-RSS claim is made;
+* canonical hydration was not measured here because providers must not access canonical storage;
+  it remains an application-layer benchmark item.
+
+The measured query and disk amplification are within the initial 100 ms and 50% budgets. Ingestion
+commit cost is intentionally explicit and belongs on asynchronous provider workers; it cannot run on
+or delay canonical append. These measurements cover one deterministic 25,000-record transcript
+profile, not the final 100,000-event representative corpus or daemon-level p50/p95/p99 acceptance.
+
+The initial Tantivy transcript measurement does not replace future large-output provider/corpus
+amplification measurements before that backend is accepted.
