@@ -809,6 +809,15 @@ fn apply_effect_result(
         TuiEffectResult::SetSessionReasoning { status, result } => {
             apply_set_session_reasoning_result(chat, status, result);
         }
+        TuiEffectResult::AppendPresentationNote { result } => {
+            if let Err(error) = result {
+                daemon_issue::report_client_issue(
+                    &mut chat.app,
+                    "presentation note persistence failed",
+                    &error,
+                );
+            }
+        }
         TuiEffectResult::CompactContext { session_id, result } => {
             apply_compact_context_result(chat, session_id, result);
         }
@@ -1385,10 +1394,13 @@ fn apply_create_worktree_result(
         chat.app.apply_session_summary(&session);
         chat.session_id = Some(session_id);
     }
-    chat.app.push_system_markdown(format!(
-        "Created worktree\n* Path: {}",
-        display_from_current_dir(&path)
-    ));
+    chat.push_presentation_markdown(
+        "bcode.host",
+        format!(
+            "Created worktree\n* Path: {}",
+            display_from_current_dir(&path)
+        ),
+    );
     chat.app.set_status("created worktree".to_owned());
 }
 

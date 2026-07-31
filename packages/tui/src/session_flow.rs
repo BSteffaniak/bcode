@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bcode_agent_profile::AgentInfo;
 use bcode_client::{AttachedSessionHistory, BcodeClient, SessionCatalogWatcher, SessionList};
@@ -27,6 +28,8 @@ use super::text_input_flow;
 use super::{TuiError, history_flow};
 use super::{session_picker, session_picker_render};
 
+static PRESENTATION_NOTE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
 /// Active chat session state shared by TUI flows.
 pub struct ActiveChat {
     pub app: BmuxApp,
@@ -41,6 +44,39 @@ pub struct ActiveChat {
 }
 
 impl ActiveChat {
+    /// Queue a renderer-neutral presentation note, persisting it when a session is active.
+    pub fn push_presentation_note(
+        &mut self,
+        source_id: impl Into<String>,
+        text: String,
+        format: bcode_command::CommandTextFormat,
+    ) {
+        let source_id = source_id.into();
+        if let Some(session_id) = self.app.session_id() {
+            self.start_effect(super::effects::TuiEffect::AppendPresentationNote {
+                session_id,
+                source_id,
+                note_id: format!(
+                    "{:020}-{}",
+                    PRESENTATION_NOTE_SEQUENCE.fetch_add(1, Ordering::Relaxed),
+                    uuid::Uuid::new_v4()
+                ),
+                text,
+                format,
+            });
+            return;
+        }
+        match format {
+            bcode_command::CommandTextFormat::PlainText => self.app.push_system_plain(text),
+            bcode_command::CommandTextFormat::Markdown => self.app.push_system_markdown(text),
+            bcode_command::CommandTextFormat::Json => self.app.push_system_json(text),
+        }
+    }
+
+    pub fn push_presentation_markdown(&mut self, source_id: impl Into<String>, text: String) {
+        self.push_presentation_note(source_id, text, bcode_command::CommandTextFormat::Markdown);
+    }
+
     /// Queue a background effect to start when the chat loop effect runner is available.
     pub fn start_effect(&mut self, effect: super::effects::TuiEffect) {
         self.pending_effects.start(effect);

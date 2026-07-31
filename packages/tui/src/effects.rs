@@ -1,6 +1,6 @@
 //! Background effect runner for TUI work that may touch daemon/client services.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use bcode_client::{BcodeClient, ClientError, MessageAcceptance};
 use bcode_ipc::{ComposerDraftScope, PermissionSummary, PromptPlacement};
@@ -212,6 +212,19 @@ pub enum TuiEffect {
         summary: Option<String>,
         /// Success status text.
         status: String,
+    },
+    /// Append one durable presentation-only transcript note.
+    AppendPresentationNote {
+        /// Session that owns the note.
+        session_id: SessionId,
+        /// Stable producer identity.
+        source_id: String,
+        /// Unique note identity within the producer.
+        note_id: String,
+        /// Complete bounded note text.
+        text: String,
+        /// Renderer-neutral text format.
+        format: bcode_command::CommandTextFormat,
     },
     /// Cancel runtime work for a session.
     CancelRuntimeWork {
@@ -466,6 +479,11 @@ pub enum TuiEffectResult {
         /// Daemon response.
         result: Result<(), ClientError>,
     },
+    /// Durable presentation note append completed.
+    AppendPresentationNote {
+        /// Daemon response.
+        result: Result<(), ClientError>,
+    },
     /// Runtime work cancellation completed.
     CancelRuntimeWork {
         /// Cancelled work id.
@@ -553,6 +571,9 @@ impl TuiEffectResult {
             Self::SkillAction { result, .. } => DaemonObservation::from_client_result(result),
             Self::SetSessionModel { result, .. } => DaemonObservation::from_client_result(result),
             Self::SetSessionReasoning { result, .. } => {
+                DaemonObservation::from_client_result(result)
+            }
+            Self::AppendPresentationNote { result } => {
                 DaemonObservation::from_client_result(result)
             }
             Self::SubmitMessage { result, .. } => DaemonObservation::from_client_result(result),
@@ -653,6 +674,7 @@ enum EffectKey {
     SkillAction(SkillId),
     SetSessionModel(SessionId),
     SetSessionReasoning(SessionId),
+    AppendPresentationNote(SessionId, String),
     CancelRuntimeWork(SessionId),
     CompactContext(SessionId),
     AttachWorktree(SessionId),
@@ -772,6 +794,9 @@ impl TuiEffect {
                 status,
                 result: Err(client_error),
             },
+            Self::AppendPresentationNote { .. } => TuiEffectResult::AppendPresentationNote {
+                result: Err(client_error),
+            },
             Self::CancelRuntimeWork { work_id, .. } => TuiEffectResult::CancelRuntimeWork {
                 work_id,
                 result: Err(client_error),
@@ -824,6 +849,7 @@ impl TuiEffect {
             | Self::SkillAction { .. }
             | Self::SetSessionModel { .. }
             | Self::SetSessionReasoning { .. }
+            | Self::AppendPresentationNote { .. }
             | Self::CancelRuntimeWork { .. }
             | Self::CompactContext { .. }
             | Self::AttachWorktree { .. }
@@ -907,6 +933,7 @@ pub struct TuiEffectRunner {
     streaming_sender: mpsc::UnboundedSender<TuiEffectResult>,
     streaming_receiver: mpsc::UnboundedReceiver<TuiEffectResult>,
     queued_latest: BTreeMap<EffectKey, TuiEffect>,
+    queued_presentation_notes: BTreeMap<SessionId, VecDeque<TuiEffect>>,
 }
 
 impl TuiEffectRunner {
@@ -926,12 +953,28 @@ impl TuiEffectRunner {
             streaming_sender,
             streaming_receiver,
             queued_latest: BTreeMap::new(),
+            queued_presentation_notes: BTreeMap::new(),
         }
     }
 
     /// Start an effect if another effect with the same key is not running.
     pub fn start(&mut self, effect: TuiEffect) -> bool {
         let key = effect.key();
+        if let TuiEffect::AppendPresentationNote { session_id, .. } = &effect {
+            let session_id = *session_id;
+            let active = self
+                .tasks
+                .keys()
+                .any(|key| matches!(key, EffectKey::AppendPresentationNote(active, _) if *active == session_id));
+            let queue = self
+                .queued_presentation_notes
+                .entry(session_id)
+                .or_default();
+            if active || !queue.is_empty() {
+                queue.push_back(effect);
+                return false;
+            }
+        }
         if self.tasks.contains_key(&key) {
             return false;
         }
@@ -1007,7 +1050,20 @@ impl TuiEffectRunner {
                 Err(_error) => {}
             }
             if let Some(effect) = self.queued_latest.remove(&key) {
+                self.spawn(key.clone(), effect);
+            }
+            let EffectKey::AppendPresentationNote(session_id, _) = key else {
+                continue;
+            };
+            let next = self
+                .queued_presentation_notes
+                .get_mut(&session_id)
+                .and_then(VecDeque::pop_front);
+            if let Some(effect) = next {
+                let key = effect.key();
                 self.spawn(key, effect);
+            } else {
+                self.queued_presentation_notes.remove(&session_id);
             }
         }
         results
@@ -1038,6 +1094,7 @@ impl TuiEffectRunner {
     /// Abort all in-flight effects.
     pub fn abort_all(&mut self) {
         self.queued_latest.clear();
+        self.queued_presentation_notes.clear();
         for (_key, task) in std::mem::take(&mut self.tasks) {
             task.abort();
         }
@@ -1085,6 +1142,11 @@ impl TuiEffect {
             Self::SetSessionReasoning { session_id, .. } => {
                 EffectKey::SetSessionReasoning(*session_id)
             }
+            Self::AppendPresentationNote {
+                session_id,
+                note_id,
+                ..
+            } => EffectKey::AppendPresentationNote(*session_id, note_id.clone()),
             Self::CancelRuntimeWork { session_id, .. } => EffectKey::CancelRuntimeWork(*session_id),
             Self::CompactContext { session_id } => EffectKey::CompactContext(*session_id),
             Self::AttachWorktree { session_id, .. } => EffectKey::AttachWorktree(*session_id),
@@ -1329,6 +1391,17 @@ impl TuiEffect {
                 )
                 .await
                 .map(|_| ()),
+            },
+            Self::AppendPresentationNote {
+                session_id,
+                source_id,
+                note_id,
+                text,
+                format,
+            } => TuiEffectResult::AppendPresentationNote {
+                result: client
+                    .append_presentation_note(session_id, source_id, note_id, text, format)
+                    .await,
             },
             Self::CancelRuntimeWork {
                 session_id,
@@ -1960,6 +2033,44 @@ async fn cycle_thinking_effort(
 #[cfg(test)]
 mod progress_routing_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn presentation_note_queue_preserves_emission_order_per_session() {
+        let client = BcodeClient::default_endpoint();
+        let mut runner = TuiEffectRunner::new(&client, &client, TuiDaemonHost::new(&[]));
+        let session_id = SessionId::new();
+        let note = |note_id: &str| TuiEffect::AppendPresentationNote {
+            session_id,
+            source_id: "test".to_owned(),
+            note_id: note_id.to_owned(),
+            text: note_id.to_owned(),
+            format: bcode_command::CommandTextFormat::PlainText,
+        };
+        let active_key = EffectKey::AppendPresentationNote(session_id, "0001".to_owned());
+        runner.tasks.insert(
+            active_key,
+            tokio::spawn(async { std::future::pending::<TuiEffectResult>().await }),
+        );
+
+        assert!(!runner.start(note("0002")));
+        assert!(!runner.start(note("0003")));
+
+        let queued = runner
+            .queued_presentation_notes
+            .get(&session_id)
+            .expect("notes should queue behind the active append")
+            .iter()
+            .map(TuiEffect::key)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            queued,
+            vec![
+                EffectKey::AppendPresentationNote(session_id, "0002".to_owned()),
+                EffectKey::AppendPresentationNote(session_id, "0003".to_owned()),
+            ]
+        );
+        runner.abort_all();
+    }
 
     #[tokio::test]
     async fn runner_drains_streaming_session_progress_through_effect_results() {

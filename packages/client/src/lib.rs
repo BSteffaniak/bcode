@@ -1911,6 +1911,34 @@ impl BcodeClient {
         }
     }
 
+    /// Append a durable presentation-only note to a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the note.
+    pub async fn append_presentation_note(
+        &self,
+        session_id: SessionId,
+        source_id: String,
+        note_id: String,
+        text: String,
+        format: bcode_command::CommandTextFormat,
+    ) -> Result<(), ClientError> {
+        match self
+            .send_request(Request::AppendPresentationNote {
+                session_id,
+                source_id,
+                note_id,
+                text,
+                format,
+            })
+            .await?
+        {
+            ResponsePayload::PresentationNoteAppended => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Return active model metadata for a session.
     ///
     /// # Errors

@@ -214,11 +214,9 @@ async fn apply_command_effect<W: Write>(
 ) -> Result<(), TuiError> {
     match effect {
         CommandEffect::Status { message } => chat.app.set_status(message),
-        CommandEffect::AppendText { text, format } => match format {
-            bcode_command::CommandTextFormat::PlainText => chat.app.push_system_plain(text),
-            bcode_command::CommandTextFormat::Markdown => chat.app.push_system_markdown(text),
-            bcode_command::CommandTextFormat::Json => chat.app.push_system_json(text),
-        },
+        CommandEffect::AppendText { text, format } => {
+            chat.push_presentation_note(plugin_id.to_owned(), text, format);
+        }
         CommandEffect::ToggleSurface { surface_id } => toggle_surface(chat, &surface_id),
         CommandEffect::OpenPluginSurface {
             surface_kind,
@@ -287,7 +285,7 @@ async fn open_command_plugin_surface<W: Write>(
     )
     .await;
     let outcome = surface_result?;
-    apply_plugin_surface_outcome(chat, outcome);
+    apply_plugin_surface_outcome(chat, plugin_id, outcome);
     Ok(())
 }
 
@@ -350,7 +348,11 @@ async fn hydrate_plugin_surface_options(
     serde_json::Value::Object(map)
 }
 
-fn apply_plugin_surface_outcome(chat: &mut ActiveChat, outcome: Option<serde_json::Value>) {
+fn apply_plugin_surface_outcome(
+    chat: &mut ActiveChat,
+    plugin_id: &str,
+    outcome: Option<serde_json::Value>,
+) {
     let Some(outcome) = outcome else {
         return;
     };
@@ -366,11 +368,7 @@ fn apply_plugin_surface_outcome(chat: &mut ActiveChat, outcome: Option<serde_jso
     }
     if let Some(text) = outcome.append_text {
         let (text, format) = text.into_parts();
-        match format {
-            bcode_command::CommandTextFormat::PlainText => chat.app.push_system_plain(text),
-            bcode_command::CommandTextFormat::Markdown => chat.app.push_system_markdown(text),
-            bcode_command::CommandTextFormat::Json => chat.app.push_system_json(text),
-        }
+        chat.push_presentation_note(plugin_id.to_owned(), text, format);
     }
     if let Some(path) = outcome.set_session_working_directory {
         if let Some(session_id) = chat.app.session_id() {
@@ -484,7 +482,8 @@ fn start_compact_context(chat: &mut ActiveChat) {
 }
 
 fn show_bmux_help(chat: &mut ActiveChat) {
-    chat.app.push_system_markdown(
+    chat.push_presentation_note(
+        "bcode.host",
         [
             "# TUI help",
             "",
@@ -493,6 +492,7 @@ fn show_bmux_help(chat: &mut ActiveChat) {
             "* In permission dialogs, approve or deny directly, or move focus and confirm.",
         ]
         .join("\n"),
+        bcode_command::CommandTextFormat::Markdown,
     );
     chat.app.set_status("help shown".to_owned());
 }

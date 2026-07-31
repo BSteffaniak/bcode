@@ -602,6 +602,9 @@ fn non_streaming_item(event: &SessionEvent) -> Option<(TranscriptProjectionItemK
         SessionEventKind::UserMessage { text, .. } | SessionEventKind::SystemMessage { text } => {
             Some((TranscriptProjectionItemKind::UserMessage, text.len()))
         }
+        SessionEventKind::PluginStatusNote { text, .. } => {
+            Some((TranscriptProjectionItemKind::Other, text.len()))
+        }
         SessionEventKind::PermissionRequested { arguments_json, .. } => Some((
             TranscriptProjectionItemKind::Permission,
             arguments_json.len(),

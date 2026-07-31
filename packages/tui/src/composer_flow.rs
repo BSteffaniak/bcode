@@ -166,12 +166,20 @@ async fn handle_slash_command<W: Write>(
         }
         slash_commands::SlashCommandOutcome::SystemMarkdown(note) => {
             chat.app.clear_pending_submission(message);
-            chat.app.push_system_markdown(note);
+            chat.push_presentation_note(
+                "bcode.host",
+                note,
+                bcode_command::CommandTextFormat::Markdown,
+            );
             chat.app.set_status("slash command handled".to_owned());
         }
         slash_commands::SlashCommandOutcome::SystemPlain(note) => {
             chat.app.clear_pending_submission(message);
-            chat.app.push_system_plain(note);
+            chat.push_presentation_note(
+                "bcode.host",
+                note,
+                bcode_command::CommandTextFormat::PlainText,
+            );
             chat.app.set_status("slash command handled".to_owned());
         }
         slash_commands::SlashCommandOutcome::OpenThinkingSettings(focus) => {

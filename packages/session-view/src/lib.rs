@@ -1371,21 +1371,41 @@ impl SessionView {
                 text,
                 metadata,
             } => {
-                let key = format!("{plugin_id}:{note_id}");
-                self.snapshot.plugin_status.insert(
-                    key,
-                    PluginStatusView {
-                        plugin_id: plugin_id.clone(),
-                        note_id: note_id.clone(),
+                let presentation_only = metadata
+                    .get("presentation_only")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or_default();
+                if !presentation_only {
+                    let key = format!("{plugin_id}:{note_id}");
+                    self.snapshot.plugin_status.insert(
+                        key,
+                        PluginStatusView {
+                            plugin_id: plugin_id.clone(),
+                            note_id: note_id.clone(),
+                            text: text.clone(),
+                            priority: 0,
+                            metadata: metadata.clone(),
+                        },
+                    );
+                }
+                let format = metadata.get("format").and_then(serde_json::Value::as_str);
+                let mut message = match format {
+                    Some("markdown") => ChatMessageView::markdown(text.clone()),
+                    Some("json") => ChatMessageView {
                         text: text.clone(),
-                        priority: 0,
-                        metadata: metadata.clone(),
+                        display_label: None,
+                        format: bcode_session_view_models::TextFormat::Json,
                     },
-                );
-                let mut message = ChatMessageView::plain(text.clone());
+                    _ => ChatMessageView::plain(text.clone()),
+                };
                 message.display_label = Some(plugin_id.clone());
+                let item_id = if presentation_only {
+                    TranscriptViewItemId::event(event.sequence)
+                } else {
+                    TranscriptViewItemId::new(format!("plugin-status:{plugin_id}:{note_id}"))
+                };
                 self.upsert_item(
-                    TranscriptViewItemId::new(format!("plugin-status:{plugin_id}:{note_id}")),
+                    item_id,
                     event.sequence,
                     Some(event.timestamp_ms),
                     false,
@@ -6462,6 +6482,50 @@ mod tests {
     }
 
     #[test]
+    fn presentation_only_plugin_notes_do_not_accumulate_active_status() {
+        let session_id = SessionId::new();
+        let snapshot = build_session_view_snapshot(&[
+            event(
+                session_id,
+                1,
+                SessionEventKind::PluginStatusNote {
+                    plugin_id: "bcode.host".to_owned(),
+                    note_id: "notice-1".to_owned(),
+                    text: "first".to_owned(),
+                    metadata: BTreeMap::from([(
+                        "presentation_only".to_owned(),
+                        serde_json::Value::Bool(true),
+                    )]),
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::PluginStatusNote {
+                    plugin_id: "bcode.host".to_owned(),
+                    note_id: "notice-2".to_owned(),
+                    text: "second".to_owned(),
+                    metadata: BTreeMap::from([(
+                        "presentation_only".to_owned(),
+                        serde_json::Value::Bool(true),
+                    )]),
+                },
+            ),
+        ]);
+
+        assert!(snapshot.plugin_status.is_empty());
+        assert_eq!(snapshot.transcript.items.len(), 2);
+        assert_eq!(
+            snapshot.transcript.items[0].id,
+            TranscriptViewItemId::event(1)
+        );
+        assert_eq!(
+            snapshot.transcript.items[1].id,
+            TranscriptViewItemId::event(2)
+        );
+    }
+
+    #[test]
     fn projects_skill_and_plugin_status_semantics() {
         let session_id = SessionId::new();
         let skill_id = bcode_skill_models::SkillId::new("renderer-skill");
@@ -6503,7 +6567,10 @@ mod tests {
                     plugin_id: "bcode.loop".to_owned(),
                     note_id: "run".to_owned(),
                     text: "iteration finished".to_owned(),
-                    metadata: BTreeMap::from([("iteration".to_owned(), serde_json::json!(2))]),
+                    metadata: BTreeMap::from([
+                        ("iteration".to_owned(), serde_json::json!(2)),
+                        ("format".to_owned(), serde_json::json!("markdown")),
+                    ]),
                 },
             ),
             event(
@@ -6530,6 +6597,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(status_items.len(), 1);
         assert_eq!(status_items[0].revision, 1);
+        assert!(matches!(
+            &status_items[0].kind,
+            TranscriptViewItemKind::SystemMessage { message }
+                if message.format == bcode_session_view_models::TextFormat::Markdown
+        ));
         assert!(snapshot.transcript.items.iter().any(|item| {
             matches!(
                 &item.kind,

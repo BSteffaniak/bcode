@@ -3633,6 +3633,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::CompactSession { session_id }
         | Request::SetSessionModel { session_id, .. }
         | Request::SetSessionReasoning { session_id, .. }
+        | Request::AppendPresentationNote { session_id, .. }
         | Request::SessionModelStatus { session_id }
         | Request::ActivateSkill { session_id, .. }
         | Request::DeactivateSkill { session_id, .. }
@@ -3786,6 +3787,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::CompactSession { .. } => "compact_session",
         Request::SetSessionModel { .. } => "set_session_model",
         Request::SetSessionReasoning { .. } => "set_session_reasoning",
+        Request::AppendPresentationNote { .. } => "append_presentation_note",
         Request::SessionModelStatus { .. } => "session_model_status",
         Request::DefaultModelStatus => "default_model_status",
         Request::SessionModelList { .. } => "session_model_list",
@@ -4699,6 +4701,27 @@ async fn handle_request_inner(
         } => {
             handle_set_session_reasoning(request_id, state, writer, session_id, effort, summary)
                 .await
+        }
+        Request::AppendPresentationNote {
+            session_id,
+            source_id,
+            note_id,
+            text,
+            format,
+        } => {
+            handle_append_presentation_note(
+                request_id,
+                state,
+                writer,
+                PresentationNoteRequest {
+                    session_id,
+                    source_id,
+                    note_id,
+                    text,
+                    format,
+                },
+            )
+            .await
         }
         Request::SessionModelStatus { session_id } => {
             handle_session_model_status(request_id, client_id, state, writer, session_id).await
@@ -10779,6 +10802,98 @@ fn reasoning_capabilities_from_config(
         raw_reasoning_supported: reasoning.raw_reasoning_supported.unwrap_or_default(),
         source: bcode_model::ModelReasoningCapabilitySource::ConfigOverride,
     })
+}
+
+const MAX_PRESENTATION_NOTE_SOURCE_ID_BYTES: usize = 128;
+const MAX_PRESENTATION_NOTE_ID_BYTES: usize = 256;
+const MAX_PRESENTATION_NOTE_TEXT_BYTES: usize = 64 * 1024;
+
+struct PresentationNoteRequest {
+    session_id: SessionId,
+    source_id: String,
+    note_id: String,
+    text: String,
+    format: bcode_command::CommandTextFormat,
+}
+
+async fn handle_append_presentation_note(
+    request_id: u64,
+    state: &ServerState,
+    writer: &SharedWriter,
+    request: PresentationNoteRequest,
+) -> Result<(), ServerError> {
+    let PresentationNoteRequest {
+        session_id,
+        source_id,
+        note_id,
+        text,
+        format,
+    } = request;
+    let invalid = source_id.trim().is_empty()
+        || source_id.len() > MAX_PRESENTATION_NOTE_SOURCE_ID_BYTES
+        || note_id.trim().is_empty()
+        || note_id.len() > MAX_PRESENTATION_NOTE_ID_BYTES
+        || text.trim().is_empty()
+        || text.len() > MAX_PRESENTATION_NOTE_TEXT_BYTES;
+    if invalid {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new(
+                "invalid_presentation_note",
+                "presentation note fields are empty or exceed their bounded limits",
+            )),
+        )
+        .await;
+    }
+    let metadata = BTreeMap::from([
+        (
+            "format".to_owned(),
+            serde_json::Value::String(
+                match format {
+                    bcode_command::CommandTextFormat::PlainText => "plain_text",
+                    bcode_command::CommandTextFormat::Markdown => "markdown",
+                    bcode_command::CommandTextFormat::Json => "json",
+                }
+                .to_owned(),
+            ),
+        ),
+        (
+            "presentation_only".to_owned(),
+            serde_json::Value::Bool(true),
+        ),
+    ]);
+    match state
+        .sessions
+        .append_event(
+            session_id,
+            SessionEventKind::PluginStatusNote {
+                plugin_id: source_id,
+                note_id,
+                text,
+                metadata,
+            },
+        )
+        .await
+    {
+        Ok(event) => {
+            publish_session_event(state, &event).await;
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::PresentationNoteAppended),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(session_error_response(&error)),
+            )
+            .await
+        }
+    }
 }
 
 async fn handle_set_session_model(

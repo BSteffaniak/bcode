@@ -84,7 +84,7 @@ const MAX_CHUNK_DATA_SIZE: usize = MAX_FRAME_PAYLOAD_SIZE / 2;
 /// enum layouts or envelope payload shapes change incompatibly so stale
 /// client/daemon pairs fail explicitly during envelope decode instead of
 /// interpreting payloads with mismatched positional layouts.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 24;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 25;
 
 /// Durable session-storage writer epoch expected by this IPC build.
 pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
@@ -727,6 +727,14 @@ pub enum Request {
         request: bcode_session_search::SessionSearchRequest,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         routes: Vec<bcode_session_search::SessionSearchContentRoute>,
+    },
+    /// Append one durable, presentation-only note at the current session sequence.
+    AppendPresentationNote {
+        session_id: SessionId,
+        source_id: String,
+        note_id: String,
+        text: String,
+        format: bcode_command::CommandTextFormat,
     },
 }
 
@@ -2378,6 +2386,7 @@ pub enum ResponsePayload {
     SessionSearchPlan {
         plan: bcode_session_search::SessionSearchPlan,
     },
+    PresentationNoteAppended,
 }
 
 /// Stable reasons runtime ownership cannot currently be released.

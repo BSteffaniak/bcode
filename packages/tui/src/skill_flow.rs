@@ -33,8 +33,11 @@ pub async fn pick_skill_for_session<W: Write>(
     };
     if skills.skills.is_empty() {
         chat.app.set_status("no skills available".to_owned());
-        chat.app
-            .push_system_plain("No skills are available.".to_owned());
+        chat.push_presentation_note(
+            "bcode.host",
+            "No skills are available.".to_owned(),
+            bcode_command::CommandTextFormat::PlainText,
+        );
         return Ok(());
     }
     let mut picker = skill_picker::SkillPickerApp::new(skills.skills);
@@ -290,14 +293,17 @@ async fn describe_skill(
         .description
         .as_deref()
         .unwrap_or("no description");
-    chat.app
-        .push_system_markdown(super::slash_commands::format_skill_details_markdown(
+    chat.push_presentation_note(
+        "bcode.host",
+        super::slash_commands::format_skill_details_markdown(
             &manifest.summary.name,
             manifest.summary.id.as_str(),
             &manifest.summary.source.label,
             Some(description),
             &truncate_markdown_for_display(&manifest.instructions, 2_000),
-        ));
+        ),
+        bcode_command::CommandTextFormat::Markdown,
+    );
     chat.app.set_status(format!("shown skill {skill_id}"));
     Ok(())
 }

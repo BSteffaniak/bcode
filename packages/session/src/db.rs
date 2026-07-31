@@ -3699,6 +3699,17 @@ async fn project_event(
             )
             .await?;
         }
+        SessionEventKind::PluginStatusNote { text, .. } => {
+            insert_transcript_item(
+                db,
+                event,
+                "system",
+                "plugin_status_note",
+                "complete",
+                Some(text.clone()),
+            )
+            .await?;
+        }
         SessionEventKind::ToolCallRequested {
             tool_call_id,
             tool_name,
@@ -5253,6 +5264,39 @@ mod tests {
         );
         assert_eq!(transcript[1].kind, "tool_exchange_resolved");
         assert_eq!(transcript[1].status, "complete");
+    }
+
+    #[tokio::test]
+    async fn presentation_note_is_in_bounded_transcript_projection() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        let db = SessionDb::open_turso_in_root(session_id, temp_dir.path())
+            .await
+            .expect("open session db");
+        db.append_event(&event(
+            session_id,
+            0,
+            SessionEventKind::PluginStatusNote {
+                plugin_id: "bcode.host".to_owned(),
+                note_id: "notice-1".to_owned(),
+                text: "durable notice".to_owned(),
+                metadata: BTreeMap::from([(
+                    "presentation_only".to_owned(),
+                    serde_json::Value::Bool(true),
+                )]),
+            },
+        ))
+        .await
+        .expect("append presentation note");
+
+        let transcript = db
+            .latest_transcript_items(10)
+            .await
+            .expect("bounded transcript");
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].role, "system");
+        assert_eq!(transcript[0].kind, "plugin_status_note");
+        assert_eq!(transcript[0].content.as_deref(), Some("durable notice"));
     }
 
     #[tokio::test]
