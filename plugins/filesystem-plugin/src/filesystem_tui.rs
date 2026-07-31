@@ -688,6 +688,51 @@ mod tests {
     }
 
     #[test]
+    fn progressive_write_and_edit_drafts_render_current_diff_content() {
+        let context = bcode_plugin_sdk::tui::PluginTuiVisualRenderContext::new(
+            80,
+            bcode_plugin_sdk::tui::PluginTuiDiffLayout::Unified,
+            None,
+        );
+        for (schema, previews, expected_each) in [
+            (
+                "bcode.filesystem.request-draft.write",
+                vec![
+                    r#"{"path":"src/new.rs","contents":"fn one() {}"#,
+                    r#"{"path":"src/new.rs","contents":"fn one() {}\nfn two() {}"#,
+                ],
+                vec!["fn one() {}", "fn two() {}"],
+            ),
+            (
+                "bcode.filesystem.request-draft.edit",
+                vec![
+                    r#"{"path":"src/lib.rs","old_text":"old line","new_text":"new"#,
+                    r#"{"path":"src/lib.rs","old_text":"old line","new_text":"new line"#,
+                ],
+                vec!["new", "new line"],
+            ),
+        ] {
+            for (index, preview) in previews.iter().enumerate() {
+                let payload = serde_json::json!({
+                    "preview": preview,
+                    "argument_bytes": preview.len(),
+                    "truncated": false,
+                });
+                let rendered = request_draft_rows(schema, &payload, 80, &context)
+                    .iter()
+                    .map(line_text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(rendered.contains("assembling"), "{rendered}");
+                assert!(rendered.contains(expected_each[index]), "{rendered}");
+                if index > 0 {
+                    assert!(rendered.contains(expected_each[0]), "{rendered}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn request_draft_adapter_bounds_huge_string_rendering() {
         let huge_line = "x".repeat(256 * 1024);
         let preview = format!(r#"{{"path":"src/lib.rs","contents":"{huge_line}"}}"#);

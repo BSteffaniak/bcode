@@ -12,7 +12,11 @@ cleanup() {
         kill "${server_pid}" 2>/dev/null || true
         wait "${server_pid}" 2>/dev/null || true
     fi
-    rm -rf "${workdir}"
+    if [[ "${BCODE_TUI_PTY_KEEP_WORKDIR:-0}" == "1" ]]; then
+        echo "smoke-tui-pty: retained ${workdir}" >&2
+    else
+        rm -rf "${workdir}"
+    fi
 }
 trap cleanup EXIT
 
@@ -26,7 +30,9 @@ esac
 
 cd "${root}"
 
-cargo build --quiet -p bcode --features distribution -p bcode_fake_provider_plugin
+if [[ "${BCODE_TUI_PTY_SKIP_BUILD:-0}" != "1" ]]; then
+    cargo build --quiet -p bcode --features distribution -p bcode_fake_provider_plugin
+fi
 
 case "$(uname -s)" in
     Darwin)
@@ -113,7 +119,7 @@ if pid == 0:
 
 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
 capture = bytearray()
-deadline = time.monotonic() + 120
+deadline = time.monotonic() + int(os.environ.get("BCODE_TUI_PTY_TIMEOUT_SECS", "120"))
 exit_status = None
 exit_requested = False
 request_sent = False
@@ -136,7 +142,7 @@ fn main() {
 '''
 probe_dir = tempfile.mkdtemp(prefix="bcode-tui-grid-")
 with open(os.path.join(probe_dir, "Cargo.toml"), "w", encoding="utf-8") as manifest:
-    manifest.write('''[package]\nname="bcode-tui-grid-probe"\nversion="0.0.0"\nedition="2024"\n[dependencies]\nbmux_terminal_grid={git="https://github.com/BSteffaniak/bmux.git",rev="44a7249f"}\n''')
+    manifest.write('''[package]\nname="bcode-tui-grid-probe"\nversion="0.0.0"\nedition="2024"\n[dependencies]\nbmux_terminal_grid={git="https://github.com/BSteffaniak/bmux.git",rev="e0567de1b11edfb794b041bf3674f451429c493d"}\n''')
 os.mkdir(os.path.join(probe_dir, "src"))
 with open(os.path.join(probe_dir, "src", "main.rs"), "w", encoding="utf-8") as source:
     source.write(probe_source)
@@ -170,7 +176,7 @@ while time.monotonic() < deadline:
     if not request_sent and b"bcode" in capture and session_marker in capture:
         os.write(
             fd,
-            b"tool-shell printf '\\106\\122\\105\\123\\110\\137\\114\\111\\126\\105\\137\\117\\125\\124\\120\\125\\124\\012'; sleep 4; printf '\\106\\122\\105\\123\\110\\137\\106\\111\\116\\101\\114\\137\\117\\125\\124\\120\\125\\124\\012'\r",
+            b"tool-shell printf FRESH\\137LIVE\\137OUTPUT; sleep 4; printf FRESH\\137FINAL\\137OUTPUT\\r",
         )
         request_sent = True
 
