@@ -890,6 +890,7 @@ fn runtime_state_changes_patch_without_transcript_operations_or_reset() {
     let patch = SessionViewPatch::between_snapshots(&base, &next);
     assert!(patch.reset.is_none());
     assert!(patch.transcript.is_empty());
+    assert_eq!(next.transcript.revision, patch.revision);
     assert_eq!(patch.latest_sequence, Some(2));
     assert_eq!(patch.runtime.as_ref(), Some(&next.runtime));
     assert_eq!(patch.runtime_work.as_ref(), Some(&next.runtime_work));
