@@ -617,18 +617,28 @@ async fn ingest_provider_page(
         .last()
         .map(|event| event.sequence);
     let generation = generation.to_owned();
+    let projection_policy =
+        bcode_session_search::projection::SearchProjectionPolicy::for_content_kinds(
+            &provider.capabilities.content_kinds,
+        );
     let mut records = Vec::new();
     let mut batch_text_bytes = 0_usize;
     for event in &page.events {
-        let projected = match bcode_session_search::projection::project_event(
-            event,
-            &bcode_session_search::projection::SearchProjectionPolicy::default(),
-        )
-        .map_err(IngestionError::retryable)?
-        {
-            bcode_session_search::projection::EventProjection::Records(projected) => projected,
-            bcode_session_search::projection::EventProjection::Excluded(_) => continue,
-        };
+        let projected =
+            match bcode_session_search::projection::project_event(event, &projection_policy)
+                .map_err(IngestionError::retryable)?
+            {
+                bcode_session_search::projection::EventProjection::Records(projected) => projected
+                    .into_iter()
+                    .filter(|record| {
+                        provider
+                            .capabilities
+                            .content_kinds
+                            .contains(&record.content_kind)
+                    })
+                    .collect::<Vec<_>>(),
+                bcode_session_search::projection::EventProjection::Excluded(_) => continue,
+            };
         let projected_text_bytes = projected.iter().fold(0_usize, |total, record| {
             total.saturating_add(usize::try_from(record.indexed_bytes).unwrap_or(usize::MAX))
         });
@@ -1203,17 +1213,13 @@ pub async fn search_federated_with_policy_and_routes(
             let result = if call_deadline.is_zero() {
                 Err(timeout_error())
             } else {
-                tokio::time::timeout(
+                search_provider_with_timeout(
+                    state,
+                    &provider.plugin_id,
+                    &provider_request,
                     call_deadline,
-                    search_provider_with_timeout(
-                        state,
-                        &provider.plugin_id,
-                        &provider_request,
-                        call_deadline,
-                    ),
                 )
                 .await
-                .unwrap_or_else(|_| Err(timeout_error()))
             };
             (
                 provider.plugin_id,
@@ -1362,12 +1368,31 @@ fn hydration_error(
     let outcome = match error {
         bcode_session::SessionError::NotFound(_) => SearchHitHydrationOutcome::SessionMissing,
         bcode_session::SessionError::ProjectionStale { .. }
-        | bcode_session::SessionError::Db(_)
+        | bcode_session::SessionError::Db(
+            bcode_session::db::SessionDbError::ProjectionStale { .. }
+            | bcode_session::db::SessionDbError::MigrationHistoryIncompatible { .. }
+            | bcode_session::db::SessionDbError::InvalidCanonicalSequence { .. }
+            | bcode_session::db::SessionDbError::InvalidCompactionMarker { .. }
+            | bcode_session::db::SessionDbError::InvalidRow { .. },
+        )
         | bcode_session::SessionError::DbUnavailable(_) => {
             SearchHitHydrationOutcome::RepairRequired
         }
         bcode_session::SessionError::StorageMigrationRequired { .. }
+        | bcode_session::SessionError::Db(
+            bcode_session::db::SessionDbError::ProjectionIncompatible { .. }
+            | bcode_session::db::SessionDbError::WriterIncompatible { .. }
+            | bcode_session::db::SessionDbError::PersistedEvent(
+                bcode_session::persisted::PersistedSessionEventError::UnsupportedSchemaVersion {
+                    ..
+                }
+                | bcode_session::persisted::PersistedSessionEventError::UnsupportedEventKind {
+                    ..
+                },
+            ),
+        )
         | bcode_session::SessionError::Lease(_) => SearchHitHydrationOutcome::Incompatible,
+        bcode_session::SessionError::Db(_) => SearchHitHydrationOutcome::RepairRequired,
         _ => SearchHitHydrationOutcome::Unavailable,
     };
     HydratedSessionSearchHit {
@@ -1735,6 +1760,18 @@ mod tests {
                     .request
                     .payload_json::<ApplySearchRecordsRequest>()
                     .expect("apply batch request");
+                assert!(request.records.iter().all(|record| {
+                    matches!(
+                        record.content_kind,
+                        SearchContentKind::SessionTitle
+                            | SearchContentKind::UserMessage
+                            | SearchContentKind::AssistantMessage
+                            | SearchContentKind::SystemMessage
+                            | SearchContentKind::ShellCommand
+                            | SearchContentKind::ToolError
+                            | SearchContentKind::Compaction
+                    )
+                }));
                 APPLY_BATCH_CALLS.fetch_add(1, Ordering::SeqCst);
                 service_response(&ApplySearchRecordsResponse {
                     batch_id: request.batch_id,
@@ -2141,6 +2178,34 @@ mod tests {
         }));
         assert!(!response.query_complete);
         assert!(!response.coverage_complete);
+    }
+
+    #[test]
+    fn canonical_hydration_classifies_future_and_damaged_storage_without_guessing() {
+        let hit = response().hits.remove(0);
+        let future = hydration_error(
+            hit.clone(),
+            &bcode_session::SessionError::Db(bcode_session::db::SessionDbError::PersistedEvent(
+                bcode_session::persisted::PersistedSessionEventError::UnsupportedSchemaVersion {
+                    actual: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION
+                        .saturating_add(1),
+                    current: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                },
+            )),
+        );
+        assert_eq!(future.outcome, SearchHitHydrationOutcome::Incompatible);
+        assert!(future.event.is_none());
+
+        let damaged = hydration_error(
+            hit,
+            &bcode_session::SessionError::Db(
+                bcode_session::db::SessionDbError::MigrationHistoryIncompatible {
+                    reason: "unknown migration tail".to_owned(),
+                },
+            ),
+        );
+        assert_eq!(damaged.outcome, SearchHitHydrationOutcome::RepairRequired);
+        assert!(damaged.event.is_none());
     }
 
     #[tokio::test]

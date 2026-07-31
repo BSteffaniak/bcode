@@ -56,6 +56,38 @@ pub struct SearchProjectionPolicy {
     pub artifact_metadata: ProjectionContentPolicy,
 }
 
+impl SearchProjectionPolicy {
+    /// Build the host projection policy for one provider's advertised content coverage.
+    ///
+    /// Finalized transcript categories remain structurally projected by [`project_event`]. This
+    /// method maps only independently gated sensitive categories; a provider cannot receive a
+    /// gated category that it did not advertise.
+    #[must_use]
+    pub fn for_content_kinds(
+        content_kinds: &std::collections::BTreeSet<SearchContentKind>,
+    ) -> Self {
+        let enabled = |kind| {
+            if content_kinds.contains(&kind) {
+                ProjectionContentPolicy::Include
+            } else {
+                ProjectionContentPolicy::Exclude
+            }
+        };
+        Self {
+            reasoning: enabled(SearchContentKind::AssistantReasoning),
+            shell_commands: enabled(SearchContentKind::ShellCommand),
+            shell_output: enabled(SearchContentKind::ShellOutput),
+            tool_arguments: enabled(SearchContentKind::ToolArguments),
+            tool_output: enabled(SearchContentKind::ToolOutput),
+            permissions: enabled(SearchContentKind::Permission),
+            runtime_diagnostics: enabled(SearchContentKind::RuntimeDiagnostic),
+            trace_metadata: enabled(SearchContentKind::TraceMetadata),
+            artifact_metadata: enabled(SearchContentKind::ArtifactMetadata),
+            ..Self::default()
+        }
+    }
+}
+
 impl Default for SearchProjectionPolicy {
     fn default() -> Self {
         Self {
@@ -1668,6 +1700,29 @@ mod tests {
                 assert!(std::str::from_utf8(normalized.text.as_bytes()).is_ok());
             }
         }
+    }
+
+    #[test]
+    fn advertised_content_builds_exact_sensitive_projection_policy() {
+        let content = std::collections::BTreeSet::from([
+            SearchContentKind::AssistantReasoning,
+            SearchContentKind::ShellOutput,
+            SearchContentKind::Permission,
+        ]);
+        let policy = SearchProjectionPolicy::for_content_kinds(&content);
+        assert_eq!(policy.reasoning, ProjectionContentPolicy::Include);
+        assert_eq!(policy.shell_output, ProjectionContentPolicy::Include);
+        assert_eq!(policy.permissions, ProjectionContentPolicy::Include);
+        assert_eq!(policy.shell_commands, ProjectionContentPolicy::Exclude);
+        assert_eq!(policy.tool_arguments, ProjectionContentPolicy::Exclude);
+        assert_eq!(policy.tool_output, ProjectionContentPolicy::Exclude);
+        assert_eq!(policy.runtime_diagnostics, ProjectionContentPolicy::Exclude);
+        assert_eq!(policy.trace_metadata, ProjectionContentPolicy::Exclude);
+        assert_eq!(policy.artifact_metadata, ProjectionContentPolicy::Exclude);
+        assert_eq!(
+            policy.max_text_bytes_per_record,
+            DEFAULT_MAX_TEXT_BYTES_PER_RECORD
+        );
     }
 
     #[test]

@@ -2358,4 +2358,40 @@ mod tests {
         assert!(!content.contains(&SearchContentKind::ToolOutput));
         assert!(confined_storage_root(Path::new("relative")).is_err());
     }
+
+    #[test]
+    fn enablement_and_purge_are_independent_lifecycle_controls() {
+        let parent = tempfile::tempdir().expect("parent");
+        let root = parent.path().join("provider-state");
+        std::fs::create_dir(&root).expect("provider root");
+        std::fs::write(root.join("retained-marker"), b"derived").expect("retained state");
+
+        let plugin = TantivySessionSearchPlugin::default();
+        assert_eq!(
+            plugin.status(&ProviderConfig::default()).state,
+            SearchProviderState::Disabled
+        );
+        assert!(root.join("retained-marker").exists());
+
+        let enabled = config(&root);
+        assert_eq!(plugin.status(&enabled).state, SearchProviderState::Ready);
+        assert!(root.join("retained-marker").exists());
+
+        assert_eq!(
+            plugin.status(&ProviderConfig::default()).state,
+            SearchProviderState::Disabled
+        );
+        assert!(root.join("retained-marker").exists());
+
+        let response = plugin.purge(
+            &enabled,
+            &PurgeSessionSearchRequest {
+                provider_id: PLUGIN_ID.to_owned(),
+                confirmation: PURGE_CONFIRMATION.to_owned(),
+            },
+        );
+        assert!(response.error.is_none());
+        assert!(!root.exists());
+        assert!(parent.path().exists());
+    }
 }

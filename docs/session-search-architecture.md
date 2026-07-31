@@ -120,15 +120,22 @@ absent at compile time, disabled at runtime, or excluded from a content route. A
 * allocates no backend writer/cache resources;
 * cannot affect session creation, append, listing, attach, history, export, or structured inspection.
 
-Disabling a provider does not delete its data. Purge is a separate explicit maintenance operation.
-Tantivy is one possible provider implementation and must remain confined to its provider crate and
-feature path. Its types and query language do not enter shared contracts.
+Disabling a provider does not delete its data. Re-enabling the same configured provider root reuses
+retained compatible derived state. Purge is a separate explicit maintenance operation requiring the
+exact provider identity and provider-defined confirmation token; it revalidates root confinement at
+deletion time and removes only the provider directory while preserving its parent. Tantivy is one
+possible provider implementation and must remain confined to its provider crate and feature path.
+Its types and query language do not enter shared contracts.
 
 ## Search-record projection
 
 Providers receive an allowlisted searchable projection, not raw `SessionEvent` values or serialized
 event payloads. Projection policy explicitly chooses finalized content such as titles, user and
 assistant messages, optional reasoning, commands, bounded tool output, errors, and compact metadata.
+For ingestion, the selected provider's advertised content kinds are the host allowlist: Bcode derives
+each independent sensitive-category gate from those capabilities and filters projected records again
+before invoking the provider. A provider therefore cannot receive a content category it did not
+advertise, while provider configuration may conservatively omit categories from its capabilities.
 New event fields do not become searchable automatically.
 
 Transport-level deltas, replaceable progress, raw event JSON, binary artifacts, and trace blobs are
@@ -163,10 +170,13 @@ using backend-neutral rank information, then deduplicated by canonical locator.
 Every v1 response is one bounded terminal aggregate; partial provider response streaming is deferred.
 Every provider contribution or failure identifies its terminal stage, elapsed time, requested/searched
 or hydration-affected content, completion, timeout/failure classification, stale checkpoints, content
-exclusions, truncation, quotas, and covered ranges. Failed canonical hydration adds a hydration-stage
-stale-provider outcome and makes query/coverage completeness false rather than leaving a successful
-provider report unqualified. Query-execution completeness and corpus-coverage completeness are
-distinct.
+exclusions, truncation, quotas, and covered ranges. Failed canonical hydration adds a hydration-stage stale-provider outcome and makes query/coverage
+completeness false rather than leaving a successful provider report unqualified. Future persisted
+event schemas/kinds, projection schemas, writer epochs, and ownership classify as incompatible;
+inconsistent migration history, invalid canonical sequences/rows/compaction markers, stale
+projections, and unavailable/corrupt canonical DB state classify as repair-required. Failed
+hydration never substitutes another event or returns guessed canonical content. Query-execution
+completeness and corpus-coverage completeness are distinct.
 
 ## Ingestion and maintenance
 
@@ -225,8 +235,13 @@ search semantics do not depend on that choice.
 ## Privacy and resource controls
 
 Reasoning, command text, tool arguments, shell output, other tool output, permissions, diagnostics,
-traces, and artifacts have independent policy controls. Sensitive/high-volume categories use
-conservative defaults and explicit limits. Trace projection includes only allowlisted semantic
+traces, and artifacts have independent projection-policy gates. The default projection includes
+shell command text but excludes reasoning, shell output, tool arguments, successful generic tool
+output, permissions, runtime diagnostics, traces, and artifacts. The Tantivy provider separately
+requires sensitive categories to be explicitly allowlisted before accepting projected records.
+Commands, arguments, reasoning, and tool output may contain credentials or private data; enabling a
+category copies its bounded normalized text into disposable provider-owned derived storage until
+explicit purge. Trace projection includes only allowlisted semantic
 summaries and identifiers; trace blobs, blob paths, opaque metadata, and request/output payloads are
 excluded. Artifact projection includes only identity, producer, schema, title, and reference count;
 opaque metadata, storage URIs, and artifact bytes are excluded.
@@ -267,4 +282,5 @@ session IDs, query scope, content/provider coverage, truncation, freshness, and 
 session workflow must not fall back to direct database access when optional providers are absent or
 coverage is incomplete. The installed user-config skill still requires a separately authorized
 migration before it satisfies this contract; architecture documentation does not treat that external
-file as already migrated.
+file as already migrated. A 2026-08-01 write attempt was rejected by the active filesystem permission
+boundary before changing the skill.
