@@ -17,6 +17,25 @@ The workflow status surface exposes:
 
 Use paged event and attempt APIs for additional history. Artifact references are opaque owner-produced references; status does not read entire artifacts or command output.
 
+## Progress-document and operator interactions
+
+Composable coding workflows use the existing durable input, approval, and mutation-approval
+machinery for progress-document previews, plan-drift review, tranche continuation, and exact
+checkpoint approval. The exact requested path, payload digest, operation identity, and decision are
+persisted before continuation. Renderer actions display and resolve these portable waits; renderer
+selection or presentation metadata never constitutes authorization.
+
+A progress-document proposal created with `local-progress-doc` or `refocus-progress-doc` remains
+subject to its direct exact-payload approval barrier. Approval routes the exact payload to the
+progress-document plugin and is followed by normal mutation authorization. Revision guidance returns
+to the drafting agent; cancellation produces an explicit paused or stopped product outcome. Normal
+status reports only bounded identity, digest, and task-count summaries, never complete document
+content.
+
+Parent/child workflow status includes bounded child identity and stable outcome, but normal reads do
+not poll child owners, load child artifacts, or replay either history. The detailed product behavior
+is specified in [`composable-coding-workflows.md`](composable-coding-workflows.md).
+
 ## Diagnosing a run
 
 Run explicit doctor for a suspected damaged or ambiguous run. Doctor is bounded and non-mutating. It reports:

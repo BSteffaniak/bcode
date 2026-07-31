@@ -103,6 +103,24 @@ revisions remain immutable but report the missing current requirement and fail c
 that need the unavailable block. Existing runs remain pinned to their exact revision and definition;
 no renderer or plugin may migrate them implicitly.
 
+## External authoring documents and composed templates
+
+Inline manifest definitions remain supported. Large bundled product templates may instead use a
+versioned contribution that references a standard `WorkflowAuthoringDocument` beneath the plugin
+package and declares its expected SHA-256. Discovery canonicalizes and confines the source path,
+reads it within the authoring-document bound, verifies the digest, and validates it through the same
+portable authoring pipeline used for client documents. Unknown versions, path escapes, missing files,
+digest mismatch, or invalid source produce diagnostics and never fall back to an older or different
+template.
+
+Instantiating either template form creates a normal mutable authored draft. It does not start the
+workflow, grant authority, or create a private plugin-owned draft. Exact child-workflow dependencies
+inside a template are resolved and previewed before publication; their requirements and effects are
+aggregated rather than hidden behind the parent template.
+
+The workflow plugin's composable coding product and three-level flagship workflow are specified in
+[`composable-coding-workflows.md`](composable-coding-workflows.md).
+
 ## Authoring surface
 
 The workflow plugin contributes `workflow.author`. Existing template describe/configure presents

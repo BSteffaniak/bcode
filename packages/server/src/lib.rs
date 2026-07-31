@@ -14658,6 +14658,29 @@ async fn drive_workflow_run(state: &Arc<ServerState>, run_id: &str) -> Result<()
     Ok(())
 }
 
+async fn drive_workflow_run_and_parents(
+    state: &Arc<ServerState>,
+    initial_run_id: &str,
+) -> Result<(), ServerError> {
+    let mut next = Some(initial_run_id.to_string());
+    let mut visited = BTreeSet::new();
+    while let Some(run_id) = next {
+        if !visited.insert(run_id.clone()) {
+            return Err(ServerError::WorkflowDefinitionUnsupported(
+                "workflow parent link cycle detected while driving completion".to_string(),
+            ));
+        }
+        drive_workflow_run(state, &run_id).await?;
+        next = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .parent_run_link(&run_id)?
+            .map(|link| link.parent_run_id);
+    }
+    Ok(())
+}
+
 async fn handle_list_workflow_definitions(
     request_id: u64,
     state: &ServerState,
@@ -14714,6 +14737,8 @@ async fn workflow_run_inspection(
         grants,
         resource_leases,
         outputs,
+        child_run_links,
+        repeat_outcomes,
     ) = {
         let store = state
             .workflow_store
@@ -14742,6 +14767,8 @@ async fn workflow_run_inspection(
             store.grants_for_run(run_id, limit)?,
             store.resource_leases_for_run(run_id, limit)?,
             store.output_summaries(run_id, limit)?,
+            store.child_run_links(run_id, limit)?,
+            store.repeat_outcomes(run_id, limit)?,
         )
     };
     let child_sessions = state
@@ -14769,6 +14796,8 @@ async fn workflow_run_inspection(
         grants,
         resource_leases,
         outputs,
+        child_run_links,
+        repeat_outcomes,
         child_sessions,
     })
 }
@@ -26296,6 +26325,19 @@ impl bcode_workflow_store::AsyncAttemptStatusObserver for WorkflowTurnReceiptObs
                 .receipt
                 .get("owner")
                 .and_then(serde_json::Value::as_str)
+                == Some("bcode.server.workflow-child/v1")
+            {
+                return self
+                    .state
+                    .workflow_store
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .observe_child_attempt(request, current_unix_millis());
+            }
+            if request
+                .receipt
+                .get("owner")
+                .and_then(serde_json::Value::as_str)
                 == Some(bcode_workflow::WORKFLOW_BLOCK_INTERFACE_ID)
             {
                 return observe_workflow_plugin_receipt(request);
@@ -26606,7 +26648,15 @@ fn authorize_workflow_plugin_block(
                 "workflow plugin block activation has no approval input".to_string(),
             )
         })?;
-        let input_json = serde_json::to_vec(input)?;
+        let prepared = bcode_workflow::prepare_workflow_node_dataflow(
+            activation.node.dataflow,
+            &activation.node.input,
+            &block.input,
+            input,
+        )
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        let owner_input = prepared.owner_input();
+        let input_json = serde_json::to_vec(owner_input)?;
         if input_json.len() > 16_384 {
             return Err(WorkflowStoreError::InvalidData(
                 "workflow mutation approval input summary exceeds 16384 bytes".to_string(),
@@ -26628,7 +26678,7 @@ fn authorize_workflow_plugin_block(
                 use sha2::Digest as _;
                 format!("{:x}", sha2::Sha256::digest(&input_json))
             },
-            input_summary: input.clone(),
+            input_summary: owner_input.clone(),
             resource_claims: bcode_workflow::normalize_resource_claims(
                 activation.node.resources.clone(),
             )
@@ -26715,6 +26765,26 @@ impl ActivationDispatchOwner for WorkflowActivationOwner<'_> {
                     }),
                 }))
             }
+            bcode_workflow::NodeKind::WorkflowCall => {
+                let configuration: bcode_workflow::WorkflowCallConfiguration =
+                    serde_json::from_value(activation.node.configuration.clone())?;
+                configuration
+                    .validate()
+                    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+                if !activation.node.resources.is_empty() {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "workflow call cannot retain resources while awaiting a child".to_string(),
+                    ));
+                }
+                Ok(Some(bcode_workflow_store::ActivationDispatchPlan {
+                    side_effect: bcode_workflow_store::DispatchSideEffect::ReadOnly,
+                    intent: serde_json::json!({
+                        "owner": "bcode.server.workflow-child/v1",
+                        "target": configuration.target,
+                        "input": activation.input,
+                    }),
+                }))
+            }
             _ => Ok(None),
         }
     }
@@ -26742,6 +26812,9 @@ impl ActivationDispatchOwner for WorkflowActivationOwner<'_> {
                 bcode_workflow::NodeKind::PluginBlock => {
                     dispatch_workflow_plugin_block(self.state, request).await
                 }
+                bcode_workflow::NodeKind::WorkflowCall => {
+                    dispatch_workflow_child(self.state, request).await
+                }
                 _ => Err(WorkflowStoreError::InvalidData(
                     "workflow activation has no production owner".to_string(),
                 )),
@@ -26766,6 +26839,190 @@ impl ActivationDispatchOwner for WorkflowActivationOwner<'_> {
 }
 
 #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
+async fn dispatch_workflow_child(
+    state: &Arc<ServerState>,
+    request: &bcode_workflow_store::PreparedActivationDispatch,
+) -> Result<serde_json::Value, WorkflowStoreError> {
+    let configuration: bcode_workflow::WorkflowCallConfiguration =
+        serde_json::from_value(request.activation.node.configuration.clone())?;
+    configuration
+        .validate()
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    let target = configuration.target;
+    let target_identity = target.definition_identity().clone();
+    let now = current_unix_millis();
+    let (parent, parent_link, authored_provenance, child_limits) = {
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let parent = store
+            .run_summary(&request.activation.run_id)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData("parent workflow run is missing".to_string())
+            })?;
+        let parent_link = store.parent_run_link(&request.activation.run_id)?;
+        let stored = store
+            .definition(
+                &target_identity.definition_id,
+                target_identity.definition_version,
+            )?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "exact child workflow definition is unavailable".to_string(),
+                )
+            })?;
+        let _definition: bcode_workflow::WorkflowDefinition =
+            serde_json::from_str(&stored.definition_json)?;
+        let (provenance, limits) = match &target {
+            bcode_workflow::WorkflowCallTarget::Definition { .. } => (None, None),
+            bcode_workflow::WorkflowCallTarget::AuthoredRevision {
+                workflow_id,
+                revision,
+                definition_identity,
+                preset,
+            } => {
+                let published = store
+                    .workflow_revision(workflow_id, *revision)?
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "exact authored child revision is unavailable".to_string(),
+                        )
+                    })?;
+                if published.definition_identity != *definition_identity {
+                    return Err(WorkflowStoreError::InvalidData(
+                        "authored child revision compiled identity changed".to_string(),
+                    ));
+                }
+                let (configuration, limits, preset_id, preset_generation) =
+                    if let Some(preset) = preset {
+                        let stored = store
+                            .workflow_preset(workflow_id, &preset.preset_id)?
+                            .ok_or_else(|| {
+                                WorkflowStoreError::InvalidData(
+                                    "exact authored child preset is unavailable".to_string(),
+                                )
+                            })?;
+                        if stored.revision != *revision || stored.generation != preset.generation {
+                            return Err(WorkflowStoreError::InvalidData(
+                                "authored child preset revision or generation changed".to_string(),
+                            ));
+                        }
+                        (
+                            stored.configuration,
+                            stored.run_limits,
+                            Some(preset.preset_id.clone()),
+                            Some(preset.generation),
+                        )
+                    } else {
+                        (serde_json::json!({}), None, None, None)
+                    };
+                (
+                    Some(bcode_workflow_store::AuthoredWorkflowRunProvenance::new(
+                        workflow_id.clone(),
+                        *revision,
+                        definition_identity.clone(),
+                        preset_id,
+                        preset_generation,
+                        configuration,
+                    )),
+                    limits.map(|limits| bcode_workflow_store::WorkflowRunLimits {
+                        deadline_at_ms: limits
+                            .maximum_duration_ms
+                            .map(|deadline| now.saturating_add(deadline)),
+                        node_execution_cap: limits.node_execution_cap,
+                        concurrency_cap: limits.concurrency_cap,
+                        cycle_cap: limits.cycle_cap,
+                        retry_cap: limits.retry_cap,
+                    }),
+                )
+            }
+        };
+        (parent, parent_link, provenance, limits)
+    };
+    let root_run_id = parent_link
+        .as_ref()
+        .map_or_else(|| parent.run_id.clone(), |link| link.root_run_id.clone());
+    let depth = parent_link
+        .as_ref()
+        .map_or(2, |link| link.depth.saturating_add(1));
+    let child_run_id = bcode_workflow_store::workflow_child_run_id(
+        &root_run_id,
+        &parent.run_id,
+        &request.activation.activation_id,
+        request.attempt,
+        &target,
+    );
+    let parent_limits = {
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store.run_limits(&parent.run_id)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("parent workflow limits are missing".to_string())
+        })?
+    };
+    let child = bcode_workflow_store::NewChildWorkflowRun {
+        link: bcode_workflow_store::WorkflowRunLink {
+            version: bcode_workflow_store::WORKFLOW_RUN_LINK_VERSION,
+            root_run_id,
+            parent_run_id: parent.run_id,
+            parent_node_id: request.activation.node_id.clone(),
+            parent_activation_id: request.activation.activation_id.clone(),
+            parent_attempt: request.attempt,
+            child_run_id: child_run_id.clone(),
+            target,
+            depth,
+            created_at_ms: now,
+        },
+        run: bcode_workflow_store::NewWorkflowRun {
+            run_id: child_run_id.clone(),
+            definition_id: target_identity.definition_id,
+            definition_version: target_identity.definition_version,
+            workspace_snapshot: parent.workspace_snapshot,
+            parent_session_id: parent.parent_session_id,
+            binding: None,
+            authored_provenance,
+            input: request.activation.input.clone(),
+            created_at_ms: now,
+            limits: child_limits.unwrap_or(parent_limits),
+        },
+    };
+    state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .create_child_run_idempotent(&child)?;
+    drive_workflow_run_and_parents(state, &child_run_id)
+        .await
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    Ok(serde_json::json!({
+        "owner": "bcode.server.workflow-child/v1",
+        "child_run_id": child_run_id,
+        "root_run_id": child.link.root_run_id,
+        "depth": child.link.depth,
+        "target": child.link.target,
+    }))
+}
+
+fn workflow_plugin_block_input(
+    request: &bcode_workflow_store::PreparedActivationDispatch,
+    block: &bcode_workflow::WorkflowBlockDefinition,
+) -> Result<serde_json::Value, WorkflowStoreError> {
+    let complete_input = request.activation.input.as_ref().ok_or_else(|| {
+        WorkflowStoreError::InvalidData("workflow plugin block activation has no input".to_string())
+    })?;
+    let prepared = bcode_workflow::prepare_workflow_node_dataflow(
+        request.activation.node.dataflow,
+        &request.activation.node.input,
+        &block.input,
+        complete_input,
+    )
+    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    Ok(prepared.owner_input().clone())
+}
+
+#[allow(clippy::too_many_lines)]
 async fn dispatch_workflow_plugin_block(
     state: &Arc<ServerState>,
     request: &bcode_workflow_store::PreparedActivationDispatch,
@@ -26789,6 +27046,7 @@ async fn dispatch_workflow_plugin_block(
             SessionId::from_str(value)
                 .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))
         })?;
+    let canonical_input = workflow_plugin_block_input(request, &block)?;
     let payload = serde_json::to_vec(&bcode_workflow::WorkflowBlockInvocation {
         version: bcode_workflow::WorkflowBlockInvocation::VERSION,
         dispatch_identity: request.dispatch_identity.clone(),
@@ -26798,11 +27056,7 @@ async fn dispatch_workflow_plugin_block(
             .await
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?
             .working_directory,
-        input: request.activation.input.clone().ok_or_else(|| {
-            WorkflowStoreError::InvalidData(
-                "workflow plugin block activation has no input".to_string(),
-            )
-        })?,
+        input: canonical_input,
     })?;
     let run_work_id = WorkId::new(format!("workflow:{}", request.activation.run_id));
     let mut invocation = state
@@ -26845,7 +27099,34 @@ async fn dispatch_workflow_plugin_block(
     let (status, output, message, runtime_status) = match terminal {
         Ok(Ok(response)) if response.error.is_none() => {
             match serde_json::from_slice::<serde_json::Value>(&response.payload) {
-                Ok(value) => ("succeeded", Some(value), None, RuntimeWorkStatus::Completed),
+                Ok(value) => {
+                    let complete_input = request.activation.input.as_ref().ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "workflow plugin block activation has no input".to_string(),
+                        )
+                    })?;
+                    let prepared = bcode_workflow::prepare_workflow_node_dataflow(
+                        request.activation.node.dataflow,
+                        &request.activation.node.input,
+                        &block.input,
+                        complete_input,
+                    )
+                    .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+                    match bcode_workflow::complete_workflow_node_dataflow(
+                        prepared,
+                        &block.output,
+                        &request.activation.node.output,
+                        value,
+                    ) {
+                        Ok(value) => ("succeeded", Some(value), None, RuntimeWorkStatus::Completed),
+                        Err(error) => (
+                            "failed",
+                            None,
+                            Some(error.to_string()),
+                            RuntimeWorkStatus::Failed,
+                        ),
+                    }
+                }
                 Err(error) => (
                     "failed",
                     None,
@@ -26882,6 +27163,7 @@ async fn dispatch_workflow_plugin_block(
             )
         }
     };
+    drop(invocation);
     finish_registered_runtime_work(
         state,
         parent_session_id,
@@ -27808,6 +28090,31 @@ async fn signal_workflow_attempt_cancellation(
     state: &ServerState,
     attempt: &bcode_workflow_store::ActiveAttemptCancellation,
 ) -> Result<(), WorkflowStoreError> {
+    if attempt
+        .receipt
+        .as_ref()
+        .and_then(|receipt| receipt.get("owner"))
+        .and_then(serde_json::Value::as_str)
+        == Some("bcode.server.workflow-child/v1")
+    {
+        let child_run_id = attempt
+            .receipt
+            .as_ref()
+            .and_then(|receipt| receipt.get("child_run_id"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "workflow child cancellation receipt has no child_run_id".to_string(),
+                )
+            })?;
+        let mut store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = store.request_cancellation(child_run_id, current_unix_millis())?;
+        drop(store);
+        return Ok(());
+    }
     let work_id = WorkId::new(attempt.dispatch_identity.clone());
     let cancelled = state
         .runtime_work
@@ -45622,6 +45929,7 @@ library = "test"
                     id: "task".to_string(),
                     name: "task".to_string(),
                     kind: bcode_workflow::NodeKind::Task,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: schema.clone(),
                     output: schema,
                     resources: Vec::new(),
@@ -45692,6 +46000,7 @@ library = "test"
                         id: "node".to_string(),
                         name: "node".to_string(),
                         kind,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                         input: schema.clone(),
                         output: schema,
                         resources: Vec::new(),
@@ -45736,6 +46045,7 @@ library = "test"
                     id: "block".to_string(),
                     name: "block".to_string(),
                     kind: bcode_workflow::NodeKind::PluginBlock,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: block.input.clone(),
                     output: block.output.clone(),
                     resources: block.resources.clone(),
@@ -45826,6 +46136,7 @@ library = "test"
             id: id.to_string(),
             name: id.to_string(),
             kind,
+            dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
             input: schema.clone(),
             output: schema.clone(),
             resources: Vec::new(),
@@ -45903,6 +46214,7 @@ library = "test"
                         id: "target".to_string(),
                         name: "target".to_string(),
                         kind: bcode_workflow::NodeKind::Input,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                         input: bcode_workflow::ValueSchema {
                             type_name: "string".to_string(),
                             schema: serde_json::json!({"type": "string"}),
@@ -45988,6 +46300,7 @@ library = "test"
                     id: "block".to_string(),
                     name: "block".to_string(),
                     kind: bcode_workflow::NodeKind::PluginBlock,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: schema.clone(),
                     output: schema,
                     resources: Vec::new(),
@@ -46190,6 +46503,7 @@ library = "test"
                         id: "agent".to_string(),
                         name: "Agent".to_string(),
                         kind: bcode_workflow::NodeKind::Agent,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                         input: schema.clone(),
                         output: schema.clone(),
                         resources: Vec::new(),
@@ -46516,6 +46830,7 @@ library = "test"
             id: id.to_string(),
             name: id.to_string(),
             kind: bcode_workflow::NodeKind::Agent,
+            dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
             input: value_schema.clone(),
             output: value_schema.clone(),
             resources: Vec::new(),
@@ -46546,6 +46861,7 @@ library = "test"
                         id: "join".to_string(),
                         name: "join".to_string(),
                         kind: bcode_workflow::NodeKind::Parallel,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                         input: bcode_workflow::ValueSchema {
                             type_name: "(u32,u32)".to_string(),
                             schema: serde_json::json!({
@@ -46747,6 +47063,7 @@ library = "test"
                     id: "agent".to_string(),
                     name: "agent".to_string(),
                     kind: bcode_workflow::NodeKind::Agent,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: bcode_workflow::ValueSchema {
                         type_name: "u32".to_string(),
                         schema: serde_json::json!({"type": "integer"}),
@@ -47154,6 +47471,7 @@ library = "test"
                 id: "loop.implementation".to_string(),
                 name: "loop implementation".to_string(),
                 kind: bcode_workflow::NodeKind::Agent,
+                dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                 input: schema.clone(),
                 output: schema.clone(),
                 resources: Vec::new(),
@@ -47166,6 +47484,7 @@ library = "test"
                 id: "loop.repeat".to_string(),
                 name: "loop repeat".to_string(),
                 kind: bcode_workflow::NodeKind::Repeat,
+                dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                 input: schema.clone(),
                 output: schema.clone(),
                 resources: Vec::new(),
@@ -47747,6 +48066,7 @@ library = "test"
                         id: "loop.implementation".to_string(),
                         name: "loop implementation".to_string(),
                         kind: bcode_workflow::NodeKind::Agent,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                         input: schema.clone(),
                         output: schema,
                         resources: Vec::new(),
@@ -47982,6 +48302,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     id: "test.delay".to_string(),
                     name: "delayed block".to_string(),
                     kind: bcode_workflow::NodeKind::PluginBlock,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: block.input.clone(),
                     output: block.output.clone(),
                     resources: Vec::new(),
@@ -48140,6 +48461,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     id: "test.delay".to_string(),
                     name: "retry block".to_string(),
                     kind: bcode_workflow::NodeKind::PluginBlock,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: block.input.clone(),
                     output: block.output.clone(),
                     resources: Vec::new(),
@@ -48342,6 +48664,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     id: "code_review.bundle".to_string(),
                     name: "code review bundle".to_string(),
                     kind: bcode_workflow::NodeKind::PluginBlock,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: block.input.clone(),
                     output: block.output.clone(),
                     resources: block.resources.clone(),
@@ -48683,6 +49006,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     id: "git.commit".to_string(),
                     name: "Git commit".to_string(),
                     kind: bcode_workflow::NodeKind::PluginBlock,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: block.input.clone(),
                     output: block.output.clone(),
                     resources: block.resources.clone(),
@@ -48844,6 +49168,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             id: id.to_string(),
             name: id.to_string(),
             kind: bcode_workflow::NodeKind::Agent,
+            dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
             input: schema.clone(),
             output: schema.clone(),
             resources: Vec::new(),
@@ -49025,6 +49350,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
             id: id.to_string(),
             name: id.to_string(),
             kind: bcode_workflow::NodeKind::Agent,
+            dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
             input: schema.clone(),
             output: schema.clone(),
             resources: Vec::new(),
@@ -49084,6 +49410,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         id: "loop.repeat".to_string(),
                         name: "loop.repeat".to_string(),
                         kind: bcode_workflow::NodeKind::Repeat,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                         input: schema.clone(),
                         output: schema.clone(),
                         resources: Vec::new(),
@@ -49272,6 +49599,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         id: "seed".to_string(),
                         name: "seed".to_string(),
                         kind: bcode_workflow::NodeKind::Branch,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                         input: schema.clone(),
                         output: schema.clone(),
                         resources: Vec::new(),
@@ -49291,6 +49619,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         id: "repeat".to_string(),
                         name: "repeat".to_string(),
                         kind: bcode_workflow::NodeKind::Repeat,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                         input: schema.clone(),
                         output: schema.clone(),
                         resources: Vec::new(),
@@ -49307,6 +49636,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         id: "agent".to_string(),
                         name: "agent".to_string(),
                         kind: bcode_workflow::NodeKind::Agent,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                         input: schema.clone(),
                         output: schema.clone(),
                         resources: Vec::new(),
@@ -49502,6 +49832,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     id: "loop.commit-message".to_string(),
                     name: "commit message".to_string(),
                     kind: bcode_workflow::NodeKind::Agent,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: bcode_workflow::ValueSchema::of::<serde_json::Value>(),
                     output: schema,
                     resources: Vec::new(),
@@ -49627,6 +49958,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         id: id.to_string(),
                         name: id.to_string(),
                         kind: bcode_workflow::NodeKind::Agent,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                         input: bcode_workflow::ValueSchema::of::<serde_json::Value>(),
                         output: bcode_workflow::ValueSchema::of::<serde_json::Value>(),
                         resources: Vec::new(),
@@ -49685,6 +50017,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     id: "agent".to_string(),
                     name: "agent".to_string(),
                     kind: bcode_workflow::NodeKind::Agent,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: schema.clone(),
                     output: schema,
                     resources: Vec::new(),
@@ -49799,6 +50132,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     id: "agent".to_string(),
                     name: "agent".to_string(),
                     kind: bcode_workflow::NodeKind::Agent,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: schema.clone(),
                     output: schema.clone(),
                     resources: Vec::new(),
@@ -49972,6 +50306,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     id: "agent".to_string(),
                     name: "agent".to_string(),
                     kind: bcode_workflow::NodeKind::Agent,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: bcode_workflow::ValueSchema {
                         type_name: "u32".to_string(),
                         schema: serde_json::json!({"type": "integer", "minimum": 0}),
@@ -50201,6 +50536,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     id: "wait".to_string(),
                     name: "wait".to_string(),
                     kind: bcode_workflow::NodeKind::Input,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: schema.clone(),
                     output: schema,
                     resources: Vec::new(),
@@ -50331,6 +50667,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                             id: "wait".to_string(),
                             name: "wait".to_string(),
                             kind: bcode_workflow::NodeKind::Input,
+                            dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                             input: schema.clone(),
                             output: schema,
                             resources: Vec::new(),
@@ -50412,6 +50749,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     id: "wait".to_string(),
                     name: "wait".to_string(),
                     kind: bcode_workflow::NodeKind::Input,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: schema.clone(),
                     output: schema,
                     resources: Vec::new(),
@@ -50506,6 +50844,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                             id: "wait".to_string(),
                             name: "wait".to_string(),
                             kind: bcode_workflow::NodeKind::Input,
+                            dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                             input: schema.clone(),
                             output: schema,
                             resources: Vec::new(),
@@ -50583,6 +50922,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     id: "wait".to_string(),
                     name: "wait".to_string(),
                     kind: bcode_workflow::NodeKind::Input,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: schema.clone(),
                     output: schema,
                     resources: Vec::new(),

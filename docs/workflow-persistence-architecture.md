@@ -136,6 +136,29 @@ slice requires these identities and relationships:
 Stable dispatch identity is derived from `(run_id, node_id, activation_id, attempt)` and persisted
 with prepared intent before an external operation is invoked.
 
+## Canonical terminal output and child composition
+
+A successfully completed workflow may expose one canonical terminal output pointer and checksum. The
+exact successful exit activation commits that output atomically with the terminal run transition.
+Byte-equivalent duplicate settlement is idempotent; conflicting outputs, ambiguous successful exits,
+or stale updates fail closed. Failed, cancelled, paused, and repair-required runs never expose a
+successful terminal output.
+
+Synchronous child-workflow calls add canonical parent/child links to this database. A link records the
+root run, parent run and activation/attempt, deterministic child run identity, exact immutable target,
+workspace identity, and lifecycle timestamps. The link and child creation commit before parent
+dispatch admission is acknowledged. Restart reconciliation follows the persisted child identity and
+receipt rather than creating another child. Parent cancellation propagates to the child and waits for
+a stable outcome; version 1 does not abandon children.
+
+Child dependency depth, descendant count, recursion, exact target, and output-schema compatibility
+are validated before start. Parent resource leases are not retained while waiting for a child that may
+need them. Child grants do not become ambient parent authority, and parent grants apply to descendants
+only through an explicit exact descendant-operation scope.
+
+The complete contracts and fixed bounds are defined in
+[`composable-coding-workflows.md`](composable-coding-workflows.md).
+
 ## Durable agent configuration
 
 Version 1 `WorkflowAgentConfiguration` is the strict serialized agent-node contract. It includes the

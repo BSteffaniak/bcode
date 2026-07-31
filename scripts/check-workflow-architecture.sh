@@ -227,4 +227,56 @@ if ! rg -q 'explicit_grant_required = true' plugins/shell-plugin/bcode-plugin.to
   violations=1
 fi
 
+if ! rg -q 'pub enum WorkflowNodeDataflowPolicy' packages/workflow/src/lib.rs \
+  || ! rg -q 'StateEnvelopeV1' packages/workflow/src/lib.rs \
+  || ! rg -q 'prepare_workflow_node_dataflow' packages/server/src/lib.rs \
+  || ! rg -q 'owner_input = prepared\.owner_input' packages/server/src/lib.rs \
+  || ! rg -q 'complete_workflow_node_dataflow' packages/server/src/lib.rs; then
+  echo "Workflow state-envelope violation: explicit adaptation, owner-only authorization, or result rewrapping was removed." >&2
+  violations=1
+fi
+
+if ! rg -q 'FieldsEqual' packages/workflow/src/lib.rs \
+  || ! rg -q 'NumericCompare' packages/workflow/src/lib.rs \
+  || ! rg -q 'MAX_PREDICATE_DEPTH' packages/workflow/src/lib.rs \
+  || ! rg -q 'WORKFLOW_PREDICATE_MIN_VERSION' packages/workflow/src/lib.rs; then
+  echo "Workflow predicate violation: bounded versioned compositional predicates were removed." >&2
+  violations=1
+fi
+
+if ! rg -q 'NodeKind::WorkflowCall' packages/workflow/src/lib.rs \
+  || ! rg -q 'WorkflowCallTarget' packages/workflow/src/lib.rs \
+  || ! rg -q 'workflow call nodes must not retain resource leases' packages/workflow/src/lib.rs \
+  || ! rg -q 'create_child_run_idempotent' packages/workflow-store/src/lib.rs \
+  || ! rg -q '"child_run_id".*request\.link\.child_run_id' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'observe_child_attempt' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'workflow_run_links' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'reject_recursive_child_target' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'dispatch_workflow_child' packages/server/src/lib.rs \
+  || ! rg -q 'MAX_WORKFLOW_RUN_DESCENDANTS' packages/workflow-store/src/lib.rs; then
+  echo "Workflow child-composition violation: exact call targets, atomic links, or admission bounds were removed." >&2
+  violations=1
+fi
+
+if ! rg -q 'terminal_output_id' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'terminal_output_checksum_sha256' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'terminal_output_survives_restart_without_duplicate_materialization' \
+    packages/workflow-store/src/lib.rs; then
+  echo "Workflow terminal-output violation: canonical successful output identity or restart coverage was removed." >&2
+  violations=1
+fi
+
+if ! rg -q 'WorkflowRepeatExhaustionPolicy' packages/workflow/src/lib.rs \
+  || ! rg -q 'WorkflowRepeatOutcome' packages/workflow/src/lib.rs \
+  || ! rg -q 'repeat_outcomes' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'repeat_iteration_limit_exhausted' packages/workflow-store/src/lib.rs; then
+  echo "Workflow repeat outcome violation: typed exhaustion outcomes or fail-default compatibility were removed." >&2
+  violations=1
+fi
+
+if ! bash scripts/check-composable-workflow-architecture.sh; then
+  echo "Workflow composability architecture violation: coding-workflow product boundaries drifted." >&2
+  violations=1
+fi
+
 exit "$violations"

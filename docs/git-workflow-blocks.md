@@ -8,6 +8,29 @@ The Git plugin owns deterministic repository preparation, commit composition, co
 
 Preparation output is a snapshot, not authorization. Later composition and dispatch preserve its exact repository root, HEAD, and paths. If the path set is empty, workflow policy must explicitly choose failure or a no-op branch.
 
+## Repository snapshots and verified checkpoints
+
+`workspace_snapshot` remains the workflow's immutable workspace-location identity. Git content
+identity uses a distinct versioned repository snapshot owned by this plugin.
+
+A repository snapshot records canonical repository identity, HEAD, ordered include/exclude policy,
+and an ordered changed-entry manifest covering index/worktree status, base/index/worktree identity,
+mode and kind, deletions, rename/copy source, symlink target, submodule state, and untracked content.
+It also binds the applicable project-instruction fingerprint and a canonical aggregate SHA-256.
+Parsing uses porcelain-v2 `-z` or an equivalently unambiguous Git representation. Unsupported paths
+and oversized authoritative manifests fail closed instead of being normalized or truncated.
+
+A verification receipt names exact command-plan, instruction, and repository-snapshot digests. It is
+valid only when the relevant snapshots immediately before and after verification match. Formatting is
+a separate mutation and therefore requires a new snapshot and post-format verification.
+
+A verified commit request carries expected HEAD, final verified snapshot digest, exact path policy,
+expected selected-entry manifest, and structured message. Immediately before mutation the owner
+recomputes the snapshot, rejects changed content or unrelated staged paths, stages exact selected
+paths, verifies index object identities, commits only those paths, and verifies commit parent and
+committed path set. Approval remains exact and per checkpoint. The complete authority contract is in
+[`composable-coding-workflows.md`](composable-coding-workflows.md).
+
 ## Commit composition
 
 `git.compose-commit` is read-only and deterministic. It combines exact preparation output with a typed proposed message and explicit no-changes policy. The result is either:

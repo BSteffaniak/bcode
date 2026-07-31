@@ -1907,6 +1907,12 @@ pub struct WorkflowRunInspection {
     pub grants: Vec<bcode_workflow_store::WorkflowGrant>,
     pub resource_leases: Vec<bcode_workflow_store::WorkflowResourceLease>,
     pub outputs: Vec<bcode_workflow_store::WorkflowOutputSummary>,
+    /// Bounded direct child-run links.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub child_run_links: Vec<bcode_workflow_store::WorkflowRunLink>,
+    /// Typed repeat outcomes projected by a bounded normalized query.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repeat_outcomes: Vec<bcode_workflow_store::WorkflowRepeatOutcomeSummary>,
     pub child_sessions: Vec<SessionSummary>,
 }
 
@@ -3739,6 +3745,8 @@ mod tests {
                 parent_session_id: None,
                 binding: None,
                 authored_provenance: None,
+                terminal_output_id: None,
+                terminal_output_checksum_sha256: None,
                 status: bcode_workflow_store::RunStatus::Running,
                 cancellation_requested_at_ms: None,
                 created_at_ms: 1,

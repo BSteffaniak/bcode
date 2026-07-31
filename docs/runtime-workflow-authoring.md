@@ -346,6 +346,19 @@ second result is returned as either the exact authored-run start response or a s
 error. A failed run admission cannot appear to undo publication, and retry-safe caller run identities
 retain the normal complete-provenance conflict checks.
 
+## Composable coding workflows
+
+The broader product architecture for state-preserving operation dataflow, deterministic predicate
+extensions, typed repeat outcomes, canonical terminal output, exact child-workflow calls, repository
+verification authority, progress-document interactions, semantic graph editing, and prompt-generated
+drafts is defined in [`composable-coding-workflows.md`](composable-coding-workflows.md).
+
+Those extensions preserve this document's source/compile/run boundary. Coding-product state belongs
+to the workflow plugin, operation behavior remains domain/plugin-owned, and only generic typed
+contracts enter `bcode_workflow`. Child calls target exact immutable revisions or definitions; active
+revision lookup is never deferred to dispatch. Editors and generators continue to submit the same
+portable `WorkflowAuthoringDocument` and receive the same diagnostics.
+
 ## Mechanical enforcement
 
 `scripts/check-workflow-architecture.sh` enforces that:

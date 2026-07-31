@@ -32,6 +32,25 @@ error event.
 Transcript projection retains neutral text, image, tool-call, and tool-result blocks. Provider
 extensions and cache points are omitted. No TUI or plugin types occur in the contract.
 
+## Workflow authoring contracts
+
+Workflow authoring uses versioned portable catalogs, documents, semantic edit batches, diagnostics,
+compilation previews, drafts, conflicts, revisions, and start operations. Frontends and plugin-owned
+surfaces consume those contracts through the application boundary; they do not access workflow-store
+rows or daemon-private objects.
+
+Manual editors mutate `WorkflowAuthoringDocument` through bounded semantic operations rather than a
+renderer-private graph or unrestricted JSON Patch. Graph positions, groups, comments, and editor
+hints remain namespaced presentation metadata excluded from executable identity. The TUI owns only
+terminal layout, viewport, hit testing, input mapping, and drawing; web and desktop clients may use
+native canvases without changing semantics.
+
+Prompt-driven authoring consumes the same catalog and diagnostics, produces the same document, and
+may save only an explicitly accepted optimistic draft. It cannot publish, activate, start, grant
+permission, persist secrets, invent plugin contracts, access private application state, or resolve a
+conflict automatically. Exact editor and generator boundaries are defined in
+[`composable-coding-workflows.md`](composable-coding-workflows.md).
+
 ## Snapshot semantics
 
 A session snapshot contains the visible projected transcript, optional materialized turn, and next

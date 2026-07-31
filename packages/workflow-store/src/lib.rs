@@ -20,7 +20,7 @@ use std::pin::Pin;
 use thiserror::Error;
 
 const DATABASE_FILE: &str = "workflow.db";
-const SCHEMA_VERSION: u32 = 8;
+const SCHEMA_VERSION: u32 = 9;
 /// Current durable authored-run provenance contract version.
 pub const AUTHORED_WORKFLOW_RUN_PROVENANCE_VERSION: u32 = 1;
 const MAX_ID_BYTES: usize = 512;
@@ -162,6 +162,12 @@ pub struct WorkflowRunSummary {
     /// Exact authored source when this run originated from a published authored workflow.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authored_provenance: Option<AuthoredWorkflowRunProvenance>,
+    /// Canonical successful terminal output identity, absent for non-successful or active runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_output_id: Option<String>,
+    /// Checksum of the canonical successful terminal output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_output_checksum_sha256: Option<String>,
     pub status: RunStatus,
     pub cancellation_requested_at_ms: Option<u64>,
     pub created_at_ms: u64,
@@ -321,6 +327,59 @@ pub struct WorkflowRunBindingKey {
     pub owner_plugin_id: String,
     pub workflow_kind: String,
     pub scope_key: String,
+}
+
+/// Derive the deterministic child run identity for one exact parent attempt and target.
+/// # Panics
+///
+/// Panics only if the typed target identity tuple cannot be serialized, which is impossible for
+/// its serde-derived fields.
+#[must_use]
+pub fn workflow_child_run_id(
+    root_run_id: &str,
+    parent_run_id: &str,
+    parent_activation_id: &str,
+    parent_attempt: u32,
+    target: &bcode_workflow::WorkflowCallTarget,
+) -> String {
+    let encoded = serde_json::to_vec(&(
+        root_run_id,
+        parent_run_id,
+        parent_activation_id,
+        parent_attempt,
+        target,
+    ))
+    .expect("workflow child identity tuple is serializable");
+    format!("workflow-child:{}", sha256_hex(&encoded))
+}
+
+/// Current durable parent/child workflow link contract version.
+pub const WORKFLOW_RUN_LINK_VERSION: u32 = 1;
+/// Current maximum child-workflow nesting depth, including the root run.
+pub const MAX_WORKFLOW_RUN_DEPTH: u32 = bcode_workflow::MAX_WORKFLOW_CALL_DEPTH;
+/// Current maximum descendants beneath one root run.
+pub const MAX_WORKFLOW_RUN_DESCENDANTS: u32 = bcode_workflow::MAX_WORKFLOW_CALL_DESCENDANTS;
+
+/// Immutable parent activation/attempt to child run relationship.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRunLink {
+    pub version: u32,
+    pub root_run_id: String,
+    pub parent_run_id: String,
+    pub parent_node_id: String,
+    pub parent_activation_id: String,
+    pub parent_attempt: u32,
+    pub child_run_id: String,
+    pub target: bcode_workflow::WorkflowCallTarget,
+    pub depth: u32,
+    pub created_at_ms: u64,
+}
+
+/// Atomic exact child-run creation request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NewChildWorkflowRun {
+    pub link: WorkflowRunLink,
+    pub run: NewWorkflowRun,
 }
 
 /// Durable workflow run creation request.
@@ -844,6 +903,22 @@ pub struct OutputPersistenceResult {
     pub completed_activation_id: String,
     pub activated: Vec<NewActivation>,
     pub run_status: RunStatus,
+}
+
+/// Bounded durable repeat outcome returned by normal inspection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowRepeatOutcomeSummary {
+    pub run_id: String,
+    pub node_id: String,
+    pub activation_id: String,
+    pub output_id: String,
+    pub outcome: bcode_workflow::WorkflowRepeatOutcomeKind,
+    pub iterations_completed: u64,
+    pub max_iterations: u64,
+    pub cycle_cap: u64,
+    pub effective_iteration_bound: u64,
+    pub checksum_sha256: String,
+    pub created_at_ms: u64,
 }
 
 /// Bounded persisted output summary for workflow inspection.
@@ -2968,147 +3043,291 @@ impl WorkflowStore {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        if let Some(provenance) = &run.authored_provenance {
-            validate_persisted_authored_run_provenance(&transaction, run, provenance)?;
-        }
-        if let Some(binding) = &run.binding
-            && binding.single_active
-        {
-            let active: Option<String> = transaction
-                .query_row(
-                    "SELECT run_id FROM workflow_runs WHERE owner_plugin_id = ?1 \
-                     AND workflow_kind = ?2 AND scope_key = ?3 \
-                     AND status IN ('running', 'paused', 'repair_required') \
-                     ORDER BY updated_at_ms DESC, run_id LIMIT 1",
-                    (
-                        &binding.owner_plugin_id,
-                        &binding.workflow_kind,
-                        &binding.scope_key,
-                    ),
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(active) = active {
-                return Err(WorkflowStoreError::InvalidData(format!(
-                    "workflow binding already has an active run: {active}"
-                )));
-            }
-        }
-        let definition_json = transaction
+        create_run_in_transaction(&transaction, run)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Atomically create and link one exact child run before parent admission completes.
+    ///
+    /// Returns `true` when created and `false` for a byte-equivalent duplicate parent attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed links, missing/invalid parent attempts, recursion, workspace
+    /// mismatch, depth/descendant overflow, exact-target mismatch, identity conflict, or database
+    /// failure. No child or link is retained on error.
+    #[allow(clippy::too_many_lines)]
+    pub fn create_child_run_idempotent(
+        &mut self,
+        request: &NewChildWorkflowRun,
+    ) -> Result<bool, WorkflowStoreError> {
+        validate_run(&request.run)?;
+        validate_run_link(&request.link, &request.run)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let parent = transaction
             .query_row(
-                "SELECT definition_json FROM workflow_definitions \
-                 WHERE definition_id = ?1 AND version = ?2",
-                (&run.definition_id, run.definition_version),
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
-        let Some(definition_json) = definition_json else {
-            return Err(WorkflowStoreError::InvalidData(format!(
-                "workflow definition not found: {} v{}",
-                run.definition_id, run.definition_version
-            )));
-        };
-        let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
-        let input_json = run
-            .input
-            .as_ref()
-            .map(|input| validate_run_input(&definition, input))
-            .transpose()?;
-        let (owner_plugin_id, workflow_kind, scope_key, display_label, single_active) = run
-            .binding
-            .as_ref()
-            .map_or((None, None, None, None, false), |binding| {
+                "SELECT run.workspace_snapshot, activation.status, definition.definition_json \
+                 FROM workflow_runs run \
+                 JOIN workflow_activations activation ON activation.run_id = run.run_id \
+                 JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+                   AND definition.version = run.definition_version \
+                 WHERE run.run_id = ?1 AND activation.node_id = ?2 \
+                   AND activation.activation_id = ?3",
                 (
-                    Some(binding.owner_plugin_id.as_str()),
-                    Some(binding.workflow_kind.as_str()),
-                    Some(binding.scope_key.as_str()),
-                    binding.display_label.as_deref(),
-                    binding.single_active,
+                    &request.link.parent_run_id,
+                    &request.link.parent_node_id,
+                    &request.link.parent_activation_id,
+                ),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "workflow child call parent activation is missing".to_string(),
                 )
-            });
-        let authored_provenance_json = run
-            .authored_provenance
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()?;
+            })?;
+        if parent.0 != request.run.workspace_snapshot || parent.1 != "running" {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child must share the active parent workspace".to_string(),
+            ));
+        }
+        let parent_definition: WorkflowDefinition = serde_json::from_str(&parent.2)?;
+        let parent_definition_identity =
+            bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+                parent_definition.name.clone(),
+                &parent_definition,
+            )
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        let parent_node = parent_definition
+            .node(&request.link.parent_node_id)
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData("parent call node is missing".to_string())
+            })?;
+        if parent_node.kind != bcode_workflow::NodeKind::WorkflowCall {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child parent node is not a workflow call".to_string(),
+            ));
+        }
+        let configuration: bcode_workflow::WorkflowCallConfiguration =
+            serde_json::from_value(parent_node.configuration.clone())?;
+        configuration
+            .validate()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        if configuration.target != request.link.target {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child exact target differs from the parent call node".to_string(),
+            ));
+        }
+        if let Some(existing) = child_link_for_parent_attempt(&transaction, &request.link)? {
+            if existing == request.link {
+                return Ok(false);
+            }
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child parent attempt conflicts with an existing link".to_string(),
+            ));
+        }
+        let prepared_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM workflow_attempts WHERE run_id = ?1 AND node_id = ?2 \
+             AND activation_id = ?3 AND attempt = ?4 AND status = 'prepared')",
+            (
+                &request.link.parent_run_id,
+                &request.link.parent_node_id,
+                &request.link.parent_activation_id,
+                request.link.parent_attempt,
+            ),
+            |row| row.get(0),
+        )?;
+        if !prepared_exists {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child parent attempt is not durably prepared".to_string(),
+            ));
+        }
+        let descendant_count: u32 = transaction.query_row(
+            "SELECT COUNT(*) FROM workflow_run_links WHERE root_run_id = ?1",
+            [&request.link.root_run_id],
+            |row| row.get(0),
+        )?;
+        if descendant_count >= MAX_WORKFLOW_RUN_DESCENDANTS {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child descendant limit reached".to_string(),
+            ));
+        }
+        let target = request.link.target.definition_identity();
+        reject_recursive_child_target(
+            &transaction,
+            &request.link.parent_run_id,
+            target,
+            &parent_definition_identity,
+        )?;
+        if request.run.definition_id != target.definition_id
+            || request.run.definition_version != target.definition_version
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child run does not use the exact target definition".to_string(),
+            ));
+        }
+        create_run_in_transaction(&transaction, &request.run)?;
+        let child_receipt = serde_json::json!({
+            "owner": "bcode.server.workflow-child/v1",
+            "child_run_id": request.link.child_run_id,
+            "root_run_id": request.link.root_run_id,
+            "depth": request.link.depth,
+            "target": request.link.target,
+        });
+        let child_receipt_json = serde_json::to_string(&child_receipt)?;
         transaction.execute(
-            "INSERT INTO workflow_runs \
-             (run_id, definition_id, definition_version, workspace_snapshot, parent_session_id, \
-              owner_plugin_id, workflow_kind, scope_key, display_label, single_active, \
-              authored_provenance_json, input_json, status, deadline_at_ms, node_execution_cap, \
-              concurrency_cap, cycle_cap, retry_cap, created_at_ms, updated_at_ms) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                     ?17, ?18, ?19, ?19)",
+            "INSERT INTO workflow_run_links \
+             (root_run_id, parent_run_id, parent_node_id, parent_activation_id, parent_attempt, \
+              child_run_id, version, target_json, depth, created_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
-                &run.run_id,
-                &run.definition_id,
-                run.definition_version,
-                &run.workspace_snapshot,
-                &run.parent_session_id,
-                owner_plugin_id,
-                workflow_kind,
-                scope_key,
-                display_label,
-                single_active,
-                &authored_provenance_json,
-                &input_json,
-                RunStatus::Running.as_str(),
-                run.limits.deadline_at_ms,
-                run.limits.node_execution_cap,
-                run.limits.concurrency_cap,
-                run.limits.cycle_cap,
-                run.limits.retry_cap,
-                run.created_at_ms,
+                &request.link.root_run_id,
+                &request.link.parent_run_id,
+                &request.link.parent_node_id,
+                &request.link.parent_activation_id,
+                request.link.parent_attempt,
+                &request.link.child_run_id,
+                request.link.version,
+                serde_json::to_string(&request.link.target)?,
+                request.link.depth,
+                request.link.created_at_ms,
             ],
+        )?;
+        let admitted = transaction.execute(
+            "UPDATE workflow_attempts SET status = 'admitted', receipt_json = ?5, \
+             admitted_at_ms = ?6 WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 \
+               AND attempt = ?4 AND status = 'prepared'",
+            (
+                &request.link.parent_run_id,
+                &request.link.parent_node_id,
+                &request.link.parent_activation_id,
+                request.link.parent_attempt,
+                &child_receipt_json,
+                request.link.created_at_ms,
+            ),
+        )?;
+        if admitted != 1 {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child parent attempt could not commit its admission receipt".to_string(),
+            ));
+        }
+        append_event(
+            &transaction,
+            &request.link.parent_run_id,
+            "attempt_admitted",
+            &serde_json::to_string(&DispatchReceipt {
+                run_id: request.link.parent_run_id.clone(),
+                node_id: request.link.parent_node_id.clone(),
+                activation_id: request.link.parent_activation_id.clone(),
+                attempt: request.link.parent_attempt,
+                dispatch_identity: dispatch_identity(
+                    &request.link.parent_run_id,
+                    &request.link.parent_node_id,
+                    &request.link.parent_activation_id,
+                    request.link.parent_attempt,
+                ),
+                receipt: child_receipt,
+                admitted_at_ms: request.link.created_at_ms,
+            })?,
+            request.link.created_at_ms,
         )?;
         append_event(
             &transaction,
-            &run.run_id,
-            "run_created",
-            &serde_json::to_string(run)?,
-            run.created_at_ms,
+            &request.link.parent_run_id,
+            "child_run_linked",
+            &serde_json::to_string(&request.link)?,
+            request.link.created_at_ms,
         )?;
-        if definition.entries.is_empty() {
-            return Err(WorkflowStoreError::InvalidData(
-                "workflow definition has no entry nodes".to_string(),
-            ));
-        }
-        if definition.entries.len()
-            > usize::try_from(run.limits.concurrency_cap).unwrap_or(usize::MAX)
-        {
-            return Err(WorkflowStoreError::InvalidData(
-                "workflow entry set exceeds run concurrency cap".to_string(),
-            ));
-        }
-        for node_id in &definition.entries {
-            let node = definition.nodes.get(node_id).ok_or_else(|| {
-                WorkflowStoreError::InvalidData(format!(
-                    "workflow entry node is missing: {node_id}"
-                ))
-            })?;
-            let entry_input = run.input.clone().unwrap_or(serde_json::Value::Null);
-            validate_json_schema(
-                &format!("workflow entry input for node {node_id}"),
-                &node.input.schema,
-                &entry_input,
-            )?;
-            let activation = NewActivation {
-                run_id: run.run_id.clone(),
-                node_id: node_id.clone(),
-                activation_id: activation_identity(&run.run_id, node_id, 0),
-                dependency_generation: 0,
-                input: Some(entry_input),
-                created_at_ms: run.created_at_ms,
-            };
-            validate_activation(&activation)?;
-            insert_activation_with_status(
-                &transaction,
-                &activation,
-                activation_status_for_node(node),
-            )?;
-        }
         transaction.commit()?;
-        Ok(())
+        Ok(true)
+    }
+
+    /// Return bounded direct child links without replaying workflow history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity/limit, malformed persisted targets, or query failure.
+    pub fn child_run_links(
+        &self,
+        parent_run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkflowRunLink>, WorkflowStoreError> {
+        validate_id("parent_run_id", parent_run_id)?;
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT root_run_id, parent_run_id, parent_node_id, parent_activation_id, \
+             parent_attempt, child_run_id, version, target_json, depth, created_at_ms \
+             FROM workflow_run_links WHERE parent_run_id = ?1 \
+             ORDER BY created_at_ms, child_run_id LIMIT ?2",
+        )?;
+        statement
+            .query_map((parent_run_id, limit), decode_run_link)?
+            .map(|row| row.map_err(WorkflowStoreError::from))
+            .collect()
+    }
+
+    /// Return the exact parent link for one child without replaying history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed child identity, malformed persisted target, or query failure.
+    pub fn parent_run_link(
+        &self,
+        child_run_id: &str,
+    ) -> Result<Option<WorkflowRunLink>, WorkflowStoreError> {
+        validate_id("child_run_id", child_run_id)?;
+        self.connection
+            .query_row(
+                "SELECT root_run_id, parent_run_id, parent_node_id, parent_activation_id, \
+                 parent_attempt, child_run_id, version, target_json, depth, created_at_ms \
+                 FROM workflow_run_links WHERE child_run_id = ?1",
+                [child_run_id],
+                decode_run_link,
+            )
+            .optional()
+            .map_err(WorkflowStoreError::from)
+    }
+
+    /// Return exact persisted execution limits for one run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity, invalid persisted limits, or query failure.
+    pub fn run_limits(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<WorkflowRunLimits>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        self.connection
+            .query_row(
+                "SELECT deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap \
+                 FROM workflow_runs WHERE run_id = ?1",
+                [run_id],
+                |row| {
+                    Ok(WorkflowRunLimits {
+                        deadline_at_ms: row.get(0)?,
+                        node_execution_cap: row.get(1)?,
+                        concurrency_cap: row.get(2)?,
+                        cycle_cap: row.get(3)?,
+                        retry_cap: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?
+            .map(|limits| {
+                validate_run_limits(&limits)?;
+                Ok(limits)
+            })
+            .transpose()
     }
 
     /// Return bounded persisted output metadata without loading inline output values.
@@ -3144,6 +3363,90 @@ impl WorkflowStore {
             })?
             .collect::<Result<Vec<_>, _>>()
             .map_err(WorkflowStoreError::from)
+    }
+
+    /// Return bounded typed repeat outcomes without replaying workflow history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when identity/limit validation, definition/output decoding, or querying
+    /// fails. Malformed persisted typed outcomes fail closed.
+    pub fn repeat_outcomes(
+        &self,
+        run_id: &str,
+        limit: usize,
+    ) -> Result<Vec<WorkflowRepeatOutcomeSummary>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let limit = bounded_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT output.run_id, output.node_id, output.activation_id, output.output_id, \
+                    output.value_json, output.checksum_sha256, output.created_at_ms, \
+                    definition.definition_json \
+             FROM workflow_outputs output \
+             JOIN workflow_runs run ON run.run_id = output.run_id \
+             JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
+               AND definition.version = run.definition_version \
+             WHERE output.run_id = ?1 ORDER BY output.created_at_ms, output.output_id LIMIT ?2",
+        )?;
+        statement
+            .query_map((run_id, limit), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, u64>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })?
+            .map(|row| match row {
+                Ok((
+                    run_id,
+                    node_id,
+                    activation_id,
+                    output_id,
+                    value_json,
+                    checksum,
+                    created_at,
+                    definition,
+                )) => (|| {
+                    let definition: WorkflowDefinition = serde_json::from_str(&definition)?;
+                    let node = definition.node(&node_id).ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(format!(
+                            "repeat output references missing node: {node_id}"
+                        ))
+                    })?;
+                    if node.kind != bcode_workflow::NodeKind::Repeat
+                        || node
+                            .configuration
+                            .get("exhaustion_policy")
+                            .and_then(serde_json::Value::as_str)
+                            != Some("emit_outcome")
+                    {
+                        return Ok(None);
+                    }
+                    let outcome: bcode_workflow::WorkflowRepeatOutcome<serde_json::Value> =
+                        serde_json::from_str(&value_json)?;
+                    Ok(Some(WorkflowRepeatOutcomeSummary {
+                        run_id,
+                        node_id,
+                        activation_id,
+                        output_id,
+                        outcome: outcome.outcome,
+                        iterations_completed: outcome.iterations_completed,
+                        max_iterations: outcome.max_iterations,
+                        cycle_cap: outcome.cycle_cap,
+                        effective_iteration_bound: outcome.effective_iteration_bound,
+                        checksum_sha256: checksum,
+                        created_at_ms: created_at,
+                    }))
+                })(),
+                Err(error) => Err(WorkflowStoreError::from(error)),
+            })
+            .filter_map(Result::transpose)
+            .collect()
     }
 
     /// Return bounded grants for one run ordered by grant time and identity.
@@ -4713,8 +5016,27 @@ impl WorkflowStore {
             ),
         )?;
         if changed != 1 {
+            let existing: Option<String> = transaction
+                .query_row(
+                    "SELECT receipt_json FROM workflow_attempts WHERE run_id = ?1 AND node_id = ?2 \
+                     AND activation_id = ?3 AND attempt = ?4 AND dispatch_identity = ?5 \
+                       AND status IN ('admitted', 'running')",
+                    (
+                        &receipt.run_id,
+                        &receipt.node_id,
+                        &receipt.activation_id,
+                        receipt.attempt,
+                        &receipt.dispatch_identity,
+                    ),
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if existing.as_deref() == Some(receipt_json.as_str()) {
+                transaction.commit()?;
+                return Ok(());
+            }
             return Err(WorkflowStoreError::InvalidData(format!(
-                "attempt is not prepared: {}",
+                "attempt is not prepared or receipt conflicts: {}",
                 receipt.dispatch_identity
             )));
         }
@@ -4909,6 +5231,73 @@ impl WorkflowStore {
         )?;
         transaction.commit()?;
         Ok(summary)
+    }
+
+    /// Observe a durable child run by its exact persisted link and project its canonical output to
+    /// the parent attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed receipt/link state, missing child runs, invalid canonical
+    /// output, schema mismatch, or database failure.
+    pub fn observe_child_attempt(
+        &self,
+        request: &AttemptReconciliationRequest,
+        observed_at_ms: u64,
+    ) -> Result<AttemptObservation, WorkflowStoreError> {
+        let child_run_id = request
+            .receipt
+            .get("child_run_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "workflow child receipt has no child_run_id".to_string(),
+                )
+            })?;
+        let link = child_link_for_parent_attempt_connection(&self.connection, request)?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "workflow child receipt has no canonical parent link".to_string(),
+                )
+            })?;
+        if link.child_run_id != child_run_id {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child receipt conflicts with the canonical link".to_string(),
+            ));
+        }
+        let child = self.run_summary(child_run_id)?.ok_or_else(|| {
+            WorkflowStoreError::InvalidData("workflow child run is missing".to_string())
+        })?;
+        match child.status {
+            RunStatus::Running | RunStatus::Paused => Ok(AttemptObservation::Running),
+            RunStatus::Completed => {
+                let output = self
+                    .canonical_terminal_output(child_run_id)?
+                    .ok_or_else(|| {
+                        WorkflowStoreError::InvalidData(
+                            "completed workflow child has no terminal output".to_string(),
+                        )
+                    })?;
+                Ok(AttemptObservation::Succeeded {
+                    output: ValidatedOutput {
+                        output_id: format!("{}:output", request.dispatch_identity),
+                        run_id: request.run_id.clone(),
+                        node_id: request.node_id.clone(),
+                        activation_id: request.activation_id.clone(),
+                        schema_id: output.schema_id,
+                        schema_version: output.schema_version,
+                        value: output.value,
+                        artifact_reference: output.artifact_reference,
+                        created_at_ms: observed_at_ms,
+                    },
+                })
+            }
+            RunStatus::Failed => Ok(AttemptObservation::Failed {
+                message: "child workflow failed".to_string(),
+            }),
+            RunStatus::Cancelled => Ok(AttemptObservation::Cancelled),
+            RunStatus::RepairRequired => Ok(AttemptObservation::Unknown),
+        }
     }
 
     /// Reconcile receipt-backed admitted/running attempts through a bounded owner status API.
@@ -5634,6 +6023,15 @@ impl WorkflowStore {
             |row| row.get(0),
         )?;
         let effective_iteration_bound = max_iterations.min(cycle_cap);
+        let exhaustion_policy = activation
+            .node
+            .configuration
+            .get("exhaustion_policy")
+            .cloned()
+            .map_or(
+                Ok(bcode_workflow::WorkflowRepeatExhaustionPolicy::Fail),
+                |value| serde_json::from_value(value).map_err(WorkflowStoreError::from),
+            )?;
         let should_repeat = evaluate_predicate(&predicate, input)?;
         let next_generation = activation
             .dependency_generation
@@ -5642,6 +6040,32 @@ impl WorkflowStore {
                 WorkflowStoreError::InvalidData("workflow repeat generation overflow".to_string())
             })?;
         let within_iteration_bound = next_generation < effective_iteration_bound;
+        let iteration_bound_exhausted = should_repeat && !within_iteration_bound;
+        let emit_typed_outcome = exhaustion_policy
+            == bcode_workflow::WorkflowRepeatExhaustionPolicy::EmitOutcome
+            && (!should_repeat || iteration_bound_exhausted);
+        let persisted_value = if emit_typed_outcome {
+            serde_json::to_value(bcode_workflow::WorkflowRepeatOutcome {
+                version: bcode_workflow::WORKFLOW_REPEAT_OUTCOME_VERSION,
+                outcome: if iteration_bound_exhausted {
+                    bcode_workflow::WorkflowRepeatOutcomeKind::IterationLimitReached
+                } else {
+                    bcode_workflow::WorkflowRepeatOutcomeKind::ConditionCleared
+                },
+                iterations_completed: next_generation,
+                max_iterations,
+                cycle_cap,
+                effective_iteration_bound,
+                value: input.clone(),
+            })?
+        } else {
+            input.clone()
+        };
+        activation
+            .node
+            .output
+            .validate_value("repeat.output", &persisted_value)
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
         transaction.execute(
             "UPDATE workflow_activations SET status = 'completed', output_id = ?4 \
              WHERE run_id = ?1 AND node_id = ?2 AND activation_id = ?3 AND status = 'pending'",
@@ -5652,7 +6076,7 @@ impl WorkflowStore {
                 format!("{}:control-output", activation.activation_id),
             ),
         )?;
-        let value_json = serde_json::to_string(&input)?;
+        let value_json = serde_json::to_string(&persisted_value)?;
         transaction.execute(
             "INSERT INTO workflow_outputs \
              (output_id, run_id, node_id, activation_id, schema_id, schema_version, value_json, \
@@ -5743,7 +6167,9 @@ impl WorkflowStore {
                 )?;
                 activated.push(next);
             }
-        } else if should_repeat {
+        } else if iteration_bound_exhausted
+            && exhaustion_policy == bcode_workflow::WorkflowRepeatExhaustionPolicy::Fail
+        {
             transaction.execute(
                 "UPDATE workflow_runs SET status = 'failed', updated_at_ms = ?2 \
                  WHERE run_id = ?1 AND status = 'running'",
@@ -5765,10 +6191,13 @@ impl WorkflowStore {
                 settled_at_ms,
             )?;
         } else {
+            let output_id = format!("{}:control-output", activation.activation_id);
+            let checksum = sha256_hex(value_json.as_bytes());
             transaction.execute(
-                "UPDATE workflow_runs SET status = 'completed', updated_at_ms = ?2 \
+                "UPDATE workflow_runs SET status = 'completed', terminal_output_id = ?3, \
+                 terminal_output_checksum_sha256 = ?4, updated_at_ms = ?2 \
                  WHERE run_id = ?1 AND status = 'running'",
-                (&activation.run_id, settled_at_ms),
+                (&activation.run_id, settled_at_ms, &output_id, &checksum),
             )?;
             append_event(
                 &transaction,
@@ -5787,11 +6216,18 @@ impl WorkflowStore {
                 "activation_id": activation.activation_id,
                 "repeat": should_repeat && within_iteration_bound,
                 "generation": activation.dependency_generation,
+                "iterations_completed": next_generation,
                 "next_generation": should_repeat.then_some(next_generation),
                 "max_iterations": max_iterations,
                 "cycle_cap": cycle_cap,
                 "effective_iteration_bound": effective_iteration_bound,
-                "iteration_bound_exhausted": should_repeat && !within_iteration_bound,
+                "iteration_bound_exhausted": iteration_bound_exhausted,
+                "exhaustion_policy": exhaustion_policy,
+                "outcome": emit_typed_outcome.then_some(if iteration_bound_exhausted {
+                    bcode_workflow::WorkflowRepeatOutcomeKind::IterationLimitReached
+                } else {
+                    bcode_workflow::WorkflowRepeatOutcomeKind::ConditionCleared
+                }),
             })
             .to_string(),
             settled_at_ms,
@@ -6159,7 +6595,8 @@ impl WorkflowStore {
             .query_row(
                 "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
                  parent_session_id, owner_plugin_id, workflow_kind, scope_key, display_label, \
-                 single_active, authored_provenance_json, status, cancellation_requested_at_ms, \
+                 single_active, authored_provenance_json, terminal_output_id, \
+                 terminal_output_checksum_sha256, status, cancellation_requested_at_ms, \
                  created_at_ms, updated_at_ms \
                  FROM workflow_runs WHERE run_id = ?1",
                 [run_id],
@@ -6168,6 +6605,98 @@ impl WorkflowStore {
             .optional()?
             .map(parse_run_summary)
             .transpose()
+    }
+
+    /// Read and validate the canonical successful terminal output for one run.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity, inconsistent terminal state, missing output,
+    /// malformed persisted JSON, checksum mismatch, or database failure.
+    pub fn canonical_terminal_output(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<ValidatedOutput>, WorkflowStoreError> {
+        validate_id("run_id", run_id)?;
+        let terminal = self
+            .connection
+            .query_row(
+                "SELECT status, terminal_output_id, terminal_output_checksum_sha256 \
+                 FROM workflow_runs WHERE run_id = ?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((status, output_id, checksum)) = terminal else {
+            return Ok(None);
+        };
+        if status != RunStatus::Completed.as_str() {
+            if output_id.is_some() || checksum.is_some() {
+                return Err(WorkflowStoreError::InvalidData(
+                    "non-completed workflow run exposes terminal output identity".to_string(),
+                ));
+            }
+            return Ok(None);
+        }
+        let output_id = output_id.ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "completed workflow run has no canonical terminal output".to_string(),
+            )
+        })?;
+        let checksum = checksum.ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "completed workflow run has no terminal output checksum".to_string(),
+            )
+        })?;
+        let output = self
+            .connection
+            .query_row(
+                "SELECT output_id, run_id, node_id, activation_id, schema_id, schema_version, \
+             value_json, artifact_reference, created_at_ms FROM workflow_outputs \
+             WHERE output_id = ?1 AND run_id = ?2",
+                (&output_id, run_id),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, u32>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, u64>(8)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(
+                    "canonical terminal output row is missing".to_string(),
+                )
+            })?;
+        if sha256_hex(output.6.as_bytes()) != checksum {
+            return Err(WorkflowStoreError::InvalidData(
+                "canonical terminal output checksum is inconsistent".to_string(),
+            ));
+        }
+        Ok(Some(ValidatedOutput {
+            output_id: output.0,
+            run_id: output.1,
+            node_id: output.2,
+            activation_id: output.3,
+            schema_id: output.4,
+            schema_version: output.5,
+            value: serde_json::from_str(&output.6)?,
+            artifact_reference: output.7,
+            created_at_ms: output.8,
+        }))
     }
 
     /// Return bounded activations for one run without event replay.
@@ -6307,7 +6836,8 @@ impl WorkflowStore {
         let mut statement = self.connection.prepare(
             "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
              parent_session_id, owner_plugin_id, workflow_kind, scope_key, display_label, \
-             single_active, authored_provenance_json, status, cancellation_requested_at_ms, \
+             single_active, authored_provenance_json, terminal_output_id, \
+             terminal_output_checksum_sha256, status, cancellation_requested_at_ms, \
              created_at_ms, updated_at_ms \
              FROM workflow_runs ORDER BY updated_at_ms DESC, run_id LIMIT ?1",
         )?;
@@ -6339,7 +6869,8 @@ impl WorkflowStore {
             .query_row(
                 "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
                  parent_session_id, owner_plugin_id, workflow_kind, scope_key, display_label, \
-                 single_active, authored_provenance_json, status, cancellation_requested_at_ms, \
+                 single_active, authored_provenance_json, terminal_output_id, \
+                 terminal_output_checksum_sha256, status, cancellation_requested_at_ms, \
                  created_at_ms, updated_at_ms \
                  FROM workflow_runs WHERE owner_plugin_id = ?1 AND workflow_kind = ?2 \
                  AND scope_key = ?3 ORDER BY updated_at_ms DESC, run_id LIMIT 1",
@@ -6804,9 +7335,15 @@ where
         RunStatus::Failed
     } else if active_count == 0 && completed_is_exit {
         transaction.execute(
-            "UPDATE workflow_runs SET status = 'completed', updated_at_ms = ?2 \
+            "UPDATE workflow_runs SET status = 'completed', terminal_output_id = ?3, \
+             terminal_output_checksum_sha256 = ?4, updated_at_ms = ?2 \
              WHERE run_id = ?1 AND status = 'running'",
-            (&output.run_id, output.created_at_ms),
+            (
+                &output.run_id,
+                output.created_at_ms,
+                &output.output_id,
+                &checksum,
+            ),
         )?;
         append_event(
             transaction,
@@ -8009,6 +8546,8 @@ type RawRunSummary = (
     Option<String>,
     bool,
     Option<String>,
+    Option<String>,
+    Option<String>,
     String,
     Option<u64>,
     u64,
@@ -8032,6 +8571,8 @@ fn run_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRunSumma
         row.get(12)?,
         row.get(13)?,
         row.get(14)?,
+        row.get(15)?,
+        row.get(16)?,
     ))
 }
 
@@ -8048,6 +8589,8 @@ fn parse_run_summary(raw: RawRunSummary) -> Result<WorkflowRunSummary, WorkflowS
         display_label,
         single_active,
         authored_provenance_json,
+        terminal_output_id,
+        terminal_output_checksum_sha256,
         status,
         cancellation_requested_at_ms,
         created_at_ms,
@@ -8095,6 +8638,8 @@ fn parse_run_summary(raw: RawRunSummary) -> Result<WorkflowRunSummary, WorkflowS
         parent_session_id,
         binding,
         authored_provenance,
+        terminal_output_id,
+        terminal_output_checksum_sha256,
         status: parse_run_status(&status)?,
         cancellation_requested_at_ms,
         created_at_ms,
@@ -8641,6 +9186,302 @@ fn validate_run_input(
         )));
     }
     Ok(input_json)
+}
+
+#[allow(clippy::too_many_lines)]
+fn create_run_in_transaction(
+    transaction: &Transaction<'_>,
+    run: &NewWorkflowRun,
+) -> Result<(), WorkflowStoreError> {
+    if let Some(provenance) = &run.authored_provenance {
+        validate_persisted_authored_run_provenance(transaction, run, provenance)?;
+    }
+    if let Some(binding) = &run.binding
+        && binding.single_active
+    {
+        let active: Option<String> = transaction
+            .query_row(
+                "SELECT run_id FROM workflow_runs WHERE owner_plugin_id = ?1 \
+                     AND workflow_kind = ?2 AND scope_key = ?3 \
+                     AND status IN ('running', 'paused', 'repair_required') \
+                     ORDER BY updated_at_ms DESC, run_id LIMIT 1",
+                (
+                    &binding.owner_plugin_id,
+                    &binding.workflow_kind,
+                    &binding.scope_key,
+                ),
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(active) = active {
+            return Err(WorkflowStoreError::InvalidData(format!(
+                "workflow binding already has an active run: {active}"
+            )));
+        }
+    }
+    let definition_json = transaction
+        .query_row(
+            "SELECT definition_json FROM workflow_definitions \
+                 WHERE definition_id = ?1 AND version = ?2",
+            (&run.definition_id, run.definition_version),
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let Some(definition_json) = definition_json else {
+        return Err(WorkflowStoreError::InvalidData(format!(
+            "workflow definition not found: {} v{}",
+            run.definition_id, run.definition_version
+        )));
+    };
+    let definition: WorkflowDefinition = serde_json::from_str(&definition_json)?;
+    let input_json = run
+        .input
+        .as_ref()
+        .map(|input| validate_run_input(&definition, input))
+        .transpose()?;
+    let (owner_plugin_id, workflow_kind, scope_key, display_label, single_active) = run
+        .binding
+        .as_ref()
+        .map_or((None, None, None, None, false), |binding| {
+            (
+                Some(binding.owner_plugin_id.as_str()),
+                Some(binding.workflow_kind.as_str()),
+                Some(binding.scope_key.as_str()),
+                binding.display_label.as_deref(),
+                binding.single_active,
+            )
+        });
+    let authored_provenance_json = run
+        .authored_provenance
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    transaction.execute(
+        "INSERT INTO workflow_runs \
+             (run_id, definition_id, definition_version, workspace_snapshot, parent_session_id, \
+              owner_plugin_id, workflow_kind, scope_key, display_label, single_active, \
+              authored_provenance_json, input_json, status, deadline_at_ms, node_execution_cap, \
+              concurrency_cap, cycle_cap, retry_cap, created_at_ms, updated_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
+                     ?17, ?18, ?19, ?19)",
+        rusqlite::params![
+            &run.run_id,
+            &run.definition_id,
+            run.definition_version,
+            &run.workspace_snapshot,
+            &run.parent_session_id,
+            owner_plugin_id,
+            workflow_kind,
+            scope_key,
+            display_label,
+            single_active,
+            &authored_provenance_json,
+            &input_json,
+            RunStatus::Running.as_str(),
+            run.limits.deadline_at_ms,
+            run.limits.node_execution_cap,
+            run.limits.concurrency_cap,
+            run.limits.cycle_cap,
+            run.limits.retry_cap,
+            run.created_at_ms,
+        ],
+    )?;
+    append_event(
+        transaction,
+        &run.run_id,
+        "run_created",
+        &serde_json::to_string(run)?,
+        run.created_at_ms,
+    )?;
+    if definition.entries.is_empty() {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow definition has no entry nodes".to_string(),
+        ));
+    }
+    if definition.entries.len() > usize::try_from(run.limits.concurrency_cap).unwrap_or(usize::MAX)
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow entry set exceeds run concurrency cap".to_string(),
+        ));
+    }
+    for node_id in &definition.entries {
+        let node = definition.nodes.get(node_id).ok_or_else(|| {
+            WorkflowStoreError::InvalidData(format!("workflow entry node is missing: {node_id}"))
+        })?;
+        let entry_input = run.input.clone().unwrap_or(serde_json::Value::Null);
+        validate_json_schema(
+            &format!("workflow entry input for node {node_id}"),
+            &node.input.schema,
+            &entry_input,
+        )?;
+        let activation = NewActivation {
+            run_id: run.run_id.clone(),
+            node_id: node_id.clone(),
+            activation_id: activation_identity(&run.run_id, node_id, 0),
+            dependency_generation: 0,
+            input: Some(entry_input),
+            created_at_ms: run.created_at_ms,
+        };
+        validate_activation(&activation)?;
+        insert_activation_with_status(transaction, &activation, activation_status_for_node(node))?;
+    }
+    Ok(())
+}
+
+fn reject_recursive_child_target(
+    transaction: &Transaction<'_>,
+    parent_run_id: &str,
+    target: &bcode_workflow::WorkflowDefinitionIdentity,
+    parent_definition_identity: &bcode_workflow::WorkflowDefinitionIdentity,
+) -> Result<(), WorkflowStoreError> {
+    if target == parent_definition_identity {
+        return Err(WorkflowStoreError::InvalidData(
+            "recursive workflow child target is forbidden".to_string(),
+        ));
+    }
+    let mut current: Option<String> = transaction
+        .query_row(
+            "SELECT parent_run_id FROM workflow_run_links WHERE child_run_id = ?1",
+            [parent_run_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut visited = std::collections::BTreeSet::new();
+    for _ in 0..MAX_WORKFLOW_RUN_DEPTH {
+        let Some(run_id) = current else {
+            return Ok(());
+        };
+        if !visited.insert(run_id.clone()) {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow run link ancestry contains a cycle".to_string(),
+            ));
+        }
+        let definition: (String, u32) = transaction.query_row(
+            "SELECT definition_id, definition_version FROM workflow_runs WHERE run_id = ?1",
+            [&run_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if definition == (target.definition_id.clone(), target.definition_version) {
+            return Err(WorkflowStoreError::InvalidData(
+                "recursive workflow child target is forbidden".to_string(),
+            ));
+        }
+        current = transaction
+            .query_row(
+                "SELECT parent_run_id FROM workflow_run_links WHERE child_run_id = ?1",
+                [&run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+    }
+    if current.is_some() {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow child ancestry exceeds the supported depth".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_run_link(
+    link: &WorkflowRunLink,
+    child: &NewWorkflowRun,
+) -> Result<(), WorkflowStoreError> {
+    for (label, value) in [
+        ("root_run_id", link.root_run_id.as_str()),
+        ("parent_run_id", link.parent_run_id.as_str()),
+        ("parent_node_id", link.parent_node_id.as_str()),
+        ("parent_activation_id", link.parent_activation_id.as_str()),
+        ("child_run_id", link.child_run_id.as_str()),
+    ] {
+        validate_id(label, value)?;
+    }
+    link.target
+        .validate()
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+    if link.version != WORKFLOW_RUN_LINK_VERSION
+        || link.parent_attempt == 0
+        || !(2..=MAX_WORKFLOW_RUN_DEPTH).contains(&link.depth)
+        || link.child_run_id != child.run_id
+        || link.child_run_id
+            != workflow_child_run_id(
+                &link.root_run_id,
+                &link.parent_run_id,
+                &link.parent_activation_id,
+                link.parent_attempt,
+                &link.target,
+            )
+        || link.parent_run_id == link.child_run_id
+        || link.root_run_id == link.child_run_id
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "workflow child link identity, version, attempt, depth, or recursion is invalid"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn child_link_for_parent_attempt(
+    transaction: &Transaction<'_>,
+    link: &WorkflowRunLink,
+) -> Result<Option<WorkflowRunLink>, WorkflowStoreError> {
+    transaction
+        .query_row(
+            "SELECT root_run_id, parent_run_id, parent_node_id, parent_activation_id, \
+             parent_attempt, child_run_id, version, target_json, depth, created_at_ms \
+             FROM workflow_run_links WHERE parent_run_id = ?1 AND parent_node_id = ?2 \
+               AND parent_activation_id = ?3 AND parent_attempt = ?4",
+            (
+                &link.parent_run_id,
+                &link.parent_node_id,
+                &link.parent_activation_id,
+                link.parent_attempt,
+            ),
+            decode_run_link,
+        )
+        .optional()
+        .map_err(WorkflowStoreError::from)
+}
+
+fn child_link_for_parent_attempt_connection(
+    connection: &Connection,
+    request: &AttemptReconciliationRequest,
+) -> Result<Option<WorkflowRunLink>, WorkflowStoreError> {
+    connection
+        .query_row(
+            "SELECT root_run_id, parent_run_id, parent_node_id, parent_activation_id, \
+             parent_attempt, child_run_id, version, target_json, depth, created_at_ms \
+             FROM workflow_run_links WHERE parent_run_id = ?1 AND parent_node_id = ?2 \
+               AND parent_activation_id = ?3 AND parent_attempt = ?4",
+            (
+                &request.run_id,
+                &request.node_id,
+                &request.activation_id,
+                request.attempt,
+            ),
+            decode_run_link,
+        )
+        .optional()
+        .map_err(WorkflowStoreError::from)
+}
+
+fn decode_run_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkflowRunLink> {
+    let target_json = row.get::<_, String>(7)?;
+    let target = serde_json::from_str(&target_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(7, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(WorkflowRunLink {
+        root_run_id: row.get(0)?,
+        parent_run_id: row.get(1)?,
+        parent_node_id: row.get(2)?,
+        parent_activation_id: row.get(3)?,
+        parent_attempt: row.get(4)?,
+        child_run_id: row.get(5)?,
+        version: row.get(6)?,
+        target,
+        depth: row.get(8)?,
+        created_at_ms: row.get(9)?,
+    })
 }
 
 fn validate_run(run: &NewWorkflowRun) -> Result<(), WorkflowStoreError> {
@@ -9278,6 +10119,8 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
              single_active INTEGER NOT NULL DEFAULT 0,\
              authored_provenance_json TEXT,\
              input_json TEXT,\
+             terminal_output_id TEXT,\
+             terminal_output_checksum_sha256 TEXT,\
              status TEXT NOT NULL,\
              cancellation_requested_at_ms INTEGER,\
              deadline_at_ms INTEGER,\
@@ -9290,6 +10133,24 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
              FOREIGN KEY (definition_id, definition_version)\
                  REFERENCES workflow_definitions(definition_id, version)\
          );\
+         CREATE TABLE IF NOT EXISTS workflow_run_links (\
+             root_run_id TEXT NOT NULL,\
+             parent_run_id TEXT NOT NULL,\
+             parent_node_id TEXT NOT NULL,\
+             parent_activation_id TEXT NOT NULL,\
+             parent_attempt INTEGER NOT NULL CHECK (parent_attempt > 0),\
+             child_run_id TEXT PRIMARY KEY NOT NULL,\
+             version INTEGER NOT NULL,\
+             target_json TEXT NOT NULL,\
+             depth INTEGER NOT NULL CHECK (depth > 1),\
+             created_at_ms INTEGER NOT NULL,\
+             UNIQUE (parent_run_id, parent_node_id, parent_activation_id, parent_attempt),\
+             FOREIGN KEY (root_run_id) REFERENCES workflow_runs(run_id),\
+             FOREIGN KEY (parent_run_id) REFERENCES workflow_runs(run_id),\
+             FOREIGN KEY (child_run_id) REFERENCES workflow_runs(run_id)\
+         );\
+         CREATE INDEX IF NOT EXISTS idx_workflow_run_links_root \
+             ON workflow_run_links(root_run_id, created_at_ms, child_run_id);\
          CREATE TABLE IF NOT EXISTS workflow_activations (\
              run_id TEXT NOT NULL,\
              node_id TEXT NOT NULL,\
@@ -9579,6 +10440,33 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
          WHERE contract_id = 1 AND schema_version = 7",
         [],
     )?;
+    let run_columns = transaction
+        .prepare("PRAGMA table_info(workflow_runs)")?
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    if !run_columns
+        .iter()
+        .any(|existing| existing == "terminal_output_id")
+    {
+        transaction.execute(
+            "ALTER TABLE workflow_runs ADD COLUMN terminal_output_id TEXT",
+            [],
+        )?;
+    }
+    if !run_columns
+        .iter()
+        .any(|existing| existing == "terminal_output_checksum_sha256")
+    {
+        transaction.execute(
+            "ALTER TABLE workflow_runs ADD COLUMN terminal_output_checksum_sha256 TEXT",
+            [],
+        )?;
+    }
+    transaction.execute(
+        "UPDATE workflow_store_contract SET schema_version = 9 \
+         WHERE contract_id = 1 AND schema_version = 8",
+        [],
+    )?;
     let actual: u32 = transaction.query_row(
         "SELECT schema_version FROM workflow_store_contract WHERE contract_id = 1",
         [],
@@ -9656,6 +10544,7 @@ mod tests {
                         id: "agent".to_string(),
                         name: "Agent".to_string(),
                         kind: bcode_workflow::NodeKind::Agent,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                         input: schema.clone(),
                         output: schema.clone(),
                         resources: Vec::new(),
@@ -9788,6 +10677,55 @@ mod tests {
         .clone()
     }
 
+    fn repeat_definition_with_outcome() -> WorkflowDefinition {
+        let mut definition = repeat_definition();
+        let repeat = definition
+            .nodes
+            .get_mut("repeat-control")
+            .expect("repeat control");
+        repeat.configuration["exhaustion_policy"] = serde_json::json!("emit_outcome");
+        repeat.configuration["repeat_outcome_version"] =
+            serde_json::json!(bcode_workflow::WORKFLOW_REPEAT_OUTCOME_VERSION);
+        repeat.output = bcode_workflow::ValueSchema::of::<
+            bcode_workflow::WorkflowRepeatOutcome<serde_json::Value>,
+        >();
+        definition.output = repeat.output.clone();
+        definition.validate().expect("outcome repeat definition");
+        definition
+    }
+
+    fn workflow_call_definition(
+        target: bcode_workflow::WorkflowDefinitionIdentity,
+    ) -> WorkflowDefinition {
+        let schema = bcode_workflow::ValueSchema::of::<u32>();
+        let node = bcode_workflow::NodeDefinition {
+            id: "call".to_string(),
+            name: "call".to_string(),
+            kind: bcode_workflow::NodeKind::WorkflowCall,
+            dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
+            input: schema.clone(),
+            output: schema.clone(),
+            resources: Vec::new(),
+            configuration: serde_json::to_value(bcode_workflow::WorkflowCallConfiguration {
+                version: bcode_workflow::WORKFLOW_CALL_VERSION,
+                target: bcode_workflow::WorkflowCallTarget::Definition { identity: target },
+            })
+            .expect("call"),
+        };
+        let definition = WorkflowDefinition {
+            schema_version: bcode_workflow::WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "parent-call".to_string(),
+            input: schema.clone(),
+            output: schema,
+            nodes: BTreeMap::from([("call".to_string(), node)]),
+            entries: vec!["call".to_string()],
+            exits: vec!["call".to_string()],
+            edges: Vec::new(),
+        };
+        definition.validate().expect("call definition");
+        definition
+    }
+
     fn parallel_join_definition() -> WorkflowDefinition {
         let left = Step::task("left", |value: u32, _context| async move { Ok(value + 1) });
         let right = Step::task("right", |value: u32, _context| async move { Ok(value + 2) });
@@ -9902,6 +10840,7 @@ mod tests {
                     id: "git.commit".to_string(),
                     name: "commit".to_string(),
                     kind: bcode_workflow::NodeKind::PluginBlock,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: schema.clone(),
                     output: schema,
                     resources: Vec::new(),
@@ -11168,6 +12107,82 @@ mod tests {
     }
 
     #[test]
+    fn repeat_emit_outcome_completes_at_bound_and_is_boundedly_inspectable() {
+        let temp = tempfile::tempdir().expect("temp");
+        let definition = repeat_definition_with_outcome();
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("repeat-outcome", 1, &definition)
+            .expect("definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "repeat-outcome-run".to_string(),
+                definition_id: "repeat-outcome".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
+                created_at_ms: 1,
+                limits: WorkflowRunLimits {
+                    cycle_cap: 1,
+                    ..WorkflowRunLimits::default()
+                },
+            })
+            .expect("run");
+        let body = store
+            .pending_activations(10)
+            .expect("body")
+            .pop()
+            .expect("body");
+        store
+            .persist_validated_output(&ValidatedOutput {
+                output_id: "outcome-body".to_string(),
+                run_id: "repeat-outcome-run".to_string(),
+                node_id: "body".to_string(),
+                activation_id: body.activation_id,
+                schema_id: definition.nodes["body"].output.type_name.clone(),
+                schema_version: 1,
+                value: serde_json::json!({"condition_met": false, "iteration": 1}),
+                artifact_reference: None,
+                created_at_ms: 2,
+            })
+            .expect("body output");
+        store
+            .settle_pending_control_nodes("repeat-outcome-run", 10, 3)
+            .expect("settle");
+        assert_eq!(
+            store
+                .run_summary("repeat-outcome-run")
+                .expect("run")
+                .expect("run")
+                .status,
+            RunStatus::Completed
+        );
+        let outcomes = store
+            .repeat_outcomes("repeat-outcome-run", 10)
+            .expect("outcomes");
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(
+            outcomes[0].outcome,
+            bcode_workflow::WorkflowRepeatOutcomeKind::IterationLimitReached
+        );
+        assert_eq!(outcomes[0].iterations_completed, 1);
+        assert_eq!(outcomes[0].max_iterations, 2);
+        assert_eq!(outcomes[0].cycle_cap, 1);
+        assert_eq!(outcomes[0].effective_iteration_bound, 1);
+        let settled = store
+            .event_history("repeat-outcome-run", None, 20)
+            .expect("events")
+            .into_iter()
+            .find(|event| event.event_type == "control_node_settled")
+            .expect("settled");
+        assert_eq!(settled.payload["iterations_completed"], 1);
+        assert_eq!(settled.payload["outcome"], "iteration_limit_reached");
+    }
+
+    #[test]
     fn repeat_predicate_clearing_at_bound_completes_and_records_accounting() {
         let temp = tempfile::tempdir().expect("temp");
         let definition = repeat_definition();
@@ -11853,6 +12868,234 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn exact_child_run_creation_is_atomic_idempotent_bounded_and_restart_safe() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let child_definition = definition("child");
+        let target_identity =
+            bcode_workflow::WorkflowDefinitionIdentity::for_definition("child", &child_definition)
+                .expect("identity");
+        let parent_definition = workflow_call_definition(target_identity.clone());
+        store
+            .persist_definition("parent", 1, &parent_definition)
+            .expect("parent definition");
+        store
+            .persist_definition(
+                &target_identity.definition_id,
+                target_identity.definition_version,
+                &child_definition,
+            )
+            .expect("child definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "parent-run".to_string(),
+                definition_id: "parent".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!(1)),
+                created_at_ms: 1,
+                limits: WorkflowRunLimits::default(),
+            })
+            .expect("parent run");
+        let activation = store
+            .pending_activations(10)
+            .expect("activation")
+            .pop()
+            .expect("activation");
+        store
+            .prepare_pending_activation(
+                "parent-run",
+                "call",
+                &activation.activation_id,
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({"target": target_identity}),
+                2,
+            )
+            .expect("prepared");
+        let target = bcode_workflow::WorkflowCallTarget::Definition {
+            identity: target_identity.clone(),
+        };
+        let child_run_id = workflow_child_run_id(
+            "parent-run",
+            "parent-run",
+            &activation.activation_id,
+            1,
+            &target,
+        );
+        let request = NewChildWorkflowRun {
+            link: WorkflowRunLink {
+                version: WORKFLOW_RUN_LINK_VERSION,
+                root_run_id: "parent-run".to_string(),
+                parent_run_id: "parent-run".to_string(),
+                parent_node_id: "call".to_string(),
+                parent_activation_id: activation.activation_id,
+                parent_attempt: 1,
+                child_run_id: child_run_id.clone(),
+                target,
+                depth: 2,
+                created_at_ms: 3,
+            },
+            run: NewWorkflowRun {
+                run_id: child_run_id.clone(),
+                definition_id: target_identity.definition_id,
+                definition_version: target_identity.definition_version,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!(1)),
+                created_at_ms: 3,
+                limits: WorkflowRunLimits::default(),
+            },
+        };
+        assert!(
+            store
+                .create_child_run_idempotent(&request)
+                .expect("created")
+        );
+        let attempts = store
+            .active_attempts_for_run("parent-run", 10)
+            .expect("attempts");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].receipt["child_run_id"], child_run_id);
+        store
+            .persist_dispatch_receipt(&DispatchReceipt {
+                run_id: "parent-run".to_string(),
+                node_id: "call".to_string(),
+                activation_id: request.link.parent_activation_id.clone(),
+                attempt: 1,
+                dispatch_identity: dispatch_identity(
+                    "parent-run",
+                    "call",
+                    &request.link.parent_activation_id,
+                    1,
+                ),
+                receipt: attempts[0].receipt.clone(),
+                admitted_at_ms: 3,
+            })
+            .expect("scheduler receipt redelivery is idempotent");
+        assert!(
+            !store
+                .create_child_run_idempotent(&request)
+                .expect("duplicate")
+        );
+        assert_eq!(
+            store.child_run_links("parent-run", 10).expect("links"),
+            std::slice::from_ref(&request.link)
+        );
+        drop(store);
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
+        assert_eq!(
+            reopened.child_run_links("parent-run", 10).expect("links"),
+            [request.link]
+        );
+        assert!(
+            reopened
+                .run_summary(&child_run_id)
+                .expect("child")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn child_run_failure_rolls_back_child_and_link() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        let child_definition = definition("child");
+        let identity =
+            bcode_workflow::WorkflowDefinitionIdentity::for_definition("child", &child_definition)
+                .expect("identity");
+        let parent_definition = workflow_call_definition(identity.clone());
+        store
+            .persist_definition("parent", 1, &parent_definition)
+            .expect("parent");
+        store
+            .persist_definition(&identity.definition_id, 1, &child_definition)
+            .expect("child");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "rollback-parent".to_string(),
+                definition_id: "parent".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!(1)),
+                created_at_ms: 1,
+                limits: WorkflowRunLimits::default(),
+            })
+            .expect("parent run");
+        let activation = store
+            .pending_activations(10)
+            .expect("pending")
+            .pop()
+            .expect("call");
+        store
+            .prepare_pending_activation(
+                "rollback-parent",
+                "call",
+                &activation.activation_id,
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({}),
+                2,
+            )
+            .expect("prepare");
+        let target = bcode_workflow::WorkflowCallTarget::Definition {
+            identity: identity.clone(),
+        };
+        let child_id = workflow_child_run_id(
+            "rollback-parent",
+            "rollback-parent",
+            &activation.activation_id,
+            1,
+            &target,
+        );
+        let mut request = NewChildWorkflowRun {
+            link: WorkflowRunLink {
+                version: WORKFLOW_RUN_LINK_VERSION,
+                root_run_id: "rollback-parent".to_string(),
+                parent_run_id: "rollback-parent".to_string(),
+                parent_node_id: "call".to_string(),
+                parent_activation_id: activation.activation_id,
+                parent_attempt: 1,
+                child_run_id: child_id.clone(),
+                target,
+                depth: 2,
+                created_at_ms: 3,
+            },
+            run: NewWorkflowRun {
+                run_id: child_id.clone(),
+                definition_id: identity.definition_id,
+                definition_version: 1,
+                workspace_snapshot: "wrong".to_string(),
+                parent_session_id: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!(1)),
+                created_at_ms: 3,
+                limits: WorkflowRunLimits::default(),
+            },
+        };
+        assert!(store.create_child_run_idempotent(&request).is_err());
+        assert!(store.run_summary(&child_id).expect("child").is_none());
+        assert!(
+            store
+                .child_run_links("rollback-parent", 10)
+                .expect("links")
+                .is_empty()
+        );
+        request.run.workspace_snapshot = "snapshot".to_string();
+        request.link.depth = MAX_WORKFLOW_RUN_DEPTH + 1;
+        assert!(store.create_child_run_idempotent(&request).is_err());
+        assert!(store.run_summary(&child_id).expect("child").is_none());
+    }
+
+    #[test]
     fn terminal_output_survives_restart_without_duplicate_materialization() {
         let (temp, mut store) = initialized_store();
         let identity = prepare_receipt_backed_attempt(&mut store, DispatchSideEffect::ReadOnly);
@@ -11886,6 +13129,19 @@ mod tests {
                 .expect("run")
                 .status,
             RunStatus::Completed
+        );
+        let terminal = reopened
+            .run_summary("run-1")
+            .expect("summary")
+            .expect("run");
+        assert_eq!(
+            terminal.terminal_output_id.as_deref(),
+            Some("restart-output")
+        );
+        let expected_terminal_checksum = sha256_hex(b"7");
+        assert_eq!(
+            terminal.terminal_output_checksum_sha256.as_deref(),
+            Some(expected_terminal_checksum.as_str())
         );
         assert!(
             reopened
@@ -12641,6 +13897,7 @@ mod tests {
                         id: "input".to_string(),
                         name: "input".to_string(),
                         kind: bcode_workflow::NodeKind::Input,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                         input: schema.clone(),
                         output: schema.clone(),
                         resources: Vec::new(),
@@ -12653,6 +13910,7 @@ mod tests {
                         id: "next".to_string(),
                         name: "next".to_string(),
                         kind: bcode_workflow::NodeKind::Task,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                         input: schema.clone(),
                         output: schema,
                         resources: Vec::new(),
@@ -12747,6 +14005,7 @@ mod tests {
                         id: "approve".to_string(),
                         name: "approve".to_string(),
                         kind: bcode_workflow::NodeKind::Approval,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                         input: schema.clone(),
                         output: schema.clone(),
                         resources: Vec::new(),
@@ -12759,6 +14018,7 @@ mod tests {
                         id: "mutate".to_string(),
                         name: "mutate".to_string(),
                         kind: bcode_workflow::NodeKind::Task,
+                        dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                         input: schema.clone(),
                         output: schema,
                         resources: Vec::new(),
@@ -14452,7 +15712,10 @@ mod tests {
             ))
             .expect("decision query")
             .expect("decision");
-        assert_eq!(decision.value["predicate_version"], 1);
+        assert_eq!(
+            decision.value["predicate_version"],
+            bcode_workflow::WORKFLOW_PREDICATE_VERSION
+        );
         assert_eq!(decision.value["selected"], true);
         assert_eq!(
             decision.value["selected_entries"],

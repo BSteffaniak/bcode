@@ -45,7 +45,15 @@ pub const WORKFLOW_PRODUCTION_CAPABILITY_VERSION: u32 = 1;
 pub const WORKFLOW_REQUIREMENT_AVAILABILITY_VERSION: u32 = 1;
 
 /// Stable deterministic predicate contract version.
-pub const WORKFLOW_PREDICATE_VERSION: u32 = 1;
+pub const WORKFLOW_PREDICATE_VERSION: u32 = 2;
+/// Earliest deterministic predicate contract version retained for compatibility.
+pub const WORKFLOW_PREDICATE_MIN_VERSION: u32 = 1;
+
+const MAX_PREDICATE_DEPTH: usize = 16;
+const MAX_PREDICATE_OPERATIONS: usize = 256;
+const MAX_PREDICATE_PATH_BYTES: usize = 512;
+const MAX_PREDICATE_PATH_SEGMENT_BYTES: usize = 256;
+const MAX_PREDICATE_VALUE_BYTES: usize = 65_536;
 
 /// Stable plugin workflow-block interface version.
 pub const WORKFLOW_BLOCK_INTERFACE_VERSION: u32 = 1;
@@ -990,6 +998,203 @@ impl ArtifactReference {
 
 /// Stable durable workflow-state envelope contract version.
 pub const WORKFLOW_STATE_ENVELOPE_VERSION: u32 = 1;
+/// Maximum serialized retained-state bytes for one state-envelope boundary.
+pub const MAX_WORKFLOW_STATE_ENVELOPE_STATE_BYTES: usize = 262_144;
+/// Maximum artifact references carried by one state-envelope boundary.
+pub const MAX_WORKFLOW_STATE_ENVELOPE_ARTIFACTS: usize = 128;
+/// Maximum bytes for one artifact-reference string field.
+pub const MAX_WORKFLOW_ARTIFACT_REFERENCE_FIELD_BYTES: usize = 1_024;
+
+/// Versioned node input/output adaptation policy.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowNodeDataflowPolicy {
+    /// Dispatch and persist the complete typed value unchanged.
+    #[default]
+    Direct,
+    /// Dispatch only `value` while retaining explicit state and artifact references.
+    StateEnvelopeV1,
+}
+
+impl WorkflowNodeDataflowPolicy {
+    // Serde's `skip_serializing_if` callback receives a reference even for copy types.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    const fn is_direct(policy: &Self) -> bool {
+        matches!(policy, Self::Direct)
+    }
+}
+
+/// Validated owned parts of one state-envelope boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkflowStateEnvelopeParts {
+    /// Explicit retained state.
+    pub state: serde_json::Value,
+    /// Narrow operation request or result.
+    pub value: serde_json::Value,
+    /// Explicit artifact references.
+    pub artifacts: Vec<ArtifactReference>,
+}
+
+/// Dispatch-ready owner input plus state retained explicitly by the host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkflowPreparedDataflow {
+    /// Complete node input is also the owner input.
+    Direct(serde_json::Value),
+    /// Owner receives only `value`; state and artifacts remain explicit for result rewrapping.
+    StateEnvelope(WorkflowStateEnvelopeParts),
+}
+
+impl WorkflowPreparedDataflow {
+    /// Return the canonical operation input used for authorization and owner dispatch.
+    #[must_use]
+    pub const fn owner_input(&self) -> &serde_json::Value {
+        match self {
+            Self::Direct(value) => value,
+            Self::StateEnvelope(parts) => &parts.value,
+        }
+    }
+}
+
+/// Validate a complete node input and prepare its canonical owner-operation input.
+///
+/// # Errors
+///
+/// Returns an error when the complete input, envelope, or unwrapped owner input is invalid.
+pub fn prepare_workflow_node_dataflow(
+    policy: WorkflowNodeDataflowPolicy,
+    complete_input: &ValueSchema,
+    owner_input: &ValueSchema,
+    value: &serde_json::Value,
+) -> Result<WorkflowPreparedDataflow, WorkflowError> {
+    complete_input.validate_value("node.input", value)?;
+    match policy {
+        WorkflowNodeDataflowPolicy::Direct => {
+            owner_input.validate_value("owner.input", value)?;
+            Ok(WorkflowPreparedDataflow::Direct(value.clone()))
+        }
+        WorkflowNodeDataflowPolicy::StateEnvelopeV1 => {
+            let parts = validate_workflow_state_envelope(value)?;
+            owner_input.validate_value("owner.input", &parts.value)?;
+            Ok(WorkflowPreparedDataflow::StateEnvelope(parts))
+        }
+    }
+}
+
+/// Validate an owner result and adapt it to the complete node output boundary.
+///
+/// # Errors
+///
+/// Returns an error when the owner result or complete adapted output is invalid.
+pub fn complete_workflow_node_dataflow(
+    prepared: WorkflowPreparedDataflow,
+    owner_output_schema: &ValueSchema,
+    complete_output_schema: &ValueSchema,
+    owner_output: serde_json::Value,
+) -> Result<serde_json::Value, WorkflowError> {
+    owner_output_schema.validate_value("owner.output", &owner_output)?;
+    match prepared {
+        WorkflowPreparedDataflow::Direct(_) => {
+            complete_output_schema.validate_value("node.output", &owner_output)?;
+            Ok(owner_output)
+        }
+        WorkflowPreparedDataflow::StateEnvelope(parts) => {
+            rewrap_workflow_state_envelope(&parts, &owner_output, complete_output_schema)
+        }
+    }
+}
+
+/// Validate and split one serialized state envelope.
+///
+/// # Errors
+///
+/// Returns an error when the envelope version, shape, retained-state bound, artifact count, or
+/// artifact-reference fields are invalid.
+pub fn validate_workflow_state_envelope(
+    envelope: &serde_json::Value,
+) -> Result<WorkflowStateEnvelopeParts, WorkflowError> {
+    let object = envelope.as_object().ok_or_else(|| WorkflowError::Build {
+        path: "state_envelope".to_string(),
+        message: "state envelope must be an object".to_string(),
+    })?;
+    if object.len() > 4
+        || !object.contains_key("schema_version")
+        || !object.contains_key("state")
+        || !object.contains_key("value")
+        || object.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "schema_version" | "state" | "value" | "artifacts"
+            )
+        })
+    {
+        return Err(WorkflowError::Build {
+            path: "state_envelope".to_string(),
+            message:
+                "state envelope must contain schema_version, state, value, and optional artifacts"
+                    .to_string(),
+        });
+    }
+    if object["schema_version"].as_u64() != Some(u64::from(WORKFLOW_STATE_ENVELOPE_VERSION)) {
+        return Err(WorkflowError::Build {
+            path: "state_envelope.schema_version".to_string(),
+            message: format!(
+                "unsupported state envelope version; expected {WORKFLOW_STATE_ENVELOPE_VERSION}"
+            ),
+        });
+    }
+    let state = &object["state"];
+    let encoded_state = serde_json::to_vec(state).map_err(|error| WorkflowError::Build {
+        path: "state_envelope.state".to_string(),
+        message: format!("retained state cannot be serialized: {error}"),
+    })?;
+    if encoded_state.len() > MAX_WORKFLOW_STATE_ENVELOPE_STATE_BYTES {
+        return Err(WorkflowError::Build {
+            path: "state_envelope.state".to_string(),
+            message: format!(
+                "retained state exceeds {MAX_WORKFLOW_STATE_ENVELOPE_STATE_BYTES} bytes"
+            ),
+        });
+    }
+    let artifacts_value = object
+        .get("artifacts")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!([]));
+    let artifacts: Vec<ArtifactReference> =
+        serde_json::from_value(artifacts_value).map_err(|error| WorkflowError::Build {
+            path: "state_envelope.artifacts".to_string(),
+            message: format!("artifact references are invalid: {error}"),
+        })?;
+    if artifacts.len() > MAX_WORKFLOW_STATE_ENVELOPE_ARTIFACTS {
+        return Err(WorkflowError::Build {
+            path: "state_envelope.artifacts".to_string(),
+            message: format!(
+                "artifact references exceed {MAX_WORKFLOW_STATE_ENVELOPE_ARTIFACTS} entries"
+            ),
+        });
+    }
+    for artifact in &artifacts {
+        for (field, value) in [
+            ("artifact_id", artifact.artifact_id.as_str()),
+            ("schema", artifact.schema.as_str()),
+            ("content_type", artifact.content_type.as_str()),
+            ("reference_key", artifact.reference_key.as_str()),
+        ] {
+            if value.is_empty() || value.len() > MAX_WORKFLOW_ARTIFACT_REFERENCE_FIELD_BYTES {
+                return Err(WorkflowError::Build {
+                    path: format!("state_envelope.artifacts.{field}"),
+                    message: format!(
+                        "artifact reference field must contain 1 to {MAX_WORKFLOW_ARTIFACT_REFERENCE_FIELD_BYTES} bytes"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(WorkflowStateEnvelopeParts {
+        state: state.clone(),
+        value: object["value"].clone(),
+        artifacts,
+    })
+}
 
 /// Explicit typed dataflow envelope carrying retained workflow state beside a narrow value.
 ///
@@ -1026,6 +1231,69 @@ impl<T, R> WorkflowStateEnvelope<T, R> {
         self.artifacts = artifacts;
         self
     }
+}
+
+/// Rewrap one validated owner result with retained state and artifacts.
+///
+/// # Errors
+///
+/// Returns an error when the complete result does not match `complete_output`.
+pub fn rewrap_workflow_state_envelope(
+    parts: &WorkflowStateEnvelopeParts,
+    owner_output: &serde_json::Value,
+    complete_output: &ValueSchema,
+) -> Result<serde_json::Value, WorkflowError> {
+    let value = serde_json::json!({
+        "schema_version": WORKFLOW_STATE_ENVELOPE_VERSION,
+        "state": parts.state.clone(),
+        "value": owner_output.clone(),
+        "artifacts": parts.artifacts.clone(),
+    });
+    complete_output.validate_value("state_envelope.output", &value)?;
+    Ok(value)
+}
+
+/// Current typed repeat-outcome contract version.
+pub const WORKFLOW_REPEAT_OUTCOME_VERSION: u32 = 1;
+
+/// Repeat behavior when its effective durable iteration bound is reached.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRepeatExhaustionPolicy {
+    /// Preserve existing behavior by failing the run.
+    #[default]
+    Fail,
+    /// Complete with a typed `iteration_limit_reached` result.
+    EmitOutcome,
+}
+
+/// Stable reason carried by a typed repeat outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRepeatOutcomeKind {
+    /// The predicate cleared before the effective iteration bound.
+    ConditionCleared,
+    /// The predicate remained true at the effective iteration bound.
+    IterationLimitReached,
+}
+
+/// Generic typed result emitted by repeat outcome mode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WorkflowRepeatOutcome<T> {
+    /// Repeat-outcome contract version.
+    pub version: u32,
+    /// Stable terminal repeat result.
+    pub outcome: WorkflowRepeatOutcomeKind,
+    /// Runtime-owned number of completed body iterations.
+    pub iterations_completed: u64,
+    /// Definition-level maximum iterations.
+    pub max_iterations: u64,
+    /// Effective run-level cycle cap.
+    pub cycle_cap: u64,
+    /// Minimum of definition and run-level limits.
+    pub effective_iteration_bound: u64,
+    /// Last retained typed body value.
+    pub value: T,
 }
 
 /// Stable fan-out result envelope contract version.
@@ -1389,6 +1657,19 @@ impl ValueSchema {
             schema: serde_json::to_value(schemars::schema_for!(T))
                 .expect("schemars workflow schema should serialize to JSON"),
         }
+    }
+
+    /// Validate one serialized value against this exact schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema is unsupported or malformed, or the value does not match.
+    pub fn validate_value(
+        &self,
+        path: &str,
+        value: &serde_json::Value,
+    ) -> Result<(), WorkflowError> {
+        validate_value_against_schema(path, value, self)
     }
 }
 
@@ -3589,7 +3870,8 @@ fn resolve_authoring_catalog(
             | NodeKind::Parallel
             | NodeKind::FanOut
             | NodeKind::Input
-            | NodeKind::Approval => {}
+            | NodeKind::Approval
+            | NodeKind::WorkflowCall => {}
         }
     }
     for node_id in plugin_input_defaults.keys() {
@@ -3639,12 +3921,27 @@ fn resolve_authoring_plugin_block(
         ));
     }
     if let Some(defaults) = input_defaults {
-        validate_value_against_schema(
-            &format!("plugin_input_defaults.{node_id}"),
-            defaults,
-            &block.input,
-        )?;
+        prepare_workflow_node_dataflow(node.dataflow, &node.input, &block.input, defaults)?;
     }
+    finish_authoring_plugin_block_resolution(
+        node_id,
+        &block,
+        key,
+        requirements,
+        effects,
+        permissions,
+    );
+    Ok(())
+}
+
+fn finish_authoring_plugin_block_resolution(
+    node_id: &str,
+    block: &WorkflowBlockDefinition,
+    key: String,
+    requirements: &mut WorkflowRequirementSummary,
+    effects: &mut WorkflowEffectSummary,
+    permissions: &mut WorkflowPermissionPreview,
+) {
     requirements.plugins.insert(block.plugin_id.clone());
     requirements.blocks.insert(key);
     effects.block_effects.insert(block.effect);
@@ -3664,7 +3961,6 @@ fn resolve_authoring_plugin_block(
             .mutation_approval_nodes
             .push(node_id.to_string());
     }
-    Ok(())
 }
 
 fn authoring_diagnostic_code(message: &str) -> &'static str {
@@ -4606,6 +4902,148 @@ pub enum AgentExecutionTarget {
     SharedParentSequential,
 }
 
+/// Current exact child-workflow call contract version.
+pub const WORKFLOW_CALL_VERSION: u32 = 1;
+/// Maximum supported workflow-call nesting depth, including the root run.
+pub const MAX_WORKFLOW_CALL_DEPTH: u32 = 4;
+/// Maximum descendants admitted beneath one root run.
+pub const MAX_WORKFLOW_CALL_DESCENDANTS: u32 = 64;
+
+/// Exact optional preset selected for one authored child call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowCallPreset {
+    /// Stable preset identity beneath the authored workflow.
+    pub preset_id: String,
+    /// Exact immutable preset generation.
+    pub generation: u64,
+}
+
+/// Exact immutable target for one synchronous child-workflow call.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkflowCallTarget {
+    /// One exact registered compiled definition.
+    Definition {
+        /// Product identity plus content-derived compiled definition identity.
+        identity: WorkflowDefinitionIdentity,
+    },
+    /// One exact published authored revision and its expected compiled definition.
+    AuthoredRevision {
+        /// Stable logical authored workflow identity.
+        workflow_id: String,
+        /// Exact immutable published revision.
+        revision: u64,
+        /// Expected compiled identity resolved during validation/publication.
+        definition_identity: WorkflowDefinitionIdentity,
+        /// Optional exact preset generation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preset: Option<WorkflowCallPreset>,
+    },
+}
+
+impl WorkflowCallTarget {
+    /// Return the exact compiled definition identity required at child admission.
+    #[must_use]
+    pub const fn definition_identity(&self) -> &WorkflowDefinitionIdentity {
+        match self {
+            Self::Definition { identity } => identity,
+            Self::AuthoredRevision {
+                definition_identity,
+                ..
+            } => definition_identity,
+        }
+    }
+
+    /// Validate bounded identity and exact target invariants.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions, malformed identities, zero revisions or preset
+    /// generations, or authored/compiled logical identity mismatch.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        let identity = self.definition_identity();
+        validate_workflow_call_id("workflow_call.target.kind", &identity.kind)?;
+        validate_workflow_call_id(
+            "workflow_call.target.definition_id",
+            &identity.definition_id,
+        )?;
+        if identity.definition_version == 0 {
+            return Err(WorkflowError::Build {
+                path: "workflow_call.target.definition_version".to_string(),
+                message: "workflow call definition version must be greater than zero".to_string(),
+            });
+        }
+        if let Self::AuthoredRevision {
+            workflow_id,
+            revision,
+            preset,
+            ..
+        } = self
+        {
+            validate_workflow_call_id("workflow_call.target.workflow_id", workflow_id)?;
+            if workflow_id != &identity.kind || *revision == 0 {
+                return Err(WorkflowError::Build {
+                    path: "workflow_call.target.authored_revision".to_string(),
+                    message: "authored call target must use a nonzero revision and matching logical identity"
+                        .to_string(),
+                });
+            }
+            if let Some(preset) = preset {
+                validate_workflow_call_id("workflow_call.target.preset_id", &preset.preset_id)?;
+                if preset.generation == 0 {
+                    return Err(WorkflowError::Build {
+                        path: "workflow_call.target.preset_generation".to_string(),
+                        message: "workflow call preset generation must be greater than zero"
+                            .to_string(),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Portable synchronous child-workflow call configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowCallConfiguration {
+    /// Call contract version.
+    pub version: u32,
+    /// Exact immutable target.
+    pub target: WorkflowCallTarget,
+}
+
+impl WorkflowCallConfiguration {
+    /// Validate the current exact child-call contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for unsupported versions or invalid exact targets.
+    pub fn validate(&self) -> Result<(), WorkflowError> {
+        if self.version != WORKFLOW_CALL_VERSION {
+            return Err(WorkflowError::Build {
+                path: "workflow_call.version".to_string(),
+                message: format!(
+                    "unsupported workflow call version {}; expected {WORKFLOW_CALL_VERSION}",
+                    self.version
+                ),
+            });
+        }
+        self.target.validate()
+    }
+}
+
+fn validate_workflow_call_id(path: &str, value: &str) -> Result<(), WorkflowError> {
+    if value.trim().is_empty() || value.len() > 512 {
+        return Err(WorkflowError::Build {
+            path: path.to_string(),
+            message: "workflow call identity must contain 1 to 512 bytes".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Serializable description of one workflow node.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeDefinition {
@@ -4615,6 +5053,9 @@ pub struct NodeDefinition {
     pub name: String,
     /// Generic node kind interpreted by the workflow host.
     pub kind: NodeKind,
+    /// Versioned adaptation between the complete node boundary and owner operation boundary.
+    #[serde(default, skip_serializing_if = "WorkflowNodeDataflowPolicy::is_direct")]
+    pub dataflow: WorkflowNodeDataflowPolicy,
     /// Typed input schema.
     pub input: ValueSchema,
     /// Typed output schema.
@@ -4651,10 +5092,12 @@ pub enum NodeKind {
     Input,
     /// Durable human approval gate resolved by the workflow host.
     Approval,
+    /// Synchronous exact immutable child-workflow call.
+    WorkflowCall,
 }
 
 /// Every public serialized node kind, used to enforce exhaustive production capability coverage.
-pub const ALL_NODE_KINDS: [NodeKind; 10] = [
+pub const ALL_NODE_KINDS: [NodeKind; 11] = [
     NodeKind::Task,
     NodeKind::Agent,
     NodeKind::Branch,
@@ -4665,6 +5108,7 @@ pub const ALL_NODE_KINDS: [NodeKind; 10] = [
     NodeKind::PluginBlock,
     NodeKind::Input,
     NodeKind::Approval,
+    NodeKind::WorkflowCall,
 ];
 
 /// Every public serialized edge kind, used to enforce exhaustive production capability coverage.
@@ -4692,6 +5136,7 @@ pub const fn node_kind_name(kind: NodeKind) -> &'static str {
         NodeKind::PluginBlock => "plugin_block",
         NodeKind::Input => "input",
         NodeKind::Approval => "approval",
+        NodeKind::WorkflowCall => "workflow_call",
     }
 }
 
@@ -4760,6 +5205,7 @@ impl WorkflowProductionCapabilities {
             (NodeKind::PluginBlock, WorkflowCapabilitySupport::Supported),
             (NodeKind::Input, WorkflowCapabilitySupport::Supported),
             (NodeKind::Approval, WorkflowCapabilitySupport::Supported),
+            (NodeKind::WorkflowCall, WorkflowCapabilitySupport::Supported),
         ]);
         let edge_kinds = BTreeMap::from([
             (
@@ -4932,11 +5378,25 @@ impl EdgeKind {
     }
 }
 
+/// Numeric ordering operation used by deterministic predicates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredicateNumericComparison {
+    /// The left number is less than the right number.
+    LessThan,
+    /// The left number is less than or equal to the right number.
+    LessThanOrEqual,
+    /// The left number is greater than the right number.
+    GreaterThan,
+    /// The left number is greater than or equal to the right number.
+    GreaterThanOrEqual,
+}
+
 /// Serializable deterministic predicate over a structured workflow value.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum PredicateExpression {
-    /// Compare the value at a dotted field path for equality.
+    /// Compare the value at a dotted field path with one constant for equality.
     Equals {
         /// Predicate contract version.
         version: u32,
@@ -4944,6 +5404,47 @@ pub enum PredicateExpression {
         path: String,
         /// Expected JSON value.
         value: serde_json::Value,
+    },
+    /// Compare two values selected from the same structured input for equality.
+    FieldsEqual {
+        /// Predicate contract version.
+        version: u32,
+        /// Left dotted object field path.
+        left_path: String,
+        /// Right dotted object field path.
+        right_path: String,
+    },
+    /// Require every bounded child predicate to match.
+    All {
+        /// Predicate contract version.
+        version: u32,
+        /// Non-empty child predicate list.
+        predicates: Vec<Self>,
+    },
+    /// Require at least one bounded child predicate to match.
+    Any {
+        /// Predicate contract version.
+        version: u32,
+        /// Non-empty child predicate list.
+        predicates: Vec<Self>,
+    },
+    /// Negate one bounded child predicate.
+    Not {
+        /// Predicate contract version.
+        version: u32,
+        /// Child predicate.
+        predicate: Box<Self>,
+    },
+    /// Compare two finite JSON numbers selected from the same structured input.
+    NumericCompare {
+        /// Predicate contract version.
+        version: u32,
+        /// Left dotted object field path.
+        left_path: String,
+        /// Right dotted object field path.
+        right_path: String,
+        /// Ordering relation that must hold.
+        comparison: PredicateNumericComparison,
     },
 }
 
@@ -4956,42 +5457,176 @@ impl PredicateExpression {
         self.evaluate_value(&value)
     }
 
+    /// Return this expression's declared contract version.
+    #[must_use]
+    pub const fn version(&self) -> u32 {
+        match self {
+            Self::Equals { version, .. }
+            | Self::FieldsEqual { version, .. }
+            | Self::All { version, .. }
+            | Self::Any { version, .. }
+            | Self::Not { version, .. }
+            | Self::NumericCompare { version, .. } => *version,
+        }
+    }
+
     /// Evaluate this predicate against an already serialized workflow value.
     ///
     /// # Errors
     ///
-    /// Returns an error when a referenced field is missing or its JSON value category is
-    /// incompatible with the expected value.
+    /// Returns an error for an unsupported version, an invalid bounded expression, a missing field,
+    /// incompatible JSON value categories, or non-finite/inexact numeric comparison.
     pub fn evaluate_value(&self, value: &serde_json::Value) -> Result<bool, WorkflowError> {
+        validate_predicate_expression(self)?;
+        self.evaluate_validated(value)
+    }
+
+    fn evaluate_validated(&self, value: &serde_json::Value) -> Result<bool, WorkflowError> {
         match self {
             Self::Equals {
                 version: _,
                 path,
                 value: expected,
             } => {
-                let actual = path
-                    .split('.')
-                    .filter(|part| !part.is_empty())
-                    .try_fold(value, |current, part| current.get(part))
-                    .ok_or_else(|| WorkflowError::Build {
-                        path: path.clone(),
-                        message: "predicate field was not present in the structured value"
-                            .to_string(),
-                    })?;
+                let actual = predicate_value_at_path(value, path)?;
                 if !predicate_values_compatible(actual, expected) {
-                    return Err(WorkflowError::Build {
-                        path: path.clone(),
-                        message: format!(
-                            "predicate value type {} is incompatible with expected type {}",
-                            predicate_value_kind(actual),
-                            predicate_value_kind(expected)
-                        ),
-                    });
+                    return Err(predicate_type_mismatch(path, actual, expected));
                 }
                 Ok(actual == expected)
             }
+            Self::FieldsEqual {
+                version: _,
+                left_path,
+                right_path,
+            } => {
+                let left = predicate_value_at_path(value, left_path)?;
+                let right = predicate_value_at_path(value, right_path)?;
+                if !predicate_values_compatible(left, right) {
+                    return Err(predicate_type_mismatch(left_path, left, right));
+                }
+                Ok(left == right)
+            }
+            Self::All {
+                version: _,
+                predicates,
+            } => {
+                for predicate in predicates {
+                    if !predicate.evaluate_validated(value)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            Self::Any {
+                version: _,
+                predicates,
+            } => {
+                for predicate in predicates {
+                    if predicate.evaluate_validated(value)? {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            }
+            Self::Not {
+                version: _,
+                predicate,
+            } => Ok(!predicate.evaluate_validated(value)?),
+            Self::NumericCompare {
+                version: _,
+                left_path,
+                right_path,
+                comparison,
+            } => {
+                let left_value = predicate_value_at_path(value, left_path)?;
+                let right_value = predicate_value_at_path(value, right_path)?;
+                let serde_json::Value::Number(left) = left_value else {
+                    return Err(WorkflowError::Build {
+                        path: left_path.clone(),
+                        message: format!(
+                            "numeric predicate expected number, found {}",
+                            predicate_value_kind(left_value)
+                        ),
+                    });
+                };
+                let serde_json::Value::Number(right) = right_value else {
+                    return Err(WorkflowError::Build {
+                        path: right_path.clone(),
+                        message: format!(
+                            "numeric predicate expected number, found {}",
+                            predicate_value_kind(right_value)
+                        ),
+                    });
+                };
+                let ordering =
+                    compare_json_numbers(left, right).ok_or_else(|| WorkflowError::Build {
+                        path: format!("{left_path},{right_path}"),
+                        message: "numeric predicate values cannot be compared exactly".to_string(),
+                    })?;
+                Ok(match comparison {
+                    PredicateNumericComparison::LessThan => ordering.is_lt(),
+                    PredicateNumericComparison::LessThanOrEqual => !ordering.is_gt(),
+                    PredicateNumericComparison::GreaterThan => ordering.is_gt(),
+                    PredicateNumericComparison::GreaterThanOrEqual => !ordering.is_lt(),
+                })
+            }
         }
     }
+}
+
+fn predicate_value_at_path<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> Result<&'a serde_json::Value, WorkflowError> {
+    path.split('.')
+        .filter(|part| !part.is_empty())
+        .try_fold(value, |current, part| current.get(part))
+        .ok_or_else(|| WorkflowError::Build {
+            path: path.to_string(),
+            message: "predicate field was not present in the structured value".to_string(),
+        })
+}
+
+fn predicate_type_mismatch(
+    path: &str,
+    actual: &serde_json::Value,
+    expected: &serde_json::Value,
+) -> WorkflowError {
+    WorkflowError::Build {
+        path: path.to_string(),
+        message: format!(
+            "predicate value type {} is incompatible with expected type {}",
+            predicate_value_kind(actual),
+            predicate_value_kind(expected)
+        ),
+    }
+}
+
+fn compare_json_numbers(
+    left: &serde_json::Number,
+    right: &serde_json::Number,
+) -> Option<std::cmp::Ordering> {
+    match (left.as_i64(), right.as_i64()) {
+        (Some(left), Some(right)) => return Some(left.cmp(&right)),
+        (Some(left), None) if left >= 0 => {
+            return right.as_u64().map(|right| left.cast_unsigned().cmp(&right));
+        }
+        (None, Some(right)) if right >= 0 => {
+            return left.as_u64().map(|left| left.cmp(&right.cast_unsigned()));
+        }
+        _ => {}
+    }
+    match (left.as_u64(), right.as_u64()) {
+        (Some(left), Some(right)) => return Some(left.cmp(&right)),
+        (Some(_), None) if right.as_i64().is_some_and(|right| right < 0) => {
+            return Some(std::cmp::Ordering::Greater);
+        }
+        (None, Some(_)) if left.as_i64().is_some_and(|left| left < 0) => {
+            return Some(std::cmp::Ordering::Less);
+        }
+        _ => {}
+    }
+    left.as_f64()?.partial_cmp(&right.as_f64()?)
 }
 
 fn predicate_values_compatible(actual: &serde_json::Value, expected: &serde_json::Value) -> bool {
@@ -5857,6 +6492,7 @@ where
             id: name.clone(),
             name,
             kind,
+            dataflow: WorkflowNodeDataflowPolicy::Direct,
             input: ValueSchema::of::<I>(),
             output: ValueSchema::of::<O>(),
             resources: Vec::new(),
@@ -6053,6 +6689,7 @@ where
             id: repeat_id.clone(),
             name,
             kind: NodeKind::Repeat,
+            dataflow: WorkflowNodeDataflowPolicy::Direct,
             input: ValueSchema::of::<O>(),
             output: ValueSchema::of::<O>(),
             resources: Vec::new(),
@@ -6250,6 +6887,7 @@ where
             id: branch_id,
             name,
             kind: NodeKind::Branch,
+            dataflow: WorkflowNodeDataflowPolicy::Direct,
             input: ValueSchema::of::<O>(),
             output: ValueSchema::of::<O>(),
             resources: Vec::new(),
@@ -6346,6 +6984,7 @@ where
             id: retry_id.clone(),
             name,
             kind: NodeKind::Retry,
+            dataflow: WorkflowNodeDataflowPolicy::Direct,
             input: ValueSchema::of::<I>(),
             output: ValueSchema::of::<O>(),
             resources: Vec::new(),
@@ -6486,6 +7125,7 @@ where
         id: fan_out_id.clone(),
         name,
         kind: NodeKind::FanOut,
+        dataflow: WorkflowNodeDataflowPolicy::Direct,
         input: ValueSchema::of::<Vec<I>>(),
         output: ValueSchema::of::<Vec<O>>(),
         resources: Vec::new(),
@@ -6646,6 +7286,7 @@ where
         id: join_id.clone(),
         name: "parallel join".to_string(),
         kind: NodeKind::Parallel,
+        dataflow: WorkflowNodeDataflowPolicy::Direct,
         input: ValueSchema::of::<(A, B)>(),
         output: ValueSchema::of::<(A, B)>(),
         resources: Vec::new(),
@@ -7275,7 +7916,25 @@ fn validate_compiled_definition(definition: &WorkflowDefinition) -> Result<(), W
                 message: "step name must not be empty".to_string(),
             });
         }
+        if node.kind == NodeKind::WorkflowCall && !node.resources.is_empty() {
+            return Err(WorkflowError::Build {
+                path: node.id.clone(),
+                message:
+                    "workflow call nodes must not retain resource leases while awaiting children"
+                        .to_string(),
+            });
+        }
         validate_control_node(node)?;
+        if node.kind == NodeKind::WorkflowCall {
+            let call: WorkflowCallConfiguration =
+                serde_json::from_value(node.configuration.clone()).map_err(|error| {
+                    WorkflowError::Build {
+                        path: node.id.clone(),
+                        message: format!("workflow call configuration is invalid: {error}"),
+                    }
+                })?;
+            call.validate()?;
+        }
     }
     for id in definition.entries.iter().chain(&definition.exits) {
         if !definition.nodes.contains_key(id) {
@@ -7457,37 +8116,128 @@ fn validate_production_agent_node(
 }
 
 fn validate_predicate_expression(expression: &PredicateExpression) -> Result<(), WorkflowError> {
+    let mut operations = 0;
+    validate_predicate_expression_inner(expression, 1, &mut operations)
+}
+
+fn validate_predicate_expression_inner(
+    expression: &PredicateExpression,
+    depth: usize,
+    operations: &mut usize,
+) -> Result<(), WorkflowError> {
+    *operations = operations.saturating_add(1);
+    if depth > MAX_PREDICATE_DEPTH {
+        return Err(WorkflowError::Build {
+            path: "predicate".to_string(),
+            message: format!("predicate depth exceeds {MAX_PREDICATE_DEPTH}"),
+        });
+    }
+    if *operations > MAX_PREDICATE_OPERATIONS {
+        return Err(WorkflowError::Build {
+            path: "predicate".to_string(),
+            message: format!("predicate operations exceed {MAX_PREDICATE_OPERATIONS}"),
+        });
+    }
+
+    let version = expression.version();
+    if !(WORKFLOW_PREDICATE_MIN_VERSION..=WORKFLOW_PREDICATE_VERSION).contains(&version) {
+        return Err(WorkflowError::Build {
+            path: "predicate".to_string(),
+            message: format!(
+                "unsupported workflow predicate version {version}; expected {WORKFLOW_PREDICATE_MIN_VERSION} through {WORKFLOW_PREDICATE_VERSION}"
+            ),
+        });
+    }
+
     match expression {
-        PredicateExpression::Equals {
-            version,
-            path,
-            value,
-        } => {
-            if *version != WORKFLOW_PREDICATE_VERSION {
-                return Err(WorkflowError::Build {
-                    path: path.clone(),
-                    message: format!(
-                        "unsupported workflow predicate version {version}; expected {WORKFLOW_PREDICATE_VERSION}"
-                    ),
-                });
-            }
-            if path.len() > 512 || path.split('.').any(|part| part.len() > 256) {
-                return Err(WorkflowError::Build {
-                    path: path.clone(),
-                    message: "predicate path exceeds durable bounds".to_string(),
-                });
-            }
+        PredicateExpression::Equals { path, value, .. } => {
+            validate_predicate_path(path)?;
             let encoded = serde_json::to_vec(value).map_err(|error| WorkflowError::Build {
                 path: path.clone(),
                 message: format!("predicate value cannot be serialized: {error}"),
             })?;
-            if encoded.len() > 65_536 {
+            if encoded.len() > MAX_PREDICATE_VALUE_BYTES {
                 return Err(WorkflowError::Build {
                     path: path.clone(),
-                    message: "predicate value exceeds 65536 bytes".to_string(),
+                    message: format!("predicate value exceeds {MAX_PREDICATE_VALUE_BYTES} bytes"),
                 });
             }
         }
+        PredicateExpression::FieldsEqual {
+            left_path,
+            right_path,
+            ..
+        }
+        | PredicateExpression::NumericCompare {
+            left_path,
+            right_path,
+            ..
+        } => {
+            if version < 2 {
+                return Err(predicate_operation_requires_version_two(expression));
+            }
+            validate_predicate_path(left_path)?;
+            validate_predicate_path(right_path)?;
+        }
+        PredicateExpression::All { predicates, .. }
+        | PredicateExpression::Any { predicates, .. } => {
+            if version < 2 {
+                return Err(predicate_operation_requires_version_two(expression));
+            }
+            if predicates.is_empty() || predicates.len() > MAX_PREDICATE_OPERATIONS {
+                return Err(WorkflowError::Build {
+                    path: "predicate".to_string(),
+                    message: format!(
+                        "predicate child count must be between 1 and {MAX_PREDICATE_OPERATIONS}"
+                    ),
+                });
+            }
+            for predicate in predicates {
+                if predicate.version() != version {
+                    return Err(WorkflowError::Build {
+                        path: "predicate".to_string(),
+                        message: "nested predicate versions must match their parent".to_string(),
+                    });
+                }
+                validate_predicate_expression_inner(predicate, depth + 1, operations)?;
+            }
+        }
+        PredicateExpression::Not { predicate, .. } => {
+            if version < 2 {
+                return Err(predicate_operation_requires_version_two(expression));
+            }
+            if predicate.version() != version {
+                return Err(WorkflowError::Build {
+                    path: "predicate".to_string(),
+                    message: "nested predicate versions must match their parent".to_string(),
+                });
+            }
+            validate_predicate_expression_inner(predicate, depth + 1, operations)?;
+        }
+    }
+    Ok(())
+}
+
+fn predicate_operation_requires_version_two(expression: &PredicateExpression) -> WorkflowError {
+    WorkflowError::Build {
+        path: "predicate".to_string(),
+        message: format!(
+            "predicate operation requires version 2, found {}",
+            expression.version()
+        ),
+    }
+}
+
+fn validate_predicate_path(path: &str) -> Result<(), WorkflowError> {
+    if path.len() > MAX_PREDICATE_PATH_BYTES
+        || path
+            .split('.')
+            .any(|part| part.len() > MAX_PREDICATE_PATH_SEGMENT_BYTES)
+    {
+        return Err(WorkflowError::Build {
+            path: path.to_string(),
+            message: "predicate path exceeds durable bounds".to_string(),
+        });
     }
     Ok(())
 }
@@ -7556,22 +8306,50 @@ pub fn validate_parallel_join_configuration(
     Ok(())
 }
 
-fn validate_control_node(node: &NodeDefinition) -> Result<(), WorkflowError> {
-    if matches!(node.kind, NodeKind::Branch | NodeKind::Repeat)
+fn validate_repeat_outcome_configuration(node: &NodeDefinition) -> Result<(), WorkflowError> {
+    let policy = node
+        .configuration
+        .get("exhaustion_policy")
+        .cloned()
+        .map_or(Ok(WorkflowRepeatExhaustionPolicy::Fail), |value| {
+            serde_json::from_value(value).map_err(|error| WorkflowError::Build {
+                path: node.id.clone(),
+                message: format!("repeat exhaustion_policy is invalid: {error}"),
+            })
+        })?;
+    if policy == WorkflowRepeatExhaustionPolicy::EmitOutcome
         && node
             .configuration
-            .get("predicate_version")
+            .get("repeat_outcome_version")
             .and_then(serde_json::Value::as_u64)
-            != Some(u64::from(WORKFLOW_PREDICATE_VERSION))
+            != Some(u64::from(WORKFLOW_REPEAT_OUTCOME_VERSION))
     {
         return Err(WorkflowError::Build {
             path: node.id.clone(),
             message: format!(
-                "control node must declare predicate_version {WORKFLOW_PREDICATE_VERSION}"
+                "emit_outcome repeat must declare repeat_outcome_version {WORKFLOW_REPEAT_OUTCOME_VERSION}"
             ),
         });
     }
+    Ok(())
+}
+
+fn validate_control_node(node: &NodeDefinition) -> Result<(), WorkflowError> {
     if matches!(node.kind, NodeKind::Branch | NodeKind::Repeat) {
+        let declared_version = node
+            .configuration
+            .get("predicate_version")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| {
+                (WORKFLOW_PREDICATE_MIN_VERSION..=WORKFLOW_PREDICATE_VERSION).contains(value)
+            })
+            .ok_or_else(|| WorkflowError::Build {
+                path: node.id.clone(),
+                message: format!(
+                    "control node must declare predicate_version between {WORKFLOW_PREDICATE_MIN_VERSION} and {WORKFLOW_PREDICATE_VERSION}"
+                ),
+            })?;
         let predicate = node
             .configuration
             .get("predicate")
@@ -7585,7 +8363,17 @@ fn validate_control_node(node: &NodeDefinition) -> Result<(), WorkflowError> {
                 path: node.id.clone(),
                 message: format!("control node predicate is invalid: {error}"),
             })?;
+        if predicate.version() != declared_version {
+            return Err(WorkflowError::Build {
+                path: node.id.clone(),
+                message: "control node predicate_version must match the predicate expression"
+                    .to_string(),
+            });
+        }
         validate_predicate_expression(&predicate)?;
+        if matches!(node.kind, NodeKind::Repeat) {
+            validate_repeat_outcome_configuration(node)?;
+        }
     }
     if node.kind == NodeKind::FanOut
         && (node
@@ -7727,6 +8515,7 @@ mod tests {
                         id: "agent".to_string(),
                         name: "Agent".to_string(),
                         kind: NodeKind::Agent,
+                        dataflow: WorkflowNodeDataflowPolicy::Direct,
                         input: value_schema.clone(),
                         output: value_schema.clone(),
                         resources: vec![ResourceClaim::read("repository")],
@@ -7850,6 +8639,7 @@ mod tests {
                 id: "commit".to_string(),
                 name: "Commit".to_string(),
                 kind: NodeKind::PluginBlock,
+                dataflow: WorkflowNodeDataflowPolicy::Direct,
                 input: block.input.clone(),
                 output: block.output.clone(),
                 resources: block.resources.clone(),
@@ -7941,6 +8731,7 @@ mod tests {
             id: "branch".to_string(),
             name: "Branch".to_string(),
             kind: NodeKind::Branch,
+            dataflow: WorkflowNodeDataflowPolicy::Direct,
             input: schema.clone(),
             output: schema.clone(),
             resources: Vec::new(),
@@ -7957,6 +8748,7 @@ mod tests {
             id: "repeat".to_string(),
             name: "Repeat".to_string(),
             kind: NodeKind::Repeat,
+            dataflow: WorkflowNodeDataflowPolicy::Direct,
             input: schema.clone(),
             output: schema.clone(),
             resources: Vec::new(),
@@ -7980,6 +8772,7 @@ mod tests {
                     id: "read".to_string(),
                     name: "Read".to_string(),
                     kind: NodeKind::PluginBlock,
+                    dataflow: WorkflowNodeDataflowPolicy::Direct,
                     input: schema.clone(),
                     output: schema.clone(),
                     resources: read.resources.clone(),
@@ -7993,6 +8786,7 @@ mod tests {
                     id: "mutate".to_string(),
                     name: "Mutate".to_string(),
                     kind: NodeKind::PluginBlock,
+                    dataflow: WorkflowNodeDataflowPolicy::Direct,
                     input: schema.clone(),
                     output: schema,
                     resources: mutate.resources.clone(),
@@ -8864,6 +9658,10 @@ mod tests {
             );
         }
         assert_eq!(
+            capabilities.node_support(NodeKind::WorkflowCall),
+            WorkflowCapabilitySupport::Supported
+        );
+        assert_eq!(
             capabilities.edge_support(WorkflowEdgeKind::Retry),
             WorkflowCapabilitySupport::Unsupported
         );
@@ -8887,6 +9685,44 @@ mod tests {
             capabilities.artifact_references,
             WorkflowCapabilitySupport::Supported
         );
+    }
+
+    #[test]
+    fn workflow_call_targets_are_exact_versioned_and_fail_closed() {
+        let identity = WorkflowDefinitionIdentity {
+            kind: "child".to_string(),
+            definition_id: "child:sha256".to_string(),
+            definition_version: 1,
+        };
+        let configuration = WorkflowCallConfiguration {
+            version: WORKFLOW_CALL_VERSION,
+            target: WorkflowCallTarget::AuthoredRevision {
+                workflow_id: "child".to_string(),
+                revision: 3,
+                definition_identity: identity,
+                preset: Some(WorkflowCallPreset {
+                    preset_id: "strict".to_string(),
+                    generation: 2,
+                }),
+            },
+        };
+        configuration.validate().expect("exact target");
+        let encoded = serde_json::to_value(&configuration).expect("serialize");
+        assert_eq!(encoded["target"]["kind"], "authored_revision");
+        assert_eq!(encoded["target"]["revision"], 3);
+        assert_eq!(encoded["target"]["preset"]["generation"], 2);
+
+        let mut future = encoded.clone();
+        future["version"] = serde_json::json!(WORKFLOW_CALL_VERSION + 1);
+        let future: WorkflowCallConfiguration = serde_json::from_value(future).expect("decode");
+        assert!(future.validate().is_err());
+
+        let mut mutable_lookup = encoded;
+        mutable_lookup["target"]
+            .as_object_mut()
+            .expect("target")
+            .remove("revision");
+        assert!(serde_json::from_value::<WorkflowCallConfiguration>(mutable_lookup).is_err());
     }
 
     #[test]
@@ -8927,6 +9763,7 @@ mod tests {
                         id: "node".to_string(),
                         name: "node".to_string(),
                         kind,
+                        dataflow: WorkflowNodeDataflowPolicy::Direct,
                         input: schema.clone(),
                         output: schema.clone(),
                         resources: Vec::new(),
@@ -9039,6 +9876,7 @@ mod tests {
             id: id.to_string(),
             name: id.to_string(),
             kind: NodeKind::Input,
+            dataflow: WorkflowNodeDataflowPolicy::Direct,
             input: schema.clone(),
             output: schema.clone(),
             resources: Vec::new(),
@@ -9414,6 +10252,7 @@ mod tests {
                         id: "source".to_string(),
                         name: "source".to_string(),
                         kind: NodeKind::Input,
+                        dataflow: WorkflowNodeDataflowPolicy::Direct,
                         input: number.clone(),
                         output: number,
                         resources: Vec::new(),
@@ -9426,6 +10265,7 @@ mod tests {
                         id: "target".to_string(),
                         name: "target".to_string(),
                         kind: NodeKind::Input,
+                        dataflow: WorkflowNodeDataflowPolicy::Direct,
                         input: text.clone(),
                         output: text,
                         resources: Vec::new(),
@@ -9481,6 +10321,7 @@ mod tests {
             id: "node".to_string(),
             name: "node".to_string(),
             kind: NodeKind::Input,
+            dataflow: WorkflowNodeDataflowPolicy::Direct,
             input: schema.clone(),
             output: schema.clone(),
             resources: Vec::new(),
@@ -9514,6 +10355,7 @@ mod tests {
                         id: "agent".to_string(),
                         name: "agent".to_string(),
                         kind: NodeKind::Agent,
+                        dataflow: WorkflowNodeDataflowPolicy::Direct,
                         input: schema.clone(),
                         output: schema.clone(),
                         resources: Vec::new(),
@@ -9529,6 +10371,7 @@ mod tests {
                         id: "parallel".to_string(),
                         name: "parallel".to_string(),
                         kind: NodeKind::Parallel,
+                        dataflow: WorkflowNodeDataflowPolicy::Direct,
                         input: schema,
                         output: ValueSchema::of::<(u32, u32)>(),
                         resources: Vec::new(),
@@ -10077,7 +10920,161 @@ mod tests {
     }
 
     #[test]
-    fn durable_predicates_require_the_current_version_and_bounds() {
+    fn state_envelope_dataflow_validates_and_isolates_owner_input() {
+        let owner_input = ValueSchema {
+            type_name: "owner.input/v1".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "required": ["command"],
+                "properties": {"command": {"type": "string"}},
+                "additionalProperties": false
+            }),
+        };
+        let owner_output = ValueSchema {
+            type_name: "owner.output/v1".to_string(),
+            schema: serde_json::json!({"type": "boolean"}),
+        };
+        let envelope_schema = ValueSchema {
+            type_name: "state-envelope/v1".to_string(),
+            schema: serde_json::json!({
+                "type": "object",
+                "required": ["schema_version", "state", "value"],
+                "properties": {
+                    "schema_version": {"const": WORKFLOW_STATE_ENVELOPE_VERSION},
+                    "state": {"type": "object"},
+                    "value": {},
+                    "artifacts": {"type": "array"}
+                },
+                "additionalProperties": false
+            }),
+        };
+        let input = serde_json::json!({
+            "schema_version": WORKFLOW_STATE_ENVELOPE_VERSION,
+            "state": {"secret_looking_but_not_authority": "retained"},
+            "value": {"command": "check"},
+            "artifacts": []
+        });
+        let prepared = prepare_workflow_node_dataflow(
+            WorkflowNodeDataflowPolicy::StateEnvelopeV1,
+            &envelope_schema,
+            &owner_input,
+            &input,
+        )
+        .expect("prepared");
+        assert_eq!(
+            prepared.owner_input(),
+            &serde_json::json!({"command": "check"})
+        );
+        let completed = complete_workflow_node_dataflow(
+            prepared,
+            &owner_output,
+            &envelope_schema,
+            serde_json::json!(true),
+        )
+        .expect("completed");
+        assert_eq!(completed["state"], input["state"]);
+        assert_eq!(completed["value"], serde_json::json!(true));
+
+        let future = serde_json::json!({
+            "schema_version": WORKFLOW_STATE_ENVELOPE_VERSION + 1,
+            "state": {},
+            "value": {"command": "check"},
+            "artifacts": []
+        });
+        assert!(
+            prepare_workflow_node_dataflow(
+                WorkflowNodeDataflowPolicy::StateEnvelopeV1,
+                &envelope_schema,
+                &owner_input,
+                &future,
+            )
+            .is_err()
+        );
+
+        let oversized = serde_json::json!({
+            "schema_version": WORKFLOW_STATE_ENVELOPE_VERSION,
+            "state": {"value": "x".repeat(MAX_WORKFLOW_STATE_ENVELOPE_STATE_BYTES)},
+            "value": {"command": "check"},
+            "artifacts": []
+        });
+        let permissive_envelope = ValueSchema {
+            type_name: "state-envelope/permissive".to_string(),
+            schema: serde_json::json!({"type": "object"}),
+        };
+        assert!(
+            prepare_workflow_node_dataflow(
+                WorkflowNodeDataflowPolicy::StateEnvelopeV1,
+                &permissive_envelope,
+                &owner_input,
+                &oversized,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn durable_predicates_support_bounded_versioned_composition() {
+        let input = serde_json::json!({
+            "current": 4,
+            "limit": 5,
+            "status": "ready",
+            "expected_status": "ready"
+        });
+        let predicate = PredicateExpression::All {
+            version: WORKFLOW_PREDICATE_VERSION,
+            predicates: vec![
+                PredicateExpression::NumericCompare {
+                    version: WORKFLOW_PREDICATE_VERSION,
+                    left_path: "current".to_string(),
+                    right_path: "limit".to_string(),
+                    comparison: PredicateNumericComparison::LessThan,
+                },
+                PredicateExpression::FieldsEqual {
+                    version: WORKFLOW_PREDICATE_VERSION,
+                    left_path: "status".to_string(),
+                    right_path: "expected_status".to_string(),
+                },
+                PredicateExpression::Not {
+                    version: WORKFLOW_PREDICATE_VERSION,
+                    predicate: Box::new(PredicateExpression::Equals {
+                        version: WORKFLOW_PREDICATE_VERSION,
+                        path: "status".to_string(),
+                        value: serde_json::json!("failed"),
+                    }),
+                },
+            ],
+        };
+        assert!(predicate.evaluate_value(&input).expect("predicate"));
+
+        let version_one = PredicateExpression::Equals {
+            version: WORKFLOW_PREDICATE_MIN_VERSION,
+            path: "status".to_string(),
+            value: serde_json::json!("ready"),
+        };
+        assert!(version_one.evaluate_value(&input).expect("version one"));
+
+        let mixed_versions = PredicateExpression::All {
+            version: WORKFLOW_PREDICATE_VERSION,
+            predicates: vec![version_one],
+        };
+        assert!(mixed_versions.evaluate_value(&input).is_err());
+
+        let mut too_deep = PredicateExpression::Equals {
+            version: WORKFLOW_PREDICATE_VERSION,
+            path: "status".to_string(),
+            value: serde_json::json!("ready"),
+        };
+        for _ in 0..MAX_PREDICATE_DEPTH {
+            too_deep = PredicateExpression::Not {
+                version: WORKFLOW_PREDICATE_VERSION,
+                predicate: Box::new(too_deep),
+            };
+        }
+        assert!(too_deep.evaluate_value(&input).is_err());
+    }
+
+    #[test]
+    fn durable_predicates_require_a_supported_version_and_bounds() {
         let workflow = WorkflowBuilder::new(
             "branch",
             Step::map("source", |value: u32| Ok(value)).branch(
@@ -10108,6 +11105,29 @@ mod tests {
                         if *version == WORKFLOW_PREDICATE_VERSION
                 ))
         );
+
+        let mut compatible = definition.clone();
+        compatible
+            .nodes
+            .get_mut("choose")
+            .expect("choose")
+            .configuration["predicate_version"] = serde_json::json!(WORKFLOW_PREDICATE_MIN_VERSION);
+        compatible
+            .nodes
+            .get_mut("choose")
+            .expect("choose")
+            .configuration["predicate"]["version"] =
+            serde_json::json!(WORKFLOW_PREDICATE_MIN_VERSION);
+        for edge in &mut compatible.edges {
+            if let EdgeKind::Conditional { predicate, .. } = &mut edge.kind {
+                *predicate = PredicateExpression::Equals {
+                    version: WORKFLOW_PREDICATE_MIN_VERSION,
+                    path: String::new(),
+                    value: serde_json::json!(1),
+                };
+            }
+        }
+        compatible.validate().expect("version one remains valid");
 
         let mut unsupported = definition.clone();
         unsupported

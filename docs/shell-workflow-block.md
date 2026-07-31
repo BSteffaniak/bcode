@@ -6,6 +6,13 @@ Version 1 plans use **argv mode only**. Each command is an ordered non-empty arr
 is the executable and remaining items are exact arguments. The owner never implicitly reparses an
 argv command as a shell string.
 
+A later version adds bounded unique `accepted_exit_codes` to each command, defaulting to `[0]`, plus
+`continue_on_unaccepted_exit`. Existing version-1 plans retain their current zero-exit behavior.
+Unaccepted ordinary exits remain typed result data distinct from spawn failure, timeout, signal
+termination, and cancellation. Results expose both actual and accepted codes so deterministic
+workflow predicates can route without parsing presentation text. The complete contract is specified
+in [`composable-coding-workflows.md`](composable-coding-workflows.md).
+
 The manifest schema bounds the workspace-relative cwd, command and argument counts, per-command
 timeouts, environment entries, and retained output previews. The result preserves command order by
 index and reports ordinary nonzero exits as typed result data rather than transport failures.

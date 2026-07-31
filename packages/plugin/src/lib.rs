@@ -7409,6 +7409,7 @@ library = "libexample_plugin.dylib"
                     id: "transform".to_string(),
                     name: "Transform".to_string(),
                     kind: bcode_workflow::NodeKind::Input,
+                    dataflow: bcode_workflow::WorkflowNodeDataflowPolicy::Direct,
                     input: schema.clone(),
                     output: schema,
                     resources: Vec::new(),
