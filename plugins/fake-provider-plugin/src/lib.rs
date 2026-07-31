@@ -554,8 +554,22 @@ fn dispatch_fake_turn(dispatch: FakeTurnDispatch<'_>) {
         emit_malformed_tool_call,
         has_tool_result,
     ) {
+    } else if let Some(text) = last_user_text(&request.messages).strip_prefix("stream-reasoning ") {
+        dispatch_fake_reasoning_turn(
+            turn,
+            text.to_owned(),
+            fake_tool_delta_delay(request),
+            request_input_tokens,
+        );
+    } else if let Some(text) = last_user_text(&request.messages).strip_prefix("stream-text ") {
+        dispatch_fake_streaming_text(
+            turn,
+            text.to_owned(),
+            fake_tool_delta_delay(request),
+            request_input_tokens,
+        );
     } else if let Some(tool_call) = tool_call {
-        finish_fake_tool_turn(&turn, tool_call);
+        dispatch_fake_tool_turn(turn, tool_call, fake_tool_delta_delay(request));
     } else {
         finish_fake_text_response(
             turn,
@@ -1264,23 +1278,155 @@ fn finish_fake_tool_call(turn: &FakeTurn, call: ToolCall) {
     turn.push(ProviderTurnEvent::ToolCallFinished { call });
 }
 
-fn finish_fake_tool_turn(turn: &FakeTurn, call: ToolCall) {
+fn fake_tool_arguments_json(call: &ToolCall) -> String {
+    let Some(arguments) = call.arguments.as_object() else {
+        return serde_json::to_string(&call.arguments).unwrap_or_default();
+    };
+    let ordered_keys: &[&str] = match call.name.as_str() {
+        "filesystem.write" => &["path", "contents"],
+        "filesystem.edit" => &["path", "old_text", "new_text"],
+        _ => return serde_json::to_string(&call.arguments).unwrap_or_default(),
+    };
+    let mut ordered = serde_json::Map::new();
+    for key in ordered_keys {
+        if let Some(value) = arguments.get(*key) {
+            ordered.insert((*key).to_owned(), value.clone());
+        }
+    }
+    for (key, value) in arguments {
+        if !ordered.contains_key(key) {
+            ordered.insert(key.clone(), value.clone());
+        }
+    }
+    serde_json::to_string(&ordered).unwrap_or_default()
+}
+
+fn fake_tool_argument_split_index(call: &ToolCall, arguments: &str) -> usize {
+    let marker = match call.name.as_str() {
+        "filesystem.write" => "PTYFILESYSTEMFIRST",
+        "filesystem.edit" => "PTYFILESYSTEMSECOND",
+        _ => "",
+    };
+    if !marker.is_empty()
+        && let Some(index) = arguments.find(marker)
+    {
+        return index + marker.len();
+    }
+    let split_target = arguments.len().saturating_mul(3) / 4;
+    arguments
+        .char_indices()
+        .map(|(index, _)| index)
+        .find(|index| *index >= split_target)
+        .unwrap_or(arguments.len())
+}
+
+fn dispatch_fake_reasoning_turn(
+    turn: FakeTurn,
+    text: String,
+    delta_delay: Option<Duration>,
+    request_input_tokens: u64,
+) {
+    let delay = delta_delay.unwrap_or_default();
+    std::thread::spawn(move || {
+        let activity_id = "fake-streaming-reasoning".to_owned();
+        turn.push(ProviderTurnEvent::ReasoningActivity {
+            event: bcode_session_models::ReasoningActivityEvent::Started {
+                activity_id: activity_id.clone(),
+                order: 0,
+            },
+        });
+        let midpoint = text
+            .char_indices()
+            .map(|(index, _)| index)
+            .find(|index| *index >= text.len() / 2)
+            .unwrap_or(text.len());
+        for delta in [&text[..midpoint], &text[midpoint..]] {
+            turn.push(ProviderTurnEvent::ReasoningActivity {
+                event: bcode_session_models::ReasoningActivityEvent::PartDelta {
+                    activity_id: activity_id.clone(),
+                    activity_order: 0,
+                    part_id: "summary".to_owned(),
+                    kind: bcode_session_models::ReasoningContentKind::Summary,
+                    role: bcode_session_models::ReasoningContentRole::Milestone,
+                    part_order: 0,
+                    text: delta.to_owned(),
+                },
+            });
+            std::thread::sleep(delay);
+            if turn.is_cancelled() {
+                return;
+            }
+        }
+        turn.push(ProviderTurnEvent::ReasoningActivity {
+            event: bcode_session_models::ReasoningActivityEvent::Finished {
+                activity_id,
+                activity_order: 0,
+                status: bcode_session_models::ReasoningActivityStatus::Completed,
+            },
+        });
+        finish_fake_turn(&turn, "REASONINGFINAL".to_owned(), request_input_tokens);
+    });
+}
+
+fn dispatch_fake_streaming_text(
+    turn: FakeTurn,
+    text: String,
+    delta_delay: Option<Duration>,
+    request_input_tokens: u64,
+) {
+    if let Some(delay) = delta_delay {
+        std::thread::spawn(move || {
+            let midpoint = text
+                .char_indices()
+                .map(|(index, _)| index)
+                .find(|index| *index >= text.len() / 2)
+                .unwrap_or(text.len());
+            std::thread::sleep(delay);
+            if turn.is_cancelled() {
+                return;
+            }
+            turn.push(ProviderTurnEvent::TextDelta {
+                text: text[..midpoint].to_owned(),
+            });
+            std::thread::sleep(delay);
+            if turn.is_cancelled() {
+                return;
+            }
+            finish_fake_turn(&turn, text[midpoint..].to_owned(), request_input_tokens);
+        });
+    } else {
+        finish_fake_turn(&turn, text, request_input_tokens);
+    }
+}
+
+fn dispatch_fake_tool_turn(turn: FakeTurn, call: ToolCall, delta_delay: Option<Duration>) {
+    if let Some(delay) = delta_delay {
+        std::thread::spawn(move || finish_fake_tool_turn(&turn, call, Some(delay)));
+    } else {
+        finish_fake_tool_turn(&turn, call, None);
+    }
+}
+
+fn finish_fake_tool_turn(turn: &FakeTurn, call: ToolCall, delta_delay: Option<Duration>) {
     turn.push(ProviderTurnEvent::ToolCallStarted {
         call_id: call.id.clone(),
         name: call.name.clone(),
     });
-    let arguments = serde_json::to_string(&call.arguments).unwrap_or_default();
-    let midpoint = arguments
-        .char_indices()
-        .map(|(index, _)| index)
-        .find(|index| *index >= arguments.len() / 2)
-        .unwrap_or(arguments.len());
-    for delta in [&arguments[..midpoint], &arguments[midpoint..]] {
+    let arguments = fake_tool_arguments_json(&call);
+    let midpoint = fake_tool_argument_split_index(&call, &arguments);
+    let deltas = [&arguments[..midpoint], &arguments[midpoint..]];
+    for delta in deltas {
         if !delta.is_empty() {
             turn.push(ProviderTurnEvent::ToolCallDelta {
                 call_id: call.id.clone(),
                 delta: delta.to_owned(),
             });
+            if let Some(delay) = delta_delay {
+                std::thread::sleep(delay);
+                if turn.is_cancelled() {
+                    return;
+                }
+            }
         }
     }
     turn.push(ProviderTurnEvent::ToolCallFinished { call });
@@ -1290,6 +1436,16 @@ fn finish_fake_tool_turn(turn: &FakeTurn, call: ToolCall) {
     turn.push(ProviderTurnEvent::TurnFinished {
         stop_reason: StopReason::ToolCall,
     });
+}
+
+fn fake_tool_delta_delay(request: &ModelTurnRequest) -> Option<Duration> {
+    request
+        .provider_context
+        .settings
+        .get("fake_tool_delta_delay_ms")
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map(Duration::from_millis)
 }
 
 fn fake_request_delay(request: &ModelTurnRequest) -> Option<Duration> {
@@ -1506,6 +1662,21 @@ fn fake_tool_call(user_text: &str, next_turn: u64) -> Option<ToolCall> {
             arguments: serde_json::json!({ "path": path, "contents": contents }),
         });
     }
+    if let Some(rest) = user_text.strip_prefix("tool-edit ") {
+        let mut parts = rest.splitn(3, ' ');
+        let path = parts.next().unwrap_or_default();
+        let old_text = parts.next().unwrap_or_default();
+        let new_text = parts.next().unwrap_or_default();
+        return Some(ToolCall {
+            id: format!("fake-tool-{next_turn}"),
+            name: "filesystem.edit".to_string(),
+            arguments: serde_json::json!({
+                "path": path,
+                "old_text": old_text,
+                "new_text": new_text,
+            }),
+        });
+    }
     if let Some(command) = user_text.strip_prefix("tool-shell ") {
         return Some(ToolCall {
             id: format!("fake-tool-{next_turn}"),
@@ -1532,15 +1703,19 @@ fn last_user_text(messages: &[ModelMessage]) -> String {
 }
 
 fn last_tool_result(messages: &[ModelMessage]) -> Option<String> {
-    messages.iter().rev().find_map(|message| {
-        if message.role != MessageRole::Tool {
-            return None;
-        }
-        message.content.iter().find_map(|block| match block {
-            ContentBlock::ToolResult { result } => Some(result.output.clone()),
-            _ => None,
+    messages
+        .iter()
+        .rev()
+        .take_while(|message| message.role != MessageRole::User)
+        .find_map(|message| {
+            if message.role != MessageRole::Tool {
+                return None;
+            }
+            message.content.iter().find_map(|block| match block {
+                ContentBlock::ToolResult { result } => Some(result.output.clone()),
+                _ => None,
+            })
         })
-    })
 }
 
 fn mark_fake_compaction_summary_started(request: &ModelTurnRequest) {
@@ -1661,7 +1836,7 @@ mod tests {
             name: "filesystem.write".to_owned(),
             arguments: serde_json::json!({"path": "src/lib.rs", "contents": "hello"}),
         };
-        finish_fake_tool_turn(&turn, call.clone());
+        finish_fake_tool_turn(&turn, call.clone(), None);
         let events = turn.drain();
         assert!(matches!(
             events.first(),
@@ -1674,11 +1849,162 @@ mod tests {
                 _ => None,
             })
             .collect::<String>();
-        assert_eq!(deltas, serde_json::to_string(&call.arguments).unwrap());
+        assert_eq!(deltas, fake_tool_arguments_json(&call));
         assert!(events.iter().any(|event| matches!(
             event,
             ProviderTurnEvent::ToolCallFinished { call: finished } if finished == &call
         )));
+    }
+
+    #[test]
+    fn fake_tool_turn_can_pause_between_argument_deltas() {
+        let turn = FakeTurn::default();
+        let call = ToolCall {
+            id: "call-delayed".to_owned(),
+            name: "filesystem.write".to_owned(),
+            arguments: serde_json::json!({"path": "src/lib.rs", "contents": "hello"}),
+        };
+        dispatch_fake_tool_turn(turn.clone(), call, Some(Duration::from_millis(100)));
+        let first = drain_script_until(&turn, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::ToolCallDelta { .. }))
+        });
+        assert_eq!(
+            first
+                .iter()
+                .filter(|event| matches!(event, ProviderTurnEvent::ToolCallDelta { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !first
+                .iter()
+                .any(|event| { matches!(event, ProviderTurnEvent::ToolCallFinished { .. }) })
+        );
+        let finished = drain_script_until(&turn, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::ToolCallFinished { .. }))
+        });
+        assert!(
+            finished
+                .iter()
+                .any(|event| { matches!(event, ProviderTurnEvent::ToolCallFinished { .. }) })
+        );
+    }
+
+    #[test]
+    fn fake_text_turn_can_pause_between_deltas() {
+        let turn = FakeTurn::default();
+        dispatch_fake_streaming_text(
+            turn.clone(),
+            "ASSISTANTPREFIXASSISTANTSUFFIX".to_owned(),
+            Some(Duration::from_millis(100)),
+            4,
+        );
+        let first = drain_script_until(&turn, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::TextDelta { .. }))
+        });
+        assert_eq!(
+            first
+                .iter()
+                .filter(|event| matches!(event, ProviderTurnEvent::TextDelta { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !first
+                .iter()
+                .any(|event| { matches!(event, ProviderTurnEvent::TurnFinished { .. }) })
+        );
+        let finished = drain_script_until(&turn, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::TurnFinished { .. }))
+        });
+        assert!(
+            finished
+                .iter()
+                .any(|event| { matches!(event, ProviderTurnEvent::TextDelta { .. }) })
+        );
+    }
+
+    #[test]
+    fn fake_reasoning_turn_can_pause_between_ordered_updates() {
+        let turn = FakeTurn::default();
+        dispatch_fake_reasoning_turn(
+            turn.clone(),
+            "REASONINGFIRSTREASONINGSECOND".to_owned(),
+            Some(Duration::from_millis(100)),
+            4,
+        );
+        let first = drain_script_until(&turn, |events| {
+            events.iter().any(|event| {
+                matches!(
+                    event,
+                    ProviderTurnEvent::ReasoningActivity {
+                        event: bcode_session_models::ReasoningActivityEvent::PartDelta { .. }
+                    }
+                )
+            })
+        });
+        assert_eq!(
+            first
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ProviderTurnEvent::ReasoningActivity {
+                        event: bcode_session_models::ReasoningActivityEvent::PartDelta { .. }
+                    }
+                ))
+                .count(),
+            1
+        );
+        assert!(
+            !first
+                .iter()
+                .any(|event| { matches!(event, ProviderTurnEvent::TurnFinished { .. }) })
+        );
+        let finished = drain_script_until(&turn, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event, ProviderTurnEvent::TurnFinished { .. }))
+        });
+        assert!(finished.iter().any(|event| {
+            matches!(
+                event,
+                ProviderTurnEvent::ReasoningActivity {
+                    event: bcode_session_models::ReasoningActivityEvent::Finished { .. }
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn tool_result_only_applies_after_the_current_user_message() {
+        let messages = vec![
+            ModelMessage {
+                role: MessageRole::Tool,
+                content: vec![ContentBlock::ToolResult {
+                    result: bcode_model::ToolResult {
+                        call_id: "old-call".to_owned(),
+                        output: "old result".to_owned(),
+                        is_error: false,
+                        content: Vec::new(),
+                    },
+                }],
+            },
+            ModelMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: "new request".to_owned(),
+                }],
+            },
+        ];
+        assert_eq!(last_tool_result(&messages), None);
     }
 
     #[test]

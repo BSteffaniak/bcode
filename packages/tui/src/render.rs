@@ -2716,25 +2716,7 @@ fn push_tool_request_rows(
         false,
         width,
     );
-    if !item.text().is_empty() && !tool_request_arguments_are_sensitive(context.tool_name) {
-        push_labeled_text_preview(
-            rows,
-            "arguments",
-            item.text(),
-            width,
-            MAX_INLINE_TOOL_TEXT_ROWS,
-        );
-    }
     rows.push(Line::default());
-}
-
-fn tool_request_arguments_are_sensitive(tool_name: &str) -> bool {
-    let normalized = tool_name.replace('_', ".").to_ascii_lowercase();
-    ["write", "edit"].iter().any(|operation| {
-        normalized
-            .strip_suffix(operation)
-            .is_some_and(|prefix| prefix.ends_with('.'))
-    })
 }
 
 fn canonical_plugin_visual_render_mode(
@@ -2988,7 +2970,7 @@ fn push_tool_invocation_fallback_rows(
         push_labeled_text_preview(
             rows,
             "arguments",
-            arguments,
+            &bounded_tool_arguments(arguments),
             width,
             MAX_INLINE_TOOL_TEXT_ROWS,
         );
@@ -3162,6 +3144,18 @@ fn push_tool_result_rows(
         );
     }
     rows.push(Line::default());
+}
+
+fn bounded_tool_arguments(arguments: &str) -> String {
+    const MAX_ARGUMENT_CHARS: usize = 512;
+    let mut bounded = arguments
+        .chars()
+        .take(MAX_ARGUMENT_CHARS)
+        .collect::<String>();
+    if arguments.chars().count() > MAX_ARGUMENT_CHARS {
+        bounded.push('…');
+    }
+    bounded
 }
 
 fn push_labeled_text_preview(

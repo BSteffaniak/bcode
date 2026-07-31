@@ -224,19 +224,75 @@ impl ArtifactStreamCoordinator {
         }
     }
 
+    pub(crate) fn observe_session_live_artifact(
+        &mut self,
+        session_id: SessionId,
+        event: &bcode_session_models::SessionLiveEventKind,
+        accepts_reference: impl Fn(&str, &str, u32, &str, Option<&str>) -> bool,
+    ) {
+        match event {
+            bcode_session_models::SessionLiveEventKind::ToolContributionPlaced { envelope } => {
+                self.observe_contribution(session_id, &envelope.contribution, accepts_reference);
+            }
+            bcode_session_models::SessionLiveEventKind::ToolPresentationUpdated { update } => {
+                self.observe_presentation_update(session_id, update, accepts_reference);
+            }
+            _ => {}
+        }
+    }
+
     pub(crate) fn observe_contribution(
         &mut self,
         session_id: SessionId,
         event: &bcode_session_models::ToolContributionEvent,
         accepts_reference: impl Fn(&str, &str, u32, &str, Option<&str>) -> bool,
     ) {
-        let Some(artifact) = event.artifact.as_ref() else {
-            return;
-        };
-        if !accepts_reference(
+        self.observe_artifact(
+            session_id,
+            &event.invocation_id,
             &event.producer_id,
             &event.schema,
             event.schema_version,
+            event.artifact.as_ref(),
+            accepts_reference,
+        );
+    }
+
+    fn observe_presentation_update(
+        &mut self,
+        session_id: SessionId,
+        update: &bcode_tool::ToolPresentationUpdate,
+        accepts_reference: impl Fn(&str, &str, u32, &str, Option<&str>) -> bool,
+    ) {
+        self.observe_artifact(
+            session_id,
+            &update.invocation_id,
+            &update.producer_id,
+            &update.schema,
+            update.schema_version,
+            update.artifact.as_ref(),
+            accepts_reference,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn observe_artifact(
+        &mut self,
+        session_id: SessionId,
+        invocation_id: &str,
+        producer_plugin_id: &str,
+        schema: &str,
+        schema_version: u32,
+        artifact: Option<&bcode_tool::ToolContributionArtifact>,
+        accepts_reference: impl Fn(&str, &str, u32, &str, Option<&str>) -> bool,
+    ) {
+        let Some(artifact) = artifact else {
+            return;
+        };
+        if !accepts_reference(
+            producer_plugin_id,
+            schema,
+            schema_version,
             &artifact.reference_key,
             artifact.content_type.as_deref(),
         ) {
@@ -244,7 +300,7 @@ impl ArtifactStreamCoordinator {
         }
         let key = (
             session_id,
-            event.invocation_id.clone(),
+            invocation_id.to_owned(),
             artifact.artifact_id.clone(),
             artifact.reference_key.clone(),
         );
@@ -252,9 +308,9 @@ impl ArtifactStreamCoordinator {
             session_id,
             &key,
             ActiveArtifactTarget {
-                producer_plugin_id: event.producer_id.clone(),
-                schema: event.schema.clone(),
-                schema_version: event.schema_version,
+                producer_plugin_id: producer_plugin_id.to_owned(),
+                schema: schema.to_owned(),
+                schema_version,
                 content_type: artifact.content_type.clone(),
                 committed_bytes: artifact.committed_bytes,
                 revision: artifact.revision,
@@ -572,6 +628,66 @@ mod tests {
             checksum_sha256: None,
             bytes: bytes.to_vec(),
         }
+    }
+
+    #[tokio::test]
+    async fn presentation_update_hydration_requires_adapter_owned_reference() {
+        let session_id = SessionId::new();
+        let event = bcode_session_models::SessionLiveEventKind::ToolPresentationUpdated {
+            update: bcode_tool::ToolPresentationUpdate {
+                invocation_id: "call".to_owned(),
+                producer_id: "test.producer".to_owned(),
+                generation: 0,
+                revision: 2,
+                identity: bcode_tool::ToolPresentationIdentity::Primary,
+                retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                schema: "test.artifact".to_owned(),
+                schema_version: 1,
+                artifact: Some(bcode_tool::ToolContributionArtifact {
+                    artifact_id: "artifact".to_owned(),
+                    reference_key: "reference".to_owned(),
+                    content_type: Some("application/octet-stream".to_owned()),
+                    storage_uri: "untrusted://must-not-be-read".to_owned(),
+                    committed_bytes: 9,
+                    revision: 2,
+                    finalized: false,
+                    availability: None,
+                }),
+                payload: serde_json::Value::Null,
+            },
+        };
+
+        let mut rejected = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
+        rejected.observe_session_live_artifact(session_id, &event, |_, _, _, _, _| false);
+        assert!(rejected.artifact_fetches.is_empty());
+
+        let mut accepted = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
+        accepted.observe_session_live_artifact(
+            session_id,
+            &event,
+            |producer, schema, version, key, ty| {
+                producer == "test.producer"
+                    && schema == "test.artifact"
+                    && version == 1
+                    && key == "reference"
+                    && ty == Some("application/octet-stream")
+            },
+        );
+        let key = (
+            session_id,
+            "call".to_owned(),
+            "artifact".to_owned(),
+            "reference".to_owned(),
+        );
+        let state = accepted
+            .artifact_fetches
+            .get(&key)
+            .expect("accepted presentation artifact fetch");
+        assert!(state.fetching);
+        let target = state.target.as_ref().expect("presentation artifact target");
+        assert_eq!(target.committed_bytes, 9);
+        assert_eq!(target.revision, 2);
+        assert_eq!(target.schema, "test.artifact");
     }
 
     #[tokio::test]

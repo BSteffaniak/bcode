@@ -233,10 +233,11 @@
     "name": "requested-no-presentation",
     "expected": [
       "example.request",
-      "requested",
+      "requested"
+    ],
+    "forbidden": [
       "fixture-target"
     ],
-    "forbidden": [],
     "item": {
       "id": "tool:fixture-requested",
       "revision": 3,

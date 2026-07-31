@@ -73,12 +73,22 @@ enabled = ["bcode.fake-provider", "bcode.shell"]
 [model]
 provider_plugin_id = "bcode.fake-provider"
 model_id = "fake-echo"
+profile = "pty-smoke"
+
+[model.profiles.pty-smoke]
+provider_plugin_id = "bcode.fake-provider"
+model_id = "fake-echo"
+
+[model.profiles.pty-smoke.settings]
+fake_tool_delta_delay_ms = "2500"
 
 [model.prompt_cache]
 mode = "off"
 
 [agent.build.permission]
 command = { "*" = "allow" }
+write = { "**" = "allow" }
+edit = { "**" = "allow" }
 
 [tools.shell.env]
 mode = "inherit"
@@ -123,14 +133,45 @@ deadline = time.monotonic() + int(os.environ.get("BCODE_TUI_PTY_TIMEOUT_SECS", "
 exit_deadline = None
 exit_status = None
 exit_requested = False
-request_sent = False
+shell_request_sent = False
+filesystem_request_sent = False
+filesystem_edit_request_sent = False
 live_output_before_finish = False
 final_output_after_finish = False
 final_seen_before_live = False
+filesystem_draft_before_finish = False
+filesystem_second_draft_before_finish = False
+filesystem_final_after_draft = False
+filesystem_final_seen_before_draft = False
+filesystem_draft_identity_stable = True
+filesystem_edit_draft_before_finish = False
+filesystem_edit_second_draft_before_finish = False
+filesystem_edit_final_after_draft = False
+filesystem_edit_final_seen_before_draft = False
+filesystem_edit_draft_identity_stable = True
+assistant_request_sent = False
+assistant_prefix_before_finish = False
+assistant_final_after_prefix = False
+assistant_suffix_before_prefix = False
+reasoning_request_sent = False
+reasoning_first_before_second = False
+reasoning_second_after_first = False
+reasoning_final_after_updates = False
+raw_argument_json_visible = False
+running_timeout_visible = False
 next_screen_probe = 0.0
 screen_frames = []
 live_marker = b"FRESHLIVEOUTPUT"
 final_marker = b"FRESHFINALOUTPUT"
+filesystem_path_marker = b"pty-progressive.txt"
+filesystem_first_marker = b"PTYFILESYSTEMFIRST"
+filesystem_second_marker = b"PTYFILESYSTEMSECOND"
+filesystem_edit_marker = b"PTYFILESYSTEMEDITED"
+assistant_prefix_marker = b"ASSISTANTPREFIX"
+assistant_suffix_marker = b"ASSISTANTSUFFIX"
+reasoning_first_marker = b"REASONINGFIRST"
+reasoning_combined_marker = b"REASONINGFIRSTREASONINGSECOND"
+reasoning_final_marker = b"REASONINGFINAL"
 
 def screen_text():
     with open(capture_path, "wb") as capture_file:
@@ -157,7 +198,7 @@ while time.monotonic() < deadline:
         screen = screen_text()
         screen_frames.append(screen)
         if (
-            not request_sent
+            not shell_request_sent
             and b"bcode" in screen
             and session_marker in screen
             and b"ready" in screen
@@ -166,10 +207,13 @@ while time.monotonic() < deadline:
                 fd,
                 b"tool-shell echo FRESHLIVEOUTPUT; sleep 4; echo FRESHFINALOUTPUT\r",
             )
-            request_sent = True
-        if request_sent:
+            shell_request_sent = True
+        if shell_request_sent and not filesystem_request_sent:
             running_shell = b"running tool: shell" in screen.lower()
             final_shell = b"shell run" in screen.lower() and b"exit code" in screen.lower()
+            raw_argument_json_visible |= b'"command"' in screen or b"arguments" in screen.lower()
+            if running_shell and b"timeout 30.0s" in screen.lower():
+                running_timeout_visible = True
             output_lines = {
                 line.strip()
                 for line in screen.splitlines()
@@ -181,17 +225,146 @@ while time.monotonic() < deadline:
                 live_output_before_finish = True
             if final_shell and final_output:
                 final_output_after_finish = True
-            if final_output and not live_output:
+            if final_output and not live_output_before_finish:
                 final_seen_before_live = True
-            if live_output_before_finish and final_output_after_finish:
-                capture.extend(b"\nBCODE_SMOKE_FINAL_MARKER_VISIBLE\n")
+            if (
+                live_output_before_finish
+                and final_output_after_finish
+                and b"ready" in screen.lower()
+            ):
+                capture.extend(b"\nBCODE_SMOKE_SHELL_FINAL_MARKER_VISIBLE\n")
+                os.write(
+                    fd,
+                    b"tool-write pty-progressive.txt PTYFILESYSTEMFIRST\\nPTYFILESYSTEMSECOND\r",
+                )
+                filesystem_request_sent = True
+        if filesystem_request_sent:
+            lower_screen = screen.lower()
+            filesystem_draft = (
+                b"filesystem write" in lower_screen
+                and b"writing file" not in lower_screen
+            )
+            filesystem_second_draft = (
+                b"filesystem write" in lower_screen
+                and b"writing file" in lower_screen
+                and filesystem_path_marker in screen
+            )
+            filesystem_final = (
+                b"wrote" in lower_screen
+                and filesystem_path_marker in screen
+            )
+            if filesystem_draft and not filesystem_second_draft and not filesystem_final:
+                filesystem_draft_before_finish = True
+                filesystem_draft_identity_stable &= lower_screen.count(b"filesystem write") == 1
+            if filesystem_second_draft and not filesystem_final:
+                filesystem_second_draft_before_finish = True
+                filesystem_draft_identity_stable &= lower_screen.count(b"filesystem write") == 1
+            if filesystem_final and filesystem_draft_before_finish:
+                filesystem_final_after_draft = True
+            if filesystem_final and not filesystem_draft_before_finish:
+                filesystem_final_seen_before_draft = True
+            if (
+                filesystem_final_after_draft
+                and b"fake tool result: wrote" in lower_screen
+                and not filesystem_edit_request_sent
+                and b"ready" in lower_screen
+                and b"tool-write" not in lower_screen
+            ):
+                capture.extend(b"\nBCODE_SMOKE_FILESYSTEM_WRITE_FINAL_MARKER_VISIBLE\n")
+                os.write(fd, b"\x15")
+                os.write(
+                    fd,
+                    b"tool-edit pty-progressive.txt PTYFILESYSTEMSECOND PTYFILESYSTEMEDITED\r",
+                )
+                filesystem_edit_request_sent = True
+        if filesystem_edit_request_sent:
+            lower_screen = screen.lower()
+            filesystem_edit_draft = (
+                b"filesystem edit" in lower_screen
+                and b"editing file" not in lower_screen
+            )
+            filesystem_edit_second_draft = (
+                b"filesystem edit" in lower_screen
+                and b"editing file" in lower_screen
+                and filesystem_path_marker in screen
+                and filesystem_second_marker in screen
+                and filesystem_edit_marker in screen
+            )
+            filesystem_edit_final = b"applied 1 replacement" in lower_screen
+            if (
+                filesystem_edit_draft
+                and not filesystem_edit_second_draft
+                and not filesystem_edit_final
+            ):
+                filesystem_edit_draft_before_finish = True
+                filesystem_edit_draft_identity_stable &= lower_screen.count(b"filesystem edit") == 1
+            if filesystem_edit_second_draft and not filesystem_edit_final:
+                filesystem_edit_second_draft_before_finish = True
+                filesystem_edit_draft_identity_stable &= lower_screen.count(b"filesystem edit") == 1
+            if filesystem_edit_final and filesystem_edit_draft_before_finish:
+                filesystem_edit_final_after_draft = True
+            if filesystem_edit_final and not filesystem_edit_draft_before_finish:
+                filesystem_edit_final_seen_before_draft = True
+            if (
+                filesystem_edit_final_after_draft
+                and not assistant_request_sent
+                and b"ready" in lower_screen
+                and b"tool-edit" not in lower_screen
+            ):
+                capture.extend(b"\nBCODE_SMOKE_FILESYSTEM_EDIT_FINAL_MARKER_VISIBLE\n")
+                os.write(fd, b"stream-text ASSISTANTPREFIXASSISTANTSUFFIX\r")
+                assistant_request_sent = True
+        if assistant_request_sent:
+            prefix_visible = assistant_prefix_marker in screen
+            suffix_visible = assistant_suffix_marker in screen
+            if prefix_visible and not suffix_visible:
+                assistant_prefix_before_finish = True
+            if suffix_visible and not prefix_visible and not assistant_prefix_before_finish:
+                assistant_suffix_before_prefix = True
+            if prefix_visible and suffix_visible and assistant_prefix_before_finish:
+                assistant_final_after_prefix = True
+            if (
+                assistant_final_after_prefix
+                and not reasoning_request_sent
+                and b"ready" in screen.lower()
+                and b"stream-text" not in screen.lower()
+            ):
+                capture.extend(b"\nBCODE_SMOKE_ASSISTANT_FINAL_MARKER_VISIBLE\n")
+                os.write(fd, b"stream-reasoning REASONINGFIRSTREASONINGSECOND\r")
+                reasoning_request_sent = True
+        if reasoning_request_sent:
+            first_visible = reasoning_first_marker in screen
+            combined_visible = reasoning_combined_marker in screen
+            final_visible = reasoning_final_marker in screen
+            if first_visible and not combined_visible:
+                reasoning_first_before_second = True
+            if combined_visible and reasoning_first_before_second:
+                reasoning_second_after_first = True
+            if final_visible and reasoning_second_after_first:
+                reasoning_final_after_updates = True
+                capture.extend(b"\nBCODE_SMOKE_REASONING_FINAL_MARKER_VISIBLE\n")
         next_screen_probe = time.monotonic() + 0.25
 
     if (
         not exit_requested
-        and request_sent
+        and shell_request_sent
+        and filesystem_request_sent
+        and filesystem_edit_request_sent
         and live_output_before_finish
         and final_output_after_finish
+        and filesystem_draft_before_finish
+        and filesystem_second_draft_before_finish
+        and filesystem_final_after_draft
+        and filesystem_edit_draft_before_finish
+        and filesystem_edit_second_draft_before_finish
+        and filesystem_edit_final_after_draft
+        and assistant_request_sent
+        and assistant_prefix_before_finish
+        and assistant_final_after_prefix
+        and reasoning_request_sent
+        and reasoning_first_before_second
+        and reasoning_second_after_first
+        and reasoning_final_after_updates
     ):
         try:
             os.write(fd, b"\x04")
@@ -238,10 +411,32 @@ checks = {
     "rendered Bcode frame": b"bcode" in capture,
     "rendered session identity": session_marker in capture,
     "rendered provider status": b"provider" in capture,
-    "shell request sent": request_sent,
+    "shell request sent": shell_request_sent,
     "live output visible before command completion": live_output_before_finish,
+    "running shell shows effective timeout": running_timeout_visible,
+    "raw argument JSON never visible": not raw_argument_json_visible,
     "final output did not precede live output": not final_seen_before_live,
     "final output visible after command completion": final_output_after_finish,
+    "filesystem request sent": filesystem_request_sent,
+    "filesystem first draft visible before completion": filesystem_draft_before_finish,
+    "filesystem second draft visible before completion": filesystem_second_draft_before_finish,
+    "filesystem final did not precede draft": not filesystem_final_seen_before_draft,
+    "filesystem final visible after draft": filesystem_final_after_draft,
+    "filesystem draft has one invocation presentation": filesystem_draft_identity_stable,
+    "filesystem edit request sent": filesystem_edit_request_sent,
+    "filesystem edit first draft visible before completion": filesystem_edit_draft_before_finish,
+    "filesystem edit second draft visible before completion": filesystem_edit_second_draft_before_finish,
+    "filesystem edit final did not precede draft": not filesystem_edit_final_seen_before_draft,
+    "filesystem edit final visible after draft": filesystem_edit_final_after_draft,
+    "filesystem edit draft has one invocation presentation": filesystem_edit_draft_identity_stable,
+    "assistant streaming request sent": assistant_request_sent,
+    "assistant prefix visible before completion": assistant_prefix_before_finish,
+    "assistant suffix did not precede prefix": not assistant_suffix_before_prefix,
+    "assistant final preserves prefix and suffix": assistant_final_after_prefix,
+    "reasoning streaming request sent": reasoning_request_sent,
+    "reasoning first update visible before second": reasoning_first_before_second,
+    "reasoning second update preserves first": reasoning_second_after_first,
+    "reasoning final follows ordered updates": reasoning_final_after_updates,
     "clean Ctrl-D exit": os.WIFEXITED(exit_status) and os.WEXITSTATUS(exit_status) == 0,
 }
 failures = [name for name, passed in checks.items() if not passed]

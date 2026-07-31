@@ -4986,6 +4986,61 @@ fn vim_edit_plugin_host() -> bcode_plugin::PluginHost {
 }
 
 #[test]
+fn live_filesystem_request_draft_append_events_render_distinct_progressive_frames() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+    let event = |revision, operation, argument_bytes| bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolRequestDraft {
+            event: bcode_session_models::ToolRequestDraftEvent {
+                output_position: None,
+                turn_id: "turn-1".to_owned(),
+                tool_call_id: "call-write".to_owned(),
+                tool_name: "filesystem.write".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                schema: "bcode.filesystem.request-draft.write".to_owned(),
+                schema_version: 1,
+                placement: bcode_session_models::ToolContributionPlacement::Request,
+                generation: 1,
+                revision,
+                operation,
+                argument_bytes,
+                truncated: false,
+            },
+        },
+    };
+    let first_text = r#"{"path":"src/lib.rs","contents":"hello"#;
+    app.absorb_session_live_event(&event(
+        1,
+        bcode_session_models::ToolRequestDraftOperation::Append {
+            offset: 0,
+            text: first_text.to_owned(),
+        },
+        first_text.len(),
+    ));
+    let first = render_app_text(&mut app);
+    assert!(first.contains("Filesystem write · assembling"), "{first}");
+    assert!(first.contains("src/lib.rs"), "{first}");
+    assert!(first.contains("hello"), "{first}");
+
+    let second_text = " world\"}";
+    app.absorb_session_live_event(&event(
+        2,
+        bcode_session_models::ToolRequestDraftOperation::Append {
+            offset: first_text.len(),
+            text: second_text.to_owned(),
+        },
+        first_text.len().saturating_add(second_text.len()),
+    ));
+    let second = render_app_text(&mut app);
+    assert!(second.contains("Filesystem write · assembling"), "{second}");
+    assert!(second.contains("hello world"), "{second}");
+    assert_ne!(first, second);
+    assert_eq!(app.session_view_snapshot().transcript.items.len(), 1);
+}
+
+#[test]
 fn live_filesystem_request_draft_renders_updates_and_retains_completed_handoff() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
@@ -5481,7 +5536,7 @@ fn live_progress_contribution_renders_replaces_in_place_and_removes() {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn live_shell_recording_chunk_renders_once_through_canonical_request_contribution() {
+async fn live_shell_recording_chunk_renders_once_from_presentation_update() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
     app.set_plugin_host(Arc::new(shell_plugin_host()));
@@ -5639,52 +5694,45 @@ async fn live_shell_recording_chunk_renders_once_through_canonical_request_contr
     let mut coordinator = super::artifact_stream::ArtifactStreamCoordinator::new(
         bcode_client::BcodeClient::new(endpoint),
     );
-    let contribution = bcode_session_models::ToolContributionEvent {
-        invocation_id: "call-live-shell".to_owned(),
-        contribution_id: "shell-recording".to_owned(),
-        sequence: 2,
-        producer_id: "bcode.shell".to_owned(),
-        schema: "bcode.shell.run".to_owned(),
-        schema_version: 1,
-        operation: bcode_session_models::ToolContributionOperation::Upsert,
-        persistence: bcode_session_models::ToolContributionPersistence::Transient,
-        artifact: Some(bcode_session_models::ToolContributionArtifact {
-            artifact_id: "call-live-shell-shell-run".to_owned(),
-            reference_key: "shell_recording".to_owned(),
-            content_type: Some("application/x-bcode-shell-recording; version=3".to_owned()),
-            storage_uri: String::new(),
-            committed_bytes: u64::try_from(bytes.len()).expect("recording length"),
-            revision: 2,
-            finalized: false,
-            availability: None,
-        }),
-        payload: serde_json::json!({"mode": "terminal"}),
+    let live_event = bcode_session_models::SessionLiveEvent {
+        session_id,
+        kind: bcode_session_models::SessionLiveEventKind::ToolPresentationUpdated {
+            update: bcode_tool::ToolPresentationUpdate {
+                invocation_id: "call-live-shell".to_owned(),
+                producer_id: "bcode.shell".to_owned(),
+                generation: 0,
+                revision: 2,
+                identity: bcode_tool::ToolPresentationIdentity::Primary,
+                retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                schema: "bcode.shell.run".to_owned(),
+                schema_version: 1,
+                artifact: Some(bcode_tool::ToolContributionArtifact {
+                    artifact_id: "call-live-shell-shell-run".to_owned(),
+                    reference_key: "shell_recording".to_owned(),
+                    content_type: Some("application/x-bcode-shell-recording; version=3".to_owned()),
+                    storage_uri: String::new(),
+                    committed_bytes: u64::try_from(bytes.len()).expect("recording length"),
+                    revision: 2,
+                    finalized: false,
+                    availability: None,
+                }),
+                payload: serde_json::json!({"mode": "terminal", "timeout_ms": 30_000}),
+            },
+        },
     };
-    app.absorb_session_live_event(&bcode_session_models::SessionLiveEvent {
-        session_id,
-        kind: bcode_session_models::SessionLiveEventKind::ToolContributionPlaced {
-            envelope: bcode_session_models::ToolContributionEnvelope::new(
-                bcode_session_models::ToolContributionPlacement::Progress,
-                contribution.clone(),
-            ),
-        },
-    });
-    coordinator.observe_contribution(
-        session_id,
-        &contribution,
-        |producer, schema, version, key, content_type| {
-            app.plugin_presentation().is_some_and(|presentation| {
-                presentation.accepts_artifact_reference(
-                    producer,
-                    schema,
-                    version,
-                    key,
-                    content_type,
-                )
-            })
-        },
+    assert!(
+        app.plugin_presentation()
+            .expect("plugin presentation")
+            .accepts_artifact_reference(
+                "bcode.shell",
+                "bcode.shell.run",
+                1,
+                "shell_recording",
+                Some("application/x-bcode-shell-recording; version=3"),
+            )
     );
-    let completion = tokio::time::timeout(Duration::from_secs(1), coordinator.next_completion())
+    super::chat_loop::absorb_session_live_event(&mut app, &mut coordinator, &live_event);
+    let completion = tokio::time::timeout(Duration::from_secs(5), coordinator.next_completion())
         .await
         .expect("artifact fetch timeout")
         .expect("artifact completion");

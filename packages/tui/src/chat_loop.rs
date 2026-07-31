@@ -2189,6 +2189,30 @@ fn apply_session_stream_resynchronization(
         .set_status("Session view resynchronized".to_owned());
 }
 
+pub fn absorb_session_live_event(
+    app: &mut super::app::BmuxApp,
+    artifact_stream: &mut ArtifactStreamCoordinator,
+    event: &bcode_session_models::SessionLiveEvent,
+) {
+    let presentation = app.plugin_presentation();
+    artifact_stream.observe_session_live_artifact(
+        event.session_id,
+        &event.kind,
+        |producer_plugin_id, schema, schema_version, reference_key, content_type| {
+            presentation.is_some_and(|presentation| {
+                presentation.accepts_artifact_reference(
+                    producer_plugin_id,
+                    schema,
+                    schema_version,
+                    reference_key,
+                    content_type,
+                )
+            })
+        },
+    );
+    app.absorb_session_live_event(event);
+}
+
 fn absorb_bcode_event(
     chat: &mut ActiveChat,
     loop_state: &mut ChatLoopState,
@@ -2253,27 +2277,7 @@ fn absorb_bcode_event(
             true
         }
         BcodeEvent::SessionLive(event) if Some(event.session_id) == chat.session_id => {
-            if let bcode_session_models::SessionLiveEventKind::ToolContributionPlaced { envelope } =
-                &event.kind
-            {
-                let presentation = chat.app.plugin_presentation();
-                loop_state.artifact_stream.observe_contribution(
-                    event.session_id,
-                    &envelope.contribution,
-                    |producer_plugin_id, schema, schema_version, reference_key, content_type| {
-                        presentation.is_some_and(|presentation| {
-                            presentation.accepts_artifact_reference(
-                                producer_plugin_id,
-                                schema,
-                                schema_version,
-                                reference_key,
-                                content_type,
-                            )
-                        })
-                    },
-                );
-            }
-            chat.app.absorb_session_live_event(&event);
+            absorb_session_live_event(&mut chat.app, &mut loop_state.artifact_stream, &event);
             true
         }
         BcodeEvent::RuntimeWork(event) if Some(event.session_id) == chat.session_id => {
@@ -3211,6 +3215,61 @@ mod scheduler_tests {
             markdown_destination_cache_source(&web),
             "https://example.com/image.png"
         );
+    }
+
+    #[tokio::test]
+    async fn production_live_event_handler_observes_presentation_artifacts() {
+        let session_id = bcode_session_models::SessionId::new();
+        let mut app =
+            super::super::app::BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+        let bundled = [bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+            bcode_shell_plugin::static_plugin(),
+        )];
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &bundled,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .expect("select shell plugin");
+        let host =
+            bcode_plugin::PluginHost::load_static_plugins(&selected).expect("load shell plugin");
+        app.set_plugin_host(std::sync::Arc::new(host));
+        let mut artifact_stream = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
+        let event = bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::ToolPresentationUpdated {
+                update: bcode_tool::ToolPresentationUpdate {
+                    invocation_id: "call-shell".to_owned(),
+                    producer_id: "bcode.shell".to_owned(),
+                    generation: 0,
+                    revision: 1,
+                    identity: bcode_tool::ToolPresentationIdentity::Primary,
+                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    schema: "bcode.shell.run".to_owned(),
+                    schema_version: 1,
+                    artifact: Some(bcode_tool::ToolContributionArtifact {
+                        artifact_id: "call-shell-shell-run".to_owned(),
+                        reference_key: "shell_recording".to_owned(),
+                        content_type: Some(
+                            "application/x-bcode-shell-recording; version=3".to_owned(),
+                        ),
+                        storage_uri: "untrusted://opaque".to_owned(),
+                        committed_bytes: 128,
+                        revision: 128,
+                        finalized: false,
+                        availability: None,
+                    }),
+                    payload: serde_json::json!({"mode": "terminal", "timeout_ms": 30_000}),
+                },
+            },
+        };
+
+        absorb_session_live_event(&mut app, &mut artifact_stream, &event);
+
+        let stats = artifact_stream.drain_stats();
+        assert_eq!(stats.observed_targets, 1);
+        assert_eq!(stats.fetches_started, 1);
+        assert_eq!(stats.backlog, 1);
     }
 
     fn test_chat() -> ActiveChat {
