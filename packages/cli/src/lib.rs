@@ -8551,11 +8551,15 @@ async fn session_search_status(json: bool) -> Result<(), CliError> {
     }
     for provider in response.providers {
         println!(
-            "{}: {:?}, index={}/{}, pending={}, schema={}/{}/{}",
+            "{}: {:?}, execution={:?}, content={:?}, features={:?}, index={}/{}, documents={}, pending={}, schema={}/{}/{}",
             provider.plugin_id,
             provider.status.state,
+            provider.capabilities.execution,
+            provider.capabilities.content_kinds,
+            provider.capabilities.features,
             provider.status.index_bytes,
             provider.status.quota_bytes,
+            provider.status.document_count,
             provider.status.pending_sessions,
             provider.status.record_schema_version,
             provider.status.normalization_version,
@@ -8563,13 +8567,21 @@ async fn session_search_status(json: bool) -> Result<(), CliError> {
         );
         for coverage in provider.status.coverage {
             println!(
-                "  session {} through {:?}, complete={}, skipped={}, truncated={}",
+                "  session {} generation={} tail={:?} through={:?}, content={:?}, text_bytes={}, complete={}, skipped={}, truncated={}, exclusions={:?}",
                 coverage.generation.session_id,
+                coverage.generation.fingerprint,
+                coverage.generation.last_sequence,
                 coverage.indexed_through_sequence,
+                coverage.content_kinds,
+                coverage.indexed_text_bytes,
                 coverage.complete,
                 coverage.skipped_records,
-                coverage.truncated_records
+                coverage.truncated_records,
+                coverage.exclusions
             );
+        }
+        if let Some(reason) = provider.status.degraded_reason {
+            println!("  degraded: {reason}");
         }
     }
     for failure in response.failures {

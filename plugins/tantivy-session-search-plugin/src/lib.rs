@@ -104,19 +104,22 @@ struct PersistedProviderState {
     normalization_version: u16,
     policy_version: u16,
     quota_bytes: u64,
+    #[serde(default)]
+    content_kinds: BTreeSet<SearchContentKind>,
     sessions: BTreeMap<SessionId, PersistedSessionState>,
     batch_digests: BTreeMap<String, String>,
 }
 
 impl PersistedProviderState {
-    const fn new(quota_bytes: u64) -> Self {
+    fn new(config: &ProviderConfig) -> Self {
         Self {
             index_schema_version: INDEX_SCHEMA_VERSION,
             tokenizer_version: TOKENIZER_VERSION,
             record_schema_version: CURRENT_SEARCH_RECORD_VERSION,
             normalization_version: CURRENT_NORMALIZATION_VERSION,
             policy_version: CURRENT_SEARCH_POLICY_VERSION,
-            quota_bytes,
+            quota_bytes: config.quota_bytes,
+            content_kinds: config.allowed_content(),
             sessions: BTreeMap::new(),
             batch_digests: BTreeMap::new(),
         }
@@ -137,6 +140,12 @@ impl PersistedProviderState {
         if self.quota_bytes != config.quota_bytes {
             return Err(ProviderError::incompatible(
                 "configured quota differs from retained provider state; explicit rebuild is required"
+                    .to_owned(),
+            ));
+        }
+        if self.content_kinds != config.allowed_content() {
+            return Err(ProviderError::incompatible(
+                "configured content policy differs from retained provider state; explicit rebuild is required"
                     .to_owned(),
             ));
         }
@@ -1317,7 +1326,7 @@ fn load_state(
 ) -> Result<PersistedProviderState, ProviderError> {
     let path = root.join(CHECKPOINT_FILE);
     if !path.exists() {
-        return Ok(PersistedProviderState::new(config.quota_bytes));
+        return Ok(PersistedProviderState::new(config));
     }
     let bytes = std::fs::read(&path).map_err(ProviderError::index)?;
     let state =
@@ -1973,6 +1982,33 @@ mod tests {
         let status = plugin.status(&config(root.path()));
         assert_eq!(status.state, SearchProviderState::Degraded);
         assert!(status.degraded_reason.is_some());
+    }
+
+    #[test]
+    fn content_policy_change_requires_explicit_rebuild() {
+        let root = tempfile::tempdir().expect("root");
+        let config = config(root.path());
+        {
+            let engine = SearchEngine::open(root.path().to_path_buf(), &config).expect("engine");
+            let state = engine.state.lock().expect("state");
+            persist_state(root.path(), &state).expect("persist initial state");
+        }
+
+        let mut changed = config;
+        changed
+            .sensitive_content
+            .insert(SearchContentKind::AssistantReasoning);
+        let plugin = TantivySessionSearchPlugin::default();
+        let status = plugin.status(&changed);
+        assert_eq!(status.state, SearchProviderState::Degraded);
+        assert!(
+            status
+                .degraded_reason
+                .as_deref()
+                .is_some_and(
+                    |reason| reason.contains("content policy") && reason.contains("rebuild")
+                )
+        );
     }
 
     #[test]

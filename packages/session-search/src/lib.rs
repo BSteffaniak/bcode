@@ -707,7 +707,10 @@ pub enum SessionSearchProviderStage {
 /// Bounded application-level provider discovery response.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ListSessionSearchProvidersResponse {
+    /// Active provider inventory with capabilities, content policy, versions, quota, pending work,
+    /// coverage, and degraded state.
     pub providers: Vec<SessionSearchProviderInfo>,
+    /// Discovery/status failures for configured providers that could not join the active inventory.
     pub failures: Vec<SessionSearchProviderFailure>,
 }
 
@@ -730,6 +733,12 @@ pub struct SessionSearchPlanPolicy {
     /// Maximum age of an incomplete/catching-up checkpoint accepted for indexed providers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub maximum_staleness_sequences: Option<u64>,
+    /// Whether a remote provider is explicitly authorized to receive projected session content.
+    ///
+    /// This field is ignored for local indexed/scan providers. Remote providers fail closed unless
+    /// it is `true`; provider discovery alone is never authorization.
+    #[serde(default)]
+    pub allow_remote: bool,
     /// Deadline for each selected provider, bounded again by the request's overall deadline.
     pub per_provider_deadline_ms: u64,
 }
@@ -738,6 +747,7 @@ impl Default for SessionSearchPlanPolicy {
     fn default() -> Self {
         Self {
             execution_class: SessionSearchExecutionClass::Ordinary,
+            allow_remote: false,
             maximum_staleness_sequences: Some(0),
             per_provider_deadline_ms: 2_000,
         }
@@ -1092,6 +1102,13 @@ fn filter_discovery_for_policy(
             Some((
                 SearchErrorCode::ProviderUnavailable,
                 "provider is configured but unavailable",
+            ))
+        } else if matches!(provider.capabilities.execution, SearchExecutionKind::Remote)
+            && !policy.allow_remote
+        {
+            Some((
+                SearchErrorCode::UnsupportedQuery,
+                "remote provider requires explicit authorization",
             ))
         } else if matches!(
             policy.execution_class,
@@ -2068,6 +2085,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn plan_policy_excludes_cold_and_stale_providers_from_ordinary_search() {
         fn provider(
             id: &str,
@@ -2137,11 +2155,13 @@ mod tests {
                 provider("fresh", SearchExecutionKind::Indexed, 10),
                 provider("stale", SearchExecutionKind::Indexed, 7),
                 provider("scan", SearchExecutionKind::Scan, 10),
+                provider("remote", SearchExecutionKind::Remote, 10),
             ],
             failures: Vec::new(),
         };
         let policy = SessionSearchPlanPolicy {
             execution_class: SessionSearchExecutionClass::Ordinary,
+            allow_remote: false,
             maximum_staleness_sequences: Some(1),
             per_provider_deadline_ms: 1_000,
         };
@@ -2155,16 +2175,36 @@ mod tests {
             vec!["fresh"]
         );
         assert_eq!(plan.per_provider_deadline_ms, 1_000);
-        assert_eq!(plan.failures.len(), 2);
+        assert_eq!(plan.failures.len(), 3);
+        assert!(plan.failures.iter().any(|failure| {
+            failure.plugin_id == "scan"
+                && failure.error.code == SearchErrorCode::UnsupportedQuery
+                && failure.error.message.contains("explicit deep search")
+        }));
+        assert!(plan.failures.iter().any(|failure| {
+            failure.plugin_id == "remote"
+                && failure.error.code == SearchErrorCode::UnsupportedQuery
+                && failure.error.message.contains("explicit authorization")
+        }));
 
         let deep = SessionSearchPlanPolicy {
             execution_class: SessionSearchExecutionClass::Deep,
+            allow_remote: false,
             maximum_staleness_sequences: None,
             per_provider_deadline_ms: 4_000,
         };
-        let plan = plan_session_search_with_policy_and_routes(&request, discovery, &deep, &[]);
-        assert!(plan.failures.is_empty());
+        let plan =
+            plan_session_search_with_policy_and_routes(&request, discovery.clone(), &deep, &[]);
+        assert_eq!(plan.failures.len(), 1);
+        assert_eq!(plan.failures[0].plugin_id, "remote");
         assert_eq!(plan.per_provider_deadline_ms, 4_000);
+
+        let remote = SessionSearchPlanPolicy {
+            allow_remote: true,
+            ..deep
+        };
+        let plan = plan_session_search_with_policy_and_routes(&request, discovery, &remote, &[]);
+        assert!(plan.failures.is_empty());
     }
 
     #[test]

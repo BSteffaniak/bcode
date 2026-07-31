@@ -160,10 +160,10 @@ overlap.
 Eligible providers may execute concurrently with bounded concurrency, independently configured
 per-provider deadlines capped by an overall deadline, and end-to-end cancellation. Timed provider
 calls cancel the generic runtime invocation token propagated through the plugin ABI before returning
-their terminal timeout; dropping a future alone is not treated as cancellation. Planning has an
-explicit execution class: ordinary search excludes scan providers and applies a configured canonical
-sequence-lag threshold, while deep search may select scan providers and relax freshness only when
-requested. Fast indexed results are not held indefinitely by cold or deep scans. Provider scores are
+their terminal timeout; dropping a future alone is not treated as cancellation. Planning has an explicit portable execution class: ordinary search rejects every scan provider with
+an explicit deep-required outcome and applies a configured canonical sequence-lag threshold, while
+only an explicit deep request (the CLI `--deep` flag) may select scan providers and relax freshness.
+Fast indexed results are not held indefinitely by cold or deep scans. Provider scores are
 opaque and are not treated as directly comparable across backends. Results are grouped or combined
 using backend-neutral rank information, then deduplicated by canonical locator.
 
@@ -202,9 +202,12 @@ defines no retention, acknowledgment replay, or conflict protocol beyond each id
 
 Provider-owned checkpoints advance only after derived data is durably published. Checkpoints bind to
 a versioned SHA-256 of stable canonical session identity, creation identity, and import/fork lineage
-facts/cutoffs, plus projection, normalization, and content-policy versions. Mutable title, activity,
-working-directory, and client-count fields do not change generation. Mismatch produces terminal stale
-or rebuild-required state before paging; it never causes silent reuse or merge.
+facts/cutoffs, plus projection, normalization, content-policy versions, quota, and the provider's
+exact configured content-kind allowlist. Mutable title, activity, working-directory, and client-count
+fields do not change generation. A changed content allowlist or quota produces explicit degraded,
+rebuild-required status rather than reusing prior coverage; canonical generation mismatch likewise
+produces terminal stale or rebuild-required state before paging and never causes silent reuse or
+merge.
 
 Historical backfill, full rebuild, policy-change reindexing, and purge are explicit cancellable
 maintenance operations. The public client/IPC/CLI boundary currently exposes provider-scoped purge
@@ -251,6 +254,23 @@ indexed bytes, truncation, and normalization/policy versions. Split shell stdout
 their own canonical byte totals rather than inheriting an invocation-wide total; aggregate invocation
 bytes remain explicit metadata.
 
+Provider ingestion has explicit resource bounds at every current layer:
+
+* one normalized record is capped at 64 KiB;
+* one portable batch is capped at 256 records, 4 MiB normalized text, and 8 MiB serialized payload;
+* one canonical session is capped at 256 MiB cumulative normalized text per provider;
+* one federated query is capped at eight concurrent providers, 200 hits per provider, 4 KiB previews,
+  and explicit per-provider/overall deadlines;
+* the Tantivy provider defaults to a 32 MiB writer cache (15 MiB minimum) and a 2 GiB derived-state
+  quota; configured quota and content-policy changes require explicit rebuild;
+* the asynchronous server drains at most 16 bounded pages per provider/session scheduling slice and
+  retains at most 1,024 coalesced dirty sessions.
+
+The current transcript provider has no automatic eviction: reaching any bound preserves committed
+derived state, stops or narrows advancement, and reports incomplete/quota state. A future large-output
+provider must define its own total corpus, chunk, cache, concurrency, and retention bounds before it
+can be enabled; these transcript limits do not pre-decide that backend.
+
 Provider ingestion has three independent content bounds before a batch may cross the plugin boundary:
 individual normalized record text, aggregate normalized text and serialized payload for one invocation,
 and cumulative normalized text for one canonical session. The session aggregate is carried as an
@@ -263,13 +283,30 @@ records the resulting latency, commit, reopen, and storage-amplification behavio
 advancement, and reports incomplete coverage. It does not silently claim completeness or mutate
 canonical history.
 
-Provider paths are canonicalized and confined to authorized derived-state roots. A provider root must
-identify a non-root directory rather than a file, traversal, filesystem root, or symbolic-link
-provider boundary; destructive operations revalidate that boundary before deletion. Provider errors
-are passed through the shared provider diagnostic sanitizer before entering portable failures so
-credential-shaped headers, assignments, URLs, JSON/form values, bearer/basic tokens, and AWS keys
-are redacted before bounded truncation. Remote providers require separately approved configuration
-and authorization before receiving session content.
+Provider status is the operational source for active provider identity, execution kind, advertised
+content policy/features, shared projection versions, index/quota/document/pending counts, degraded
+reason, and per-session generation/tail/checkpoint/content/byte/completeness/exclusion state.
+Explain-plan carries the explicit backend-neutral routes plus selected and excluded providers. CLI
+text and JSON expose those contracts without reading provider files.
+
+Remote providers fail closed independently of ordinary/deep policy. Discovery, loading, routing, or
+an explicit deep request is not authorization: the portable plan policy must separately set
+`allow_remote = true` before a provider advertising `Remote` execution can be selected to receive
+projected session content. Frontends do not currently expose that opt-in by default.
+
+Provider paths are canonicalized and confined to authorized, explicitly configured derived-state
+roots. A provider root must be an absolute non-root directory rather than a file, traversal,
+filesystem root, or symbolic-link provider boundary. Existing roots are canonicalized; new roots use
+a canonical parent plus one final provider-owned component. Tantivy stores only its `index/` and
+versioned checkpoint files there. Destructive operations revalidate the boundary and remove only that
+provider root, never canonical session directories. Provider errors are passed through the shared
+credential sanitizer before character-bounded truncation. The server rejects previews and diagnostic
+messages above 4 KiB and bounds opaque scores, record IDs, and cursors; Tantivy creates UTF-8-safe
+bounded previews. Session-search metrics use fixed host-owned names without query text, session IDs,
+paths, or provider-controlled labels. Focused tests cover credential-shaped diagnostics, oversized
+responses, and UTF-8-safe truncation. Remote providers require separately approved configuration
+and the explicit portable `allow_remote` authorization described above before receiving session
+content.
 
 ## Frontend and skill boundary
 
