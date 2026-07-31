@@ -4,6 +4,11 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 workdir="$(mktemp -d /tmp/bcode-artifact-identity.XXXXXX)"
 cleanup() {
+    if command -v pgrep >/dev/null 2>&1; then
+        while read -r daemon_pid; do
+            [[ -n "${daemon_pid}" ]] && kill "${daemon_pid}" 2>/dev/null || true
+        done < <(pgrep -f "${workdir}/.*/daemon-images" || true)
+    fi
     rm -rf "${workdir}"
 }
 trap cleanup EXIT
@@ -89,6 +94,46 @@ fi
 BCODE_STATE_DIR="${coexist_state}" "${workdir}/debug-a" server stop >/dev/null
 check_running_artifact "${workdir}/release-b" matrix-release-b "${coexist_state}"
 BCODE_STATE_DIR="${coexist_state}" "${workdir}/release-b" server stop >/dev/null
+
+session_state="${workdir}/session-state"
+session_root="${workdir}/canonical-sessions"
+BCODE_STATE_DIR="${session_state}" BCODE_SESSION_STORE_DIR="${session_root}" \
+    "${workdir}/debug-a" server start >/dev/null
+session_id="$(BCODE_STATE_DIR="${session_state}" BCODE_SESSION_STORE_DIR="${session_root}" \
+    "${workdir}/debug-a" session create cross-artifact-session)"
+BCODE_STATE_DIR="${session_state}" BCODE_SESSION_STORE_DIR="${session_root}" \
+    "${workdir}/debug-a" attach "${session_id}" >"${workdir}/session-owner-attach.log" 2>&1 &
+owner_attach_pid="$!"
+sleep 0.5
+if BCODE_STATE_DIR="${session_state}" BCODE_SESSION_STORE_DIR="${session_root}" \
+    "${workdir}/release-b" attach "${session_id}" >"${workdir}/foreign-attach.log" 2>&1; then
+    echo "foreign artifact unexpectedly acquired a live-owned session" >&2
+    exit 1
+fi
+if ! grep -Eq 'active elsewhere|another incompatible Bcode writer|session_active_elsewhere' "${workdir}/foreign-attach.log"; then
+    echo "foreign artifact ownership rejection was not actionable" >&2
+    cat "${workdir}/foreign-attach.log" >&2
+    exit 1
+fi
+kill "${owner_attach_pid}" 2>/dev/null || true
+wait "${owner_attach_pid}" 2>/dev/null || true
+BCODE_STATE_DIR="${session_state}" BCODE_SESSION_STORE_DIR="${session_root}" \
+    "${workdir}/debug-a" session release-owner "${session_id}" >/dev/null
+BCODE_STATE_DIR="${session_state}" BCODE_SESSION_STORE_DIR="${session_root}" \
+    "${workdir}/release-b" attach "${session_id}" >"${workdir}/released-attach.log" 2>&1 &
+released_attach_pid="$!"
+sleep 0.5
+if ! kill -0 "${released_attach_pid}" 2>/dev/null; then
+    echo "foreign artifact could not acquire released canonical session ownership" >&2
+    cat "${workdir}/released-attach.log" >&2
+    exit 1
+fi
+kill "${released_attach_pid}" 2>/dev/null || true
+wait "${released_attach_pid}" 2>/dev/null || true
+BCODE_STATE_DIR="${session_state}" BCODE_SESSION_STORE_DIR="${session_root}" \
+    "${workdir}/debug-a" server stop >/dev/null
+BCODE_STATE_DIR="${session_state}" BCODE_SESSION_STORE_DIR="${session_root}" \
+    "${workdir}/release-b" server stop >/dev/null
 
 concurrent_state="${workdir}/concurrent-state"
 client_pids=()

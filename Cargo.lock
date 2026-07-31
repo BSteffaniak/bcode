@@ -2653,7 +2653,6 @@ dependencies = [
  "bcode_code_review_models",
  "bcode_command",
  "bcode_config",
- "bcode_daemon_lifecycle",
  "bcode_filesystem_plugin",
  "bcode_git_plugin",
  "bcode_ipc",

@@ -5622,9 +5622,6 @@ async fn live_shell_recording_chunk_renders_once_from_contribution_artifact() {
     let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("artifact.sock"));
     let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("IPC listener");
     let response_bytes = bytes.clone();
-    let executable_digest = bcode_daemon_lifecycle::current_executable_identity()
-        .ok()
-        .map(|(_path, digest)| digest);
     let responder = tokio::spawn(async move {
         let mut stream = listener.accept().await.expect("artifact client");
         loop {
@@ -5642,7 +5639,7 @@ async fn live_shell_recording_chunk_renders_once_from_contribution_artifact() {
                             protocol_version: u32::from(bcode_ipc::ProtocolVersion::current().0),
                             artifact_id: Some(bcode_ipc::ArtifactId::current()),
                             build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
-                            executable_digest: executable_digest.clone(),
+                            executable_digest: None,
                             storage_writer_epoch: Some(
                                 bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH,
                             ),
