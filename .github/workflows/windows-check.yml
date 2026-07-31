@@ -54,6 +54,7 @@ jobs:
           cargo test --package bcode_shell_plugin windows_shell_plan_uses_cmd_contract
           cargo test --package bcode_shell_plugin terminal_mode_executes_cmd_through_native_pty
           cargo test --package bcode_shell_plugin cancellation_terminates_windows_terminal_child_promptly
+          cargo test --package bcode_tool_runtime cancellation_terminates_windows_process_tree
           cargo test --package bcode_provider_auth windows_dpapi_device_seal_round_trips_for_current_user
 
       - name: Run Windows path semantics smoke tests

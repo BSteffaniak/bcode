@@ -320,6 +320,10 @@ async fn run_process_inner(
     configure_command_for_timeout(&mut command);
     let started = Instant::now();
     let mut child = command.kill_on_drop(true).spawn()?;
+    #[cfg(windows)]
+    let process_guard = attach_child_process_guard(&child)?;
+    #[cfg(not(windows))]
+    let process_guard = attach_child_process_guard(&child);
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let output_callback = Arc::new(std::sync::Mutex::new(on_output));
@@ -338,7 +342,7 @@ async fn run_process_inner(
         output_callback,
     ));
     let (status, timed_out, cancelled) =
-        wait_for_process(&mut child, request.timeout, cancel).await?;
+        wait_for_process(&mut child, request.timeout, cancel, &process_guard).await?;
     let (stdout, stdout_truncated) = if timed_out {
         (Vec::new(), false)
     } else {
@@ -370,6 +374,7 @@ async fn wait_for_process(
     child: &mut Child,
     timeout: Option<Duration>,
     cancel: Arc<Notify>,
+    process_guard: &ChildProcessGuard,
 ) -> Result<(std::process::ExitStatus, bool, bool), std::io::Error> {
     let started = Instant::now();
     loop {
@@ -377,7 +382,7 @@ async fn wait_for_process(
             return Ok((status, false, false));
         }
         if timeout.is_some_and(|timeout| started.elapsed() >= timeout) {
-            return terminate_child_after_timeout(child)
+            return terminate_child_after_timeout(child, process_guard)
                 .await
                 .map(|status| (status, true, false));
         }
@@ -385,7 +390,7 @@ async fn wait_for_process(
             .await
             .is_ok()
         {
-            return terminate_child_after_timeout(child)
+            return terminate_child_after_timeout(child, process_guard)
                 .await
                 .map(|status| (status, false, true));
         }
@@ -398,11 +403,77 @@ fn configure_command_for_timeout(command: &mut Command) {
 }
 
 #[cfg(not(unix))]
-fn configure_command_for_timeout(_command: &mut Command) {}
+const fn configure_command_for_timeout(_command: &mut Command) {}
+
+#[cfg(windows)]
+struct ChildProcessGuard(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Drop for ChildProcessGuard {
+    fn drop(&mut self) {
+        // SAFETY: this guard exclusively owns the job handle returned by
+        // `CreateJobObjectW` and closes it exactly once.
+        unsafe {
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn attach_child_process_guard(child: &Child) -> Result<ChildProcessGuard, std::io::Error> {
+    use std::mem::size_of;
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+        SetInformationJobObject,
+    };
+
+    let process = child.raw_handle().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "spawned tool process handle is unavailable",
+        )
+    })?;
+    // SAFETY: the job handle is checked before use, the limit structure is
+    // initialized for the duration of the call, and the process handle is
+    // borrowed from a live Tokio child.
+    unsafe {
+        let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+        if job.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        let guard = ChildProcessGuard(job);
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        if SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            std::ptr::from_ref(&limits).cast(),
+            u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>())
+                .expect("job limit structure size fits u32"),
+        ) == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        if AssignProcessToJobObject(job, process.cast()) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(guard)
+    }
+}
+
+#[cfg(not(windows))]
+struct ChildProcessGuard;
+
+#[cfg(not(windows))]
+const fn attach_child_process_guard(_child: &Child) -> ChildProcessGuard {
+    ChildProcessGuard
+}
 
 #[cfg(unix)]
 async fn terminate_child_after_timeout(
     child: &mut Child,
+    _process_guard: &ChildProcessGuard,
 ) -> Result<std::process::ExitStatus, std::io::Error> {
     let Some(child_id) = child.id() else {
         return child.wait().await;
@@ -423,9 +494,29 @@ async fn terminate_child_after_timeout(
     child.wait().await
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 async fn terminate_child_after_timeout(
     child: &mut Child,
+    process_guard: &ChildProcessGuard,
+) -> Result<std::process::ExitStatus, std::io::Error> {
+    // SAFETY: the guard owns a live job handle configured to contain the
+    // spawned process and all descendants. Terminating the job is the Windows
+    // equivalent of killing the Unix process group.
+    let terminated =
+        unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(process_guard.0, 1) };
+    if terminated == 0 {
+        let error = std::io::Error::last_os_error();
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(error);
+    }
+    child.wait().await
+}
+
+#[cfg(all(not(unix), not(windows)))]
+async fn terminate_child_after_timeout(
+    child: &mut Child,
+    _process_guard: &ChildProcessGuard,
 ) -> Result<std::process::ExitStatus, std::io::Error> {
     let _ = child.kill().await;
     child.wait().await
@@ -560,6 +651,66 @@ mod tests {
         assert_eq!(status.running, 0);
         assert_eq!(status.cancelled, 1);
         assert_eq!(status.completed, 0);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn cancellation_terminates_windows_process_tree() {
+        let marker_dir = tempfile::tempdir().expect("marker tempdir");
+        let marker = marker_dir.path().join("descendant-finished.txt");
+        let child_script = marker_dir.path().join("descendant.cmd");
+        std::fs::write(
+            &child_script,
+            format!(
+                "@ping -n 4 127.0.0.1 >NUL\r\n@echo escaped>\"{}\"\r\n",
+                marker.display()
+            ),
+        )
+        .expect("write descendant script");
+        let parent_script = marker_dir.path().join("parent.cmd");
+        std::fs::write(
+            &parent_script,
+            format!(
+                "@start \"\" /B cmd.exe /D /C call \"{}\"\r\n@ping -n 30 127.0.0.1 >NUL\r\n",
+                child_script.display()
+            ),
+        )
+        .expect("write parent script");
+        let runtime = Arc::new(ToolExecutionRuntime::new(1));
+        let cancellation = runtime.cancellation_handle();
+        let task_runtime = Arc::clone(&runtime);
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            task_runtime
+                .run_process_with_cancellation(
+                    ProcessExecutionRequest {
+                        program: "cmd.exe".to_owned(),
+                        args: vec![
+                            "/D".to_owned(),
+                            "/C".to_owned(),
+                            "call".to_owned(),
+                            parent_script.display().to_string(),
+                        ],
+                        cwd: None,
+                        timeout: Some(Duration::from_secs(15)),
+                        max_output_bytes: 1024,
+                        inherit_environment: true,
+                        environment: BTreeMap::new(),
+                    },
+                    &task_cancellation,
+                )
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        cancellation.cancel();
+        let result = task.await.expect("task").expect("cancelled result");
+        assert!(result.cancelled);
+        assert!(!result.timed_out);
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            !marker.exists(),
+            "cancelled descendant escaped the Windows Job Object"
+        );
     }
 
     #[tokio::test]
