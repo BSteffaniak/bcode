@@ -1231,6 +1231,7 @@ fn capabilities(config: &ProviderConfig) -> SessionSearchCapabilities {
             SearchFeature::IncrementalIngestion,
             SearchFeature::HistoricalBackfill,
             SearchFeature::RemoveSession,
+            SearchFeature::Rebuild,
             SearchFeature::Purge,
         ]),
         max_hits: bcode_session_search::MAX_SEARCH_HITS,

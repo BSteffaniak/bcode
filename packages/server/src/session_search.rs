@@ -4,9 +4,10 @@ use bcode_session_search::{
     ApplySearchRecordsRequest, ApplySearchRecordsResponse, FederatedProviderContribution,
     FederatedProviderReport, FederatedSessionSearchResponse, HydratedSessionSearchHit,
     ListSessionSearchProvidersResponse, MAX_FEDERATED_PROVIDERS, OP_APPLY_BATCH, OP_CAPABILITIES,
-    OP_REMOVE_SESSION, OP_SEARCH, OP_STATUS, RemoveSessionSearchRequest,
-    SESSION_SEARCH_INTERFACE_ID, SearchCanonicalGeneration, SearchErrorCode, SearchFeature,
-    SearchHitHydrationOutcome, SessionSearchCapabilities, SessionSearchContentRoute,
+    OP_PURGE, OP_REBUILD, OP_REMOVE_SESSION, OP_SEARCH, OP_STATUS, PurgeSessionSearchRequest,
+    RebuildSessionSearchRequest, RemoveSessionSearchRequest, SESSION_SEARCH_INTERFACE_ID,
+    SearchCanonicalGeneration, SearchErrorCode, SearchFeature, SearchHitHydrationOutcome,
+    SessionSearchCapabilities, SessionSearchContentRoute, SessionSearchMaintenanceResponse,
     SessionSearchProviderFailure, SessionSearchProviderInfo, SessionSearchRequest,
     SessionSearchResponse, SessionSearchServiceError, SessionSearchStatus,
     aggregate_federated_search, plan_session_search_with_policy_and_routes,
@@ -22,6 +23,220 @@ use crate::ServerState;
 const MAX_DIRTY_SESSION_SEARCH_SESSIONS: usize = 1_024;
 const MAX_INCREMENTAL_BATCHES_PER_SESSION: usize = 16;
 const INCREMENTAL_RETRY_DELAY: Duration = Duration::from_millis(100);
+const MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Run an explicit provider-owned purge and return fresh provider status.
+///
+/// # Errors
+///
+/// Returns a normalized service error when the provider is unavailable, does not advertise purge,
+/// rejects the confirmation, or returns invalid status after the operation.
+pub async fn purge_provider(
+    state: &ServerState,
+    provider_id: &str,
+    confirmation: String,
+) -> Result<SessionSearchMaintenanceResponse, SessionSearchServiceError> {
+    invoke_provider_maintenance(
+        state,
+        provider_id,
+        SearchFeature::Purge,
+        OP_PURGE,
+        &PurgeSessionSearchRequest {
+            provider_id: provider_id.to_owned(),
+            confirmation,
+        },
+    )
+    .await
+}
+
+/// Run an explicit provider-owned rebuild and return fresh provider status.
+///
+/// Rebuild recreates empty derived state. Incremental ingestion is scheduled only for sessions
+/// that subsequently commit canonical mutations; historical backfill remains a separate explicit
+/// maintenance workflow.
+///
+/// # Errors
+///
+/// Returns a normalized service error when the provider is unavailable, does not advertise
+/// rebuild, rejects the confirmation, or returns invalid status after the operation.
+pub async fn rebuild_provider(
+    state: &ServerState,
+    provider_id: &str,
+    confirmation: String,
+) -> Result<SessionSearchMaintenanceResponse, SessionSearchServiceError> {
+    invoke_provider_maintenance(
+        state,
+        provider_id,
+        SearchFeature::Rebuild,
+        OP_REBUILD,
+        &RebuildSessionSearchRequest {
+            provider_id: provider_id.to_owned(),
+            confirmation,
+        },
+    )
+    .await
+}
+
+async fn invoke_provider_maintenance<Q>(
+    state: &ServerState,
+    provider_id: &str,
+    required_feature: SearchFeature,
+    operation: &'static str,
+    request: &Q,
+) -> Result<SessionSearchMaintenanceResponse, SessionSearchServiceError>
+where
+    Q: serde::Serialize + Sync,
+{
+    let capabilities = provider_capabilities(state, provider_id).await?;
+    if !capabilities.features.contains(&required_feature) {
+        return Err(SessionSearchServiceError {
+            code: SearchErrorCode::UnsupportedQuery,
+            message: format!(
+                "session-search provider '{provider_id}' does not support {operation} maintenance"
+            ),
+            retryable: false,
+        });
+    }
+    let payload = serde_json::to_vec(request).map_err(|error| SessionSearchServiceError {
+        code: SearchErrorCode::InvalidRequest,
+        message: bounded_message(&error.to_string()),
+        retryable: false,
+    })?;
+    let response = state
+        .plugins
+        .invoke_service_scoped_with_timeout(
+            provider_id,
+            SESSION_SEARCH_INTERFACE_ID,
+            operation,
+            payload,
+            bcode_plugin::PluginInvocationScope::Global,
+            MAINTENANCE_TIMEOUT,
+        )
+        .await
+        .map_err(|error| {
+            let error = bcode_plugin::PluginServiceCallError::from(error);
+            maintenance_call_error(&error)
+        })?;
+    if let Some(error) = response.error {
+        return Err(maintenance_call_error(
+            &bcode_plugin::PluginServiceCallError::Service {
+                code: error.code,
+                message: error.message,
+            },
+        ));
+    }
+    let status = provider_status(state, provider_id).await?;
+    Ok(SessionSearchMaintenanceResponse {
+        provider_id: provider_id.to_owned(),
+        operation: operation.to_owned(),
+        status,
+    })
+}
+
+async fn provider_capabilities(
+    state: &ServerState,
+    provider_id: &str,
+) -> Result<SessionSearchCapabilities, SessionSearchServiceError> {
+    let registered = state
+        .plugins
+        .registry()
+        .service_registry()
+        .providers_for(SESSION_SEARCH_INTERFACE_ID)
+        .is_some_and(|providers| providers.contains(provider_id));
+    if !registered {
+        return Err(SessionSearchServiceError {
+            code: SearchErrorCode::ProviderUnavailable,
+            message: format!("session-search provider '{provider_id}' is not loaded"),
+            retryable: false,
+        });
+    }
+    let capabilities = state
+        .plugins
+        .invoke_service_json::<_, SessionSearchCapabilities>(
+            provider_id,
+            SESSION_SEARCH_INTERFACE_ID,
+            OP_CAPABILITIES,
+            &(),
+        )
+        .await
+        .map_err(|error| maintenance_call_error(&error))?;
+    if capabilities.provider_id != provider_id {
+        return Err(SessionSearchServiceError {
+            code: SearchErrorCode::InvalidRequest,
+            message: "provider capability identity does not match selected plugin".to_owned(),
+            retryable: false,
+        });
+    }
+    capabilities
+        .validate()
+        .map_err(|error| SessionSearchServiceError {
+            code: SearchErrorCode::FutureVersion,
+            message: bounded_message(&error.to_string()),
+            retryable: false,
+        })?;
+    Ok(capabilities)
+}
+
+async fn provider_status(
+    state: &ServerState,
+    provider_id: &str,
+) -> Result<SessionSearchStatus, SessionSearchServiceError> {
+    let status = state
+        .plugins
+        .invoke_service_json::<_, SessionSearchStatus>(
+            provider_id,
+            SESSION_SEARCH_INTERFACE_ID,
+            OP_STATUS,
+            &(),
+        )
+        .await
+        .map_err(|error| maintenance_call_error(&error))?;
+    if status.provider_id != provider_id {
+        return Err(SessionSearchServiceError {
+            code: SearchErrorCode::InvalidRequest,
+            message: "provider status identity does not match selected plugin".to_owned(),
+            retryable: false,
+        });
+    }
+    status
+        .validate()
+        .map_err(|error| SessionSearchServiceError {
+            code: SearchErrorCode::FutureVersion,
+            message: bounded_message(&error.to_string()),
+            retryable: false,
+        })?;
+    Ok(status)
+}
+
+fn maintenance_call_error(
+    error: &bcode_plugin::PluginServiceCallError,
+) -> SessionSearchServiceError {
+    let (code, retryable) = match &error {
+        bcode_plugin::PluginServiceCallError::ResponseDecode(_) => {
+            (SearchErrorCode::FutureVersion, false)
+        }
+        bcode_plugin::PluginServiceCallError::RequestEncode(_) => {
+            (SearchErrorCode::InvalidRequest, false)
+        }
+        bcode_plugin::PluginServiceCallError::Service { code, .. }
+            if code == "confirmation_required" =>
+        {
+            (SearchErrorCode::InvalidRequest, false)
+        }
+        bcode_plugin::PluginServiceCallError::Invoke(
+            bcode_plugin::PluginLoadError::ServiceInvocationTimeout { .. },
+        ) => (SearchErrorCode::DeadlineExceeded, true),
+        bcode_plugin::PluginServiceCallError::Service { .. }
+        | bcode_plugin::PluginServiceCallError::Invoke(_) => {
+            (SearchErrorCode::ProviderUnavailable, true)
+        }
+    };
+    SessionSearchServiceError {
+        code,
+        message: bounded_message(&error.to_string()),
+        retryable,
+    }
+}
 
 pub(crate) async fn remove_session_from_providers(
     state: &ServerState,
@@ -1419,6 +1634,8 @@ mod tests {
                 SearchFeature::StructuredFilters,
                 SearchFeature::RelevanceSort,
                 SearchFeature::IncrementalIngestion,
+                SearchFeature::Rebuild,
+                SearchFeature::Purge,
             ]),
             max_hits: bcode_session_search::MAX_SEARCH_HITS,
             max_batch_records: bcode_session_search::MAX_INGEST_RECORDS,
@@ -1476,7 +1693,7 @@ mod tests {
         ServiceResponse::json(value).expect("test service response encodes")
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn test_provider_service(
         instance: *const c_void,
         input_ptr: *const u8,
@@ -1542,6 +1759,34 @@ mod tests {
                     )
                 } else {
                     service_response(&serde_json::json!({}))
+                }
+            }
+            OP_PURGE => {
+                let request = context
+                    .request
+                    .payload_json::<PurgeSessionSearchRequest>()
+                    .expect("purge request");
+                if request.provider_id != provider.provider_id || request.confirmation != "purge" {
+                    ServiceResponse::error("confirmation_required", "exact confirmation required")
+                } else {
+                    ServiceResponse::empty()
+                }
+            }
+            OP_REBUILD => {
+                let request = context
+                    .request
+                    .payload_json::<RebuildSessionSearchRequest>()
+                    .expect("rebuild request");
+                if request.provider_id != provider.provider_id || request.confirmation != "rebuild"
+                {
+                    ServiceResponse::error("confirmation_required", "exact confirmation required")
+                } else {
+                    service_response(&serde_json::json!({
+                        "provider_id": provider.provider_id,
+                        "record_schema_version": CURRENT_SEARCH_RECORD_VERSION,
+                        "normalization_version": bcode_session_search::CURRENT_NORMALIZATION_VERSION,
+                        "policy_version": bcode_session_search::CURRENT_SEARCH_POLICY_VERSION
+                    }))
                 }
             }
             OP_SEARCH => match provider.behavior {
@@ -1801,6 +2046,30 @@ mod tests {
             "unrelated.plugin",
             None
         ));
+    }
+
+    #[tokio::test]
+    async fn explicit_provider_maintenance_requires_capability_and_confirmation() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        let state = state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Fast)]);
+
+        let error = purge_provider(&state, FAST_PROVIDER_ID, "wrong".to_owned())
+            .await
+            .expect_err("wrong confirmation must fail");
+        assert_eq!(error.code, SearchErrorCode::InvalidRequest);
+
+        let purged = purge_provider(&state, FAST_PROVIDER_ID, "purge".to_owned())
+            .await
+            .expect("purge succeeds");
+        assert_eq!(purged.provider_id, FAST_PROVIDER_ID);
+        assert_eq!(purged.operation, OP_PURGE);
+        assert_eq!(purged.status.state, SearchProviderState::Ready);
+
+        let rebuilt = rebuild_provider(&state, FAST_PROVIDER_ID, "rebuild".to_owned())
+            .await
+            .expect("rebuild succeeds");
+        assert_eq!(rebuilt.provider_id, FAST_PROVIDER_ID);
+        assert_eq!(rebuilt.operation, OP_REBUILD);
     }
 
     #[tokio::test]

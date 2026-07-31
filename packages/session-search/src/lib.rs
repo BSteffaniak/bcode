@@ -469,6 +469,7 @@ pub enum SearchFeature {
     IncrementalIngestion,
     HistoricalBackfill,
     RemoveSession,
+    Rebuild,
     Purge,
 }
 
@@ -1548,6 +1549,14 @@ pub struct PurgeSessionSearchRequest {
 pub struct RebuildSessionSearchRequest {
     pub provider_id: String,
     pub confirmation: String,
+}
+
+/// Portable summary of an explicit provider maintenance operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchMaintenanceResponse {
+    pub provider_id: String,
+    pub operation: String,
+    pub status: SessionSearchStatus,
 }
 
 /// Durable acknowledgment that a provider-owned rebuild completed.

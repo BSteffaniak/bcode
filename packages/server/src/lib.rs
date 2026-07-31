@@ -3678,6 +3678,8 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionSearch { .. } => "session_search",
         Request::SessionSearchProviders => "session_search_providers",
         Request::SessionSearchExplain { .. } => "session_search_explain",
+        Request::SessionSearchPurge { .. } => "session_search_purge",
+        Request::SessionSearchRebuild { .. } => "session_search_rebuild",
         Request::PrepareSessionOpen { .. } => "prepare_session_open",
         Request::WaitSessionOpenProgress { .. } => "wait_session_open_progress",
         Request::AttachSession { .. } => "attach_session",
@@ -4059,6 +4061,20 @@ async fn handle_request_inner(
                 Response::Ok(ResponsePayload::SessionSearchPlan { plan }),
             )
             .await
+        }
+        Request::SessionSearchPurge {
+            provider_id,
+            confirmation,
+        } => {
+            let result = session_search::purge_provider(state, &provider_id, confirmation).await;
+            handle_session_search_maintenance(request_id, writer, result).await
+        }
+        Request::SessionSearchRebuild {
+            provider_id,
+            confirmation,
+        } => {
+            let result = session_search::rebuild_provider(state, &provider_id, confirmation).await;
+            handle_session_search_maintenance(request_id, writer, result).await
         }
         Request::PrepareSessionOpen { session_id } => {
             handle_prepare_session_open(request_id, state, writer, session_id).await
@@ -8675,6 +8691,37 @@ async fn handle_session_search(
                     response,
                     hydrated_hits,
                 }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    format!("session_search_{:?}", error.code).to_lowercase(),
+                    error.message,
+                )),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_session_search_maintenance(
+    request_id: u64,
+    writer: &SharedWriter,
+    result: Result<
+        bcode_session_search::SessionSearchMaintenanceResponse,
+        bcode_session_search::SessionSearchServiceError,
+    >,
+) -> Result<(), ServerError> {
+    match result {
+        Ok(response) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionSearchMaintenance { response }),
             )
             .await
         }
@@ -29299,6 +29346,7 @@ const fn response_payload_kind(response: &Response) -> &'static str {
             ResponsePayload::SessionSearch { .. } => "session_search",
             ResponsePayload::SessionSearchProviders { .. } => "session_search_providers",
             ResponsePayload::SessionSearchPlan { .. } => "session_search_plan",
+            ResponsePayload::SessionSearchMaintenance { .. } => "session_search_maintenance",
             ResponsePayload::SessionList { .. } => "session_list",
             ResponsePayload::SessionCatalogRefreshed { .. } => "session_catalog_refreshed",
             ResponsePayload::PermissionList { .. } => "permission_list",

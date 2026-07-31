@@ -1829,6 +1829,50 @@ impl BcodeClient {
         }
     }
 
+    /// Explicitly purge one provider's derived session-search state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the provider rejects the operation.
+    pub async fn session_search_purge(
+        &self,
+        provider_id: String,
+        confirmation: String,
+    ) -> Result<bcode_session_search::SessionSearchMaintenanceResponse, ClientError> {
+        match self
+            .send_request(Request::SessionSearchPurge {
+                provider_id,
+                confirmation,
+            })
+            .await?
+        {
+            ResponsePayload::SessionSearchMaintenance { response } => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
+    /// Explicitly recreate one provider's empty derived session-search state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or the provider rejects the operation.
+    pub async fn session_search_rebuild(
+        &self,
+        provider_id: String,
+        confirmation: String,
+    ) -> Result<bcode_session_search::SessionSearchMaintenanceResponse, ClientError> {
+        match self
+            .send_request(Request::SessionSearchRebuild {
+                provider_id,
+                confirmation,
+            })
+            .await?
+        {
+            ResponsePayload::SessionSearchMaintenance { response } => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Send a user message to a session.
     ///
     /// # Errors

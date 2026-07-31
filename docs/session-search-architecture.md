@@ -197,7 +197,10 @@ working-directory, and client-count fields do not change generation. Mismatch pr
 or rebuild-required state before paging; it never causes silent reuse or merge.
 
 Historical backfill, full rebuild, policy-change reindexing, and purge are explicit cancellable
-maintenance operations. Canonical deletion remains authoritative and occurs first; after success the
+maintenance operations. The public client/IPC/CLI boundary currently exposes provider-scoped purge
+and empty rebuild with exact provider-defined confirmation tokens and fresh post-operation status;
+historical backfill remains a separate unfinished workflow rather than being implied by rebuild.
+Canonical deletion remains authoritative and occurs first; after success the
 server best-effort invokes each loaded provider's typed `remove_session` with the expected generation,
 without rolling canonical deletion back on provider failure. The Tantivy provider's rebuild operation
 is deliberately provider-local: an exact provider-specific confirmation detaches live reader/writer

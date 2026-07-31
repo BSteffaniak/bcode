@@ -1997,6 +1997,26 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Explicitly purge one provider's disposable derived search state.
+    SearchPurge {
+        #[arg(long)]
+        provider: String,
+        /// Exact provider-defined confirmation token.
+        #[arg(long)]
+        confirm: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explicitly recreate one provider's empty derived search state.
+    SearchRebuild {
+        #[arg(long)]
+        provider: String,
+        /// Exact provider-defined confirmation token.
+        #[arg(long)]
+        confirm: String,
+        #[arg(long)]
+        json: bool,
+    },
     /// Explain provider selection for a query without invoking provider searches.
     SearchExplain {
         query: String,
@@ -2711,6 +2731,16 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
             handle_session_search_cli(command).await?;
         }
         SessionCommand::SearchStatus { json } => session_search_status(json).await?,
+        SessionCommand::SearchPurge {
+            provider,
+            confirm,
+            json,
+        } => session_search_maintenance(provider, confirm, json, false).await?,
+        SessionCommand::SearchRebuild {
+            provider,
+            confirm,
+            json,
+        } => session_search_maintenance(provider, confirm, json, true).await?,
         command @ SessionCommand::SearchExplain { .. } => {
             handle_session_search_explain_cli(command).await?;
         }
@@ -8551,6 +8581,36 @@ async fn session_search_status(json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
+async fn session_search_maintenance(
+    provider: String,
+    confirmation: String,
+    json: bool,
+    rebuild: bool,
+) -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
+    let response = if rebuild {
+        client
+            .session_search_rebuild(provider, confirmation)
+            .await?
+    } else {
+        client.session_search_purge(provider, confirmation).await?
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&response)?);
+    } else {
+        println!(
+            "{} {} complete: state={:?}, index={}/{}, documents={}",
+            response.provider_id,
+            response.operation,
+            response.status.state,
+            response.status.index_bytes,
+            response.status.quota_bytes,
+            response.status.document_count
+        );
+    }
+    Ok(())
+}
+
 async fn session_search_explain(command: SessionSearchCliCommand) -> Result<(), CliError> {
     let policy = command.scope.policy(command.deadline_ms);
     let plan = BcodeClient::default_endpoint()
@@ -11297,6 +11357,48 @@ mod web_command_tests {
                     ..
                 }
             )
+        ));
+    }
+
+    #[test]
+    fn session_search_maintenance_commands_require_provider_confirmation() {
+        let purge = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "search-purge",
+            "--provider",
+            "bcode.tantivy-session-search",
+            "--confirm",
+            "purge-bcode.tantivy-session-search",
+            "--json",
+        ])
+        .expect("purge command should parse");
+        assert!(matches!(
+            purge.command,
+            Some(Commands::Session {
+                command: SessionCommand::SearchPurge { provider, confirm, json }
+            }) if provider == "bcode.tantivy-session-search"
+                && confirm == "purge-bcode.tantivy-session-search"
+                && json
+        ));
+
+        let rebuild = Cli::try_parse_from([
+            "bcode",
+            "session",
+            "search-rebuild",
+            "--provider",
+            "bcode.tantivy-session-search",
+            "--confirm",
+            "rebuild-bcode.tantivy-session-search",
+        ])
+        .expect("rebuild command should parse");
+        assert!(matches!(
+            rebuild.command,
+            Some(Commands::Session {
+                command: SessionCommand::SearchRebuild { provider, confirm, json }
+            }) if provider == "bcode.tantivy-session-search"
+                && confirm == "rebuild-bcode.tantivy-session-search"
+                && !json
         ));
     }
 

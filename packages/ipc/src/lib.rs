@@ -732,6 +732,16 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         routes: Vec<bcode_session_search::SessionSearchContentRoute>,
     },
+    /// Explicitly purge one provider's derived session-search state.
+    SessionSearchPurge {
+        provider_id: String,
+        confirmation: String,
+    },
+    /// Explicitly recreate one provider's empty derived session-search state.
+    SessionSearchRebuild {
+        provider_id: String,
+        confirmation: String,
+    },
     /// Append one durable, presentation-only note at the current session sequence.
     AppendPresentationNote {
         session_id: SessionId,
@@ -2390,6 +2400,9 @@ pub enum ResponsePayload {
     SessionSearchPlan {
         plan: bcode_session_search::SessionSearchPlan,
     },
+    SessionSearchMaintenance {
+        response: bcode_session_search::SessionSearchMaintenanceResponse,
+    },
     PresentationNoteAppended,
 }
 
@@ -3820,6 +3833,49 @@ mod tests {
         let decoded: Response =
             decode_typed_stable(&encode_typed_stable(&response).expect("encode")).expect("decode");
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn session_search_maintenance_contract_round_trips_portably() {
+        let purge = Request::SessionSearchPurge {
+            provider_id: "bcode.tantivy-session-search".to_owned(),
+            confirmation: "purge-bcode.tantivy-session-search".to_owned(),
+        };
+        let decoded: Request =
+            decode_typed_stable(&encode_typed_stable(&purge).expect("encode")).expect("decode");
+        assert_eq!(decoded, purge);
+        let rebuild = Request::SessionSearchRebuild {
+            provider_id: "bcode.tantivy-session-search".to_owned(),
+            confirmation: "rebuild-bcode.tantivy-session-search".to_owned(),
+        };
+        let decoded: Request =
+            decode_typed_stable(&encode_typed_stable(&rebuild).expect("encode rebuild"))
+                .expect("decode rebuild");
+        assert_eq!(decoded, rebuild);
+
+        let maintenance = Response::Ok(ResponsePayload::SessionSearchMaintenance {
+            response: bcode_session_search::SessionSearchMaintenanceResponse {
+                provider_id: "bcode.tantivy-session-search".to_owned(),
+                operation: bcode_session_search::OP_PURGE.to_owned(),
+                status: bcode_session_search::SessionSearchStatus {
+                    provider_id: "bcode.tantivy-session-search".to_owned(),
+                    state: bcode_session_search::SearchProviderState::Disabled,
+                    record_schema_version: bcode_session_search::CURRENT_SEARCH_RECORD_VERSION,
+                    normalization_version: bcode_session_search::CURRENT_NORMALIZATION_VERSION,
+                    policy_version: bcode_session_search::CURRENT_SEARCH_POLICY_VERSION,
+                    index_bytes: 0,
+                    quota_bytes: 1024,
+                    document_count: 0,
+                    pending_sessions: 0,
+                    coverage: Vec::new(),
+                    degraded_reason: None,
+                },
+            },
+        });
+        let decoded: Response =
+            decode_typed_stable(&encode_typed_stable(&maintenance).expect("encode maintenance"))
+                .expect("decode maintenance");
+        assert_eq!(decoded, maintenance);
     }
 
     #[test]
