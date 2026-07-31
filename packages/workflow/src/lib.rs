@@ -2047,12 +2047,55 @@ impl WorkflowPortableRevision {
     }
 }
 
+/// Exact immutable dependency carried by portable export/import contracts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkflowDependencyManifestEntry {
+    /// Calling node identity in the exported definition.
+    pub node_id: String,
+    /// Exact immutable target.
+    pub target: WorkflowCallTarget,
+}
+
+/// Derive the exact dependency manifest from one validated definition.
+///
+/// # Errors
+///
+/// Returns an error when the definition or a workflow-call configuration is invalid.
+pub fn workflow_dependency_manifest(
+    definition: &WorkflowDefinition,
+) -> Result<Vec<WorkflowDependencyManifestEntry>, WorkflowError> {
+    definition.validate()?;
+    definition
+        .nodes
+        .values()
+        .filter(|node| node.kind == NodeKind::WorkflowCall)
+        .map(|node| {
+            let call: WorkflowCallConfiguration =
+                serde_json::from_value(node.configuration.clone()).map_err(|error| {
+                    authoring_error(
+                        format!("definition.nodes.{}.configuration", node.id),
+                        format!("workflow call configuration is invalid: {error}"),
+                    )
+                })?;
+            call.validate()?;
+            Ok(WorkflowDependencyManifestEntry {
+                node_id: node.id.clone(),
+                target: call.target,
+            })
+        })
+        .collect()
+}
+
 /// Canonical portable export bundle for one exact immutable revision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WorkflowExportBundle {
     pub version: u32,
     pub revision: WorkflowPortableRevision,
+    /// Exact dependency graph roots referenced by the exported revision.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<WorkflowDependencyManifestEntry>,
 }
 
 impl WorkflowExportBundle {
@@ -2071,7 +2114,15 @@ impl WorkflowExportBundle {
                 ),
             ));
         }
-        self.revision.validate()
+        self.revision.validate()?;
+        let expected = workflow_dependency_manifest(&self.revision.document.definition)?;
+        if self.dependencies != expected {
+            return Err(authoring_error(
+                "export.dependencies",
+                "export dependency manifest must exactly match workflow call nodes",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -2710,6 +2761,9 @@ pub struct WorkflowAuthoringCatalogSnapshot {
     /// Exact plugin block contracts keyed by [`workflow_block_catalog_key`].
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub blocks: BTreeMap<String, WorkflowBlockDefinition>,
+    /// Exact immutable definitions available for child-call preview, keyed by compiled identity.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub workflow_definitions: BTreeMap<String, WorkflowDefinition>,
     /// Portable configured agent profile identities.
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
     pub agent_profiles: BTreeSet<String>,
@@ -2777,8 +2831,11 @@ impl WorkflowAuthoringCatalogSnapshot {
             ));
         }
         self.production_capabilities()?;
-        let entry_count =
-            self.plugins.len() + self.blocks.len() + self.agent_profiles.len() + self.skills.len();
+        let entry_count = self.plugins.len()
+            + self.blocks.len()
+            + self.workflow_definitions.len()
+            + self.agent_profiles.len()
+            + self.skills.len();
         if entry_count > MAX_WORKFLOW_AUTHORING_REQUIREMENTS {
             return Err(authoring_error(
                 "catalog",
@@ -2810,6 +2867,17 @@ impl WorkflowAuthoringCatalogSnapshot {
                         "catalog block '{}' references unavailable plugin '{}'",
                         block.block_id, block.plugin_id
                     ),
+                ));
+            }
+        }
+        for (key, definition) in &self.workflow_definitions {
+            definition.validate()?;
+            let identity =
+                WorkflowDefinitionIdentity::for_definition(definition.name.clone(), definition)?;
+            if key != &identity.definition_id {
+                return Err(authoring_error(
+                    "catalog.workflow_definitions",
+                    format!("catalog definition key '{key}' does not match exact content identity"),
                 ));
             }
         }
@@ -2857,10 +2925,10 @@ impl From<&WorkflowProductionAdmission> for WorkflowAuthoringProductionAdmission
 pub struct WorkflowPermissionPreview {
     /// Maximum tool capability requested by any compiled node.
     pub maximum_capability: WorkflowToolCapability,
-    /// Nodes whose owner contract requires an exact explicit grant.
+    /// Exact parent/child node paths whose owner contract requires an explicit grant.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub explicit_grant_nodes: Vec<String>,
-    /// Mutating nodes that retain runtime approval before dispatch.
+    /// Exact parent/child node paths that retain runtime mutation approval.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mutation_approval_nodes: Vec<String>,
 }
@@ -3813,6 +3881,31 @@ fn resolve_authoring_catalog(
     ),
     WorkflowError,
 > {
+    resolve_authoring_catalog_inner(
+        definition,
+        declared,
+        plugin_input_defaults,
+        catalog,
+        &mut BTreeSet::new(),
+        1,
+    )
+}
+
+fn resolve_authoring_catalog_inner(
+    definition: &WorkflowDefinition,
+    declared: &WorkflowRequirementSummary,
+    plugin_input_defaults: &BTreeMap<String, serde_json::Value>,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+    visited: &mut BTreeSet<String>,
+    depth: u32,
+) -> Result<
+    (
+        WorkflowRequirementSummary,
+        WorkflowEffectSummary,
+        WorkflowPermissionPreview,
+    ),
+    WorkflowError,
+> {
     validate_declared_authoring_requirements(declared, catalog)?;
 
     let mut requirements = declared.clone();
@@ -3863,6 +3956,16 @@ fn resolve_authoring_catalog(
                 &mut effects,
                 &mut permissions,
             )?,
+            NodeKind::WorkflowCall => resolve_authoring_workflow_call(
+                node_id,
+                node,
+                catalog,
+                &mut requirements,
+                &mut effects,
+                &mut permissions,
+                visited,
+                depth,
+            )?,
             NodeKind::Task
             | NodeKind::Branch
             | NodeKind::Repeat
@@ -3870,8 +3973,7 @@ fn resolve_authoring_catalog(
             | NodeKind::Parallel
             | NodeKind::FanOut
             | NodeKind::Input
-            | NodeKind::Approval
-            | NodeKind::WorkflowCall => {}
+            | NodeKind::Approval => {}
         }
     }
     for node_id in plugin_input_defaults.keys() {
@@ -3893,6 +3995,118 @@ fn resolve_authoring_catalog(
     permissions.mutation_approval_nodes.dedup();
     requirements.validate()?;
     Ok((requirements, effects, permissions))
+}
+
+fn merge_child_preview(
+    prefix: &str,
+    child_requirements: WorkflowRequirementSummary,
+    child_effects: WorkflowEffectSummary,
+    child_permissions: WorkflowPermissionPreview,
+    requirements: &mut WorkflowRequirementSummary,
+    effects: &mut WorkflowEffectSummary,
+    permissions: &mut WorkflowPermissionPreview,
+) {
+    requirements
+        .capabilities
+        .extend(child_requirements.capabilities);
+    requirements.plugins.extend(child_requirements.plugins);
+    requirements.blocks.extend(child_requirements.blocks);
+    requirements.agents.extend(child_requirements.agents);
+    requirements.skills.extend(child_requirements.skills);
+    effects.maximum_capability = effects
+        .maximum_capability
+        .max(child_effects.maximum_capability);
+    effects.block_effects.extend(child_effects.block_effects);
+    effects.reconciliation.extend(child_effects.reconciliation);
+    effects.resources.extend(child_effects.resources);
+    permissions.maximum_capability = permissions
+        .maximum_capability
+        .max(child_permissions.maximum_capability);
+    permissions.explicit_grant_nodes.extend(
+        child_permissions
+            .explicit_grant_nodes
+            .into_iter()
+            .map(|node| format!("{prefix}/{node}")),
+    );
+    permissions.mutation_approval_nodes.extend(
+        child_permissions
+            .mutation_approval_nodes
+            .into_iter()
+            .map(|node| format!("{prefix}/{node}")),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_authoring_workflow_call(
+    node_id: &str,
+    node: &NodeDefinition,
+    catalog: &WorkflowAuthoringCatalogSnapshot,
+    requirements: &mut WorkflowRequirementSummary,
+    effects: &mut WorkflowEffectSummary,
+    permissions: &mut WorkflowPermissionPreview,
+    visited: &mut BTreeSet<String>,
+    depth: u32,
+) -> Result<(), WorkflowError> {
+    if depth >= MAX_WORKFLOW_CALL_DEPTH {
+        return Err(authoring_error(
+            format!("definition.nodes.{node_id}.configuration"),
+            "workflow call dependency depth exceeds the supported bound",
+        ));
+    }
+    let call: WorkflowCallConfiguration = serde_json::from_value(node.configuration.clone())
+        .map_err(|error| {
+            authoring_error(
+                format!("definition.nodes.{node_id}.configuration"),
+                format!("workflow call configuration is invalid: {error}"),
+            )
+        })?;
+    call.validate()?;
+    let identity = call.target.definition_identity();
+    if !visited.insert(identity.definition_id.clone()) {
+        return Err(authoring_error(
+            format!("definition.nodes.{node_id}.configuration"),
+            "workflow call dependency graph is recursive",
+        ));
+    }
+    let child = catalog
+        .workflow_definitions
+        .get(&identity.definition_id)
+        .ok_or_else(|| {
+            authoring_error(
+                format!("definition.nodes.{node_id}.configuration.target"),
+                format!(
+                    "exact child definition '{}' is unavailable",
+                    identity.definition_id
+                ),
+            )
+        })?;
+    let actual = WorkflowDefinitionIdentity::for_definition(identity.kind.clone(), child)?;
+    if &actual != identity {
+        return Err(authoring_error(
+            format!("definition.nodes.{node_id}.configuration.target"),
+            "exact child definition identity does not match catalog content",
+        ));
+    }
+    let empty_defaults = BTreeMap::new();
+    let (child_requirements, child_effects, child_permissions) = resolve_authoring_catalog_inner(
+        child,
+        &WorkflowRequirementSummary::default(),
+        &empty_defaults,
+        catalog,
+        visited,
+        depth + 1,
+    )?;
+    merge_child_preview(
+        node_id,
+        child_requirements,
+        child_effects,
+        child_permissions,
+        requirements,
+        effects,
+        permissions,
+    );
+    visited.remove(&identity.definition_id);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8605,6 +8819,7 @@ mod tests {
             ),
             plugins: BTreeSet::new(),
             blocks: BTreeMap::new(),
+            workflow_definitions: BTreeMap::new(),
             agent_profiles: BTreeSet::from(["build".to_string(), "review".to_string()]),
             skills: BTreeSet::new(),
         }
@@ -9512,6 +9727,169 @@ mod tests {
     }
 
     #[test]
+    fn workflow_call_preview_aggregates_child_requirements_effects_and_permissions() {
+        let mut document = authored_document();
+        document.bindings.clear();
+        document.requirements.agents.clear();
+        let mut catalog = authoring_catalog();
+        let child_block = WorkflowBlockDefinition {
+            block_id: "child.commit".to_string(),
+            block_version: 1,
+            plugin_id: "bcode.child".to_string(),
+            operation: "child.commit".to_string(),
+            input: document.definition.input.clone(),
+            output: document.definition.output.clone(),
+            effect: WorkflowBlockEffect::Mutating,
+            resources: vec![ResourceClaim::write("repository")],
+            authorization: WorkflowBlockAuthorization {
+                capability: WorkflowToolCapability::Mutating,
+                explicit_grant_required: true,
+            },
+            timeout_ms: 1_000,
+            cancellation_supported: true,
+            reconciliation: WorkflowBlockReconciliation::RepairRequired,
+        };
+        child_block.validate().expect("block");
+        catalog.plugins.insert("bcode.child".to_string());
+        catalog.blocks.insert(
+            workflow_block_catalog_key(&child_block),
+            child_block.clone(),
+        );
+        let child = WorkflowDefinition {
+            schema_version: WORKFLOW_DEFINITION_SCHEMA_VERSION,
+            name: "workflow/child".to_string(),
+            input: document.definition.input.clone(),
+            output: document.definition.output.clone(),
+            nodes: BTreeMap::from([(
+                "commit".to_string(),
+                NodeDefinition {
+                    id: "commit".to_string(),
+                    name: "commit".to_string(),
+                    kind: NodeKind::PluginBlock,
+                    dataflow: WorkflowNodeDataflowPolicy::Direct,
+                    input: child_block.input.clone(),
+                    output: child_block.output.clone(),
+                    resources: child_block.resources.clone(),
+                    configuration: serde_json::to_value(&child_block).expect("block"),
+                },
+            )]),
+            entries: vec!["commit".to_string()],
+            exits: vec!["commit".to_string()],
+            edges: Vec::new(),
+        };
+        child.validate().expect("child");
+        let identity =
+            WorkflowDefinitionIdentity::for_definition("workflow/child", &child).expect("identity");
+        catalog
+            .workflow_definitions
+            .insert(identity.definition_id.clone(), child);
+        let node = document.definition.nodes.get_mut("agent").expect("agent");
+        node.kind = NodeKind::WorkflowCall;
+        node.resources.clear();
+        node.configuration = serde_json::to_value(WorkflowCallConfiguration {
+            version: WORKFLOW_CALL_VERSION,
+            target: WorkflowCallTarget::Definition { identity },
+        })
+        .expect("call");
+        let preview = document.compilation_preview(&catalog, None);
+        let compiled = preview.compiled.expect("compiled");
+        assert!(compiled.requirements.plugins.contains("bcode.child"));
+        assert_eq!(
+            compiled.effects.maximum_capability,
+            WorkflowToolCapability::Mutating
+        );
+        assert!(
+            compiled
+                .effects
+                .resources
+                .contains(&ResourceClaim::write("repository"))
+        );
+        assert_eq!(compiled.permissions.explicit_grant_nodes, ["agent/commit"]);
+        assert_eq!(
+            compiled.permissions.mutation_approval_nodes,
+            ["agent/commit"]
+        );
+    }
+
+    #[test]
+    fn workflow_call_preview_rejects_an_unavailable_child() {
+        let mut document = authored_document();
+        document.bindings.clear();
+        document.requirements.agents.clear();
+        let mut child = document.definition.clone();
+        child.name = "workflow/child".to_string();
+        let child_identity =
+            WorkflowDefinitionIdentity::for_definition(child.name.clone(), &child).expect("child");
+        let call = WorkflowCallConfiguration {
+            version: WORKFLOW_CALL_VERSION,
+            target: WorkflowCallTarget::Definition {
+                identity: child_identity,
+            },
+        };
+        let node = document.definition.nodes.get_mut("agent").expect("agent");
+        node.kind = NodeKind::WorkflowCall;
+        node.resources.clear();
+        node.configuration = serde_json::to_value(&call).expect("call");
+
+        let catalog = authoring_catalog();
+        let unavailable = document.compilation_preview(&catalog, None);
+        assert!(unavailable.compiled.is_none());
+        assert!(unavailable.validation.diagnostics.iter().any(|diagnostic| {
+            diagnostic.document_path == "definition.nodes.agent.configuration.target"
+                && diagnostic.message.contains("unavailable")
+        }));
+    }
+
+    #[test]
+    fn export_bundle_carries_exact_immutable_dependencies() {
+        let mut document = authored_document();
+        let child = WorkflowDefinitionIdentity {
+            kind: "workflow/child".to_string(),
+            definition_id: "workflow/child:sha256".to_string(),
+            definition_version: 1,
+        };
+        document.bindings.clear();
+        document.requirements.agents.clear();
+        let node = document.definition.nodes.get_mut("agent").expect("agent");
+        node.kind = NodeKind::WorkflowCall;
+        node.resources.clear();
+        node.configuration = serde_json::to_value(WorkflowCallConfiguration {
+            version: WORKFLOW_CALL_VERSION,
+            target: WorkflowCallTarget::Definition { identity: child },
+        })
+        .expect("call");
+        document.definition.validate().expect("definition");
+        let dependencies = workflow_dependency_manifest(&document.definition).expect("manifest");
+        let bundle = WorkflowExportBundle {
+            version: WORKFLOW_EXPORT_BUNDLE_VERSION,
+            revision: WorkflowPortableRevision {
+                identity: WorkflowRevisionIdentity {
+                    workflow_id: document.workflow_id.clone(),
+                    revision: 1,
+                },
+                source_checksum_sha256: document.source_digest_sha256().expect("source digest"),
+                executable_source_checksum_sha256: document
+                    .executable_source_digest_sha256()
+                    .expect("executable digest"),
+                definition_identity: WorkflowDefinitionIdentity::for_definition(
+                    document.workflow_id.clone(),
+                    &document.definition,
+                )
+                .expect("definition identity"),
+                producer: document.producer.clone(),
+                document,
+                published_at_ms: 1,
+            },
+            dependencies,
+        };
+        bundle.validate().expect("bundle");
+        assert_eq!(bundle.dependencies.len(), 1);
+        let mut missing = bundle;
+        missing.dependencies.clear();
+        assert!(missing.validate().is_err());
+    }
+
+    #[test]
     fn export_bundle_contains_only_immutable_portable_authoring_facts() {
         let document = authored_document();
         let bundle = WorkflowExportBundle {
@@ -9534,6 +9912,7 @@ mod tests {
                 document,
                 published_at_ms: 1,
             },
+            dependencies: Vec::new(),
         };
         bundle.validate().expect("bundle");
         let encoded = serde_json::to_value(bundle).expect("bundle JSON");

@@ -1,0 +1,23 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Confined project instruction discovery and fingerprints for bcode"
+edition     = { workspace = true }
+keywords    = ["bcode", "instructions", "repository"]
+license     = { workspace = true }
+name        = "bcode_project_instructions"
+readme      = { workspace = true }
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde     = { workspace = true, features = ["derive", "std"] }
+sha2      = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -168,6 +168,9 @@ pub struct WorkflowRunSummary {
     /// Checksum of the canonical successful terminal output.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_output_checksum_sha256: Option<String>,
+    /// Persisted immutable authorization ceiling for this run and its descendants.
+    #[serde(default)]
+    pub authorization_ceiling: bcode_workflow::WorkflowToolCapability,
     pub status: RunStatus,
     pub cancellation_requested_at_ms: Option<u64>,
     pub created_at_ms: u64,
@@ -405,6 +408,9 @@ pub struct NewWorkflowRun {
     pub input: Option<serde_json::Value>,
     /// Creation timestamp supplied by the host clock.
     pub created_at_ms: u64,
+    /// Maximum capability inherited from the initiating context for this run and descendants.
+    #[serde(default)]
+    pub authorization_ceiling: bcode_workflow::WorkflowToolCapability,
     /// Persisted execution limits enforced by durable admission.
     pub limits: WorkflowRunLimits,
 }
@@ -2926,6 +2932,7 @@ impl WorkflowStore {
     ///
     /// Returns an error for malformed input, missing definition, conflicting identity, malformed
     /// stored input, or database failure.
+    #[allow(clippy::too_many_lines)]
     pub fn create_run_idempotent(
         &mut self,
         run: &NewWorkflowRun,
@@ -2937,7 +2944,7 @@ impl WorkflowStore {
                 "SELECT definition_id, definition_version, workspace_snapshot, parent_session_id, \
                  input_json, deadline_at_ms, node_execution_cap, concurrency_cap, cycle_cap, retry_cap, \
                  owner_plugin_id, workflow_kind, scope_key, display_label, single_active, \
-                 authored_provenance_json \
+                 authored_provenance_json, authorization_ceiling \
                  FROM workflow_runs WHERE run_id = ?1",
                 [&run.run_id],
                 |row| {
@@ -2958,6 +2965,7 @@ impl WorkflowStore {
                         row.get::<_, Option<String>>(13)?,
                         row.get::<_, bool>(14)?,
                         row.get::<_, Option<String>>(15)?,
+                        row.get::<_, String>(16)?,
                     ))
                 },
             )
@@ -2979,6 +2987,7 @@ impl WorkflowStore {
             display_label,
             single_active,
             authored_provenance_json,
+            authorization_ceiling,
         )) = existing
         else {
             self.create_run(run)?;
@@ -3020,6 +3029,7 @@ impl WorkflowStore {
             && parent_session_id == run.parent_session_id
             && existing_binding == run.binding
             && authored_provenance == run.authored_provenance
+            && parse_workflow_capability(&authorization_ceiling)? == run.authorization_ceiling
             && input == run.input
             && limits == run.limits
         {
@@ -3069,7 +3079,8 @@ impl WorkflowStore {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let parent = transaction
             .query_row(
-                "SELECT run.workspace_snapshot, activation.status, definition.definition_json \
+                "SELECT run.workspace_snapshot, activation.status, definition.definition_json, \
+                        run.authorization_ceiling \
                  FROM workflow_runs run \
                  JOIN workflow_activations activation ON activation.run_id = run.run_id \
                  JOIN workflow_definitions definition ON definition.definition_id = run.definition_id \
@@ -3086,6 +3097,7 @@ impl WorkflowStore {
                         row.get::<_, String>(0)?,
                         row.get::<_, String>(1)?,
                         row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
                     ))
                 },
             )
@@ -3100,6 +3112,7 @@ impl WorkflowStore {
                 "workflow child must share the active parent workspace".to_string(),
             ));
         }
+        let parent_authorization_ceiling = parse_workflow_capability(&parent.3)?;
         let parent_definition: WorkflowDefinition = serde_json::from_str(&parent.2)?;
         let parent_definition_identity =
             bcode_workflow::WorkflowDefinitionIdentity::for_definition(
@@ -3107,6 +3120,16 @@ impl WorkflowStore {
                 &parent_definition,
             )
             .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        if request.run.authorization_ceiling > parent_authorization_ceiling {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child authorization ceiling exceeds its parent".to_string(),
+            ));
+        }
+        if request.run.binding.is_some() {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child cannot inherit or introduce an ambient product binding".to_string(),
+            ));
+        }
         let parent_node = parent_definition
             .node(&request.link.parent_node_id)
             .ok_or_else(|| {
@@ -3162,6 +3185,20 @@ impl WorkflowStore {
             ));
         }
         let target = request.link.target.definition_identity();
+        let child_definition_json: String = transaction.query_row(
+            "SELECT definition_json FROM workflow_definitions WHERE definition_id = ?1 AND version = ?2",
+            (&target.definition_id, target.definition_version),
+            |row| row.get(0),
+        )?;
+        let child_definition: WorkflowDefinition = serde_json::from_str(&child_definition_json)?;
+        if required_definition_capability(&child_definition, "")?
+            > request.run.authorization_ceiling
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow child requirements exceed the inherited authorization ceiling"
+                    .to_string(),
+            ));
+        }
         reject_recursive_child_target(
             &transaction,
             &request.link.parent_run_id,
@@ -3450,6 +3487,9 @@ impl WorkflowStore {
     }
 
     /// Return bounded grants for one run ordered by grant time and identity.
+    ///
+    /// Grants are deliberately queried by exact run identity. Child runs never inherit parent
+    /// grant rows implicitly.
     ///
     /// # Errors
     ///
@@ -6596,7 +6636,7 @@ impl WorkflowStore {
                 "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
                  parent_session_id, owner_plugin_id, workflow_kind, scope_key, display_label, \
                  single_active, authored_provenance_json, terminal_output_id, \
-                 terminal_output_checksum_sha256, status, cancellation_requested_at_ms, \
+                 terminal_output_checksum_sha256, authorization_ceiling, status, cancellation_requested_at_ms, \
                  created_at_ms, updated_at_ms \
                  FROM workflow_runs WHERE run_id = ?1",
                 [run_id],
@@ -6837,7 +6877,7 @@ impl WorkflowStore {
             "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
              parent_session_id, owner_plugin_id, workflow_kind, scope_key, display_label, \
              single_active, authored_provenance_json, terminal_output_id, \
-             terminal_output_checksum_sha256, status, cancellation_requested_at_ms, \
+             terminal_output_checksum_sha256, authorization_ceiling, status, cancellation_requested_at_ms, \
              created_at_ms, updated_at_ms \
              FROM workflow_runs ORDER BY updated_at_ms DESC, run_id LIMIT ?1",
         )?;
@@ -6870,7 +6910,7 @@ impl WorkflowStore {
                 "SELECT run_id, definition_id, definition_version, workspace_snapshot, \
                  parent_session_id, owner_plugin_id, workflow_kind, scope_key, display_label, \
                  single_active, authored_provenance_json, terminal_output_id, \
-                 terminal_output_checksum_sha256, status, cancellation_requested_at_ms, \
+                 terminal_output_checksum_sha256, authorization_ceiling, status, cancellation_requested_at_ms, \
                  created_at_ms, updated_at_ms \
                  FROM workflow_runs WHERE owner_plugin_id = ?1 AND workflow_kind = ?2 \
                  AND scope_key = ?3 ORDER BY updated_at_ms DESC, run_id LIMIT 1",
@@ -8163,9 +8203,25 @@ fn apply_attempt_observation(
             request.dispatch_identity, current_status
         )));
     }
-    if cancellation_requested_for_run(transaction, &request.run_id)?
-        || sibling_cancellation_requested_for_attempt(transaction, &request.dispatch_identity)?
+    let cancellation_requested = cancellation_requested_for_run(transaction, &request.run_id)?
+        || sibling_cancellation_requested_for_attempt(transaction, &request.dispatch_identity)?;
+    let child_attempt = request
+        .receipt
+        .get("owner")
+        .and_then(serde_json::Value::as_str)
+        == Some("bcode.server.workflow-child/v1");
+    if cancellation_requested
+        && child_attempt
+        && matches!(
+            observation,
+            AttemptObservation::Admitted | AttemptObservation::Running
+        )
     {
+        transition_attempt(transaction, request, "cancelling", None)?;
+        summary.running.push(request.dispatch_identity.clone());
+        return Ok(());
+    }
+    if cancellation_requested {
         observation = AttemptObservation::Cancelled;
     }
     match observation {
@@ -8549,6 +8605,7 @@ type RawRunSummary = (
     Option<String>,
     Option<String>,
     String,
+    String,
     Option<u64>,
     u64,
     u64,
@@ -8573,6 +8630,7 @@ fn run_summary_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawRunSumma
         row.get(14)?,
         row.get(15)?,
         row.get(16)?,
+        row.get(17)?,
     ))
 }
 
@@ -8591,6 +8649,7 @@ fn parse_run_summary(raw: RawRunSummary) -> Result<WorkflowRunSummary, WorkflowS
         authored_provenance_json,
         terminal_output_id,
         terminal_output_checksum_sha256,
+        authorization_ceiling,
         status,
         cancellation_requested_at_ms,
         created_at_ms,
@@ -8640,11 +8699,35 @@ fn parse_run_summary(raw: RawRunSummary) -> Result<WorkflowRunSummary, WorkflowS
         authored_provenance,
         terminal_output_id,
         terminal_output_checksum_sha256,
+        authorization_ceiling: parse_workflow_capability(&authorization_ceiling)?,
         status: parse_run_status(&status)?,
         cancellation_requested_at_ms,
         created_at_ms,
         updated_at_ms,
     })
+}
+
+const fn workflow_capability_name(
+    capability: bcode_workflow::WorkflowToolCapability,
+) -> &'static str {
+    match capability {
+        bcode_workflow::WorkflowToolCapability::Disabled => "disabled",
+        bcode_workflow::WorkflowToolCapability::ReadOnly => "read_only",
+        bcode_workflow::WorkflowToolCapability::Mutating => "mutating",
+    }
+}
+
+fn parse_workflow_capability(
+    capability: &str,
+) -> Result<bcode_workflow::WorkflowToolCapability, WorkflowStoreError> {
+    match capability {
+        "disabled" => Ok(bcode_workflow::WorkflowToolCapability::Disabled),
+        "read_only" => Ok(bcode_workflow::WorkflowToolCapability::ReadOnly),
+        "mutating" => Ok(bcode_workflow::WorkflowToolCapability::Mutating),
+        _ => Err(WorkflowStoreError::InvalidData(format!(
+            "unknown workflow authorization ceiling: {capability}"
+        ))),
+    }
 }
 
 fn parse_run_status(status: &str) -> Result<RunStatus, WorkflowStoreError> {
@@ -9260,10 +9343,10 @@ fn create_run_in_transaction(
         "INSERT INTO workflow_runs \
              (run_id, definition_id, definition_version, workspace_snapshot, parent_session_id, \
               owner_plugin_id, workflow_kind, scope_key, display_label, single_active, \
-              authored_provenance_json, input_json, status, deadline_at_ms, node_execution_cap, \
-              concurrency_cap, cycle_cap, retry_cap, created_at_ms, updated_at_ms) \
+              authored_provenance_json, input_json, authorization_ceiling, status, deadline_at_ms, \
+              node_execution_cap, concurrency_cap, cycle_cap, retry_cap, created_at_ms, updated_at_ms) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
-                     ?17, ?18, ?19, ?19)",
+                     ?17, ?18, ?19, ?20, ?20)",
         rusqlite::params![
             &run.run_id,
             &run.definition_id,
@@ -9277,6 +9360,7 @@ fn create_run_in_transaction(
             single_active,
             &authored_provenance_json,
             &input_json,
+            workflow_capability_name(run.authorization_ceiling),
             RunStatus::Running.as_str(),
             run.limits.deadline_at_ms,
             run.limits.node_execution_cap,
@@ -9380,6 +9464,35 @@ fn reject_recursive_child_target(
         ));
     }
     Ok(())
+}
+
+fn required_definition_capability(
+    definition: &WorkflowDefinition,
+    excluded_call_node: &str,
+) -> Result<bcode_workflow::WorkflowToolCapability, WorkflowStoreError> {
+    definition
+        .nodes
+        .values()
+        .filter(|node| node.id != excluded_call_node)
+        .try_fold(
+            bcode_workflow::WorkflowToolCapability::Disabled,
+            |maximum, node| {
+                let capability = match node.kind {
+                    bcode_workflow::NodeKind::Agent => {
+                        let configuration: bcode_workflow::WorkflowAgentConfiguration =
+                            serde_json::from_value(node.configuration.clone())?;
+                        configuration.tool_capability
+                    }
+                    bcode_workflow::NodeKind::PluginBlock => {
+                        let block: bcode_workflow::WorkflowBlockDefinition =
+                            serde_json::from_value(node.configuration.clone())?;
+                        block.authorization.capability
+                    }
+                    _ => bcode_workflow::WorkflowToolCapability::Disabled,
+                };
+                Ok(maximum.max(capability))
+            },
+        )
 }
 
 fn validate_run_link(
@@ -10119,6 +10232,7 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
              single_active INTEGER NOT NULL DEFAULT 0,\
              authored_provenance_json TEXT,\
              input_json TEXT,\
+             authorization_ceiling TEXT NOT NULL DEFAULT 'disabled',\
              terminal_output_id TEXT,\
              terminal_output_checksum_sha256 TEXT,\
              status TEXT NOT NULL,\
@@ -10462,6 +10576,15 @@ fn migrate(connection: &mut Connection) -> Result<(), WorkflowStoreError> {
             [],
         )?;
     }
+    if !run_columns
+        .iter()
+        .any(|existing| existing == "authorization_ceiling")
+    {
+        transaction.execute(
+            "ALTER TABLE workflow_runs ADD COLUMN authorization_ceiling TEXT NOT NULL DEFAULT 'disabled'",
+            [],
+        )?;
+    }
     transaction.execute(
         "UPDATE workflow_store_contract SET schema_version = 9 \
          WHERE contract_id = 1 AND schema_version = 8",
@@ -10622,6 +10745,7 @@ mod tests {
             ),
             plugins: std::collections::BTreeSet::new(),
             blocks: BTreeMap::new(),
+            workflow_definitions: BTreeMap::new(),
             agent_profiles: std::collections::BTreeSet::from(["review".to_string()]),
             skills: std::collections::BTreeSet::new(),
         };
@@ -10906,6 +11030,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(input),
                 created_at_ms: 10,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -10999,6 +11124,7 @@ mod tests {
                     authored_provenance: None,
                     input: Some(input),
                     created_at_ms: 10,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: WorkflowRunLimits::default(),
                 })
                 .expect("run");
@@ -11100,6 +11226,7 @@ mod tests {
                     authored_provenance: None,
                     input: Some(input),
                     created_at_ms: 10,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: WorkflowRunLimits::default(),
                 })
                 .expect("run");
@@ -11147,6 +11274,7 @@ mod tests {
                     authored_provenance: None,
                     input: Some(input.clone()),
                     created_at_ms: 10,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: WorkflowRunLimits::default(),
                 })
                 .expect("run");
@@ -11201,6 +11329,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(input.clone()),
                 created_at_ms: 10,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -11242,6 +11371,7 @@ mod tests {
             authored_provenance: None,
             input: Some(serde_json::json!(1)),
             created_at_ms: 10,
+            authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
             limits: WorkflowRunLimits::default(),
         }
     }
@@ -11457,6 +11587,7 @@ mod tests {
                 ..run.clone()
             },
             NewWorkflowRun {
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits {
                     retry_cap: run.limits.retry_cap + 1,
                     ..run.limits.clone()
@@ -11954,6 +12085,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -12040,6 +12172,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -12125,6 +12258,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits {
                     cycle_cap: 1,
                     ..WorkflowRunLimits::default()
@@ -12201,6 +12335,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits {
                     cycle_cap: 2,
                     ..WorkflowRunLimits::default()
@@ -12290,6 +12425,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!({"condition_met": false, "iteration": 1})),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits {
                     cycle_cap: 1,
                     ..WorkflowRunLimits::default()
@@ -12898,6 +13034,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
             .expect("parent run");
@@ -12949,6 +13086,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 3,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             },
         };
@@ -12986,6 +13124,49 @@ mod tests {
         assert_eq!(
             store.child_run_links("parent-run", 10).expect("links"),
             std::slice::from_ref(&request.link)
+        );
+        let receipt = store
+            .active_attempts_for_run("parent-run", 10)
+            .expect("attempt")
+            .pop()
+            .expect("attempt");
+        store
+            .request_cancellation("parent-run", 4)
+            .expect("cancel parent");
+        let running = store
+            .observe_child_attempt(&receipt, 5)
+            .expect("observe running child");
+        let summary = store
+            .apply_attempt_observation(&receipt.dispatch_identity, running, 5)
+            .expect("parent remains cancelling");
+        assert_eq!(
+            summary.running,
+            std::slice::from_ref(&receipt.dispatch_identity)
+        );
+        assert_eq!(
+            store
+                .attempt_history("parent-run", None, 10)
+                .expect("attempts")[0]
+                .status,
+            "cancelling"
+        );
+        store
+            .request_cancellation(&child_run_id, 6)
+            .expect("cancel child");
+        let cancelled = store
+            .observe_child_attempt(&receipt, 7)
+            .expect("observe cancelled child");
+        let summary = store
+            .apply_attempt_observation(&receipt.dispatch_identity, cancelled, 7)
+            .expect("settle parent cancellation");
+        assert_eq!(summary.cancelled, [receipt.dispatch_identity]);
+        assert_eq!(
+            store
+                .run_summary("parent-run")
+                .expect("parent")
+                .expect("parent")
+                .status,
+            RunStatus::Cancelled
         );
         drop(store);
         let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("restart");
@@ -13027,6 +13208,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
             .expect("parent run");
@@ -13078,6 +13260,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 3,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             },
         };
@@ -13093,6 +13276,119 @@ mod tests {
         request.link.depth = MAX_WORKFLOW_RUN_DEPTH + 1;
         assert!(store.create_child_run_idempotent(&request).is_err());
         assert!(store.run_summary(&child_id).expect("child").is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn child_creation_rejects_recursive_target_and_authority_escalation() {
+        let (_temp, mut store) = initialized_store();
+        let parent_definition = definition("example");
+        let parent_identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+            parent_definition.name.clone(),
+            &parent_definition,
+        )
+        .expect("identity");
+        let call_definition = workflow_call_definition(parent_identity.clone());
+        store
+            .persist_definition("call-parent", 1, &call_definition)
+            .expect("parent definition");
+        store
+            .persist_definition(
+                &parent_identity.definition_id,
+                parent_identity.definition_version,
+                &parent_definition,
+            )
+            .expect("target definition");
+        store
+            .create_run(&NewWorkflowRun {
+                run_id: "recursive-parent".to_string(),
+                definition_id: "call-parent".to_string(),
+                definition_version: 1,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!(1)),
+                created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::ReadOnly,
+                limits: WorkflowRunLimits::default(),
+            })
+            .expect("parent run");
+        let activation = store
+            .pending_activations(10)
+            .expect("pending")
+            .pop()
+            .expect("call");
+        store
+            .prepare_pending_activation(
+                "recursive-parent",
+                "call",
+                &activation.activation_id,
+                DispatchSideEffect::ReadOnly,
+                serde_json::json!({}),
+                2,
+            )
+            .expect("prepare");
+        let target = bcode_workflow::WorkflowCallTarget::Definition {
+            identity: parent_identity.clone(),
+        };
+        let child_run_id = workflow_child_run_id(
+            "recursive-parent",
+            "recursive-parent",
+            &activation.activation_id,
+            1,
+            &target,
+        );
+        let parent_call_identity = bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+            call_definition.name.clone(),
+            &call_definition,
+        )
+        .expect("parent call identity");
+        {
+            let transaction = store.connection.transaction().expect("transaction");
+            assert!(
+                reject_recursive_child_target(
+                    &transaction,
+                    "recursive-parent",
+                    &parent_call_identity,
+                    &parent_call_identity,
+                )
+                .is_err()
+            );
+            transaction.rollback().expect("rollback");
+        }
+        let mut request = NewChildWorkflowRun {
+            link: WorkflowRunLink {
+                version: WORKFLOW_RUN_LINK_VERSION,
+                root_run_id: "recursive-parent".to_string(),
+                parent_run_id: "recursive-parent".to_string(),
+                parent_node_id: "call".to_string(),
+                parent_activation_id: activation.activation_id,
+                parent_attempt: 1,
+                child_run_id: child_run_id.clone(),
+                target,
+                depth: 2,
+                created_at_ms: 3,
+            },
+            run: NewWorkflowRun {
+                run_id: child_run_id.clone(),
+                definition_id: parent_identity.definition_id,
+                definition_version: parent_identity.definition_version,
+                workspace_snapshot: "snapshot".to_string(),
+                parent_session_id: None,
+                binding: None,
+                authored_provenance: None,
+                input: Some(serde_json::json!(1)),
+                created_at_ms: 3,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
+                limits: WorkflowRunLimits::default(),
+            },
+        };
+        assert!(store.create_child_run_idempotent(&request).is_err());
+        assert!(store.run_summary(&child_run_id).expect("child").is_none());
+        request.run.authorization_ceiling = bcode_workflow::WorkflowToolCapability::ReadOnly;
+        assert!(store.create_child_run_idempotent(&request).is_err());
+        assert!(store.run_summary(&child_run_id).expect("child").is_none());
     }
 
     #[test]
@@ -14049,6 +14345,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(3)),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -14531,6 +14828,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits {
                     concurrency_cap: 2,
                     ..WorkflowRunLimits::default()
@@ -14704,6 +15002,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -14915,6 +15214,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
             .expect_err("entry schema mismatch");
@@ -15127,6 +15427,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -15229,6 +15530,7 @@ mod tests {
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: WorkflowRunLimits {
                     concurrency_cap: 2,
                     ..WorkflowRunLimits::default()
@@ -15510,6 +15812,7 @@ mod tests {
                     authored_provenance: None,
                     input: Some(value.clone()),
                     created_at_ms: 1,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: WorkflowRunLimits::default(),
                 })
                 .expect("run");

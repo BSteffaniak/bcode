@@ -30,8 +30,10 @@ pub const SHELL_RECORDING_MEDIA_TYPE: &str = "application/x-bcode-shell-recordin
 /// Current authoritative shell recording content type.
 pub const SHELL_RECORDING_CONTENT_TYPE: &str = "application/x-bcode-shell-recording; version=3";
 
+/// Legacy typed command-plan workflow block contract version.
+pub const SHELL_COMMAND_PLAN_VERSION_1: u32 = 1;
 /// Current typed command-plan workflow block contract version.
-pub const SHELL_COMMAND_PLAN_VERSION: u32 = 1;
+pub const SHELL_COMMAND_PLAN_VERSION: u32 = 2;
 
 /// One argv-mode command. No implicit shell-string parsing is performed.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -39,7 +41,15 @@ pub const SHELL_COMMAND_PLAN_VERSION: u32 = 1;
 pub struct ShellWorkflowCommand {
     pub argv: Vec<String>,
     pub timeout_ms: u64,
+    /// Version-1 continuation policy retained for exact compatibility.
+    #[serde(default)]
     pub continue_on_nonzero: bool,
+    /// Accepted process exit codes. Version 1 always uses `[0]`; version 2 defaults to `[0]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_exit_codes: Option<Vec<i32>>,
+    /// Whether version 2 continues after an exited code outside the accepted set.
+    #[serde(default)]
+    pub continue_on_unaccepted_exit: bool,
 }
 
 /// Explicit environment policy for a workflow command plan.
@@ -90,6 +100,8 @@ pub struct ShellWorkflowCommandResult {
     pub index: u32,
     pub status: ShellWorkflowCommandStatus,
     pub exit_code: Option<i32>,
+    /// Exact accepted exit codes used to classify this command.
+    pub accepted_exit_codes: Vec<i32>,
     pub signal: Option<i32>,
     pub duration_ms: u64,
     pub stdout_preview: String,
@@ -206,6 +218,8 @@ mod tests {
                 argv: vec!["cargo".to_string(), "test".to_string()],
                 timeout_ms: 30_000,
                 continue_on_nonzero: false,
+                accepted_exit_codes: None,
+                continue_on_unaccepted_exit: false,
             }],
             environment: ShellWorkflowEnvironment {
                 inherit: false,
@@ -217,7 +231,7 @@ mod tests {
             },
         };
         let payload = serde_json::to_value(&plan).expect("encode");
-        assert_eq!(payload["version"], 1);
+        assert_eq!(payload["version"], SHELL_COMMAND_PLAN_VERSION);
         assert_eq!(
             payload["commands"][0]["argv"],
             serde_json::json!(["cargo", "test"])
@@ -229,6 +243,25 @@ mod tests {
     }
 
     #[test]
+    fn workflow_command_plan_v1_decodes_without_v2_fields() {
+        let payload = serde_json::json!({
+            "version": SHELL_COMMAND_PLAN_VERSION_1,
+            "cwd": ".",
+            "commands": [{
+                "argv": ["true"],
+                "timeout_ms": 1_000,
+                "continue_on_nonzero": false
+            }],
+            "environment": {"inherit": false, "set": {}},
+            "output": {"preview_bytes": 1_024, "artifact_spill": false}
+        });
+        let plan: ShellWorkflowCommandPlan = serde_json::from_value(payload).expect("version 1");
+        assert_eq!(plan.version, SHELL_COMMAND_PLAN_VERSION_1);
+        assert_eq!(plan.commands[0].accepted_exit_codes, None);
+        assert!(!plan.commands[0].continue_on_unaccepted_exit);
+    }
+
+    #[test]
     fn workflow_command_plan_result_carries_terminal_detail_and_artifacts() {
         let result = ShellWorkflowCommandPlanResult {
             version: SHELL_COMMAND_PLAN_VERSION,
@@ -237,6 +270,7 @@ mod tests {
                 index: 0,
                 status: ShellWorkflowCommandStatus::Exited,
                 exit_code: Some(1),
+                accepted_exit_codes: vec![0],
                 signal: None,
                 duration_ms: 12,
                 stdout_preview: String::new(),

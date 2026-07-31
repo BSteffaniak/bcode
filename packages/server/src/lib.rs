@@ -13056,9 +13056,11 @@ async fn handle_export_workflow_revision(
                 request.workflow_id, request.revision
             ))
         })?;
+    let dependencies = bcode_workflow::workflow_dependency_manifest(&revision.document.definition)?;
     let bundle = bcode_workflow::WorkflowExportBundle {
         version: bcode_workflow::WORKFLOW_EXPORT_BUNDLE_VERSION,
         revision: portable_workflow_revision(revision),
+        dependencies,
     };
     bundle.validate()?;
     send_response(
@@ -13931,6 +13933,21 @@ async fn workflow_authoring_catalog_snapshot(
             .map(|skill| skill.id.to_string())
             .collect()
     });
+    let workflow_definitions = {
+        let store = state
+            .workflow_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        store
+            .list_definitions(1_000)?
+            .into_iter()
+            .map(|stored| {
+                let definition: bcode_workflow::WorkflowDefinition =
+                    serde_json::from_str(&stored.definition_json)?;
+                Ok((stored.definition_id, definition))
+            })
+            .collect::<Result<BTreeMap<_, _>, WorkflowStoreError>>()?
+    };
     let catalog = bcode_workflow::WorkflowAuthoringCatalogSnapshot {
         version: bcode_workflow::WORKFLOW_AUTHORING_CATALOG_VERSION,
         capabilities: bcode_workflow::WorkflowAuthoringCapabilitySummary::from(
@@ -13938,6 +13955,7 @@ async fn workflow_authoring_catalog_snapshot(
         ),
         plugins,
         blocks,
+        workflow_definitions,
         agent_profiles,
         skills,
     };
@@ -14568,6 +14586,7 @@ async fn start_workflow_run(
         authored_provenance,
         input: request.input,
         created_at_ms,
+        authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
         limits: request.limits,
     };
     let run = {
@@ -21563,10 +21582,22 @@ fn build_repository_context_parts(
         "* Detected project files: {}",
         detected_project_files(context_root).join(", ")
     ));
-    if let Some(instructions) =
-        read_nearest_agent_instructions(cwd, context_root, repository_instructions_max_chars)
-    {
-        stable_lines.push(format!("* Project instructions excerpt:\n{instructions}"));
+    if let Ok(instructions) = bcode_project_instructions::discover_project_instructions(
+        context_root,
+        &[cwd.to_path_buf()],
+        bcode_project_instructions::DEFAULT_MAX_INSTRUCTION_BYTES,
+    ) {
+        let content = instructions.content();
+        if !content.is_empty() {
+            let content = repository_instructions_max_chars.map_or_else(
+                || content.clone(),
+                |max_chars| truncate_text(&content, max_chars),
+            );
+            stable_lines.push(format!(
+                "* Project instructions (fingerprint {}):\n{content}",
+                instructions.fingerprint_sha256
+            ));
+        }
     }
 
     let mut dynamic_lines = vec![
@@ -21652,35 +21683,6 @@ fn detected_project_files(root: &Path) -> Vec<String> {
     } else {
         detected
     }
-}
-
-fn read_nearest_agent_instructions(
-    cwd: &Path,
-    stop_at: &Path,
-    max_chars: Option<usize>,
-) -> Option<String> {
-    let mut current = Some(cwd);
-    while let Some(directory) = current {
-        let candidate = directory.join("AGENTS.md");
-        if candidate.exists() {
-            return read_file_with_optional_limit(&candidate, max_chars);
-        }
-        if directory == stop_at {
-            break;
-        }
-        current = directory.parent();
-    }
-    None
-}
-
-fn read_file_with_optional_limit(path: &Path, max_chars: Option<usize>) -> Option<String> {
-    fs::read_to_string(path).ok().map(|text| {
-        let text = text.trim();
-        max_chars.map_or_else(
-            || text.to_string(),
-            |max_chars| truncate_text(text, max_chars),
-        )
-    })
 }
 
 fn truncate_text(text: &str, max_chars: usize) -> String {
@@ -26985,6 +26987,7 @@ async fn dispatch_workflow_child(
             authored_provenance,
             input: request.activation.input.clone(),
             created_at_ms: now,
+            authorization_ceiling: parent.authorization_ceiling,
             limits: child_limits.unwrap_or(parent_limits),
         },
     };
@@ -28107,12 +28110,36 @@ async fn signal_workflow_attempt_cancellation(
                     "workflow child cancellation receipt has no child_run_id".to_string(),
                 )
             })?;
-        let mut store = state
-            .workflow_store
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = store.request_cancellation(child_run_id, current_unix_millis())?;
-        drop(store);
+        let child_status = {
+            let mut store = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = store.request_cancellation(child_run_id, current_unix_millis())?;
+            store
+                .run_summary(child_run_id)?
+                .ok_or_else(|| {
+                    WorkflowStoreError::InvalidData(
+                        "workflow child cancellation target is missing".to_string(),
+                    )
+                })?
+                .status
+        };
+        if matches!(
+            child_status,
+            bcode_workflow_store::RunStatus::Running | bcode_workflow_store::RunStatus::Paused
+        ) {
+            let child_attempts = state
+                .workflow_store
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .active_attempt_cancellations(child_run_id, 1_000)?;
+            Box::pin(propagate_persisted_workflow_cancellation(
+                state,
+                child_attempts,
+            ))
+            .await?;
+        }
         return Ok(());
     }
     let work_id = WorkId::new(attempt.dispatch_identity.clone());
@@ -30828,6 +30855,7 @@ mod tests {
         let bundle = bcode_workflow::WorkflowExportBundle {
             version: bcode_workflow::WORKFLOW_EXPORT_BUNDLE_VERSION,
             revision: portable_workflow_revision(publication.revision.clone()),
+            dependencies: Vec::new(),
         };
         bundle.validate().expect("bundle");
         let target = "authored/round-trip".to_string();
@@ -31494,6 +31522,7 @@ mod tests {
                 producer: document.producer.clone(),
                 published_at_ms: 1,
             },
+            dependencies: Vec::new(),
         };
         let target_workflow_id = "authored/existing".to_string();
         let now = current_time_ms();
@@ -46921,6 +46950,7 @@ library = "test"
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -47103,6 +47133,7 @@ library = "test"
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -47262,6 +47293,7 @@ library = "test"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
                 .expect("run");
@@ -47389,6 +47421,7 @@ library = "test"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
                 .expect("run");
@@ -47549,6 +47582,7 @@ library = "test"
                     authored_provenance: None,
                     input: Some(serde_json::json!({"condition_met": false})),
                     created_at_ms: 1,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
                 .expect("run");
@@ -47890,6 +47924,7 @@ library = "test"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
                 .expect("run");
@@ -48096,6 +48131,7 @@ library = "test"
                     authored_provenance: None,
                     input: Some(serde_json::json!({"condition_met": false})),
                     created_at_ms: 1,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
                 .expect("run");
@@ -48327,6 +48363,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!({"delay_ms": 5_000})),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -48486,6 +48523,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!({"delay_ms": 5_000})),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -48697,6 +48735,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::to_value(input).expect("input")),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -49036,6 +49075,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     "paths": ["tracked.txt"],
                 })),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -49876,6 +49916,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     authored_provenance: None,
                     input: Some(serde_json::Value::Null),
                     created_at_ms: 1,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
                 .expect("run");
@@ -50042,6 +50083,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -50182,6 +50224,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
                 .expect("run");
@@ -50368,6 +50411,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
                 .expect("run");
@@ -50474,6 +50518,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
                 .expect("run");
@@ -50561,6 +50606,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!(false)),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -50691,6 +50737,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -50785,6 +50832,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -50868,6 +50916,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!(true)),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");
@@ -50963,6 +51012,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     authored_provenance: None,
                     input: Some(serde_json::json!(false)),
                     created_at_ms: 1,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
                 .expect("run");
@@ -51211,6 +51261,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
                 .expect("run");
@@ -51268,6 +51319,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     authored_provenance: None,
                     input: Some(serde_json::json!(1)),
                     created_at_ms: 1,
+                    authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                     limits: bcode_workflow_store::WorkflowRunLimits::default(),
                 })
                 .expect("run");
@@ -51367,6 +51419,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 authored_provenance: None,
                 input: Some(serde_json::json!(1)),
                 created_at_ms: 1,
+                authorization_ceiling: bcode_workflow::WorkflowToolCapability::Mutating,
                 limits: bcode_workflow_store::WorkflowRunLimits::default(),
             })
             .expect("run");

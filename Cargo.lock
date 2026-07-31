@@ -2189,6 +2189,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bcode_project_instructions"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "bcode_provider_auth"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -2306,6 +2316,7 @@ dependencies = [
  "bcode_model_provider_runtime",
  "bcode_plugin",
  "bcode_plugin_sdk",
+ "bcode_project_instructions",
  "bcode_provider_auth",
  "bcode_question_plugin",
  "bcode_ralph",

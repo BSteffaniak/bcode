@@ -244,6 +244,33 @@ if ! rg -q 'FieldsEqual' packages/workflow/src/lib.rs \
   violations=1
 fi
 
+if rg -q 'fn read_nearest_agent_instructions' packages/server/src/lib.rs \
+  || ! rg -q 'bcode_project_instructions::discover_project_instructions' packages/server/src/lib.rs \
+  || ! rg -q 'pub fn discover_project_instructions' packages/project-instructions/src/lib.rs; then
+  echo "Project-instruction ownership violation: discovery must remain domain-owned and shared." >&2
+  violations=1
+fi
+
+if ! rg -q 'workflow_definitions: BTreeMap' packages/workflow/src/lib.rs \
+  || ! rg -q 'resolve_authoring_workflow_call' packages/workflow/src/lib.rs \
+  || ! rg -q 'authorization_ceiling' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'workflow child authorization ceiling exceeds its parent' \
+    packages/workflow-store/src/lib.rs \
+  || ! rg -q 'Child runs never inherit parent' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'SHELL_COMMAND_PLAN_VERSION_1' plugins/shell-plugin/src/contracts.rs \
+  || ! rg -q 'accepted_exit_codes' plugins/shell-plugin/src/contracts.rs \
+  || ! rg -q 'continue_on_unaccepted_exit' plugins/shell-plugin/src/contracts.rs; then
+  echo "Workflow composition violation: recursive preview, authorization ceilings, or shell plan contracts were removed." >&2
+  violations=1
+fi
+
+if ! rg -q 'WorkflowDependencyManifestEntry' packages/workflow/src/lib.rs \
+  || ! rg -q 'workflow_dependency_manifest' packages/workflow/src/lib.rs \
+  || ! rg -q 'workflow_dependency_manifest' packages/server/src/lib.rs; then
+  echo "Workflow dependency-manifest violation: portable export/import no longer binds exact child targets." >&2
+  violations=1
+fi
+
 if ! rg -q 'NodeKind::WorkflowCall' packages/workflow/src/lib.rs \
   || ! rg -q 'WorkflowCallTarget' packages/workflow/src/lib.rs \
   || ! rg -q 'workflow call nodes must not retain resource leases' packages/workflow/src/lib.rs \
