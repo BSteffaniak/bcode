@@ -95,15 +95,7 @@ pub async fn handle_slash_palette_key<W: Write>(
             match outcome.request {
                 KeyRequest::None | KeyRequest::CycleAgent => {}
                 KeyRequest::CycleThinkingEffort => {
-                    if let Err(error) =
-                        thinking_flow::cycle_thinking_effort(services.client, chat).await
-                    {
-                        helpers::report_client_error(
-                            &mut chat.app,
-                            "reasoning effort failed",
-                            &error,
-                        );
-                    }
+                    thinking_flow::cycle_thinking_effort(chat);
                 }
                 KeyRequest::Interrupt => request_turn_cancellation(services.client, chat).await,
                 KeyRequest::Submit { placement } => {

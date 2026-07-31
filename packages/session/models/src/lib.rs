@@ -1019,6 +1019,17 @@ pub struct TurnStructuredOutputRequest {
     pub strict: bool,
 }
 
+/// Provider-neutral reasoning request overrides applied to one admitted turn.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TurnReasoningOptions {
+    /// Immutable provider-native effort label selected from advertised model capabilities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    /// Immutable provider-native reasoning summary label selected from advertised capabilities.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
 /// Generic execution options applied to one admitted turn.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TurnExecutionOptions {
@@ -1042,6 +1053,9 @@ pub struct TurnExecutionOptions {
     /// Immutable provider-neutral requested model identifier for this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    /// Immutable provider-neutral reasoning request overrides for this turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<Box<TurnReasoningOptions>>,
     /// Optional provider-neutral structured-output request for this turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub structured_output: Option<TurnStructuredOutputRequest>,
@@ -1050,8 +1064,10 @@ pub struct TurnExecutionOptions {
     pub skill_contexts: Vec<SkillContextResponse>,
 }
 
+/// Earliest persisted turn execution-options schema version accepted by this build.
+pub const MIN_TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 1;
 /// Current persisted turn execution-options schema version.
-pub const TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 1;
+pub const TURN_EXECUTION_OPTIONS_SCHEMA_VERSION: u32 = 2;
 
 const fn turn_execution_options_schema_version() -> u32 {
     TURN_EXECUTION_OPTIONS_SCHEMA_VERSION
@@ -1067,6 +1083,7 @@ impl Default for TurnExecutionOptions {
             tool_allowlist: None,
             provider_plugin_id: None,
             model_id: None,
+            reasoning: None,
             structured_output: None,
             skill_contexts: Vec::new(),
         }
@@ -1093,6 +1110,7 @@ const MAX_TURN_EXECUTION_UNIT_ID_BYTES: usize = 512;
 const MAX_TURN_AGENT_PROFILE_BYTES: usize = 256;
 const MAX_TURN_PROVIDER_PLUGIN_ID_BYTES: usize = 256;
 const MAX_TURN_MODEL_ID_BYTES: usize = 512;
+const MAX_TURN_REASONING_VALUE_BYTES: usize = 128;
 const MAX_TURN_TOOL_ALLOWLIST_ENTRIES: usize = 256;
 const MAX_TURN_TOOL_NAME_BYTES: usize = 256;
 const MAX_TURN_SKILL_CONTEXTS: usize = 32;
@@ -1165,6 +1183,10 @@ pub enum TurnAdmissionMetadataError {
     ProviderPluginIdTooLong,
     EmptyModelId,
     ModelIdTooLong,
+    EmptyReasoningEffort,
+    ReasoningEffortTooLong,
+    EmptyReasoningSummary,
+    ReasoningSummaryTooLong,
     EmptyStructuredOutputName,
     InvalidStructuredOutputName,
     StructuredOutputNameTooLong,
@@ -1206,6 +1228,10 @@ impl Display for TurnAdmissionMetadataError {
             Self::ProviderPluginIdTooLong => "turn provider plugin ID is too long",
             Self::EmptyModelId => "turn model ID must not be empty",
             Self::ModelIdTooLong => "turn model ID is too long",
+            Self::EmptyReasoningEffort => "turn reasoning effort must not be empty",
+            Self::ReasoningEffortTooLong => "turn reasoning effort is too long",
+            Self::EmptyReasoningSummary => "turn reasoning summary must not be empty",
+            Self::ReasoningSummaryTooLong => "turn reasoning summary is too long",
             Self::EmptyStructuredOutputName => "turn structured-output name must not be empty",
             Self::InvalidStructuredOutputName => {
                 "turn structured-output name may contain only ASCII letters, digits, underscores, and hyphens"
@@ -1292,8 +1318,16 @@ impl TurnAdmissionMetadata {
     ///
     /// Returns an error when producer/idempotency fields are empty where identity requires them
     /// or exceed their durable bounds.
+    #[allow(clippy::too_many_lines)]
     pub fn validate(&self) -> Result<(), TurnAdmissionMetadataError> {
-        if self.execution.schema_version != TURN_EXECUTION_OPTIONS_SCHEMA_VERSION {
+        if !(MIN_TURN_EXECUTION_OPTIONS_SCHEMA_VERSION..=TURN_EXECUTION_OPTIONS_SCHEMA_VERSION)
+            .contains(&self.execution.schema_version)
+        {
+            return Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion);
+        }
+        if self.execution.schema_version < TURN_EXECUTION_OPTIONS_SCHEMA_VERSION
+            && self.execution.reasoning.is_some()
+        {
             return Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion);
         }
         if self
@@ -1374,6 +1408,24 @@ impl TurnAdmissionMetadata {
             }
             if model.len() > MAX_TURN_MODEL_ID_BYTES {
                 return Err(TurnAdmissionMetadataError::ModelIdTooLong);
+            }
+        }
+        if let Some(reasoning) = &self.execution.reasoning {
+            if let Some(effort) = &reasoning.effort {
+                if effort.is_empty() {
+                    return Err(TurnAdmissionMetadataError::EmptyReasoningEffort);
+                }
+                if effort.len() > MAX_TURN_REASONING_VALUE_BYTES {
+                    return Err(TurnAdmissionMetadataError::ReasoningEffortTooLong);
+                }
+            }
+            if let Some(summary) = &reasoning.summary {
+                if summary.is_empty() {
+                    return Err(TurnAdmissionMetadataError::EmptyReasoningSummary);
+                }
+                if summary.len() > MAX_TURN_REASONING_VALUE_BYTES {
+                    return Err(TurnAdmissionMetadataError::ReasoningSummaryTooLong);
+                }
             }
         }
         if let Some(request) = &self.execution.structured_output {
@@ -3088,6 +3140,10 @@ mod tests {
                 tool_allowlist: Some(vec!["filesystem.read".to_string(), "git.diff".to_string()]),
                 provider_plugin_id: Some("bcode.fake-provider".to_string()),
                 model_id: Some("fake-structured".to_string()),
+                reasoning: Some(Box::new(TurnReasoningOptions {
+                    effort: Some("high".to_string()),
+                    summary: Some("detailed".to_string()),
+                })),
                 structured_output: Some(TurnStructuredOutputRequest {
                     name: "review_result".to_string(),
                     schema: serde_json::json!({
@@ -3110,6 +3166,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn turn_execution_overrides_reject_empty_and_duplicate_values() {
         let empty_profile = TurnAdmissionMetadata {
             execution: TurnExecutionOptions {
@@ -3121,6 +3178,21 @@ mod tests {
         assert_eq!(
             empty_profile.validate(),
             Err(TurnAdmissionMetadataError::EmptyAgentProfile)
+        );
+
+        let empty_effort = TurnAdmissionMetadata {
+            execution: TurnExecutionOptions {
+                reasoning: Some(Box::new(TurnReasoningOptions {
+                    effort: Some(String::new()),
+                    summary: None,
+                })),
+                ..TurnExecutionOptions::default()
+            },
+            ..TurnAdmissionMetadata::default()
+        };
+        assert_eq!(
+            empty_effort.validate(),
+            Err(TurnAdmissionMetadataError::EmptyReasoningEffort)
         );
 
         let duplicate_tool = TurnAdmissionMetadata {
@@ -3160,6 +3232,31 @@ mod tests {
         };
         assert_eq!(
             unsupported_version.validate(),
+            Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion)
+        );
+
+        let legacy_version = TurnAdmissionMetadata {
+            execution: TurnExecutionOptions {
+                schema_version: MIN_TURN_EXECUTION_OPTIONS_SCHEMA_VERSION,
+                ..TurnExecutionOptions::default()
+            },
+            ..TurnAdmissionMetadata::default()
+        };
+        assert_eq!(legacy_version.validate(), Ok(()));
+
+        let legacy_reasoning = TurnAdmissionMetadata {
+            execution: TurnExecutionOptions {
+                schema_version: MIN_TURN_EXECUTION_OPTIONS_SCHEMA_VERSION,
+                reasoning: Some(Box::new(TurnReasoningOptions {
+                    effort: Some("high".to_owned()),
+                    summary: None,
+                })),
+                ..TurnExecutionOptions::default()
+            },
+            ..TurnAdmissionMetadata::default()
+        };
+        assert_eq!(
+            legacy_reasoning.validate(),
             Err(TurnAdmissionMetadataError::UnsupportedExecutionOptionsVersion)
         );
 

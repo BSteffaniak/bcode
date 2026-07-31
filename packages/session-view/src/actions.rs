@@ -25,6 +25,7 @@ pub async fn execute_session_view_action(
             launch_working_directory,
             text,
             placement,
+            execution,
         } => {
             execute_submit_message(
                 client,
@@ -32,6 +33,7 @@ pub async fn execute_session_view_action(
                 launch_working_directory,
                 text,
                 placement,
+                *execution,
             )
             .await
         }
@@ -273,6 +275,7 @@ async fn execute_submit_message(
     launch_working_directory: Option<std::path::PathBuf>,
     text: String,
     placement: PromptPlacementView,
+    execution: bcode_session_models::TurnExecutionOptions,
 ) -> Result<SessionViewActionOutcome, ClientError> {
     let session_id = if let Some(session_id) = session_id {
         session_id
@@ -288,7 +291,7 @@ async fn execute_submit_message(
             .id
     };
     let acceptance = client
-        .send_user_message(session_id, text, prompt_placement(placement))
+        .send_user_message_with_execution(session_id, text, prompt_placement(placement), execution)
         .await?;
     Ok(message_accepted_outcome(session_id, acceptance))
 }

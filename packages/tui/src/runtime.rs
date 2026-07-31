@@ -131,7 +131,7 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
         chat.app.set_status("New draft".to_owned());
     }
     let result = {
-        chat_loop::run_with_client(
+        Box::pin(chat_loop::run_with_client(
             terminal,
             &mut terminal_events,
             &client,
@@ -139,7 +139,7 @@ pub async fn run_event_loop_with_startup_and_static_bundled<W: Write>(
             &mut chat,
             startup_action,
             daemon_host,
-        )
+        ))
         .await
     };
     if let Some(event_task) = chat.event_task.take() {

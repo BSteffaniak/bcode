@@ -1914,6 +1914,49 @@ impl BcodeClient {
         }
     }
 
+    /// Send a user message with immutable execution options for its admitted turn.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the request.
+    pub async fn send_user_message_with_execution(
+        &self,
+        session_id: SessionId,
+        text: String,
+        placement: bcode_ipc::PromptPlacement,
+        execution: bcode_session_models::TurnExecutionOptions,
+    ) -> Result<MessageAcceptance, ClientError> {
+        match self
+            .send_request(Request::SendUserMessageWithExecution {
+                session_id,
+                text,
+                placement,
+                execution,
+            })
+            .await?
+        {
+            ResponsePayload::MessageAccepted {
+                queued,
+                queue_position,
+            } => Ok(MessageAcceptance {
+                queued,
+                queue_position,
+                disposition: bcode_ipc::MessageAcceptanceDisposition::StartedTurn,
+            }),
+            ResponsePayload::MessageAcceptedWithDisposition {
+                queued,
+                queue_position,
+                disposition,
+            } => Ok(MessageAcceptance {
+                queued,
+                queue_position,
+                disposition,
+            }),
+            ResponsePayload::MessageSent => Ok(MessageAcceptance::sent()),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Set a session-specific model selection.
     ///
     /// # Errors

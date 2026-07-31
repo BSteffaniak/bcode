@@ -465,6 +465,7 @@ pub async fn submit_composer<W: Write>(
             agent_id,
             reasoning_effort: chat.app.reasoning_effort().map(ToOwned::to_owned),
             reasoning_summary: chat.app.reasoning_summary().map(ToOwned::to_owned),
+            reasoning_effort_generation: chat.app.pending_reasoning_effort_generation(),
             event_sender: chat.event_sender.clone(),
         }),
     });

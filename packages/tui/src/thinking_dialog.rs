@@ -62,7 +62,9 @@ impl ThinkingDialogState {
             effort: status.reasoning_effort.clone(),
             summary: status.reasoning_summary.clone(),
             effort_values: reasoning
-                .map(|reasoning| reasoning.effort_values.clone())
+                .map(|reasoning| {
+                    bcode_model::ordered_reasoning_effort_values(&reasoning.effort_values)
+                })
                 .unwrap_or_default(),
             summary_values: reasoning
                 .map(|reasoning| reasoning.summary_values.clone())

@@ -21,7 +21,7 @@ use super::{
     daemon_host::TuiDaemonHost,
     daemon_issue, history_flow,
     session_flow::{self, AgentCatalog},
-    slash_palette, thinking_flow,
+    slash_palette,
 };
 
 /// Submit-message effect request payload.
@@ -44,6 +44,8 @@ pub struct SubmitMessageRequest {
     pub reasoning_effort: Option<String>,
     /// Reasoning summary to apply before sending.
     pub reasoning_summary: Option<String>,
+    /// Reasoning effort generation captured by this submission, if locally pending.
+    pub reasoning_effort_generation: Option<u64>,
     /// Event sender for a newly-created session stream.
     pub event_sender: mpsc::UnboundedSender<super::history_flow::SessionStreamUpdate>,
 }
@@ -252,17 +254,6 @@ pub enum TuiEffect {
     },
     /// Request cancellation of the active turn for a session.
     CancelTurn { session_id: SessionId },
-    /// Cycle reasoning effort for the current model/session.
-    CycleThinkingEffort {
-        /// Session to update, or `None` for draft/default model state.
-        session_id: Option<SessionId>,
-        /// Currently selected effort.
-        current_effort: Option<String>,
-        /// Currently selected summary.
-        current_summary: Option<String>,
-        /// Current local visibility state.
-        visible: bool,
-    },
 }
 
 /// Daemon connectivity observation reported by completed effects.
@@ -517,13 +508,6 @@ pub enum TuiEffectResult {
         /// Daemon response.
         result: Result<bool, ClientError>,
     },
-    /// Result for reasoning effort cycling.
-    CycleThinkingEffort {
-        /// Session the request targeted, or `None` for draft/default state.
-        session_id: Option<SessionId>,
-        /// Cycle result.
-        result: Box<Result<ThinkingCycleResult, ClientError>>,
-    },
 }
 
 #[allow(clippy::match_same_arms)]
@@ -582,9 +566,6 @@ impl TuiEffectResult {
             Self::AttachWorktree { result, .. } => DaemonObservation::from_client_result(result),
             Self::CreateWorktree { result } => DaemonObservation::from_client_result(result),
             Self::CancelTurn { result, .. } => DaemonObservation::from_client_result(result),
-            Self::CycleThinkingEffort { result, .. } => {
-                DaemonObservation::from_client_result(result)
-            }
             Self::ConfigLoaded { .. }
             | Self::AuthSecurityReconciled { .. }
             | Self::SlashPaletteLoaded { .. } => DaemonObservation::None,
@@ -632,23 +613,12 @@ pub struct SubmitMessageResult {
     pub acceptance: MessageAcceptance,
     /// Agent committed during submission.
     pub committed_agent_id: Option<String>,
+    /// Pending reasoning effort generation committed during submission.
+    pub committed_reasoning_effort_generation: Option<u64>,
     /// Event stream task for a newly-created session.
     pub event_task: Option<JoinHandle<()>>,
     /// Releases a newly-created session stream after the TUI installs the session id.
     pub event_stream_release: Option<oneshot::Sender<()>>,
-}
-
-/// Reasoning effort cycle outcome.
-#[derive(Debug)]
-pub struct ThinkingCycleResult {
-    /// Next effort, or `None` when unsupported/unavailable.
-    pub next_effort: Option<String>,
-    /// Summary to keep/apply.
-    pub summary: Option<String>,
-    /// Visibility to keep/apply.
-    pub visible: bool,
-    /// Model status fetched while cycling.
-    pub status: Option<bcode_ipc::SessionModelStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -680,7 +650,6 @@ enum EffectKey {
     AttachWorktree(SessionId),
     CreateWorktree,
     CancelTurn(SessionId),
-    CycleThinkingEffort(Option<SessionId>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -816,10 +785,6 @@ impl TuiEffect {
                 session_id,
                 result: Err(client_error),
             },
-            Self::CycleThinkingEffort { session_id, .. } => TuiEffectResult::CycleThinkingEffort {
-                session_id,
-                result: Box::new(Err(client_error)),
-            },
             Self::LoadConfig
             | Self::ReconcileAuthSecurity { .. }
             | Self::LoadOlderHistory { .. }
@@ -854,8 +819,7 @@ impl TuiEffect {
             | Self::CompactContext { .. }
             | Self::AttachWorktree { .. }
             | Self::CreateWorktree { .. }
-            | Self::CancelTurn { .. }
-            | Self::CycleThinkingEffort { .. } => EffectDaemonIntent::Foreground,
+            | Self::CancelTurn { .. } => EffectDaemonIntent::Foreground,
             Self::OpenSession {
                 allow_daemon_start: false,
                 ..
@@ -1152,9 +1116,6 @@ impl TuiEffect {
             Self::AttachWorktree { session_id, .. } => EffectKey::AttachWorktree(*session_id),
             Self::CreateWorktree { .. } => EffectKey::CreateWorktree,
             Self::CancelTurn { session_id } => EffectKey::CancelTurn(*session_id),
-            Self::CycleThinkingEffort { session_id, .. } => {
-                EffectKey::CycleThinkingEffort(*session_id)
-            }
         }
     }
 
@@ -1471,25 +1432,6 @@ impl TuiEffect {
                     Err(error) => Err(error),
                 },
             },
-            Self::CycleThinkingEffort {
-                session_id,
-                current_effort,
-                current_summary,
-                visible,
-            } => {
-                let result = cycle_thinking_effort(
-                    &client,
-                    session_id,
-                    current_effort,
-                    current_summary,
-                    visible,
-                )
-                .await;
-                TuiEffectResult::CycleThinkingEffort {
-                    session_id,
-                    result: Box::new(result),
-                }
-            }
         }
     }
 }
@@ -1687,6 +1629,7 @@ fn message_acceptance_from_action_outcome(
     })
 }
 
+#[allow(clippy::too_many_lines)]
 async fn submit_message(
     client: &BcodeClient,
     request: SubmitMessageRequest,
@@ -1701,6 +1644,7 @@ async fn submit_message(
         agent_id,
         reasoning_effort,
         reasoning_summary,
+        reasoning_effort_generation,
         event_sender,
     } = request;
     let mut message = message;
@@ -1754,8 +1698,8 @@ async fn submit_message(
         provider_plugin_id,
         model_id,
         agent_id.clone(),
-        reasoning_effort,
-        reasoning_summary,
+        reasoning_effort.clone(),
+        reasoning_summary.clone(),
     )
     .await?;
     let placement = match placement {
@@ -1769,6 +1713,13 @@ async fn submit_message(
             launch_working_directory: None,
             text: message,
             placement,
+            execution: Box::new(bcode_session_models::TurnExecutionOptions {
+                reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
+                    effort: reasoning_effort.clone(),
+                    summary: reasoning_summary.clone(),
+                })),
+                ..bcode_session_models::TurnExecutionOptions::default()
+            }),
         },
     )
     .await?;
@@ -1778,6 +1729,7 @@ async fn submit_message(
         created_session,
         acceptance,
         committed_agent_id: agent_id,
+        committed_reasoning_effort_generation: reasoning_effort_generation,
         event_task,
         event_stream_release,
     })
@@ -1986,48 +1938,6 @@ async fn load_session_status(client: &BcodeClient, session_id: SessionId) -> Tui
                 .or(plugin_error),
         }),
     }
-}
-
-async fn cycle_thinking_effort(
-    client: &BcodeClient,
-    session_id: Option<SessionId>,
-    current_effort: Option<String>,
-    current_summary: Option<String>,
-    visible: bool,
-) -> Result<ThinkingCycleResult, ClientError> {
-    let status = if let Some(session_id) = session_id {
-        client.session_model_status(session_id).await?
-    } else {
-        client.default_model_status().await?
-    };
-    let Some(next_effort) =
-        thinking_flow::next_effort_for_status(&status, current_effort.as_deref())
-    else {
-        return Ok(ThinkingCycleResult {
-            next_effort: None,
-            summary: current_summary,
-            visible,
-            status: Some(status),
-        });
-    };
-    let summary = current_summary.or_else(|| status.reasoning_summary.clone());
-    if let Some(session_id) = session_id {
-        execute_session_view_action(
-            client,
-            SessionViewAction::SetReasoning {
-                session_id,
-                effort: Some(next_effort.clone()),
-                summary: summary.clone(),
-            },
-        )
-        .await?;
-    }
-    Ok(ThinkingCycleResult {
-        next_effort: Some(next_effort),
-        summary,
-        visible,
-        status: Some(status),
-    })
 }
 
 #[cfg(test)]

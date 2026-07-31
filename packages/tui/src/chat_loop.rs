@@ -833,9 +833,6 @@ fn apply_effect_result(
         TuiEffectResult::CancelTurn { session_id, result } => {
             apply_cancel_turn_result(chat, loop_state, session_id, result);
         }
-        TuiEffectResult::CycleThinkingEffort { session_id, result } => {
-            apply_thinking_cycle_result(chat, session_id, *result);
-        }
     }
 }
 
@@ -1103,6 +1100,9 @@ fn apply_submit_message_result(
             }
             if result.committed_agent_id.is_some() {
                 let _committed = chat.app.take_pending_agent();
+            }
+            if let Some(generation) = result.committed_reasoning_effort_generation {
+                chat.app.clear_pending_reasoning_effort(generation);
             }
             if let Some(release) = result.event_stream_release {
                 let _released = release.send(());
@@ -1466,49 +1466,6 @@ fn apply_cancel_turn_result(
             }
             report_nonfatal_client_error(chat, "Cancel unavailable", &error);
         }
-    }
-}
-
-fn apply_thinking_cycle_result(
-    chat: &mut ActiveChat,
-    session_id: Option<bcode_session_models::SessionId>,
-    result: Result<super::effects::ThinkingCycleResult, ClientError>,
-) {
-    match result {
-        Ok(result) if session_id == chat.app.session_id() => {
-            if let Some(status) = result.status {
-                chat.app.apply_model_status(status);
-            }
-            if let Some(next_effort) = result.next_effort {
-                chat.app.apply_reasoning_selection(
-                    Some(next_effort.clone()),
-                    result.summary,
-                    result.visible,
-                );
-                chat.app
-                    .set_status(format!("reasoning effort set to {next_effort}"));
-            } else {
-                chat.app
-                    .set_status("reasoning effort unavailable for current model".to_owned());
-            }
-        }
-        Ok(_stale) => {}
-        Err(error) => report_nonfatal_client_error(chat, "reasoning effort failed", &error),
-    }
-}
-
-fn start_thinking_cycle(chat: &mut ActiveChat, loop_state: &mut ChatLoopState) {
-    let started = loop_state.start_effect(TuiEffect::CycleThinkingEffort {
-        session_id: chat.app.session_id(),
-        current_effort: chat.app.reasoning_effort().map(ToOwned::to_owned),
-        current_summary: chat.app.reasoning_summary().map(ToOwned::to_owned),
-        visible: chat.app.reasoning_visible(),
-    });
-    if started {
-        chat.app.set_status("updating reasoning effort…".to_owned());
-    } else {
-        chat.app
-            .set_status("reasoning effort change already in progress".to_owned());
     }
 }
 
@@ -3062,7 +3019,7 @@ async fn handle_chat_key_request<W: Write>(
         }
         KeyRequest::CycleAgent => cycle_session_agent(chat),
         KeyRequest::CycleThinkingEffort => {
-            start_thinking_cycle(chat, loop_state);
+            thinking_flow::cycle_thinking_effort(chat);
         }
         KeyRequest::Submit { placement } => {
             let pre_submit_scope = draft_autosave.as_ref().map(|autosave| autosave.scope(chat));
@@ -3304,6 +3261,7 @@ mod scheduler_tests {
                 created_session: None,
                 acceptance: bcode_client::MessageAcceptance::sent(),
                 committed_agent_id: None,
+                committed_reasoning_effort_generation: None,
                 event_task: Some(event_task),
                 event_stream_release: Some(release_sender),
             }),

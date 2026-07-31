@@ -3626,6 +3626,7 @@ const fn request_session_id(request: &Request) -> Option<SessionId> {
         | Request::AttachSessionRecent { session_id, .. }
         | Request::SendUserMessage { session_id, .. }
         | Request::SendUserMessageWithPlacement { session_id, .. }
+        | Request::SendUserMessageWithExecution { session_id, .. }
         | Request::SubmitTurn { session_id, .. }
         | Request::InvokeSkill { session_id, .. }
         | Request::CancelSessionTurn { session_id, .. }
@@ -3686,6 +3687,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::AttachSessionRecent { .. } => "attach_session_recent",
         Request::SendUserMessage { .. } => "send_user_message",
         Request::SendUserMessageWithPlacement { .. } => "send_user_message_with_placement",
+        Request::SendUserMessageWithExecution { .. } => "send_user_message_with_execution",
         Request::SubmitTurn { .. } => "submit_turn",
         Request::InvokeSkill { .. } => "invoke_skill",
         Request::CancelSessionTurn { .. } => "cancel_session_turn",
@@ -4194,6 +4196,7 @@ async fn handle_request_inner(
                 session_id,
                 text,
                 bcode_ipc::PromptPlacement::Steering,
+                bcode_session_models::TurnExecutionOptions::default(),
             )
             .await
         }
@@ -4203,7 +4206,25 @@ async fn handle_request_inner(
             placement,
         } => {
             handle_user_message(
-                request_id, client_id, state, writer, session_id, text, placement,
+                request_id,
+                client_id,
+                state,
+                writer,
+                session_id,
+                text,
+                placement,
+                bcode_session_models::TurnExecutionOptions::default(),
+            )
+            .await
+        }
+        Request::SendUserMessageWithExecution {
+            session_id,
+            text,
+            placement,
+            execution,
+        } => {
+            handle_user_message(
+                request_id, client_id, state, writer, session_id, text, placement, execution,
             )
             .await
         }
@@ -9346,6 +9367,7 @@ async fn enqueue_user_message_command(
     runtime_context: Option<ClientRuntimeContext>,
     text: String,
     placement: bcode_ipc::PromptPlacement,
+    execution: bcode_session_models::TurnExecutionOptions,
 ) -> Result<MessageQueueStatus, ServerError> {
     let automation_lock = turn_admission_lock(state, session_id).await;
     let _automation_guard = automation_lock.lock().await;
@@ -9366,6 +9388,7 @@ async fn enqueue_user_message_command(
             runtime_context,
             text,
             window,
+            execution,
         )
         .await;
     }
@@ -9377,14 +9400,14 @@ async fn enqueue_user_message_command(
             bcode_session::SessionOwnershipKind::QueuedCommand,
         )
         .await?;
-    let (_, user_event) = admit_turn(
-        state,
-        session_id,
-        client_id,
-        text,
-        bcode_session_models::TurnAdmissionMetadata::default(),
-    )
-    .await?;
+    let admission = bcode_session_models::TurnAdmissionMetadata {
+        execution,
+        ..bcode_session_models::TurnAdmissionMetadata::default()
+    };
+    admission
+        .validate()
+        .map_err(bcode_session::SessionError::from)?;
+    let (_, user_event) = admit_turn(state, session_id, client_id, text, admission).await?;
     let user_event = user_event.ok_or(bcode_session::SessionError::NotFound(session_id))?;
     let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
     let queued = pending_before > 0 || phase_snapshot.has_active_work();
@@ -9423,7 +9446,7 @@ async fn enqueue_user_message_command(
     Err(bcode_session::SessionError::NotFound(session_id).into())
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn enqueue_steering_message_command(
     state: &Arc<ServerState>,
     handle: &SessionRuntimeHandle,
@@ -9432,6 +9455,7 @@ async fn enqueue_steering_message_command(
     runtime_context: Option<ClientRuntimeContext>,
     text: String,
     window: SteeringWindow,
+    execution: bcode_session_models::TurnExecutionOptions,
 ) -> Result<MessageQueueStatus, ServerError> {
     match window {
         SteeringWindow::Idle => {
@@ -9442,14 +9466,14 @@ async fn enqueue_steering_message_command(
                     bcode_session::SessionOwnershipKind::QueuedCommand,
                 )
                 .await?;
-            let (_, user_event) = admit_turn(
-                state,
-                session_id,
-                client_id,
-                text,
-                bcode_session_models::TurnAdmissionMetadata::default(),
-            )
-            .await?;
+            let admission = bcode_session_models::TurnAdmissionMetadata {
+                execution,
+                ..bcode_session_models::TurnAdmissionMetadata::default()
+            };
+            admission
+                .validate()
+                .map_err(bcode_session::SessionError::from)?;
+            let (_, user_event) = admit_turn(state, session_id, client_id, text, admission).await?;
             let user_event = user_event.ok_or(bcode_session::SessionError::NotFound(session_id))?;
             let pending_before = handle.queued_followups.fetch_add(1, Ordering::AcqRel);
             let send_result = handle
@@ -10776,6 +10800,7 @@ async fn handle_submit_turn(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_user_message(
     request_id: u64,
     client_id: ClientId,
@@ -10784,6 +10809,7 @@ async fn handle_user_message(
     session_id: SessionId,
     text: String,
     placement: bcode_ipc::PromptPlacement,
+    execution: bcode_session_models::TurnExecutionOptions,
 ) -> Result<(), ServerError> {
     if let Some(active_namespace) = state
         .active_session_namespace_mismatch(session_id, client_id)
@@ -10799,6 +10825,7 @@ async fn handle_user_message(
         state.client_runtime_context(client_id).await,
         text,
         placement,
+        execution,
     )
     .await
     {
@@ -20348,6 +20375,14 @@ fn apply_turn_model_selection(
     if let Some(model_id) = &execution.model_id {
         selection.requested_model_id = Some(model_id.clone());
         selection.model_id = Some(model_id.clone());
+    }
+    if let Some(reasoning) = &execution.reasoning {
+        if reasoning.effort.is_some() {
+            selection.reasoning_effort.clone_from(&reasoning.effort);
+        }
+        if reasoning.summary.is_some() {
+            selection.reasoning_summary.clone_from(&reasoning.summary);
+        }
     }
 }
 
@@ -41426,6 +41461,7 @@ library = "test"
                 None,
                 "queued before detach".to_owned(),
                 bcode_ipc::PromptPlacement::FollowUp,
+                bcode_session_models::TurnExecutionOptions::default(),
             )
             .await
         });
@@ -41650,6 +41686,7 @@ library = "test"
                 None,
                 "request racing release".to_owned(),
                 bcode_ipc::PromptPlacement::FollowUp,
+                bcode_session_models::TurnExecutionOptions::default(),
             )
             .await
         });
@@ -41772,6 +41809,7 @@ library = "test"
             None,
             "steer while streaming".to_owned(),
             bcode_ipc::PromptPlacement::Steering,
+            bcode_session_models::TurnExecutionOptions::default(),
         )
         .await
         .expect("steering admission");
@@ -41788,6 +41826,13 @@ library = "test"
             })
         ));
 
+        let follow_up_execution = bcode_session_models::TurnExecutionOptions {
+            reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
+                effort: Some("high".to_owned()),
+                summary: Some("detailed".to_owned()),
+            })),
+            ..bcode_session_models::TurnExecutionOptions::default()
+        };
         let follow_up = enqueue_user_message_command(
             &state,
             session.id,
@@ -41795,6 +41840,7 @@ library = "test"
             None,
             "explicit follow-up".to_owned(),
             bcode_ipc::PromptPlacement::FollowUp,
+            follow_up_execution.clone(),
         )
         .await
         .expect("follow-up admission");
@@ -41803,13 +41849,15 @@ library = "test"
             bcode_ipc::MessageAcceptanceDisposition::QueuedFollowUp
         );
         assert!(follow_up.queued);
-        assert!(matches!(
-            followup_receiver.try_recv(),
-            Ok(FollowupCommand::ExecuteTurn {
-                queued_steering: None,
-                ..
-            })
-        ));
+        let Ok(FollowupCommand::ExecuteTurn {
+            user_event,
+            queued_steering: None,
+            ..
+        }) = followup_receiver.try_recv()
+        else {
+            panic!("follow-up should retain its admitted execution options");
+        };
+        assert_eq!(turn_execution_options(&user_event), follow_up_execution);
 
         *handle.phase.lock().await = SessionRuntimePhase::PreparingModelRequest;
         *handle.current_turn.lock().await = None;
@@ -41820,6 +41868,7 @@ library = "test"
             None,
             "steer before request".to_owned(),
             bcode_ipc::PromptPlacement::Steering,
+            bcode_session_models::TurnExecutionOptions::default(),
         )
         .await
         .expect("applied steering admission");
@@ -56713,7 +56762,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
     }
 
     #[test]
-    fn turn_model_selection_overrides_provider_and_requested_model() {
+    fn turn_model_selection_overrides_provider_model_and_reasoning() {
         let mut selection = SessionModelSelection {
             provider_plugin_id: Some("provider-default".to_string()),
             requested_model_id: Some("model-default".to_string()),
@@ -56723,6 +56772,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
         let execution = bcode_session_models::TurnExecutionOptions {
             provider_plugin_id: Some("provider-turn".to_string()),
             model_id: Some("model-turn".to_string()),
+            reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
+                effort: Some("high".to_string()),
+                summary: Some("detailed".to_string()),
+            })),
             ..bcode_session_models::TurnExecutionOptions::default()
         };
 
@@ -56734,6 +56787,8 @@ event_symbol = "bcode_plugin_handle_event_v1"
         );
         assert_eq!(selection.requested_model_id.as_deref(), Some("model-turn"));
         assert_eq!(selection.model_id.as_deref(), Some("model-turn"));
+        assert_eq!(selection.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(selection.reasoning_summary.as_deref(), Some("detailed"));
     }
 
     #[tokio::test]

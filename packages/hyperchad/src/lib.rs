@@ -979,6 +979,7 @@ impl HyperChadAppState {
             launch_working_directory,
             text: form.text,
             placement: form.placement,
+            execution: Box::default(),
         };
         match execute_session_view_action(&self.client, action).await {
             Ok(bcode_session_view_models::SessionViewActionOutcome::MessageAccepted {

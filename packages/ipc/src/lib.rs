@@ -266,6 +266,13 @@ pub enum Request {
         text: String,
         placement: PromptPlacement,
     },
+    /// Send an ordinary user message with immutable execution options for its admitted turn.
+    SendUserMessageWithExecution {
+        session_id: SessionId,
+        text: String,
+        placement: PromptPlacement,
+        execution: bcode_session_models::TurnExecutionOptions,
+    },
     /// Submit an ordinary turn through generic admission metadata.
     SubmitTurn {
         session_id: SessionId,
@@ -4101,6 +4108,26 @@ mod tests {
         let encoded = encode_response(&response).expect("response should encode");
         let decoded = decode_response(&encoded).expect("response should decode");
         assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn user_message_execution_request_round_trips_reasoning_options() {
+        let request = Request::SendUserMessageWithExecution {
+            session_id: SessionId::new(),
+            text: "continue".to_owned(),
+            placement: PromptPlacement::FollowUp,
+            execution: bcode_session_models::TurnExecutionOptions {
+                reasoning: Some(Box::new(bcode_session_models::TurnReasoningOptions {
+                    effort: Some("high".to_owned()),
+                    summary: Some("detailed".to_owned()),
+                })),
+                ..bcode_session_models::TurnExecutionOptions::default()
+            },
+        };
+
+        let encoded = encode_request(&request).expect("request should encode");
+        let decoded = decode_request(&encoded).expect("request should decode");
+        assert_eq!(decoded, request);
     }
 
     #[test]

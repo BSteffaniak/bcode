@@ -1183,6 +1183,100 @@ pub struct ModelReasoningInfo {
     pub source: ModelReasoningCapabilitySource,
 }
 
+/// Return advertised reasoning-effort values in stable semantic order.
+///
+/// Known provider-portable values are ordered from least to greatest effort. Unknown
+/// provider-native values remain available after known values in lexical order. Duplicate values
+/// are removed, and values not advertised by the provider are never introduced.
+#[must_use]
+pub fn ordered_reasoning_effort_values(values: &[String]) -> Vec<String> {
+    const KNOWN_VALUES: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+    let advertised = values.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut ordered = KNOWN_VALUES
+        .into_iter()
+        .filter(|value| advertised.contains(value))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    ordered.extend(
+        advertised
+            .into_iter()
+            .filter(|value| !KNOWN_VALUES.contains(value))
+            .map(ToOwned::to_owned),
+    );
+    ordered
+}
+
+/// Return the effort following `current` in semantic advertised order, wrapping at the end.
+#[must_use]
+pub fn next_reasoning_effort_value(values: &[String], current: Option<&str>) -> Option<String> {
+    let values = ordered_reasoning_effort_values(values);
+    let current_index =
+        current.and_then(|current| values.iter().position(|value| value == current));
+    let next_index = current_index.map_or(0, |index| (index + 1) % values.len());
+    values.get(next_index).cloned()
+}
+
+#[cfg(test)]
+mod reasoning_effort_order_tests {
+    use super::{next_reasoning_effort_value, ordered_reasoning_effort_values};
+
+    fn values(values: &[&str]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn orders_known_efforts_semantically_and_removes_duplicates() {
+        let advertised = values(&[
+            "xhigh", "medium", "none", "high", "minimal", "low", "max", "low",
+        ]);
+
+        assert_eq!(
+            ordered_reasoning_effort_values(&advertised),
+            values(&["none", "minimal", "low", "medium", "high", "xhigh", "max"])
+        );
+    }
+
+    #[test]
+    fn preserves_only_advertised_subset_values() {
+        assert_eq!(
+            ordered_reasoning_effort_values(&values(&["high", "low"])),
+            values(&["low", "high"])
+        );
+    }
+
+    #[test]
+    fn places_unknown_values_after_known_values_deterministically() {
+        assert_eq!(
+            ordered_reasoning_effort_values(&values(&["turbo", "high", "adaptive", "low"])),
+            values(&["low", "high", "adaptive", "turbo"])
+        );
+    }
+
+    #[test]
+    fn next_value_advances_unknown_current_from_first_and_wraps() {
+        let advertised = values(&["high", "none", "low"]);
+        assert_eq!(
+            next_reasoning_effort_value(&advertised, Some("unknown")).as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            next_reasoning_effort_value(&advertised, Some("none")).as_deref(),
+            Some("low")
+        );
+        assert_eq!(
+            next_reasoning_effort_value(&advertised, Some("high")).as_deref(),
+            Some("none")
+        );
+        assert_eq!(next_reasoning_effort_value(&[], None), None);
+    }
+
+    #[test]
+    fn empty_advertisement_stays_empty() {
+        assert!(ordered_reasoning_effort_values(&[]).is_empty());
+    }
+}
+
 /// Per-model capability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

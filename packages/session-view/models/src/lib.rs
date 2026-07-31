@@ -1657,6 +1657,9 @@ pub enum SessionViewAction {
         text: String,
         /// Prompt placement semantics.
         placement: PromptPlacementView,
+        /// Provider-neutral execution options captured for this exact admitted turn.
+        #[serde(default)]
+        execution: Box<bcode_session_models::TurnExecutionOptions>,
     },
     /// Cancel the active model turn.
     CancelTurn {

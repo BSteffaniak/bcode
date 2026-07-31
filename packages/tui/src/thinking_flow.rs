@@ -1,7 +1,6 @@
 //! Thinking settings dialog input flow for the TUI.
 
 use bcode_client::BcodeClient;
-use bcode_ipc::SessionModelStatus;
 use bcode_session_view::execute_session_view_action;
 use bcode_session_view_models::SessionViewAction;
 use bmux_keyboard::{KeyCode, KeyStroke};
@@ -10,67 +9,25 @@ use super::TuiError;
 use super::session_flow::ActiveChat;
 use super::thinking_dialog::ThinkingDialogState;
 
-/// Cycle the selected reasoning effort for the current model.
-pub async fn cycle_thinking_effort(
-    client: &BcodeClient,
-    chat: &mut ActiveChat,
-) -> Result<(), TuiError> {
-    let session_id = chat.app.session_id();
-    let status = if let Some(session_id) = session_id {
-        client.session_model_status(session_id).await?
-    } else {
-        client.default_model_status().await?
-    };
-    let Some(next_effort) = next_effort_for_status(&status, chat.app.reasoning_effort()) else {
+/// Cycle the selected reasoning effort locally for the next message.
+pub fn cycle_thinking_effort(chat: &mut ActiveChat) {
+    let Some(next_effort) = chat
+        .app
+        .cycle_pending_reasoning_effort()
+        .map(ToOwned::to_owned)
+    else {
         chat.app
             .set_status("reasoning effort unavailable for current model".to_owned());
-        return Ok(());
+        return;
     };
-    let summary = chat
-        .app
-        .reasoning_summary()
-        .map(ToOwned::to_owned)
-        .or(status.reasoning_summary);
-    chat.app.apply_reasoning_selection(
-        Some(next_effort.clone()),
-        summary.clone(),
-        chat.app.reasoning_visible(),
-    );
-    if let Some(session_id) = session_id {
-        execute_session_view_action(
-            client,
-            SessionViewAction::SetReasoning {
-                session_id,
-                effort: Some(next_effort.clone()),
-                summary,
-            },
-        )
-        .await?;
-    }
-    chat.app
-        .set_status(format!("reasoning effort set to {next_effort}"));
-    Ok(())
+    chat.app.set_status(format!(
+        "reasoning effort {next_effort} selected for next message"
+    ));
 }
 
-pub fn next_effort_for_status(
-    status: &SessionModelStatus,
-    app_effort: Option<&str>,
-) -> Option<String> {
-    let reasoning = status.reasoning.as_ref()?;
-    let current = app_effort
-        .or(status.reasoning_effort.as_deref())
-        .or(reasoning.default_effort.as_deref());
-    next_effort_value(&reasoning.effort_values, current)
-}
-
+#[cfg(test)]
 fn next_effort_value(values: &[String], current: Option<&str>) -> Option<String> {
-    if values.is_empty() {
-        return None;
-    }
-    let current_index =
-        current.and_then(|current| values.iter().position(|value| value == current));
-    let next_index = current_index.map_or(0, |index| (index + 1) % values.len());
-    values.get(next_index).cloned()
+    bcode_model::next_reasoning_effort_value(values, current)
 }
 
 /// Handle one thinking-dialog key.
@@ -124,7 +81,8 @@ async fn apply_thinking_dialog(
     let visible = dialog.visible();
     let mode = dialog.mode();
     let Some(session_id) = chat.app.session_id() else {
-        chat.app.apply_reasoning_selection(effort, summary, visible);
+        chat.app.apply_reasoning_selection(effort, summary);
+        chat.app.set_reasoning_visible(visible);
         chat.app.set_reasoning_display_mode(mode);
         chat.app.set_status(format!(
             "reasoning output settings applied: {}",

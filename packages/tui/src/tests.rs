@@ -6694,7 +6694,7 @@ fn thinking_label_uses_effective_values() {
 }
 
 #[test]
-fn thinking_dialog_cycles_supported_values() {
+fn thinking_dialog_cycles_supported_values_in_semantic_order() {
     let status = bcode_ipc::SessionModelStatus {
         provider_plugin_id: None,
         requested_model_id: None,
@@ -6708,7 +6708,7 @@ fn thinking_dialog_cycles_supported_values() {
         compatibility_key: None,
         max_output_tokens: None,
         reasoning: Some(bcode_model::ModelReasoningInfo {
-            effort_values: vec!["low".to_owned(), "medium".to_owned()],
+            effort_values: vec!["high".to_owned(), "low".to_owned(), "medium".to_owned()],
             default_effort: Some("low".to_owned()),
             visible_summary_supported: true,
             summary_values: vec!["auto".to_owned(), "detailed".to_owned()],
@@ -6733,6 +6733,7 @@ fn thinking_dialog_cycles_supported_values() {
         &status,
     );
 
+    assert_eq!(dialog.effort_values(), ["low", "medium", "high"]);
     dialog.cycle_focused();
     assert!(dialog.visible());
     dialog.focus_next();
