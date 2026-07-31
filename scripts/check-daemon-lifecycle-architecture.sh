@@ -29,6 +29,14 @@ required = {
         "pub async fn ensure_daemon_running" in lifecycle,
     "client must route auto-start through lifecycle":
         "ensure_daemon_running" in client,
+    "normal CLI daemon availability must route through the client":
+        "BcodeClient::default_endpoint()\n        .ensure_daemon_available()" in cli,
+    "explicit detached server start must use lifecycle ownership":
+        "ServerCommand::Start { foreground }" in cli
+        and "start_server_daemon(false).await?" in cli
+        and "bcode_daemon_lifecycle::ensure_daemon_running" in cli,
+    "TUI must construct the canonical auto-start client":
+        "BcodeClient::default_endpoint()" in Path("packages/tui/src/runtime.rs").read_text(encoding="utf-8"),
     "client warm path must not retain a three-attempt loop":
         "for _ in 0..3" not in client,
     "normal TUI must not host a daemon":
@@ -44,6 +52,13 @@ required = {
         and "run_with_static_bundled(" not in plugin_surface_host,
     "embedded server path must not publish a daemon record":
         "run_with_static_bundled_inner(endpoint, static_plugins, false).await" in server,
+    "historical exact responsive daemons must remain gracefully controllable":
+        "DaemonRecordClassification::HistoricalExactResponsive" in cli
+        and "DaemonControlPolicy::GracefulIpc" in cli,
+    "protocol-unsupported and ambiguous historical evidence must remain conservative":
+        "DaemonRecordClassification::HistoricalProcessVerifiedProtocolUnsupported" in cli
+        and "DaemonControlPolicy::ReviewedForceOnly" in cli
+        and "DaemonControlPolicy::PreserveAndRefuse" in cli,
     "CLI startup must not eagerly materialize the daemon image":
         "ensure_current_executable_cached()" not in cli,
 }

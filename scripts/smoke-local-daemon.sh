@@ -160,7 +160,7 @@ if kill -0 "${idle_pid}" 2>/dev/null; then
     echo "daemon did not shut down after configured idle interval" >&2
     exit 1
 fi
-"${root}/target/debug/bcode" server start >/dev/null
+"${root}/target/debug/bcode" session list >/dev/null
 restarted_pid="$(python3 - "${BCODE_STATE_DIR}/daemons" <<'PY'
 import glob
 import json

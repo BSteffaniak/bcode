@@ -20,7 +20,7 @@ build_artifact() {
     local artifact_id="$2"
     local features="$3"
     local profile_flag="$4"
-    local target_dir="${workdir}/target"
+    local target_dir="${CARGO_TARGET_DIR:-${root}/target}"
 
     BCODE_ARTIFACT_ID="${artifact_id}" CARGO_TARGET_DIR="${target_dir}" \
         cargo build --quiet --package bcode --bin bcode --no-default-features \
@@ -117,15 +117,26 @@ if ! grep -Eq 'active elsewhere|another incompatible Bcode writer|session_active
 fi
 kill "${owner_attach_pid}" 2>/dev/null || true
 wait "${owner_attach_pid}" 2>/dev/null || true
-BCODE_STATE_DIR="${session_state}" BCODE_SESSION_STORE_DIR="${session_root}" \
-    "${workdir}/debug-a" session release-owner "${session_id}" >/dev/null
-BCODE_STATE_DIR="${session_state}" BCODE_SESSION_STORE_DIR="${session_root}" \
-    "${workdir}/release-b" attach "${session_id}" >"${workdir}/released-attach.log" 2>&1 &
-released_attach_pid="$!"
-sleep 0.5
-if ! kill -0 "${released_attach_pid}" 2>/dev/null; then
+released_attach_pid=""
+for attempt in {1..100}; do
+    released_log="${workdir}/released-attach-${attempt}.log"
+    BCODE_STATE_DIR="${session_state}" BCODE_SESSION_STORE_DIR="${session_root}" \
+        "${workdir}/release-b" attach "${session_id}" >"${released_log}" 2>&1 &
+    candidate_pid="$!"
+    sleep 0.1
+    if kill -0 "${candidate_pid}" 2>/dev/null; then
+        released_attach_pid="${candidate_pid}"
+        break
+    fi
+    wait "${candidate_pid}" 2>/dev/null || true
+    if ! grep -Eq 'active elsewhere|another incompatible Bcode writer|session_active_elsewhere' "${released_log}"; then
+        echo "foreign artifact ownership acquisition failed unexpectedly" >&2
+        cat "${released_log}" >&2
+        exit 1
+    fi
+done
+if [[ -z "${released_attach_pid}" ]]; then
     echo "foreign artifact could not acquire released canonical session ownership" >&2
-    cat "${workdir}/released-attach.log" >&2
     exit 1
 fi
 kill "${released_attach_pid}" 2>/dev/null || true
@@ -138,11 +149,16 @@ BCODE_STATE_DIR="${session_state}" BCODE_SESSION_STORE_DIR="${session_root}" \
 concurrent_state="${workdir}/concurrent-state"
 client_pids=()
 for client in {1..16}; do
-    BCODE_STATE_DIR="${concurrent_state}" "${workdir}/debug-a" server start >/dev/null &
+    BCODE_STATE_DIR="${concurrent_state}" "${workdir}/debug-a" server start \
+        >"${workdir}/concurrent-client-${client}.log" 2>&1 &
     client_pids+=("$!")
 done
-for client_pid in "${client_pids[@]}"; do
-    wait "${client_pid}"
+for client_index in "${!client_pids[@]}"; do
+    if ! wait "${client_pids[${client_index}]}"; then
+        echo "concurrent client $((client_index + 1)) failed" >&2
+        cat "${workdir}/concurrent-client-$((client_index + 1)).log" >&2
+        exit 1
+    fi
 done
 check_running_artifact "${workdir}/debug-a" matrix-debug-a "${concurrent_state}"
 record_count="$(find "${concurrent_state}/daemons" -name '*.json' -type f | wc -l | tr -d ' ')"

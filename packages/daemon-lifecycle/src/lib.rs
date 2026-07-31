@@ -533,6 +533,7 @@ pub struct DaemonImageMetadata {
 
 const DAEMON_IMAGE_METADATA_SCHEMA_VERSION: u32 = 1;
 const DAEMON_IMAGE_METADATA_FILE: &str = "image.json";
+const DAEMON_IMAGE_CLEANUP_LOCK_FILE: &str = "daemon-images.lock";
 
 /// Return the artifact-scoped directory that stores cached daemon executables.
 #[must_use]
@@ -923,6 +924,65 @@ fn preserve_executable_permissions(
     Ok(())
 }
 
+fn daemon_image_cleanup_lock_path(state_dir: &Path) -> PathBuf {
+    state_dir
+        .join("daemons")
+        .join(DAEMON_IMAGE_CLEANUP_LOCK_FILE)
+}
+
+fn open_daemon_image_cleanup_lock(state_dir: &Path) -> Result<fs::File, DaemonLifecycleError> {
+    let path = daemon_image_cleanup_lock_path(state_dir);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|source| DaemonLifecycleError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    }
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|source| DaemonLifecycleError::Io { path, source })
+}
+
+struct DaemonImageUseGuard {
+    file: fs::File,
+}
+
+impl DaemonImageUseGuard {
+    fn acquire(state_dir: &Path) -> Result<Self, DaemonLifecycleError> {
+        let file = open_daemon_image_cleanup_lock(state_dir)?;
+        file.lock_shared()
+            .map_err(|source| DaemonLifecycleError::Io {
+                path: daemon_image_cleanup_lock_path(state_dir),
+                source,
+            })?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for DaemonImageUseGuard {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
+
+fn try_acquire_daemon_image_cleanup_lock(
+    state_dir: &Path,
+) -> Result<Option<fs::File>, DaemonLifecycleError> {
+    let file = open_daemon_image_cleanup_lock(state_dir)?;
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(source)) => Err(DaemonLifecycleError::Io {
+            path: daemon_image_cleanup_lock_path(state_dir),
+            source,
+        }),
+    }
+}
+
 fn retained_daemon_image_paths(
     state_dir: &Path,
 ) -> Result<(std::collections::BTreeSet<PathBuf>, bool), DaemonLifecycleError> {
@@ -978,6 +1038,9 @@ fn retained_daemon_image_paths(
 ///
 /// Returns an error when reading registry evidence or removing image directories fails.
 pub fn cleanup_stale_daemon_images(state_dir: &Path) -> Result<usize, DaemonLifecycleError> {
+    let Some(_cleanup_lock) = try_acquire_daemon_image_cleanup_lock(state_dir)? else {
+        return Ok(0);
+    };
     let root = state_dir.join("daemon-images");
     let namespace_entries = match fs::read_dir(&root) {
         Ok(entries) => entries,
@@ -1098,6 +1161,26 @@ mod tests {
     fn write_test_image(path: &Path) {
         fs::create_dir_all(path.parent().expect("image parent")).expect("image directory");
         fs::write(path, b"stale daemon image").expect("image");
+    }
+
+    #[test]
+    fn daemon_image_cleanup_skips_while_any_artifact_start_uses_images() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "bcode-daemon-image-use-lock-test-{}-{}",
+            std::process::id(),
+            unix_time_millis().expect("time")
+        ));
+        let stale_image = stale_image_path(&state_dir, "historical", "in-use");
+        write_test_image(&stale_image);
+        let use_guard = DaemonImageUseGuard::acquire(&state_dir).expect("image use guard");
+
+        assert_eq!(cleanup_stale_daemon_images(&state_dir).expect("cleanup"), 0);
+        assert!(stale_image.exists());
+
+        drop(use_guard);
+        assert_eq!(cleanup_stale_daemon_images(&state_dir).expect("cleanup"), 1);
+        assert!(!stale_image.exists());
+        fs::remove_dir_all(state_dir).expect("state cleanup");
     }
 
     #[test]
@@ -1676,15 +1759,21 @@ where
         return Ok(());
     }
 
-    let lock = StartupLock::acquire().await?;
+    let Some(lock) = StartupLock::acquire(&options.endpoint).await? else {
+        print_daemon_status(options, "server already running");
+        return Ok(());
+    };
+    let image_use_guard = DaemonImageUseGuard::acquire(&bcode_config::default_state_dir())?;
     cleanup_stale_endpoint(&options.endpoint)?;
     if ping_ready(&options.endpoint).await {
+        drop(image_use_guard);
         drop(lock);
         print_daemon_status(options, "server already running");
         return Ok(());
     }
 
     start(options).await?;
+    drop(image_use_guard);
     let _cleanup_task = tokio::spawn(async {
         let _ = cleanup_stale_daemon_records().await;
         let _ = cleanup_stale_daemon_images(&bcode_config::default_state_dir());
@@ -1724,16 +1813,45 @@ impl StartupLock {
     const ACQUIRE_TIMEOUT: Duration = Duration::from_secs(25);
     const POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-    async fn acquire() -> Result<Self, DaemonStartError> {
-        Self::acquire_at(
-            bcode_config::default_state_dir()
-                .join("daemons")
-                .join(format!("{}.lock", daemon_namespace())),
-            Self::ACQUIRE_TIMEOUT,
-        )
-        .await
+    async fn acquire(endpoint: &IpcEndpoint) -> Result<Option<Self>, DaemonStartError> {
+        let path = bcode_config::default_state_dir()
+            .join("daemons")
+            .join(format!("{}.lock", daemon_namespace()));
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let started = std::time::Instant::now();
+        loop {
+            let file = fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)?;
+            match file.try_lock() {
+                Ok(()) => {
+                    file.set_len(0)?;
+                    writeln!(&file, "pid={}", std::process::id())?;
+                    file.sync_data()?;
+                    return Ok(Some(Self { file }));
+                }
+                Err(std::fs::TryLockError::WouldBlock) => {
+                    if ping_ready(endpoint).await {
+                        return Ok(None);
+                    }
+                    if started.elapsed() >= Self::ACQUIRE_TIMEOUT {
+                        return Err(DaemonStartError::StartupCoordinationTimeout {
+                            lock_path: path,
+                        });
+                    }
+                    tokio::time::sleep(Self::POLL_INTERVAL).await;
+                }
+                Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
     }
 
+    #[cfg(test)]
     async fn acquire_at(path: PathBuf, timeout: Duration) -> Result<Self, DaemonStartError> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;

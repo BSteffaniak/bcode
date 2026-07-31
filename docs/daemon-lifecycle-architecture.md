@@ -47,7 +47,7 @@ Bootstrap captures an open read handle before CLI setup. Cold copy and digest op
 
 Materialization occurs only on the cold start path while lifecycle owns the artifact startup lock. Publication writes a process-specific temporary executable, preserves executable permissions, verifies SHA-256, atomically renames the image, and then publishes matching metadata. Existing images are reused only when both bytes and metadata validate. A corrupt image or metadata pair is removed and rebuilt once while the startup lock is held.
 
-Digest and metadata are retained for diagnostics and conservative process verification. Cleanup retains images referenced by daemon records and the current image. Malformed records, unreadable registry evidence, and unknown record schemas make image cleanup fail closed so a newer or historical daemon image is never removed merely because the current build cannot interpret its evidence.
+Digest and metadata are retained for diagnostics and conservative process verification. Cleanup retains images referenced by daemon records and the current image. A state-root image lock allows independent artifact startups to hold shared use leases while cleanup requires a nonblocking exclusive lease; cleanup skips instead of racing image materialization, spawn, or record publication. Malformed records, unreadable registry evidence, and unknown record schemas also make image cleanup fail closed so a newer or historical daemon image is never removed merely because the current build cannot interpret its evidence.
 
 ## Startup coordination and readiness
 
@@ -69,7 +69,7 @@ Snapshots, event envelopes, and bounded reconnect checkpoints are state transfer
 
 ## Transition behavior
 
-Records without exact artifact identity are historical records. They may be classified through exact endpoint or process evidence, but they are not treated as current-artifact routing authority. Workaround-era content-addressed images may remain until no live record retains them; new startup publishes artifact-scoped image metadata. Old responsive daemons are not replaced merely because their namespace or protocol is historical.
+Records without exact artifact identity are historical records. They may be classified through exact endpoint or process evidence, but they are not treated as current-artifact routing authority. Workaround-era content-addressed images may remain until no live record retains them; new startup publishes artifact-scoped image metadata. Old responsive daemons are not replaced merely because their namespace or protocol is historical. Exact responsive historical records remain controllable through graceful IPC. Process-verified daemons whose protocol cannot be decoded require an explicit reviewed force action, while identity-mismatched or unverifiable records are preserved and refused rather than guessed.
 
 ## Performance boundary
 

@@ -92,6 +92,10 @@ edit = { "**" = "allow" }
 
 [tools.shell.env]
 mode = "inherit"
+
+[daemon]
+idle_shutdown = true
+idle_shutdown_after_secs = 1
 EOF
 
 "${root}/target/debug/bcode" server run >"${workdir}/server.log" 2>&1 &
@@ -109,6 +113,133 @@ if ! grep -q "server ready; accepting clients" "${workdir}/server.log"; then
 fi
 
 session_id="$(trap - EXIT; cd "${workdir}" && "${root}/target/debug/bcode" session create tui-pty-smoke)"
+initial_pid="$(python3 - "${BCODE_STATE_DIR}/daemons" <<'PY'
+import glob
+import json
+import os
+import sys
+records = glob.glob(os.path.join(sys.argv[1], "*.json"))
+with open(records[0], "r", encoding="utf-8") as record_file:
+    print(json.load(record_file)["pid"])
+PY
+)"
+wait "${server_pid}"
+server_pid=""
+for _ in {1..100}; do
+    if ! kill -0 "${initial_pid}" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+if kill -0 "${initial_pid}" 2>/dev/null; then
+    echo "isolated daemon did not retire after configured idle interval" >&2
+    exit 1
+fi
+
+python3 - "${root}/target/debug/bcode" "${session_id}" "${initial_pid}" <<'PY'
+import fcntl
+import glob
+import json
+import os
+import pty
+import select
+import signal
+import struct
+import sys
+import termios
+import time
+
+binary, session_id, initial_pid = sys.argv[1:]
+initial_pid = int(initial_pid)
+session_marker = f"#{session_id[:8]}".encode()
+started = time.monotonic()
+pid, fd = pty.fork()
+if pid == 0:
+    os.execv(binary, [binary, "tui", session_id])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+capture = bytearray()
+daemon_ready_at = None
+connected_at = None
+request_sent = False
+deadline = started + 10
+while time.monotonic() < deadline:
+    ready, _, _ = select.select([fd], [], [], 0.05)
+    if ready:
+        try:
+            capture.extend(os.read(fd, 65536))
+        except OSError:
+            break
+    if not request_sent and session_marker in capture:
+        os.write(fd, b"cold-auto-start-input\r")
+        request_sent = True
+    if daemon_ready_at is None:
+        for record_path in glob.glob(os.path.join(os.environ["BCODE_STATE_DIR"], "daemons", "*.json")):
+            try:
+                with open(record_path, "r", encoding="utf-8") as record_file:
+                    record = json.load(record_file)
+                daemon_pid = record.get("pid")
+                artifact_id = record.get("artifact_id")
+                if daemon_pid and daemon_pid != initial_pid and artifact_id:
+                    os.kill(daemon_pid, 0)
+                    daemon_ready_at = time.monotonic()
+                    break
+            except (OSError, ValueError):
+                pass
+    if session_marker in capture and daemon_ready_at is not None:
+        connected_at = time.monotonic()
+        break
+
+try:
+    os.write(fd, b"\x1b\x1b")
+except OSError:
+    pass
+exit_status = None
+exit_deadline = time.monotonic() + 3
+while time.monotonic() < exit_deadline:
+    ready, _, _ = select.select([fd], [], [], 0.05)
+    if ready:
+        try:
+            capture.extend(os.read(fd, 65536))
+        except OSError:
+            pass
+    waited_pid, status = os.waitpid(pid, os.WNOHANG)
+    if waited_pid:
+        exit_status = status
+        break
+if exit_status is None:
+    os.kill(pid, signal.SIGKILL)
+    _, exit_status = os.waitpid(pid, 0)
+
+checks = {
+    "rendered session identity": session_marker in capture,
+    "TUI auto-started daemon": daemon_ready_at is not None,
+    "daemon started within 10 seconds": daemon_ready_at is not None
+    and daemon_ready_at - started <= 10,
+    "TUI observed auto-started daemon": connected_at is not None,
+    "TUI connected within 10 seconds": connected_at is not None and connected_at - started <= 10,
+}
+failures = [name for name, passed in checks.items() if not passed]
+if failures:
+    print("cold TUI auto-start acceptance failed: " + ", ".join(failures), file=sys.stderr)
+    print(repr(bytes(capture[-2000:])), file=sys.stderr)
+    sys.exit(1)
+PY
+
+"${root}/target/debug/bcode" server stop >/dev/null
+"${root}/target/debug/bcode" server run >"${workdir}/server.log" 2>&1 &
+server_pid="$!"
+for _ in {1..100}; do
+    if "${root}/target/debug/bcode" server status >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.1
+done
+if ! "${root}/target/debug/bcode" server status >/dev/null 2>&1; then
+    echo "replacement daemon did not become ready for PTY acceptance" >&2
+    cat "${workdir}/server.log" >&2 || true
+    exit 1
+fi
+
 python3 - "${root}/target/debug/bcode" "${root}/target/debug/bcode_terminal_grid_probe" "${session_id}" "${workdir}/tui.capture" <<'PY'
 import fcntl
 import os
