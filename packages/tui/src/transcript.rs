@@ -6,8 +6,8 @@ use bcode_session_models::{ToolArtifact, ToolInvocationResult};
 #[cfg(test)]
 use bcode_session_view::SessionView;
 use bcode_session_view_models::{
-    InteractionViewSummary, TextFormat, ToolInvocationView, ToolInvocationViewStatus,
-    ToolResultView, TranscriptViewItem, TranscriptViewItemKind,
+    InteractionViewSummary, TextFormat, TextStreamViewStatus, ToolInvocationView,
+    ToolInvocationViewStatus, ToolResultView, TranscriptViewItem, TranscriptViewItemKind,
 };
 
 /// Generic timing metadata for a tool invocation.
@@ -128,6 +128,15 @@ impl TranscriptItemId {
     }
 }
 
+/// Visible integrity state for terminal-projected streamed text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptStreamIntegrity {
+    /// The retained checkpoint omits an earlier source prefix.
+    Incomplete,
+    /// A gap or conflicting update requires authoritative resynchronization.
+    Degraded,
+}
+
 /// Renderable transcript item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscriptItem {
@@ -135,6 +144,7 @@ pub struct TranscriptItem {
     revision: u64,
     source_view_item_id: Option<bcode_session_view_models::TranscriptViewItemId>,
     source_view_revision: Option<bcode_session_view_models::ViewRevision>,
+    stream_integrity: Option<TranscriptStreamIntegrity>,
     pub role: &'static str,
     pub text: String,
     pub streaming: bool,
@@ -184,6 +194,7 @@ impl TranscriptItem {
             revision: 0,
             source_view_item_id: None,
             source_view_revision: None,
+            stream_integrity: None,
             role,
             text,
             streaming,
@@ -248,6 +259,33 @@ impl TranscriptItem {
         self.source_view_revision
     }
 
+    pub(crate) const fn with_stream_integrity(
+        mut self,
+        integrity: TranscriptStreamIntegrity,
+    ) -> Self {
+        self.stream_integrity = Some(integrity);
+        self
+    }
+
+    /// Replace streamed-text integrity metadata without changing shared semantic content.
+    pub(crate) fn set_stream_integrity(
+        &mut self,
+        integrity: Option<TranscriptStreamIntegrity>,
+    ) -> bool {
+        if self.stream_integrity == integrity {
+            return false;
+        }
+        self.stream_integrity = integrity;
+        self.bump_revision();
+        true
+    }
+
+    /// Return visible streamed-text integrity state, when degraded or incomplete.
+    #[must_use]
+    pub const fn stream_integrity(&self) -> Option<TranscriptStreamIntegrity> {
+        self.stream_integrity
+    }
+
     fn with_source_view_item(
         mut self,
         id: bcode_session_view_models::TranscriptViewItemId,
@@ -264,6 +302,7 @@ impl TranscriptItem {
             return false;
         }
         self.source_view_revision = replacement.source_view_revision;
+        self.stream_integrity = replacement.stream_integrity;
         self.role = replacement.role;
         self.text = replacement.text;
         self.streaming = replacement.streaming;
@@ -735,6 +774,21 @@ fn terminal_tool_invocation_item_from_shared(
         )
     } else {
         terminal_tool_item_from_shared(tool)
+    }
+}
+
+pub fn apply_stream_integrity(
+    item: TranscriptItem,
+    state: Option<&bcode_session_view_models::TextStreamViewState>,
+) -> TranscriptItem {
+    match state.map(|state| state.status) {
+        Some(TextStreamViewStatus::Incomplete) => {
+            item.with_stream_integrity(TranscriptStreamIntegrity::Incomplete)
+        }
+        Some(TextStreamViewStatus::Degraded) => {
+            item.with_stream_integrity(TranscriptStreamIntegrity::Degraded)
+        }
+        Some(TextStreamViewStatus::Healthy | TextStreamViewStatus::Terminal(_)) | None => item,
     }
 }
 

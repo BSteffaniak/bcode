@@ -13,9 +13,9 @@ use bcode_config::{
 };
 use bcode_session_models::{
     ClientId, RuntimeWorkKind, SessionEvent, SessionEventKind, SessionId, SessionInputHistoryEntry,
-    SessionProjectionKind, SessionSummary, SessionTitleSource, SessionTokenUsage,
-    SessionTraceEvent, SessionTracePayload, SessionTracePhase, ToolArtifact, ToolArtifactRef,
-    ToolInvocationResult, WorkId,
+    SessionLiveEvent, SessionLiveEventKind, SessionProjectionKind, SessionSummary,
+    SessionTitleSource, SessionTokenUsage, SessionTraceEvent, SessionTracePayload,
+    SessionTracePhase, ToolArtifact, ToolArtifactRef, ToolInvocationResult, WorkId,
 };
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use bmux_text_edit::TextMotion;
@@ -3364,7 +3364,7 @@ fn manual_scroll_grace_prevents_stream_top_anchor() {
 }
 
 #[test]
-fn submitted_user_message_anchors_at_top() {
+fn staged_user_message_does_not_navigate_before_semantic_acceptance() {
     let session_id = SessionId::new();
     let history = (0..12)
         .map(|sequence| {
@@ -3393,7 +3393,56 @@ fn submitted_user_message_anchors_at_top() {
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
 
-    assert_eq!(output_line_y(&buffer, "You · sending"), Some(1));
+    assert_ne!(output_line_y(&buffer, "You · sending"), Some(1));
+}
+
+#[test]
+fn user_submission_navigation_waits_for_accepted_semantic_message() {
+    let session_id = SessionId::new();
+    let history = (0..12)
+        .map(|sequence| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+
+    app.replace_composer_with("accepted prompt");
+    app.stage_submission();
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+    assert_ne!(output_line_y(&buffer, "You · sending"), Some(1));
+
+    app.mark_pending_submission_sent();
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+    assert!(output_line_y(&buffer, "You").is_none());
+
+    app.absorb_session_event(&event(
+        session_id,
+        12,
+        SessionEventKind::UserMessage {
+            client_id: ClientId::new(),
+            text: "accepted prompt".to_owned(),
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+    std::thread::sleep(Duration::from_millis(220));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+
+    assert_eq!(output_line_y(&buffer, "You"), Some(1));
+    assert!(rendered_text(&buffer).contains("accepted prompt"));
 }
 
 #[test]
@@ -3427,7 +3476,7 @@ fn accepted_markdown_submission_preserves_submitted_user_message_transition() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
-    assert_eq!(output_line_y(&buffer, "You · sending"), Some(1));
+    assert_ne!(output_line_y(&buffer, "You · sending"), Some(1));
 
     app.mark_pending_submission_sent();
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
@@ -3501,7 +3550,7 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 20));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
-    assert_eq!(output_line_y(&buffer, "You · sending"), Some(1));
+    assert_ne!(output_line_y(&buffer, "You · sending"), Some(1));
 
     app.absorb_session_event(&event(
         session_id,
@@ -3529,6 +3578,65 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
 
     assert!(rendered_text(&buffer).contains("shell.run"));
     assert_eq!(output_line_y(&buffer, "You"), Some(1));
+}
+
+#[test]
+fn assistant_navigation_waits_for_first_nonempty_segment_content_and_runs_once() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        0,
+        SessionEventKind::UserMessage {
+            client_id: ClientId::new(),
+            text: "prompt".to_owned(),
+            admission: bcode_session_models::TurnAdmissionMetadata::default(),
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+
+    let stream = |revision, expected_offset, text: &str| SessionLiveEvent {
+        session_id,
+        kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+            output_position: None,
+            turn_id: "turn-1".to_owned(),
+            segment_id: "segment-0".to_owned(),
+            segment_order: 0,
+            update: bcode_session_models::TextStreamUpdate {
+                generation: 0,
+                first_revision: revision,
+                revision,
+                operation: bcode_session_models::TextStreamOperation::Append {
+                    expected_offset,
+                    text: text.to_owned(),
+                },
+            },
+        },
+    };
+
+    app.absorb_session_live_event(&stream(1, 0, ""));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+    assert!(!app.has_assistant_stream_anchor());
+
+    app.absorb_session_live_event(&stream(2, 0, "first line"));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+    std::thread::sleep(Duration::from_millis(220));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+    let initial_y = output_line_y(&buffer, "Bcode …").expect("nonempty stream visible");
+    let anchor_index = app
+        .assistant_stream_anchor_index()
+        .expect("nonempty stream anchors");
+
+    app.absorb_session_live_event(&stream(3, "first line".len(), "\nsecond\nthird"));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+    assert_eq!(app.assistant_stream_anchor_index(), Some(anchor_index));
+    assert_eq!(output_line_y(&buffer, "Bcode …"), Some(initial_y));
 }
 
 #[test]
@@ -4032,7 +4140,7 @@ fn runtime_work_events_do_not_pull_final_response_to_bottom() {
 }
 
 #[test]
-fn committed_user_echo_does_not_restart_submitted_message_anchor() {
+fn committed_user_echo_triggers_submitted_message_anchor_after_acceptance() {
     let session_id = SessionId::new();
     let history = (0..12)
         .map(|sequence| {
@@ -4060,7 +4168,7 @@ fn committed_user_echo_does_not_restart_submitted_message_anchor() {
     let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
     let mut frame = Frame::new(&mut buffer);
     render::render(&mut app, &mut frame);
-    assert_eq!(output_line_y(&buffer, "You · sending"), Some(1));
+    assert_ne!(output_line_y(&buffer, "You · sending"), Some(1));
 
     app.absorb_session_event(&event(
         session_id,

@@ -66,7 +66,9 @@ use super::app::{BmuxApp, DaemonConnectionState, composer_policy};
 use super::pending_submission::{PendingSubmission, PendingSubmissionState};
 use super::time_format::{format_millis, unix_time_millis};
 use super::tool_render_projection::{CanonicalPluginVisual, CanonicalToolVisual};
-use super::transcript::{ToolTiming, TranscriptItem, TranscriptItemKind};
+use super::transcript::{
+    ToolTiming, TranscriptItem, TranscriptItemKind, TranscriptStreamIntegrity,
+};
 use super::transcript_layout::TranscriptLayoutSignature;
 use bmux_tui::text_width::{display_width as text_display_width, truncate_to_display_width};
 use unicode_segmentation::UnicodeSegmentation;
@@ -414,6 +416,40 @@ fn local_plain_markdown_and_json_system_notes_keep_distinct_formats() {
         app.local_notices()[2].text_format(),
         bcode_session_view_models::TextFormat::Json
     );
+}
+
+#[cfg(test)]
+#[test]
+fn streamed_text_integrity_is_visible_without_rewriting_source_bytes() {
+    let body = "retained suffix";
+    for (integrity, expected) in [
+        (
+            TranscriptStreamIntegrity::Incomplete,
+            "Earlier streamed text is unavailable; showing the retained checkpoint.",
+        ),
+        (
+            TranscriptStreamIntegrity::Degraded,
+            "Stream integrity is degraded; waiting for authoritative resynchronization.",
+        ),
+    ] {
+        let item =
+            TranscriptItem::new("Assistant", body.to_owned()).with_stream_integrity(integrity);
+        let rows = transcript_item_rows(
+            std::slice::from_ref(&item),
+            0,
+            80,
+            None,
+            TuiDiffViewerConfig::default(),
+        );
+        let rendered = rows
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_str())
+            .collect::<String>();
+        assert!(rendered.contains(expected));
+        assert!(rendered.contains(body));
+        assert_eq!(item.text(), body);
+    }
 }
 
 #[cfg(test)]
@@ -1520,9 +1556,14 @@ pub fn transcript_item_signature(
     _inline_view_config: (),
 ) -> TranscriptLayoutSignature {
     TranscriptLayoutSignature::new(format!(
-        "item:{}:{}:{width}:{}",
+        "item:{}:{}:{width}:{}:{}",
         item.id().get(),
         item.revision(),
+        match item.stream_integrity() {
+            Some(TranscriptStreamIntegrity::Incomplete) => "incomplete",
+            Some(TranscriptStreamIntegrity::Degraded) => "degraded",
+            None => "healthy",
+        },
         terminal_elapsed_signature_fragment(item).unwrap_or_default()
     ))
 }
@@ -1561,6 +1602,17 @@ fn push_transcript_item_rows(
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
 ) {
     let item = &transcript[index];
+    if let Some(integrity) = item.stream_integrity() {
+        let message = match integrity {
+            TranscriptStreamIntegrity::Incomplete => {
+                "Earlier streamed text is unavailable; showing the retained checkpoint."
+            }
+            TranscriptStreamIntegrity::Degraded => {
+                "Stream integrity is degraded; waiting for authoritative resynchronization."
+            }
+        };
+        push_detail_block(rows, "Stream status", message, Color::Yellow, width);
+    }
     match item.kind() {
         TranscriptItemKind::UserMessage => {
             push_formatted_block(

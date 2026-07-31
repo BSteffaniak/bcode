@@ -111,6 +111,21 @@ impl TranscriptDocument {
         index
     }
 
+    fn set_stream_integrity(
+        &mut self,
+        id: &bcode_session_view_models::TranscriptViewItemId,
+        integrity: Option<crate::transcript::TranscriptStreamIntegrity>,
+    ) -> bool {
+        let Some(index) = self.source_indices.get(id).copied() else {
+            return false;
+        };
+        if self.items[index].set_stream_integrity(integrity) {
+            self.bump_revision();
+            return true;
+        }
+        false
+    }
+
     fn reorder_from_shared(
         &mut self,
         ordered_source_ids: &[bcode_session_view_models::TranscriptViewItemId],

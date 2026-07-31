@@ -58,6 +58,12 @@ impl PendingSubmissions {
         }
     }
 
+    /// Return whether an equivalent submission is awaiting semantic acceptance.
+    #[must_use]
+    pub fn contains(&self, text: &str) -> bool {
+        self.items.iter().any(|pending| pending.text() == text)
+    }
+
     /// Remove a pending submission by text.
     pub fn remove(&mut self, text: &str) {
         if let Some(index) = self.items.iter().position(|pending| pending.text() == text) {

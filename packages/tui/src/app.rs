@@ -2130,12 +2130,7 @@ impl BmuxApp {
     /// Store the current composer text as a pending submission and clear input.
     pub fn stage_submission(&mut self) {
         let text = self.composer.buffer().text().to_owned();
-        self.submitted_user_message_following = if text.trim().is_empty() {
-            SubmittedUserMessageFollowing::Idle
-        } else {
-            SubmittedUserMessageFollowing::PendingAnchor
-        };
-        self.scroll_mode = TranscriptScrollMode::TransitionToEntry { sticky: false };
+        self.submitted_user_message_following = SubmittedUserMessageFollowing::Idle;
         self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
         self.pending_submissions.stage(text);
         self.input_history.reset_navigation();
@@ -2494,11 +2489,9 @@ impl BmuxApp {
     }
 
     fn maybe_request_assistant_stream_anchor(&mut self, should_anchor: bool) {
-        let Some(index) = self
-            .transcript
-            .iter()
-            .rposition(|item| item.role() == "Assistant" && item.streaming())
-        else {
+        let Some(index) = self.transcript.iter().rposition(|item| {
+            item.role() == "Assistant" && item.streaming() && !item.text().is_empty()
+        }) else {
             return;
         };
         if self.assistant_scroll_anchor.index() == Some(index) {
@@ -2521,6 +2514,16 @@ impl BmuxApp {
         {
             self.assistant_scroll_anchor = AssistantScrollAnchorState::Idle;
         }
+    }
+
+    #[cfg(test)]
+    pub const fn has_assistant_stream_anchor(&self) -> bool {
+        self.assistant_scroll_anchor.index().is_some()
+    }
+
+    #[cfg(test)]
+    pub const fn assistant_stream_anchor_index(&self) -> Option<usize> {
+        self.assistant_scroll_anchor.index()
     }
 
     #[cfg(test)]
@@ -3208,7 +3211,13 @@ impl BmuxApp {
             .unwrap_or_else(|| text.to_owned());
         self.input_history
             .push_committed(sequence, timestamp_ms, &text);
+        let accepted_pending_submission = self.pending_submissions.contains(&text);
         self.remove_pending_submission(&text);
+        if accepted_pending_submission {
+            self.submitted_user_message_following = SubmittedUserMessageFollowing::PendingAnchor;
+            self.scroll_mode = TranscriptScrollMode::TransitionToEntry { sticky: false };
+            self.pending_transcript_top_anchor_sequence = Some(sequence);
+        }
         if application.live_activity() {
             self.set_activity(ActivityState::PreparingModelRequest);
         }
@@ -3265,10 +3274,10 @@ impl BmuxApp {
 
     fn apply_session_view_terminal_adapter(&mut self) -> TranscriptDocumentDamage {
         self.capture_stable_transcript_anchor();
-        let damage = self.session_view_terminal_adapter.apply(
-            &self.session_view.snapshot().transcript,
-            &mut self.transcript,
-        );
+        let snapshot = self.session_view.snapshot();
+        let damage = self
+            .session_view_terminal_adapter
+            .apply(snapshot, &mut self.transcript);
         if let TranscriptDocumentDamage::Items(ids) = &damage {
             self.transcript_dirty_items
                 .extend(ids.iter().filter_map(|id| self.transcript.source_index(id)));
