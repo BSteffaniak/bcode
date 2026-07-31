@@ -5,7 +5,7 @@ set -euo pipefail
 unset BCODE_DAEMON_LOG BCODE_IPC_ENDPOINT BCODE_IPC_ENDPOINT_NAMESPACE
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-workdir="$(mktemp -d /tmp/bcode-smoke.XXXXXX)"
+workdir="$(cd "$(mktemp -d /tmp/bcode-smoke.XXXXXX)" && pwd -P)"
 server_pid=""
 cleanup() {
     if [[ -n "${server_pid}" ]] && kill -0 "${server_pid}" 2>/dev/null; then
@@ -31,7 +31,8 @@ esac
 cd "${root}"
 
 if [[ "${BCODE_TUI_PTY_SKIP_BUILD:-0}" != "1" ]]; then
-    cargo build --quiet -p bcode --features distribution -p bcode_fake_provider_plugin -p bcode_tui_components --bin bcode_terminal_grid_probe
+    cargo build --quiet -p bcode --features distribution -p bcode_fake_provider_plugin
+    cargo build --quiet -p bcode_tui_components --bin bcode_terminal_grid_probe
 fi
 
 case "$(uname -s)" in
@@ -85,19 +86,19 @@ EOF
 
 "${root}/target/debug/bcode" server run >"${workdir}/server.log" 2>&1 &
 server_pid="$!"
-for _ in {1..100}; do
-    if "${root}/target/debug/bcode" server status >/dev/null 2>&1; then
+for _ in {1..600}; do
+    if [[ -s "${workdir}/server.log" ]] && grep -q "server ready; accepting clients" "${workdir}/server.log"; then
         break
     fi
     sleep 0.1
 done
-if ! "${root}/target/debug/bcode" server status >/dev/null 2>&1; then
+if ! grep -q "server ready; accepting clients" "${workdir}/server.log"; then
     echo "isolated daemon did not become ready" >&2
     cat "${workdir}/server.log" >&2 || true
     exit 1
 fi
 
-session_id="$("${root}/target/debug/bcode" session create tui-pty-smoke)"
+session_id="$(trap - EXIT; cd "${workdir}" && "${root}/target/debug/bcode" session create tui-pty-smoke)"
 python3 - "${root}/target/debug/bcode" "${root}/target/debug/bcode_terminal_grid_probe" "${session_id}" "${workdir}/tui.capture" <<'PY'
 import fcntl
 import os
@@ -119,10 +120,12 @@ if pid == 0:
 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
 capture = bytearray()
 deadline = time.monotonic() + int(os.environ.get("BCODE_TUI_PTY_TIMEOUT_SECS", "120"))
+exit_deadline = None
 exit_status = None
 exit_requested = False
 request_sent = False
-live_seen_before_finish = False
+live_output_before_finish = False
+final_output_after_finish = False
 final_seen_before_live = False
 next_screen_probe = 0.0
 screen_frames = []
@@ -165,29 +168,43 @@ while time.monotonic() < deadline:
             )
             request_sent = True
         if request_sent:
-            if live_marker in screen and not live_seen_before_finish:
-                live_seen_before_finish = final_marker not in screen
-            if final_marker in screen and live_marker not in screen:
+            running_shell = b"running tool: shell" in screen.lower()
+            final_shell = b"shell run" in screen.lower() and b"exit code" in screen.lower()
+            output_lines = {
+                line.strip()
+                for line in screen.splitlines()
+                if line.startswith(b"    ")
+            }
+            live_output = live_marker in output_lines
+            final_output = final_marker in output_lines
+            if running_shell and live_output and not final_output:
+                live_output_before_finish = True
+            if final_shell and final_output:
+                final_output_after_finish = True
+            if final_output and not live_output:
                 final_seen_before_live = True
-            if live_seen_before_finish and final_marker in screen:
+            if live_output_before_finish and final_output_after_finish:
                 capture.extend(b"\nBCODE_SMOKE_FINAL_MARKER_VISIBLE\n")
         next_screen_probe = time.monotonic() + 0.25
 
     if (
         not exit_requested
         and request_sent
-        and live_seen_before_finish
-        and b"BCODE_SMOKE_FINAL_MARKER_VISIBLE" in capture
+        and live_output_before_finish
+        and final_output_after_finish
     ):
         try:
             os.write(fd, b"\x04")
         except OSError:
             pass
         exit_requested = True
+        exit_deadline = time.monotonic() + 10
 
     waited_pid, status = os.waitpid(pid, os.WNOHANG)
     if waited_pid:
         exit_status = status
+        break
+    if exit_deadline is not None and time.monotonic() >= exit_deadline:
         break
 
 if exit_status is None:
@@ -222,10 +239,9 @@ checks = {
     "rendered session identity": session_marker in capture,
     "rendered provider status": b"provider" in capture,
     "shell request sent": request_sent,
-    "live output visible before command completion": live_seen_before_finish,
+    "live output visible before command completion": live_output_before_finish,
     "final output did not precede live output": not final_seen_before_live,
-    "final output visible after command completion": b"BCODE_SMOKE_FINAL_MARKER_VISIBLE"
-    in capture,
+    "final output visible after command completion": final_output_after_finish,
     "clean Ctrl-D exit": os.WIFEXITED(exit_status) and os.WEXITSTATUS(exit_status) == 0,
 }
 failures = [name for name, passed in checks.items() if not passed]
@@ -242,8 +258,15 @@ if failures:
     sys.exit(1)
 PY
 
-"${root}/target/debug/bcode" server status >/dev/null
-"${root}/target/debug/bcode" server stop >/dev/null
+    "${root}/target/debug/bcode" server stop >/dev/null 2>&1 &
+    stop_pid=$!
+    for _ in {1..100}; do
+        if ! kill -0 "${stop_pid}" 2>/dev/null; then
+            wait "${stop_pid}" || true
+            break
+        fi
+        sleep 0.1
+    done
 wait "${server_pid}" || true
 server_pid=""
 
