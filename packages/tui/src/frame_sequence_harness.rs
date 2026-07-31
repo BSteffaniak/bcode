@@ -65,6 +65,7 @@ pub enum TranscriptFrameInput {
         events: Vec<SessionEvent>,
         has_more: bool,
     },
+    DurableBatch(Vec<SessionEvent>),
     ScrollUp(usize),
     Observe,
 }
@@ -102,6 +103,11 @@ impl TranscriptFrameSequence {
                 TranscriptFrameInput::PrependHistory { events, has_more } => {
                     self.app.prepend_older_history(&events, has_more);
                 }
+                TranscriptFrameInput::DurableBatch(events) => {
+                    for event in events {
+                        self.app.absorb_session_event(&event);
+                    }
+                }
                 TranscriptFrameInput::ScrollUp(rows) => {
                     let _ = self.app.scroll_transcript_up(rows);
                 }
@@ -133,8 +139,8 @@ impl TranscriptFrameSequence {
 mod tests {
     use super::*;
     use bcode_session_models::{
-        ClientId, SessionEventKind, SessionId, TextStreamOperation, TextStreamUpdate,
-        ToolInvocationResult,
+        ClientId, RuntimeWorkKind, RuntimeWorkStatus, SessionEventKind, SessionId,
+        SessionTokenUsage, TextStreamOperation, TextStreamUpdate, ToolInvocationResult, WorkId,
     };
     use std::sync::Arc;
 
@@ -909,6 +915,145 @@ mod tests {
             "{}",
             frames[2].text
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn screenshot_scale_tool_and_metadata_sequence_has_no_operational_transcript_rows() {
+        let session_id = SessionId::new();
+        let tools = [
+            ("filesystem_read", r#"{"path":"src/lib.rs"}"#),
+            ("filesystem_grep", r#"{"pattern":"needle","path":"src"}"#),
+            ("filesystem_list", r#"{"path":"src"}"#),
+            ("shell", r#"{"command":"cargo check"}"#),
+        ];
+        let mut sequence = 1_u64;
+        let mut steps = Vec::new();
+        for (index, (tool_name, arguments_json)) in tools.iter().enumerate() {
+            let invocation_id = format!("tool_call_{index}_{tool_name}");
+            let work_id = WorkId::new(format!("raw-work-{index}-{tool_name}"));
+            steps.push(TranscriptFrameStep {
+                label: "tool-request",
+                input: TranscriptFrameInput::Durable(durable(
+                    session_id,
+                    sequence,
+                    SessionEventKind::ToolCallRequested {
+                        tool_call_id: invocation_id.clone(),
+                        producer_plugin_id: None,
+                        tool_name: (*tool_name).to_owned(),
+                        arguments_json: (*arguments_json).to_owned(),
+                        working_directory: None,
+                    },
+                )),
+            });
+            sequence += 1;
+            let metadata = vec![
+                durable(
+                    session_id,
+                    sequence,
+                    SessionEventKind::ModelUsage {
+                        turn_id: format!("turn-{index}"),
+                        usage: SessionTokenUsage {
+                            input_tokens: Some(100),
+                            output_tokens: Some(10),
+                            total_tokens: Some(110),
+                            ..SessionTokenUsage::default()
+                        },
+                    },
+                ),
+                durable(
+                    session_id,
+                    sequence + 1,
+                    SessionEventKind::RuntimeWorkStarted {
+                        work_id: work_id.clone(),
+                        kind: RuntimeWorkKind::Tool,
+                        label: (*tool_name).to_owned(),
+                        tool_call_id: Some(invocation_id.clone()),
+                        plugin_id: Some("fixture.plugin".to_owned()),
+                        service_interface: None,
+                        operation: None,
+                        parent_work_id: None,
+                        started_at_ms: Some(sequence + 1),
+                        cancellable: true,
+                    },
+                ),
+                durable(
+                    session_id,
+                    sequence + 2,
+                    SessionEventKind::RuntimeWorkProgress {
+                        work_id: work_id.clone(),
+                        message: "halfway".to_owned(),
+                        completed_units: Some(1),
+                        total_units: Some(2),
+                        progress_at_ms: Some(sequence + 2),
+                    },
+                ),
+                durable(
+                    session_id,
+                    sequence + 3,
+                    SessionEventKind::RuntimeWorkFinished {
+                        work_id,
+                        status: RuntimeWorkStatus::Completed,
+                        finished_at_ms: Some(sequence + 3),
+                        message: Some("done".to_owned()),
+                    },
+                ),
+            ];
+            sequence += 4;
+            steps.push(TranscriptFrameStep {
+                label: "operational-metadata",
+                input: TranscriptFrameInput::DurableBatch(metadata),
+            });
+            steps.push(TranscriptFrameStep {
+                label: "tool-result",
+                input: TranscriptFrameInput::Durable(durable(
+                    session_id,
+                    sequence,
+                    SessionEventKind::ToolInvocationResultRecorded {
+                        record: bcode_session_models::ToolInvocationResultRecord {
+                            invocation_id,
+                            model_output: format!("{tool_name} complete"),
+                            is_error: false,
+                            presentation: None,
+                            result: None,
+                        },
+                    },
+                )),
+            });
+            sequence += 1;
+        }
+
+        let frames = TranscriptFrameSequence::new(
+            BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+            100,
+            40,
+        )
+        .run(steps);
+        assert_no_forbidden_frames(&frames, |frame| {
+            [
+                "Usage ·",
+                "Runtime work",
+                "tool_call_",
+                "raw-work-",
+                "label: filesystem.",
+                "label: shell.",
+            ]
+            .into_iter()
+            .find(|forbidden| frame.text.contains(forbidden))
+            .map(|forbidden| format!("contains operational metadata {forbidden:?}"))
+        })
+        .expect("screenshot-scale frames exclude operational metadata");
+
+        for (index, frame) in frames.iter().enumerate() {
+            let expected_items = index / 3 + 1;
+            assert_eq!(frame.observation.semantic_items.len(), expected_items);
+            assert_eq!(frame.observation.terminal_items.len(), expected_items);
+            assert_eq!(
+                frame.observation.semantic_items.len(),
+                frame.observation.terminal_items.len(),
+                "frame {index} has duplicate terminal rows"
+            );
+        }
     }
 
     #[test]

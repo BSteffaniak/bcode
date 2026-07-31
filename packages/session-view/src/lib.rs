@@ -137,7 +137,6 @@ pub struct SessionView {
     live_reasoning: BTreeMap<(String, String), LiveReasoningActivity>,
     last_text_stream_updates:
         BTreeMap<TranscriptViewItemId, bcode_session_models::TextStreamUpdate>,
-    renderer_local_notice_sequence: u64,
 }
 
 impl Default for SessionView {
@@ -160,7 +159,6 @@ impl SessionView {
             terminal_runtime_work: BTreeSet::new(),
             live_reasoning: BTreeMap::new(),
             last_text_stream_updates: BTreeMap::new(),
-            renderer_local_notice_sequence: 0,
         }
     }
 
@@ -211,30 +209,6 @@ impl SessionView {
     #[must_use]
     pub fn into_snapshot(self) -> SessionViewSnapshot {
         self.snapshot
-    }
-
-    /// Append a non-durable renderer-local system notice.
-    ///
-    /// Renderer-local notices exist only in this in-memory view. History-window rebuilds clear
-    /// them, and they do not define transport retention, replay, or reconnect behavior.
-    pub fn push_renderer_local_system_notice(&mut self, text: String, format: TextFormat) {
-        self.renderer_local_notice_sequence = self.renderer_local_notice_sequence.saturating_add(1);
-        self.push_item(
-            TranscriptViewItemId::new(format!(
-                "renderer-local-system:{}",
-                self.renderer_local_notice_sequence
-            )),
-            0,
-            None,
-            false,
-            TranscriptViewItemKind::SystemMessage {
-                message: ChatMessageView {
-                    text,
-                    display_label: None,
-                    format,
-                },
-            },
-        );
     }
 
     /// Apply canonical session metadata from an attach or catalog response.
@@ -6641,32 +6615,6 @@ mod tests {
         assert_eq!(full_ids, shifted_ids);
         assert_eq!(full_ids[0].get(), "event:2");
         assert_eq!(full_ids[1].get(), "tool:tool-1");
-    }
-
-    #[test]
-    fn renderer_local_notices_are_semantic_and_cleared_by_history_rebuild() {
-        let mut view = SessionView::new();
-        view.push_renderer_local_system_notice("plain".to_owned(), TextFormat::PlainText);
-        view.push_renderer_local_system_notice("json".to_owned(), TextFormat::Json);
-
-        assert_eq!(view.snapshot().transcript.items.len(), 2);
-        assert_eq!(
-            view.snapshot().transcript.items[0].id,
-            TranscriptViewItemId::new("renderer-local-system:1")
-        );
-        assert!(matches!(
-            &view.snapshot().transcript.items[0].kind,
-            TranscriptViewItemKind::SystemMessage { message }
-                if message.text == "plain" && message.format == TextFormat::PlainText
-        ));
-        assert!(matches!(
-            &view.snapshot().transcript.items[1].kind,
-            TranscriptViewItemKind::SystemMessage { message }
-                if message.text == "json" && message.format == TextFormat::Json
-        ));
-
-        view.rebuild_history_window(&[]);
-        assert!(view.snapshot().transcript.items.is_empty());
     }
 
     #[test]

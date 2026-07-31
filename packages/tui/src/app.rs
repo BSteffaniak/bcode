@@ -268,6 +268,11 @@ pub struct BmuxApp {
     composer: TextInputState,
     input_history: InputHistory,
     transcript: TranscriptDocument,
+    local_notices: Vec<TranscriptItem>,
+    local_notice_revision: u64,
+    projected_items: Vec<TranscriptItem>,
+    projected_items_revision: u64,
+    projected_items_source_revision: Option<(u64, u64)>,
     session_view_terminal_adapter: SessionViewTerminalAdapter,
     session_view: bcode_session_view::SessionView,
     transcript_window: TranscriptResidentWindow,
@@ -469,6 +474,11 @@ impl BmuxApp {
             composer: TextInputState::new(TextEditBuffer::new()),
             input_history: InputHistory::from_entries(input_history),
             transcript: TranscriptDocument::default(),
+            local_notices: Vec::new(),
+            local_notice_revision: 0,
+            projected_items: Vec::new(),
+            projected_items_revision: 0,
+            projected_items_source_revision: None,
             session_view_terminal_adapter: SessionViewTerminalAdapter::default(),
             session_view: bcode_session_view::SessionView::new(),
             transcript_window: TranscriptResidentWindow::default(),
@@ -519,6 +529,7 @@ impl BmuxApp {
             last_transcript_damage: TranscriptDocumentDamage::None,
         };
         app.absorb_history(history);
+        app.sync_projected_items();
         app
     }
 
@@ -1373,10 +1384,32 @@ impl BmuxApp {
         self.session_view.snapshot()
     }
 
-    /// Return transcript items.
+    /// Return terminal presentation items, including TUI-owned ephemeral notices.
     #[must_use]
     pub fn transcript(&self) -> &[TranscriptItem] {
-        self.transcript.items()
+        &self.projected_items
+    }
+
+    /// Recompose terminal presentation items when semantic transcript or local notices changed.
+    pub fn sync_projected_items(&mut self) {
+        let source_revision = (self.transcript.revision(), self.local_notice_revision);
+        if self.projected_items_source_revision == Some(source_revision) {
+            return;
+        }
+        self.projected_items.clear();
+        self.projected_items
+            .extend(self.transcript.items().iter().cloned());
+        self.projected_items
+            .extend(self.local_notices.iter().cloned());
+        self.projected_items_revision = self.projected_items_revision.saturating_add(1);
+        self.projected_items_source_revision = Some(source_revision);
+    }
+
+    /// Return TUI-owned ephemeral notices rendered outside the canonical transcript.
+    #[cfg(test)]
+    #[must_use]
+    pub fn local_notices(&self) -> &[TranscriptItem] {
+        &self.local_notices
     }
 
     /// Return revision for elapsed-time labels in active transcript entries.
@@ -1388,7 +1421,7 @@ impl BmuxApp {
     /// Return revision for transcript collection changes.
     #[must_use]
     pub const fn transcript_projection_revision(&self) -> u64 {
-        self.transcript.revision()
+        self.projected_items_revision
     }
 
     /// Drain at most `limit` transcript invocation identifiers whose elapsed-time label changed.
@@ -1978,9 +2011,10 @@ impl BmuxApp {
         text: String,
         format: bcode_session_view_models::TextFormat,
     ) {
-        self.session_view
-            .push_renderer_local_system_notice(text, format);
-        self.apply_session_view_terminal_adapter();
+        self.local_notices
+            .push(TranscriptItem::with_format("System", text, format));
+        self.local_notice_revision = self.local_notice_revision.saturating_add(1);
+        self.sync_projected_items();
     }
 
     /// Replace the current status line.
@@ -3243,6 +3277,7 @@ impl BmuxApp {
         {
             self.last_transcript_damage.clone_from(&damage);
         }
+        self.sync_projected_items();
         damage
     }
 

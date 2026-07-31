@@ -143,6 +143,7 @@ pub fn prepare_frame_with_bottom_dock(
     area: Rect,
     dock_height: u16,
 ) -> Option<(FrameLayout, Rect)> {
+    app.sync_projected_items();
     let layout = frame_layout(app, area)?;
     app.set_composer_content_area(layout.composer_content);
     let (layout, dock) = layout.with_bottom_dock(app, dock_height);
@@ -399,16 +400,18 @@ fn local_plain_markdown_and_json_system_notes_keep_distinct_formats() {
     app.push_system_markdown("* rendered".to_owned());
     app.push_system_json(r#"{"value":1}"#.to_owned());
 
+    assert_eq!(app.local_notices().len(), 3);
+    assert!(app.session_view_snapshot().transcript.items.is_empty());
     assert_eq!(
-        app.transcript()[0].text_format(),
+        app.local_notices()[0].text_format(),
         bcode_session_view_models::TextFormat::PlainText
     );
     assert_eq!(
-        app.transcript()[1].text_format(),
+        app.local_notices()[1].text_format(),
         bcode_session_view_models::TextFormat::Markdown
     );
     assert_eq!(
-        app.transcript()[2].text_format(),
+        app.local_notices()[2].text_format(),
         bcode_session_view_models::TextFormat::Json
     );
 }
@@ -1577,7 +1580,7 @@ fn push_transcript_item_rows(
             push_reasoning_rows(rows, item, width);
         }
         TranscriptItemKind::ToolRequest {
-            tool_call_id,
+            tool_call_id: _,
             producer_plugin_id: _,
             tool_name,
             working_directory: _,
@@ -1586,14 +1589,13 @@ fn push_transcript_item_rows(
             status,
         } => {
             let context = ToolRequestRenderContext {
-                tool_call_id,
                 tool_name,
                 status: *status,
             };
             push_tool_request_rows(rows, item, &context, width);
         }
         TranscriptItemKind::ToolResult {
-            tool_call_id,
+            tool_call_id: _,
             tool_name,
             arguments_json: _,
             working_directory,
@@ -1606,7 +1608,6 @@ fn push_transcript_item_rows(
                 rows,
                 item,
                 &ToolResultRenderContext {
-                    tool_call_id,
                     tool_name: tool_name.as_deref(),
                     result,
                     artifact: artifact.as_deref(),
@@ -2635,7 +2636,6 @@ fn push_reasoning_rows(rows: &mut Vec<Line>, item: &TranscriptItem, width: u16) 
 
 #[derive(Clone, Copy)]
 struct ToolRequestRenderContext<'a> {
-    tool_call_id: &'a str,
     tool_name: &'a str,
     status: Option<bcode_session_view_models::ToolInvocationViewStatus>,
 }
@@ -2663,14 +2663,6 @@ fn push_tool_request_rows(
         item.tool_is_active(),
         false,
         width,
-    );
-    push_wrapped_styled_text(
-        rows,
-        vec![Span::styled("  ", muted_style())],
-        &format!("call {}", context.tool_call_id),
-        width,
-        muted_style(),
-        muted_style(),
     );
     if !item.text().is_empty() && !tool_request_arguments_are_sensitive(context.tool_name) {
         push_labeled_text_preview(
@@ -3004,7 +2996,6 @@ const fn tool_status_label(
 }
 
 struct ToolResultRenderContext<'a> {
-    tool_call_id: &'a str,
     tool_name: Option<&'a str>,
     result: &'a str,
     artifact: Option<&'a bcode_session_models::ToolArtifact>,
@@ -3112,7 +3103,7 @@ fn push_tool_result_rows(
         push_wrapped_styled_text(
             rows,
             vec![Span::styled("  ", muted_style())],
-            &format!("tool call {}", context.tool_call_id),
+            "tool failed",
             width,
             muted_style(),
             muted_style(),

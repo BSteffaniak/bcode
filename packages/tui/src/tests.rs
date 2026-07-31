@@ -3829,6 +3829,134 @@ fn assistant_response_after_tool_loop_transitions_to_message_top() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn screenshot_scale_metadata_events_never_pollute_tool_frames_or_identity() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    disable_theme_transition(&mut app);
+    let tools = [
+        ("filesystem_read", r#"{"path":"src/lib.rs"}"#),
+        ("filesystem_grep", r#"{"pattern":"needle","path":"src"}"#),
+        ("filesystem_list", r#"{"path":"src"}"#),
+        ("shell", r#"{"command":"cargo check"}"#),
+    ];
+    let mut sequence = 1;
+    let mut frames = Vec::new();
+
+    for (index, (tool_name, arguments_json)) in tools.iter().enumerate() {
+        let tool_call_id = format!("tool_call_{index}_{tool_name}");
+        let work_id = WorkId::new(format!("raw-work-{index}-{tool_name}"));
+        app.absorb_session_event(&event(
+            session_id,
+            sequence,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: tool_call_id.clone(),
+                producer_plugin_id: None,
+                tool_name: (*tool_name).to_owned(),
+                arguments_json: (*arguments_json).to_owned(),
+                working_directory: None,
+            },
+        ));
+        sequence += 1;
+        let source_id = app
+            .transcript()
+            .iter()
+            .find(|item| item.visual_invocation_id() == Some(tool_call_id.as_str()))
+            .and_then(TranscriptItem::source_view_item_id)
+            .cloned()
+            .expect("tool request has one shared transcript identity");
+        frames.push(render_app_text(&mut app));
+
+        for kind in [
+            SessionEventKind::ModelUsage {
+                turn_id: format!("turn-{index}"),
+                usage: SessionTokenUsage {
+                    input_tokens: Some(100),
+                    output_tokens: Some(10),
+                    total_tokens: Some(110),
+                    ..SessionTokenUsage::default()
+                },
+            },
+            SessionEventKind::RuntimeWorkStarted {
+                work_id: work_id.clone(),
+                kind: RuntimeWorkKind::Tool,
+                label: (*tool_name).to_owned(),
+                tool_call_id: Some(tool_call_id.clone()),
+                plugin_id: Some("fixture.plugin".to_owned()),
+                service_interface: None,
+                operation: None,
+                parent_work_id: None,
+                started_at_ms: Some(sequence),
+                cancellable: true,
+            },
+            SessionEventKind::RuntimeWorkProgress {
+                work_id: work_id.clone(),
+                message: "halfway".to_owned(),
+                completed_units: Some(1),
+                total_units: Some(2),
+                progress_at_ms: Some(sequence),
+            },
+            SessionEventKind::RuntimeWorkFinished {
+                work_id,
+                status: bcode_session_models::RuntimeWorkStatus::Completed,
+                finished_at_ms: Some(sequence),
+                message: Some("done".to_owned()),
+            },
+        ] {
+            let transcript_len = app.session_view_snapshot().transcript.items.len();
+            app.absorb_session_event(&event(session_id, sequence, kind));
+            sequence += 1;
+            assert_eq!(
+                app.session_view_snapshot().transcript.items.len(),
+                transcript_len,
+                "operational metadata must not change transcript membership"
+            );
+            frames.push(render_app_text(&mut app));
+        }
+
+        app.absorb_session_event(&event(
+            session_id,
+            sequence,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: tool_call_id.clone(),
+                    model_output: format!("{tool_name} complete"),
+                    is_error: false,
+                    presentation: None,
+                    result: None,
+                },
+            },
+        ));
+        sequence += 1;
+        frames.push(render_app_text(&mut app));
+
+        let matching = app
+            .transcript()
+            .iter()
+            .filter(|item| item.visual_invocation_id() == Some(tool_call_id.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(matching.len(), 1, "one primary row per invocation");
+        assert_eq!(matching[0].source_view_item_id(), Some(&source_id));
+    }
+
+    for (index, frame) in frames.iter().enumerate() {
+        for forbidden in [
+            "Usage ·",
+            "Runtime work",
+            "tool_call_",
+            "raw-work-",
+            "label: filesystem.",
+            "label: shell.",
+        ] {
+            assert!(
+                !frame.contains(forbidden),
+                "frame {index} contains forbidden metadata {forbidden:?}:\n{frame}"
+            );
+        }
+    }
+}
+
+#[test]
 fn runtime_work_events_do_not_pull_final_response_to_bottom() {
     let session_id = SessionId::new();
     let history = [event(

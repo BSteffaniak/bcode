@@ -158,9 +158,7 @@ impl TranscriptItem {
     }
 
     /// Create a local transcript item with an explicit text format.
-    #[cfg(test)]
-    #[must_use]
-    pub fn with_format(role: &'static str, text: String, text_format: TextFormat) -> Self {
+    pub(crate) fn with_format(role: &'static str, text: String, text_format: TextFormat) -> Self {
         Self::with_identity(role, text, false, text_format, kind_for_role(role))
     }
 
@@ -1072,7 +1070,6 @@ pub fn truncate_block(value: &str, max_chars: usize) -> String {
     output
 }
 
-#[cfg(test)]
 fn kind_for_role(role: &str) -> TranscriptItemKind {
     match role {
         "You" => TranscriptItemKind::UserMessage,

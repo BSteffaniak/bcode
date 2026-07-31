@@ -2072,6 +2072,92 @@ where
 mod tests {
     use super::*;
 
+    fn durable(
+        session_id: bcode_session_models::SessionId,
+        sequence: u64,
+        kind: bcode_session_models::SessionEventKind,
+    ) -> bcode_session_models::SessionEvent {
+        bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence,
+            timestamp_ms: sequence,
+            session_id,
+            provenance: None,
+            kind,
+        }
+    }
+
+    #[test]
+    fn screenshot_scale_snapshot_keeps_one_tool_item_per_invocation() {
+        let session_id = bcode_session_models::SessionId::new();
+        let tools = [
+            "filesystem_read",
+            "filesystem_grep",
+            "filesystem_list",
+            "shell",
+        ];
+        let mut view = SessionView::new();
+        let mut sequence = 1_u64;
+        for (index, tool_name) in tools.iter().enumerate() {
+            let invocation_id = format!("tool_call_{index}_{tool_name}");
+            let work_id = bcode_session_models::WorkId::new(format!("raw-work-{index}"));
+            for kind in [
+                bcode_session_models::SessionEventKind::ToolCallRequested {
+                    tool_call_id: invocation_id.clone(),
+                    producer_plugin_id: None,
+                    tool_name: (*tool_name).to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    working_directory: None,
+                },
+                bcode_session_models::SessionEventKind::ModelUsage {
+                    turn_id: format!("turn-{index}"),
+                    usage: bcode_session_models::SessionTokenUsage {
+                        total_tokens: Some(10),
+                        ..bcode_session_models::SessionTokenUsage::default()
+                    },
+                },
+                bcode_session_models::SessionEventKind::RuntimeWorkStarted {
+                    work_id: work_id.clone(),
+                    kind: bcode_session_models::RuntimeWorkKind::Tool,
+                    label: (*tool_name).to_owned(),
+                    tool_call_id: Some(invocation_id.clone()),
+                    plugin_id: None,
+                    service_interface: None,
+                    operation: None,
+                    parent_work_id: None,
+                    started_at_ms: Some(sequence),
+                    cancellable: true,
+                },
+                bcode_session_models::SessionEventKind::RuntimeWorkFinished {
+                    work_id: work_id.clone(),
+                    status: bcode_session_models::RuntimeWorkStatus::Completed,
+                    finished_at_ms: Some(sequence),
+                    message: Some("done".to_owned()),
+                },
+                bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id,
+                        model_output: "complete".to_owned(),
+                        is_error: false,
+                        presentation: None,
+                        result: None,
+                    },
+                },
+            ] {
+                view.apply_event(&durable(session_id, sequence, kind));
+                sequence += 1;
+            }
+        }
+
+        let snapshot = view.snapshot();
+        assert_eq!(snapshot.transcript.items.len(), tools.len());
+        assert!(snapshot.runtime_work.is_empty());
+        assert!(snapshot.transcript.items.iter().all(|item| matches!(
+            item.kind,
+            bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { .. }
+        )));
+    }
+
     #[test]
     fn scoped_snapshot_patch_replaces_and_removes_legacy_progress_supplemental() {
         let session_id = bcode_session_models::SessionId::new();

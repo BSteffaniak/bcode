@@ -1399,6 +1399,12 @@ then
   violations=1
 fi
 
+if rg -n 'renderer_local_notice|push_renderer_local_system_notice' packages/session-view --glob '*.rs' >/tmp/bcode-session-view-renderer-local-notices.txt; then
+  echo "Runtime architecture violation: renderer-local notice state or APIs must not exist in SessionView." >&2
+  cat /tmp/bcode-session-view-renderer-local-notices.txt >&2
+  violations=1
+fi
+
 if ! grep -F 'UnsupportedSnapshotSchemaVersion' packages/session-view/models/src/lib.rs >/dev/null \
   || ! grep -F 'UnsupportedPatchSchemaVersion' packages/session-view/models/src/lib.rs >/dev/null \
   || ! grep -F 'snapshot_patch_application_rejects_unknown_schema_versions' packages/session-view/models/src/tests.rs >/dev/null; then
