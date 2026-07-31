@@ -549,7 +549,7 @@ if ! grep -F '# Scheduler invariants' packages/agent-runtime/src/lib.rs >/dev/nu
   violations=1
 fi
 
-if ! grep -F 'runtime_work_status_label_preserves_semantic_activity' packages/session-view/models/src/tests.rs >/dev/null ||
+if ! grep -F 'runtime_work_detail_is_terminal_presentation_owned' packages/tui/src/activity.rs >/dev/null ||
    ! grep -F 'authoritative_runtime_work_snapshot_drives_tui_activity' packages/tui/src/app.rs >/dev/null ||
    ! grep -F 'runtime_work_terminal_state_leaves_sibling_active_and_rejects_late_revival' packages/session-view/src/lib.rs >/dev/null ||
    ! grep -F 'terminal_runtime_work_without_visible_start_leaves_no_history' packages/session-view/src/lib.rs >/dev/null ||
@@ -1402,6 +1402,19 @@ fi
 if rg -n 'renderer_local_notice|push_renderer_local_system_notice' packages/session-view --glob '*.rs' >/tmp/bcode-session-view-renderer-local-notices.txt; then
   echo "Runtime architecture violation: renderer-local notice state or APIs must not exist in SessionView." >&2
   cat /tmp/bcode-session-view-renderer-local-notices.txt >&2
+  violations=1
+fi
+
+if rg -n 'runtime_work_status_label|aggregate activity label for active runtime work' \
+  packages/session-view --glob '*.rs' >/tmp/bcode-session-view-runtime-presentation.txt; then
+  echo "Runtime architecture violation: runtime-work status formatting must remain renderer-owned." >&2
+  cat /tmp/bcode-session-view-runtime-presentation.txt >&2
+  violations=1
+fi
+
+if ! grep -F 'fn runtime_work_detail(' packages/tui/src/activity.rs >/dev/null \
+  || ! grep -F 'runtime_work_detail_is_terminal_presentation_owned' packages/tui/src/activity.rs >/dev/null; then
+  echo "Runtime architecture violation: terminal runtime-work formatting or its ownership coverage was removed." >&2
   violations=1
 fi
 

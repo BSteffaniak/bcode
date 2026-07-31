@@ -1401,48 +1401,6 @@ impl RuntimeWorkView {
     }
 }
 
-/// Return the renderer-neutral aggregate activity label for active runtime work.
-#[must_use]
-pub fn runtime_work_status_label(runtime_work: &[RuntimeWorkView]) -> Option<String> {
-    let running_tools = runtime_work
-        .iter()
-        .filter(|work| {
-            work.kind == RuntimeWorkKind::Tool && work.status == RuntimeWorkStatus::Running
-        })
-        .count();
-    if running_tools > 1 {
-        return Some(format!("running {running_tools} tools"));
-    }
-    let work = runtime_work
-        .iter()
-        .min_by(|left, right| left.work_id.cmp(&right.work_id))?;
-    let prefix = match work.status {
-        RuntimeWorkStatus::Queued => "queued",
-        RuntimeWorkStatus::Cancelling => "cancelling",
-        RuntimeWorkStatus::Running => match work.kind {
-            RuntimeWorkKind::ModelTurn => "running",
-            RuntimeWorkKind::Tool => "running tool",
-            RuntimeWorkKind::PluginInvocation => "running plugin",
-            RuntimeWorkKind::EventDelivery => "delivering event",
-            RuntimeWorkKind::Workflow => "running workflow",
-            RuntimeWorkKind::WorkflowNode => "running workflow node",
-        },
-        RuntimeWorkStatus::Completed
-        | RuntimeWorkStatus::Cancelled
-        | RuntimeWorkStatus::Failed
-        | RuntimeWorkStatus::TimedOut => return None,
-    };
-    let detail = match (work.label.is_empty(), work.message.as_deref()) {
-        (true, Some(message)) => message.to_owned(),
-        (true, None) => work.work_id.to_string(),
-        (false, Some(message)) if message != work.label => {
-            format!("{} — {message}", work.label)
-        }
-        (false, _) => work.label.clone(),
-    };
-    Some(format!("{prefix}: {detail}"))
-}
-
 /// Renderer-neutral model, agent, context, and turn state.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionRuntimeViewState {

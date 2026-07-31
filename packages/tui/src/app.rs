@@ -24,7 +24,7 @@ use bmux_tui_components::text_input::{
     TextInputControl, TextInputOutcome, TextInputPolicy, TextInputState,
 };
 
-use super::activity::{ActivityState, model_turn_outcome_label};
+use super::activity::{ActivityState, model_turn_outcome_label, runtime_work_detail};
 use super::cursor_blink::CursorBlink;
 use super::exit_state::ExitState;
 use super::input_history::{InputHistory, InputHistoryOutcome};
@@ -3537,9 +3537,7 @@ impl BmuxApp {
             .any(|work| work.status == bcode_session_models::RuntimeWorkStatus::Cancelling)
         {
             self.set_cancelling();
-        } else if let Some(detail) =
-            bcode_session_view_models::runtime_work_status_label(runtime_work)
-        {
+        } else if let Some(detail) = runtime_work_detail(runtime_work) {
             self.set_activity(ActivityState::RuntimeWork { detail });
         } else if !snapshot.active_invocations.is_empty() {
             let count = snapshot.active_invocations.len();

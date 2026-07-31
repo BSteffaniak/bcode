@@ -9400,6 +9400,111 @@ mod tests {
     }
 
     #[test]
+    fn tool_runtime_work_correlates_without_creating_a_second_transcript_item() {
+        let session_id = SessionId::new();
+        let tool_call_id = "call-runtime-correlation";
+        let work_id = bcode_session_models::WorkId::new("work-runtime-correlation");
+        let mut view = SessionView::new();
+
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::ToolCallRequested {
+                tool_call_id: tool_call_id.to_owned(),
+                producer_plugin_id: Some("test.plugin".to_owned()),
+                tool_name: "test.tool".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        ));
+        let initial_item = view.snapshot().transcript.items[0].clone();
+        assert_eq!(initial_item.id, TranscriptViewItemId::tool(tool_call_id));
+
+        view.apply_event(&event(
+            session_id,
+            2,
+            SessionEventKind::RuntimeWorkStarted {
+                work_id: work_id.clone(),
+                kind: bcode_session_models::RuntimeWorkKind::Tool,
+                label: "test.tool".to_owned(),
+                tool_call_id: Some(tool_call_id.to_owned()),
+                plugin_id: Some("test.plugin".to_owned()),
+                service_interface: None,
+                operation: None,
+                parent_work_id: None,
+                started_at_ms: Some(2),
+                cancellable: true,
+            },
+        ));
+        view.apply_event(&event(
+            session_id,
+            3,
+            SessionEventKind::RuntimeWorkProgress {
+                work_id: work_id.clone(),
+                message: "halfway".to_owned(),
+                completed_units: Some(1),
+                total_units: Some(2),
+                progress_at_ms: Some(3),
+            },
+        ));
+
+        assert_eq!(
+            view.snapshot().transcript.items,
+            std::slice::from_ref(&initial_item)
+        );
+        assert_eq!(view.snapshot().runtime_work.len(), 1);
+
+        view.apply_event(&event(
+            session_id,
+            4,
+            SessionEventKind::RuntimeWorkFinished {
+                work_id,
+                status: bcode_session_models::RuntimeWorkStatus::Completed,
+                finished_at_ms: Some(4),
+                message: Some("done".to_owned()),
+            },
+        ));
+        assert_eq!(
+            view.snapshot().transcript.items,
+            std::slice::from_ref(&initial_item)
+        );
+        assert!(view.snapshot().runtime_work.is_empty());
+
+        view.apply_event(&event(
+            session_id,
+            5,
+            SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: tool_call_id.to_owned(),
+                    model_output: "done".to_owned(),
+                    is_error: false,
+                    presentation: None,
+                    result: Some(bcode_session_models::ToolInvocationResult::Text {
+                        text: "done".to_owned(),
+                    }),
+                },
+            },
+        ));
+
+        let matching_items = view
+            .snapshot()
+            .transcript
+            .items
+            .iter()
+            .filter(|item| item.id == initial_item.id)
+            .collect::<Vec<_>>();
+        assert_eq!(matching_items.len(), 1);
+        assert!(matching_items[0].revision > initial_item.revision);
+        assert!(matches!(
+            &matching_items[0].kind,
+            TranscriptViewItemKind::ToolInvocation { tool }
+                if tool.tool_call_id == tool_call_id
+                    && tool.status == ToolInvocationViewStatus::Finished
+                    && tool.result_text.as_deref() == Some("done")
+        ));
+    }
+
+    #[test]
     fn provider_compaction_view_hides_opaque_payloads() {
         let secret = "secret-opaque-view-value";
         let session_id = SessionId::new();

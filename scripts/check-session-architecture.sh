@@ -70,16 +70,28 @@ import re
 from pathlib import Path
 source = Path('packages/session/models/src/lib.rs').read_text()
 documentation = Path('docs/session-view-event-coverage.md').read_text()
-for enum_name in ('SessionEventKind', 'SessionLiveEventKind'):
+for enum_name, heading, next_heading in (
+    ('SessionEventKind', '## Durable `SessionEventKind` coverage', '## Live `SessionLiveEventKind` coverage'),
+    ('SessionLiveEventKind', '## Live `SessionLiveEventKind` coverage', '## Migration order derived from the matrix'),
+):
     start = source.index(f'pub enum {enum_name}')
     end = source.index('\n}', start)
     variants = re.findall(r'^    ([A-Z][A-Za-z0-9_]*)', source[start:end], re.MULTILINE)
-    missing = [variant for variant in variants if f'`{variant}`' not in documentation]
+    section = documentation.split(heading, 1)[1].split(next_heading, 1)[0]
+    missing = [variant for variant in variants if not re.search(rf'^\| `{variant}` \|', section, re.MULTILINE)]
     if missing:
-        raise SystemExit(f'{enum_name} variants missing from coverage matrix: {missing}')
+        raise SystemExit(f'{enum_name} variants missing explicit coverage rows: {missing}')
+    for line in section.splitlines():
+        if not line.startswith('| `'):
+            continue
+        cells = [cell.strip() for cell in line.strip('|').split('|')]
+        if len(cells) != 5:
+            raise SystemExit(f'{enum_name} coverage row lacks the five required columns: {line}')
+        if cells[2] not in {'transcript', 'non-transcript', 'none'}:
+            raise SystemExit(f'{enum_name} coverage row has invalid transcript eligibility: {line}')
 PY
 then
-  echo "Session architecture violation: durable/live SessionView event coverage documentation is incomplete." >&2
+  echo "Session architecture violation: durable/live SessionView event coverage documentation lacks explicit semantic state, transcript eligibility, or frontend presentation classification." >&2
   violations=1
 fi
 

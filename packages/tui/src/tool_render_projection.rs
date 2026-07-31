@@ -1,13 +1,12 @@
-//! Isolated canonical tool-render projection for the TUI.
+//! Isolated terminal-native plugin visual projection.
 //!
-//! This module is the temporary compatibility boundary between raw/legacy tool
-//! event shapes and the renderer. Render code should consume these canonical
-//! visuals instead of interpreting legacy request/live/result details directly.
+//! This module converts shared plugin-owned artifact contracts into the TUI's
+//! local visual-adapter input. It does not define shared tool semantics.
 
 use bcode_session_models::ToolArtifact;
 use serde_json::Value;
 
-/// Canonical renderer-neutral visual for a tool surface.
+/// Terminal-local plugin visual for a tool surface.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CanonicalToolVisual {
     /// Plugin-owned visual routed by schema and optional producer preference.

@@ -1,6 +1,7 @@
 //! Current TUI activity state.
 
-use bcode_session_models::ModelTurnOutcome;
+use bcode_session_models::{ModelTurnOutcome, RuntimeWorkKind, RuntimeWorkStatus};
+use bcode_session_view_models::RuntimeWorkView;
 
 /// Current high-level TUI activity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +112,48 @@ impl ActivityState {
     }
 }
 
+/// Format active runtime work for the compact terminal activity surface.
+#[must_use]
+pub fn runtime_work_detail(runtime_work: &[RuntimeWorkView]) -> Option<String> {
+    let running_tools = runtime_work
+        .iter()
+        .filter(|work| {
+            work.kind == RuntimeWorkKind::Tool && work.status == RuntimeWorkStatus::Running
+        })
+        .count();
+    if running_tools > 1 {
+        return Some(format!("running {running_tools} tools"));
+    }
+    let work = runtime_work
+        .iter()
+        .min_by(|left, right| left.work_id.cmp(&right.work_id))?;
+    let prefix = match work.status {
+        RuntimeWorkStatus::Queued => "queued",
+        RuntimeWorkStatus::Cancelling => "cancelling",
+        RuntimeWorkStatus::Running => match work.kind {
+            RuntimeWorkKind::ModelTurn => "running",
+            RuntimeWorkKind::Tool => "running tool",
+            RuntimeWorkKind::PluginInvocation => "running plugin",
+            RuntimeWorkKind::EventDelivery => "delivering event",
+            RuntimeWorkKind::Workflow => "running workflow",
+            RuntimeWorkKind::WorkflowNode => "running workflow node",
+        },
+        RuntimeWorkStatus::Completed
+        | RuntimeWorkStatus::Cancelled
+        | RuntimeWorkStatus::Failed
+        | RuntimeWorkStatus::TimedOut => return None,
+    };
+    let detail = match (work.label.is_empty(), work.message.as_deref()) {
+        (true, Some(message)) => message.to_owned(),
+        (true, None) => work.work_id.to_string(),
+        (false, Some(message)) if message != work.label => {
+            format!("{} — {message}", work.label)
+        }
+        (false, _) => work.label.clone(),
+    };
+    Some(format!("{prefix}: {detail}"))
+}
+
 /// Return a status label for a model turn outcome.
 #[must_use]
 pub const fn model_turn_outcome_label(outcome: ModelTurnOutcome) -> &'static str {
@@ -121,5 +164,61 @@ pub const fn model_turn_outcome_label(outcome: ModelTurnOutcome) -> &'static str
         ModelTurnOutcome::IdleTimeout => "idle timeout",
         ModelTurnOutcome::ToolRoundLimitReached => "tool round limit reached",
         ModelTurnOutcome::ProviderUnavailable => "provider unavailable",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bcode_session_models::WorkId;
+
+    #[test]
+    fn runtime_work_detail_is_terminal_presentation_owned() {
+        let running = |id: &str, kind, label: &str, message: Option<&str>| RuntimeWorkView {
+            work_id: WorkId::new(id),
+            kind,
+            label: label.to_owned(),
+            status: RuntimeWorkStatus::Running,
+            cancellable: true,
+            message: message.map(ToOwned::to_owned),
+            completed_units: None,
+            total_units: None,
+            updated_at_ms: None,
+        };
+        let one = running("work-1", RuntimeWorkKind::Tool, "shell", Some("halfway"));
+        assert_eq!(
+            runtime_work_detail(std::slice::from_ref(&one)).as_deref(),
+            Some("running tool: shell — halfway")
+        );
+        let two = running("work-2", RuntimeWorkKind::Tool, "web", None);
+        assert_eq!(
+            runtime_work_detail(&[one, two]).as_deref(),
+            Some("running 2 tools")
+        );
+        let queued = RuntimeWorkView {
+            work_id: WorkId::new("a-work"),
+            kind: RuntimeWorkKind::ModelTurn,
+            label: "queued turn".to_owned(),
+            status: RuntimeWorkStatus::Queued,
+            cancellable: false,
+            message: None,
+            completed_units: None,
+            total_units: None,
+            updated_at_ms: None,
+        };
+        let plugin = running("z-work", RuntimeWorkKind::PluginInvocation, "plugin", None);
+        assert_eq!(
+            runtime_work_detail(&[plugin, queued]).as_deref(),
+            Some("queued: queued turn")
+        );
+
+        let cancelling = RuntimeWorkView {
+            status: RuntimeWorkStatus::Cancelling,
+            ..running("work-3", RuntimeWorkKind::PluginInvocation, "plugin", None)
+        };
+        assert_eq!(
+            runtime_work_detail(&[cancelling]).as_deref(),
+            Some("cancelling: plugin")
+        );
     }
 }

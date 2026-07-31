@@ -2,6 +2,32 @@
 
 Bcode's target renderer architecture uses a shared semantic session-view layer rather than session event logs or another renderer's UI state.
 
+Reasoning content remains shared semantic state, while visibility, readable-representation selection (`all`, `summary`, or `raw`), disclosure, labels, and styling are frontend presentation policy. `SessionView` accepts a renderer/client-selected policy so each attached frontend can derive its own bounded projection; the policy never changes provider requests or durable history.
+
+Plugin fallback remains contract-driven: `SessionView` transports invocation identity, lifecycle, typed results, artifacts, and opaque schema-versioned plugin payloads without interpreting tool domains. Each frontend first attempts its own plugin adapter and otherwise renders the bounded generic invocation/result contract.
+
+Canonical transcript content crosses the single `SessionViewTerminalAdapter` boundary into the TUI. Runtime-work label composition and other terminal activity strings live in TUI modules rather than shared session-view models.
+
+## Transcript eligibility catalog
+
+Every `TranscriptViewItemKind` is intentional chronological product history:
+
+* `UserMessage` — user-authored conversation content.
+* `AssistantMessage` — assistant-authored conversation content.
+* `ReasoningMessage` — supported legacy reasoning history whose richer source representation is unavailable.
+* `ReasoningActivity` — structured assistant reasoning history with stable lifecycle and ordering.
+* `ToolInvocation` — the one canonical primary history item for a tool invocation.
+* `ToolRequestDraft` — live provisional request content occupying the canonical invocation position until superseded or removed.
+* `ToolRequest` — supported historical request context retained after a result supersedes an older active representation.
+* `Permission` — a user-visible authorization checkpoint and its resolution in the conversation flow.
+* `Compaction` — a user-visible semantic explanation that model context was compacted.
+* `Interaction` — a user-visible plugin interaction checkpoint and its resolution.
+* `Skill` — user-visible skill activation, context, suggestion, or failure history.
+* `SystemMessage` — shared product-authored conversation status, never renderer-local notices.
+* `ToolContribution` — an explicitly placed plugin-owned history contribution with a portable fallback.
+
+Usage, generic runtime work, provider progress, occupancy, active invocation progress, and renderer-local notices are deliberately absent from this catalog.
+
 ## Current migration status
 
 The target boundary is active for tool transcript semantics in both established renderers:
