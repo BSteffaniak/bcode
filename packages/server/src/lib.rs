@@ -16465,7 +16465,7 @@ fn serialized_tool_argument_len(arguments: &serde_json::Value) -> usize {
 
 #[derive(Default)]
 struct ModelTurnRecoveryState {
-    retried_after_context_overflow: bool,
+    retried_after_context_pressure: bool,
     retried_after_malformed_tool_arguments: bool,
     max_tokens_continuations: u32,
     retry_attempts: BTreeMap<String, u64>,
@@ -16980,29 +16980,58 @@ async fn run_model_turn_inner(
                 }
             }
             Some(bcode_model::StopReason::MaxTokens)
-                if should_continue_after_max_tokens(recovery.max_tokens_continuations) =>
+                if should_compact_after_max_tokens(
+                    compaction_decision,
+                    recovery.retried_after_context_pressure,
+                ) =>
             {
-                recovery.max_tokens_continuations =
-                    recovery.max_tokens_continuations.saturating_add(1);
+                recovery.retried_after_context_pressure = true;
                 recovery.retry_instruction = Some(MAX_TOKENS_CONTINUATION_INSTRUCTION);
-                append_provider_event_trace(
+                set_runtime_phase(phase, SessionRuntimePhase::Compacting).await;
+                let result = compact_session_after_max_tokens(
                     state,
                     session_id,
-                    &request.turn_id,
-                    "max_tokens_continuation",
-                    Some(format!(
-                        "model exhausted its output token budget; continuing ({}/{MAX_TOKENS_CONTINUATION_LIMIT})",
-                        recovery.max_tokens_continuations
-                    )),
+                    &selection,
+                    trigger_event.sequence,
+                    cancel_state.as_ref(),
                 )
                 .await;
+                set_runtime_phase(phase, SessionRuntimePhase::ProviderActive).await;
+                match result {
+                    Ok(true) => {
+                        record_max_tokens_continuation(
+                            state,
+                            session_id,
+                            &request.turn_id,
+                            &mut recovery,
+                        )
+                        .await;
+                    }
+                    Ok(false)
+                        if should_continue_after_max_tokens(recovery.max_tokens_continuations) =>
+                    {
+                        record_max_tokens_continuation(
+                            state,
+                            session_id,
+                            &request.turn_id,
+                            &mut recovery,
+                        )
+                        .await;
+                    }
+                    Ok(false) => {
+                        return max_tokens_continuation_limit_completion(state, session_id).await;
+                    }
+                    Err(completion) => return completion,
+                }
+            }
+            Some(bcode_model::StopReason::MaxTokens)
+                if should_continue_after_max_tokens(recovery.max_tokens_continuations) =>
+            {
+                record_max_tokens_continuation(state, session_id, &request.turn_id, &mut recovery)
+                    .await;
             }
             Some(bcode_model::StopReason::MaxTokens) => {
-                let message = format!(
-                    "model repeatedly exhausted its output token budget ({MAX_TOKENS_CONTINUATION_LIMIT} continuations)"
-                );
-                append_system_event(state, session_id, message.clone()).await;
-                return ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message);
+                return max_tokens_continuation_limit_completion(state, session_id).await;
             }
             Some(_) => {
                 return outcome
@@ -17034,6 +17063,45 @@ async fn run_model_turn_inner(
 
 const fn should_continue_after_max_tokens(continuations: u32) -> bool {
     continuations < MAX_TOKENS_CONTINUATION_LIMIT
+}
+
+const fn should_compact_after_max_tokens(
+    decision: CompactionDecision,
+    already_retried: bool,
+) -> bool {
+    !already_retried && decision.overflow_recovery
+}
+
+async fn record_max_tokens_continuation(
+    state: &ServerState,
+    session_id: SessionId,
+    turn_id: &str,
+    recovery: &mut ModelTurnRecoveryState,
+) {
+    recovery.max_tokens_continuations = recovery.max_tokens_continuations.saturating_add(1);
+    recovery.retry_instruction = Some(MAX_TOKENS_CONTINUATION_INSTRUCTION);
+    append_provider_event_trace(
+        state,
+        session_id,
+        turn_id,
+        "max_tokens_continuation",
+        Some(format!(
+            "model exhausted its output token budget; continuing ({}/{MAX_TOKENS_CONTINUATION_LIMIT})",
+            recovery.max_tokens_continuations
+        )),
+    )
+    .await;
+}
+
+async fn max_tokens_continuation_limit_completion(
+    state: &ServerState,
+    session_id: SessionId,
+) -> ModelTurnCompletion {
+    let message = format!(
+        "model repeatedly exhausted its output token budget ({MAX_TOKENS_CONTINUATION_LIMIT} continuations)"
+    );
+    append_system_event(state, session_id, message.clone()).await;
+    ModelTurnCompletion::with_message(ModelTurnOutcome::Error, message)
 }
 
 async fn maybe_retry_after_provider_error(
@@ -17070,9 +17138,9 @@ async fn maybe_retry_after_provider_error(
     if should_retry_after_context_overflow(
         context.compaction_decision,
         error,
-        recovery.retried_after_context_overflow,
+        recovery.retried_after_context_pressure,
     ) {
-        recovery.retried_after_context_overflow = true;
+        recovery.retried_after_context_pressure = true;
         set_runtime_phase(context.phase, SessionRuntimePhase::Compacting).await;
         let result = compact_session_after_context_overflow(
             state,
@@ -17638,6 +17706,75 @@ fn should_retry_after_malformed_tool_arguments(
     already_retried: bool,
 ) -> bool {
     !already_retried && is_tool_arguments_decode_provider_error(error)
+}
+
+async fn compact_session_after_max_tokens(
+    state: &ServerState,
+    session_id: SessionId,
+    selection: &SessionModelSelection,
+    first_kept_sequence: u64,
+    cancel_state: &TurnCancelState,
+) -> Result<bool, ModelTurnCompletion> {
+    append_context_compaction_trace(
+        state,
+        session_id,
+        CompactionTraceKind::Diagnostic,
+        "max_output_tokens",
+        0,
+        false,
+        Some("model exhausted its output token budget; attempting context compaction before continuing".to_owned()),
+    )
+    .await;
+    match compact_session_context_before_sequence(
+        state,
+        session_id,
+        selection,
+        first_kept_sequence,
+        cancel_state,
+    )
+    .await
+    {
+        Ok(completion) => {
+            append_context_compaction_trace(
+                state,
+                session_id,
+                CompactionTraceKind::Diagnostic,
+                "max_output_tokens",
+                0,
+                true,
+                Some(format!("{}; continuing model turn", completion.message)),
+            )
+            .await;
+            Ok(true)
+        }
+        Err(CompactionError::PlanUnavailable(reason)) => {
+            append_context_compaction_trace(
+                state,
+                session_id,
+                CompactionTraceKind::Skipped,
+                "max_output_tokens",
+                0,
+                false,
+                Some(format!(
+                    "output-budget compaction unavailable ({reason}); continuing without compaction"
+                )),
+            )
+            .await;
+            Ok(false)
+        }
+        Err(CompactionError::Cancelled) => Err(ModelTurnCompletion::with_message(
+            ModelTurnOutcome::Cancelled,
+            "model turn cancelled",
+        )),
+        Err(error) => {
+            let message = format!("output-budget compaction failed: {error}");
+            append_system_event(state, session_id, message.clone()).await;
+            Err(ModelTurnCompletion::with_message(
+                ModelTurnOutcome::Error,
+                message,
+            ))
+        }
+    }
 }
 
 async fn compact_session_after_context_overflow(
@@ -34067,6 +34204,16 @@ library = "test"
             sources: Box::default(),
         };
 
+        assert!(should_compact_after_max_tokens(decision, false));
+        assert!(!should_compact_after_max_tokens(decision, true));
+        assert!(!should_compact_after_max_tokens(
+            CompactionDecision {
+                strategy: AutomaticCompactionStrategy::Disabled,
+                overflow_recovery: false,
+                reason: "test",
+            },
+            false,
+        ));
         assert!(should_retry_after_context_overflow(decision, &error, false));
         assert!(!should_retry_after_context_overflow(decision, &error, true));
     }
@@ -53577,6 +53724,105 @@ event_symbol = "bcode_plugin_handle_event_v1"
             event.sequence > trigger_event.sequence
                 && matches!(event.kind, SessionEventKind::AssistantMessage { .. })
         }));
+    }
+
+    #[tokio::test]
+    async fn max_output_tokens_compacts_before_continuing() {
+        let sessions = SessionManager::default();
+        let summary = sessions
+            .create_session(
+                Some("max output recovery".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session should be created");
+        let session_id = summary.id;
+        sessions
+            .append_model_changed(
+                session_id,
+                "bcode.fake-provider".to_owned(),
+                "fake-echo".to_owned(),
+            )
+            .await
+            .expect("select fake provider");
+        append_test_history(&sessions, session_id, 8, 500).await;
+        let trigger_event = sessions
+            .append_event(
+                session_id,
+                SessionEventKind::UserMessage {
+                    client_id: ClientId::new(),
+                    text: "continue after output exhaustion".to_owned(),
+                    admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                },
+            )
+            .await
+            .expect("append trigger event");
+        let mut state = test_server_state_with_fake_provider(sessions);
+        state.auto_compaction.mode = bcode_config::CompactionMode::OnOverflow;
+        state.auto_compaction.backend = bcode_config::CompactionBackend::Local;
+        state
+            .selected_provider_context
+            .settings
+            .insert("fake_max_tokens_once".to_owned(), "true".to_owned());
+        state.session_model_selections.lock().await.insert(
+            session_id,
+            SessionModelSelection {
+                provider_plugin_id: Some("bcode.fake-provider".to_owned()),
+                model_id: Some("fake-echo".to_owned()),
+                provider_context: state.selected_provider_context.clone(),
+                ..SessionModelSelection::default()
+            },
+        );
+        let mut permit = SessionTurnPermit::new(session_id);
+        let (_followup_tx, mut followup_rx) = mpsc::channel(1);
+        let (_steering_tx, mut steering_rx) = mpsc::channel(1);
+        let (_cancel_tx, mut cancel_rx) = mpsc::channel(1);
+        let queued_followups = AtomicUsize::new(0);
+        let mut command_context = RuntimeCommandContext::new(
+            &mut followup_rx,
+            &mut steering_rx,
+            &mut cancel_rx,
+            &queued_followups,
+            Arc::new(Mutex::new(None)),
+        );
+        let phase = Arc::new(Mutex::new(SessionRuntimePhase::Idle));
+
+        let completion = run_model_turn(
+            &state,
+            &mut permit,
+            &trigger_event,
+            ClientId::new(),
+            None,
+            &mut command_context,
+            &phase,
+            None,
+        )
+        .await;
+
+        assert_eq!(completion.outcome, ModelTurnOutcome::Completed);
+        let history = state
+            .sessions
+            .session_history(session_id)
+            .await
+            .expect("history should read");
+        assert!(
+            history
+                .iter()
+                .any(|event| matches!(event.kind, SessionEventKind::ContextCompacted { .. }))
+        );
+        assert!(history.iter().any(|event| matches!(
+            &event.kind,
+            SessionEventKind::TraceEvent { trace }
+                if matches!(
+                    &trace.payload,
+                    SessionTracePayload::ContextCompaction {
+                        reason,
+                        compacted: true,
+                        ..
+                    } if reason == "max_output_tokens"
+                )
+        )));
+        assert_eq!(permit.turn_entries, 1);
     }
 
     #[tokio::test]

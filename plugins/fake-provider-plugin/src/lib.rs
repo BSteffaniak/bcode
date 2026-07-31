@@ -154,6 +154,7 @@ struct FakeProviderState {
     tool_rounds_emitted: u64,
     turns: BTreeMap<String, FakeTurn>,
     overflow_emitted: bool,
+    max_tokens_emitted: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -402,6 +403,23 @@ impl FakeProviderPlugin {
         if emit_overflow {
             state.overflow_emitted = true;
         }
+        let emit_max_tokens = request
+            .provider_context
+            .settings
+            .get("fake_max_tokens_once")
+            .is_some_and(|value| value == "true")
+            && !is_compaction_request
+            && !state.max_tokens_emitted;
+        if emit_max_tokens {
+            state.max_tokens_emitted = true;
+        }
+        let forced_stop = if emit_overflow {
+            Some(StopReason::Error)
+        } else if emit_max_tokens {
+            Some(StopReason::MaxTokens)
+        } else {
+            None
+        };
         let configured_tool_call_count = fake_tool_call_count(&request);
         let emit_malformed_tool_call = request
             .provider_context
@@ -414,7 +432,7 @@ impl FakeProviderPlugin {
             turn,
             request: &request,
             event_script,
-            emit_overflow,
+            forced_stop,
             configured_tool_call_count,
             emit_malformed_tool_call,
             has_tool_result,
@@ -480,7 +498,7 @@ struct FakeTurnDispatch<'a> {
     turn: FakeTurn,
     request: &'a ModelTurnRequest,
     event_script: Option<FakeProviderEventScript>,
-    emit_overflow: bool,
+    forced_stop: Option<StopReason>,
     configured_tool_call_count: usize,
     emit_malformed_tool_call: bool,
     has_tool_result: bool,
@@ -494,7 +512,7 @@ fn dispatch_fake_turn(dispatch: FakeTurnDispatch<'_>) {
         turn,
         request,
         event_script,
-        emit_overflow,
+        forced_stop,
         configured_tool_call_count,
         emit_malformed_tool_call,
         has_tool_result,
@@ -504,7 +522,7 @@ fn dispatch_fake_turn(dispatch: FakeTurnDispatch<'_>) {
     } = dispatch;
     if let Some(script) = event_script {
         run_fake_event_script(turn, script);
-    } else if emit_overflow {
+    } else if forced_stop == Some(StopReason::Error) {
         turn.push(ProviderTurnEvent::Error {
             error: ProviderError {
                 code: "context_length_exceeded".to_string(),
@@ -521,6 +539,13 @@ fn dispatch_fake_turn(dispatch: FakeTurnDispatch<'_>) {
         });
         turn.push(ProviderTurnEvent::TurnFinished {
             stop_reason: StopReason::Error,
+        });
+    } else if forced_stop == Some(StopReason::MaxTokens) {
+        turn.push(ProviderTurnEvent::TextDelta {
+            text: "fake partial output".to_owned(),
+        });
+        turn.push(ProviderTurnEvent::TurnFinished {
+            stop_reason: StopReason::MaxTokens,
         });
     } else if finish_configured_fake_tool_conformance(
         &turn,
