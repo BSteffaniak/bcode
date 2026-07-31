@@ -34,10 +34,20 @@ Supported v1 targets:
 * `x86_64-unknown-linux-gnu`
 * `x86_64-pc-windows-msvc`
 
-Artifacts are written to `target/dist/` with adjacent `sha256` files. macOS and Windows
-artifacts are `.zip` archives; Linux artifacts are `.tar.gz` archives. Portable ZIP is the complete
-initial Windows distribution format; an installer, Store package, package-manager publication, and
-auto-updater are outside the v1 Windows milestone. Every archive contains
+Artifacts are written to `target/dist/` with adjacent `sha256` files. Each `bcode` artifact also
+contains an exact produced-artifact identity. `cargo xtask build`, `release`, and `dev-release`
+generate one identity for the produced binary; signing, stripping, copying, archiving, and extraction
+must preserve it. The executable's artifact identity is probed before and after host post-link
+signing or stripping, and the staged copy is checked against the same value before archiving.
+`verify-release` then executes `bcode artifact-id` from the extracted host artifact and fails if the
+identity is missing or malformed before running daemon smoke coverage. Together these checks cover
+macOS signing, Linux stripping, Windows signing when configured, copy/staging, archiving, and
+extraction without treating signatures or executable digests as identity. Artifact identity is
+daemon routing metadata and is distinct from the archive checksum and executable SHA-256.
+
+macOS and Windows artifacts are `.zip` archives; Linux artifacts are `.tar.gz` archives. Portable ZIP
+is the complete initial Windows distribution format; an installer, Store package, package-manager
+publication, and auto-updater are outside the v1 Windows milestone. Every archive contains
 `bcode` and the process-isolated `bcode-mermaid-worker` (with `.exe` suffixes on Windows), plus
 the bundled Tesseract runtime tree selected by the `distribution` feature. Windows source
 builds use the MSVC Rust target and require Visual Studio Build Tools with C++ support and CMake.

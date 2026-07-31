@@ -5724,14 +5724,17 @@ mod tests {
             },
         )];
         let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
-        let before_items = app.transcript().to_vec();
+        let before_items = app.transcript().iter().cloned().collect::<Vec<_>>();
         let before_frame = app.frame_observation();
         let before_scroll = app.scroll_offset();
         let before_visible = app.reasoning_visible();
 
         app.apply_reasoning_selection(Some("high".to_owned()), None);
 
-        assert_eq!(app.transcript(), before_items.as_slice());
+        assert_eq!(
+            app.transcript().iter().cloned().collect::<Vec<_>>(),
+            before_items
+        );
         assert_eq!(app.frame_observation(), before_frame);
         assert_eq!(app.scroll_offset(), before_scroll);
         assert_eq!(app.reasoning_visible(), before_visible);
@@ -5821,11 +5824,14 @@ mod tests {
             },
         )];
         let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
-        let before_items = app.transcript().to_vec();
+        let before_items = app.transcript().iter().cloned().collect::<Vec<_>>();
 
         app.set_reasoning_visible(app.reasoning_visible());
 
-        assert_eq!(app.transcript(), before_items.as_slice());
+        assert_eq!(
+            app.transcript().iter().cloned().collect::<Vec<_>>(),
+            before_items
+        );
     }
 
     #[test]

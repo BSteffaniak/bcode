@@ -485,7 +485,7 @@ while time.monotonic() < deadline:
 
 if exit_status is None:
     try:
-        os.write(fd, b"\x04")
+        os.write(fd, b"\x1b")
     except OSError:
         pass
     time.sleep(0.5)

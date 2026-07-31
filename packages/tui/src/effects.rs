@@ -17,9 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::{
-    TuiError, clipboard_image,
-    daemon_host::TuiDaemonHost,
-    daemon_issue, history_flow,
+    TuiError, clipboard_image, daemon_issue, history_flow,
     session_flow::{self, AgentCatalog},
     slash_palette,
 };
@@ -695,7 +693,7 @@ enum EffectDaemonIntent {
 }
 
 impl TuiEffect {
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, dead_code)]
     fn daemon_start_failed(self, client_error: ClientError) -> TuiEffectResult {
         match self {
             Self::OpenSession { session_id, .. } => TuiEffectResult::SessionOpened {
@@ -927,7 +925,6 @@ impl TuiEffectQueue {
 pub struct TuiEffectRunner {
     foreground_client: BcodeClient,
     passive_client: BcodeClient,
-    daemon_host: TuiDaemonHost,
     tasks: BTreeMap<EffectKey, tokio::task::JoinHandle<TuiEffectResult>>,
     streaming_sender: mpsc::UnboundedSender<TuiEffectResult>,
     streaming_receiver: mpsc::UnboundedReceiver<TuiEffectResult>,
@@ -938,16 +935,11 @@ pub struct TuiEffectRunner {
 impl TuiEffectRunner {
     /// Create an effect runner using foreground and passive clients.
     #[must_use]
-    pub fn new(
-        foreground_client: &BcodeClient,
-        passive_client: &BcodeClient,
-        daemon_host: TuiDaemonHost,
-    ) -> Self {
+    pub fn new(foreground_client: &BcodeClient, passive_client: &BcodeClient) -> Self {
         let (streaming_sender, streaming_receiver) = mpsc::unbounded_channel();
         Self {
             foreground_client: foreground_client.clone(),
             passive_client: passive_client.clone(),
-            daemon_host,
             tasks: BTreeMap::new(),
             streaming_sender,
             streaming_receiver,
@@ -1015,16 +1007,9 @@ impl TuiEffectRunner {
             EffectDaemonIntent::Background => self.passive_client.clone(),
             EffectDaemonIntent::Foreground => self.foreground_client.clone(),
         };
-        let daemon_host = self.daemon_host.clone();
         let streaming_sender = self.streaming_sender.clone();
-        let task = tokio::spawn(async move {
-            if daemon_intent == EffectDaemonIntent::Foreground
-                && let Err(error) = ensure_foreground_daemon(&client, &daemon_host).await
-            {
-                return effect.daemon_start_failed(error);
-            }
-            Box::pin(effect.run(client, streaming_sender)).await
-        });
+        let task =
+            tokio::spawn(async move { Box::pin(effect.run(client, streaming_sender)).await });
         self.tasks.insert(key, task);
     }
 
@@ -1097,21 +1082,6 @@ impl TuiEffectRunner {
         for (_key, task) in std::mem::take(&mut self.tasks) {
             task.abort();
         }
-    }
-}
-
-async fn ensure_foreground_daemon(
-    client: &BcodeClient,
-    daemon_host: &TuiDaemonHost,
-) -> Result<(), ClientError> {
-    match client.ensure_daemon_available().await {
-        Ok(()) => Ok(()),
-        Err(error) if error.is_daemon_unavailable() => {
-            tracing::warn!(%error, "detached daemon startup failed; falling back to in-process daemon");
-            daemon_host.ensure_available().await?;
-            Ok(())
-        }
-        Err(error) => Err(error),
     }
 }
 
@@ -2036,7 +2006,7 @@ mod progress_routing_tests {
     #[tokio::test]
     async fn presentation_note_queue_preserves_emission_order_per_session() {
         let client = BcodeClient::default_endpoint();
-        let mut runner = TuiEffectRunner::new(&client, &client, TuiDaemonHost::new(&[]));
+        let mut runner = TuiEffectRunner::new(&client, &client);
         let session_id = SessionId::new();
         let note = |note_id: &str| TuiEffect::AppendPresentationNote {
             session_id,
@@ -2074,7 +2044,7 @@ mod progress_routing_tests {
     #[tokio::test]
     async fn runner_drains_streaming_session_progress_through_effect_results() {
         let client = BcodeClient::default_endpoint();
-        let mut runner = TuiEffectRunner::new(&client, &client, TuiDaemonHost::new(&[]));
+        let mut runner = TuiEffectRunner::new(&client, &client);
         let session_id = SessionId::new();
         let snapshot = bcode_session_models::SessionOpenOperationSnapshot {
             operation_id: bcode_session_models::SessionOpenOperationId::new(),

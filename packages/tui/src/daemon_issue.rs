@@ -149,14 +149,19 @@ impl TuiDaemonIssue {
 /// Classify a client error as a TUI-recoverable daemon issue.
 #[must_use]
 pub fn classify_client_error(error: &ClientError) -> TuiDaemonIssue {
-    if matches!(error, ClientError::RequestTimeout { .. }) {
+    if matches!(
+        error,
+        ClientError::RequestTimeout { .. } | ClientError::DaemonStartupTimeout { .. }
+    ) {
         return TuiDaemonIssue::Timeout;
     }
     if error.is_daemon_unavailable() {
         return TuiDaemonIssue::Unavailable;
     }
     match error {
-        ClientError::RequestTimeout { .. } => TuiDaemonIssue::Timeout,
+        ClientError::RequestTimeout { .. } | ClientError::DaemonStartupTimeout { .. } => {
+            TuiDaemonIssue::Timeout
+        }
         ClientError::Codec(CodecError::UnsupportedVersion { .. })
         | ClientError::IncompatibleDaemon { .. } => TuiDaemonIssue::StaleOrIncompatible,
         ClientError::Codec(

@@ -4158,6 +4158,7 @@ impl PluginHost {
         static_plugins: &[StaticBundledPlugin],
         configs: BTreeMap<String, ResolvedPluginConfig>,
     ) -> Result<Self, PluginLoadError> {
+        let discovery_started_at = Instant::now();
         tracing::debug!(target: "bcode_plugin::startup", "discovering plugins");
         let static_plugins = filter_selected_static_plugins(static_plugins, selection)?;
         let static_ids = static_plugins
@@ -4170,6 +4171,9 @@ impl PluginHost {
             .collect::<Vec<_>>();
         tracing::debug!(
             target: "bcode_plugin::startup",
+            elapsed_ms = discovery_started_at.elapsed().as_millis(),
+            static_plugin_count = static_plugins.len(),
+            plugin_count = plugins.len(),
             static_plugins = ?static_plugins
                 .iter()
                 .map(|plugin| plugin.0.id.as_str())
@@ -4194,6 +4198,12 @@ impl PluginHost {
         host.load_registered_plugins_into(&plugins)?;
         validate_tool_presentation_declarations(host.loaded.iter().map(LoadedPlugin::manifest))?;
         host.validate_tool_presentation_ownership()?;
+        tracing::debug!(
+            target: "bcode_plugin::startup",
+            elapsed_ms = discovery_started_at.elapsed().as_millis(),
+            loaded_plugin_count = host.loaded.len(),
+            "plugin startup complete"
+        );
         Ok(host)
     }
 

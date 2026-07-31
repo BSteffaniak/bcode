@@ -5640,6 +5640,7 @@ async fn live_shell_recording_chunk_renders_once_from_contribution_artifact() {
                         daemon: bcode_ipc::DaemonStatus {
                             namespace: bcode_ipc::daemon_namespace(),
                             protocol_version: u32::from(bcode_ipc::ProtocolVersion::current().0),
+                            artifact_id: Some(bcode_ipc::ArtifactId::current()),
                             build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
                             executable_digest: executable_digest.clone(),
                             storage_writer_epoch: Some(

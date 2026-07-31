@@ -86,7 +86,7 @@ if ! "${root}/target/debug/bcode" session list 2>/dev/null | grep "${session_id}
     exit 1
 fi
 
-if ! "${root}/target/debug/bcode" session history "${session_id}" | grep "hello from smoke" >/dev/null; then
+if ! "${root}/target/debug/bcode" session history "${session_id}" --json | grep "hello from smoke" >/dev/null; then
     echo "persisted session history did not include sent message" >&2
     echo "--- restarted server log ---" >&2
     cat "$workdir/server-restarted.log" >&2 || true
@@ -128,6 +128,51 @@ sleep 1
 restarted_executable="$("${root}/target/debug/bcode" server status --verbose | sed -n 's/^daemon executable: //p')"
 if [[ "${restarted_executable}" != "${daemon_executable}" ]]; then
     echo "daemon restart did not reuse the immutable image" >&2
+    exit 1
+fi
+"${root}/target/debug/bcode" server stop >/dev/null
+
+idle_config="${workdir}/idle-bcode.toml"
+cat >"${idle_config}" <<'EOF'
+[daemon]
+idle_shutdown = true
+idle_shutdown_after_secs = 1
+EOF
+export BCODE_CONFIG="${idle_config}"
+"${root}/target/debug/bcode" server start >/dev/null
+idle_pid="$(python3 - "${BCODE_STATE_DIR}/daemons" <<'PY'
+import glob
+import json
+import os
+import sys
+records = glob.glob(os.path.join(sys.argv[1], "*.json"))
+with open(records[0], "r", encoding="utf-8") as record_file:
+    print(json.load(record_file)["pid"])
+PY
+)"
+for _ in {1..100}; do
+    if ! kill -0 "${idle_pid}" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
+if kill -0 "${idle_pid}" 2>/dev/null; then
+    echo "daemon did not shut down after configured idle interval" >&2
+    exit 1
+fi
+"${root}/target/debug/bcode" server start >/dev/null
+restarted_pid="$(python3 - "${BCODE_STATE_DIR}/daemons" <<'PY'
+import glob
+import json
+import os
+import sys
+records = glob.glob(os.path.join(sys.argv[1], "*.json"))
+with open(records[0], "r", encoding="utf-8") as record_file:
+    print(json.load(record_file)["pid"])
+PY
+)"
+if [[ "${restarted_pid}" == "${idle_pid}" ]] || ! kill -0 "${restarted_pid}" 2>/dev/null; then
+    echo "idle shutdown was not followed by automatic matching restart" >&2
     exit 1
 fi
 "${root}/target/debug/bcode" server stop >/dev/null

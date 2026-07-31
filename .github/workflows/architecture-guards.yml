@@ -21,6 +21,18 @@ jobs:
       - name: Test cross-process session lease locking
         run: cargo test --package bcode_session lease::tests --no-default-features
 
+  daemon-lifecycle:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check daemon lifecycle architecture
+        run: scripts/check-daemon-lifecycle-architecture.sh
+      - name: Check produced artifact identity matrix
+        run: scripts/check-artifact-identity-matrix.sh
+
   model-catalog:
     runs-on: ubuntu-latest
     permissions:

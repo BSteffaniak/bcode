@@ -13,6 +13,14 @@ const ROOT_SOURCE_FILES: &[&str] = &[
 
 fn main() {
     println!("cargo:rerun-if-env-changed=BCODE_BUILD_FINGERPRINT");
+    println!("cargo:rerun-if-env-changed=BCODE_ARTIFACT_ID");
+    let artifact_id = match std::env::var("BCODE_ARTIFACT_ID") {
+        Ok(value) if is_valid_artifact_id(&value) => value,
+        Ok(value) => panic!("invalid BCODE_ARTIFACT_ID {value:?}"),
+        Err(std::env::VarError::NotPresent) => generated_artifact_id(),
+        Err(std::env::VarError::NotUnicode(_)) => panic!("BCODE_ARTIFACT_ID is not valid Unicode"),
+    };
+    println!("cargo:rustc-env=BCODE_ARTIFACT_ID={artifact_id}");
     if let Ok(value) = std::env::var("BCODE_BUILD_FINGERPRINT")
         && is_valid_fingerprint(&value)
     {
@@ -111,6 +119,33 @@ fn short_digest(digest: &[u8]) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     hex[..16].to_string()
+}
+
+fn generated_artifact_id() -> String {
+    let generated_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let mut digest = Sha256::new();
+    let values = [
+        env!("CARGO_PKG_NAME").to_owned(),
+        env!("CARGO_PKG_VERSION").to_owned(),
+        std::env::var("PROFILE").unwrap_or_default(),
+        std::env::var("TARGET").unwrap_or_default(),
+        std::process::id().to_string(),
+        generated_at.to_string(),
+    ];
+    for value in values {
+        update_length_prefixed(&mut digest, value.as_bytes());
+    }
+    format!("cargo-{}", short_digest(digest.finalize().as_slice()))
+}
+
+fn is_valid_artifact_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
 fn is_valid_fingerprint(value: &str) -> bool {

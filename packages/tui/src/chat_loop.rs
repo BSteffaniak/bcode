@@ -21,7 +21,6 @@ use super::activity::ActivityState;
 use super::artifact_stream::{ActiveArtifactFetchCompletion, ArtifactStreamCoordinator};
 use super::clipboard_image;
 use super::command_palette::BmuxCommandPalette;
-use super::daemon_host::TuiDaemonHost;
 use super::daemon_issue;
 use super::effects::{DaemonObservation, TuiEffect, TuiEffectResult, TuiEffectRunner};
 use super::helpers;
@@ -144,13 +143,12 @@ impl ChatLoopState {
     fn new(
         foreground_client: &BcodeClient,
         passive_client: &BcodeClient,
-        daemon_host: TuiDaemonHost,
         metrics_enabled: bool,
     ) -> Self {
         Self {
             palette: None,
             slash_palette: None,
-            effects: TuiEffectRunner::new(foreground_client, passive_client, daemon_host),
+            effects: TuiEffectRunner::new(foreground_client, passive_client),
             daemon_connection: DaemonConnectionMonitor::default(),
             permission_dialog: None,
             thinking_dialog: None,
@@ -443,17 +441,11 @@ pub async fn run_with_client<W: Write>(
     settings: &mut TuiRuntimeSettings,
     chat: &mut ActiveChat,
     startup_action: super::startup_action::StartupTuiAction,
-    daemon_host: TuiDaemonHost,
 ) -> Result<(), TuiError> {
     let passive_client = client
         .clone()
         .with_daemon_availability(DaemonAvailability::RequireRunning);
-    let mut loop_state = ChatLoopState::new(
-        client,
-        &passive_client,
-        daemon_host,
-        settings.metrics_enabled,
-    );
+    let mut loop_state = ChatLoopState::new(client, &passive_client, settings.metrics_enabled);
     let result = run_chat_loop(
         terminal,
         terminal_events,
@@ -3761,7 +3753,6 @@ mod scheduler_tests {
         let mut state = ChatLoopState::new(
             &BcodeClient::default_endpoint(),
             &BcodeClient::default_endpoint(),
-            TuiDaemonHost::new(&[]),
             false,
         );
         let first = interaction("first", "bcode.question.inline");
@@ -3785,7 +3776,6 @@ mod scheduler_tests {
         let mut state = ChatLoopState::new(
             &BcodeClient::default_endpoint(),
             &BcodeClient::default_endpoint(),
-            TuiDaemonHost::new(&[]),
             false,
         );
         let request = interaction("question-1", "bcode.question.inline");
@@ -3814,7 +3804,6 @@ mod scheduler_tests {
         let mut state = ChatLoopState::new(
             &BcodeClient::default_endpoint(),
             &BcodeClient::default_endpoint(),
-            TuiDaemonHost::new(&[]),
             false,
         );
         state.interactive_surface_queue.enqueue(
@@ -3836,7 +3825,6 @@ mod scheduler_tests {
         let mut state = ChatLoopState::new(
             &BcodeClient::default_endpoint(),
             &BcodeClient::default_endpoint(),
-            TuiDaemonHost::new(&[]),
             false,
         );
         install_question_runtime(&mut state);

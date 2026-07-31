@@ -28,12 +28,13 @@ use bcode_session_models::{
 };
 use bcode_skill_models::{SkillId, SkillList, SkillManifest};
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
 const DEFAULT_CLIENT_IPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
-const CLIENT_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(5);
-const CLIENT_DAEMON_RETRY_DELAY: Duration = Duration::from_millis(50);
+const DEFAULT_CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_CLIENT_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Bounded generic session artifact byte range.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +185,8 @@ pub enum ClientError {
     DaemonStart(#[from] DaemonStartError),
     #[error("server returned error {code}: {message}")]
     Server { code: String, message: String },
+    #[error("daemon startup timed out after {timeout:?}")]
+    DaemonStartupTimeout { timeout: Duration },
     #[error("client request timed out after {timeout:?}")]
     RequestTimeout { timeout: Duration },
     #[error("incompatible daemon: {message}")]
@@ -215,7 +218,9 @@ impl ClientError {
                     | std::io::ErrorKind::BrokenPipe
                     | std::io::ErrorKind::UnexpectedEof
             ),
-            Self::RequestTimeout { .. } | Self::DaemonStart(_) => true,
+            Self::RequestTimeout { .. }
+            | Self::DaemonStartupTimeout { .. }
+            | Self::DaemonStart(_) => true,
             Self::Transport(_)
             | Self::Codec(_)
             | Self::Server { .. }
@@ -630,6 +635,9 @@ pub struct BcodeClient {
     endpoint: IpcEndpoint,
     runtime_context: Option<ClientRuntimeContext>,
     daemon_availability: DaemonAvailability,
+    connect_timeout: Duration,
+    startup_timeout: Duration,
+    startup_gate: Arc<tokio::sync::Mutex<()>>,
     request_timeout: Duration,
 }
 
@@ -778,17 +786,23 @@ impl BcodeClient {
             endpoint: default_endpoint(),
             runtime_context: Some(current_runtime_context()),
             daemon_availability: DaemonAvailability::AutoStart,
+            connect_timeout: DEFAULT_CLIENT_CONNECT_TIMEOUT,
+            startup_timeout: DEFAULT_CLIENT_DAEMON_START_TIMEOUT,
+            startup_gate: Arc::new(tokio::sync::Mutex::new(())),
             request_timeout: configured_request_timeout(),
         }
     }
 
     /// Create a client for a specific endpoint.
     #[must_use]
-    pub const fn new(endpoint: IpcEndpoint) -> Self {
+    pub fn new(endpoint: IpcEndpoint) -> Self {
         Self {
             endpoint,
             runtime_context: None,
             daemon_availability: DaemonAvailability::RequireRunning,
+            connect_timeout: DEFAULT_CLIENT_CONNECT_TIMEOUT,
+            startup_timeout: DEFAULT_CLIENT_DAEMON_START_TIMEOUT,
+            startup_gate: Arc::new(tokio::sync::Mutex::new(())),
             request_timeout: DEFAULT_CLIENT_IPC_REQUEST_TIMEOUT,
         }
     }
@@ -826,14 +840,40 @@ impl BcodeClient {
         self
     }
 
-    /// Configure the maximum wait for connection handshakes and IPC responses.
+    /// Configure the maximum wait for one transport connection and verified handshake.
+    #[must_use]
+    pub const fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self
+    }
+
+    /// Configure the maximum wait for daemon lifecycle startup.
+    #[must_use]
+    pub const fn with_startup_timeout(mut self, startup_timeout: Duration) -> Self {
+        self.startup_timeout = startup_timeout;
+        self
+    }
+
+    /// Configure the maximum wait for application IPC responses.
     #[must_use]
     pub const fn with_request_timeout(mut self, request_timeout: Duration) -> Self {
         self.request_timeout = request_timeout;
         self
     }
 
-    /// Return the configured IPC request timeout.
+    /// Return the configured connection and handshake timeout.
+    #[must_use]
+    pub const fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    /// Return the configured daemon startup timeout.
+    #[must_use]
+    pub const fn startup_timeout(&self) -> Duration {
+        self.startup_timeout
+    }
+
+    /// Return the configured application request timeout.
     #[must_use]
     pub const fn request_timeout(&self) -> Duration {
         self.request_timeout
@@ -859,8 +899,16 @@ impl BcodeClient {
         if self.daemon_availability == DaemonAvailability::RequireRunning {
             return Ok(());
         }
+        let _startup_guard = self.startup_gate.lock().await;
+        if self
+            .connect_with_deadline("bcode-daemon-availability")
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
         tokio::time::timeout(
-            CLIENT_DAEMON_START_TIMEOUT,
+            self.startup_timeout,
             ensure_daemon_running(&EnsureDaemonOptions {
                 endpoint: self.endpoint.clone(),
                 quiet: true,
@@ -868,8 +916,8 @@ impl BcodeClient {
             }),
         )
         .await
-        .map_err(|_| ClientError::RequestTimeout {
-            timeout: CLIENT_DAEMON_START_TIMEOUT,
+        .map_err(|_| ClientError::DaemonStartupTimeout {
+            timeout: self.startup_timeout,
         })??;
         Ok(())
     }
@@ -994,10 +1042,12 @@ impl BcodeClient {
     fn verify_daemon_identity(status: &bcode_ipc::DaemonStatus) -> Result<(), ClientError> {
         let expected_namespace = bcode_ipc::daemon_namespace();
         let expected_protocol = u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION);
+        let expected_artifact_id = bcode_ipc::ArtifactId::current();
         let expected_writer_epoch = bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH;
         let expected_event_schema = bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION;
         if status.namespace == expected_namespace
             && status.protocol_version == expected_protocol
+            && status.artifact_id.as_ref() == Some(&expected_artifact_id)
             && status.build_fingerprint == bcode_ipc::BUILD_FINGERPRINT
             && status.storage_writer_epoch == Some(expected_writer_epoch)
             && status.session_event_schema_version == Some(expected_event_schema)
@@ -1006,9 +1056,13 @@ impl BcodeClient {
         }
         Err(ClientError::IncompatibleDaemon {
             message: format!(
-                "client expects namespace={expected_namespace} protocol={expected_protocol} build={} session_event_schema={expected_event_schema} storage_writer_epoch={expected_writer_epoch}; daemon reported namespace={} protocol={} build={} executable={} session_event_schema={} storage_writer_epoch={}",
+                "client expects namespace={expected_namespace} artifact={expected_artifact_id} protocol={expected_protocol} build={} session_event_schema={expected_event_schema} storage_writer_epoch={expected_writer_epoch}; daemon reported namespace={} artifact={} protocol={} build={} executable={} session_event_schema={} storage_writer_epoch={}",
                 bcode_ipc::BUILD_FINGERPRINT,
                 status.namespace,
+                status
+                    .artifact_id
+                    .as_ref()
+                    .map_or("<unknown>", bcode_ipc::ArtifactId::as_str),
                 status.protocol_version,
                 status.build_fingerprint,
                 status.executable_digest.as_deref().unwrap_or("<unknown>"),
@@ -3901,28 +3955,28 @@ impl BcodeClient {
     /// Returns an error when the daemon cannot be reached, rejects the handshake, or reports a
     /// different build fingerprint.
     pub async fn connect(&self, client_name: &str) -> Result<ClientConnection, ClientError> {
-        let mut last_error = None;
-        for _ in 0..3 {
-            let result = tokio::time::timeout(self.request_timeout, self.connect_once(client_name))
-                .await
-                .map_err(|_| ClientError::RequestTimeout {
-                    timeout: self.request_timeout,
-                })
-                .and_then(std::convert::identity);
-            match result {
-                Ok(connection) => return Ok(connection),
-                Err(error)
-                    if self.daemon_availability == DaemonAvailability::AutoStart
-                        && error.is_daemon_unavailable() =>
-                {
-                    last_error = Some(error);
-                    self.ensure_daemon_available().await?;
-                    tokio::time::sleep(CLIENT_DAEMON_RETRY_DELAY).await;
-                }
-                Err(error) => return Err(error),
+        match self.connect_with_deadline(client_name).await {
+            Ok(connection) => Ok(connection),
+            Err(error)
+                if self.daemon_availability == DaemonAvailability::AutoStart
+                    && error.is_daemon_unavailable() =>
+            {
+                self.ensure_daemon_available().await?;
+                self.connect_with_deadline(client_name).await
             }
+            Err(error) => Err(error),
         }
-        Err(last_error.unwrap_or(ClientError::UnexpectedResponse))
+    }
+
+    async fn connect_with_deadline(
+        &self,
+        client_name: &str,
+    ) -> Result<ClientConnection, ClientError> {
+        tokio::time::timeout(self.connect_timeout, self.connect_once(client_name))
+            .await
+            .map_err(|_| ClientError::RequestTimeout {
+                timeout: self.connect_timeout,
+            })?
     }
 
     /// Observe detached session-open preparation until terminal state or receiver drop.
@@ -3967,6 +4021,7 @@ impl BcodeClient {
                 client_name: format!("{client_name};cap=message_accepted"),
                 runtime_context: self.runtime_context.clone(),
                 daemon_namespace: bcode_ipc::daemon_namespace(),
+                artifact_id: Some(bcode_ipc::ArtifactId::current()),
                 build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
             })
             .await?
@@ -4593,6 +4648,7 @@ mod client_timeout_tests {
         bcode_ipc::DaemonStatus {
             namespace: bcode_ipc::daemon_namespace(),
             protocol_version: u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION),
+            artifact_id: Some(bcode_ipc::ArtifactId::current()),
             build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
             executable_digest: Some(digest),
             storage_writer_epoch: Some(bcode_ipc::CURRENT_SESSION_STORAGE_WRITER_EPOCH),
@@ -4604,7 +4660,7 @@ mod client_timeout_tests {
     }
 
     #[test]
-    fn daemon_identity_accepts_same_build_with_different_executable_digest() {
+    fn daemon_identity_accepts_same_artifact_with_different_executable_digest() {
         let matching = matching_daemon_status();
         let resigned = bcode_ipc::DaemonStatus {
             executable_digest: Some("different-signed-executable-digest".to_owned()),
@@ -4621,6 +4677,13 @@ mod client_timeout_tests {
         BcodeClient::verify_daemon_identity(&matching).expect("matching daemon");
 
         let cases = [
+            bcode_ipc::DaemonStatus {
+                artifact_id: Some(
+                    bcode_ipc::ArtifactId::parse("other-artifact")
+                        .expect("other artifact identity"),
+                ),
+                ..matching.clone()
+            },
             bcode_ipc::DaemonStatus {
                 protocol_version: matching.protocol_version.saturating_add(1),
                 ..matching.clone()
@@ -4651,11 +4714,57 @@ mod client_timeout_tests {
             let ClientError::IncompatibleDaemon { message } = error else {
                 panic!("expected incompatible daemon");
             };
+            assert!(message.contains("artifact="));
             assert!(message.contains("session_event_schema="));
             assert!(message.contains("storage_writer_epoch="));
             assert!(message.contains("protocol="));
             assert!(message.contains("build="));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mismatched_artifact_hello_is_rejected_explicitly() {
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bci-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("artifact.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept client");
+            let hello = bcode_ipc::recv_envelope(&mut stream)
+                .await
+                .expect("hello request");
+            let daemon = bcode_ipc::DaemonStatus {
+                artifact_id: Some(
+                    bcode_ipc::ArtifactId::parse("foreign-artifact")
+                        .expect("foreign artifact identity"),
+                ),
+                ..matching_daemon_status()
+            };
+            let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                protocol_version: bcode_ipc::ProtocolVersion(bcode_ipc::CURRENT_PROTOCOL_VERSION),
+                client_id: bcode_session_models::ClientId::new(),
+                daemon,
+            });
+            let envelope = bcode_ipc::response_envelope(hello.request_id, &response)
+                .expect("hello response envelope");
+            bcode_ipc::send_envelope(&mut stream, &envelope)
+                .await
+                .expect("send hello response");
+        });
+
+        let client = BcodeClient::new(endpoint)
+            .with_daemon_availability(super::DaemonAvailability::RequireRunning);
+        let error = client
+            .connect("artifact-mismatch-test")
+            .await
+            .expect_err("foreign artifact must be rejected");
+        assert!(matches!(error, ClientError::IncompatibleDaemon { .. }));
+        assert!(error.to_string().contains("foreign-artifact"));
+
+        server.await.expect("server task");
+        std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
     }
 
     #[cfg(unix)]

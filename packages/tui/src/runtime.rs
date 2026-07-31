@@ -116,7 +116,6 @@ async fn run_event_loop_with_input_and_static_bundled<W: Write>(
             },
         )
         .with_interaction_adapters(super::bundled_interaction_adapters("tui"));
-    let daemon_host = super::daemon_host::TuiDaemonHost::new(static_plugins);
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
     let mut app = BmuxApp::new_with_history(session_id, &[], &[], false);
     match super::plugin_tui::load_default_presentation_with_static_bundled(static_plugins) {
@@ -173,7 +172,6 @@ async fn run_event_loop_with_input_and_static_bundled<W: Write>(
             &mut settings,
             &mut chat,
             startup_action,
-            daemon_host,
         ))
         .await
     };

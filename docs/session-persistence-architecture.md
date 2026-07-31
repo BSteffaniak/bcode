@@ -9,9 +9,12 @@ A Bcode session id maps to exactly one canonical database:
 ```
 
 The `events` table in that database is the authoritative ordered session history. Canonical event
-rows are append-only and sequence-contiguous. Writer epochs, daemon namespaces, protocol versions,
+rows are append-only and sequence-contiguous. Writer epochs, daemon namespaces, exact produced-artifact
+identities, protocol versions,
 and build fingerprints never select a different session root, directory, database, or history.
-They are compatibility and routing metadata only.
+They are compatibility and routing metadata only. Exact artifact identity chooses a matching daemon
+endpoint, never a different session database. Multiple artifact versions therefore share canonical
+session storage while runtime leases prevent conflicting ownership.
 
 Other authoritative session-owned state, such as composer drafts, lives in explicitly designated
 tables in the same per-session database. It is authoritative for that state but is not transcript

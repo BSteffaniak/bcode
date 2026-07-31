@@ -111,6 +111,7 @@ jobs:
           cargo test --package bcode_session_models terminal_projection_is_absorbing_for_late_lifecycle_and_result_events
           cargo test --package bcode_daemon_lifecycle startup_lock_tests
           cargo test --package bcode_ipc default_windows_endpoint_is_a_namespaced_named_pipe
+          cargo test --package bcode_daemon_lifecycle --lib
           cargo test --package bcode_ocr_plugin ocr_relative_path_rejects_directory_junction_escape
           cargo test --package bcode_mermaid_render cancellation_is_stable_and_backend_neutral
           cargo test --package bcode_mermaid_render tiny_deadline_returns_typed_timeout

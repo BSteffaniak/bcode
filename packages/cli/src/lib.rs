@@ -140,12 +140,10 @@ pub async fn run_with_static_bundled(
     static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
 ) -> Result<(), CliError> {
     init_tracing();
+    bcode_daemon_lifecycle::initialize_artifact_bootstrap()?;
     let static_plugin_ids = bcode_plugin::static_bundled_plugin_ids(&static_plugins)?;
     let static_default_plugin_ids =
         bcode_plugin::static_bundled_default_plugin_ids(&static_plugins)?;
-    if let Err(error) = bcode_daemon_lifecycle::ensure_current_executable_cached() {
-        tracing::warn!(%error, "failed to cache current executable for detached daemon startup");
-    }
     let _ = STATIC_BUNDLED_PLUGINS.set(static_plugins);
     let _ = STATIC_BUNDLED_PLUGIN_IDS.set(static_plugin_ids);
     let _ = STATIC_BUNDLED_DEFAULT_PLUGIN_IDS.set(static_default_plugin_ids);
@@ -256,6 +254,7 @@ async fn handle_cli(cli: Cli) -> Result<(), CliError> {
             },
             secure_import_env,
         )?,
+        Commands::ArtifactId => println!("{}", bcode_ipc::ArtifactId::current()),
         Commands::Server { command } => handle_server_command(command).await?,
         Commands::Session { command } => handle_session_command(command).await?,
         #[cfg(feature = "web-renderer")]
@@ -1214,6 +1213,7 @@ async fn handle_session_io_command(command: Commands) -> Result<(), CliError> {
             message,
         } => send_message(session_id, message).await?,
         Commands::Onboard { .. }
+        | Commands::ArtifactId
         | Commands::Server { .. }
         | Commands::Session { .. }
         | Commands::Plugin { .. }
@@ -1386,6 +1386,9 @@ enum Commands {
         #[arg(long = "secure-import-env", value_name = "ENV_VAR")]
         secure_import_env: Option<String>,
     },
+    /// Print the exact identity embedded in this produced artifact.
+    #[command(hide = true)]
+    ArtifactId,
     Server {
         #[command(subcommand)]
         command: ServerCommand,
@@ -1859,6 +1862,9 @@ enum ServerCommand {
         #[arg(long)]
         verbose: bool,
     },
+    /// Measure one verified connection using the normal client availability policy.
+    #[command(hide = true)]
+    StartupProbe,
     Metrics {
         #[arg(long)]
         json: bool,
@@ -2730,6 +2736,7 @@ async fn handle_server_command(command: ServerCommand) -> Result<(), CliError> {
         }
         ServerCommand::Run => run_server_foreground().await?,
         ServerCommand::Status { verbose } => server_status(verbose).await?,
+        ServerCommand::StartupProbe => daemon_startup_probe().await?,
         ServerCommand::Metrics { json, report } => server_metrics(json, report).await?,
         ServerCommand::Diagnose { json } => server_diagnose(json).await?,
         ServerCommand::Stop { force } => server_stop(force).await?,
@@ -7115,6 +7122,14 @@ fn print_server_identity(status: &ServerStatus, verbose: bool) -> Result<(), Cli
     println!("daemon: running");
     println!("namespace: {}", status.daemon.namespace);
     println!(
+        "artifact identity: {}",
+        status
+            .daemon
+            .artifact_id
+            .as_ref()
+            .map_or("<unknown>", bcode_ipc::ArtifactId::as_str)
+    );
+    println!(
         "executable identity: {}",
         status
             .daemon
@@ -7159,6 +7174,15 @@ fn print_server_identity(status: &ServerStatus, verbose: bool) -> Result<(), Cli
         println!("instance: {}", status.daemon.instance_id);
         println!("build fingerprint: {}", status.daemon.build_fingerprint);
     }
+    Ok(())
+}
+
+async fn daemon_startup_probe() -> Result<(), CliError> {
+    let started = Instant::now();
+    BcodeClient::default_endpoint()
+        .connect("bcode-daemon-startup-probe")
+        .await?;
+    println!("{}", started.elapsed().as_micros());
     Ok(())
 }
 
@@ -7689,6 +7713,7 @@ fn daemon_status_matches(
 ) -> bool {
     status.namespace == record.namespace
         && status.instance_id == record.instance_id
+        && status.artifact_id == record.artifact_id
         && status.build_fingerprint == record.build_fingerprint
         && status.executable_digest == record.executable_digest
         && status.storage_writer_epoch == record.storage_writer_epoch
@@ -8173,8 +8198,16 @@ async fn session_history(
     let cursor = before
         .or(after)
         .map(|sequence| SessionHistoryCursor { sequence });
-    let page = session_owner_client(session_id)
-        .await?
+    let owner_client = match session_owner_client(session_id).await {
+        Ok(client) => client,
+        Err(CliError::InvalidArguments(message))
+            if message.contains("no verified live Bcode daemon owner was found") =>
+        {
+            BcodeClient::default_endpoint()
+        }
+        Err(error) => return Err(error),
+    };
+    let page = owner_client
         .session_history_page(
             session_id,
             SessionHistoryQuery {
@@ -12056,6 +12089,7 @@ mod web_command_tests {
             schema_version: bcode_daemon_lifecycle::DAEMON_RECORD_SCHEMA_VERSION,
             namespace: "owner".to_owned(),
             protocol_version: 15,
+            artifact_id: Some(bcode_ipc::ArtifactId::current()),
             build_fingerprint: "build".to_owned(),
             executable_digest: Some("digest".to_owned()),
             endpoint: bcode_daemon_lifecycle::DaemonEndpointRecord::UnixSocket {
@@ -12072,6 +12106,7 @@ mod web_command_tests {
         let matching = bcode_ipc::DaemonStatus {
             namespace: "owner".to_owned(),
             protocol_version: 15,
+            artifact_id: Some(bcode_ipc::ArtifactId::current()),
             build_fingerprint: "build".to_owned(),
             executable_digest: Some("digest".to_owned()),
             storage_writer_epoch: Some(5),
@@ -12142,6 +12177,7 @@ mod web_command_tests {
             schema_version: bcode_daemon_lifecycle::DAEMON_RECORD_SCHEMA_VERSION,
             namespace: "namespace".to_string(),
             protocol_version: 9,
+            artifact_id: Some(bcode_ipc::ArtifactId::current()),
             build_fingerprint: "build".to_string(),
             storage_writer_epoch: Some(2),
             pid: Some(1),
@@ -12158,6 +12194,7 @@ mod web_command_tests {
         let matching = bcode_ipc::DaemonStatus {
             namespace: "namespace".to_string(),
             protocol_version: 9,
+            artifact_id: Some(bcode_ipc::ArtifactId::current()),
             build_fingerprint: "build".to_string(),
             executable_digest: Some("digest".to_string()),
             storage_writer_epoch: Some(2),

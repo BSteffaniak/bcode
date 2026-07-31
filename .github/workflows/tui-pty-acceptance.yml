@@ -21,6 +21,8 @@ on:
       - "packages/tui/**"
       - "packages/tui-components/**"
       - "plugins/**"
+      - "scripts/check-daemon-lifecycle-architecture.sh"
+      - "scripts/smoke-local-daemon.sh"
       - "scripts/smoke-tui-pty.sh"
   push:
     branches: [master]
@@ -42,6 +44,8 @@ on:
       - "packages/tui/**"
       - "packages/tui-components/**"
       - "plugins/**"
+      - "scripts/check-daemon-lifecycle-architecture.sh"
+      - "scripts/smoke-local-daemon.sh"
       - "scripts/smoke-tui-pty.sh"
   workflow_dispatch:
 
@@ -59,5 +63,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Exercise local daemon lifecycle
+        run: scripts/smoke-local-daemon.sh
       - name: Exercise the real TUI in a pseudo-terminal
         run: scripts/smoke-tui-pty.sh

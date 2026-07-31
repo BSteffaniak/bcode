@@ -396,6 +396,8 @@ pub struct ServerState {
     idle_shutdown_started: std::sync::atomic::AtomicBool,
     daemon_status: DaemonStatus,
     daemon_record_path: Option<PathBuf>,
+    startup_started_at: Instant,
+    first_hello_recorded: std::sync::atomic::AtomicBool,
     metrics: MetricsRegistry,
     shutdown: broadcast::Sender<()>,
 }
@@ -1375,6 +1377,7 @@ struct ServerStateInit {
     skill_model_policy: bcode_config::SkillModelPolicyConfig,
     daemon_status: DaemonStatus,
     daemon_record_path: Option<PathBuf>,
+    startup_started_at: Option<Instant>,
     metrics: MetricsRegistry,
     workflow_store: Option<bcode_workflow_store::WorkflowStore>,
     workflow_application_authorization: Option<WorkflowApplicationAuthorizationPolicy>,
@@ -1608,6 +1611,8 @@ impl ServerState {
             idle_shutdown_started: std::sync::atomic::AtomicBool::new(false),
             daemon_status: init.daemon_status,
             daemon_record_path: init.daemon_record_path,
+            startup_started_at: init.startup_started_at.unwrap_or_else(Instant::now),
+            first_hello_recorded: std::sync::atomic::AtomicBool::new(false),
             metrics: init.metrics,
             shutdown,
         }
@@ -2252,12 +2257,30 @@ fn register_daemon(
     endpoint: &IpcEndpoint,
 ) -> Result<bcode_daemon_lifecycle::DaemonRecord, ServerError> {
     let instance_id = daemon_instance_id()?;
-    let mut record = bcode_daemon_lifecycle::DaemonRecord::current(
-        endpoint,
-        daemon_log_path(),
-        std::env::current_exe().ok(),
-        instance_id,
-    )?;
+    let executable_path = std::env::current_exe().ok();
+    let executable_digest = std::env::var(bcode_daemon_lifecycle::BCODE_EXECUTABLE_DIGEST_ENV)
+        .ok()
+        .filter(|digest| {
+            executable_path.as_deref().is_some_and(|path| {
+                bcode_daemon_lifecycle::executable_path_matches_digest(path, digest)
+            })
+        });
+    let mut record = if executable_digest.is_some() {
+        bcode_daemon_lifecycle::DaemonRecord::current_with_digest(
+            endpoint,
+            daemon_log_path(),
+            executable_path,
+            executable_digest,
+            instance_id,
+        )?
+    } else {
+        bcode_daemon_lifecycle::DaemonRecord::current(
+            endpoint,
+            daemon_log_path(),
+            executable_path,
+            instance_id,
+        )?
+    };
     record.storage_writer_epoch = Some(bcode_session::lease::CURRENT_SESSION_STORAGE_WRITER_EPOCH);
     bcode_daemon_lifecycle::write_record(&bcode_config::default_state_dir(), &record)?;
     Ok(record)
@@ -2272,6 +2295,7 @@ fn daemon_status_from_record(record: &bcode_daemon_lifecycle::DaemonRecord) -> D
     DaemonStatus {
         namespace: record.namespace.clone(),
         protocol_version: record.protocol_version,
+        artifact_id: record.artifact_id.clone(),
         build_fingerprint: record.build_fingerprint.clone(),
         executable_digest: record.executable_digest.clone(),
         storage_writer_epoch: record.storage_writer_epoch,
@@ -3151,9 +3175,17 @@ async fn run_with_static_bundled_inner(
     static_plugins: &[bcode_plugin::StaticBundledPlugin],
     publish_daemon_record: bool,
 ) -> Result<(), ServerError> {
+    let startup_started_at = Instant::now();
+    let mut stage_started_at = startup_started_at;
     tracing::debug!(target: "bcode_server::startup", "loading config");
     let config = bcode_config::load_config()?;
-    tracing::debug!(target: "bcode_server::startup", "config loaded");
+    tracing::debug!(
+        target: "bcode_server::startup",
+        elapsed_ms = stage_started_at.elapsed().as_millis(),
+        total_elapsed_ms = startup_started_at.elapsed().as_millis(),
+        "config loaded"
+    );
+    stage_started_at = Instant::now();
     let default_plugin_ids = bcode_plugin::static_bundled_default_plugin_ids(static_plugins)?;
     let plugin_selection =
         bcode_config::plugin_selection_with_default_plugin_ids(&config, &default_plugin_ids);
@@ -3170,7 +3202,13 @@ async fn run_with_static_bundled_inner(
         static_plugins,
         plugin_configs,
     )?;
-    tracing::debug!(target: "bcode_server::startup", "plugins loaded");
+    tracing::debug!(
+        target: "bcode_server::startup",
+        elapsed_ms = stage_started_at.elapsed().as_millis(),
+        total_elapsed_ms = startup_started_at.elapsed().as_millis(),
+        "plugins loaded"
+    );
+    stage_started_at = Instant::now();
     let legacy_recovery = session_migration_adapter::recover_historical_session_storage(
         &bcode_config::default_state_dir(),
     )?;
@@ -3196,6 +3234,13 @@ async fn run_with_static_bundled_inner(
             "historical and canonical session directories conflict; no data was moved"
         );
     }
+    tracing::debug!(
+        target: "bcode_server::startup",
+        elapsed_ms = stage_started_at.elapsed().as_millis(),
+        total_elapsed_ms = startup_started_at.elapsed().as_millis(),
+        "historical session recovery complete"
+    );
+    stage_started_at = Instant::now();
     tracing::debug!(target: "bcode_server::startup", endpoint = ?endpoint, "binding IPC endpoint");
     let listener = LocalIpcListener::bind(&endpoint)?;
     let daemon_record = if publish_daemon_record {
@@ -3207,6 +3252,7 @@ async fn run_with_static_bundled_inner(
         || DaemonStatus {
             namespace: bcode_ipc::daemon_namespace(),
             protocol_version: u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION),
+            artifact_id: Some(bcode_ipc::ArtifactId::current()),
             build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
             executable_digest: bcode_daemon_lifecycle::current_executable_identity()
                 .ok()
@@ -3219,7 +3265,13 @@ async fn run_with_static_bundled_inner(
         },
         daemon_status_from_record,
     );
-    tracing::debug!(target: "bcode_server::startup", "IPC endpoint bound");
+    tracing::debug!(
+        target: "bcode_server::startup",
+        elapsed_ms = stage_started_at.elapsed().as_millis(),
+        total_elapsed_ms = startup_started_at.elapsed().as_millis(),
+        "IPC endpoint bound"
+    );
+    stage_started_at = Instant::now();
     tracing::debug!(target: "bcode_server::startup", "initializing lazy session services");
     let metrics = if config.metrics.enabled {
         if config.metrics.persist_events {
@@ -3256,7 +3308,13 @@ async fn run_with_static_bundled_inner(
             daemon_instance_id: Some(daemon_status.instance_id.clone()),
         },
     );
-    tracing::debug!(target: "bcode_server::startup", "lazy session services ready");
+    tracing::debug!(
+        target: "bcode_server::startup",
+        elapsed_ms = stage_started_at.elapsed().as_millis(),
+        total_elapsed_ms = startup_started_at.elapsed().as_millis(),
+        "lazy session services ready"
+    );
+    stage_started_at = Instant::now();
     let resolved_model = config.resolved_model_selection();
     tracing::debug!(
         target: "bcode_server::startup",
@@ -3273,6 +3331,7 @@ async fn run_with_static_bundled_inner(
             selection: resolved_model.clone(),
         },
     );
+    let construction_started_at = Instant::now();
     let state = Arc::new(ServerState::new(
         sessions,
         plugins,
@@ -3318,17 +3377,31 @@ async fn run_with_static_bundled_inner(
                     &daemon_record.namespace,
                 )
             }),
+            startup_started_at: Some(startup_started_at),
             metrics,
             workflow_store: None,
             workflow_application_authorization: None,
             ralph_store: bcode_ralph::RalphStateStore::default(),
         },
     ));
+    tracing::debug!(
+        target: "bcode_server::startup",
+        elapsed_ms = construction_started_at.elapsed().as_millis(),
+        total_elapsed_ms = startup_started_at.elapsed().as_millis(),
+        "server state constructed"
+    );
     state.start_catalog_event_forwarder();
     state.start_session_search_ingestion();
     state.model_catalog.spawn_refresh();
     interrupt_stale_ralph_runs_best_effort(&state);
+    let workflow_recovery_started_at = Instant::now();
     restore_workflow_runtime_work(&state).await;
+    tracing::debug!(
+        target: "bcode_server::startup",
+        elapsed_ms = workflow_recovery_started_at.elapsed().as_millis(),
+        total_elapsed_ms = startup_started_at.elapsed().as_millis(),
+        "workflow runtime recovery complete"
+    );
     if config.daemon.idle_shutdown {
         state.start_idle_shutdown_watcher(Duration::from_secs(
             config.daemon.idle_shutdown_after_secs,
@@ -3336,7 +3409,12 @@ async fn run_with_static_bundled_inner(
     }
     warn_on_unregistered_agent_ids(&state, &configured_agent_ids).await;
     let mut shutdown = state.subscribe_shutdown();
-    tracing::info!(target: "bcode_server::startup", "server ready; accepting clients");
+    tracing::info!(
+        target: "bcode_server::startup",
+        elapsed_ms = stage_started_at.elapsed().as_millis(),
+        total_elapsed_ms = startup_started_at.elapsed().as_millis(),
+        "server ready; accepting clients"
+    );
     loop {
         tokio::select! {
             stream = listener.accept() => {
@@ -3864,6 +3942,7 @@ async fn handle_request_inner(
             client_name,
             runtime_context,
             daemon_namespace,
+            artifact_id,
             build_fingerprint,
         } => {
             handle_hello(
@@ -3875,6 +3954,7 @@ async fn handle_request_inner(
                     client_name,
                     runtime_context,
                     daemon_namespace,
+                    artifact_id,
                     build_fingerprint,
                 },
             )
@@ -5089,7 +5169,19 @@ struct ClientHello {
     client_name: String,
     runtime_context: Option<ClientRuntimeContext>,
     daemon_namespace: String,
+    artifact_id: Option<bcode_ipc::ArtifactId>,
     build_fingerprint: String,
+}
+
+fn validate_client_artifact_id(artifact_id: Option<&bcode_ipc::ArtifactId>) -> Result<(), String> {
+    let expected = bcode_ipc::ArtifactId::current();
+    match artifact_id {
+        Some(artifact_id) if artifact_id == &expected => Ok(()),
+        Some(artifact_id) => Err(format!(
+            "client artifact identity {artifact_id:?} does not match daemon artifact identity {expected:?}"
+        )),
+        None => Err("client did not advertise an exact artifact identity".to_owned()),
+    }
 }
 
 fn validate_client_build_fingerprint(build_fingerprint: &str) -> Result<(), String> {
@@ -5109,6 +5201,14 @@ async fn handle_hello(
     writer: &SharedWriter,
     hello: ClientHello,
 ) -> Result<(), ServerError> {
+    if let Err(message) = validate_client_artifact_id(hello.artifact_id.as_ref()) {
+        return send_response(
+            writer,
+            request_id,
+            Response::Err(ErrorResponse::new("incompatible_artifact", message)),
+        )
+        .await;
+    }
     if let Err(message) = validate_client_build_fingerprint(&hello.build_fingerprint) {
         return send_response(
             writer,
@@ -5124,6 +5224,16 @@ async fn handle_hello(
             Response::Err(ErrorResponse::new("invalid_interaction_adapters", message)),
         )
         .await;
+    }
+    if !state
+        .first_hello_recorded
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        tracing::info!(
+            target: "bcode_server::startup",
+            elapsed_ms = state.startup_started_at.elapsed().as_millis(),
+            "first verified Hello completed"
+        );
     }
     if client_name_supports_message_accepted(&hello.client_name) {
         state.register_message_accepted_client(client_id).await;
@@ -30660,6 +30770,22 @@ mod tests {
     }
 
     #[test]
+    fn hello_requires_the_exact_artifact_identity() {
+        let artifact_id = bcode_ipc::ArtifactId::current();
+        validate_client_artifact_id(Some(&artifact_id)).expect("matching artifact identity");
+
+        let different = bcode_ipc::ArtifactId::parse("different-artifact").expect("artifact ID");
+        let error = validate_client_artifact_id(Some(&different))
+            .expect_err("different artifact identity must be rejected");
+        assert!(error.contains("different-artifact"));
+        assert!(error.contains(artifact_id.as_str()));
+
+        let missing = validate_client_artifact_id(None)
+            .expect_err("missing artifact identity must be rejected");
+        assert!(missing.contains("did not advertise"));
+    }
+
+    #[test]
     fn hello_requires_the_exact_daemon_build_fingerprint() {
         validate_client_build_fingerprint(bcode_ipc::BUILD_FINGERPRINT)
             .expect("matching build fingerprint");
@@ -47235,6 +47361,7 @@ library = "test"
                     ..DaemonStatus::default()
                 },
                 daemon_record_path: None,
+                startup_started_at: None,
                 metrics: MetricsRegistry::default(),
                 workflow_application_authorization: None,
                 workflow_store: Some(
@@ -56101,6 +56228,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 system_prompt: bcode_config::SystemPromptConfig::default(),
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
+                startup_started_at: None,
                 metrics: MetricsRegistry::default(),
                 workflow_application_authorization: None,
                 workflow_store: Some(
@@ -56790,6 +56918,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 system_prompt: bcode_config::SystemPromptConfig::default(),
                 daemon_status: DaemonStatus::default(),
                 daemon_record_path: None,
+                startup_started_at: None,
                 metrics: MetricsRegistry::default(),
                 workflow_application_authorization: None,
                 workflow_store: Some(

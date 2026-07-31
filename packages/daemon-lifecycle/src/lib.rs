@@ -9,17 +9,20 @@ use bcode_plugin_sdk::path::display_from_current_dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use std::fs;
-use std::io::{Read as _, Write as _};
+use std::io::{Read, Seek as _, Write as _};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use thiserror::Error;
 
+/// Environment variable carrying parent-verified executable digest evidence to a spawned daemon.
+pub const BCODE_EXECUTABLE_DIGEST_ENV: &str = "BCODE_EXECUTABLE_DIGEST";
+
 /// Current daemon registry record schema version.
-pub const DAEMON_RECORD_SCHEMA_VERSION: u32 = 2;
+pub const DAEMON_RECORD_SCHEMA_VERSION: u32 = 3;
 
 /// Errors returned by daemon lifecycle registry operations.
 #[derive(Debug, Error)]
@@ -102,7 +105,10 @@ pub struct DaemonRecord {
     pub namespace: String,
     /// IPC protocol version.
     pub protocol_version: u32,
-    /// Build fingerprint included in the namespace.
+    /// Exact produced-artifact identity, when advertised by this daemon generation.
+    #[serde(default)]
+    pub artifact_id: Option<bcode_ipc::ArtifactId>,
+    /// Build fingerprint retained as source/build diagnostic evidence.
     pub build_fingerprint: String,
     /// Durable session-storage writer epoch supported by this daemon, when known.
     #[serde(default)]
@@ -138,15 +144,37 @@ impl DaemonRecord {
         executable_path: Option<PathBuf>,
         instance_id: String,
     ) -> Result<Self, DaemonLifecycleError> {
-        let now = unix_time_millis()?;
         let executable_digest = executable_path
             .as_deref()
             .map(executable_sha256)
             .transpose()?;
+        Self::current_with_digest(
+            endpoint,
+            log_path,
+            executable_path,
+            executable_digest,
+            instance_id,
+        )
+    }
+
+    /// Build a daemon record from already-verified executable digest evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the system clock is before the Unix epoch.
+    pub fn current_with_digest(
+        endpoint: &IpcEndpoint,
+        log_path: PathBuf,
+        executable_path: Option<PathBuf>,
+        executable_digest: Option<String>,
+        instance_id: String,
+    ) -> Result<Self, DaemonLifecycleError> {
+        let now = unix_time_millis()?;
         Ok(Self {
             schema_version: DAEMON_RECORD_SCHEMA_VERSION,
             namespace: daemon_namespace(),
             protocol_version: u32::from(CURRENT_PROTOCOL_VERSION),
+            artifact_id: Some(bcode_ipc::ArtifactId::current()),
             build_fingerprint: BUILD_FINGERPRINT.to_string(),
             storage_writer_epoch: None,
             pid: Some(std::process::id()),
@@ -360,6 +388,7 @@ fn daemon_status_matches_record(record: &DaemonRecord, status: &bcode_ipc::Daemo
     status.instance_id == record.instance_id
         && status.namespace == record.namespace
         && status.protocol_version == record.protocol_version
+        && status.artifact_id == record.artifact_id
         && status.build_fingerprint == record.build_fingerprint
         && status.executable_digest == record.executable_digest
         && status.storage_writer_epoch == record.storage_writer_epoch
@@ -491,10 +520,175 @@ pub async fn incompatible_storage_writer_records(
         .collect()
 }
 
-/// Return the directory that stores cached daemon executables for this namespace.
+/// Metadata published beside one immutable daemon image.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DaemonImageMetadata {
+    /// Metadata schema version.
+    pub schema_version: u32,
+    /// Exact produced-artifact identity embedded in the image.
+    pub artifact_id: bcode_ipc::ArtifactId,
+    /// SHA-256 digest of the image bytes.
+    pub executable_digest: String,
+}
+
+const DAEMON_IMAGE_METADATA_SCHEMA_VERSION: u32 = 1;
+const DAEMON_IMAGE_METADATA_FILE: &str = "image.json";
+
+/// Return the artifact-scoped directory that stores cached daemon executables.
 #[must_use]
 pub fn daemon_image_dir(state_dir: &Path) -> PathBuf {
-    state_dir.join("daemon-images").join(daemon_namespace())
+    state_dir
+        .join("daemon-images")
+        .join(bcode_ipc::ArtifactId::current().as_str())
+}
+
+/// Bootstrap snapshot of the exact running artifact retained independently of its pathname.
+#[derive(Debug)]
+pub struct ArtifactBootstrap {
+    artifact_id: bcode_ipc::ArtifactId,
+    source_path: PathBuf,
+    source: Mutex<fs::File>,
+    executable_digest: OnceLock<String>,
+}
+
+static ARTIFACT_BOOTSTRAP: OnceLock<ArtifactBootstrap> = OnceLock::new();
+
+/// Capture and retain the running artifact before its original pathname can be replaced.
+///
+/// Repeated calls return the same process bootstrap. The retained file handle remains readable
+/// after Unix pathname replacement and prevents later lifecycle work from reopening a different
+/// file at the original path.
+///
+/// # Panics
+///
+/// Panics only if the process-global bootstrap cannot be observed immediately after this function
+/// successfully initializes it.
+///
+/// # Errors
+///
+/// Returns an error when the current executable cannot be located or opened.
+pub fn initialize_artifact_bootstrap() -> Result<&'static ArtifactBootstrap, DaemonLifecycleError> {
+    if let Some(bootstrap) = ARTIFACT_BOOTSTRAP.get() {
+        return Ok(bootstrap);
+    }
+    let source_path = std::env::current_exe().map_err(|source| DaemonLifecycleError::Io {
+        path: PathBuf::from("<current_exe>"),
+        source,
+    })?;
+    let bootstrap = ArtifactBootstrap::open(source_path, bcode_ipc::ArtifactId::current())?;
+    let _ = ARTIFACT_BOOTSTRAP.set(bootstrap);
+    Ok(ARTIFACT_BOOTSTRAP
+        .get()
+        .expect("artifact bootstrap initialized"))
+}
+
+impl ArtifactBootstrap {
+    fn open(
+        source_path: PathBuf,
+        artifact_id: bcode_ipc::ArtifactId,
+    ) -> Result<Self, DaemonLifecycleError> {
+        let source = fs::File::open(&source_path).map_err(|source| DaemonLifecycleError::Io {
+            path: source_path.clone(),
+            source,
+        })?;
+        Ok(Self {
+            artifact_id,
+            source_path,
+            source: Mutex::new(source),
+            executable_digest: OnceLock::new(),
+        })
+    }
+
+    /// Return the exact embedded artifact identity.
+    #[must_use]
+    pub const fn artifact_id(&self) -> &bcode_ipc::ArtifactId {
+        &self.artifact_id
+    }
+
+    /// Return the pathname observed at bootstrap for diagnostics only.
+    #[must_use]
+    pub fn source_path(&self) -> &Path {
+        &self.source_path
+    }
+
+    fn digest(&self) -> Result<String, DaemonLifecycleError> {
+        if let Some(digest) = self.executable_digest.get() {
+            return Ok(digest.clone());
+        }
+        let mut source = self.source.lock().map_err(|_| DaemonLifecycleError::Io {
+            path: self.source_path.clone(),
+            source: std::io::Error::other("artifact bootstrap lock poisoned"),
+        })?;
+        source.rewind().map_err(|error| DaemonLifecycleError::Io {
+            path: self.source_path.clone(),
+            source: error,
+        })?;
+        let digest = sha256_reader(&mut *source, &self.source_path)?;
+        drop(source);
+        let _ = self.executable_digest.set(digest.clone());
+        Ok(digest)
+    }
+
+    fn copy_to(&self, target: &Path) -> Result<String, DaemonLifecycleError> {
+        let mut source = self.source.lock().map_err(|_| DaemonLifecycleError::Io {
+            path: self.source_path.clone(),
+            source: std::io::Error::other("artifact bootstrap lock poisoned"),
+        })?;
+        source.rewind().map_err(|error| DaemonLifecycleError::Io {
+            path: self.source_path.clone(),
+            source: error,
+        })?;
+        let mut output = fs::File::create(target).map_err(|source| DaemonLifecycleError::Io {
+            path: target.to_path_buf(),
+            source,
+        })?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+        loop {
+            let read = source
+                .read(&mut buffer)
+                .map_err(|source| DaemonLifecycleError::Io {
+                    path: self.source_path.clone(),
+                    source,
+                })?;
+            if read == 0 {
+                break;
+            }
+            output
+                .write_all(&buffer[..read])
+                .map_err(|source| DaemonLifecycleError::Io {
+                    path: target.to_path_buf(),
+                    source,
+                })?;
+            hasher.update(&buffer[..read]);
+        }
+        drop(source);
+        output
+            .sync_all()
+            .map_err(|source| DaemonLifecycleError::Io {
+                path: target.to_path_buf(),
+                source,
+            })?;
+        Ok(format!("{:x}", hasher.finalize()))
+    }
+}
+
+fn sha256_reader(mut reader: impl Read, path: &Path) -> Result<String, DaemonLifecycleError> {
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|source| DaemonLifecycleError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Return the immutable cached executable path for one binary digest.
@@ -516,11 +710,8 @@ pub fn cached_daemon_executable_path_for_digest(
 pub fn current_cached_daemon_executable_path(
     state_dir: &Path,
 ) -> Result<PathBuf, DaemonLifecycleError> {
-    let source = std::env::current_exe().map_err(|source| DaemonLifecycleError::Io {
-        path: PathBuf::from("<current_exe>"),
-        source,
-    })?;
-    let digest = executable_sha256(&source)?;
+    let bootstrap = initialize_artifact_bootstrap()?;
+    let digest = bootstrap.digest()?;
     Ok(cached_daemon_executable_path_for_digest(state_dir, &digest))
 }
 
@@ -534,21 +725,7 @@ pub fn executable_sha256(path: &Path) -> Result<String, DaemonLifecycleError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .map_err(|source| DaemonLifecycleError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+    sha256_reader(&mut file, path)
 }
 
 /// Return the current process executable and its byte digest.
@@ -557,18 +734,12 @@ pub fn executable_sha256(path: &Path) -> Result<String, DaemonLifecycleError> {
 ///
 /// Returns an error when the executable cannot be located or read.
 pub fn current_executable_identity() -> Result<(PathBuf, String), DaemonLifecycleError> {
-    static IDENTITY: OnceLock<(PathBuf, String)> = OnceLock::new();
-    if let Some(identity) = IDENTITY.get() {
-        return Ok(identity.clone());
-    }
-    let path = std::env::current_exe().map_err(|source| DaemonLifecycleError::Io {
-        path: PathBuf::from("<current_exe>"),
-        source,
-    })?;
-    let digest = executable_sha256(&path)?;
-    let identity = (path, digest);
-    let _ = IDENTITY.set(identity.clone());
-    Ok(identity)
+    let bootstrap = initialize_artifact_bootstrap()?;
+    Ok((bootstrap.source_path().to_path_buf(), bootstrap.digest()?))
+}
+
+fn cached_executable_digest(path: &Path) -> Option<&str> {
+    path.parent()?.file_name()?.to_str()
 }
 
 /// Verify that an executable digest agrees with its content-addressed cache path.
@@ -578,6 +749,55 @@ pub fn executable_path_matches_digest(path: &Path, executable_digest: &str) -> b
         .and_then(Path::file_name)
         .and_then(|component| component.to_str())
         == Some(executable_digest)
+}
+
+fn daemon_image_metadata_path(executable: &Path) -> PathBuf {
+    executable
+        .parent()
+        .expect("content-addressed daemon image has a parent")
+        .join(DAEMON_IMAGE_METADATA_FILE)
+}
+
+fn daemon_image_is_valid(
+    executable: &Path,
+    expected_digest: &str,
+) -> Result<bool, DaemonLifecycleError> {
+    if !executable.is_file() || executable_sha256(executable)? != expected_digest {
+        return Ok(false);
+    }
+    let metadata_path = daemon_image_metadata_path(executable);
+    let metadata = match fs::read(&metadata_path) {
+        Ok(contents) => serde_json::from_slice::<DaemonImageMetadata>(&contents)?,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(source) => {
+            return Err(DaemonLifecycleError::Io {
+                path: metadata_path,
+                source,
+            });
+        }
+    };
+    Ok(
+        metadata.schema_version == DAEMON_IMAGE_METADATA_SCHEMA_VERSION
+            && metadata.artifact_id == bcode_ipc::ArtifactId::current()
+            && metadata.executable_digest == expected_digest,
+    )
+}
+
+fn write_daemon_image_metadata(
+    executable: &Path,
+    digest: &str,
+) -> Result<(), DaemonLifecycleError> {
+    let metadata_path = daemon_image_metadata_path(executable);
+    let metadata = DaemonImageMetadata {
+        schema_version: DAEMON_IMAGE_METADATA_SCHEMA_VERSION,
+        artifact_id: bcode_ipc::ArtifactId::current(),
+        executable_digest: digest.to_owned(),
+    };
+    let contents = serde_json::to_vec_pretty(&metadata)?;
+    fs::write(&metadata_path, contents).map_err(|source| DaemonLifecycleError::Io {
+        path: metadata_path,
+        source,
+    })
 }
 
 /// Ensure the currently running executable is cached for detached daemon starts.
@@ -595,23 +815,30 @@ pub fn ensure_current_executable_cached() -> Result<PathBuf, DaemonLifecycleErro
 fn ensure_current_executable_cached_in_state(
     state_dir: &Path,
 ) -> Result<PathBuf, DaemonLifecycleError> {
-    let (source, digest) = current_executable_identity()?;
+    let bootstrap = initialize_artifact_bootstrap()?;
+    let source = bootstrap.source_path().to_path_buf();
+    let digest = bootstrap.digest()?;
     let target = cached_daemon_executable_path_for_digest(state_dir, &digest);
     if target == source {
         return Ok(target);
     }
     if target.exists() {
-        let cached_digest = executable_sha256(&target)?;
-        if cached_digest == digest {
+        if daemon_image_is_valid(&target, &digest)? {
             return Ok(target);
         }
-        return Err(DaemonLifecycleError::Io {
-            path: target,
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "content-addressed daemon image digest mismatch",
-            ),
-        });
+        fs::remove_file(&target).map_err(|source| DaemonLifecycleError::Io {
+            path: target.clone(),
+            source,
+        })?;
+        let metadata = daemon_image_metadata_path(&target);
+        if let Err(source) = fs::remove_file(&metadata)
+            && source.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(DaemonLifecycleError::Io {
+                path: metadata,
+                source,
+            });
+        }
     }
     let parent = target
         .parent()
@@ -625,12 +852,8 @@ fn ensure_current_executable_cached_in_state(
         std::process::id(),
         next_daemon_image_temp_id()
     ));
-    fs::copy(&source, &temp).map_err(|source_error| DaemonLifecycleError::Io {
-        path: temp.clone(),
-        source: source_error,
-    })?;
+    let copied_digest = bootstrap.copy_to(&temp)?;
     preserve_executable_permissions(&source, &temp)?;
-    let copied_digest = executable_sha256(&temp)?;
     if copied_digest != digest {
         let _ = fs::remove_file(&temp);
         return Err(DaemonLifecycleError::Io {
@@ -642,8 +865,11 @@ fn ensure_current_executable_cached_in_state(
         });
     }
     match fs::rename(&temp, &target) {
-        Ok(()) => Ok(target),
-        Err(_source_error) if target.exists() && executable_sha256(&target)? == digest => {
+        Ok(()) => {
+            write_daemon_image_metadata(&target, &digest)?;
+            Ok(target)
+        }
+        Err(_source_error) if daemon_image_is_valid(&target, &digest)? => {
             let _ = fs::remove_file(&temp);
             Ok(target)
         }
@@ -794,6 +1020,7 @@ mod tests {
             schema_version: DAEMON_RECORD_SCHEMA_VERSION,
             namespace: "test".to_string(),
             protocol_version: u32::from(CURRENT_PROTOCOL_VERSION),
+            artifact_id: Some(bcode_ipc::ArtifactId::current()),
             build_fingerprint: "test-build".to_string(),
             storage_writer_epoch,
             pid: Some(std::process::id()),
@@ -844,11 +1071,75 @@ mod tests {
     }
 
     #[test]
+    fn daemon_record_identity_fields_are_independently_validated() {
+        let record = record_with_writer_epoch(Some(2));
+        let exact = bcode_ipc::DaemonStatus {
+            namespace: record.namespace.clone(),
+            protocol_version: record.protocol_version,
+            artifact_id: record.artifact_id.clone(),
+            build_fingerprint: record.build_fingerprint.clone(),
+            executable_digest: record.executable_digest.clone(),
+            storage_writer_epoch: record.storage_writer_epoch,
+            session_event_schema_version: None,
+            pid: record.pid,
+            instance_id: record.instance_id.clone(),
+            started_at_unix_ms: record.started_at_unix_ms,
+        };
+        assert!(daemon_status_matches_record(&record, &exact));
+
+        let cases = [
+            bcode_ipc::DaemonStatus {
+                instance_id: "other-instance".to_owned(),
+                ..exact.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                namespace: "other-namespace".to_owned(),
+                ..exact.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                protocol_version: exact.protocol_version.saturating_add(1),
+                ..exact.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                artifact_id: Some(
+                    bcode_ipc::ArtifactId::parse("other-artifact")
+                        .expect("other artifact identity"),
+                ),
+                ..exact.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                build_fingerprint: "other-build".to_owned(),
+                ..exact.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                executable_digest: Some("other-digest".to_owned()),
+                ..exact.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                storage_writer_epoch: exact.storage_writer_epoch.map(|epoch| epoch + 1),
+                ..exact.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                pid: exact.pid.map(|pid| pid.saturating_add(1)),
+                ..exact.clone()
+            },
+            bcode_ipc::DaemonStatus {
+                started_at_unix_ms: exact.started_at_unix_ms.saturating_add(1),
+                ..exact
+            },
+        ];
+        for status in cases {
+            assert!(!daemon_status_matches_record(&record, &status));
+        }
+    }
+
+    #[test]
     fn daemon_record_classification_preserves_historical_and_ambiguous_evidence() {
         let current = record_with_writer_epoch(Some(2));
         let exact = bcode_ipc::DaemonStatus {
             namespace: current.namespace.clone(),
             protocol_version: current.protocol_version,
+            artifact_id: current.artifact_id.clone(),
             build_fingerprint: current.build_fingerprint.clone(),
             executable_digest: current.executable_digest.clone(),
             storage_writer_epoch: current.storage_writer_epoch,
@@ -942,10 +1233,91 @@ mod tests {
             cached_daemon_executable_path_for_digest(Path::new("/state"), "abc123"),
             Path::new("/state")
                 .join("daemon-images")
-                .join(daemon_namespace())
+                .join(bcode_ipc::ArtifactId::current().as_str())
                 .join("abc123")
                 .join(if cfg!(windows) { "bcode.exe" } else { "bcode" })
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_artifact_handle_survives_source_path_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "bcode-retained-artifact-test-{}-{}",
+            std::process::id(),
+            unix_time_millis().unwrap()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("bcode");
+        fs::write(&source, b"original artifact bytes").unwrap();
+        let bootstrap = ArtifactBootstrap::open(
+            source.clone(),
+            bcode_ipc::ArtifactId::parse("retained-test").unwrap(),
+        )
+        .unwrap();
+        let original_digest = bootstrap.digest().unwrap();
+        let replacement = root.join("replacement");
+        fs::write(&replacement, b"replacement bytes").unwrap();
+        fs::rename(&replacement, &source).unwrap();
+        let copied = root.join("copied");
+        let copied_digest = bootstrap.copy_to(&copied).unwrap();
+
+        assert_eq!(copied_digest, original_digest);
+        assert_eq!(executable_sha256(&copied).unwrap(), original_digest);
+        assert_ne!(executable_sha256(&source).unwrap(), original_digest);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_cached_image_is_repaired_with_exact_metadata() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "bcode-daemon-image-repair-test-{}-{}",
+            std::process::id(),
+            unix_time_millis().unwrap()
+        ));
+        let cached = ensure_current_executable_cached_in_state(&state_dir).unwrap();
+        fs::write(&cached, b"corrupt").unwrap();
+
+        let repaired = ensure_current_executable_cached_in_state(&state_dir).unwrap();
+        let (_source, digest) = current_executable_identity().unwrap();
+        assert_eq!(repaired, cached);
+        assert!(daemon_image_is_valid(&repaired, &digest).unwrap());
+        assert_eq!(
+            ensure_current_executable_cached_in_state(&state_dir).unwrap(),
+            repaired
+        );
+        assert!(
+            fs::read_dir(repaired.parent().expect("cached image parent"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".bcode.tmp-"))
+        );
+        fs::remove_dir_all(state_dir).unwrap();
+    }
+
+    #[test]
+    fn interrupted_cache_copy_does_not_block_verified_image() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "bcode-daemon-image-interrupted-test-{}-{}",
+            std::process::id(),
+            unix_time_millis().unwrap()
+        ));
+        let (_source, digest) = current_executable_identity().unwrap();
+        let target = cached_daemon_executable_path_for_digest(&state_dir, &digest);
+        let parent = target.parent().expect("cached image parent");
+        fs::create_dir_all(parent).unwrap();
+        let interrupted = parent.join(format!(".bcode.tmp-{}", std::process::id()));
+        fs::write(&interrupted, b"partial executable bytes").unwrap();
+
+        let cached = ensure_current_executable_cached_in_state(&state_dir).unwrap();
+
+        assert_eq!(cached, target);
+        assert_eq!(fs::read(&interrupted).unwrap(), b"partial executable bytes");
+        assert!(daemon_image_is_valid(&cached, &digest).unwrap());
+        fs::remove_dir_all(state_dir).unwrap();
     }
 
     #[test]
@@ -983,6 +1355,15 @@ mod tests {
             cached_daemon_executable_path_for_digest(&state_dir, &digest)
         );
         assert_eq!(executable_sha256(&cached).unwrap(), digest);
+        assert!(daemon_image_is_valid(&cached, &digest).unwrap());
+        assert_eq!(
+            serde_json::from_slice::<DaemonImageMetadata>(
+                &fs::read(daemon_image_metadata_path(&cached)).unwrap()
+            )
+            .unwrap()
+            .artifact_id,
+            bcode_ipc::ArtifactId::current()
+        );
         assert_eq!(
             ensure_current_executable_cached_in_state(&state_dir).unwrap(),
             cached
@@ -1104,6 +1485,15 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
             let stderr_log = log_file.try_clone()?;
 
             let exe = ensure_current_executable_cached()?;
+            let executable_digest = cached_executable_digest(&exe)
+                .ok_or_else(|| DaemonLifecycleError::Io {
+                    path: exe.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "cached daemon executable path has no digest component",
+                    ),
+                })?
+                .to_owned();
             let (endpoint_env_name, endpoint_env_value) =
                 bcode_ipc::endpoint_env_pair(&endpoint)
                     .map_err(|error| std::io::Error::other(error.to_string()))?;
@@ -1114,6 +1504,7 @@ pub async fn ensure_daemon_running(options: &EnsureDaemonOptions) -> Result<(), 
                     bcode_ipc::BCODE_IPC_ENDPOINT_NAMESPACE_ENV,
                     bcode_ipc::daemon_namespace(),
                 )
+                .env(BCODE_EXECUTABLE_DIGEST_ENV, executable_digest)
                 .env("BCODE_DAEMON_LOG", &log_path)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::from(log_file))
@@ -1162,44 +1553,22 @@ where
         return Ok(());
     }
 
-    let mut startup_attempts = 0;
-    loop {
-        startup_attempts += 1;
-        let lock = StartupLock::acquire().await?;
-        cleanup_stale_endpoint(&options.endpoint)?;
-        if ping_ready(&options.endpoint).await {
-            drop(lock);
-            print_daemon_status(options, "server already running");
-            return Ok(());
-        }
-
-        match start(options).await {
-            Ok(()) => {
-                let _cleanup_task = tokio::spawn(async {
-                    let _ = cleanup_stale_daemon_records().await;
-                    let _ = cleanup_stale_daemon_images(&bcode_config::default_state_dir());
-                });
-                drop(lock);
-                print_daemon_status(options, "server started");
-                return Ok(());
-            }
-            Err(error) if error.is_existing_daemon_race() && startup_attempts < 3 => {
-                drop(lock);
-                if wait_for_existing_daemon(&options.endpoint).await {
-                    return Ok(());
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
-            }
-            Err(error) if error.is_existing_daemon_race() => {
-                if wait_for_existing_daemon(&options.endpoint).await {
-                    drop(lock);
-                    return Ok(());
-                }
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        }
+    let lock = StartupLock::acquire().await?;
+    cleanup_stale_endpoint(&options.endpoint)?;
+    if ping_ready(&options.endpoint).await {
+        drop(lock);
+        print_daemon_status(options, "server already running");
+        return Ok(());
     }
+
+    start(options).await?;
+    let _cleanup_task = tokio::spawn(async {
+        let _ = cleanup_stale_daemon_records().await;
+        let _ = cleanup_stale_daemon_images(&bcode_config::default_state_dir());
+    });
+    drop(lock);
+    print_daemon_status(options, "server started");
+    Ok(())
 }
 
 fn print_daemon_status(options: &EnsureDaemonOptions, status: &str) {
@@ -1281,57 +1650,65 @@ impl Drop for StartupLock {
     }
 }
 
+const READINESS_TIMEOUT: Duration = Duration::from_secs(20);
+const READINESS_RETRY_DELAY: Duration = Duration::from_millis(25);
+
 async fn wait_for_server_ready(
     endpoint: &IpcEndpoint,
     child: &mut tokio::process::Child,
     log_path: &Path,
 ) -> Result<(), DaemonStartError> {
-    for _ in 0..200 {
-        if ping_ready(endpoint).await {
-            if let Some(status) = child.try_wait()? {
-                return Err(DaemonStartError::Exited {
+    let deadline = tokio::time::Instant::now() + READINESS_TIMEOUT;
+    loop {
+        let readiness = ping_ready(endpoint);
+        tokio::pin!(readiness);
+        tokio::select! {
+            biased;
+            status = child.wait() => {
+                let status = status?;
+                let error = DaemonStartError::Exited {
                     status: status.to_string(),
                     log_path: display_from_current_dir(log_path).to_string(),
                     recent_log: recent_log_excerpt(log_path),
-                });
+                };
+                if error.is_existing_daemon_race() && wait_for_existing_daemon(endpoint).await {
+                    return Ok(());
+                }
+                return Err(error);
             }
-            return Ok(());
+            ready = &mut readiness => {
+                if ready {
+                    return Ok(());
+                }
+            }
         }
-        if let Some(status) = child.try_wait()? {
-            let error = DaemonStartError::Exited {
-                status: status.to_string(),
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DaemonStartError::StartTimeout {
                 log_path: display_from_current_dir(log_path).to_string(),
                 recent_log: recent_log_excerpt(log_path),
-            };
-            if error.is_existing_daemon_race() && wait_for_existing_daemon(endpoint).await {
-                return Ok(());
-            }
-            return Err(error);
+            });
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(READINESS_RETRY_DELAY).await;
     }
-
-    Err(DaemonStartError::StartTimeout {
-        log_path: display_from_current_dir(log_path).to_string(),
-        recent_log: recent_log_excerpt(log_path),
-    })
 }
 
 async fn wait_for_daemon_ready(
     endpoint: &IpcEndpoint,
     log_path: &Path,
 ) -> Result<(), DaemonStartError> {
-    for _ in 0..200 {
+    let deadline = tokio::time::Instant::now() + READINESS_TIMEOUT;
+    loop {
         if ping_ready(endpoint).await {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(DaemonStartError::StartTimeout {
+                log_path: display_from_current_dir(log_path).to_string(),
+                recent_log: recent_log_excerpt(log_path),
+            });
+        }
+        tokio::time::sleep(READINESS_RETRY_DELAY).await;
     }
-
-    Err(DaemonStartError::StartTimeout {
-        log_path: display_from_current_dir(log_path).to_string(),
-        recent_log: recent_log_excerpt(log_path),
-    })
 }
 
 async fn ping_ready(endpoint: &IpcEndpoint) -> bool {
@@ -1350,6 +1727,7 @@ async fn ping_ready(endpoint: &IpcEndpoint) -> bool {
 fn daemon_status_matches_current_executable(status: &bcode_ipc::DaemonStatus) -> bool {
     if status.namespace != daemon_namespace()
         || status.protocol_version != u32::from(CURRENT_PROTOCOL_VERSION)
+        || status.artifact_id.as_ref() != Some(&bcode_ipc::ArtifactId::current())
         || status.build_fingerprint != BUILD_FINGERPRINT
     {
         return false;
@@ -1411,7 +1789,7 @@ const fn cleanup_stale_endpoint(_endpoint: &IpcEndpoint) -> Result<(), DaemonLif
 
 #[cfg(unix)]
 fn remove_stale_unix_socket_path(path: &Path) -> Result<(), DaemonLifecycleError> {
-    if !is_bcode_socket_path(path) || unix_socket_has_listener(path) {
+    if !path.exists() || !is_bcode_socket_path(path) || unix_socket_has_listener(path) {
         return Ok(());
     }
     std::thread::sleep(Duration::from_millis(100));
@@ -1457,6 +1835,34 @@ mod startup_lock_tests {
         ))
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn stale_socket_cleanup_preserves_live_listener_then_removes_stale_path() {
+        let root = PathBuf::from(format!(
+            "/tmp/bcode-ds-{}-{}",
+            std::process::id(),
+            unix_time_millis().expect("time")
+        ));
+        fs::create_dir_all(&root).expect("socket directory");
+        let live_path = root.join("bcode-foreign-artifact.sock");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&live_path).expect("bind live listener");
+
+        remove_stale_unix_socket_path(&live_path).expect("preserve live endpoint");
+        assert!(live_path.exists());
+        let connection = std::os::unix::net::UnixStream::connect(&live_path)
+            .expect("live foreign endpoint remains reachable");
+        drop(connection);
+        drop(listener);
+
+        let stale_path = root.join("bcode-stale-artifact.sock");
+        drop(std::os::unix::net::UnixDatagram::bind(&stale_path).expect("bind stale socket"));
+        remove_stale_unix_socket_path(&stale_path).expect("remove stale endpoint");
+        assert!(!stale_path.exists());
+        fs::remove_file(live_path).expect("live socket cleanup");
+        fs::remove_dir_all(root).expect("socket directory cleanup");
+    }
+
     #[tokio::test]
     async fn startup_lock_waits_for_owner_instead_of_stealing_lock_file() {
         let path = lock_path("wait");
@@ -1473,6 +1879,97 @@ mod startup_lock_tests {
         let second = waiter.await.expect("waiter task").expect("second lock");
         drop(second);
         let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn startup_lock_crash_helper() {
+        let Some(path) = std::env::var_os("BCODE_STARTUP_LOCK_CRASH_PATH") else {
+            return;
+        };
+        let marker =
+            std::env::var_os("BCODE_STARTUP_LOCK_CRASH_MARKER").expect("crash helper marker path");
+        let _lock = StartupLock::acquire_at(PathBuf::from(path), Duration::from_secs(2))
+            .await
+            .expect("crash helper lock");
+        fs::write(marker, b"locked").expect("write crash helper marker");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        std::process::exit(70);
+    }
+
+    #[tokio::test]
+    async fn startup_lock_owner_crash_permits_bounded_takeover() {
+        let path = lock_path("crash");
+        let marker = path.with_extension("locked");
+        let mut child = tokio::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["startup_lock_crash_helper", "--nocapture"])
+            .env("BCODE_STARTUP_LOCK_CRASH_PATH", &path)
+            .env("BCODE_STARTUP_LOCK_CRASH_MARKER", &marker)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn crash helper");
+
+        let marker_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !marker.exists() {
+            assert!(
+                tokio::time::Instant::now() < marker_deadline,
+                "crash helper did not acquire startup lock"
+            );
+            assert!(
+                child.try_wait().expect("query crash helper").is_none(),
+                "crash helper exited before acquiring startup lock"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let replacement = StartupLock::acquire_at(path.clone(), Duration::from_secs(2))
+            .await
+            .expect("take over lock after owner crash");
+        let status = child.wait().await.expect("wait for crash helper");
+        assert!(!status.success());
+        drop(replacement);
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(marker);
+    }
+
+    #[test]
+    fn startup_errors_preserve_actionable_log_context() {
+        let log_path = PathBuf::from("/tmp/bcode-daemon-test.log");
+        let recent_log = "fatal startup detail\n".to_owned();
+        let exited = DaemonStartError::Exited {
+            status: "exit status: 70".to_owned(),
+            log_path: log_path.display().to_string(),
+            recent_log: recent_log.clone(),
+        };
+        let timeout = DaemonStartError::StartTimeout {
+            log_path: log_path.display().to_string(),
+            recent_log,
+        };
+
+        for error in [exited, timeout] {
+            let message = error.to_string();
+            assert!(message.contains("/tmp/bcode-daemon-test.log"));
+            assert!(message.contains("fatal startup detail"));
+            assert!(message.contains("bcode server run"));
+        }
+    }
+
+    #[test]
+    fn recent_log_excerpt_is_bounded_to_latest_context() {
+        let path = lock_path("recent-log");
+        let contents = (0..40)
+            .map(|line| format!("line-{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, contents).expect("write test log");
+
+        let excerpt = recent_log_excerpt(&path);
+
+        assert!(!excerpt.contains("line-0\n"));
+        assert!(excerpt.starts_with("line-10\n"));
+        assert!(excerpt.ends_with("line-39\n"));
+        fs::remove_file(path).expect("remove test log");
     }
 
     #[tokio::test]

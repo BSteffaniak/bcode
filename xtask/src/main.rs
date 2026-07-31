@@ -1266,9 +1266,27 @@ fn features_enable_bundled_tesseract(features: &[String]) -> bool {
     })
 }
 
+fn generated_artifact_id() -> String {
+    let unique = format!(
+        "{}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_nanos()),
+        env::var("GITHUB_RUN_ID").unwrap_or_default()
+    );
+    format!("bcode-{}", sha256_bytes(unique.as_bytes())[..32].to_owned())
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 fn build_bcode_release(target: &str, features: &[String]) -> Result<()> {
+    let artifact_id = generated_artifact_id();
     let mut command = Command::new("cargo");
     command
+        .env("BCODE_ARTIFACT_ID", &artifact_id)
         .arg("build")
         .arg("--release")
         .arg("--package")
@@ -1284,7 +1302,9 @@ fn build_bcode_release(target: &str, features: &[String]) -> Result<()> {
         .arg(features.join(","))
         .arg("--target")
         .arg(target);
-    run_command(&mut command)
+    run_command(&mut command)?;
+    println!("built bcode artifact identity: {artifact_id}");
+    Ok(())
 }
 
 fn build(options: &Options) -> Result<()> {
@@ -1305,6 +1325,11 @@ fn release(options: &Options) -> Result<()> {
 
     let binary = built_binary(&options.target, target_kind);
     ensure_file(&binary)?;
+    let artifact_id_before_postprocessing = if options.target == host_target() {
+        Some(probe_artifact_identity(&binary)?)
+    } else {
+        None
+    };
     let mermaid_worker =
         include_mermaid_worker.then(|| built_mermaid_worker(&options.target, target_kind));
     if let Some(worker) = &mermaid_worker {
@@ -1328,11 +1353,28 @@ fn release(options: &Options) -> Result<()> {
             sign_windows_release_binary_if_configured(worker)?;
         }
     }
+    if let Some(expected_artifact_id) = artifact_id_before_postprocessing.as_deref() {
+        let actual_artifact_id = probe_artifact_identity(&binary)?;
+        if actual_artifact_id != expected_artifact_id {
+            return Err(format_error(format!(
+                "artifact identity changed during signing/stripping: expected {expected_artifact_id}, found {actual_artifact_id}"
+            )));
+        }
+        println!("verified post-processing artifact identity: {actual_artifact_id}");
+    }
 
     let staging_dir = staging_dir(options);
     recreate_dir(&staging_dir)?;
     let staged_binary = staging_dir.join(binary_file_name(target_kind));
     copy_release_binary(&binary, &staged_binary)?;
+    if let Some(expected_artifact_id) = artifact_id_before_postprocessing.as_deref() {
+        let staged_artifact_id = probe_artifact_identity(&staged_binary)?;
+        if staged_artifact_id != expected_artifact_id {
+            return Err(format_error(format!(
+                "artifact identity changed while staging release: expected {expected_artifact_id}, found {staged_artifact_id}"
+            )));
+        }
+    }
     if let Some(worker) = &mermaid_worker {
         let staged_worker = staging_dir.join(mermaid_worker_file_name(target_kind));
         copy_release_binary(worker, &staged_worker)?;
@@ -1430,6 +1472,11 @@ fn dev_release(options: &Options) -> Result<()> {
     build_bcode_release(&options.target, &features)?;
     let binary = built_binary(&options.target, target_kind);
     ensure_file(&binary)?;
+    let artifact_id_before_postprocessing = if options.target == host_target() {
+        Some(probe_artifact_identity(&binary)?)
+    } else {
+        None
+    };
 
     match target_kind {
         TargetKind::Macos => {
@@ -1452,6 +1499,16 @@ fn dev_release(options: &Options) -> Result<()> {
         TargetKind::Windows => {
             println!("dev release ready: {}", binary.display());
         }
+    }
+
+    if let Some(expected_artifact_id) = artifact_id_before_postprocessing {
+        let actual_artifact_id = probe_artifact_identity(&binary)?;
+        if actual_artifact_id != expected_artifact_id {
+            return Err(format_error(format!(
+                "artifact identity changed during signing/stripping: expected {expected_artifact_id}, found {actual_artifact_id}"
+            )));
+        }
+        println!("verified post-processing artifact identity: {actual_artifact_id}");
     }
 
     Ok(())
@@ -2354,6 +2411,35 @@ fn smoke_test_release_archive(
     }
 }
 
+fn probe_artifact_identity(binary: &Path) -> Result<String> {
+    let output = Command::new(binary).arg("artifact-id").output()?;
+    if !output.status.success() {
+        return Err(format_error(format!(
+            "artifact identity probe failed for {}: {}",
+            binary.display(),
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    let artifact_id = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    let valid = !artifact_id.is_empty()
+        && artifact_id.len() <= 128
+        && artifact_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+    if !valid {
+        return Err(format_error(format!(
+            "artifact identity probe returned invalid identity {artifact_id:?}"
+        )));
+    }
+    Ok(artifact_id)
+}
+
+fn verify_extracted_artifact_identity(binary: &Path) -> Result<()> {
+    let artifact_id = probe_artifact_identity(binary)?;
+    println!("verified extracted artifact identity: {artifact_id}");
+    Ok(())
+}
+
 fn smoke_test_release_archive_in(
     archive: &Path,
     target_kind: TargetKind,
@@ -2386,6 +2472,7 @@ fn smoke_test_release_archive_in(
     } else {
         run_command(&mut version)?;
     }
+    verify_extracted_artifact_identity(&binary)?;
     if include_mermaid_worker {
         smoke_test_mermaid_worker(
             &extraction.join(mermaid_worker_file_name(target_kind)),

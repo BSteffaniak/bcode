@@ -19,12 +19,14 @@ pub use bcode_worktree_models::{
     WorktreeRemoveRequest, WorktreeRemoveResponse,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+#[cfg(test)]
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::env;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::str::FromStr;
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -92,6 +94,78 @@ pub const CURRENT_SESSION_STORAGE_WRITER_EPOCH: u32 =
 
 /// Build-scoped daemon fingerprint generated at compile time.
 pub const BUILD_FINGERPRINT: &str = env!("BCODE_BUILD_FINGERPRINT");
+
+/// Exact identity embedded in this produced executable artifact.
+pub const ARTIFACT_ID: &str = env!("BCODE_ARTIFACT_ID");
+
+/// Exact produced-artifact identity used for daemon routing.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ArtifactId(String);
+
+impl ArtifactId {
+    /// Parse an exact artifact identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the identity is empty, too long, or contains unsupported bytes.
+    pub fn parse(value: impl Into<String>) -> Result<Self, ArtifactIdParseError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(ArtifactIdParseError::Empty);
+        }
+        if value.len() > 128 {
+            return Err(ArtifactIdParseError::TooLong);
+        }
+        if !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(ArtifactIdParseError::InvalidCharacter);
+        }
+        Ok(Self(value))
+    }
+
+    /// Return the embedded identity of the current produced artifact.
+    #[must_use]
+    pub fn current() -> Self {
+        Self(ARTIFACT_ID.to_owned())
+    }
+
+    /// Return the artifact identity as text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ArtifactId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for ArtifactId {
+    type Err = ArtifactIdParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::parse(value)
+    }
+}
+
+/// Invalid exact artifact identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+pub enum ArtifactIdParseError {
+    /// Identity was empty.
+    #[error("artifact identity cannot be empty")]
+    Empty,
+    /// Identity exceeded the contract limit.
+    #[error("artifact identity is longer than 128 bytes")]
+    TooLong,
+    /// Identity contained a byte outside the portable identifier alphabet.
+    #[error("artifact identity must contain only ASCII letters, digits, '-' or '_'")]
+    InvalidCharacter,
+}
 
 /// Protocol version used in IPC envelopes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -211,6 +285,8 @@ pub enum Request {
         runtime_context: Option<ClientRuntimeContext>,
         #[serde(default)]
         daemon_namespace: String,
+        #[serde(default)]
+        artifact_id: Option<ArtifactId>,
         #[serde(default)]
         build_fingerprint: String,
     },
@@ -871,7 +947,10 @@ pub struct DaemonStatus {
     /// IPC protocol version.
     #[serde(default)]
     pub protocol_version: u32,
-    /// Build fingerprint included in the namespace.
+    /// Exact produced-artifact identity.
+    #[serde(default)]
+    pub artifact_id: Option<ArtifactId>,
+    /// Build fingerprint retained as source/build diagnostic evidence.
     #[serde(default)]
     pub build_fingerprint: String,
     /// SHA-256 digest of the executable bytes running the daemon.
@@ -3122,49 +3201,16 @@ pub fn endpoint_from_env_value(value: &str) -> Result<IpcEndpoint, serde_json::E
     serde_json::from_str(value)
 }
 
-/// Return the daemon namespace for this executable and IPC protocol version.
+/// Return the daemon namespace for this produced artifact and IPC protocol version.
 #[must_use]
 pub fn daemon_namespace() -> String {
-    format!("ipc-v{CURRENT_PROTOCOL_VERSION}-{}", daemon_fingerprint())
+    daemon_namespace_for(&ArtifactId::current())
 }
 
-fn daemon_fingerprint() -> &'static str {
-    static FINGERPRINT: OnceLock<String> = OnceLock::new();
-    FINGERPRINT.get_or_init(|| {
-        current_executable_fingerprint().map_or_else(
-            || BUILD_FINGERPRINT.to_owned(),
-            |executable| combined_build_fingerprint(BUILD_FINGERPRINT, &executable),
-        )
-    })
-}
-
-fn combined_build_fingerprint(build: &str, executable: &str) -> String {
-    let mut hasher = Sha256::new();
-    for value in [build.as_bytes(), executable.as_bytes()] {
-        hasher.update(u64::try_from(value.len()).unwrap_or(u64::MAX).to_le_bytes());
-        hasher.update(value);
-    }
-    let digest = format!("{:x}", hasher.finalize());
-    digest[..16].to_owned()
-}
-
-fn current_executable_fingerprint() -> Option<String> {
-    let executable = env::current_exe().ok()?;
-    executable_fingerprint_from_reader(fs::File::open(executable).ok()?).ok()
-}
-
-fn executable_fingerprint_from_reader(mut reader: impl std::io::Read) -> std::io::Result<String> {
-    let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
-    }
-    let digest = format!("{:x}", hasher.finalize());
-    Ok(digest[..16].to_owned())
+/// Return the daemon namespace for one exact produced artifact.
+#[must_use]
+pub fn daemon_namespace_for(artifact_id: &ArtifactId) -> String {
+    format!("ipc-v{CURRENT_PROTOCOL_VERSION}-{artifact_id}")
 }
 
 /// Return the default local IPC endpoint.
@@ -3341,42 +3387,23 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn executable_fingerprint_is_content_derived() {
-        let first = executable_fingerprint_from_reader(&b"first executable"[..]).unwrap();
-        let repeated = executable_fingerprint_from_reader(&b"first executable"[..]).unwrap();
-        let second = executable_fingerprint_from_reader(&b"second executable"[..]).unwrap();
-
-        assert_eq!(first, repeated);
-        assert_ne!(first, second);
-        assert_eq!(first.len(), 16);
-        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+    fn artifact_id_validates_portable_identity() {
+        let artifact_id = ArtifactId::parse("artifact_123-test").expect("valid artifact identity");
+        assert_eq!(artifact_id.as_str(), "artifact_123-test");
+        assert!(ArtifactId::parse("").is_err());
+        assert!(ArtifactId::parse("invalid/value").is_err());
     }
 
     #[test]
-    fn daemon_fingerprint_uses_build_and_executable_identity() {
-        let baseline = combined_build_fingerprint("build-a", "executable-a");
-
+    fn daemon_namespace_uses_exact_artifact_identity() {
+        let artifact_id = ArtifactId::parse("artifact-a").expect("artifact identity");
         assert_eq!(
-            baseline,
-            combined_build_fingerprint("build-a", "executable-a")
+            daemon_namespace_for(&artifact_id),
+            format!("ipc-v{CURRENT_PROTOCOL_VERSION}-artifact-a")
         );
-        assert_ne!(
-            baseline,
-            combined_build_fingerprint("build-b", "executable-a")
-        );
-        assert_ne!(
-            baseline,
-            combined_build_fingerprint("build-a", "executable-b")
-        );
-        assert_eq!(baseline.len(), 16);
-        assert!(baseline.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    }
-
-    #[test]
-    fn daemon_namespace_uses_the_current_daemon_fingerprint() {
         assert_eq!(
             daemon_namespace(),
-            format!("ipc-v{CURRENT_PROTOCOL_VERSION}-{}", daemon_fingerprint())
+            daemon_namespace_for(&ArtifactId::current())
         );
     }
 
@@ -4733,6 +4760,7 @@ mod tests {
         let request = Request::Hello {
             client_name: "test".to_string(),
             daemon_namespace: daemon_namespace(),
+            artifact_id: Some(ArtifactId::current()),
             build_fingerprint: BUILD_FINGERPRINT.to_owned(),
             runtime_context: Some(ClientRuntimeContext {
                 working_directory: Some(PathBuf::from("/tmp/client")),
@@ -4819,6 +4847,7 @@ mod tests {
                     daemon: DaemonStatus {
                         namespace: daemon_namespace(),
                         protocol_version: u32::from(ProtocolVersion::current().0),
+                        artifact_id: Some(ArtifactId::current()),
                         build_fingerprint: "test-build".to_string(),
                         executable_digest: Some("digest".to_string()),
                         storage_writer_epoch: Some(2),
