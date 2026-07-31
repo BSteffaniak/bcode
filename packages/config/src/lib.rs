@@ -7432,7 +7432,24 @@ enabled = ["bcode.filesystem"]
     }
 
     #[test]
-    fn plugin_default_bundled_enables_bundled_unless_disabled() {
+    fn plugin_default_bundled_enables_only_supplied_defaults_and_explicit_plugins() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[plugins]
+enabled = ["bcode.vim-edit"]
+"#,
+        )
+        .expect("config parses");
+        let selection = plugin_selection_with_default_plugin_ids(&config, ["bcode.default-agents"]);
+
+        assert_eq!(selection.mode, PluginSelectionMode::Explicit);
+        assert!(selection.is_enabled("bcode.default-agents"));
+        assert!(selection.is_enabled("bcode.vim-edit"));
+        assert!(!selection.is_enabled("bcode.other-available"));
+    }
+
+    #[test]
+    fn plugin_default_bundled_respects_explicit_disable() {
         let config: BcodeConfig = toml::from_str(
             r#"
 [plugins]
@@ -7448,6 +7465,22 @@ disabled = ["bcode.vim-edit"]
         assert_eq!(selection.mode, PluginSelectionMode::Explicit);
         assert!(selection.is_enabled("bcode.default-agents"));
         assert!(!selection.is_enabled("bcode.vim-edit"));
+    }
+
+    #[test]
+    fn plugin_default_all_enables_available_plugins() {
+        let config: BcodeConfig = toml::from_str(
+            r#"
+[plugins]
+default = "all"
+"#,
+        )
+        .expect("config parses");
+        let selection = plugin_selection_with_default_plugin_ids(&config, ["bcode.default-agents"]);
+
+        assert_eq!(selection.mode, PluginSelectionMode::All);
+        assert!(selection.is_enabled("bcode.vim-edit"));
+        assert!(selection.is_enabled("bcode.any-discovered-plugin"));
     }
 
     #[test]

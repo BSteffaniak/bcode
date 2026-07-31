@@ -120,6 +120,7 @@ use std::sync::OnceLock;
 
 static STATIC_BUNDLED_PLUGINS: OnceLock<Vec<bcode_plugin::StaticBundledPlugin>> = OnceLock::new();
 static STATIC_BUNDLED_PLUGIN_IDS: OnceLock<Vec<String>> = OnceLock::new();
+static STATIC_BUNDLED_DEFAULT_PLUGIN_IDS: OnceLock<Vec<String>> = OnceLock::new();
 
 /// Parse CLI arguments and run the requested command.
 ///
@@ -140,11 +141,14 @@ pub async fn run_with_static_bundled(
 ) -> Result<(), CliError> {
     init_tracing();
     let static_plugin_ids = bcode_plugin::static_bundled_plugin_ids(&static_plugins)?;
+    let static_default_plugin_ids =
+        bcode_plugin::static_bundled_default_plugin_ids(&static_plugins)?;
     if let Err(error) = bcode_daemon_lifecycle::ensure_current_executable_cached() {
         tracing::warn!(%error, "failed to cache current executable for detached daemon startup");
     }
     let _ = STATIC_BUNDLED_PLUGINS.set(static_plugins);
     let _ = STATIC_BUNDLED_PLUGIN_IDS.set(static_plugin_ids);
+    let _ = STATIC_BUNDLED_DEFAULT_PLUGIN_IDS.set(static_default_plugin_ids);
     let registrations = plugin_cli::registrations(
         STATIC_BUNDLED_PLUGINS.get().map_or(&[][..], Vec::as_slice),
         STATIC_BUNDLED_PLUGIN_IDS
@@ -6208,10 +6212,10 @@ fn random_urlsafe(bytes: usize) -> Result<String, CliError> {
 fn plugin_selection_for_config(
     config: &bcode_config::BcodeConfig,
 ) -> bcode_plugin::PluginSelection {
-    let static_plugin_ids = STATIC_BUNDLED_PLUGIN_IDS
+    let default_plugin_ids = STATIC_BUNDLED_DEFAULT_PLUGIN_IDS
         .get()
         .map_or_else(Vec::new, Clone::clone);
-    bcode_config::plugin_selection_with_default_plugin_ids(config, &static_plugin_ids)
+    bcode_config::plugin_selection_with_default_plugin_ids(config, &default_plugin_ids)
 }
 
 fn open_browser(url: &str) {

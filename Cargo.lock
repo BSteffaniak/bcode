@@ -1438,6 +1438,7 @@ dependencies = [
  "bcode_blims_plugin",
  "bcode_code_review_plugin",
  "bcode_command",
+ "bcode_config",
  "bcode_default_agents_plugin",
  "bcode_document_plugin",
  "bcode_eval_plugin",

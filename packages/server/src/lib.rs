@@ -3145,9 +3145,9 @@ async fn run_with_static_bundled_inner(
     tracing::debug!(target: "bcode_server::startup", "loading config");
     let config = bcode_config::load_config()?;
     tracing::debug!(target: "bcode_server::startup", "config loaded");
-    let static_plugin_ids = bcode_plugin::static_bundled_plugin_ids(static_plugins)?;
+    let default_plugin_ids = bcode_plugin::static_bundled_default_plugin_ids(static_plugins)?;
     let plugin_selection =
-        bcode_config::plugin_selection_with_default_plugin_ids(&config, &static_plugin_ids);
+        bcode_config::plugin_selection_with_default_plugin_ids(&config, &default_plugin_ids);
     tracing::debug!(
         target: "bcode_server::startup",
         enabled = ?plugin_selection.enabled,

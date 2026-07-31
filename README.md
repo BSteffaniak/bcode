@@ -358,7 +358,7 @@ Bcode uses an agent-scoped permission model with `allow` / `ask` / `deny` rules 
 
 ### Plugin and tool selection
 
-Bcode separates plugin loading from model-callable tool exposure. Statically bundled plugins are compiled into the Bcode binary, but users can still opt out of bundled defaults or opt in to individual plugins.
+Bcode separates plugin availability and loading from model-callable tool exposure. Statically bundled plugins are compiled into the Bcode binary, but the distribution chooses which of those plugins participate in bundled defaults. Users can still opt out of bundled defaults or opt in to any available plugin.
 
 ```toml
 [plugins]
@@ -370,7 +370,14 @@ default = "none"
 enabled = ["filesystem.read", "vim_edit.preview"]
 ```
 
-Use `default = "bundled"` under `[plugins]` to enable Bcode's bundled defaults unless disabled, `default = "none"` to start with no default plugins, or `default = "all"` to enable every discovered plugin unless disabled. Under `[tools]`, `default = "agent"` uses the active agent's normal tool policy, `default = "none"` exposes only explicitly enabled tools, and `default = "all"` exposes all loaded tools except those in `disabled`.
+Use `default = "bundled"` under `[plugins]` to enable Bcode's distribution defaults unless disabled, `default = "none"` to start with no default plugins, or `default = "all"` to enable every available or discovered plugin unless disabled. A plugin may be compiled into Bcode without participating in distribution defaults. The Vim edit plugin is bundled but opt-in; enable it without rebuilding with:
+
+```toml
+[plugins]
+enabled = ["bcode.vim-edit"]
+```
+
+Under `[tools]`, `default = "agent"` uses the active agent's normal tool policy, `default = "none"` exposes only explicitly enabled tools, and `default = "all"` exposes all loaded tools except those in `disabled`.
 
 ```toml
 [plugins]

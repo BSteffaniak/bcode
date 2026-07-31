@@ -354,6 +354,7 @@ fn vim_edit_plugin() -> bcode_plugin::StaticBundledPlugin {
         include_str!("../../../plugins/vim-edit-plugin/bcode-plugin.toml"),
         bcode_vim_edit_plugin::static_plugin(),
     )
+    .with_default_activation(bcode_plugin::PluginDefaultActivation::Disabled)
 }
 
 #[cfg(feature = "static-bundled-web-search-plugin")]
@@ -595,6 +596,157 @@ mod tests {
             adapter.tui_surface_kind.as_deref(),
             Some("bcode.question.inline")
         );
+    }
+
+    #[cfg(feature = "static-bundled-vim-edit-plugin")]
+    #[test]
+    fn vim_edit_is_available_but_not_a_distribution_default() {
+        let static_plugins = super::static_bundled_plugins();
+        let all_ids = bcode_plugin::static_bundled_plugin_ids(&static_plugins)
+            .expect("static plugin manifests parse");
+        let default_ids = bcode_plugin::static_bundled_default_plugin_ids(&static_plugins)
+            .expect("static plugin manifests parse");
+
+        assert!(all_ids.iter().any(|id| id == "bcode.vim-edit"));
+        assert!(!default_ids.iter().any(|id| id == "bcode.vim-edit"));
+
+        let default_selection = bcode_config::plugin_selection_with_default_plugin_ids(
+            &bcode_config::BcodeConfig::default(),
+            &default_ids,
+        );
+        let selected =
+            bcode_plugin::filter_selected_static_plugins(&static_plugins, &default_selection)
+                .expect("default static plugin selection parses");
+        assert!(
+            selected
+                .iter()
+                .all(|(manifest, _)| manifest.id != "bcode.vim-edit")
+        );
+        let default_host = bcode_plugin::PluginHost::load_static_plugins(&selected)
+            .expect("default-selected static plugins load");
+        assert!(
+            !default_host
+                .loaded_plugins()
+                .iter()
+                .any(|plugin| plugin.manifest().id == "bcode.vim-edit")
+        );
+        assert!(default_host.loaded_plugins().iter().all(|plugin| {
+            plugin
+                .manifest()
+                .services
+                .iter()
+                .all(|service| service.interface_id != "bcode.tool/v1")
+                || plugin.manifest().id != "bcode.vim-edit"
+        }));
+        assert!(
+            default_host
+                .visual_adapter(
+                    "bcode.vim-edit.request.preview",
+                    1,
+                    "tui",
+                    Some("bcode.vim-edit")
+                )
+                .is_none()
+        );
+
+        let mut explicitly_enabled_config = bcode_config::BcodeConfig::default();
+        explicitly_enabled_config
+            .plugins
+            .enabled
+            .insert("bcode.vim-edit".to_owned());
+        let explicitly_enabled = bcode_config::plugin_selection_with_default_plugin_ids(
+            &explicitly_enabled_config,
+            &default_ids,
+        );
+        let selected =
+            bcode_plugin::filter_selected_static_plugins(&static_plugins, &explicitly_enabled)
+                .expect("explicit static plugin selection parses");
+        assert!(
+            selected
+                .iter()
+                .any(|(manifest, _)| manifest.id == "bcode.vim-edit")
+        );
+        let explicitly_enabled_host = bcode_plugin::PluginHost::load_static_plugins(&selected)
+            .expect("explicitly selected Vim plugin loads");
+        assert!(
+            explicitly_enabled_host
+                .loaded_plugins()
+                .iter()
+                .any(|plugin| plugin.manifest().id == "bcode.vim-edit")
+        );
+        assert!(
+            explicitly_enabled_host
+                .loaded_plugins()
+                .iter()
+                .find(|plugin| plugin.manifest().id == "bcode.vim-edit")
+                .expect("Vim plugin is loaded")
+                .manifest()
+                .services
+                .iter()
+                .any(|service| service.interface_id == "bcode.tool/v1")
+        );
+        assert!(
+            explicitly_enabled_host
+                .visual_adapter(
+                    "bcode.vim-edit.request.preview",
+                    1,
+                    "tui",
+                    Some("bcode.vim-edit")
+                )
+                .is_some()
+        );
+
+        let all_config = bcode_config::BcodeConfig {
+            plugins: bcode_config::PluginConfig {
+                default: bcode_config::PluginDefaultMode::All,
+                ..bcode_config::PluginConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+        let all_selection =
+            bcode_config::plugin_selection_with_default_plugin_ids(&all_config, &default_ids);
+        let selected =
+            bcode_plugin::filter_selected_static_plugins(&static_plugins, &all_selection)
+                .expect("all static plugin selection parses");
+        assert!(
+            selected
+                .iter()
+                .any(|(manifest, _)| manifest.id == "bcode.vim-edit")
+        );
+
+        let disabled_config = bcode_config::BcodeConfig {
+            plugins: bcode_config::PluginConfig {
+                default: bcode_config::PluginDefaultMode::All,
+                enabled: std::collections::BTreeSet::from(["bcode.vim-edit".to_owned()]),
+                disabled: std::collections::BTreeSet::from(["bcode.vim-edit".to_owned()]),
+                ..bcode_config::PluginConfig::default()
+            },
+            ..bcode_config::BcodeConfig::default()
+        };
+        let disabled_selection =
+            bcode_config::plugin_selection_with_default_plugin_ids(&disabled_config, &default_ids);
+        let selected =
+            bcode_plugin::filter_selected_static_plugins(&static_plugins, &disabled_selection)
+                .expect("disabled static plugin selection parses");
+        assert!(
+            selected
+                .iter()
+                .all(|(manifest, _)| manifest.id != "bcode.vim-edit")
+        );
+    }
+
+    #[cfg(all(
+        feature = "static-bundled-vim-edit-plugin",
+        feature = "static-bundled-filesystem-plugin"
+    ))]
+    #[test]
+    fn ordinary_bundled_plugins_remain_distribution_defaults() {
+        let static_plugins = super::static_bundled_plugins();
+        let default_ids = bcode_plugin::static_bundled_default_plugin_ids(&static_plugins)
+            .expect("static plugin manifests parse");
+
+        assert!(default_ids.iter().any(|id| id == "bcode.filesystem"));
+        assert!(!default_ids.iter().any(|id| id == "bcode.vim-edit"));
     }
 
     #[cfg(feature = "static-bundled-vim-edit-plugin")]

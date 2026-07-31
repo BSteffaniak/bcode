@@ -1075,21 +1075,54 @@ pub struct PluginConfigMetadataDiagnostic {
     pub error: PluginConfigMetadataError,
 }
 
+/// Host-owned policy describing whether an available plugin participates in
+/// distribution defaults.
+///
+/// This policy is registration metadata supplied by a trusted host or
+/// distribution. It is intentionally not part of [`PluginManifest`], because a
+/// plugin must not be able to authorize its own activation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PluginDefaultActivation {
+    /// Include the plugin when distribution defaults are selected.
+    #[default]
+    Enabled,
+    /// Keep the plugin available but require another selection policy to enable it.
+    Disabled,
+}
+
 /// Statically bundled plugin registration.
 #[derive(Debug, Clone, Copy)]
 pub struct StaticBundledPlugin {
     pub manifest_toml: &'static str,
     pub vtable: StaticPluginVtable,
+    default_activation: PluginDefaultActivation,
 }
 
 impl StaticBundledPlugin {
-    /// Create a statically bundled plugin registration.
+    /// Create a statically bundled plugin registration included in distribution defaults.
     #[must_use]
     pub const fn new(manifest_toml: &'static str, vtable: StaticPluginVtable) -> Self {
         Self {
             manifest_toml,
             vtable,
+            default_activation: PluginDefaultActivation::Enabled,
         }
+    }
+
+    /// Override whether this available plugin participates in distribution defaults.
+    #[must_use]
+    pub const fn with_default_activation(
+        mut self,
+        default_activation: PluginDefaultActivation,
+    ) -> Self {
+        self.default_activation = default_activation;
+        self
+    }
+
+    /// Return this registration's host-owned distribution-default policy.
+    #[must_use]
+    pub const fn default_activation(self) -> PluginDefaultActivation {
+        self.default_activation
     }
 
     /// Return this plugin's Rust-native CLI contribution, when registered.
@@ -1770,16 +1803,43 @@ pub fn static_bundled_plugin_ids(
     plugins
         .iter()
         .map(|plugin| {
-            let manifest: PluginManifest =
-                toml::from_str(plugin.manifest_toml).map_err(|source| {
-                    PluginLoadError::ExportedManifestParse {
-                        library: PathBuf::from("<static>"),
-                        source,
-                    }
-                })?;
+            let manifest = parse_static_bundled_manifest(plugin)?;
             Ok(manifest.id)
         })
         .collect()
+}
+
+/// Return manifest IDs for statically bundled registrations included in
+/// distribution defaults.
+///
+/// The complete registration inventory remains available independently. This
+/// projection represents trusted host policy and does not read activation policy
+/// from plugin manifests.
+///
+/// # Errors
+///
+/// Returns an error when any static plugin manifest cannot be parsed, including
+/// a registration that is not enabled by default.
+pub fn static_bundled_default_plugin_ids(
+    plugins: &[StaticBundledPlugin],
+) -> Result<Vec<String>, PluginLoadError> {
+    let mut plugin_ids = Vec::new();
+    for plugin in plugins {
+        let manifest = parse_static_bundled_manifest(plugin)?;
+        if plugin.default_activation() == PluginDefaultActivation::Enabled {
+            plugin_ids.push(manifest.id);
+        }
+    }
+    Ok(plugin_ids)
+}
+
+fn parse_static_bundled_manifest(
+    plugin: &StaticBundledPlugin,
+) -> Result<PluginManifest, PluginLoadError> {
+    toml::from_str(plugin.manifest_toml).map_err(|source| PluginLoadError::ExportedManifestParse {
+        library: PathBuf::from("<static>"),
+        source,
+    })
 }
 
 /// Filter static plugin registrations according to an enable/disable policy.
@@ -4958,8 +5018,20 @@ library = "libdisabled.dylib"
         fn event(_instance: *const std::ffi::c_void, _input: *const u8, _input_len: usize) -> i32 {
             SERVICE_STATUS_OK
         }
-        let static_plugins = [StaticBundledPlugin::new(
-            r#"
+        let vtable = StaticPluginVtable {
+            instance: std::ptr::null(),
+            manifest,
+            activate: lifecycle,
+            register_commands: None,
+            register_auth_providers: None,
+            deactivate: lifecycle,
+            invoke_service_streaming: test_streaming_service,
+            cli_registration: None,
+            handle_event: event,
+        };
+        let static_plugins = [
+            StaticBundledPlugin::new(
+                r#"
 id = "bcode.example-static"
 name = "Example Static"
 version = "0.0.1"
@@ -4969,22 +5041,42 @@ type = "native"
 abi_version = 1
 library = "libexample_static.dylib"
 "#,
-            StaticPluginVtable {
-                instance: std::ptr::null(),
-                manifest,
-                activate: lifecycle,
-                register_commands: None,
-                register_auth_providers: None,
-                deactivate: lifecycle,
-                invoke_service_streaming: test_streaming_service,
-                cli_registration: None,
-                handle_event: event,
-            },
-        )];
+                vtable,
+            ),
+            StaticBundledPlugin::new(
+                r#"
+id = "bcode.opt-in-static"
+name = "Opt-in Static"
+version = "0.0.1"
+
+[runtime]
+type = "native"
+abi_version = 1
+library = "libopt_in_static.dylib"
+"#,
+                vtable,
+            )
+            .with_default_activation(PluginDefaultActivation::Disabled),
+        ];
 
         assert_eq!(
-            static_bundled_plugin_ids(&static_plugins).expect("manifest should parse"),
+            static_bundled_plugin_ids(&static_plugins).expect("manifests should parse"),
+            vec![
+                "bcode.example-static".to_string(),
+                "bcode.opt-in-static".to_string()
+            ]
+        );
+        assert_eq!(
+            static_bundled_default_plugin_ids(&static_plugins).expect("manifests should parse"),
             vec!["bcode.example-static".to_string()]
+        );
+        assert_eq!(
+            static_plugins[0].default_activation(),
+            PluginDefaultActivation::Enabled
+        );
+        assert_eq!(
+            static_plugins[1].default_activation(),
+            PluginDefaultActivation::Disabled
         );
     }
 
