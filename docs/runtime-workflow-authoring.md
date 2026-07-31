@@ -163,8 +163,11 @@ activation-scoped grants and approval-before-dispatch rules remain in force. Imp
 documents never carry trusted grants. Presentation metadata and producer labels never affect policy.
 
 Saved presets bind an exact revision and carry their own optimistic generation. They may hold bounded,
-validated non-secret configuration and permitted limit/workspace policy. Secrets remain approved
-references resolved for a request; inline secret material is not made durable implicitly. Starting a
+validated non-secret configuration and permitted limit/workspace policy. Authored documents, presets,
+and durable authored-run provenance reject sensitive credential fields and explicit `env`/`sshenv`
+secret-reference objects before persistence. Those references remain request-scoped invocation inputs;
+persisting any reference form requires a future explicit, versioned contract rather than inference.
+Starting a
 preset requires its exact generation and records the preset identity/generation, revision, final
 configuration, and compiled definition in the public start result. Exact-revision and active-revision
 starts use the same centralized resolver. Every start rechecks current catalog/production admission,
@@ -201,6 +204,13 @@ explicit new draft identity and never rewrites revisions or active pointers. Sem
 export an immutable revision, preview it under a new logical identity, and prove the imported
 executable projection changes only that explicitly selected identity. Imported provenance is
 normalized to untrusted generated content and records the exact source revision.
+
+Exact-revision import is distinct from draft import. It requires the target workflow to exist, an
+explicit revision equal to the canonical next revision, the `require_existing_workflow_next_revision`
+collision policy, and (when activating) the expected current active pointer. The standard preview and
+authorization boundaries run before one atomic transaction persists the compiled definition,
+immutable revision, optional active pointer, and `revision_imported` event. It never creates or
+rewrites a draft, skips a revision number, or overwrites history.
 
 Existing-workflow import is a distinct versioned operation from new-workflow import. It requires an
 explicit target logical workflow and new draft identity, normalizes source provenance to untrusted
@@ -239,6 +249,14 @@ semantics from an SDK document. They cannot carry grants, bypass application aut
 provenance into actor identity.
 
 ## Persistence, reads, and maintenance
+
+Explicit authored maintenance is separate from every list/get/inspect/start path. The store operation
+acquires an exclusive `SQLite` transaction, requires a new backup path confined to the canonical
+workflow directory, creates a complete online backup, verifies its integrity and schema contract, and
+only then mutates state. Repair is deliberately limited to disposable authored indexes and clearing
+an active pointer whose target revision is provably absent. Missing compiled definitions, stale draft
+bases, orphaned presets, and any other ambiguous canonical intent remain diagnosed for operator
+resolution. A retained backup is never overwritten.
 
 Authored lifecycle observability uses bounded dimensions only. Validation and compilation record
 valid/invalid or compiled/rejected outcomes; publication records published/conflict; conflict counts

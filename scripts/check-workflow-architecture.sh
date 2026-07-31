@@ -35,6 +35,16 @@ if ! rg -q 'pub struct WorkflowExecutableAuthoringSemantics' packages/workflow/s
   || ! rg -q 'AuthoredWorkflowInspection' packages/ipc/src/lib.rs \
   || ! rg -q 'workflow_authoring_events' packages/workflow-store/src/lib.rs \
   || ! rg -q 'diagnose_authored_workflow' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'typed_client_completes_authored_workflow_lifecycle_over_ipc' packages/server/src/lib.rs \
+  || ! rg -q 'portable_json_catalog_fixture_composes_agent_control_and_exact_block_safety' packages/workflow/src/lib.rs \
+  || ! rg -q 'repair_authored_workflow' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'TransactionBehavior::Exclusive' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'workflow maintenance backup must be in the canonical workflow directory' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'explicit_authored_repair_requires_confined_backup_and_repairs_only_safe_state' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'ImportWorkflowRevisionRequest' packages/ipc/src/lib.rs \
+  || ! rg -q 'import_workflow_revision' packages/workflow-store/src/lib.rs \
+  || ! rg -q 'RequireExistingWorkflowNextRevision' packages/ipc/src/lib.rs \
+  || ! rg -q 'exact_revision_import_is_atomic_collision_safe_and_restart_safe' packages/workflow-store/src/lib.rs \
   || ! rg -q 'WorkflowImportCollisionPolicy' packages/ipc/src/lib.rs \
   || ! rg -q 'export_preview_import_preserves_semantics_and_enforces_collision_policy' packages/server/src/lib.rs \
   || ! rg -q 'producer_kind_does_not_change_compilation_or_local_authorization' packages/workflow/src/lib.rs \
@@ -50,6 +60,14 @@ if ! rg -q 'pub struct WorkflowDraftInspectionSummary' packages/ipc/src/lib.rs \
   echo "Workflow diagnostic-data violation: aggregate inspection must use content-minimized summaries without documents, schemas, configuration, secrets, or prose." >&2
   violations=1
 fi
+if ! rg -q 'pub fn validate_persistable_authoring_value' packages/workflow/src/lib.rs \
+  || ! rg -Fq 'validate_persistable_authoring_value("configuration_defaults"' packages/workflow/src/lib.rs \
+  || ! rg -Fq 'validate_persistable_authoring_value("preset.configuration"' packages/workflow-store/src/lib.rs \
+  || ! rg -q '"authored_run.configuration"' packages/workflow-store/src/lib.rs; then
+  echo "Workflow persistence-safety violation: authored documents, presets, and run provenance must reject inline secrets and request-scoped secret references." >&2
+  violations=1
+fi
+
 if ! rg -q 'record_histogram_with_exact_labels' packages/server/src/lib.rs \
   || ! rg -q 'add_counter_with_exact_labels' packages/server/src/lib.rs \
   || ! rg -q 'workflow.authoring.validation.duration_ms' packages/server/src/lib.rs \

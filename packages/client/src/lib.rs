@@ -2271,6 +2271,24 @@ impl BcodeClient {
         }
     }
 
+    /// Import one portable bundle as the exact next immutable revision of an existing workflow.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or import is incompatible/unauthorized.
+    pub async fn import_workflow_revision(
+        &self,
+        request: bcode_ipc::ImportWorkflowRevisionRequest,
+    ) -> Result<bcode_ipc::WorkflowRevisionImportResult, ClientError> {
+        match self
+            .send_request(Request::ImportWorkflowRevision(request))
+            .await?
+        {
+            ResponsePayload::WorkflowRevisionImported { result } => Ok(result),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Resolve and start one immutable authored-workflow revision.
     ///
     /// # Errors

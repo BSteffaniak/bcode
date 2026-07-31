@@ -3703,6 +3703,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::PreviewWorkflowImport(_) => "preview_workflow_import",
         Request::ImportWorkflow(_) => "import_workflow",
         Request::ImportWorkflowDraft(_) => "import_workflow_draft",
+        Request::ImportWorkflowRevision(_) => "import_workflow_revision",
         Request::StartAuthoredWorkflow(_) => "start_authored_workflow",
         Request::ListAuthoredWorkflows { .. } => "list_authored_workflows",
         Request::GetAuthoredWorkflow { .. } => "get_authored_workflow",
@@ -4256,6 +4257,9 @@ async fn handle_request_inner(
         }
         Request::ImportWorkflowDraft(request) => {
             handle_import_workflow_draft(request_id, client_id, state, writer, request).await
+        }
+        Request::ImportWorkflowRevision(request) => {
+            handle_import_workflow_revision(request_id, client_id, state, writer, request).await
         }
         Request::StartAuthoredWorkflow(request) => {
             handle_start_authored_workflow(request_id, client_id, state, writer, request).await
@@ -13069,6 +13073,82 @@ async fn handle_import_workflow_draft(
         writer,
         request_id,
         Response::Ok(ResponsePayload::WorkflowDraftImported { result }),
+    )
+    .await
+}
+
+async fn handle_import_workflow_revision(
+    request_id: u64,
+    client_id: ClientId,
+    state: &Arc<ServerState>,
+    writer: &SharedWriter,
+    request: bcode_ipc::ImportWorkflowRevisionRequest,
+) -> Result<(), ServerError> {
+    if request.collision_policy
+        != bcode_ipc::WorkflowImportCollisionPolicy::RequireExistingWorkflowNextRevision
+    {
+        return Err(WorkflowStoreError::InvalidData(
+            "revision import requires require_existing_workflow_next_revision collision policy"
+                .to_string(),
+        )
+        .into());
+    }
+    let (preview, document) = workflow_import_preview(
+        request_id,
+        state,
+        request.bundle,
+        request.workflow_id.clone(),
+        request.control,
+    )
+    .await?;
+    let compiled = preview.compilation.compiled.as_ref().ok_or_else(|| {
+        ServerError::WorkflowDefinitionUnsupported(
+            "revision import requires a successful compilation preview".to_string(),
+        )
+    })?;
+    state.authorize_local_workflow_application_operation(
+        client_id,
+        LocalWorkflowApplicationOperationRequest {
+            operation: bcode_workflow::WorkflowApplicationOperation::ImportRevision,
+            workflow_id: request.workflow_id.clone(),
+            draft_id: Some(format!("import-revision-{}", request.revision)),
+            revision: None,
+            preset_id: None,
+            producer: Some(document.producer.clone()),
+            requirements: compiled.requirements.clone(),
+            effects: compiled.effects.clone(),
+            activates: request.activate,
+            executes: false,
+        },
+    )?;
+    let publication = state
+        .workflow_store
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .import_workflow_revision(
+            &request.workflow_id,
+            request.revision,
+            &document,
+            &document.producer,
+            &preview.compilation,
+            request.activate,
+            request.expected_active_revision,
+            current_time_ms(),
+        );
+    let result = match publication {
+        Ok(publication) => bcode_ipc::WorkflowRevisionImportResult::Imported {
+            revision: Box::new(workflow_revision_snapshot(publication.revision)),
+            active_revision: publication.active_revision,
+        },
+        Err(error @ WorkflowStoreError::AuthoringConflict { .. }) => {
+            bcode_ipc::WorkflowRevisionImportResult::Conflict(authoring_conflict_result(error)?)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    send_response(
+        writer,
+        request_id,
+        Response::Ok(ResponsePayload::WorkflowRevisionImported { result }),
     )
     .await
 }
@@ -25927,6 +26007,12 @@ fn workflow_turn_output(
                 segment_order,
                 text,
                 ..
+            }
+            | SessionEventKind::PositionedAssistantResponseSegment {
+                turn_id: event_turn_id,
+                segment_order,
+                text,
+                ..
             } if event_turn_id == turn_id => Some((*segment_order, event.sequence, text)),
             _ => None,
         })
@@ -26147,17 +26233,13 @@ async fn observe_workflow_turn(
             } if event_turn_id == turn_id => Some((*outcome, message.clone(), event.timestamp_ms)),
             _ => None,
         });
-    let in_memory_history = if terminal.is_none() {
-        Some(
-            state
-                .sessions
-                .session_history(session_id)
-                .await
-                .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?,
-        )
-    } else {
-        None
-    };
+    let in_memory_history = Some(
+        state
+            .sessions
+            .session_history(session_id)
+            .await
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?,
+    );
     let terminal = terminal.or_else(|| {
         in_memory_history.as_ref().and_then(|events| {
             events.iter().rev().find_map(|event| match &event.kind {
@@ -29705,6 +29787,132 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn typed_client_completes_authored_workflow_lifecycle_over_ipc() {
+        let sessions = SessionManager::default();
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+            .expect("workflow store");
+        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+            sessions, store,
+        ));
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let document = test_workflow_authoring_document();
+        let workflow_id = document.workflow_id.clone();
+        let catalog = client.workflow_authoring_catalog().await.expect("catalog");
+        assert!(catalog.plugins.contains("bcode.fake-provider"));
+        assert!(
+            client
+                .validate_workflow_authoring(document.clone())
+                .await
+                .expect("validation")
+                .valid
+        );
+        assert!(
+            client
+                .preview_workflow_compilation(document.clone(), None)
+                .await
+                .expect("preview")
+                .is_compiled()
+        );
+        let (workflow, draft) = client
+            .create_authored_workflow(bcode_ipc::CreateAuthoredWorkflowRequest {
+                document: document.clone(),
+                draft_id: "draft-1".to_string(),
+            })
+            .await
+            .expect("create");
+        assert_eq!(workflow.workflow_id, workflow_id);
+        let update = client
+            .update_workflow_draft(bcode_ipc::UpdateWorkflowDraftRequest {
+                workflow_id: workflow_id.clone(),
+                draft_id: draft.identity.draft_id,
+                expected_generation: 1,
+                document: document.clone(),
+                producer: document.producer.clone(),
+            })
+            .await
+            .expect("update");
+        let bcode_ipc::WorkflowDraftUpdateResult::Updated(updated) = update else {
+            panic!("expected updated draft")
+        };
+        let publication = client
+            .publish_workflow_draft(bcode_ipc::PublishWorkflowDraftRequest {
+                workflow_id: workflow_id.clone(),
+                draft_id: updated.identity.draft_id,
+                expected_generation: updated.generation,
+                configuration: None,
+                activate: true,
+                expected_active_revision: None,
+                control: bcode_ipc::WorkflowComputationControl::default(),
+            })
+            .await
+            .expect("publish");
+        assert!(matches!(
+            publication,
+            bcode_ipc::WorkflowPublicationResult::Published {
+                active_revision: Some(1),
+                ..
+            }
+        ));
+        let preset = client
+            .create_workflow_preset(bcode_ipc::CreateWorkflowPresetRequest {
+                preset: bcode_ipc::WorkflowPresetMutation {
+                    workflow_id: workflow_id.clone(),
+                    preset_id: "default".to_string(),
+                    revision: 1,
+                    name: "Default".to_string(),
+                    configuration: serde_json::json!({}),
+                    run_limits: None,
+                    producer: document.producer.clone(),
+                },
+            })
+            .await
+            .expect("preset");
+        assert_eq!(preset.generation, 1);
+        let inspection = client
+            .inspect_authored_workflow(workflow_id.clone(), 100)
+            .await
+            .expect("inspect")
+            .expect("workflow");
+        assert_eq!(inspection.workflow.active_revision, Some(1));
+        assert_eq!(inspection.revisions.len(), 1);
+        assert_eq!(inspection.presets.len(), 1);
+        assert!(inspection.issues.is_empty());
+        let bundle = client
+            .export_workflow_revision(bcode_ipc::ExportWorkflowRevisionRequest {
+                workflow_id: workflow_id.clone(),
+                revision: 1,
+            })
+            .await
+            .expect("export");
+        let preview = client
+            .preview_workflow_import(bcode_ipc::PreviewWorkflowImportRequest {
+                bundle,
+                target_workflow_id: "authored/sdk-import".to_string(),
+                control: bcode_ipc::WorkflowComputationControl::default(),
+            })
+            .await
+            .expect("import preview");
+        assert!(preview.compilation.is_compiled());
+        server.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn authoring_catalog_validation_and_preview_are_non_mutating_and_connection_safe() {
         let sessions = SessionManager::default();
         let workflow_root = tempfile::tempdir().expect("workflow root");
@@ -30369,6 +30577,273 @@ mod tests {
                 },
             )
             .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn authored_revision_pinning_survives_publication_and_store_restart() {
+        let sessions = SessionManager::default();
+        let parent = sessions
+            .create_session(
+                Some("authored pinning".to_string()),
+                test_working_directory(),
+            )
+            .await
+            .expect("parent session");
+        let workflow_root = tempfile::tempdir().expect("workflow root");
+        let store = bcode_workflow_store::WorkflowStore::open_in_state_dir(workflow_root.path())
+            .expect("workflow store");
+        let path = store.path().to_path_buf();
+        let state = Arc::new(test_server_state_with_fake_provider_and_workflow_store(
+            sessions, store,
+        ));
+        let now = current_time_ms();
+        let mut document = test_workflow_authoring_document();
+        document.workflow_id = "authored/pinning".to_string();
+        document.definition.input.schema["type"] = serde_json::json!(["object", "null"]);
+        document
+            .definition
+            .nodes
+            .get_mut("agent")
+            .expect("agent node")
+            .input
+            .schema["type"] = serde_json::json!(["object", "null"]);
+        let workflow = bcode_workflow_store::AuthoredWorkflow {
+            workflow_id: document.workflow_id.clone(),
+            title: document.metadata.title.clone(),
+            description: None,
+            archived: false,
+            active_revision: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        let draft = bcode_workflow_store::WorkflowDraft {
+            workflow_id: document.workflow_id.clone(),
+            draft_id: "draft-1".to_string(),
+            base_revision: None,
+            generation: 1,
+            checksum_sha256: document.source_digest_sha256().expect("digest"),
+            document: document.clone(),
+            producer: document.producer.clone(),
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        state
+            .workflow_store
+            .lock()
+            .expect("workflow store")
+            .create_authored_workflow_with_initial_draft(&workflow, &draft)
+            .expect("workflow");
+        let catalog = workflow_authoring_catalog_snapshot(&state)
+            .await
+            .expect("catalog");
+        let first_preview = document.compilation_preview(&catalog, None);
+        state
+            .workflow_store
+            .lock()
+            .expect("workflow store")
+            .publish_workflow_draft(
+                &workflow.workflow_id,
+                "draft-1",
+                1,
+                &first_preview,
+                true,
+                None,
+                now + 1,
+            )
+            .expect("revision 1");
+
+        let first = start_authored_workflow(
+            ClientId::new(),
+            &state,
+            bcode_ipc::StartAuthoredWorkflowRequest {
+                selection: bcode_ipc::AuthoredWorkflowRunSelection::Active {
+                    workflow_id: workflow.workflow_id.clone(),
+                },
+                run_id: Some("authored-pinned-v1".to_string()),
+                parent_session_id: parent.id,
+                workspace_snapshot: None,
+                configuration: None,
+            },
+            true,
+        )
+        .await
+        .expect("start revision 1");
+        assert_eq!(first.revision, 1);
+
+        state
+            .workflow_store
+            .lock()
+            .expect("workflow store")
+            .create_workflow_preset(&bcode_workflow_store::WorkflowPreset {
+                workflow_id: workflow.workflow_id.clone(),
+                preset_id: "revision-one".to_string(),
+                revision: 1,
+                name: "Revision one".to_string(),
+                generation: 1,
+                configuration: serde_json::json!({}),
+                run_limits: None,
+                producer: document.producer.clone(),
+                created_at_ms: now + 2,
+                updated_at_ms: now + 2,
+            })
+            .expect("preset");
+        let preset_first = start_authored_workflow(
+            ClientId::new(),
+            &state,
+            bcode_ipc::StartAuthoredWorkflowRequest {
+                selection: bcode_ipc::AuthoredWorkflowRunSelection::Preset {
+                    workflow_id: workflow.workflow_id.clone(),
+                    preset_id: "revision-one".to_string(),
+                    preset_generation: 1,
+                },
+                run_id: Some("authored-preset-v1".to_string()),
+                parent_session_id: parent.id,
+                workspace_snapshot: None,
+                configuration: None,
+            },
+            true,
+        )
+        .await
+        .expect("start revision 1 preset");
+        assert_eq!(preset_first.revision, 1);
+        assert_eq!(preset_first.preset_id.as_deref(), Some("revision-one"));
+        assert_eq!(preset_first.preset_generation, Some(1));
+
+        let mut second_draft = state
+            .workflow_store
+            .lock()
+            .expect("workflow store")
+            .fork_workflow_revision(
+                &workflow.workflow_id,
+                1,
+                "draft-2",
+                document.producer.clone(),
+                now + 2,
+            )
+            .expect("fork revision 1");
+        second_draft.document.definition.name = "ipc-authoring-v2".to_string();
+        let second_draft = state
+            .workflow_store
+            .lock()
+            .expect("workflow store")
+            .update_workflow_draft(
+                &workflow.workflow_id,
+                "draft-2",
+                1,
+                &second_draft.document,
+                &second_draft.producer,
+                now + 3,
+            )
+            .expect("update second draft");
+        let second_preview = second_draft.document.compilation_preview(&catalog, None);
+        state
+            .workflow_store
+            .lock()
+            .expect("workflow store")
+            .publish_workflow_draft(
+                &workflow.workflow_id,
+                "draft-2",
+                2,
+                &second_preview,
+                true,
+                Some(1),
+                now + 4,
+            )
+            .expect("revision 2");
+
+        let second = start_authored_workflow(
+            ClientId::new(),
+            &state,
+            bcode_ipc::StartAuthoredWorkflowRequest {
+                selection: bcode_ipc::AuthoredWorkflowRunSelection::Active {
+                    workflow_id: workflow.workflow_id.clone(),
+                },
+                run_id: Some("authored-active-v2".to_string()),
+                parent_session_id: parent.id,
+                workspace_snapshot: None,
+                configuration: None,
+            },
+            true,
+        )
+        .await
+        .expect("start active revision 2");
+        assert_eq!(second.revision, 2);
+        let explicit_first = start_authored_workflow(
+            ClientId::new(),
+            &state,
+            bcode_ipc::StartAuthoredWorkflowRequest {
+                selection: bcode_ipc::AuthoredWorkflowRunSelection::Revision {
+                    workflow_id: workflow.workflow_id.clone(),
+                    revision: 1,
+                },
+                run_id: Some("authored-explicit-v1".to_string()),
+                parent_session_id: parent.id,
+                workspace_snapshot: None,
+                configuration: None,
+            },
+            true,
+        )
+        .await
+        .expect("start explicit revision 1");
+        assert_eq!(explicit_first.revision, 1);
+
+        let reopened =
+            bcode_workflow_store::WorkflowStore::open_at_path(&path).expect("reopen store");
+        assert_eq!(
+            reopened
+                .run_summary("authored-pinned-v1")
+                .expect("run summary")
+                .expect("pinned run")
+                .authored_provenance
+                .expect("authored provenance")
+                .revision,
+            1
+        );
+        assert_eq!(
+            reopened
+                .run_summary("authored-preset-v1")
+                .expect("run summary")
+                .expect("preset run")
+                .authored_provenance
+                .expect("authored provenance"),
+            bcode_workflow_store::AuthoredWorkflowRunProvenance::new(
+                workflow.workflow_id.clone(),
+                1,
+                first.definition_identity,
+                Some("revision-one".to_string()),
+                Some(1),
+                serde_json::json!({}),
+            )
+        );
+        assert_eq!(
+            reopened
+                .run_summary("authored-active-v2")
+                .expect("run summary")
+                .expect("active run")
+                .authored_provenance
+                .expect("authored provenance")
+                .revision,
+            2
+        );
+        assert_eq!(
+            reopened
+                .run_summary("authored-explicit-v1")
+                .expect("run summary")
+                .expect("explicit run")
+                .authored_provenance
+                .expect("authored provenance")
+                .revision,
+            1
+        );
+        assert_eq!(
+            reopened
+                .authored_workflow(&workflow.workflow_id)
+                .expect("workflow")
+                .expect("workflow")
+                .active_revision,
+            Some(2)
         );
     }
 
@@ -43747,6 +44222,15 @@ library = "test"
                         && tool.request_draft.as_ref().is_some_and(|draft| draft.preview == "current live draft")
             )
         }));
+        assert_eq!(
+            replacement
+                .snapshot()
+                .tools
+                .get("call-reconnect")
+                .and_then(|tool| tool.request_draft.as_ref())
+                .map(|draft| draft.preview.as_str()),
+            Some("current live draft")
+        );
         assert!(
             replacement
                 .snapshot()

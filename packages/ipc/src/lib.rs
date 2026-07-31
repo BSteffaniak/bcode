@@ -321,6 +321,8 @@ pub enum Request {
     ImportWorkflow(ImportWorkflowRequest),
     /// Import one portable bundle as a new draft in an existing logical workflow.
     ImportWorkflowDraft(ImportWorkflowDraftRequest),
+    /// Import one portable bundle as the exact next immutable revision of an existing workflow.
+    ImportWorkflowRevision(ImportWorkflowRevisionRequest),
     /// Resolve and start one immutable authored-workflow revision.
     StartAuthoredWorkflow(StartAuthoredWorkflowRequest),
     /// List bounded logical authored workflows.
@@ -1747,6 +1749,8 @@ pub enum WorkflowImportCollisionPolicy {
     RequireNewWorkflow,
     /// Require the target logical workflow to exist and the requested draft identity to be absent.
     RequireExistingWorkflowNewDraft,
+    /// Require the target logical workflow to exist and its next revision to match exactly.
+    RequireExistingWorkflowNextRevision,
 }
 
 /// Import one portable bundle as a new logical workflow and generation-1 draft.
@@ -1771,6 +1775,31 @@ pub struct ImportWorkflowDraftRequest {
     /// Must be [`WorkflowImportCollisionPolicy::RequireExistingWorkflowNewDraft`].
     pub collision_policy: WorkflowImportCollisionPolicy,
     pub control: WorkflowComputationControl,
+}
+
+/// Import one portable bundle directly as the exact next immutable revision of an existing workflow.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportWorkflowRevisionRequest {
+    pub bundle: bcode_workflow::WorkflowExportBundle,
+    pub workflow_id: String,
+    pub revision: u64,
+    pub activate: bool,
+    pub expected_active_revision: Option<u64>,
+    /// Must be [`WorkflowImportCollisionPolicy::RequireExistingWorkflowNextRevision`].
+    pub collision_policy: WorkflowImportCollisionPolicy,
+    pub control: WorkflowComputationControl,
+}
+
+/// Typed exact-revision import outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkflowRevisionImportResult {
+    Imported {
+        revision: Box<WorkflowRevisionSnapshot>,
+        active_revision: Option<u64>,
+    },
+    Conflict(WorkflowAuthoringConflict),
 }
 
 /// Typed existing-workflow import outcome with collision-safe draft identity handling.
@@ -2143,6 +2172,9 @@ pub enum ResponsePayload {
     },
     WorkflowDraftImported {
         result: WorkflowDraftImportResult,
+    },
+    WorkflowRevisionImported {
+        result: WorkflowRevisionImportResult,
     },
     AuthoredWorkflowRunStarted(AuthoredWorkflowRunStartResponse),
     AuthoredWorkflowList {
@@ -3313,6 +3345,39 @@ mod tests {
                 workflow_id: authoring_document.workflow_id.clone(),
                 draft_id: "imported-draft".to_string(),
                 collision_policy: WorkflowImportCollisionPolicy::RequireExistingWorkflowNewDraft,
+                control: WorkflowComputationControl::default(),
+            }),
+            Request::ImportWorkflowRevision(ImportWorkflowRevisionRequest {
+                bundle: bcode_workflow::WorkflowExportBundle {
+                    version: bcode_workflow::WORKFLOW_EXPORT_BUNDLE_VERSION,
+                    revision: bcode_workflow::WorkflowPortableRevision {
+                        identity: bcode_workflow::WorkflowRevisionIdentity {
+                            workflow_id: authoring_document.workflow_id.clone(),
+                            revision: 1,
+                        },
+                        source_checksum_sha256: authoring_document
+                            .source_digest_sha256()
+                            .expect("source digest"),
+                        executable_source_checksum_sha256: authoring_document
+                            .executable_source_digest_sha256()
+                            .expect("executable digest"),
+                        definition_identity:
+                            bcode_workflow::WorkflowDefinitionIdentity::for_definition(
+                                authoring_document.workflow_id.clone(),
+                                &definition,
+                            )
+                            .expect("identity"),
+                        document: authoring_document.clone(),
+                        producer: authoring_document.producer.clone(),
+                        published_at_ms: 1,
+                    },
+                },
+                workflow_id: authoring_document.workflow_id.clone(),
+                revision: 2,
+                activate: true,
+                expected_active_revision: Some(1),
+                collision_policy:
+                    WorkflowImportCollisionPolicy::RequireExistingWorkflowNextRevision,
                 control: WorkflowComputationControl::default(),
             }),
             Request::ActivateWorkflowRevision(ActivateWorkflowRevisionRequest {

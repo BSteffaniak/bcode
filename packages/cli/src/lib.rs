@@ -330,7 +330,7 @@ async fn handle_workflow_command(command: Box<WorkflowCommand>) -> Result<(), Cl
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::large_stack_frames)]
 fn handle_workflow_author_command(
     client: &BcodeClient,
     command: Box<WorkflowAuthorCommand>,
@@ -593,6 +593,30 @@ fn handle_workflow_author_command(
                     timeout_ms,
                 )
                 .await?;
+            }
+            WorkflowAuthorCommand::ImportRevision {
+                file,
+                workflow_id,
+                revision,
+                activate,
+                expected_active_revision,
+                operation_id,
+                timeout_ms,
+            } => {
+                let bundle = serde_json::from_value(read_bounded_json(&file)?)?;
+                print_json(
+                    &client
+                        .import_workflow_revision(bcode_ipc::ImportWorkflowRevisionRequest {
+                            bundle,
+                            workflow_id,
+                            revision,
+                            activate,
+                            expected_active_revision,
+                            collision_policy: bcode_ipc::WorkflowImportCollisionPolicy::RequireExistingWorkflowNextRevision,
+                            control: workflow_computation_control(operation_id, timeout_ms),
+                        })
+                        .await?,
+                )?;
             }
             WorkflowAuthorCommand::Catalog => {
                 print_json(&client.workflow_authoring_catalog().await?)?;
@@ -1662,6 +1686,23 @@ enum WorkflowAuthorCommand {
         workflow_id: String,
         #[arg(long)]
         draft_id: String,
+        #[arg(long)]
+        operation_id: Option<String>,
+        #[arg(long, default_value_t = bcode_ipc::DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS)]
+        timeout_ms: u64,
+    },
+    /// Import one portable bundle as the exact next immutable revision of an existing workflow.
+    ImportRevision {
+        #[arg(value_name = "FILE", default_value = "-")]
+        file: PathBuf,
+        #[arg(long)]
+        workflow_id: String,
+        #[arg(long)]
+        revision: u64,
+        #[arg(long)]
+        activate: bool,
+        #[arg(long)]
+        expected_active_revision: Option<u64>,
         #[arg(long)]
         operation_id: Option<String>,
         #[arg(long, default_value_t = bcode_ipc::DEFAULT_WORKFLOW_COMPUTATION_TIMEOUT_MS)]
@@ -10812,6 +10853,46 @@ mod web_command_tests {
             assert!(rendered.contains("schema 39"));
             assert!(rendered.contains("upgrade Bcode"));
         }
+    }
+
+    #[test]
+    fn exact_revision_import_command_parses_machine_readable_controls() {
+        let cli = Cli::try_parse_from([
+            "bcode",
+            "workflow",
+            "author",
+            "import-revision",
+            "bundle.json",
+            "--workflow-id",
+            "workflow/example",
+            "--revision",
+            "2",
+            "--activate",
+            "--expected-active-revision",
+            "1",
+            "--operation-id",
+            "import-revision-2",
+            "--timeout-ms",
+            "5000",
+        ])
+        .expect("revision import command should parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Workflow {
+                command: WorkflowCommand::Author {
+                    command
+                }
+            }) if matches!(
+                *command,
+                WorkflowAuthorCommand::ImportRevision {
+                    revision: 2,
+                    activate: true,
+                    expected_active_revision: Some(1),
+                    timeout_ms: 5000,
+                    ..
+                }
+            )
+        ));
     }
 
     #[test]

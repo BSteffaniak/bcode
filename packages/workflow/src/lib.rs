@@ -1488,6 +1488,7 @@ pub enum WorkflowApplicationOperation {
     DeletePreset,
     ImportWorkflow,
     ImportDraft,
+    ImportRevision,
     StartRevision,
     StartActiveRevision,
     StartPreset,
@@ -1503,6 +1504,7 @@ impl WorkflowApplicationOperation {
                 | Self::UpdateDraft
                 | Self::DiscardDraft
                 | Self::ImportDraft
+                | Self::ImportRevision
                 | Self::PublishDraft
                 | Self::PublishAndStart
         )
@@ -2883,6 +2885,10 @@ impl WorkflowAuthoringDocument {
                 &format!("definition.nodes.{node_id}.configuration"),
                 &node.configuration,
             )?;
+            validate_persistable_authoring_value(
+                &format!("definition.nodes.{node_id}.configuration"),
+                &node.configuration,
+            )?;
         }
         for (edge_index, edge) in self.definition.edges.iter().enumerate() {
             if let Some(transform) = &edge.transform {
@@ -2894,6 +2900,7 @@ impl WorkflowAuthoringDocument {
         }
         if let Some(defaults) = &self.configuration_defaults {
             validate_authoring_json_value("configuration_defaults", defaults)?;
+            validate_persistable_authoring_value("configuration_defaults", defaults)?;
             let validator =
                 jsonschema::validator_for(&self.configuration_schema.schema).map_err(|error| {
                     authoring_error(
@@ -3956,6 +3963,75 @@ fn validate_local_schema_references(
     validate_pointer_syntax(path, root)?;
     let mut expansions = 0;
     walk(path, root, root, &mut BTreeSet::new(), &mut expansions)
+}
+
+/// Validate that a value is safe for durable authored-workflow persistence.
+///
+/// Authored state may contain ordinary configuration, but not inline credentials or invocation-time
+/// secret references. Secret resolution remains an execution-request concern until a separately
+/// versioned persistence contract explicitly permits a reference form.
+///
+/// # Errors
+///
+/// Returns an error when the value contains an explicit secret reference or a sensitive field.
+pub fn validate_persistable_authoring_value(
+    path: &str,
+    value: &serde_json::Value,
+) -> Result<(), WorkflowError> {
+    fn sensitive_field(field: &str) -> bool {
+        matches!(
+            field.to_ascii_lowercase().as_str(),
+            "api_key"
+                | "access_token"
+                | "refresh_token"
+                | "password"
+                | "private_key"
+                | "client_secret"
+                | "credential"
+                | "credentials"
+                | "secret"
+                | "secrets"
+        )
+    }
+
+    fn walk(path: &str, value: &serde_json::Value) -> Result<(), WorkflowError> {
+        match value {
+            serde_json::Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    walk(&format!("{path}.{index}"), item)?;
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                let explicit_secret_reference = fields
+                    .get("backend")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|backend| matches!(backend, "env" | "sshenv"))
+                    && (fields.contains_key("name")
+                        || fields.contains_key("key")
+                        || fields.contains_key("profile"));
+                if explicit_secret_reference {
+                    return Err(authoring_error(
+                        path,
+                        "invocation-time secret references cannot be persisted in authored state",
+                    ));
+                }
+                for (field, item) in fields {
+                    let item_path = format!("{path}.{field}");
+                    if sensitive_field(field) && !item.is_null() {
+                        return Err(authoring_error(
+                            item_path,
+                            "inline secret-bearing fields cannot be persisted in authored state",
+                        ));
+                    }
+                    walk(&item_path, item)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    walk(path, value)
 }
 
 fn validate_authoring_json_value(
@@ -7801,6 +7877,219 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn portable_json_catalog_fixture_composes_agent_control_and_exact_block_safety() {
+        let mut document = authored_document();
+        document.workflow_id = "workflow/portable-composed".to_string();
+        document.definition.name = "portable-composed".to_string();
+        document.bindings.clear();
+        document.configuration_defaults = Some(serde_json::json!({"message": "review"}));
+        document.configuration_schema.schema = serde_json::json!({
+            "$schema": WORKFLOW_AUTHORING_JSON_SCHEMA_DIALECT,
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["message"],
+            "properties": {"message": {"type": "string"}}
+        });
+        let schema = document.definition.input.clone();
+        let read = WorkflowBlockDefinition {
+            block_id: "example.read".to_string(),
+            block_version: 1,
+            plugin_id: "bcode.example".to_string(),
+            operation: "example.read".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            effect: WorkflowBlockEffect::ReadOnly,
+            resources: vec![ResourceClaim::read("repository")],
+            authorization: WorkflowBlockAuthorization {
+                capability: WorkflowToolCapability::ReadOnly,
+                explicit_grant_required: false,
+            },
+            timeout_ms: 30_000,
+            cancellation_supported: true,
+            reconciliation: WorkflowBlockReconciliation::IdempotentReplay,
+        };
+        let mutate = WorkflowBlockDefinition {
+            block_id: "example.mutate".to_string(),
+            block_version: 1,
+            plugin_id: "bcode.example".to_string(),
+            operation: "example.mutate".to_string(),
+            input: schema.clone(),
+            output: schema.clone(),
+            effect: WorkflowBlockEffect::Mutating,
+            resources: vec![ResourceClaim::write("repository")],
+            authorization: WorkflowBlockAuthorization {
+                capability: WorkflowToolCapability::Mutating,
+                explicit_grant_required: true,
+            },
+            timeout_ms: 30_000,
+            cancellation_supported: true,
+            reconciliation: WorkflowBlockReconciliation::RepairRequired,
+        };
+        let predicate = PredicateExpression::Equals {
+            version: WORKFLOW_PREDICATE_VERSION,
+            path: "message".to_string(),
+            value: serde_json::json!("review"),
+        };
+        let agent = document
+            .definition
+            .nodes
+            .get("agent")
+            .expect("agent")
+            .clone();
+        let branch = NodeDefinition {
+            id: "branch".to_string(),
+            name: "Branch".to_string(),
+            kind: NodeKind::Branch,
+            input: schema.clone(),
+            output: schema.clone(),
+            resources: Vec::new(),
+            configuration: serde_json::json!({
+                "predicate_version": WORKFLOW_PREDICATE_VERSION,
+                "predicate": predicate,
+                "true_entries": ["read"],
+                "false_entries": ["read"],
+                "true_nodes": ["read"],
+                "false_nodes": []
+            }),
+        };
+        let repeat = NodeDefinition {
+            id: "repeat".to_string(),
+            name: "Repeat".to_string(),
+            kind: NodeKind::Repeat,
+            input: schema.clone(),
+            output: schema.clone(),
+            resources: Vec::new(),
+            configuration: serde_json::json!({
+                "predicate_version": WORKFLOW_PREDICATE_VERSION,
+                "predicate": PredicateExpression::Equals {
+                    version: WORKFLOW_PREDICATE_VERSION,
+                    path: "message".to_string(),
+                    value: serde_json::json!("repeat")
+                },
+                "max_iterations": 2,
+                "iteration_state": "explicit_back_edge_transform"
+            }),
+        };
+        document.definition.nodes = BTreeMap::from([
+            ("agent".to_string(), agent),
+            ("branch".to_string(), branch),
+            (
+                "read".to_string(),
+                NodeDefinition {
+                    id: "read".to_string(),
+                    name: "Read".to_string(),
+                    kind: NodeKind::PluginBlock,
+                    input: schema.clone(),
+                    output: schema.clone(),
+                    resources: read.resources.clone(),
+                    configuration: serde_json::to_value(&read).expect("read block"),
+                },
+            ),
+            ("repeat".to_string(), repeat),
+            (
+                "mutate".to_string(),
+                NodeDefinition {
+                    id: "mutate".to_string(),
+                    name: "Mutate".to_string(),
+                    kind: NodeKind::PluginBlock,
+                    input: schema.clone(),
+                    output: schema,
+                    resources: mutate.resources.clone(),
+                    configuration: serde_json::to_value(&mutate).expect("mutating block"),
+                },
+            ),
+        ]);
+        document.definition.entries = vec!["agent".to_string()];
+        document.definition.exits = vec!["mutate".to_string()];
+        document.definition.edges = vec![
+            EdgeDefinition {
+                from: "agent".to_string(),
+                to: "branch".to_string(),
+                kind: EdgeKind::Direct,
+                transform: None,
+            },
+            EdgeDefinition {
+                from: "branch".to_string(),
+                to: "read".to_string(),
+                kind: EdgeKind::Conditional {
+                    predicate: PredicateExpression::Equals {
+                        version: WORKFLOW_PREDICATE_VERSION,
+                        path: "message".to_string(),
+                        value: serde_json::json!("review"),
+                    },
+                    expected: true,
+                },
+                transform: None,
+            },
+            EdgeDefinition {
+                from: "read".to_string(),
+                to: "repeat".to_string(),
+                kind: EdgeKind::Direct,
+                transform: None,
+            },
+            EdgeDefinition {
+                from: "repeat".to_string(),
+                to: "mutate".to_string(),
+                kind: EdgeKind::Direct,
+                transform: None,
+            },
+        ];
+        document.requirements = WorkflowRequirementSummary::default();
+
+        let portable_json = serde_json::to_string(&document).expect("portable JSON");
+        let decoded: WorkflowAuthoringDocument =
+            serde_json::from_str(&portable_json).expect("portable JSON document");
+        let mut catalog = authoring_catalog();
+        catalog.plugins.insert("bcode.example".to_string());
+        catalog
+            .blocks
+            .insert(workflow_block_catalog_key(&read), read.clone());
+        catalog
+            .blocks
+            .insert(workflow_block_catalog_key(&mutate), mutate.clone());
+        let preview = decoded.compilation_preview(&catalog, None);
+        assert!(
+            preview.is_compiled(),
+            "{:?}",
+            preview.validation.diagnostics
+        );
+        let compiled = preview.compiled.expect("compiled");
+        assert_eq!(
+            compiled
+                .definition
+                .nodes
+                .values()
+                .map(|node| node.kind)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([
+                NodeKind::Agent,
+                NodeKind::Branch,
+                NodeKind::Repeat,
+                NodeKind::PluginBlock,
+            ])
+        );
+        assert!(
+            compiled
+                .effects
+                .block_effects
+                .contains(&WorkflowBlockEffect::ReadOnly)
+        );
+        assert!(
+            compiled
+                .effects
+                .block_effects
+                .contains(&WorkflowBlockEffect::Mutating)
+        );
+        assert_eq!(compiled.permissions.explicit_grant_nodes, ["mutate"]);
+        assert_eq!(compiled.permissions.mutation_approval_nodes, ["mutate"]);
+        assert_eq!(
+            compiled.effects.maximum_capability,
+            WorkflowToolCapability::Mutating
+        );
+    }
+
+    #[test]
     fn authoring_compilation_preview_binds_and_admits_exact_definition() {
         let document = authored_document();
         let catalog = authoring_catalog();
@@ -8426,6 +8715,90 @@ mod tests {
         let mut provenance = authored_document().producer;
         provenance.producer_id = Some("x".repeat(MAX_WORKFLOW_AUTHORING_ID_BYTES + 1));
         assert!(provenance.validate().is_err());
+    }
+
+    #[test]
+    fn export_bundle_contains_only_immutable_portable_authoring_facts() {
+        let document = authored_document();
+        let bundle = WorkflowExportBundle {
+            version: WORKFLOW_EXPORT_BUNDLE_VERSION,
+            revision: WorkflowPortableRevision {
+                identity: WorkflowRevisionIdentity {
+                    workflow_id: document.workflow_id.clone(),
+                    revision: 1,
+                },
+                source_checksum_sha256: document.source_digest_sha256().expect("source digest"),
+                executable_source_checksum_sha256: document
+                    .executable_source_digest_sha256()
+                    .expect("executable digest"),
+                definition_identity: WorkflowDefinitionIdentity::for_definition(
+                    document.workflow_id.clone(),
+                    &document.definition,
+                )
+                .expect("definition identity"),
+                producer: document.producer.clone(),
+                document,
+                published_at_ms: 1,
+            },
+        };
+        bundle.validate().expect("bundle");
+        let encoded = serde_json::to_value(bundle).expect("bundle JSON");
+        let fields = encoded.as_object().expect("bundle object");
+        assert_eq!(fields.keys().collect::<Vec<_>>(), ["revision", "version"]);
+        let revision = fields["revision"].as_object().expect("revision object");
+        assert_eq!(
+            revision.keys().cloned().collect::<BTreeSet<_>>(),
+            [
+                "definition_identity",
+                "document",
+                "executable_source_checksum_sha256",
+                "identity",
+                "producer",
+                "published_at_ms",
+                "source_checksum_sha256",
+            ]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>()
+        );
+        for forbidden in [
+            "grant",
+            "secret",
+            "provider_metadata",
+            "receipt",
+            "runtime",
+            "renderer",
+        ] {
+            assert!(!revision.contains_key(forbidden));
+        }
+    }
+
+    #[test]
+    fn authored_persistence_rejects_inline_secrets_and_request_scoped_references() {
+        let mut document = authored_document();
+        document.configuration_defaults = Some(serde_json::json!({
+            "api_key": "must-not-persist"
+        }));
+        let error = document.validate().expect_err("inline secret must fail");
+        assert!(error.to_string().contains("inline secret-bearing"));
+
+        let mut reference = authored_document();
+        reference.configuration_defaults = Some(serde_json::json!({
+            "token": {"backend": "env", "name": "WORKFLOW_TOKEN"}
+        }));
+        let error = reference
+            .validate()
+            .expect_err("request-scoped reference must fail");
+        assert!(error.to_string().contains("cannot be persisted"));
+
+        let mut node_secret = authored_document();
+        node_secret
+            .definition
+            .nodes
+            .get_mut("agent")
+            .expect("agent")
+            .configuration["client_secret"] = serde_json::json!("must-not-persist");
+        assert!(node_secret.validate().is_err());
     }
 
     #[test]

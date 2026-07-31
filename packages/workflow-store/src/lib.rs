@@ -8,6 +8,7 @@ use bcode_workflow::{
     WORKFLOW_COMPILATION_PREVIEW_VERSION, WorkflowAuthoringDocument, WorkflowAuthoringListCursor,
     WorkflowCompilationPreview, WorkflowDefinition, WorkflowDefinitionIdentity,
     WorkflowProducerProvenance, WorkflowRevisionListCursor, WorkflowRunLimitPolicy,
+    validate_persistable_authoring_value,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction};
 use serde::{Deserialize, Serialize};
@@ -1102,6 +1103,19 @@ impl WorkflowPublicationFault for NoopWorkflowPublicationFault {
     }
 }
 
+/// Explicit authored-store maintenance result with retained backup evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowAuthoringRepairReport {
+    /// Canonical confined backup created before mutation.
+    pub backup_path: PathBuf,
+    /// Whether an invalid active pointer was cleared.
+    pub active_pointer_cleared: bool,
+    /// Number of safe derived indexes recreated.
+    pub indexes_recreated: u32,
+    /// Damage deliberately left unrepaired because canonical intent is ambiguous.
+    pub remaining_issues: Vec<WorkflowAuthoringIssue>,
+}
+
 /// Durable workflow database.
 #[derive(Debug)]
 pub struct WorkflowStore {
@@ -1999,6 +2013,174 @@ impl WorkflowStore {
         })
     }
 
+    /// Import validated portable source as the exact next immutable revision atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed content, archived/missing workflow, non-next revision,
+    /// stale active pointer, unsuccessful preview, or persistence failure.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    pub fn import_workflow_revision(
+        &mut self,
+        workflow_id: &str,
+        revision: u64,
+        document: &WorkflowAuthoringDocument,
+        producer: &WorkflowProducerProvenance,
+        preview: &WorkflowCompilationPreview,
+        activate: bool,
+        expected_active_revision: Option<u64>,
+        published_at_ms: u64,
+    ) -> Result<WorkflowPublication, WorkflowStoreError> {
+        validate_id("workflow_id", workflow_id)?;
+        validate_authoring_document(workflow_id, document)?;
+        producer
+            .validate()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        if preview.version != WORKFLOW_COMPILATION_PREVIEW_VERSION || !preview.is_compiled() {
+            return Err(WorkflowStoreError::InvalidData(
+                "revision import requires a successful current-version compilation preview"
+                    .to_string(),
+            ));
+        }
+        let compiled = preview.compiled.as_ref().ok_or_else(|| {
+            WorkflowStoreError::InvalidData(
+                "successful compilation preview is missing compiled details".to_string(),
+            )
+        })?;
+        let source_checksum_sha256 = document
+            .source_digest_sha256()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        if preview.validation.source_digest_sha256.as_deref()
+            != Some(source_checksum_sha256.as_str())
+        {
+            return Err(WorkflowStoreError::InvalidData(
+                "compilation preview source digest does not match imported source".to_string(),
+            ));
+        }
+        let expected_identity = WorkflowDefinitionIdentity::for_definition(
+            workflow_id.to_string(),
+            &compiled.definition,
+        )
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        if expected_identity != compiled.definition_identity {
+            return Err(WorkflowStoreError::InvalidData(
+                "imported compilation definition identity is inconsistent".to_string(),
+            ));
+        }
+        let definition_json = bounded_json("compiled definition", &compiled.definition)?;
+        let document_json = bounded_json("published document", document)?;
+        let producer_json = bounded_json("published producer", producer)?;
+        let executable_source_checksum_sha256 = document
+            .executable_source_digest_sha256()
+            .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
+        let transaction = self.connection.transaction()?;
+        let workflow = transaction
+            .query_row(
+                "SELECT workflow_id, title, description, archived, active_revision, created_at_ms, updated_at_ms \
+                 FROM authored_workflows WHERE workflow_id = ?1",
+                [workflow_id],
+                decode_authored_workflow,
+            )
+            .optional()?
+            .map(validate_stored_authored_workflow)
+            .transpose()?
+            .ok_or_else(|| {
+                WorkflowStoreError::InvalidData(format!(
+                    "authored workflow not found: {workflow_id}"
+                ))
+            })?;
+        if workflow.archived {
+            return Err(WorkflowStoreError::InvalidData(
+                "archived authored workflows cannot import revisions".to_string(),
+            ));
+        }
+        if activate && workflow.active_revision != expected_active_revision {
+            return Err(WorkflowStoreError::AuthoringConflict {
+                entity_id: workflow_id.to_string(),
+                expected: expected_active_revision.unwrap_or(0),
+                current: workflow.active_revision.unwrap_or(0),
+            });
+        }
+        let current_revision: u64 = transaction.query_row(
+            "SELECT COALESCE(MAX(revision), 0) FROM workflow_revisions WHERE workflow_id = ?1",
+            [workflow_id],
+            |row| row.get(0),
+        )?;
+        let next_revision = current_revision.checked_add(1).ok_or_else(|| {
+            WorkflowStoreError::InvalidData("workflow revision overflow".to_string())
+        })?;
+        if revision != next_revision {
+            return Err(WorkflowStoreError::AuthoringConflict {
+                entity_id: workflow_id.to_string(),
+                expected: revision,
+                current: next_revision,
+            });
+        }
+        let stored_definition = StoredWorkflowDefinition {
+            definition_id: compiled.definition_identity.definition_id.clone(),
+            version: compiled.definition_identity.definition_version,
+            checksum_sha256: sha256_hex(definition_json.as_bytes()),
+            definition_json,
+        };
+        persist_definition_transaction(&transaction, &stored_definition)?;
+        transaction.execute(
+            "INSERT INTO workflow_revisions \
+             (workflow_id, revision, source_checksum_sha256, executable_source_checksum_sha256, definition_id, definition_version, document_json, producer_json, published_at_ms) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                workflow_id,
+                revision,
+                source_checksum_sha256,
+                executable_source_checksum_sha256,
+                compiled.definition_identity.definition_id,
+                compiled.definition_identity.definition_version,
+                document_json,
+                producer_json,
+                published_at_ms
+            ],
+        )?;
+        let active_revision = if activate {
+            transaction.execute(
+                "UPDATE authored_workflows SET active_revision = ?2, updated_at_ms = ?3 \
+                 WHERE workflow_id = ?1",
+                (workflow_id, revision, published_at_ms),
+            )?;
+            Some(revision)
+        } else {
+            workflow.active_revision
+        };
+        let event_payload = bounded_json(
+            "revision import event",
+            &serde_json::json!({
+                "revision": revision,
+                "definition_id": compiled.definition_identity.definition_id,
+                "definition_version": compiled.definition_identity.definition_version,
+                "activated": activate,
+                "imported": true,
+            }),
+        )?;
+        transaction.execute(
+            "INSERT INTO workflow_authoring_events \
+             (workflow_id, event_type, payload_json, created_at_ms) \
+             VALUES (?1, 'revision_imported', ?2, ?3)",
+            (workflow_id, event_payload, published_at_ms),
+        )?;
+        transaction.commit()?;
+        Ok(WorkflowPublication {
+            revision: PublishedWorkflowRevision {
+                workflow_id: workflow_id.to_string(),
+                revision,
+                source_checksum_sha256,
+                executable_source_checksum_sha256,
+                definition_identity: compiled.definition_identity.clone(),
+                document: document.clone(),
+                producer: producer.clone(),
+                published_at_ms,
+            },
+            active_revision,
+        })
+    }
+
     /// Load one exact immutable published revision without mutation.
     ///
     /// # Errors
@@ -2391,6 +2573,102 @@ impl WorkflowStore {
             );
         }
         Ok(issues)
+    }
+
+    /// Explicitly repair provably derived authored indexes and an invalid active pointer.
+    ///
+    /// The caller must provide a backup path in the canonical workflow directory. This operation
+    /// first acquires `SQLite` exclusive ownership, creates and verifies a complete backup, then
+    /// clears only an active pointer whose target revision is absent and recreates disposable
+    /// indexes. Missing definitions, stale draft bases, and orphaned presets remain surfaced because
+    /// their intended canonical replacement is ambiguous.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless exclusive ownership is available, the backup path is new and confined,
+    /// backup verification succeeds, or a repair transaction fails.
+    pub fn repair_authored_workflow(
+        &mut self,
+        workflow_id: &str,
+        backup_path: &Path,
+        repaired_at_ms: u64,
+    ) -> Result<WorkflowAuthoringRepairReport, WorkflowStoreError> {
+        validate_id("workflow_id", workflow_id)?;
+        let root = self.path.parent().ok_or_else(|| {
+            WorkflowStoreError::InvalidData("workflow database has no parent directory".to_string())
+        })?;
+        let root = std::fs::canonicalize(root)?;
+        if backup_path.exists() {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow maintenance backup path already exists".to_string(),
+            ));
+        }
+        let backup_parent = backup_path.parent().ok_or_else(|| {
+            WorkflowStoreError::InvalidData("workflow backup path has no parent".to_string())
+        })?;
+        std::fs::create_dir_all(backup_parent)?;
+        let backup_parent = std::fs::canonicalize(backup_parent)?;
+        if backup_parent != root {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow maintenance backup must be in the canonical workflow directory"
+                    .to_string(),
+            ));
+        }
+        self.connection
+            .execute_batch("PRAGMA busy_timeout = 0; BEGIN EXCLUSIVE; ROLLBACK;")?;
+        self.connection
+            .backup(rusqlite::DatabaseName::Main, backup_path, None)?;
+        let backup =
+            Connection::open_with_flags(backup_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        let integrity: String = backup.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        let backup_version: u32 = backup.query_row(
+            "SELECT schema_version FROM workflow_store_contract WHERE contract_id = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if integrity != "ok" || backup_version != SCHEMA_VERSION {
+            return Err(WorkflowStoreError::InvalidData(
+                "workflow maintenance backup verification failed".to_string(),
+            ));
+        }
+        drop(backup);
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)?;
+        let cleared = transaction.execute(
+            "UPDATE authored_workflows SET active_revision = NULL, updated_at_ms = ?2 \
+             WHERE workflow_id = ?1 AND active_revision IS NOT NULL \
+             AND NOT EXISTS(SELECT 1 FROM workflow_revisions revision \
+                 WHERE revision.workflow_id = authored_workflows.workflow_id \
+                   AND revision.revision = authored_workflows.active_revision)",
+            (workflow_id, repaired_at_ms),
+        )?;
+        transaction.execute_batch(
+            "DROP INDEX IF EXISTS idx_authored_workflows_updated;\
+             DROP INDEX IF EXISTS idx_workflow_drafts_updated;\
+             DROP INDEX IF EXISTS idx_workflow_revisions_published;\
+             DROP INDEX IF EXISTS idx_workflow_presets_updated;\
+             DROP INDEX IF EXISTS idx_workflow_authoring_events_identity;\
+             CREATE INDEX idx_authored_workflows_updated \
+                 ON authored_workflows(updated_at_ms DESC, workflow_id);\
+             CREATE INDEX idx_workflow_drafts_updated \
+                 ON workflow_drafts(workflow_id, updated_at_ms DESC, draft_id);\
+             CREATE INDEX idx_workflow_revisions_published \
+                 ON workflow_revisions(workflow_id, revision DESC);\
+             CREATE INDEX idx_workflow_presets_updated \
+                 ON workflow_presets(workflow_id, updated_at_ms DESC, preset_id);\
+             CREATE INDEX idx_workflow_authoring_events_identity \
+                 ON workflow_authoring_events(workflow_id, event_seq);",
+        )?;
+        transaction.commit()?;
+        let remaining_issues = self.diagnose_authored_workflow(workflow_id, 1_000)?;
+        Ok(WorkflowAuthoringRepairReport {
+            backup_path: backup_path.to_path_buf(),
+            active_pointer_cleared: cleared == 1,
+            indexes_recreated: 5,
+            remaining_issues,
+        })
     }
 
     /// Replace one preset using exact optimistic generation.
@@ -8445,6 +8723,8 @@ fn validate_authored_run_provenance(
         }
     }
     bounded_json("authored run configuration", &provenance.configuration)?;
+    validate_persistable_authoring_value("authored_run.configuration", &provenance.configuration)
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
     Ok(())
 }
 
@@ -8921,6 +9201,8 @@ fn validate_workflow_preset(preset: &WorkflowPreset) -> Result<(), WorkflowStore
         ));
     }
     bounded_json("preset configuration", &preset.configuration)?;
+    validate_persistable_authoring_value("preset.configuration", &preset.configuration)
+        .map_err(|error| WorkflowStoreError::InvalidData(error.to_string()))?;
     Ok(())
 }
 
@@ -10106,6 +10388,30 @@ mod tests {
             ..run
         };
         assert!(store.create_run_idempotent(&conflicting).is_err());
+    }
+
+    #[test]
+    fn authored_run_provenance_rejects_secret_bearing_configuration_before_persistence() {
+        let temp = tempfile::tempdir().expect("temp");
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store
+            .persist_definition("example", 1, &definition("example"))
+            .expect("definition");
+        persist_authored_run_provenance_fixture(&store);
+        for configuration in [
+            serde_json::json!({"api_key": "must-not-persist"}),
+            serde_json::json!({"token": {"backend": "env", "name": "TOKEN"}}),
+        ] {
+            let run = NewWorkflowRun {
+                authored_provenance: Some(AuthoredWorkflowRunProvenance {
+                    configuration,
+                    ..authored_run_provenance()
+                }),
+                ..new_run()
+            };
+            assert!(store.create_run(&run).is_err());
+            assert!(store.run_summary("run-1").expect("summary").is_none());
+        }
     }
 
     #[test]
@@ -14626,6 +14932,77 @@ mod tests {
     }
 
     #[test]
+    fn explicit_authored_repair_requires_confined_backup_and_repairs_only_safe_state() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (workflow, draft, catalog) = authored_store_fixture();
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store.create_authored_workflow(&workflow).expect("workflow");
+        store.create_workflow_draft(&draft).expect("draft");
+        let preview = draft.document.compilation_preview(&catalog, None);
+        store
+            .publish_workflow_draft(
+                &workflow.workflow_id,
+                &draft.draft_id,
+                1,
+                &preview,
+                true,
+                None,
+                3,
+            )
+            .expect("publish");
+        store
+            .connection
+            .execute_batch("PRAGMA foreign_keys = OFF;")
+            .expect("disable foreign keys");
+        store
+            .connection
+            .execute(
+                "UPDATE authored_workflows SET active_revision = 99 WHERE workflow_id = ?1",
+                [&workflow.workflow_id],
+            )
+            .expect("corrupt pointer");
+        let outside = temp.path().join("outside").join("backup.db");
+        assert!(
+            store
+                .repair_authored_workflow(&workflow.workflow_id, &outside, 4)
+                .is_err()
+        );
+        let backup = store
+            .path()
+            .parent()
+            .expect("root")
+            .join("repair-backup.db");
+        let report = store
+            .repair_authored_workflow(&workflow.workflow_id, &backup, 4)
+            .expect("repair");
+        assert!(report.active_pointer_cleared);
+        assert_eq!(report.indexes_recreated, 5);
+        assert!(report.remaining_issues.is_empty());
+        assert!(backup.is_file());
+        assert_eq!(
+            store
+                .authored_workflow(&workflow.workflow_id)
+                .expect("workflow")
+                .expect("workflow")
+                .active_revision,
+            None
+        );
+        let backed_up = WorkflowStore::open_at_path(&backup).expect("backup store");
+        assert_eq!(
+            backed_up
+                .diagnose_authored_workflow(&workflow.workflow_id, 10)
+                .expect("backup diagnosis"),
+            vec![WorkflowAuthoringIssue::InvalidActiveRevision { revision: 99 }]
+        );
+        assert!(
+            store
+                .repair_authored_workflow(&workflow.workflow_id, &backup, 5)
+                .is_err(),
+            "maintenance must not overwrite its retained backup evidence"
+        );
+    }
+
+    #[test]
     fn authored_inspection_is_bounded_non_mutating_and_reports_corruption() {
         let temp = tempfile::tempdir().expect("temp");
         let (workflow, draft, catalog) = authored_store_fixture();
@@ -14865,6 +15242,138 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn exact_revision_import_is_atomic_collision_safe_and_restart_safe() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (workflow, draft, catalog) = authored_store_fixture();
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store.create_authored_workflow(&workflow).expect("workflow");
+        store.create_workflow_draft(&draft).expect("draft");
+        let preview = draft.document.compilation_preview(&catalog, None);
+        store
+            .publish_workflow_draft(
+                &workflow.workflow_id,
+                &draft.draft_id,
+                1,
+                &preview,
+                true,
+                None,
+                3,
+            )
+            .expect("revision 1");
+        let mut imported = draft.document.clone();
+        imported.definition.name = "imported-revision-2".to_string();
+        imported.producer = WorkflowProducerProvenance {
+            kind: bcode_workflow::WorkflowProducerKind::Generated,
+            producer_id: Some("workflow-import".to_string()),
+            source_revision: Some(bcode_workflow::WorkflowRevisionIdentity {
+                workflow_id: "source/workflow".to_string(),
+                revision: 7,
+            }),
+        };
+        let imported_preview = imported.compilation_preview(&catalog, None);
+        let publication = store
+            .import_workflow_revision(
+                &workflow.workflow_id,
+                2,
+                &imported,
+                &imported.producer,
+                &imported_preview,
+                true,
+                Some(1),
+                4,
+            )
+            .expect("import revision 2");
+        assert_eq!(publication.revision.revision, 2);
+        assert_eq!(publication.active_revision, Some(2));
+        assert!(matches!(
+            store.import_workflow_revision(
+                &workflow.workflow_id,
+                2,
+                &imported,
+                &imported.producer,
+                &imported_preview,
+                false,
+                None,
+                5,
+            ),
+            Err(WorkflowStoreError::AuthoringConflict { .. })
+        ));
+        drop(store);
+        let reopened = WorkflowStore::open_in_state_dir(temp.path()).expect("reopen");
+        assert_eq!(
+            reopened
+                .authored_workflow(&workflow.workflow_id)
+                .expect("workflow")
+                .expect("workflow")
+                .active_revision,
+            Some(2)
+        );
+        let revision = reopened
+            .workflow_revision(&workflow.workflow_id, 2)
+            .expect("revision")
+            .expect("revision");
+        assert_eq!(revision.document, imported);
+        assert_eq!(
+            revision.producer.kind,
+            bcode_workflow::WorkflowProducerKind::Generated
+        );
+        assert_eq!(
+            reopened
+                .workflow_authoring_events(&workflow.workflow_id, None, 10)
+                .expect("events")
+                .last()
+                .expect("event")
+                .event_type,
+            "revision_imported"
+        );
+    }
+
+    #[test]
+    fn workflow_presets_reject_secret_bearing_configuration() {
+        let temp = tempfile::tempdir().expect("temp");
+        let (workflow, draft, catalog) = authored_store_fixture();
+        let mut store = WorkflowStore::open_in_state_dir(temp.path()).expect("store");
+        store.create_authored_workflow(&workflow).expect("workflow");
+        store.create_workflow_draft(&draft).expect("draft");
+        let preview = draft.document.compilation_preview(&catalog, None);
+        store
+            .publish_workflow_draft(
+                &workflow.workflow_id,
+                &draft.draft_id,
+                1,
+                &preview,
+                true,
+                None,
+                3,
+            )
+            .expect("publish");
+        for configuration in [
+            serde_json::json!({"password": "must-not-persist"}),
+            serde_json::json!({"token": {"backend": "sshenv", "profile": "vault"}}),
+        ] {
+            let preset = WorkflowPreset {
+                workflow_id: workflow.workflow_id.clone(),
+                preset_id: "unsafe".to_string(),
+                revision: 1,
+                name: "Unsafe".to_string(),
+                generation: 1,
+                configuration,
+                run_limits: None,
+                producer: draft.producer.clone(),
+                created_at_ms: 4,
+                updated_at_ms: 4,
+            };
+            assert!(store.create_workflow_preset(&preset).is_err());
+            assert!(
+                store
+                    .workflow_preset(&workflow.workflow_id, "unsafe")
+                    .expect("preset")
+                    .is_none()
+            );
+        }
     }
 
     #[test]
