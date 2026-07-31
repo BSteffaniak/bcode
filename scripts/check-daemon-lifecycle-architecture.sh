@@ -10,10 +10,12 @@ from pathlib import Path
 ipc = Path("packages/ipc/src/lib.rs").read_text(encoding="utf-8")
 lifecycle = Path("packages/daemon-lifecycle/src/lib.rs").read_text(encoding="utf-8")
 client = Path("packages/client/src/lib.rs").read_text(encoding="utf-8")
+server = Path("packages/server/src/lib.rs").read_text(encoding="utf-8")
 tui_sources = "\n".join(
     path.read_text(encoding="utf-8") for path in Path("packages/tui/src").rglob("*.rs")
 )
 cli = Path("packages/cli/src/lib.rs").read_text(encoding="utf-8")
+plugin_surface_host = Path("packages/tui/src/plugin_surface_host.rs").read_text(encoding="utf-8")
 invariants = Path("INVARIANTS.md").read_text(encoding="utf-8")
 
 required = {
@@ -37,6 +39,11 @@ required = {
             for path in Path("packages/tui/src").rglob("*.rs")
             if path.name != "tests.rs"
         ),
+    "plugin surface host must use the explicit embedded server path":
+        "run_embedded_with_static_bundled" in plugin_surface_host
+        and "run_with_static_bundled(" not in plugin_surface_host,
+    "embedded server path must not publish a daemon record":
+        "run_with_static_bundled_inner(endpoint, static_plugins, false).await" in server,
     "CLI startup must not eagerly materialize the daemon image":
         "ensure_current_executable_cached()" not in cli,
 }

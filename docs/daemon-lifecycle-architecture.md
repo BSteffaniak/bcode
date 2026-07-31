@@ -47,7 +47,7 @@ Bootstrap captures an open read handle before CLI setup. Cold copy and digest op
 
 Materialization occurs only on the cold start path while lifecycle owns the artifact startup lock. Publication writes a process-specific temporary executable, preserves executable permissions, verifies SHA-256, atomically renames the image, and then publishes matching metadata. Existing images are reused only when both bytes and metadata validate. A corrupt image or metadata pair is removed and rebuilt once while the startup lock is held.
 
-Digest and metadata are retained for diagnostics and conservative process verification. Cleanup retains images referenced by daemon records and the current image, and does not remove ambiguous live historical state.
+Digest and metadata are retained for diagnostics and conservative process verification. Cleanup retains images referenced by daemon records and the current image. Malformed records, unreadable registry evidence, and unknown record schemas make image cleanup fail closed so a newer or historical daemon image is never removed merely because the current build cannot interpret its evidence.
 
 ## Startup coordination and readiness
 

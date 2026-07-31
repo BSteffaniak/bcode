@@ -787,7 +787,9 @@ fn client_error_message(error: &ClientError) -> String {
             "The local Bcode service is unavailable. Check that it is running, then try again."
                 .to_owned()
         }
-        ClientError::RequestTimeout { .. } | ClientError::DaemonStartupTimeout { .. } => {
+        ClientError::ConnectTimeout { .. }
+        | ClientError::RequestTimeout { .. }
+        | ClientError::DaemonStartupTimeout { .. } => {
             "The local Bcode service did not respond in time. Try again.".to_owned()
         }
         ClientError::IncompatibleDaemon { .. } => {

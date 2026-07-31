@@ -17,7 +17,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::{
-    TuiError, clipboard_image, daemon_issue, history_flow,
+    TuiError, clipboard_image, history_flow,
     session_flow::{self, AgentCatalog},
     slash_palette,
 };
@@ -300,10 +300,8 @@ impl DaemonObservation {
     fn from_tui_result<T>(result: &Result<T, TuiError>) -> Self {
         match result {
             Ok(_) => Self::Success,
-            Err(error) if daemon_issue::is_nonfatal_tui_error(error) => {
-                Self::Unavailable(error.to_string())
-            }
-            Err(error) => Self::Failed(error.to_string()),
+            Err(TuiError::Client(error)) => Self::from_client_error(error),
+            Err(_) => Self::None,
         }
     }
 
@@ -2002,6 +2000,37 @@ async fn load_session_status(client: &BcodeClient, session_id: SessionId) -> Tui
 #[cfg(test)]
 mod progress_routing_tests {
     use super::*;
+
+    #[test]
+    fn application_failures_do_not_claim_the_daemon_is_offline() {
+        let server_error = ClientError::Server {
+            code: "permission_denied".to_owned(),
+            message: "request rejected".to_owned(),
+        };
+        assert!(matches!(
+            DaemonObservation::from_client_result::<()>(&Err(server_error)),
+            DaemonObservation::Failed(_)
+        ));
+        assert_eq!(
+            DaemonObservation::from_tui_result::<()>(&Err(TuiError::SessionUnavailable {
+                session_id: SessionId::new(),
+                reason: "owned elsewhere".to_owned(),
+            })),
+            DaemonObservation::None
+        );
+    }
+
+    #[test]
+    fn transport_unavailability_remains_connectivity_evidence() {
+        let error = ClientError::Transport(bcode_ipc::IpcTransportError::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "offline",
+        )));
+        assert!(matches!(
+            DaemonObservation::from_client_result::<()>(&Err(error)),
+            DaemonObservation::Unavailable(_)
+        ));
+    }
 
     #[tokio::test]
     async fn presentation_note_queue_preserves_emission_order_per_session() {

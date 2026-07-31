@@ -923,20 +923,71 @@ fn preserve_executable_permissions(
     Ok(())
 }
 
+fn retained_daemon_image_paths(
+    state_dir: &Path,
+) -> Result<(std::collections::BTreeSet<PathBuf>, bool), DaemonLifecycleError> {
+    let registry = registry_dir(state_dir);
+    let entries = match fs::read_dir(&registry) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((std::collections::BTreeSet::new(), false));
+        }
+        Err(source) => {
+            return Err(DaemonLifecycleError::Io {
+                path: registry,
+                source,
+            });
+        }
+    };
+    let mut retained = std::collections::BTreeSet::new();
+    let mut ambiguous_record_evidence = false;
+    for entry in entries {
+        let entry = entry.map_err(|source| DaemonLifecycleError::Io {
+            path: registry.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let contents = fs::read(&path).map_err(|source| DaemonLifecycleError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        let Ok(record) = serde_json::from_slice::<DaemonRecord>(&contents) else {
+            ambiguous_record_evidence = true;
+            continue;
+        };
+        if !(1..=DAEMON_RECORD_SCHEMA_VERSION).contains(&record.schema_version) {
+            ambiguous_record_evidence = true;
+            continue;
+        }
+        if let Some(executable_path) = record.executable_path {
+            retained.insert(executable_path);
+        }
+    }
+    Ok((retained, ambiguous_record_evidence))
+}
+
 /// Remove cached daemon images that are not referenced by daemon records or the current build.
+///
+/// Cleanup fails closed when any registry record is malformed or has an unknown schema because
+/// that record may contain image-retention evidence this build cannot safely interpret.
 ///
 /// # Errors
 ///
-/// Returns an error when reading or removing image directories fails.
+/// Returns an error when reading registry evidence or removing image directories fails.
 pub fn cleanup_stale_daemon_images(state_dir: &Path) -> Result<usize, DaemonLifecycleError> {
     let root = state_dir.join("daemon-images");
-    let Ok(namespace_entries) = fs::read_dir(&root) else {
-        return Ok(0);
+    let namespace_entries = match fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(source) => return Err(DaemonLifecycleError::Io { path: root, source }),
     };
-    let mut retained = read_records(state_dir)
-        .into_iter()
-        .filter_map(|(_path, record)| record.executable_path)
-        .collect::<std::collections::BTreeSet<_>>();
+    let (mut retained, ambiguous_record_evidence) = retained_daemon_image_paths(state_dir)?;
+    if ambiguous_record_evidence {
+        return Ok(0);
+    }
     retained.insert(current_cached_daemon_executable_path(state_dir)?);
     let mut removed = 0;
     for namespace_entry in namespace_entries.flatten() {
@@ -1033,6 +1084,78 @@ mod tests {
             started_at_unix_ms: 0,
             last_seen_unix_ms: 0,
             instance_id: "test-instance".to_string(),
+        }
+    }
+
+    fn stale_image_path(state_dir: &Path, namespace: &str, digest: &str) -> PathBuf {
+        state_dir
+            .join("daemon-images")
+            .join(namespace)
+            .join(digest)
+            .join(if cfg!(windows) { "bcode.exe" } else { "bcode" })
+    }
+
+    fn write_test_image(path: &Path) {
+        fs::create_dir_all(path.parent().expect("image parent")).expect("image directory");
+        fs::write(path, b"stale daemon image").expect("image");
+    }
+
+    #[test]
+    fn daemon_image_cleanup_retains_record_references_and_removes_only_unreferenced_images() {
+        let state_dir = std::env::temp_dir().join(format!(
+            "bcode-daemon-image-cleanup-test-{}-{}",
+            std::process::id(),
+            unix_time_millis().expect("time")
+        ));
+        let retained_image = stale_image_path(&state_dir, "historical", "retained");
+        let stale_image = stale_image_path(&state_dir, "historical", "stale");
+        write_test_image(&retained_image);
+        write_test_image(&stale_image);
+        let record = DaemonRecord {
+            namespace: "historical-cleanup-record".to_owned(),
+            executable_path: Some(retained_image.clone()),
+            ..record_with_writer_epoch(Some(2))
+        };
+        let record_path = write_record(&state_dir, &record).expect("record");
+
+        assert_eq!(cleanup_stale_daemon_images(&state_dir).expect("cleanup"), 1);
+        assert!(retained_image.exists());
+        assert!(!stale_image.exists());
+
+        remove_record_path(&record_path).expect("remove record");
+        assert_eq!(cleanup_stale_daemon_images(&state_dir).expect("cleanup"), 1);
+        assert!(!retained_image.exists());
+        fs::remove_dir_all(state_dir).expect("state cleanup");
+    }
+
+    #[test]
+    fn daemon_image_cleanup_fails_closed_for_ambiguous_registry_evidence() {
+        for (case, contents) in [
+            ("malformed", b"not valid json".to_vec()),
+            (
+                "future-schema",
+                serde_json::to_vec(&DaemonRecord {
+                    schema_version: DAEMON_RECORD_SCHEMA_VERSION + 1,
+                    namespace: "future-record".to_owned(),
+                    ..record_with_writer_epoch(Some(2))
+                })
+                .expect("future record"),
+            ),
+        ] {
+            let state_dir = std::env::temp_dir().join(format!(
+                "bcode-daemon-image-ambiguous-{case}-{}-{}",
+                std::process::id(),
+                unix_time_millis().expect("time")
+            ));
+            let stale_image = stale_image_path(&state_dir, "historical", "ambiguous");
+            write_test_image(&stale_image);
+            let registry = registry_dir(&state_dir);
+            fs::create_dir_all(&registry).expect("registry");
+            fs::write(registry.join("ambiguous.json"), contents).expect("ambiguous record");
+
+            assert_eq!(cleanup_stale_daemon_images(&state_dir).expect("cleanup"), 0);
+            assert!(stale_image.exists());
+            fs::remove_dir_all(state_dir).expect("state cleanup");
         }
     }
 

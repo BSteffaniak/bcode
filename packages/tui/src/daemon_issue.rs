@@ -151,7 +151,9 @@ impl TuiDaemonIssue {
 pub fn classify_client_error(error: &ClientError) -> TuiDaemonIssue {
     if matches!(
         error,
-        ClientError::RequestTimeout { .. } | ClientError::DaemonStartupTimeout { .. }
+        ClientError::ConnectTimeout { .. }
+            | ClientError::RequestTimeout { .. }
+            | ClientError::DaemonStartupTimeout { .. }
     ) {
         return TuiDaemonIssue::Timeout;
     }
@@ -159,9 +161,9 @@ pub fn classify_client_error(error: &ClientError) -> TuiDaemonIssue {
         return TuiDaemonIssue::Unavailable;
     }
     match error {
-        ClientError::RequestTimeout { .. } | ClientError::DaemonStartupTimeout { .. } => {
-            TuiDaemonIssue::Timeout
-        }
+        ClientError::ConnectTimeout { .. }
+        | ClientError::RequestTimeout { .. }
+        | ClientError::DaemonStartupTimeout { .. } => TuiDaemonIssue::Timeout,
         ClientError::Codec(CodecError::UnsupportedVersion { .. })
         | ClientError::IncompatibleDaemon { .. } => TuiDaemonIssue::StaleOrIncompatible,
         ClientError::Codec(
@@ -312,6 +314,16 @@ mod tests {
     use bcode_ipc::CodecError;
 
     use super::{TuiDaemonIssue, classify_client_error, client_issue_status, error_diagnostic};
+
+    #[test]
+    fn connection_timeout_is_recoverable_timeout_not_unavailability() {
+        let error = bcode_client::ClientError::ConnectTimeout {
+            timeout: Duration::from_secs(5),
+        };
+
+        assert_eq!(classify_client_error(&error), TuiDaemonIssue::Timeout);
+        assert!(!error.is_daemon_unavailable());
+    }
 
     #[test]
     fn request_timeout_is_recoverable_timeout() {

@@ -341,7 +341,7 @@ impl ChatLoopState {
         self.effects.abort_matching(effect);
     }
 
-    fn observe_daemon(&mut self, chat: &mut ActiveChat, observation: DaemonObservation) {
+    const fn observe_daemon(&mut self, chat: &mut ActiveChat, observation: &DaemonObservation) {
         if let Some(state) = self.daemon_connection.observe(observation) {
             chat.app.set_daemon_connection(state);
         }
@@ -351,30 +351,65 @@ impl ChatLoopState {
 #[derive(Debug, Default)]
 struct DaemonConnectionMonitor {
     saw_success: bool,
-    last_error: Option<String>,
 }
 
 impl DaemonConnectionMonitor {
-    fn observe(
+    const fn observe(
         &mut self,
-        observation: DaemonObservation,
+        observation: &DaemonObservation,
     ) -> Option<super::app::DaemonConnectionState> {
         match observation {
-            DaemonObservation::None => None,
+            DaemonObservation::None | DaemonObservation::Failed(_) => None,
             DaemonObservation::Success => {
                 self.saw_success = true;
-                self.last_error = None;
                 Some(super::app::DaemonConnectionState::Connected)
             }
-            DaemonObservation::Unavailable(error) | DaemonObservation::Failed(error) => {
-                self.last_error = Some(error);
-                Some(if self.saw_success {
-                    super::app::DaemonConnectionState::IdleOffline
-                } else {
-                    super::app::DaemonConnectionState::Unavailable
-                })
-            }
+            DaemonObservation::Unavailable(_) => Some(if self.saw_success {
+                super::app::DaemonConnectionState::IdleOffline
+            } else {
+                super::app::DaemonConnectionState::Unavailable
+            }),
         }
+    }
+}
+
+#[cfg(test)]
+mod daemon_connection_monitor_tests {
+    use super::{DaemonConnectionMonitor, DaemonObservation};
+    use crate::app::DaemonConnectionState;
+
+    #[test]
+    fn application_failure_does_not_change_connectivity_state() {
+        let mut monitor = DaemonConnectionMonitor::default();
+        assert_eq!(
+            monitor.observe(&DaemonObservation::Failed("rejected".to_owned())),
+            None
+        );
+        assert_eq!(
+            monitor.observe(&DaemonObservation::Success),
+            Some(DaemonConnectionState::Connected)
+        );
+        assert_eq!(
+            monitor.observe(&DaemonObservation::Failed("rejected".to_owned())),
+            None
+        );
+    }
+
+    #[test]
+    fn unavailability_tracks_initial_and_post_success_offline_states() {
+        let mut monitor = DaemonConnectionMonitor::default();
+        assert_eq!(
+            monitor.observe(&DaemonObservation::Unavailable("offline".to_owned())),
+            Some(DaemonConnectionState::Unavailable)
+        );
+        assert_eq!(
+            monitor.observe(&DaemonObservation::Success),
+            Some(DaemonConnectionState::Connected)
+        );
+        assert_eq!(
+            monitor.observe(&DaemonObservation::Unavailable("offline".to_owned())),
+            Some(DaemonConnectionState::IdleOffline)
+        );
     }
 }
 
@@ -731,7 +766,8 @@ async fn poll_finished_effects(
     let results = loop_state.poll_finished_effects().await;
     let needs_redraw = !results.is_empty();
     for result in results {
-        loop_state.observe_daemon(chat, result.daemon_observation());
+        let daemon_observation = result.daemon_observation();
+        loop_state.observe_daemon(chat, &daemon_observation);
         apply_effect_result(settings, chat, draft_autosave, loop_state, result);
     }
     needs_redraw

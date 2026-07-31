@@ -20,7 +20,7 @@ build_artifact() {
     local artifact_id="$2"
     local features="$3"
     local profile_flag="$4"
-    local target_dir="${workdir}/${name}-target"
+    local target_dir="${workdir}/target"
 
     BCODE_ARTIFACT_ID="${artifact_id}" CARGO_TARGET_DIR="${target_dir}" \
         cargo build --quiet --package bcode --bin bcode --no-default-features \

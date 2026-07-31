@@ -185,6 +185,8 @@ pub enum ClientError {
     DaemonStart(#[from] DaemonStartError),
     #[error("server returned error {code}: {message}")]
     Server { code: String, message: String },
+    #[error("daemon connection and handshake timed out after {timeout:?}")]
+    ConnectTimeout { timeout: Duration },
     #[error("daemon startup timed out after {timeout:?}")]
     DaemonStartupTimeout { timeout: Duration },
     #[error("client request timed out after {timeout:?}")]
@@ -218,10 +220,10 @@ impl ClientError {
                     | std::io::ErrorKind::BrokenPipe
                     | std::io::ErrorKind::UnexpectedEof
             ),
-            Self::RequestTimeout { .. }
-            | Self::DaemonStartupTimeout { .. }
-            | Self::DaemonStart(_) => true,
-            Self::Transport(_)
+            Self::DaemonStartupTimeout { .. } | Self::DaemonStart(_) => true,
+            Self::ConnectTimeout { .. }
+            | Self::RequestTimeout { .. }
+            | Self::Transport(_)
             | Self::Codec(_)
             | Self::Server { .. }
             | Self::IncompatibleDaemon { .. }
@@ -3974,7 +3976,7 @@ impl BcodeClient {
     ) -> Result<ClientConnection, ClientError> {
         tokio::time::timeout(self.connect_timeout, self.connect_once(client_name))
             .await
-            .map_err(|_| ClientError::RequestTimeout {
+            .map_err(|_| ClientError::ConnectTimeout {
                 timeout: self.connect_timeout,
             })?
     }
@@ -4720,6 +4722,40 @@ mod client_timeout_tests {
             assert!(message.contains("protocol="));
             assert!(message.contains("build="));
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn connection_timeout_is_distinct_and_does_not_trigger_auto_start() {
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("connect-timeout.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept client");
+            let _hello = bcode_ipc::recv_envelope(&mut stream)
+                .await
+                .expect("receive hello");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        });
+        let client = BcodeClient::new(endpoint)
+            .with_daemon_availability(super::DaemonAvailability::AutoStart)
+            .with_connect_timeout(Duration::from_millis(10))
+            .with_request_timeout(Duration::from_secs(1));
+
+        let error = client
+            .connect("connect-timeout-test")
+            .await
+            .expect_err("unresponsive reachable endpoint must time out");
+        assert!(matches!(
+            error,
+            ClientError::ConnectTimeout { timeout } if timeout == Duration::from_millis(10)
+        ));
+        assert!(!error.is_daemon_unavailable());
+
+        server.await.expect("server task");
+        std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
     }
 
     #[cfg(unix)]
