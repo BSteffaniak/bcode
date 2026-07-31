@@ -1240,7 +1240,25 @@ fn finish_fake_tool_call(turn: &FakeTurn, call: ToolCall) {
 }
 
 fn finish_fake_tool_turn(turn: &FakeTurn, call: ToolCall) {
-    finish_fake_tool_call(turn, call);
+    turn.push(ProviderTurnEvent::ToolCallStarted {
+        call_id: call.id.clone(),
+        name: call.name.clone(),
+    });
+    let arguments = serde_json::to_string(&call.arguments).unwrap_or_default();
+    let midpoint = arguments
+        .char_indices()
+        .map(|(index, _)| index)
+        .find(|index| *index >= arguments.len() / 2)
+        .unwrap_or(arguments.len());
+    for delta in [&arguments[..midpoint], &arguments[midpoint..]] {
+        if !delta.is_empty() {
+            turn.push(ProviderTurnEvent::ToolCallDelta {
+                call_id: call.id.clone(),
+                delta: delta.to_owned(),
+            });
+        }
+    }
+    turn.push(ProviderTurnEvent::ToolCallFinished { call });
     turn.push(ProviderTurnEvent::Usage {
         usage: TokenUsage::default(),
     });
@@ -1608,6 +1626,34 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         panic!("fake event script did not reach expected state: {events:?}");
+    }
+
+    #[test]
+    fn fake_tool_turn_streams_arguments_before_finishing() {
+        let turn = FakeTurn::default();
+        let call = ToolCall {
+            id: "call-1".to_owned(),
+            name: "filesystem.write".to_owned(),
+            arguments: serde_json::json!({"path": "src/lib.rs", "contents": "hello"}),
+        };
+        finish_fake_tool_turn(&turn, call.clone());
+        let events = turn.drain();
+        assert!(matches!(
+            events.first(),
+            Some(ProviderTurnEvent::ToolCallStarted { call_id, .. }) if call_id == &call.id
+        ));
+        let deltas = events
+            .iter()
+            .filter_map(|event| match event {
+                ProviderTurnEvent::ToolCallDelta { delta, .. } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(deltas, serde_json::to_string(&call.arguments).unwrap());
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ProviderTurnEvent::ToolCallFinished { call: finished } if finished == &call
+        )));
     }
 
     #[test]

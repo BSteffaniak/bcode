@@ -31,7 +31,7 @@ esac
 cd "${root}"
 
 if [[ "${BCODE_TUI_PTY_SKIP_BUILD:-0}" != "1" ]]; then
-    cargo build --quiet -p bcode --features distribution -p bcode_fake_provider_plugin
+    cargo build --quiet -p bcode --features distribution -p bcode_fake_provider_plugin -p bcode_tui_components --bin bcode_terminal_grid_probe
 fi
 
 case "$(uname -s)" in
@@ -98,7 +98,7 @@ if ! "${root}/target/debug/bcode" server status >/dev/null 2>&1; then
 fi
 
 session_id="$("${root}/target/debug/bcode" session create tui-pty-smoke)"
-python3 - "${root}/target/debug/bcode" "${session_id}" "${workdir}/tui.capture" <<'PY'
+python3 - "${root}/target/debug/bcode" "${root}/target/debug/bcode_terminal_grid_probe" "${session_id}" "${workdir}/tui.capture" <<'PY'
 import fcntl
 import os
 import pty
@@ -107,11 +107,10 @@ import signal
 import struct
 import subprocess
 import sys
-import tempfile
 import termios
 import time
 
-binary, session_id, capture_path = sys.argv[1:]
+binary, probe_binary, session_id, capture_path = sys.argv[1:]
 session_marker = f"#{session_id[:8]}".encode()
 pid, fd = pty.fork()
 if pid == 0:
@@ -126,31 +125,9 @@ request_sent = False
 live_seen_before_finish = False
 final_seen_before_live = False
 next_screen_probe = 0.0
-live_marker = b"FRESH_LIVE_OUTPUT"
-final_marker = b"FRESH_FINAL_OUTPUT"
-probe_source = r'''
-use bmux_terminal_grid::{GridLimits, TerminalGridStream, visible_text};
-use std::io::Read as _;
-fn main() {
-    let path = std::env::args().nth(1).expect("capture path");
-    let mut bytes = Vec::new();
-    std::fs::File::open(path).unwrap().read_to_end(&mut bytes).unwrap();
-    let mut stream = TerminalGridStream::new(120, 30, GridLimits::default()).unwrap();
-    stream.process(&bytes);
-    print!("{}", visible_text(stream.grid(), 0, 30));
-}
-'''
-probe_dir = tempfile.mkdtemp(prefix="bcode-tui-grid-")
-with open(os.path.join(probe_dir, "Cargo.toml"), "w", encoding="utf-8") as manifest:
-    manifest.write('''[package]\nname="bcode-tui-grid-probe"\nversion="0.0.0"\nedition="2024"\n[dependencies]\nbmux_terminal_grid={git="https://github.com/BSteffaniak/bmux.git",rev="e0567de1b11edfb794b041bf3674f451429c493d"}\n''')
-os.mkdir(os.path.join(probe_dir, "src"))
-with open(os.path.join(probe_dir, "src", "main.rs"), "w", encoding="utf-8") as source:
-    source.write(probe_source)
-subprocess.run(
-    ["cargo", "build", "--quiet", "--manifest-path", os.path.join(probe_dir, "Cargo.toml")],
-    check=True,
-)
-probe_binary = os.path.join(probe_dir, "target", "debug", "bcode-tui-grid-probe")
+screen_frames = []
+live_marker = b"FRESHLIVEOUTPUT"
+final_marker = b"FRESHFINALOUTPUT"
 
 def screen_text():
     with open(capture_path, "wb") as capture_file:
@@ -173,21 +150,27 @@ while time.monotonic() < deadline:
             break
         capture.extend(chunk)
 
-    if not request_sent and b"bcode" in capture and session_marker in capture:
-        os.write(
-            fd,
-            b"tool-shell printf FRESH\\137LIVE\\137OUTPUT; sleep 4; printf FRESH\\137FINAL\\137OUTPUT\\r",
-        )
-        request_sent = True
-
-    if request_sent and time.monotonic() >= next_screen_probe:
+    if time.monotonic() >= next_screen_probe:
         screen = screen_text()
-        if live_marker in screen and not live_seen_before_finish:
-            live_seen_before_finish = final_marker not in screen
-        if final_marker in screen and live_marker not in screen:
-            final_seen_before_live = True
-        if live_seen_before_finish and final_marker in screen:
-            capture.extend(b"\nBCODE_SMOKE_FINAL_MARKER_VISIBLE\n")
+        screen_frames.append(screen)
+        if (
+            not request_sent
+            and b"bcode" in screen
+            and session_marker in screen
+            and b"ready" in screen
+        ):
+            os.write(
+                fd,
+                b"tool-shell echo FRESHLIVEOUTPUT; sleep 4; echo FRESHFINALOUTPUT\r",
+            )
+            request_sent = True
+        if request_sent:
+            if live_marker in screen and not live_seen_before_finish:
+                live_seen_before_finish = final_marker not in screen
+            if final_marker in screen and live_marker not in screen:
+                final_seen_before_live = True
+            if live_seen_before_finish and final_marker in screen:
+                capture.extend(b"\nBCODE_SMOKE_FINAL_MARKER_VISIBLE\n")
         next_screen_probe = time.monotonic() + 0.25
 
     if (
@@ -225,6 +208,10 @@ if exit_status is None:
 
 with open(capture_path, "wb") as capture_file:
     capture_file.write(capture)
+with open(capture_path + ".frames", "wb") as frames_file:
+    for index, screen in enumerate(screen_frames):
+        frames_file.write(f"\n--- frame {index} ---\n".encode())
+        frames_file.write(screen)
 
 checks = {
     "alternate-screen entry": b"\x1b[?1049h" in capture,

@@ -124,9 +124,11 @@ pub fn runtime_work_detail(runtime_work: &[RuntimeWorkView]) -> Option<String> {
     if running_tools > 1 {
         return Some(format!("running {running_tools} tools"));
     }
-    let work = runtime_work
-        .iter()
-        .min_by(|left, right| left.work_id.cmp(&right.work_id))?;
+    let work = runtime_work.iter().min_by(|left, right| {
+        runtime_work_priority(left)
+            .cmp(&runtime_work_priority(right))
+            .then_with(|| left.work_id.cmp(&right.work_id))
+    })?;
     let prefix = match work.status {
         RuntimeWorkStatus::Queued => "queued",
         RuntimeWorkStatus::Cancelling => "cancelling",
@@ -152,6 +154,26 @@ pub fn runtime_work_detail(runtime_work: &[RuntimeWorkView]) -> Option<String> {
         (false, _) => work.label.clone(),
     };
     Some(format!("{prefix}: {detail}"))
+}
+
+const fn runtime_work_priority(work: &RuntimeWorkView) -> u8 {
+    match (work.status, work.kind) {
+        (RuntimeWorkStatus::Cancelling, _) => 0,
+        (RuntimeWorkStatus::Queued, _) => 1,
+        (RuntimeWorkStatus::Running, RuntimeWorkKind::Tool) => 2,
+        (RuntimeWorkStatus::Running, RuntimeWorkKind::PluginInvocation) => 3,
+        (RuntimeWorkStatus::Running, RuntimeWorkKind::WorkflowNode) => 4,
+        (RuntimeWorkStatus::Running, RuntimeWorkKind::Workflow) => 5,
+        (RuntimeWorkStatus::Running, RuntimeWorkKind::EventDelivery) => 6,
+        (RuntimeWorkStatus::Running, RuntimeWorkKind::ModelTurn) => 7,
+        (
+            RuntimeWorkStatus::Completed
+            | RuntimeWorkStatus::Cancelled
+            | RuntimeWorkStatus::Failed
+            | RuntimeWorkStatus::TimedOut,
+            _,
+        ) => 8,
+    }
 }
 
 /// Return a status label for a model turn outcome.
@@ -188,6 +210,16 @@ mod tests {
         let one = running("work-1", RuntimeWorkKind::Tool, "shell", Some("halfway"));
         assert_eq!(
             runtime_work_detail(std::slice::from_ref(&one)).as_deref(),
+            Some("running tool: shell — halfway")
+        );
+        let model = running(
+            "model-1",
+            RuntimeWorkKind::ModelTurn,
+            "model turn model-1",
+            None,
+        );
+        assert_eq!(
+            runtime_work_detail(&[model, one.clone()]).as_deref(),
             Some("running tool: shell — halfway")
         );
         let two = running("work-2", RuntimeWorkKind::Tool, "web", None);
