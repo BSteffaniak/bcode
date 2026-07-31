@@ -918,6 +918,88 @@ mod tests {
     }
 
     #[test]
+    fn positioned_frames_do_not_cross_system_message_barrier() {
+        let session_id = SessionId::new();
+        let turn_id = "turn-barrier";
+        let frames = TranscriptFrameSequence::new(
+            BmuxApp::new_with_history(Some(session_id), &[], &[], false),
+            100,
+            40,
+        )
+        .run([
+            TranscriptFrameStep {
+                label: "assistant-position-2",
+                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                    session_id,
+                    kind: bcode_session_models::SessionLiveEventKind::AssistantTextStreamUpdated {
+                        output_position: Some(bcode_session_models::TurnOutputPosition::new(2)),
+                        turn_id: turn_id.to_owned(),
+                        segment_id: "segment-0".to_owned(),
+                        segment_order: 0,
+                        update: TextStreamUpdate {
+                            generation: 0,
+                            first_revision: 1,
+                            revision: 1,
+                            operation: TextStreamOperation::Append {
+                                expected_offset: 0,
+                                text: "Answer before status".to_owned(),
+                            },
+                        },
+                    },
+                }),
+            },
+            TranscriptFrameStep {
+                label: "system-barrier",
+                input: TranscriptFrameInput::Durable(durable(
+                    session_id,
+                    1,
+                    SessionEventKind::SystemMessage {
+                        text: "System status barrier".to_owned(),
+                    },
+                )),
+            },
+            TranscriptFrameStep {
+                label: "reasoning-position-0",
+                input: TranscriptFrameInput::Live(SessionLiveEvent {
+                    session_id,
+                    kind: bcode_session_models::SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                        output_position: Some(bcode_session_models::TurnOutputPosition::new(0)),
+                        turn_id: turn_id.to_owned(),
+                        activity_id: "reasoning-1".to_owned(),
+                        activity_order: 0,
+                        part_id: "summary-0".to_owned(),
+                        kind: bcode_session_models::ReasoningContentKind::Summary,
+                        role: bcode_session_models::ReasoningContentRole::Milestone,
+                        part_order: 0,
+                        update: TextStreamUpdate {
+                            generation: 0,
+                            first_revision: 1,
+                            revision: 1,
+                            operation: TextStreamOperation::Append {
+                                expected_offset: 0,
+                                text: "Reasoning after status".to_owned(),
+                            },
+                        },
+                    },
+                }),
+            },
+        ]);
+
+        let items = &frames[2].observation.semantic_items;
+        let item_for = |needle: &str| {
+            items
+                .iter()
+                .position(|(id, _)| id.get().contains(needle))
+                .unwrap_or_else(|| panic!("missing item containing {needle}: {items:?}"))
+        };
+        assert!(
+            item_for("assistant-turn") < item_for("event:1")
+                && item_for("event:1") < item_for("reasoning"),
+            "{items:?}"
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn screenshot_scale_tool_and_metadata_sequence_has_no_operational_transcript_rows() {
         let session_id = SessionId::new();

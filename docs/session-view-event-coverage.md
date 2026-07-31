@@ -18,7 +18,9 @@ limited to terminal interaction, status, and activity side effects and cannot co
 transcript rows.
 
 The target composition for tools is one stable primary transcript item per invocation, updated by
-monotonic revision and closed without a separate final presentation object. Existing
+monotonic revision and closed without a separate final presentation object. Provider output position
+refines ordering only within a contiguous run of positioned items from the same application turn;
+unpositioned rows and rows from another turn preserve canonical transcript boundaries. Existing
 request/progress/result placement rows remain supported-history compatibility coverage until an
 explicit version cutoff; they are not the target extension contract.
 

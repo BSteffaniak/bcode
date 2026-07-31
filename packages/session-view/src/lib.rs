@@ -2525,51 +2525,51 @@ impl SessionView {
             turn_id: turn_id.to_owned(),
             position,
         };
-        if self.snapshot.transcript.items[index]
+        let location_changed = self.snapshot.transcript.items[index]
             .output_location
             .as_ref()
-            == Some(&location)
-        {
-            return;
+            != Some(&location);
+        if location_changed {
+            self.snapshot.transcript.items[index].output_location = Some(location.clone());
+            self.snapshot.transcript.items[index].revision = self.snapshot.transcript.items[index]
+                .revision
+                .saturating_add(1);
         }
-        let mut item = self.snapshot.transcript.items.remove(index);
-        item.output_location = Some(location.clone());
-        item.revision = item.revision.saturating_add(1);
 
-        let insert_at = self
-            .snapshot
-            .transcript
-            .items
-            .iter()
-            .position(|candidate| {
-                candidate
+        let mut ordered_index = index;
+        while ordered_index > 0
+            && output_location_precedes(
+                Some(&location),
+                self.snapshot.transcript.items[ordered_index - 1]
                     .output_location
-                    .as_ref()
-                    .is_some_and(|candidate_location| {
-                        candidate_location.turn_id == location.turn_id
-                            && candidate_location.position > location.position
-                    })
-            })
-            .or_else(|| {
-                self.snapshot
-                    .transcript
-                    .items
-                    .iter()
-                    .rposition(|candidate| {
-                        candidate
-                            .output_location
-                            .as_ref()
-                            .is_some_and(|candidate_location| {
-                                candidate_location.turn_id == location.turn_id
-                                    && candidate_location.position < location.position
-                            })
-                    })
-                    .map(|index| index.saturating_add(1))
-            })
-            .unwrap_or_else(|| index.min(self.snapshot.transcript.items.len()));
-        self.snapshot.transcript.items.insert(insert_at, item);
-        self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
-        self.bump_revision();
+                    .as_ref(),
+            )
+        {
+            self.snapshot
+                .transcript
+                .items
+                .swap(ordered_index - 1, ordered_index);
+            ordered_index -= 1;
+        }
+        while ordered_index + 1 < self.snapshot.transcript.items.len()
+            && output_location_precedes(
+                self.snapshot.transcript.items[ordered_index + 1]
+                    .output_location
+                    .as_ref(),
+                Some(&location),
+            )
+        {
+            self.snapshot
+                .transcript
+                .items
+                .swap(ordered_index, ordered_index + 1);
+            ordered_index += 1;
+        }
+
+        if location_changed || ordered_index != index {
+            self.snapshot.transcript.revision = self.snapshot.transcript.revision.saturating_add(1);
+            self.bump_revision();
+        }
     }
 
     const fn bump_revision(&mut self) {
@@ -3744,6 +3744,18 @@ fn upsert_by<T>(items: &mut Vec<T>, value: T, key: impl Fn(&T) -> &str) {
     } else {
         items.push(value);
     }
+}
+
+fn output_location_precedes(
+    candidate: Option<&TurnOutputLocation>,
+    neighbor: Option<&TurnOutputLocation>,
+) -> bool {
+    matches!(
+        (candidate, neighbor),
+        (Some(candidate), Some(neighbor))
+            if candidate.turn_id == neighbor.turn_id
+                && candidate.position < neighbor.position
+    )
 }
 
 fn provider_to_display_selection(provider: &str) -> Option<String> {
@@ -9754,6 +9766,239 @@ mod tests {
             TranscriptViewItemKind::SystemMessage { message }
                 if message.text
                     == "Ralph started\n* Loop: loop\n* running\n* State: .bcode/ralph/loop"
+        ));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)] // One compact fixture covers system, user, and different-turn ordering barriers.
+    fn positioned_ordering_stops_at_unpositioned_and_different_turn_boundaries() {
+        let mut view = SessionView::new();
+        let high = TranscriptViewItemId::new("high");
+        let system = TranscriptViewItemId::new("system");
+        let low = TranscriptViewItemId::new("low");
+        let other_turn = TranscriptViewItemId::new("other-turn");
+        let earliest = TranscriptViewItemId::new("earliest");
+        let user = TranscriptViewItemId::new("user");
+        let after_user = TranscriptViewItemId::new("after-user");
+
+        view.push_item(
+            high.clone(),
+            1,
+            Some(10),
+            false,
+            TranscriptViewItemKind::AssistantMessage {
+                message: ChatMessageView::markdown("high"),
+            },
+        );
+        view.assign_output_location(
+            &high,
+            "turn-1",
+            Some(bcode_session_models::TurnOutputPosition::new(2)),
+        );
+        view.push_item(
+            system.clone(),
+            2,
+            Some(20),
+            false,
+            TranscriptViewItemKind::SystemMessage {
+                message: ChatMessageView::markdown("barrier"),
+            },
+        );
+        view.push_item(
+            low.clone(),
+            3,
+            Some(30),
+            false,
+            TranscriptViewItemKind::AssistantMessage {
+                message: ChatMessageView::markdown("low"),
+            },
+        );
+        view.assign_output_location(
+            &low,
+            "turn-1",
+            Some(bcode_session_models::TurnOutputPosition::new(1)),
+        );
+        view.push_item(
+            other_turn.clone(),
+            4,
+            Some(40),
+            false,
+            TranscriptViewItemKind::AssistantMessage {
+                message: ChatMessageView::markdown("other"),
+            },
+        );
+        view.assign_output_location(
+            &other_turn,
+            "turn-2",
+            Some(bcode_session_models::TurnOutputPosition::new(0)),
+        );
+        view.push_item(
+            earliest.clone(),
+            5,
+            Some(50),
+            false,
+            TranscriptViewItemKind::AssistantMessage {
+                message: ChatMessageView::markdown("earliest"),
+            },
+        );
+        view.assign_output_location(
+            &earliest,
+            "turn-1",
+            Some(bcode_session_models::TurnOutputPosition::new(0)),
+        );
+        view.push_item(
+            user.clone(),
+            6,
+            Some(60),
+            false,
+            TranscriptViewItemKind::UserMessage {
+                message: ChatMessageView::markdown("user barrier"),
+            },
+        );
+        view.push_item(
+            after_user.clone(),
+            7,
+            Some(70),
+            false,
+            TranscriptViewItemKind::AssistantMessage {
+                message: ChatMessageView::markdown("after user"),
+            },
+        );
+        view.assign_output_location(
+            &after_user,
+            "turn-1",
+            Some(bcode_session_models::TurnOutputPosition::new(0)),
+        );
+
+        assert_eq!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .map(|item| item.id.clone())
+                .collect::<Vec<_>>(),
+            vec![high, system, low, other_turn, earliest, user, after_user]
+        );
+    }
+
+    #[test]
+    fn equal_output_positions_preserve_canonical_order() {
+        let mut view = SessionView::new();
+        for (sequence, id) in [(1, "first"), (2, "second"), (3, "third")] {
+            let id = TranscriptViewItemId::new(id);
+            view.push_item(
+                id.clone(),
+                sequence,
+                Some(sequence * 10),
+                false,
+                TranscriptViewItemKind::AssistantMessage {
+                    message: ChatMessageView::markdown(id.get()),
+                },
+            );
+            view.assign_output_location(
+                &id,
+                "turn-1",
+                Some(bcode_session_models::TurnOutputPosition::new(1)),
+            );
+        }
+
+        assert_eq!(
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .map(|item| item.id.get())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
+        );
+    }
+
+    #[test]
+    fn live_finalization_and_durable_replay_preserve_system_message_barrier() {
+        let session_id = SessionId::new();
+        let turn_id = "turn-barrier";
+        let durable = [
+            event(
+                session_id,
+                1,
+                SessionEventKind::PositionedAssistantResponseSegment {
+                    turn_id: turn_id.to_owned(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(2),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
+                    text: "answer".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::SystemMessage {
+                    text: "status".to_owned(),
+                },
+            ),
+            event(
+                session_id,
+                3,
+                SessionEventKind::PositionedAssistantReasoningActivity {
+                    turn_id: turn_id.to_owned(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(0),
+                    activity: bcode_session_models::ReasoningActivity {
+                        activity_id: "reasoning-0".to_owned(),
+                        order: 0,
+                        status: bcode_session_models::ReasoningActivityStatus::Completed,
+                        parts: vec![bcode_session_models::ReasoningPart {
+                            part_id: "summary-0".to_owned(),
+                            kind: bcode_session_models::ReasoningContentKind::Summary,
+                            role: bcode_session_models::ReasoningContentRole::Milestone,
+                            order: 0,
+                            text: "reasoning".to_owned(),
+                        }],
+                        opaque: false,
+                    },
+                },
+            ),
+        ];
+        let mut live_then_durable = SessionView::new();
+        live_then_durable.apply_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                output_position: Some(bcode_session_models::TurnOutputPosition::new(2)),
+                turn_id: turn_id.to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                update: bcode_session_models::TextStreamUpdate {
+                    generation: 0,
+                    first_revision: 1,
+                    revision: 1,
+                    operation: bcode_session_models::TextStreamOperation::Append {
+                        expected_offset: 0,
+                        text: "answer".to_owned(),
+                    },
+                },
+            },
+        });
+        live_then_durable.apply_history(&durable);
+        let mut replayed = SessionView::new();
+        replayed.apply_history(&durable);
+        let document = |view: &SessionView| {
+            view.snapshot()
+                .transcript
+                .items
+                .iter()
+                .map(|item| {
+                    (
+                        item.id.clone(),
+                        item.output_location.clone(),
+                        item.kind.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(document(&live_then_durable), document(&replayed));
+        assert!(matches!(
+            replayed.snapshot().transcript.items[1].kind,
+            TranscriptViewItemKind::SystemMessage { .. }
         ));
     }
 

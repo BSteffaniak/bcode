@@ -915,6 +915,9 @@ pub enum TextStreamViewStatus {
 }
 
 /// Cross-type semantic location of one transcript item within a model turn.
+///
+/// This refines ordering only inside a contiguous run of positioned items from the same turn.
+/// Unpositioned items and items from another turn preserve canonical transcript boundaries.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct TurnOutputLocation {
     /// Application model turn that owns the output unit.
