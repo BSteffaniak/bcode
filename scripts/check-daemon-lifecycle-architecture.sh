@@ -14,8 +14,11 @@ tui_sources = "\n".join(
     path.read_text(encoding="utf-8") for path in Path("packages/tui/src").rglob("*.rs")
 )
 cli = Path("packages/cli/src/lib.rs").read_text(encoding="utf-8")
+invariants = Path("INVARIANTS.md").read_text(encoding="utf-8")
 
 required = {
+    "daemon artifact isolation invariant must remain cataloged":
+        "**Daemon artifact versions are isolated.**" in invariants,
     "IPC endpoint routing must not hash the running executable":
         "current_executable_fingerprint()" not in ipc,
     "IPC must expose typed exact artifact identity":

@@ -9,6 +9,7 @@ An invariant is a durable condition of a valid product or architecture. Contribu
 * **Bcode remains independently usable.** BMUX and other integrations may extend Bcode, but they must not become prerequisites for unrelated core operation.
 * **Product semantics are frontend-independent.** Terminal, web, desktop, SDK, and future clients may present behavior differently, but no frontend exclusively defines shared product behavior.
 * **Clients use defined application boundaries.** Frontends and integrations must not acquire private daemon, persistence, or provider implementation details to perform application behavior.
+* **Daemon artifact versions are isolated.** A client may connect only to the exact daemon artifact identity it targets; when no matching daemon is available, startup coordination launches one matching daemon without replacing, blocking, or depending on other artifact versions.
 
 ## Package and dependency ownership
 
