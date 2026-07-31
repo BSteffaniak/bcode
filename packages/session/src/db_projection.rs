@@ -48,7 +48,8 @@ impl MaterializedProjection {
     pub const fn schema_version(self) -> u32 {
         match self {
             Self::RequestContextOccupancy => 4,
-            Self::Transcript | Self::ToolRuns => 2,
+            Self::Transcript => 3,
+            Self::ToolRuns => 2,
             Self::SessionState
             | Self::InputHistory
             | Self::ArtifactReferences
@@ -145,7 +146,7 @@ mod tests {
             MaterializedProjection::RequestContextOccupancy.schema_version(),
             4
         );
-        assert_eq!(MaterializedProjection::Transcript.schema_version(), 2);
+        assert_eq!(MaterializedProjection::Transcript.schema_version(), 3);
         assert_eq!(MaterializedProjection::ToolRuns.schema_version(), 2);
         assert_eq!(
             MaterializedProjection::ArtifactReferences.as_str(),

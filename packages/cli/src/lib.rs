@@ -1965,6 +1965,7 @@ enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Rebuild model-context and transcript indexes from canonical history.
     Reindex {
         session_id: SessionId,
     },
@@ -8504,7 +8505,7 @@ async fn reindex_session_model_context(session_id: SessionId) -> Result<(), CliE
     )?;
     let db = bcode_session::db::SessionDb::open_existing_turso_in_root(session_id, &root).await?;
     db.validate_write_readiness().await?;
-    let event_count = db.reindex_model_context(&maintenance, &write).await?;
+    let event_count = db.reindex_session_projections(&maintenance, &write).await?;
     let canonical_tail = db.last_event_sequence().await?;
     let model_context = db.model_context_projection_status().await?;
     let verified = matches!(
@@ -8513,7 +8514,7 @@ async fn reindex_session_model_context(session_id: SessionId) -> Result<(), CliE
             if Some(checkpoint) == canonical_tail
     );
     println!(
-        "Reindexed model context for session {session_id} from {event_count} canonical events"
+        "Reindexed session projections for session {session_id} from {event_count} canonical events"
     );
     println!(
         "verification: canonical_tail={canonical_tail:?} model_context={model_context:?} verified={verified}"

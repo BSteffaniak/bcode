@@ -37,7 +37,9 @@ pub use context_management::{
     RequestContextTokenCount,
 };
 
-/// Stable zero-based position of one semantic output unit within a model turn.
+/// Stable zero-based position of one semantic output unit within a provider round.
+///
+/// The host rebases provider-round positions into the application turn's ordering domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TurnOutputPosition(u64);

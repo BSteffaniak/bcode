@@ -5,9 +5,11 @@ This document is the normative behavioral contract for the versioned
 operation inventory live in `bcode_model`; the reusable deterministic harness lives in
 `bcode_model_provider_runtime`.
 
-Version 2 retains the v1 operation and request/response inventory, but semantic turn output uses
+Version 2 retains the v1 operation and request/response inventory, but semantic provider-round output uses
 `ProviderTurnEvent::Output` with stable `TurnOutputPosition` values across assistant text,
-structured reasoning, and tool calls. Bundled providers advertise both versions during the
+structured reasoning, and tool calls. Positions are scoped to one provider round; hosts that compose
+multiple provider rounds into one application turn must rebase them into a non-overlapping turn-wide
+ordering domain before publishing or persisting shared transcript state. Bundled providers advertise both versions during the
 compatibility window. Hosts prefer v2 for a provider that advertises it and fall back to v1 for
 legacy plugins. A turn must use one selected interface consistently for start, poll, cancellation,
 and finish.

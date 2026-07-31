@@ -109,7 +109,7 @@ pub(crate) const LEGACY_SESSION_STORAGE_WRITER_EPOCH: u32 = 2;
 const PREVIOUS_SESSION_STORAGE_WRITER_EPOCH: u32 = 3;
 const SESSION_STORAGE_CONTRACT_ID: i32 = 1;
 const SESSION_STORAGE_CONTRACT_SCHEMA_VERSION: u32 = 1;
-const MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u32 = 2;
+const MODEL_CONTEXT_PROJECTION_SCHEMA_VERSION: u32 = 3;
 const MODEL_CONTEXT_PROJECTION_ID: i32 = 1;
 const CONTEXT_OCCUPANCY_PROJECTION_SCHEMA_VERSION: u32 = 4;
 const CONTEXT_OCCUPANCY_PROJECTION_ID: i32 = 1;
@@ -2091,6 +2091,27 @@ impl SessionDb {
         }
     }
 
+    /// Explicitly rebuild model-context and transcript projections from strict canonical history.
+    ///
+    /// This maintenance operation is never called by normal read or append paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if canonical history is invalid or projection replacement fails.
+    pub async fn reindex_session_projections(
+        &self,
+        _maintenance: &crate::lease::SessionMaintenanceGuard,
+        _write: &crate::lease::SessionWriteGuard,
+    ) -> SessionDbResult<usize> {
+        let tx = self.db.begin_transaction().await?;
+        let events = strict_events(&*tx).await?;
+        validate_contiguous_canonical_events(&events)?;
+        rebuild_model_context_projection_from_events(&*tx, &events).await?;
+        rebuild_transcript_projection_from_events(&*tx, &events).await?;
+        tx.commit().await?;
+        Ok(events.len())
+    }
+
     /// Explicitly rebuild the model-context projection from strict canonical history.
     ///
     /// This maintenance operation is never called by normal read or append paths.
@@ -3131,6 +3152,12 @@ fn report_migration_progress(
 
 async fn rebuild_model_context_projection(db: &dyn Database) -> SessionDbResult<usize> {
     let events = strict_events(db).await?;
+    validate_contiguous_canonical_events(&events)?;
+    rebuild_model_context_projection_from_events(db, &events).await?;
+    Ok(events.len())
+}
+
+fn validate_contiguous_canonical_events(events: &[SessionEvent]) -> SessionDbResult<()> {
     for (index, event) in events.iter().enumerate() {
         let expected = u64::try_from(index).unwrap_or(u64::MAX);
         if event.sequence != expected {
@@ -3140,15 +3167,35 @@ async fn rebuild_model_context_projection(db: &dyn Database) -> SessionDbResult<
             });
         }
     }
+    Ok(())
+}
 
+async fn rebuild_model_context_projection_from_events(
+    db: &dyn Database,
+    events: &[SessionEvent],
+) -> SessionDbResult<()> {
     db.delete("model_context_entries").execute(db).await?;
     db.delete("model_context_projection_state")
         .execute(db)
         .await?;
-    for event in &events {
+    for event in events {
         project_model_context_event(db, event).await?;
     }
-    Ok(events.len())
+    Ok(())
+}
+
+async fn rebuild_transcript_projection_from_events(
+    db: &dyn Database,
+    events: &[SessionEvent],
+) -> SessionDbResult<()> {
+    db.delete("transcript_items").execute(db).await?;
+    for event in events {
+        project_event(db, event, false).await?;
+    }
+    if let Some(tail) = events.last() {
+        update_projection_checkpoint(db, MaterializedProjection::Transcript, tail).await?;
+    }
+    Ok(())
 }
 
 async fn validate_storage_writer_contract_for_epoch(
@@ -3640,7 +3687,8 @@ async fn project_event(
                 .await?;
         }
         SessionEventKind::AssistantMessage { text }
-        | SessionEventKind::AssistantResponseSegment { text, .. } => {
+        | SessionEventKind::AssistantResponseSegment { text, .. }
+        | SessionEventKind::PositionedAssistantResponseSegment { text, .. } => {
             insert_transcript_item(
                 db,
                 event,
@@ -3652,6 +3700,11 @@ async fn project_event(
             .await?;
         }
         SessionEventKind::ToolCallRequested {
+            tool_call_id,
+            tool_name,
+            ..
+        }
+        | SessionEventKind::PositionedToolCallRequested {
             tool_call_id,
             tool_name,
             ..
@@ -3722,15 +3775,6 @@ async fn project_event(
                 )
                 .await?;
             }
-            insert_transcript_item(
-                db,
-                event,
-                "runtime",
-                "invocation_lifecycle",
-                status,
-                lifecycle.message.clone(),
-            )
-            .await?;
         }
         SessionEventKind::ToolContribution {
             event: contribution,
@@ -6997,7 +7041,7 @@ mod tests {
                 .expect("projection status"),
             ModelContextProjectionStatus::Incompatible {
                 actual: 1,
-                expected: 2,
+                expected: 3,
             }
         );
         let state = reopened
@@ -7643,7 +7687,7 @@ mod tests {
                 .expect_err("incompatible version must surface"),
             SessionDbError::ModelContextProjectionVersion {
                 actual: 1,
-                expected: 2,
+                expected: 3,
             }
         ));
 

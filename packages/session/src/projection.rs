@@ -5,6 +5,7 @@ use bcode_session_models::{
 };
 use std::collections::BTreeMap;
 
+#[cfg(test)]
 pub(crate) fn projection_window_from_db_transcript_items(
     items: &[crate::db::TranscriptItem],
     first_event_sequence: Option<u64>,
@@ -34,6 +35,7 @@ pub(crate) fn projection_window_from_db_transcript_items(
     )
 }
 
+#[cfg(test)]
 fn projection_window_from_transcript_projection_items(
     spans: &mut [TranscriptProjectionItem],
     first_event_sequence: Option<u64>,
@@ -87,6 +89,7 @@ fn projection_window_from_transcript_projection_items(
     })
 }
 
+#[cfg(test)]
 fn transcript_projection_kind_from_db_item(
     item: &crate::db::TranscriptItem,
 ) -> TranscriptProjectionItemKind {
@@ -373,7 +376,8 @@ impl TranscriptProjectionBuilder {
                 self.push_stream_delta(TranscriptProjectionItemKind::AssistantMessage, event, text);
             }
             SessionEventKind::AssistantMessage { text }
-            | SessionEventKind::AssistantResponseSegment { text, .. } => {
+            | SessionEventKind::AssistantResponseSegment { text, .. }
+            | SessionEventKind::PositionedAssistantResponseSegment { text, .. } => {
                 self.finish_stream(TranscriptProjectionItemKind::AssistantMessage, event, text);
             }
             SessionEventKind::AssistantReasoningDelta { text } => {
@@ -382,7 +386,8 @@ impl TranscriptProjectionBuilder {
             SessionEventKind::AssistantReasoningMessage { text } => {
                 self.finish_stream(TranscriptProjectionItemKind::Reasoning, event, text);
             }
-            SessionEventKind::AssistantReasoningActivity { activity, .. } => {
+            SessionEventKind::AssistantReasoningActivity { activity, .. }
+            | SessionEventKind::PositionedAssistantReasoningActivity { activity, .. } => {
                 self.flush_streams();
                 let content_bytes = activity
                     .parts
@@ -397,6 +402,11 @@ impl TranscriptProjectionBuilder {
                 );
             }
             SessionEventKind::ToolCallRequested {
+                tool_call_id,
+                arguments_json,
+                ..
+            }
+            | SessionEventKind::PositionedToolCallRequested {
                 tool_call_id,
                 arguments_json,
                 ..
@@ -599,10 +609,6 @@ fn non_streaming_item(event: &SessionEvent) -> Option<(TranscriptProjectionItemK
         SessionEventKind::PermissionResolved { .. } => {
             Some((TranscriptProjectionItemKind::Permission, 0))
         }
-        SessionEventKind::ToolInvocationLifecycle { event } => Some((
-            TranscriptProjectionItemKind::Other,
-            event.message.as_ref().map_or(0, String::len),
-        )),
         SessionEventKind::ToolContribution { event } => Some((
             TranscriptProjectionItemKind::Other,
             serde_json::to_vec(event).map_or(0, |encoded| encoded.len()),
@@ -919,6 +925,74 @@ mod tests {
 
         assert_eq!(window.transcript_items.len(), 1);
         assert_eq!(window.source_range.expect("source range").start_sequence, 2);
+    }
+
+    #[test]
+    fn positioned_semantics_are_transcript_items_and_lifecycle_is_not() {
+        let session_id = SessionId::new();
+        let events = vec![
+            event(
+                session_id,
+                1,
+                SessionEventKind::PositionedToolCallRequested {
+                    turn_id: "turn-1".to_owned(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(0),
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "filesystem.read".to_owned(),
+                    arguments_json: "{}".to_owned(),
+                    producer_plugin_id: None,
+                    working_directory: None,
+                },
+            ),
+            event(
+                session_id,
+                2,
+                SessionEventKind::ToolInvocationLifecycle {
+                    event: bcode_session_models::ToolInvocationLifecycleEvent {
+                        invocation_id: "call-1".to_owned(),
+                        sequence: 1,
+                        stage: bcode_session_models::ToolInvocationLifecycleStage::Started,
+                        message: Some("running".to_owned()),
+                        metadata: serde_json::Value::Object(serde_json::Map::new()),
+                    },
+                },
+            ),
+            event(
+                session_id,
+                3,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "done".to_owned(),
+                        is_error: false,
+                        presentation: None,
+                        result: None,
+                    },
+                },
+            ),
+            event(
+                session_id,
+                4,
+                SessionEventKind::PositionedAssistantResponseSegment {
+                    turn_id: "turn-1".to_owned(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(1),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
+                    text: "answer".to_owned(),
+                },
+            ),
+        ];
+
+        let items = build_transcript_projection(&events, Some(80));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind, TranscriptProjectionItemKind::ToolInvocation);
+        assert_eq!(items[0].source_range.start_sequence, 1);
+        assert_eq!(items[0].source_range.end_sequence, 3);
+        assert_eq!(
+            items[1].kind,
+            TranscriptProjectionItemKind::AssistantMessage
+        );
+        assert_eq!(items[1].source_range.start_sequence, 4);
     }
 
     #[test]

@@ -1524,6 +1524,7 @@ pub fn conversational_units(
             event.kind,
             SessionEventKind::AssistantMessage { .. }
                 | SessionEventKind::AssistantResponseSegment { .. }
+                | SessionEventKind::PositionedAssistantResponseSegment { .. }
         ) && pending_tool_calls.is_empty()
             && units
                 .last()
@@ -1549,7 +1550,8 @@ pub fn conversational_units(
         }
         let unit = units.last_mut().expect("unit is created before use");
         match &event.kind {
-            SessionEventKind::ToolCallRequested { tool_call_id, .. } => {
+            SessionEventKind::ToolCallRequested { tool_call_id, .. }
+            | SessionEventKind::PositionedToolCallRequested { tool_call_id, .. } => {
                 pending_tool_calls.insert(tool_call_id.clone());
             }
             SessionEventKind::ToolInvocationResultRecorded { record } => {
@@ -1722,12 +1724,19 @@ pub fn session_event_compaction_line(
             truncate_text(text, COMPACTION_MAX_EVENT_CONTENT_CHARS)
         )),
         SessionEventKind::AssistantMessage { text }
-        | SessionEventKind::AssistantResponseSegment { text, .. } => Some(format!(
+        | SessionEventKind::AssistantResponseSegment { text, .. }
+        | SessionEventKind::PositionedAssistantResponseSegment { text, .. } => Some(format!(
             "#{} assistant:\n{}",
             event.sequence,
             truncate_text(text, COMPACTION_MAX_EVENT_CONTENT_CHARS)
         )),
         SessionEventKind::ToolCallRequested {
+            tool_call_id,
+            tool_name,
+            arguments_json,
+            ..
+        }
+        | SessionEventKind::PositionedToolCallRequested {
             tool_call_id,
             tool_name,
             arguments_json,

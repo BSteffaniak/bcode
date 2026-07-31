@@ -16371,6 +16371,7 @@ async fn run_model_turn_inner(
     };
     let mut round = 0_u32;
     let mut next_assistant_segment_order = 0_u32;
+    let mut next_output_position = 0_u64;
     let mut recovery = ModelTurnRecoveryState::default();
     let mut last_proactive_compaction_boundary = None;
     let mut last_proactive_attempt_boundary = None;
@@ -16570,6 +16571,7 @@ async fn run_model_turn_inner(
             ModelTurnRoundContext {
                 turn_id: &turn_id,
                 next_assistant_segment_order: &mut next_assistant_segment_order,
+                next_output_position: &mut next_output_position,
                 provider_plugin_id: provider_plugin_id.as_deref(),
                 request: &request,
                 context_projection: &context_projection,
@@ -17452,6 +17454,7 @@ async fn active_plugin_scope_for_tool_call(
 struct ModelTurnRoundContext<'a> {
     turn_id: &'a str,
     next_assistant_segment_order: &'a mut u32,
+    next_output_position: &'a mut u64,
     provider_plugin_id: Option<&'a str>,
     request: &'a ModelTurnRequest,
     context_projection: &'a bcode_session_models::RequestContextObservation,
@@ -17468,6 +17471,7 @@ async fn run_model_turn_round(
     let ModelTurnRoundContext {
         turn_id,
         next_assistant_segment_order,
+        next_output_position,
         provider_plugin_id,
         request,
         context_projection,
@@ -17578,6 +17582,7 @@ async fn run_model_turn_round(
         ModelPollContext {
             turn_id,
             next_assistant_segment_order,
+            next_output_position,
             provider_plugin_id,
             provider_turn_id: &start.provider_turn_id,
         },
@@ -17783,6 +17788,7 @@ async fn append_model_provider_round_finished_trace(
 struct ModelPollContext<'a> {
     turn_id: &'a str,
     next_assistant_segment_order: &'a mut u32,
+    next_output_position: &'a mut u64,
     provider_plugin_id: Option<&'a str>,
     provider_turn_id: &'a str,
 }
@@ -17798,6 +17804,7 @@ async fn poll_model_turn_events(
     let ModelPollContext {
         turn_id,
         next_assistant_segment_order,
+        next_output_position,
         provider_plugin_id,
         provider_turn_id,
     } = poll;
@@ -17808,6 +17815,7 @@ async fn poll_model_turn_events(
         Arc::clone(&cancel_state),
     );
     let mut outcome = ModelPollOutcome::default();
+    let output_position_base = *next_output_position;
     let mut stream_progress = ModelStreamProgress::default();
     let mut idle_for = Duration::ZERO;
     let mut no_progress_warned = false;
@@ -17890,6 +17898,7 @@ async fn poll_model_turn_events(
             response.events.len() as u64,
         );
         for event in response.events {
+            let event = rebase_provider_output_event(event, output_position_base);
             handle_provider_turn_event(
                 state,
                 session_id,
@@ -17941,7 +17950,29 @@ async fn poll_model_turn_events(
     )
     .await;
     stream.flush(state).await;
-    (stream.finish(), outcome)
+    let assistant = stream.finish();
+    let max_position = outcome
+        .tool_output_positions
+        .values()
+        .map(|(_, position)| position.get())
+        .chain(
+            outcome
+                .reasoning_activities
+                .values()
+                .filter_map(|activity| activity.output_position)
+                .map(bcode_session_models::TurnOutputPosition::get),
+        )
+        .chain(
+            assistant
+                .as_ref()
+                .and_then(|segment| segment.output_position)
+                .map(bcode_session_models::TurnOutputPosition::get),
+        )
+        .max();
+    if let Some(max_position) = max_position {
+        *next_output_position = max_position.saturating_add(1);
+    }
+    (assistant, outcome)
 }
 
 fn model_events_include_progress(events: &[ProviderTurnEvent]) -> bool {
@@ -18063,6 +18094,22 @@ async fn wait_for_model_progress_or_timeout(
             ));
             None
         }
+    }
+}
+
+fn rebase_provider_output_event(
+    event: ProviderTurnEvent,
+    output_position_base: u64,
+) -> ProviderTurnEvent {
+    let ProviderTurnEvent::Output { position, event } = event else {
+        return event;
+    };
+    let rebased = bcode_session_models::TurnOutputPosition::new(
+        output_position_base.saturating_add(position.get()),
+    );
+    ProviderTurnEvent::Output {
+        position: rebased,
+        event,
     }
 }
 
@@ -24895,6 +24942,12 @@ fn session_events_to_sanitized_model_messages(
                 tool_name,
                 arguments_json,
                 ..
+            }
+            | SessionEventKind::PositionedToolCallRequested {
+                tool_call_id,
+                tool_name,
+                arguments_json,
+                ..
             } => {
                 if seen_tool_call_ids.contains(tool_call_id) {
                     append_missing_tool_results(&mut messages, &mut pending_tool_call_ids);
@@ -25035,7 +25088,8 @@ fn non_tool_session_event_to_model_message(
             content: vec![ContentBlock::Text { text: text.clone() }],
         }),
         SessionEventKind::AssistantMessage { text }
-        | SessionEventKind::AssistantResponseSegment { text, .. } => Some(ModelMessage {
+        | SessionEventKind::AssistantResponseSegment { text, .. }
+        | SessionEventKind::PositionedAssistantResponseSegment { text, .. } => Some(ModelMessage {
             role: MessageRole::Assistant,
             content: vec![ContentBlock::Text { text: text.clone() }],
         }),
@@ -38772,6 +38826,65 @@ library = "test"
     }
 
     #[test]
+    fn positioned_tool_round_is_reconstructed_as_structured_model_context() {
+        let session_id = SessionId::new();
+        let turn_id = "turn-1".to_owned();
+        let history = vec![
+            session_event(
+                session_id,
+                1,
+                SessionEventKind::PositionedToolCallRequested {
+                    turn_id: turn_id.clone(),
+                    output_position: bcode_session_models::TurnOutputPosition::new(0),
+                    tool_call_id: "call-1".to_owned(),
+                    tool_name: "filesystem.read".to_owned(),
+                    arguments_json: r#"{"path":"README.md"}"#.to_owned(),
+                    producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                    working_directory: None,
+                },
+            ),
+            session_event(
+                session_id,
+                2,
+                SessionEventKind::ToolInvocationResultRecorded {
+                    record: bcode_session_models::ToolInvocationResultRecord {
+                        invocation_id: "call-1".to_owned(),
+                        model_output: "contents".to_owned(),
+                        is_error: false,
+                        presentation: None,
+                        result: None,
+                    },
+                },
+            ),
+            session_event(
+                session_id,
+                3,
+                SessionEventKind::PositionedAssistantResponseSegment {
+                    turn_id,
+                    output_position: bcode_session_models::TurnOutputPosition::new(1),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
+                    text: "done".to_owned(),
+                },
+            ),
+        ];
+
+        let messages = session_events_to_model_messages(&history);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0].role, MessageRole::Assistant);
+        assert!(matches!(
+            messages[0].content.as_slice(),
+            [ContentBlock::ToolCall { .. }]
+        ));
+        assert_eq!(messages[1].role, MessageRole::Tool);
+        assert_eq!(messages[2].role, MessageRole::Assistant);
+        assert!(matches!(
+            messages[2].content.as_slice(),
+            [ContentBlock::Text { text }] if text == "done"
+        ));
+    }
+
+    #[test]
     fn completed_assistant_segment_is_model_visible_and_workflow_addressable() {
         let session_id = SessionId::new();
         let turn_id = "turn-1".to_owned();
@@ -43314,8 +43427,9 @@ library = "test"
             newer
                 .projection_window
                 .expect("newer metadata")
-                .source_range,
-            Some(latest_range)
+                .source_range
+                .map(|range| range.start_sequence),
+            Some(latest_range.start_sequence)
         );
         server.abort();
     }
@@ -43626,6 +43740,11 @@ library = "test"
                 bcode_session_view_models::TranscriptViewItemKind::ToolRequestDraft { draft }
                     if draft.tool_call_id == "call-reconnect"
                         && draft.preview == "current live draft"
+            ) || matches!(
+                &item.kind,
+                bcode_session_view_models::TranscriptViewItemKind::ToolInvocation { tool }
+                    if tool.tool_call_id == "call-reconnect"
+                        && tool.request_draft.as_ref().is_some_and(|draft| draft.preview == "current live draft")
             )
         }));
         assert!(
@@ -45479,6 +45598,37 @@ library = "test"
                 .services
                 .iter()
                 .any(|service| { service.interface_id == MODEL_PROVIDER_INTERFACE_ID })
+        );
+    }
+
+    #[test]
+    fn provider_round_positions_rebase_without_colliding() {
+        let text = rebase_provider_output_event(
+            ProviderTurnEvent::Output {
+                position: bcode_session_models::TurnOutputPosition::new(0),
+                event: bcode_model::ProviderOutputEvent::TextDelta {
+                    text: "answer".to_owned(),
+                },
+            },
+            7,
+        );
+        assert_eq!(
+            text.positioned_output().map(|(position, _)| position.get()),
+            Some(7)
+        );
+        let tool = rebase_provider_output_event(
+            ProviderTurnEvent::Output {
+                position: bcode_session_models::TurnOutputPosition::new(2),
+                event: bcode_model::ProviderOutputEvent::ToolCallStarted {
+                    call_id: "call-1".to_owned(),
+                    name: "filesystem.read".to_owned(),
+                },
+            },
+            7,
+        );
+        assert_eq!(
+            tool.positioned_output().map(|(position, _)| position.get()),
+            Some(9)
         );
     }
 
@@ -48114,6 +48264,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                         event.kind,
                         SessionEventKind::AssistantMessage { .. }
                             | SessionEventKind::AssistantResponseSegment { .. }
+                            | SessionEventKind::PositionedAssistantResponseSegment { .. }
                     )
                 })
                 .count(),
@@ -48348,7 +48499,10 @@ event_symbol = "bcode_plugin_handle_event_v1"
             .iter()
             .filter_map(|event| match &event.kind {
                 SessionEventKind::AssistantMessage { text }
-                | SessionEventKind::AssistantResponseSegment { text, .. } => Some(text.as_str()),
+                | SessionEventKind::AssistantResponseSegment { text, .. }
+                | SessionEventKind::PositionedAssistantResponseSegment { text, .. } => {
+                    Some(text.as_str())
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -52296,6 +52450,13 @@ event_symbol = "bcode_plugin_handle_event_v1"
                     segment_id,
                     segment_order,
                     text,
+                }
+                | SessionEventKind::PositionedAssistantResponseSegment {
+                    turn_id: event_turn_id,
+                    segment_id,
+                    segment_order,
+                    text,
+                    ..
                 } if event_turn_id == &turn_id => {
                     Some((segment_id.as_str(), *segment_order, text.as_str()))
                 }

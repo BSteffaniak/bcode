@@ -24,9 +24,13 @@ tests, imports, and isolated stores, but all production default paths use the sa
 
 ### Positioned durable transcript events
 
-Session event schema 42 and writer epoch 6 add positioned durable assistant segments, reasoning
-activities, and tool requests. Their `TurnOutputPosition` values place different output kinds in one
-turn-local semantic ordering domain. Durable completion revises the matching live semantic identity
+Session event schema 42 and writer epoch 6 introduced positioned durable assistant segments,
+reasoning activities, and tool requests. The corrected model-context projection uses schema version
+3 so affected sessions require explicit `bcode session reindex` before additional turns. Bounded
+transcript attach now selects directly from a bounded canonical tail instead of trusting the obsolete
+derived transcript index, remaining bounded and non-mutating while explicit reindex can rebuild the
+index. `TurnOutputPosition` values place different output kinds in one application-turn semantic
+ordering domain after host rebasing. Durable completion revises the matching live semantic identity
 instead of creating an arrival-ordered replacement row. Epoch-5 history remains readable as legacy
 sequence-ordered input; migration does not invent output positions that were never recorded.
 

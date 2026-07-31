@@ -15,7 +15,9 @@ pub const fn context_history_role(kind: &SessionEventKind) -> ContextHistoryRole
         SessionEventKind::UserMessage { .. }
         | SessionEventKind::AssistantMessage { .. }
         | SessionEventKind::AssistantResponseSegment { .. }
+        | SessionEventKind::PositionedAssistantResponseSegment { .. }
         | SessionEventKind::ToolCallRequested { .. }
+        | SessionEventKind::PositionedToolCallRequested { .. }
         | SessionEventKind::ToolInvocationResultRecorded { .. }
         | SessionEventKind::SystemMessage { .. }
         | SessionEventKind::WorkingDirectoryChanged { .. }
@@ -34,7 +36,9 @@ pub const fn context_history_role_from_name(event_type: &str) -> ContextHistoryR
         b"user_message"
         | b"assistant_message"
         | b"assistant_response_segment"
+        | b"positioned_assistant_response_segment"
         | b"tool_call_requested"
+        | b"positioned_tool_call_requested"
         | b"tool_invocation_result_recorded"
         | b"system_message"
         | b"working_directory_changed"
@@ -112,7 +116,11 @@ pub const fn model_context_event_kind_name(kind: &SessionEventKind) -> &'static 
         SessionEventKind::UserMessage { .. } => "user_message",
         SessionEventKind::AssistantMessage { .. } => "assistant_message",
         SessionEventKind::AssistantResponseSegment { .. } => "assistant_response_segment",
+        SessionEventKind::PositionedAssistantResponseSegment { .. } => {
+            "positioned_assistant_response_segment"
+        }
         SessionEventKind::ToolCallRequested { .. } => "tool_call_requested",
+        SessionEventKind::PositionedToolCallRequested { .. } => "positioned_tool_call_requested",
         SessionEventKind::ToolInvocationResultRecorded { .. } => "tool_invocation_result_recorded",
         SessionEventKind::SystemMessage { .. } => "system_message",
         SessionEventKind::WorkingDirectoryChanged { .. } => "working_directory_changed",
@@ -134,6 +142,12 @@ mod tests {
         assert!(is_model_context_event_type("model_turn_started"));
         assert!(is_model_context_event_type("model_turn_finished"));
         assert!(is_model_context_event_type("assistant_response_segment"));
+        assert!(is_model_context_event_type(
+            "positioned_assistant_response_segment"
+        ));
+        assert!(is_model_context_event_type(
+            "positioned_tool_call_requested"
+        ));
         assert!(!is_model_context_event_type("request_context_observed"));
     }
 }

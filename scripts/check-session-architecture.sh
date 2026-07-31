@@ -804,7 +804,7 @@ if ! rg -q 'unknown_historical_kind_fails_writable_migration' packages/session-m
   violations=1
 fi
 
-if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 20' packages/ipc/src/lib.rs \
+if ! rg -q 'CURRENT_PROTOCOL_VERSION: u16 = 24' packages/ipc/src/lib.rs \
   || ! rg -q 'PrepareSessionOpen' packages/ipc/src/lib.rs \
   || ! rg -q 'WaitSessionOpenProgress' packages/ipc/src/lib.rs \
   || ! rg -q 'SessionOpenPrepared' packages/ipc/src/lib.rs \
@@ -1084,6 +1084,7 @@ if grep -Eq 'select\("events"\)|decode_session_event_degraded|reindex_model_cont
 fi
 
 if ! rg -q 'pub async fn reindex_model_context\(' packages/session/src/db.rs \
+  || ! rg -q 'pub async fn reindex_session_projections\(' packages/session/src/db.rs \
   || ! sed -n '/pub async fn reindex_model_context(/,/^    }/p' packages/session/src/db.rs \
       | grep -q 'SessionMaintenanceGuard'; then
   echo "Session reindex capability violation: low-level reindex must require maintenance ownership." >&2

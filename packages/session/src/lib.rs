@@ -2078,19 +2078,54 @@ impl SessionManager {
         session_id: SessionId,
         request: ProjectionWindowRequest,
     ) -> Result<ProjectionWindow, SessionError> {
-        let limit = request.limits.max_events_scanned.max(1);
-        let page = self
-            .session_history_page(
-                session_id,
-                SessionHistoryQuery {
-                    cursor: None,
+        let limit = request
+            .limits
+            .max_events_scanned
+            .clamp(1, bcode_session_models::MAX_SESSION_HISTORY_READ_EVENTS);
+        if matches!(
+            request.anchor,
+            bcode_session_models::ProjectionWindowAnchor::Latest
+        ) {
+            let page = self
+                .session_history_page(
+                    session_id,
+                    SessionHistoryQuery {
+                        cursor: None,
+                        limit,
+                        direction: SessionHistoryDirection::Backward,
+                    },
+                )
+                .await?;
+            let mut window =
+                crate::projection::projection_window_from_events(&page.events, &request)
+                    .ok_or(SessionError::UnsupportedProjectionWindow)?;
+            if let Some(range) = window.source_range.as_mut() {
+                range.end_sequence = page.events.last().map_or(range.end_sequence, |event| {
+                    event.sequence.max(range.end_sequence)
+                });
+            }
+            window.has_newer = false;
+            return Ok(window);
+        }
+        let handle = self.session_handle(session_id).await?;
+        let mut window = handle.projection_window(request).await?;
+        if let Some(range) = window.source_range.as_mut() {
+            let last = handle
+                .events_range(
+                    range.end_sequence,
+                    range
+                        .end_sequence
+                        .saturating_add(u64::try_from(limit).unwrap_or(u64::MAX)),
                     limit,
-                    direction: SessionHistoryDirection::Backward,
-                },
-            )
-            .await?;
-        crate::projection::projection_window_from_events(&page.events, &request)
-            .ok_or(SessionError::UnsupportedProjectionWindow)
+                )
+                .await?
+                .last()
+                .map(|event| event.sequence);
+            if let Some(last) = last {
+                range.end_sequence = range.end_sequence.max(last);
+            }
+        }
+        Ok(window)
     }
 
     /// Return source events in an inclusive sequence range.

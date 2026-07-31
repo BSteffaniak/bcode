@@ -1595,42 +1595,13 @@ impl SessionActor {
         &mut self,
         request: ProjectionWindowRequest,
     ) -> Result<ProjectionWindow, SessionError> {
-        if let Some(db) = self.existing_session_db().await? {
-            let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
-            let checkpoint = db
-                .materialized_projection_checkpoint(MaterializedProjection::Transcript)
-                .await?;
-            if checkpoint.is_none_or(|checkpoint| checkpoint < expected_last_sequence) {
-                return Err(SessionError::ProjectionStale {
-                    session_id: self.state.summary.id,
-                    projection: "transcript",
-                    checkpoint,
-                    expected: expected_last_sequence,
-                });
-            }
-            if !matches!(request.anchor, ProjectionWindowAnchor::Latest) {
-                return self.projection_window_from_bounded_events(&request).await;
-            }
-            let transcript_items = db
-                .transcript_items_for_latest_window(
-                    request.target.min_items.unwrap_or(1),
-                    request.limits.max_items,
-                    request.limits.max_bytes,
-                )
-                .await?;
-            return crate::projection::projection_window_from_db_transcript_items(
-                &transcript_items,
-                db.first_event_sequence().await?,
-                db.last_event_sequence().await?,
-                &request,
-            )
-            .ok_or(SessionError::UnsupportedProjectionWindow);
+        if matches!(request.anchor, ProjectionWindowAnchor::Latest) {
+            return Err(SessionError::UnsupportedProjectionWindow);
         }
-
-        if self.store.is_some() {
-            return Err(SessionError::NotFound(self.state.summary.id));
+        if self.store.is_some() || self.state.events.is_some() {
+            return self.projection_window_from_bounded_events(&request).await;
         }
-        Err(SessionError::UnsupportedProjectionWindow)
+        Err(SessionError::NotFound(self.state.summary.id))
     }
 
     async fn projection_window_from_bounded_events(
@@ -1717,43 +1688,47 @@ impl SessionActor {
         let Some(db) = self.existing_session_db().await? else {
             return Ok(None);
         };
-        let expected_last_sequence = self.state.next_sequence.saturating_sub(1);
-        match db
-            .materialized_projection_checkpoint(MaterializedProjection::Transcript)
-            .await?
-        {
-            Some(checkpoint) if checkpoint >= expected_last_sequence => {}
-            checkpoint => {
-                return Err(SessionError::ProjectionStale {
-                    session_id: self.state.summary.id,
-                    projection: "transcript",
-                    checkpoint,
-                    expected: expected_last_sequence,
-                });
-            }
-        }
-
-        let transcript_items = db.latest_transcript_items(limit).await?;
-        if transcript_items.is_empty() {
+        let latest = db.last_event_sequence().await?.unwrap_or_default();
+        let max_events = 2_048usize;
+        let start = latest.saturating_sub(
+            u64::try_from(max_events)
+                .unwrap_or(u64::MAX)
+                .saturating_sub(1),
+        );
+        let events = db.events_range(start, latest, max_events).await?;
+        let request = ProjectionWindowRequest {
+            projection: bcode_session_models::SessionProjectionKind::Transcript,
+            anchor: ProjectionWindowAnchor::Latest,
+            direction: bcode_session_models::ProjectionWindowDirection::Backward,
+            target: bcode_session_models::ProjectionWindowTarget {
+                min_items: Some(limit.max(1)),
+                min_estimated_rows: None,
+                min_bytes: None,
+                width_columns: None,
+            },
+            limits: bcode_session_models::ProjectionWindowLimits {
+                max_items: limit.max(1),
+                max_bytes: 512 * 1024,
+                max_events_scanned: 2_048,
+            },
+        };
+        let window = crate::projection::projection_window_from_events_with_source_bounds(
+            &events,
+            db.first_event_sequence().await?,
+            db.last_event_sequence().await?,
+            &request,
+        )
+        .ok_or(SessionError::UnsupportedProjectionWindow)?;
+        let Some(range) = window.source_range else {
             return Ok(Some(Vec::new()));
-        }
-
-        let start_sequence = transcript_items
-            .iter()
-            .map(|item| item.event_seq_start)
-            .min()
-            .unwrap_or(0);
-        let end_sequence = transcript_items
-            .iter()
-            .map(|item| item.event_seq_end)
-            .max()
-            .unwrap_or(start_sequence);
-        let max_events =
-            usize::try_from(end_sequence.saturating_sub(start_sequence) + 1).unwrap_or(usize::MAX);
-
+        };
         Ok(Some(
-            db.events_range(start_sequence, end_sequence, max_events)
-                .await?,
+            db.events_range(
+                range.start_sequence,
+                range.end_sequence,
+                request.limits.max_events_scanned,
+            )
+            .await?,
         ))
     }
 
