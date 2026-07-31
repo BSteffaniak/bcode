@@ -1938,6 +1938,12 @@ enum SessionCommand {
     /// Search optional derived providers without opening canonical session storage.
     Search {
         query: String,
+        /// Match semantics requested from eligible providers.
+        #[arg(long = "match", value_enum, default_value_t = SessionSearchMatchArg::Terms)]
+        match_mode: SessionSearchMatchArg,
+        /// Restrict matching to stable semantic record fields.
+        #[arg(long = "field", value_enum)]
+        fields: Vec<SessionSearchFieldArg>,
         /// Restrict search to semantic content categories.
         #[arg(long = "content", value_enum)]
         content: Vec<SessionSearchContentArg>,
@@ -1949,6 +1955,39 @@ enum SessionCommand {
         /// Hydrate exact canonical event locators through bounded daemon reads.
         #[arg(long)]
         hydrate: bool,
+        /// Permit providers that perform explicit cold/deep scans.
+        #[arg(long)]
+        deep: bool,
+        /// Restrict search to canonical session IDs.
+        #[arg(long = "session")]
+        sessions: Vec<SessionId>,
+        /// Restrict search to an exact normalized working directory.
+        #[arg(long)]
+        working_directory: Option<PathBuf>,
+        /// Restrict search to records at or after this Unix timestamp in milliseconds.
+        #[arg(long)]
+        after_timestamp_ms: Option<u64>,
+        /// Restrict search to records at or before this Unix timestamp in milliseconds.
+        #[arg(long)]
+        before_timestamp_ms: Option<u64>,
+        /// Restrict search to normalized tool names.
+        #[arg(long = "tool")]
+        tools: Vec<String>,
+        /// Restrict search to normalized tool statuses.
+        #[arg(long = "tool-status")]
+        tool_statuses: Vec<String>,
+        /// Restrict search to model-provider IDs recorded in projected content.
+        #[arg(long = "provider")]
+        providers: Vec<String>,
+        /// Restrict search to model IDs recorded in projected content.
+        #[arg(long = "model")]
+        models: Vec<String>,
+        /// Restrict search to agent IDs recorded in projected content.
+        #[arg(long = "agent")]
+        agents: Vec<String>,
+        /// Restrict search to import source IDs.
+        #[arg(long = "import-source")]
+        import_sources: Vec<String>,
         /// Print hits, provider coverage, and failures as JSON.
         #[arg(long)]
         json: bool,
@@ -1961,12 +2000,51 @@ enum SessionCommand {
     /// Explain provider selection for a query without invoking provider searches.
     SearchExplain {
         query: String,
+        /// Match semantics requested from eligible providers.
+        #[arg(long = "match", value_enum, default_value_t = SessionSearchMatchArg::Terms)]
+        match_mode: SessionSearchMatchArg,
+        /// Restrict matching to stable semantic record fields.
+        #[arg(long = "field", value_enum)]
+        fields: Vec<SessionSearchFieldArg>,
         #[arg(long = "content", value_enum)]
         content: Vec<SessionSearchContentArg>,
         #[arg(long, default_value_t = 20)]
         limit: usize,
         #[arg(long, default_value_t = 5_000)]
         deadline_ms: u64,
+        /// Explain inclusion of cold/deep scan providers.
+        #[arg(long)]
+        deep: bool,
+        /// Restrict search to canonical session IDs.
+        #[arg(long = "session")]
+        sessions: Vec<SessionId>,
+        /// Restrict search to an exact normalized working directory.
+        #[arg(long)]
+        working_directory: Option<PathBuf>,
+        /// Restrict search to records at or after this Unix timestamp in milliseconds.
+        #[arg(long)]
+        after_timestamp_ms: Option<u64>,
+        /// Restrict search to records at or before this Unix timestamp in milliseconds.
+        #[arg(long)]
+        before_timestamp_ms: Option<u64>,
+        /// Restrict search to normalized tool names.
+        #[arg(long = "tool")]
+        tools: Vec<String>,
+        /// Restrict search to normalized tool statuses.
+        #[arg(long = "tool-status")]
+        tool_statuses: Vec<String>,
+        /// Restrict search to model-provider IDs recorded in projected content.
+        #[arg(long = "provider")]
+        providers: Vec<String>,
+        /// Restrict search to model IDs recorded in projected content.
+        #[arg(long = "model")]
+        models: Vec<String>,
+        /// Restrict search to agent IDs recorded in projected content.
+        #[arg(long = "agent")]
+        agents: Vec<String>,
+        /// Restrict search to import source IDs.
+        #[arg(long = "import-source")]
+        import_sources: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -2047,6 +2125,64 @@ enum SessionImportCommand {
         source: String,
         external_session_id: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SessionSearchMatchArg {
+    Terms,
+    Phrase,
+    Prefix,
+    Regex,
+    Fuzzy,
+}
+
+impl From<SessionSearchMatchArg> for bcode_session_search::TextMatchMode {
+    fn from(value: SessionSearchMatchArg) -> Self {
+        match value {
+            SessionSearchMatchArg::Terms => Self::Terms,
+            SessionSearchMatchArg::Phrase => Self::Phrase,
+            SessionSearchMatchArg::Prefix => Self::Prefix,
+            SessionSearchMatchArg::Regex => Self::Regex,
+            SessionSearchMatchArg::Fuzzy => Self::Fuzzy,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SessionSearchFieldArg {
+    Title,
+    Text,
+    Command,
+    StandardOutput,
+    StandardError,
+    ToolName,
+    ToolArguments,
+    ErrorMessage,
+    WorkingDirectory,
+    Provider,
+    Model,
+    Agent,
+    Source,
+}
+
+impl From<SessionSearchFieldArg> for bcode_session_search::SearchField {
+    fn from(value: SessionSearchFieldArg) -> Self {
+        match value {
+            SessionSearchFieldArg::Title => Self::Title,
+            SessionSearchFieldArg::Text => Self::Text,
+            SessionSearchFieldArg::Command => Self::Command,
+            SessionSearchFieldArg::StandardOutput => Self::StandardOutput,
+            SessionSearchFieldArg::StandardError => Self::StandardError,
+            SessionSearchFieldArg::ToolName => Self::ToolName,
+            SessionSearchFieldArg::ToolArguments => Self::ToolArguments,
+            SessionSearchFieldArg::ErrorMessage => Self::ErrorMessage,
+            SessionSearchFieldArg::WorkingDirectory => Self::WorkingDirectory,
+            SessionSearchFieldArg::Provider => Self::Provider,
+            SessionSearchFieldArg::Model => Self::Model,
+            SessionSearchFieldArg::Agent => Self::Agent,
+            SessionSearchFieldArg::Source => Self::Source,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -2571,22 +2707,13 @@ async fn handle_session_command(command: SessionCommand) -> Result<(), CliError>
             limit,
             json,
         } => session_inspect(session_id, category, after, before, limit, json).await?,
-        SessionCommand::Search {
-            query,
-            content,
-            limit,
-            deadline_ms,
-            hydrate,
-            json,
-        } => session_search(query, content, limit, deadline_ms, hydrate, json).await?,
+        command @ SessionCommand::Search { .. } => {
+            handle_session_search_cli(command).await?;
+        }
         SessionCommand::SearchStatus { json } => session_search_status(json).await?,
-        SessionCommand::SearchExplain {
-            query,
-            content,
-            limit,
-            deadline_ms,
-            json,
-        } => session_search_explain(query, content, limit, deadline_ms, json).await?,
+        command @ SessionCommand::SearchExplain { .. } => {
+            handle_session_search_explain_cli(command).await?;
+        }
         SessionCommand::Export { session_id, format } => {
             session_export(session_id, format).await?;
         }
@@ -8010,22 +8137,194 @@ async fn session_inspect(
     Ok(())
 }
 
-fn session_search_request(
+async fn handle_session_search_cli(command: SessionCommand) -> Result<(), CliError> {
+    let SessionCommand::Search {
+        query,
+        match_mode,
+        fields,
+        content,
+        limit,
+        deadline_ms,
+        hydrate,
+        deep,
+        sessions,
+        working_directory,
+        after_timestamp_ms,
+        before_timestamp_ms,
+        tools,
+        tool_statuses,
+        providers,
+        models,
+        agents,
+        import_sources,
+        json,
+    } = command
+    else {
+        unreachable!("session search handler received a different command")
+    };
+    handle_session_search_command(SessionSearchCliCommand {
+        query,
+        match_mode,
+        fields,
+        content,
+        limit,
+        deadline_ms,
+        hydrate,
+        scope: SessionSearchCliScope {
+            deep,
+            sessions,
+            working_directory,
+            after_timestamp_ms,
+            before_timestamp_ms,
+            tools,
+            tool_statuses,
+            providers,
+            models,
+            agents,
+            import_sources,
+        },
+        json,
+    })
+    .await
+}
+
+async fn handle_session_search_explain_cli(command: SessionCommand) -> Result<(), CliError> {
+    let SessionCommand::SearchExplain {
+        query,
+        match_mode,
+        fields,
+        content,
+        limit,
+        deadline_ms,
+        deep,
+        sessions,
+        working_directory,
+        after_timestamp_ms,
+        before_timestamp_ms,
+        tools,
+        tool_statuses,
+        providers,
+        models,
+        agents,
+        import_sources,
+        json,
+    } = command
+    else {
+        unreachable!("session search explain handler received a different command")
+    };
+    handle_session_search_explain_command(SessionSearchCliCommand {
+        query,
+        match_mode,
+        fields,
+        content,
+        limit,
+        deadline_ms,
+        hydrate: false,
+        scope: SessionSearchCliScope {
+            deep,
+            sessions,
+            working_directory,
+            after_timestamp_ms,
+            before_timestamp_ms,
+            tools,
+            tool_statuses,
+            providers,
+            models,
+            agents,
+            import_sources,
+        },
+        json,
+    })
+    .await
+}
+
+#[derive(Debug)]
+struct SessionSearchCliCommand {
     query: String,
+    match_mode: SessionSearchMatchArg,
+    fields: Vec<SessionSearchFieldArg>,
     content: Vec<SessionSearchContentArg>,
+    limit: usize,
+    deadline_ms: u64,
+    hydrate: bool,
+    scope: SessionSearchCliScope,
+    json: bool,
+}
+
+async fn handle_session_search_command(command: SessionSearchCliCommand) -> Result<(), CliError> {
+    session_search(command).await
+}
+
+async fn handle_session_search_explain_command(
+    command: SessionSearchCliCommand,
+) -> Result<(), CliError> {
+    session_search_explain(command).await
+}
+
+#[derive(Debug, Default)]
+struct SessionSearchCliScope {
+    deep: bool,
+    sessions: Vec<SessionId>,
+    working_directory: Option<PathBuf>,
+    after_timestamp_ms: Option<u64>,
+    before_timestamp_ms: Option<u64>,
+    tools: Vec<String>,
+    tool_statuses: Vec<String>,
+    providers: Vec<String>,
+    models: Vec<String>,
+    agents: Vec<String>,
+    import_sources: Vec<String>,
+}
+
+impl SessionSearchCliScope {
+    fn filters(
+        self,
+        content: Vec<SessionSearchContentArg>,
+    ) -> bcode_session_search::SessionSearchFilters {
+        bcode_session_search::SessionSearchFilters {
+            session_ids: self.sessions.into_iter().collect(),
+            working_directory: self.working_directory,
+            after_timestamp_ms: self.after_timestamp_ms,
+            before_timestamp_ms: self.before_timestamp_ms,
+            content_kinds: content.into_iter().map(Into::into).collect(),
+            tool_names: self.tools.into_iter().collect(),
+            tool_statuses: self.tool_statuses.into_iter().collect(),
+            providers: self.providers.into_iter().collect(),
+            models: self.models.into_iter().collect(),
+            agents: self.agents.into_iter().collect(),
+            sources: self.import_sources.into_iter().collect(),
+            ..bcode_session_search::SessionSearchFilters::default()
+        }
+    }
+
+    fn policy(&self, deadline_ms: u64) -> bcode_session_search::SessionSearchPlanPolicy {
+        bcode_session_search::SessionSearchPlanPolicy {
+            execution_class: if self.deep {
+                bcode_session_search::SessionSearchExecutionClass::Deep
+            } else {
+                bcode_session_search::SessionSearchExecutionClass::Ordinary
+            },
+            per_provider_deadline_ms: deadline_ms.clamp(1, 2_000),
+            ..bcode_session_search::SessionSearchPlanPolicy::default()
+        }
+    }
+}
+
+const fn session_search_request(
+    query: String,
+    match_mode: bcode_session_search::TextMatchMode,
+    fields: BTreeSet<bcode_session_search::SearchField>,
+    filters: bcode_session_search::SessionSearchFilters,
     limit: usize,
     deadline_ms: u64,
 ) -> bcode_session_search::SessionSearchRequest {
     bcode_session_search::SessionSearchRequest {
         query: bcode_session_search::SessionSearchQuery::Text {
             text: query,
-            mode: bcode_session_search::TextMatchMode::Terms,
-            fields: BTreeSet::new(),
+            mode: match_mode,
+            fields,
         },
-        filters: bcode_session_search::SessionSearchFilters {
-            content_kinds: content.into_iter().map(Into::into).collect(),
-            ..bcode_session_search::SessionSearchFilters::default()
-        },
+        filters,
         sort: bcode_session_search::SessionSearchSort::ProviderRelevance,
         limit,
         cursor: None,
@@ -8033,35 +8332,134 @@ fn session_search_request(
     }
 }
 
-async fn session_search(
-    query: String,
-    content: Vec<SessionSearchContentArg>,
-    limit: usize,
-    deadline_ms: u64,
-    hydrate: bool,
-    json: bool,
-) -> Result<(), CliError> {
-    let request = session_search_request(query, content, limit, deadline_ms);
+fn session_search_cli_outcome(
+    response: &bcode_session_search::FederatedSessionSearchResponse,
+    hydrated_hits: &[bcode_session_search::HydratedSessionSearchHit],
+) -> &'static str {
+    use bcode_session_search::{SearchErrorCode, SearchHitHydrationOutcome};
+
+    if hydrated_hits
+        .iter()
+        .any(|hit| hit.outcome == SearchHitHydrationOutcome::RepairRequired)
+    {
+        "canonical_repair_required"
+    } else if hydrated_hits
+        .iter()
+        .any(|hit| hit.outcome == SearchHitHydrationOutcome::Incompatible)
+    {
+        "canonical_incompatible"
+    } else if response
+        .failures
+        .iter()
+        .any(|failure| failure.error.code == SearchErrorCode::DeadlineExceeded)
+    {
+        "provider_timeout"
+    } else if response
+        .failures
+        .iter()
+        .any(|failure| failure.error.code == SearchErrorCode::StaleIndex)
+    {
+        "stale_index"
+    } else if response
+        .failures
+        .iter()
+        .any(|failure| failure.error.code == SearchErrorCode::UnsupportedQuery)
+    {
+        "unsupported_query"
+    } else if response.providers.is_empty() {
+        "no_eligible_provider"
+    } else if response.hits.is_empty() && response.query_complete && response.coverage_complete {
+        "no_results"
+    } else if !response.query_complete {
+        "incomplete_query"
+    } else if !response.coverage_complete {
+        "incomplete_coverage"
+    } else {
+        "complete"
+    }
+}
+
+fn session_search_json(
+    execution_class: bcode_session_search::SessionSearchExecutionClass,
+    response: &bcode_session_search::FederatedSessionSearchResponse,
+    hydrated_hits: &[bcode_session_search::HydratedSessionSearchHit],
+) -> serde_json::Value {
+    let hits = response
+        .hits
+        .iter()
+        .map(|hit| {
+            let hydrated = hydrated_hits
+                .iter()
+                .find(|candidate| candidate.hit.locator == hit.locator);
+            serde_json::json!({
+                "session_id": hit.locator.session_id,
+                "event_sequence": hit.locator.sequence,
+                "record_id": hit.locator.record_id,
+                "content_kind": hit.content_kind,
+                "matched_field": hit.matched_field,
+                "timestamp_ms": hydrated
+                    .and_then(|candidate| candidate.event.as_deref())
+                    .map(|event| event.timestamp_ms),
+                "preview": hit.preview,
+                "preview_truncated": hit.preview_truncated,
+                "provider_id": hit.provider_id,
+                "provider_rank": hit.provider_rank,
+                "provider_score": hit.provider_score,
+                "hydration_outcome": hydrated.map(|candidate| candidate.outcome),
+                "hydration_message": hydrated.and_then(|candidate| candidate.message.as_deref()),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "outcome": session_search_cli_outcome(response, hydrated_hits),
+        "execution_class": execution_class,
+        "query_complete": response.query_complete,
+        "coverage_complete": response.coverage_complete,
+        "hits": hits,
+        "providers": response.providers,
+        "failures": response.failures,
+    })
+}
+
+async fn session_search(command: SessionSearchCliCommand) -> Result<(), CliError> {
+    let policy = command.scope.policy(command.deadline_ms);
+    let execution_class = policy.execution_class;
+    let request = session_search_request(
+        command.query,
+        command.match_mode.into(),
+        command.fields.into_iter().map(Into::into).collect(),
+        command.scope.filters(command.content),
+        command.limit,
+        command.deadline_ms,
+    );
     let (response, hydrated_hits) = BcodeClient::default_endpoint()
-        .session_search(request, Vec::new(), hydrate)
+        .session_search(request, policy, Vec::new(), command.hydrate)
         .await?;
-    if json {
+    if command.json {
         println!(
             "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "response": response,
-                "hydrated_hits": hydrated_hits,
-            }))?
+            serde_json::to_string_pretty(&session_search_json(
+                execution_class,
+                &response,
+                &hydrated_hits,
+            ))?
         );
         return Ok(());
     }
     for hit in &response.hits {
         println!(
-            "{} #{} {:?}: {}",
+            "{} #{} {:?} [{} rank {}]: {}{}",
             hit.locator.session_id,
             hit.locator.sequence,
             hit.content_kind,
-            hit.preview.as_deref().unwrap_or("<no provider preview>")
+            hit.provider_id,
+            hit.provider_rank,
+            hit.preview.as_deref().unwrap_or("<no provider preview>"),
+            if hit.preview_truncated {
+                " [truncated]"
+            } else {
+                ""
+            }
         );
     }
     for provider in &response.providers {
@@ -8098,6 +8496,10 @@ async fn session_search(
                     .map_or_else(String::new, |message| format!(" ({message})"))
             );
         }
+    }
+    let outcome = session_search_cli_outcome(&response, &hydrated_hits);
+    if outcome != "complete" {
+        eprintln!("search outcome: {outcome}");
     }
     if !response.query_complete || !response.coverage_complete {
         eprintln!("search result is partial; inspect provider status/failures above");
@@ -8149,20 +8551,23 @@ async fn session_search_status(json: bool) -> Result<(), CliError> {
     Ok(())
 }
 
-async fn session_search_explain(
-    query: String,
-    content: Vec<SessionSearchContentArg>,
-    limit: usize,
-    deadline_ms: u64,
-    json: bool,
-) -> Result<(), CliError> {
+async fn session_search_explain(command: SessionSearchCliCommand) -> Result<(), CliError> {
+    let policy = command.scope.policy(command.deadline_ms);
     let plan = BcodeClient::default_endpoint()
         .session_search_explain(
-            session_search_request(query, content, limit, deadline_ms),
+            session_search_request(
+                command.query,
+                command.match_mode.into(),
+                command.fields.into_iter().map(Into::into).collect(),
+                command.scope.filters(command.content),
+                command.limit,
+                command.deadline_ms,
+            ),
+            policy,
             Vec::new(),
         )
         .await?;
-    if json {
+    if command.json {
         println!("{}", serde_json::to_string_pretty(&plan)?);
         return Ok(());
     }
@@ -10902,6 +11307,10 @@ mod web_command_tests {
             "session",
             "search",
             "database locked",
+            "--match",
+            "phrase",
+            "--field",
+            "text",
             "--content",
             "user-message",
             "--content",
@@ -10911,6 +11320,27 @@ mod web_command_tests {
             "--deadline-ms",
             "1200",
             "--hydrate",
+            "--deep",
+            "--session",
+            "00000000-0000-0000-0000-000000000001",
+            "--working-directory",
+            "/tmp/project",
+            "--after-timestamp-ms",
+            "1000",
+            "--before-timestamp-ms",
+            "2000",
+            "--tool",
+            "shell",
+            "--tool-status",
+            "failed",
+            "--provider",
+            "bcode.openai-compatible",
+            "--model",
+            "gpt-test",
+            "--agent",
+            "build",
+            "--import-source",
+            "opencode",
             "--json",
         ])
         .expect("search command should parse");
@@ -10918,15 +11348,125 @@ mod web_command_tests {
             cli.command,
             Some(Commands::Session {
                 command: SessionCommand::Search {
+                    match_mode: SessionSearchMatchArg::Phrase,
+                    fields,
                     content,
                     limit: 15,
                     deadline_ms: 1200,
                     hydrate: true,
+                    deep: true,
+                    sessions,
+                    working_directory: Some(working_directory),
+                    after_timestamp_ms: Some(1000),
+                    before_timestamp_ms: Some(2000),
+                    tools,
+                    tool_statuses,
+                    providers,
+                    models,
+                    agents,
+                    import_sources,
                     json: true,
                     ..
                 }
-            }) if content.len() == 2
+            }) if fields.len() == 1
+                && content.len() == 2
+                && sessions.len() == 1
+                && working_directory == Path::new("/tmp/project")
+                && tools == ["shell"]
+                && tool_statuses == ["failed"]
+                && providers == ["bcode.openai-compatible"]
+                && models == ["gpt-test"]
+                && agents == ["build"]
+                && import_sources == ["opencode"]
         ));
+    }
+
+    #[test]
+    fn session_search_scope_builds_backend_neutral_filters_and_policy() {
+        let session_id = SessionId::new();
+        let scope = SessionSearchCliScope {
+            deep: true,
+            sessions: vec![session_id],
+            working_directory: Some(PathBuf::from("/tmp/project")),
+            after_timestamp_ms: Some(10),
+            before_timestamp_ms: Some(20),
+            tools: vec!["shell".to_owned()],
+            tool_statuses: vec!["failed".to_owned()],
+            providers: vec!["provider".to_owned()],
+            models: vec!["model".to_owned()],
+            agents: vec!["agent".to_owned()],
+            import_sources: vec!["opencode".to_owned()],
+        };
+        let policy = scope.policy(1_500);
+        assert_eq!(
+            policy.execution_class,
+            bcode_session_search::SessionSearchExecutionClass::Deep
+        );
+        assert_eq!(policy.per_provider_deadline_ms, 1_500);
+
+        let filters = scope.filters(vec![SessionSearchContentArg::ToolError]);
+        assert_eq!(filters.session_ids, BTreeSet::from([session_id]));
+        assert_eq!(
+            filters.working_directory.as_deref(),
+            Some(Path::new("/tmp/project"))
+        );
+        assert_eq!(filters.after_timestamp_ms, Some(10));
+        assert_eq!(filters.before_timestamp_ms, Some(20));
+        assert_eq!(filters.tool_names, BTreeSet::from(["shell".to_owned()]));
+        assert_eq!(filters.tool_statuses, BTreeSet::from(["failed".to_owned()]));
+        assert_eq!(filters.providers, BTreeSet::from(["provider".to_owned()]));
+        assert_eq!(filters.models, BTreeSet::from(["model".to_owned()]));
+        assert_eq!(filters.agents, BTreeSet::from(["agent".to_owned()]));
+        assert_eq!(filters.sources, BTreeSet::from(["opencode".to_owned()]));
+        assert_eq!(
+            filters.content_kinds,
+            BTreeSet::from([bcode_session_search::SearchContentKind::ToolError])
+        );
+    }
+
+    #[test]
+    fn session_search_automation_outcomes_are_distinct() {
+        use bcode_session_search::{
+            FederatedProviderReport, FederatedSessionSearchResponse, ProviderSearchOutcome,
+        };
+
+        let no_provider = FederatedSessionSearchResponse {
+            hits: Vec::new(),
+            query_complete: false,
+            coverage_complete: false,
+            providers: Vec::new(),
+            failures: Vec::new(),
+        };
+        assert_eq!(
+            session_search_cli_outcome(&no_provider, &[]),
+            "no_eligible_provider"
+        );
+
+        let no_results = FederatedSessionSearchResponse {
+            hits: Vec::new(),
+            query_complete: true,
+            coverage_complete: true,
+            providers: vec![FederatedProviderReport {
+                provider_id: "provider".to_owned(),
+                outcome: ProviderSearchOutcome::Complete,
+                elapsed_ms: 1,
+                query_complete: true,
+                coverage_complete: true,
+                searched_content: Vec::new(),
+                excluded_content: Vec::new(),
+            }],
+            failures: Vec::new(),
+        };
+        assert_eq!(session_search_cli_outcome(&no_results, &[]), "no_results");
+
+        let incomplete = FederatedSessionSearchResponse {
+            coverage_complete: false,
+            ..no_results
+        };
+        assert_eq!(
+            session_search_cli_outcome(&incomplete, &[]),
+            "incomplete_coverage"
+        );
     }
 
     #[test]

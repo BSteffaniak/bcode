@@ -21,7 +21,16 @@ sequence semantics, compatibility reporting, and bounded canonical reads. Curren
 
 The daemon exposes these operations through portable IPC/client contracts. CLI commands and skills
 consume those contracts. They do not open `catalog.db`, `session.db`, WAL files, projection tables,
-or other persistence implementation details.
+or other persistence implementation details. The CLI exposes backend-neutral structured search
+filters for canonical session IDs, working directory, timestamp bounds, tool name/status,
+provider/model/agent identity, import source, content category, and stable semantic match fields. The
+CLI also exposes terms, phrase, prefix, regex, and fuzzy match modes so unsupported provider features
+remain explicit during planning rather than being approximated. Ordinary search remains the
+default; `--deep` explicitly selects the plan policy that may invoke cold scan providers. CLI JSON
+flattens each hit into stable automation fields (session/event locator, content and match field,
+canonical timestamp when hydrated, bounded preview/truncation, provider rank/score, and hydration
+outcome) alongside explicit query/corpus completeness, provider reports, failures, execution class,
+and a normalized terminal outcome.
 
 Normal investigation reads are non-mutating. They do not migrate, repair, rebuild, reindex, or
 silently reinterpret unsupported canonical state. Missing, damaged, incompatible, and stale state is
@@ -250,7 +259,9 @@ Public search and investigation contracts remain portable. Renderers adapt share
 without owning provider workflows or canonical session state. The TUI owns terminal layout and
 interaction only.
 
-The `bcode-session-history` skill uses supported Bcode commands and reports session IDs, query scope,
-content/provider coverage, truncation, freshness, and failures. Until indexed cross-session search is
-implemented, the skill may explicitly state that broad full-text search is unavailable; it does not
-fall back to direct database access.
+The intended `bcode-session-history` skill contract is to use supported Bcode commands and report
+session IDs, query scope, content/provider coverage, truncation, freshness, and failures. A native
+session workflow must not fall back to direct database access when optional providers are absent or
+coverage is incomplete. The installed user-config skill still requires a separately authorized
+migration before it satisfies this contract; architecture documentation does not treat that external
+file as already migrated.

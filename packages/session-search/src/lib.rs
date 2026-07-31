@@ -60,6 +60,10 @@ pub const MAX_INGEST_TEXT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_INGEST_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
 /// Maximum cumulative normalized text bytes accepted for one canonical session.
 pub const MAX_SESSION_INGEST_TEXT_BYTES: u64 = 256 * 1024 * 1024;
+/// Maximum values accepted in one structured-filter collection.
+pub const MAX_FILTER_VALUES: usize = 64;
+/// Maximum UTF-8 bytes accepted in one structured-filter string or path.
+pub const MAX_FILTER_VALUE_BYTES: usize = 2 * 1024;
 /// Maximum UTF-8 bytes in one opaque cursor.
 pub const MAX_CURSOR_BYTES: usize = 2 * 1024;
 
@@ -80,6 +84,8 @@ pub enum ContractValidationError {
     QueryDepthExceeded { maximum: usize },
     /// Search projection policy is internally inconsistent or unsupported.
     InvalidProjection(&'static str),
+    /// Structured search filters are internally inconsistent.
+    InvalidFilter(&'static str),
     /// Batch identities or checkpoints do not agree.
     InvalidBatch(&'static str),
 }
@@ -103,6 +109,7 @@ impl std::fmt::Display for ContractValidationError {
             Self::InvalidProjection(message) => {
                 write!(formatter, "invalid search projection: {message}")
             }
+            Self::InvalidFilter(message) => write!(formatter, "invalid search filter: {message}"),
             Self::InvalidBatch(message) => write!(formatter, "invalid search batch: {message}"),
         }
     }
@@ -259,6 +266,60 @@ pub struct SessionSearchFilters {
     pub sources: BTreeSet<String>,
 }
 
+impl SessionSearchFilters {
+    fn validate(&self) -> Result<(), ContractValidationError> {
+        validate_collection_limit("session_ids", self.session_ids.len())?;
+        validate_collection_limit("content_kinds", self.content_kinds.len())?;
+        validate_collection_limit("roles", self.roles.len())?;
+        validate_collection_limit("inspection_categories", self.inspection_categories.len())?;
+        validate_filter_values("tool_names", &self.tool_names)?;
+        validate_filter_values("tool_statuses", &self.tool_statuses)?;
+        validate_filter_values("providers", &self.providers)?;
+        validate_filter_values("models", &self.models)?;
+        validate_filter_values("agents", &self.agents)?;
+        validate_filter_values("sources", &self.sources)?;
+        if let Some(working_directory) = &self.working_directory {
+            let value = working_directory.to_string_lossy();
+            validate_nonempty_bounded("working_directory", &value, MAX_FILTER_VALUE_BYTES)?;
+        }
+        if self
+            .after_timestamp_ms
+            .zip(self.before_timestamp_ms)
+            .is_some_and(|(after, before)| after > before)
+        {
+            return Err(ContractValidationError::InvalidFilter(
+                "after timestamp must not exceed before timestamp",
+            ));
+        }
+        Ok(())
+    }
+}
+
+const fn validate_collection_limit(
+    field: &'static str,
+    actual: usize,
+) -> Result<(), ContractValidationError> {
+    if actual > MAX_FILTER_VALUES {
+        return Err(ContractValidationError::LimitExceeded {
+            field,
+            actual,
+            maximum: MAX_FILTER_VALUES,
+        });
+    }
+    Ok(())
+}
+
+fn validate_filter_values(
+    field: &'static str,
+    values: &BTreeSet<String>,
+) -> Result<(), ContractValidationError> {
+    validate_collection_limit(field, values.len())?;
+    for value in values {
+        validate_nonempty_bounded(field, value, MAX_FILTER_VALUE_BYTES)?;
+    }
+    Ok(())
+}
+
 /// Deterministic portable result ordering.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -310,6 +371,7 @@ impl SessionSearchRequest {
                 maximum: MAX_SEARCH_HITS,
             });
         }
+        self.filters.validate()?;
         if let Some(cursor) = &self.cursor {
             validate_nonempty_bounded("cursor_provider_id", &cursor.provider_id, MAX_CURSOR_BYTES)?;
             validate_nonempty_bounded(
@@ -2294,6 +2356,44 @@ mod tests {
             Err(ContractValidationError::InvalidBatch(
                 "record schema version is unsupported"
             ))
+        ));
+    }
+
+    #[test]
+    fn structured_filters_validate_bounds_and_timestamp_order() {
+        let mut request = SessionSearchRequest {
+            query: text_query("needle"),
+            filters: SessionSearchFilters::default(),
+            sort: SessionSearchSort::ProviderRelevance,
+            limit: 20,
+            cursor: None,
+            deadline_ms: Some(1_000),
+        };
+        request.filters.after_timestamp_ms = Some(20);
+        request.filters.before_timestamp_ms = Some(10);
+        assert!(matches!(
+            request.validate(),
+            Err(ContractValidationError::InvalidFilter(_))
+        ));
+
+        request.filters.after_timestamp_ms = None;
+        request.filters.before_timestamp_ms = None;
+        request.filters.tool_names = (0..=MAX_FILTER_VALUES)
+            .map(|index| format!("tool-{index}"))
+            .collect();
+        assert!(matches!(
+            request.validate(),
+            Err(ContractValidationError::LimitExceeded {
+                field: "tool_names",
+                maximum: MAX_FILTER_VALUES,
+                ..
+            })
+        ));
+
+        request.filters.tool_names = BTreeSet::from([" ".to_owned()]);
+        assert!(matches!(
+            request.validate(),
+            Err(ContractValidationError::EmptyField("tool_names"))
         ));
     }
 

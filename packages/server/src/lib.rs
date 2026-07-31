@@ -4029,9 +4029,12 @@ async fn handle_request_inner(
         }
         Request::SessionSearch {
             request,
+            policy,
             routes,
             hydrate,
-        } => handle_session_search(request_id, state, writer, request, routes, hydrate).await,
+        } => {
+            handle_session_search(request_id, state, writer, request, policy, routes, hydrate).await
+        }
         Request::SessionSearchProviders => {
             let response = session_search::list_providers(state).await;
             send_response(
@@ -4041,13 +4044,15 @@ async fn handle_request_inner(
             )
             .await
         }
-        Request::SessionSearchExplain { request, routes } => {
+        Request::SessionSearchExplain {
+            request,
+            policy,
+            routes,
+        } => {
             let discovery = session_search::list_providers(state).await;
-            let plan = if routes.is_empty() {
-                bcode_session_search::plan_session_search(&request, discovery)
-            } else {
-                bcode_session_search::plan_session_search_with_routes(&request, discovery, &routes)
-            };
+            let plan = bcode_session_search::plan_session_search_with_policy_and_routes(
+                &request, discovery, &policy, &routes,
+            );
             send_response(
                 writer,
                 request_id,
@@ -8643,10 +8648,13 @@ async fn handle_session_search(
     state: &ServerState,
     writer: &SharedWriter,
     request: bcode_session_search::SessionSearchRequest,
+    policy: bcode_session_search::SessionSearchPlanPolicy,
     routes: Vec<bcode_session_search::SessionSearchContentRoute>,
     hydrate: bool,
 ) -> Result<(), ServerError> {
-    match session_search::search_federated_with_routes(state, &request, &routes).await {
+    match session_search::search_federated_with_policy_and_routes(state, &request, &policy, &routes)
+        .await
+    {
         Ok(mut response) => {
             let hydrated_hits = if hydrate {
                 let started = std::time::Instant::now();

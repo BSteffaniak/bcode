@@ -1764,6 +1764,7 @@ impl BcodeClient {
     pub async fn session_search(
         &self,
         request: bcode_session_search::SessionSearchRequest,
+        policy: bcode_session_search::SessionSearchPlanPolicy,
         routes: Vec<bcode_session_search::SessionSearchContentRoute>,
         hydrate: bool,
     ) -> Result<
@@ -1776,6 +1777,7 @@ impl BcodeClient {
         match self
             .send_request(Request::SessionSearch {
                 request,
+                policy,
                 routes,
                 hydrate,
             })
@@ -1811,10 +1813,15 @@ impl BcodeClient {
     pub async fn session_search_explain(
         &self,
         request: bcode_session_search::SessionSearchRequest,
+        policy: bcode_session_search::SessionSearchPlanPolicy,
         routes: Vec<bcode_session_search::SessionSearchContentRoute>,
     ) -> Result<bcode_session_search::SessionSearchPlan, ClientError> {
         match self
-            .send_request(Request::SessionSearchExplain { request, routes })
+            .send_request(Request::SessionSearchExplain {
+                request,
+                policy,
+                routes,
+            })
             .await?
         {
             ResponsePayload::SessionSearchPlan { plan } => Ok(plan),

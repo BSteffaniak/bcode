@@ -717,6 +717,8 @@ pub enum Request {
     },
     SessionSearch {
         request: bcode_session_search::SessionSearchRequest,
+        #[serde(default)]
+        policy: bcode_session_search::SessionSearchPlanPolicy,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         routes: Vec<bcode_session_search::SessionSearchContentRoute>,
         #[serde(default)]
@@ -725,6 +727,8 @@ pub enum Request {
     SessionSearchProviders,
     SessionSearchExplain {
         request: bcode_session_search::SessionSearchRequest,
+        #[serde(default)]
+        policy: bcode_session_search::SessionSearchPlanPolicy,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         routes: Vec<bcode_session_search::SessionSearchContentRoute>,
     },
@@ -3764,6 +3768,7 @@ mod tests {
         };
         let request = Request::SessionSearch {
             request: search_request,
+            policy: bcode_session_search::SessionSearchPlanPolicy::default(),
             routes: vec![SessionSearchContentRoute {
                 content_kinds: std::iter::once(SearchContentKind::UserMessage).collect(),
                 mode: SessionSearchRouteMode::Primary,
