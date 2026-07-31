@@ -733,6 +733,14 @@ impl SessionView {
                 let id = TranscriptViewItemId::new(format!(
                     "assistant-turn:{turn_id}:segment:{segment_id}"
                 ));
+                if self
+                    .snapshot
+                    .text_streams
+                    .get(&id)
+                    .is_some_and(|state| state.status == TextStreamViewStatus::Degraded)
+                {
+                    return;
+                }
                 self.finish_or_push_message(
                     id.clone(),
                     event.sequence,
@@ -773,6 +781,14 @@ impl SessionView {
                 let id = TranscriptViewItemId::new(format!(
                     "assistant-turn:{turn_id}:segment:{segment_id}"
                 ));
+                if self
+                    .snapshot
+                    .text_streams
+                    .get(&id)
+                    .is_some_and(|state| state.status == TextStreamViewStatus::Degraded)
+                {
+                    return;
+                }
                 self.finish_or_push_message(
                     id.clone(),
                     event.sequence,
@@ -3252,6 +3268,14 @@ impl SessionView {
         kind: StreamingMessageKind,
         text: &str,
     ) {
+        if self
+            .snapshot
+            .text_streams
+            .get(&id)
+            .is_some_and(|state| state.status == TextStreamViewStatus::Degraded)
+        {
+            return;
+        }
         if self.finish_split_streaming_message(kind) {
             return;
         }
@@ -8523,6 +8547,111 @@ mod tests {
     }
 
     #[test]
+    fn healthy_assistant_stream_preserves_exact_source_bytes_after_every_revision() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-bytes:segment:segment-0");
+        let chunks = [
+            "# Héllo\n",
+            "- 世界\n",
+            "```rust\n",
+            "let crab = \"🦀\";\n",
+            "```",
+        ];
+        let mut expected = String::new();
+        let mut view = SessionView::new();
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            let revision = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+            view.apply_live_event(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                    output_position: None,
+                    turn_id: "turn-bytes".to_owned(),
+                    segment_id: "segment-0".to_owned(),
+                    segment_order: 0,
+                    update: bcode_session_models::TextStreamUpdate {
+                        generation: 0,
+                        first_revision: revision,
+                        revision,
+                        operation: bcode_session_models::TextStreamOperation::Append {
+                            expected_offset: expected.len(),
+                            text: (*chunk).to_owned(),
+                        },
+                    },
+                },
+            });
+            expected.push_str(chunk);
+            assert_eq!(
+                transcript_item_text(view.snapshot(), &id),
+                Some(expected.as_str())
+            );
+            assert_eq!(
+                view.snapshot().text_streams[&id].accepted_bytes,
+                expected.len()
+            );
+            assert_eq!(
+                view.snapshot().text_streams[&id].status,
+                TextStreamViewStatus::Healthy
+            );
+        }
+    }
+
+    #[test]
+    fn healthy_reasoning_stream_preserves_exact_source_bytes_after_every_revision() {
+        let session_id = SessionId::new();
+        let stream_id = TranscriptViewItemId::new(
+            "reasoning-stream:turn-bytes:activity:activity-0:part:part-0",
+        );
+        let item_id = TranscriptViewItemId::reasoning("turn-bytes", "activity-0");
+        let chunks = ["Résumé ", "世界", "\n\n**done** 🦀"];
+        let mut expected = String::new();
+        let mut view = SessionView::new();
+
+        for (index, chunk) in chunks.iter().enumerate() {
+            let revision = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+            view.apply_live_event(&SessionLiveEvent {
+                session_id,
+                kind: SessionLiveEventKind::AssistantReasoningTextStreamUpdated {
+                    output_position: None,
+                    turn_id: "turn-bytes".to_owned(),
+                    activity_id: "activity-0".to_owned(),
+                    activity_order: 0,
+                    part_id: "part-0".to_owned(),
+                    kind: bcode_session_models::ReasoningContentKind::Summary,
+                    role: bcode_session_models::ReasoningContentRole::Milestone,
+                    part_order: 0,
+                    update: bcode_session_models::TextStreamUpdate {
+                        generation: 0,
+                        first_revision: revision,
+                        revision,
+                        operation: bcode_session_models::TextStreamOperation::Append {
+                            expected_offset: expected.len(),
+                            text: (*chunk).to_owned(),
+                        },
+                    },
+                },
+            });
+            expected.push_str(chunk);
+            let item = view
+                .snapshot()
+                .transcript
+                .items
+                .iter()
+                .find(|item| item.id == item_id)
+                .expect("reasoning item");
+            assert_reasoning_text(item, &expected, true);
+            assert_eq!(
+                view.snapshot().text_streams[&stream_id].accepted_bytes,
+                expected.len()
+            );
+            assert_eq!(
+                view.snapshot().text_streams[&stream_id].status,
+                TextStreamViewStatus::Healthy
+            );
+        }
+    }
+
+    #[test]
     fn ordered_assistant_stream_validates_offsets_duplicates_checkpoints_and_terminal_state() {
         let session_id = SessionId::new();
         let mut view = SessionView::new();
@@ -8653,6 +8782,58 @@ mod tests {
         assert_eq!(
             transcript_item_text(view.snapshot(), &items[1].id),
             Some("after")
+        );
+    }
+
+    #[test]
+    fn durable_segment_cannot_silently_repair_a_degraded_live_stream() {
+        let session_id = SessionId::new();
+        let id = TranscriptViewItemId::new("assistant-turn:turn-1:segment:segment-0");
+        let mut view = SessionView::new();
+        let live = |revision, text: &str| SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                output_position: None,
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                update: bcode_session_models::TextStreamUpdate {
+                    generation: 0,
+                    first_revision: revision,
+                    revision,
+                    operation: bcode_session_models::TextStreamOperation::Append {
+                        expected_offset: 0,
+                        text: text.to_owned(),
+                    },
+                },
+            },
+        };
+
+        view.apply_live_event(&live(1, "healthy bytes"));
+        view.apply_live_event(&live(1, "conflicting bytes"));
+        assert_eq!(
+            view.snapshot().text_streams[&id].status,
+            TextStreamViewStatus::Degraded
+        );
+
+        view.apply_event(&event(
+            session_id,
+            1,
+            SessionEventKind::AssistantResponseSegment {
+                turn_id: "turn-1".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                text: "durable replacement".to_owned(),
+            },
+        ));
+
+        assert_eq!(
+            transcript_item_text(view.snapshot(), &id),
+            Some("healthy bytes")
+        );
+        assert_eq!(
+            view.snapshot().text_streams[&id].status,
+            TextStreamViewStatus::Degraded
         );
     }
 

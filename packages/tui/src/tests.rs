@@ -3581,6 +3581,62 @@ fn tool_activity_after_submitted_user_message_resumes_following_latest_rows() {
 }
 
 #[test]
+fn every_utf8_markdown_prefix_streams_without_source_loss() {
+    let session_id = SessionId::new();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
+    let source =
+        "# Héllo 🦀\n\n- **世界**\n\n```rust\nlet x = \"é\";\n```\n[link](https://example.com)";
+    let boundaries = source
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(source.len()))
+        .collect::<Vec<_>>();
+    let mut expected = String::new();
+
+    for (revision_index, window) in boundaries.windows(2).enumerate() {
+        let chunk = &source[window[0]..window[1]];
+        let revision = u64::try_from(revision_index)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        app.absorb_session_live_event(&SessionLiveEvent {
+            session_id,
+            kind: SessionLiveEventKind::AssistantTextStreamUpdated {
+                output_position: None,
+                turn_id: "turn-prefix".to_owned(),
+                segment_id: "segment-0".to_owned(),
+                segment_order: 0,
+                update: bcode_session_models::TextStreamUpdate {
+                    generation: 0,
+                    first_revision: revision,
+                    revision,
+                    operation: bcode_session_models::TextStreamOperation::Append {
+                        expected_offset: expected.len(),
+                        text: chunk.to_owned(),
+                    },
+                },
+            },
+        });
+        expected.push_str(chunk);
+        let assistant = app
+            .transcript()
+            .iter()
+            .find(|item| item.role() == "Assistant")
+            .expect("assistant stream item");
+        assert_eq!(assistant.text().as_bytes(), expected.as_bytes());
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 48, 14));
+        render::render(&mut app, &mut Frame::new(&mut buffer));
+        let assistant = app
+            .transcript()
+            .iter()
+            .find(|item| item.role() == "Assistant")
+            .expect("assistant stream item after render");
+        assert_eq!(assistant.text().as_bytes(), expected.as_bytes());
+    }
+    assert_eq!(expected, source);
+}
+
+#[test]
 fn assistant_navigation_waits_for_first_nonempty_segment_content_and_runs_once() {
     let session_id = SessionId::new();
     let history = [event(
@@ -4062,6 +4118,44 @@ fn screenshot_scale_metadata_events_never_pollute_tool_frames_or_identity() {
             );
         }
     }
+}
+
+#[test]
+fn structural_insertions_preserve_stable_transcript_anchor() {
+    let session_id = SessionId::new();
+    let history = (0..24)
+        .map(|sequence| {
+            event(
+                session_id,
+                sequence,
+                SessionEventKind::AssistantMessage {
+                    text: format!("message {sequence}\nline two\nline three"),
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+    assert!(app.scroll_transcript_up(18));
+    let anchor_before = app.stable_transcript_anchor().expect("detached anchor");
+
+    app.absorb_session_event(&event(
+        session_id,
+        24,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "structural-tool".to_owned(),
+            producer_plugin_id: Some("test.plugin".to_owned()),
+            tool_name: "test.tool".to_owned(),
+            arguments_json: "{}".to_owned(),
+            working_directory: None,
+        },
+    ));
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 12));
+    render::render(&mut app, &mut Frame::new(&mut buffer));
+
+    assert_eq!(app.stable_transcript_anchor(), Some(anchor_before));
 }
 
 #[test]
