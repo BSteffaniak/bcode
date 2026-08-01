@@ -11995,6 +11995,8 @@ impl ReviewApp {
     fn draft_anchor_for_thread_key(&self, thread_key: &str) -> Option<ReviewCommentAnchor> {
         self.draft_comments
             .keys()
+            .chain(self.ai_exchanges.keys())
+            .chain(self.suggested_comments.keys())
             .find(|anchor| Self::thread_key_for_anchor(anchor) == thread_key)
             .cloned()
     }
@@ -15474,6 +15476,83 @@ mod tests {
     }
 
     #[test]
+    fn multiple_threads_keep_independent_sessions_and_bounded_context() {
+        let mut app = sample_app();
+        let first_anchor = app.comment_anchor_for_row(1).expect("first anchor");
+        let second_anchor = app.comment_anchor_for_row(2).expect("second anchor");
+        let first_session = SessionId::new().to_string();
+        let second_session = SessionId::new().to_string();
+        let first_exchange = app.create_ai_exchange(
+            first_anchor.clone(),
+            "first question".to_string(),
+            Some(first_session.clone()),
+        );
+        app.mark_thread_session(&first_exchange, &first_anchor, &first_session);
+        let second_exchange = app.create_ai_exchange(
+            second_anchor.clone(),
+            "second question".to_string(),
+            Some(second_session.clone()),
+        );
+        app.mark_thread_session(&second_exchange, &second_anchor, &second_session);
+
+        let ids = app.linked_agent_session_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&first_session));
+        assert!(ids.contains(&second_session));
+        assert_ne!(
+            app.agent_state_for_anchor(&first_anchor)
+                .and_then(|state| state.session_id.as_deref()),
+            app.agent_state_for_anchor(&second_anchor)
+                .and_then(|state| state.session_id.as_deref())
+        );
+        let context = app.agent_session_prompt(&PendingAgentSession {
+            exchange_id: second_exchange,
+            anchor: second_anchor,
+            draft_body: Some("second question".to_string()),
+            command: ReviewAiCommand::Analyze,
+        });
+        assert!(context.chars().count() <= MAX_AI_CONTEXT_CHARS + 2_000);
+        assert!(context.matches("first question").count() <= 1);
+    }
+
+    #[test]
+    fn close_and_reopen_restores_linked_exchange_and_stable_location() {
+        let session_id = SessionId::new().to_string();
+        let (mut app, anchor) = linked_agent_app(&session_id);
+        app.load_persisted_ai_exchanges(vec![ModelReviewAiExchange {
+            schema_version: bcode_code_review_models::REVIEW_AI_EXCHANGE_SCHEMA_VERSION,
+            exchange_id: "exchange-reopen".to_string(),
+            anchor: ModelDraftAnchor::from(anchor.clone()),
+            question: "Remember this question?".to_string(),
+            session_id: Some(session_id.clone()),
+            status: ModelReviewAiExchangeStatus::Linked,
+            error: None,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }]);
+        app.sidebar_mode = ReviewSidebarMode::Threads;
+        app.selected_view_target = Some(ReviewViewTarget::Thread {
+            thread_key: ReviewApp::thread_key_for_anchor(&anchor),
+        });
+        app.sync_presentation_state();
+        let mut review = app.review.clone();
+        review.workspace = Some(app.workspace.clone());
+
+        let mut reopened = ReviewApp::new(review);
+        reopened
+            .load_persisted_ai_exchanges(app.ai_exchanges.values().flatten().cloned().collect());
+
+        assert_eq!(reopened.selected_file, anchor.file_index);
+        assert_eq!(reopened.sidebar_mode, ReviewSidebarMode::Threads);
+        assert_eq!(reopened.linked_agent_session_ids(), vec![session_id]);
+        let state = reopened
+            .agent_state_for_anchor(&anchor)
+            .expect("restored linked exchange");
+        assert_eq!(state.question, "Remember this question?");
+        assert_eq!(state.status, "reconnecting linked session…");
+    }
+
+    #[test]
     fn workspace_presentation_state_restores_stable_location_best_effort() {
         let base = sample_app();
         let mut review = base.review;
@@ -15527,6 +15606,37 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("session not found"))
         );
+        assert!(!app.should_exit);
+    }
+
+    #[test]
+    fn linked_session_return_restores_exact_in_process_review_location() {
+        let session_id = SessionId::new();
+        let (mut app, anchor) = linked_agent_app(&session_id.to_string());
+        let exchange_id = app.create_ai_exchange(
+            anchor.clone(),
+            "question".to_string(),
+            Some(session_id.to_string()),
+        );
+        app.mark_thread_session(&exchange_id, &anchor, &session_id.to_string());
+        app.selected_file = 0;
+        app.selected_diff_line = 2;
+        app.diff_scroll = 7;
+        app.sidebar_mode = ReviewSidebarMode::Threads;
+        app.selected_view_target = Some(ReviewViewTarget::Thread {
+            thread_key: ReviewApp::thread_key_for_anchor(&anchor),
+        });
+        let expected_target = app.selected_view_target.clone();
+
+        assert!(app.open_linked_session_at_selection());
+        assert_eq!(app.take_session_to_open(), Some(session_id));
+        app.status_message = Some("returned from linked Bcode session".to_string());
+
+        assert_eq!(app.selected_file, 0);
+        assert_eq!(app.selected_diff_line, 2);
+        assert_eq!(app.diff_scroll, 7);
+        assert_eq!(app.sidebar_mode, ReviewSidebarMode::Threads);
+        assert_eq!(app.selected_view_target, expected_target);
         assert!(!app.should_exit);
     }
 
@@ -15634,6 +15744,39 @@ mod tests {
     }
 
     #[test]
+    fn completed_markdown_preserves_headings_lists_and_code_fences() {
+        let markdown = "## Result\n\n* first\n* second\n\n```rust\nfn main() {}\n```";
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.connection_status = SessionConnectionViewStatus::Attached;
+        snapshot
+            .transcript
+            .items
+            .push(bcode_session_view_models::TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new("assistant:markdown"),
+                revision: 1,
+                sequence: Some(1),
+                timestamp_ms: Some(1),
+                output_location: None,
+                streaming: false,
+                kind: TranscriptViewItemKind::AssistantMessage {
+                    message: bcode_session_view_models::ChatMessageView::markdown(markdown),
+                },
+            });
+
+        let state = ReviewAgentSessionViewState::from_snapshot(snapshot);
+
+        assert_eq!(state.display_answer(), markdown);
+        let answer = state
+            .session_items()
+            .iter()
+            .find(|item| item.kind == ReviewAgentSessionItemKind::Assistant)
+            .expect("assistant markdown");
+        assert_eq!(answer.format, TextFormat::Markdown);
+        assert!(answer.text.contains("```rust"));
+        assert!(answer.text.contains("* second"));
+    }
+
+    #[test]
     fn semantic_tail_preserves_a_bounded_turn_boundary() {
         let items = (0..30)
             .map(|index| bcode_session_view_models::TranscriptViewItem {
@@ -15729,6 +15872,14 @@ mod tests {
             ReviewAgentSessionItemKind::Assistant
         );
         assert_eq!(state.display_answer(), "## Done\n\n* tests passed");
+        assert_eq!(
+            state
+                .session_items()
+                .iter()
+                .map(|item| item.label.as_str())
+                .collect::<Vec<_>>(),
+            vec!["activity", "shell.run · Finished", "answer"]
+        );
     }
 
     #[test]
@@ -15750,6 +15901,76 @@ mod tests {
         let state = ReviewAgentSessionViewState::from_snapshot(failed);
         assert_eq!(state.phase, ReviewAgentThreadPhase::Failed);
         assert_eq!(state.error.as_deref(), Some("provider unavailable"));
+    }
+
+    #[test]
+    fn disconnected_stream_retry_replaces_degraded_state_with_authoritative_snapshot() {
+        let session_id = SessionId::new().to_string();
+        let (mut app, anchor) = linked_agent_app(&session_id);
+        app.selected_diff_line = anchor.diff_row;
+        app.selected_view_target = None;
+        app.agent_thread_states.insert(
+            ReviewApp::thread_key_for_anchor(&anchor),
+            ReviewAgentThreadState {
+                phase: ReviewAgentThreadPhase::Running,
+                session_id: Some(session_id.clone()),
+                question: "question".to_string(),
+                context_summary: String::new(),
+                status: "running".to_string(),
+                answer: String::new(),
+                session_items: Vec::new(),
+                session_revision: 0,
+                stream_warning: None,
+                activity: None,
+                error: None,
+            },
+        );
+        app.mark_agent_session_failed(&session_id, "daemon disconnected");
+        assert_eq!(
+            app.agent_state_for_anchor(&anchor)
+                .and_then(|state| state.error.as_deref()),
+            Some("daemon disconnected")
+        );
+
+        assert!(app.retry_linked_session_stream_at_selection());
+        assert!(
+            app.take_pending_agent_stream_retries()
+                .iter()
+                .any(|retry| retry == &session_id)
+        );
+
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.revision = 9;
+        snapshot.connection_status = SessionConnectionViewStatus::Attached;
+        snapshot
+            .transcript
+            .items
+            .push(bcode_session_view_models::TranscriptViewItem {
+                id: bcode_session_view_models::TranscriptViewItemId::new("assistant:reconnected"),
+                revision: 9,
+                sequence: Some(9),
+                timestamp_ms: Some(9),
+                output_location: None,
+                streaming: false,
+                kind: TranscriptViewItemKind::AssistantMessage {
+                    message: bcode_session_view_models::ChatMessageView::markdown(
+                        "## Reconnected\n\n* no duplicate output",
+                    ),
+                },
+            });
+        app.apply_agent_stream_state(
+            &session_id,
+            &ReviewAgentSessionViewState::from_snapshot(snapshot),
+        );
+
+        let state = app
+            .agent_state_for_anchor(&anchor)
+            .expect("restored stream");
+        assert_eq!(state.session_revision, 9);
+        assert_eq!(state.answer, "## Reconnected\n\n* no duplicate output");
+        assert!(state.error.is_none());
+        assert!(state.stream_warning.is_none());
+        assert_eq!(state.session_items.len(), 1);
     }
 
     #[test]

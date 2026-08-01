@@ -2987,31 +2987,38 @@ fn render_comment_editor(app: &mut ReviewApp, area: Rect, frame: &mut Frame<'_>)
     render_comment_editor_footer(app, editor, popup, frame);
 }
 
+fn comment_editor_title(editor: &crate::code_review_tui::ReviewCommentEditor) -> String {
+    let action = editor.action.label();
+    if matches!(
+        editor.mode,
+        crate::code_review_tui::ReviewCommentEditorMode::Edit { .. }
+    ) {
+        return if editor.preview {
+            " Edit draft preview ".to_string()
+        } else {
+            " Edit draft comment ".to_string()
+        };
+    }
+    if editor.preview {
+        return if editor.existing_comment_count > 0 {
+            format!(" Reply preview · {action} ")
+        } else {
+            format!(" Review preview · {action} ")
+        };
+    }
+    if editor.existing_comment_count > 0 {
+        format!(" Reply to review thread · {action} ")
+    } else {
+        format!(" Review composer · {action} ")
+    }
+}
+
 fn render_comment_editor_header(
     editor: &crate::code_review_tui::ReviewCommentEditor,
     popup: Rect,
     frame: &mut Frame<'_>,
 ) {
-    let title = if matches!(
-        editor.mode,
-        crate::code_review_tui::ReviewCommentEditorMode::Edit { .. }
-    ) {
-        if editor.preview {
-            " Edit draft preview "
-        } else {
-            " Edit draft comment "
-        }
-    } else if editor.preview {
-        if editor.existing_comment_count > 0 {
-            " Reply preview "
-        } else {
-            " Review comment preview "
-        }
-    } else if editor.existing_comment_count > 0 {
-        " Reply to review thread "
-    } else {
-        " Review comment "
-    };
+    let title = comment_editor_title(editor);
     frame.write_line(
         Rect::new(popup.x, popup.y, popup.width, 1),
         &Line::from_spans(vec![Span::styled(
@@ -3590,6 +3597,44 @@ mod tests {
     use crate::code_review_tui::ReviewFileStatus;
 
     use super::*;
+
+    #[test]
+    fn common_composer_title_and_footer_make_each_submit_action_explicit() {
+        let anchor = crate::code_review_tui::ReviewCommentAnchor {
+            file_index: 0,
+            path: "src/lib.rs".to_string(),
+            diff_row: 1,
+            end_diff_row: None,
+            old_line: None,
+            new_line: Some(2),
+            old_start: None,
+            old_end: None,
+            new_start: Some(2),
+            new_end: Some(2),
+            line_kind: crate::code_review_tui::ReviewLineKind::Added,
+            is_file_anchor: false,
+            surface_id: None,
+            source_id: None,
+        };
+        for (action, label) in [
+            (
+                crate::code_review_tui::ReviewCommentAction::SaveDraft,
+                "save draft",
+            ),
+            (
+                crate::code_review_tui::ReviewCommentAction::AskBcode,
+                "ask Bcode",
+            ),
+            (
+                crate::code_review_tui::ReviewCommentAction::Publish,
+                "publish",
+            ),
+        ] {
+            let editor = crate::code_review_tui::ReviewCommentEditor::new(anchor.clone(), action);
+            assert!(comment_editor_title(&editor).contains(label));
+            assert!(comment_editor_footer(&editor).contains(&format!("[{label}]")));
+        }
+    }
 
     #[test]
     fn linked_session_markdown_renders_across_narrow_and_wide_widths() {
