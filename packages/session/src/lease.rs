@@ -345,6 +345,31 @@ pub fn acquire_session_lease(
     })
 }
 
+/// Report whether exclusive session maintenance currently holds the coordinator lock.
+///
+/// This is a non-mutating admission check. A `false` result is not a lease: callers that need
+/// exclusive maintenance must still acquire and retain [`SessionMaintenanceGuard`].
+///
+/// # Errors
+///
+/// Returns an error when the coordinator lock file cannot be opened or inspected.
+pub fn session_maintenance_is_active(
+    root: &Path,
+    session_id: SessionId,
+) -> Result<bool, SessionLeaseError> {
+    let lock_path = session_lock_path(root, session_id);
+    let coordinator = open_lock_file(&lock_path)?;
+    if try_lock_file_exclusive(&coordinator).map_err(|source| SessionLeaseError::Io {
+        path: lock_path,
+        source,
+    })? {
+        let _ = unlock_file(&coordinator);
+        Ok(false)
+    } else {
+        Ok(true)
+    }
+}
+
 /// Acquire exclusive maintenance access, refusing every live session owner.
 ///
 /// The coordinator lock remains held for the guard lifetime, preventing new owners from
@@ -1081,6 +1106,32 @@ mod tests {
         acquire_session_lease(temp_dir.path(), killed_session, &context("after-kill", 5))
             .expect("owner after dead process pruning");
         assert!(!dead_path.exists(), "killed owner metadata must be pruned");
+    }
+
+    #[test]
+    fn maintenance_activity_probe_is_non_mutating_and_tracks_guard_lifetime() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let session_id = SessionId::new();
+        assert!(!session_maintenance_is_active(temp_dir.path(), session_id).expect("idle probe"));
+
+        let maintenance = acquire_session_maintenance_guard(temp_dir.path(), session_id)
+            .expect("maintenance guard");
+        assert!(
+            session_maintenance_is_active(temp_dir.path(), session_id)
+                .expect("active maintenance probe")
+        );
+        assert!(
+            active_session_owners(temp_dir.path(), session_id)
+                .expect("owner scan")
+                .is_empty(),
+            "probing must not publish owner metadata"
+        );
+
+        drop(maintenance);
+        assert!(
+            !session_maintenance_is_active(temp_dir.path(), session_id)
+                .expect("released maintenance probe")
+        );
     }
 
     #[test]

@@ -681,26 +681,27 @@ fn parse_picker_transcript_search_input(
     Ok(parsed)
 }
 
-async fn search_picker_transcript<W: Write>(
-    terminal: &mut Terminal<&mut W>,
+fn start_picker_transcript_search(
     client: &BcodeClient,
     picker: &mut session_picker::SessionPickerApp,
-    theme: super::render::TuiTheme,
-) -> Result<Option<bcode_session_search::HydratedSessionSearchHit>, TuiError> {
+    effect: &mut super::session_search_effect::SessionSearchEffect,
+    completion_tx: tokio::sync::mpsc::UnboundedSender<
+        super::session_search_effect::SessionSearchCompletion,
+    >,
+) -> bool {
     let input = picker.filter().buffer().text().trim();
     if input.is_empty() {
         picker.set_status("Type a transcript query, then press Ctrl-F".to_owned());
-        return Ok(None);
+        return false;
     }
     let parsed = match parse_picker_transcript_search_input(input) {
         Ok(parsed) => parsed,
         Err(error) => {
             picker.set_status(error);
-            return Ok(None);
+            return false;
         }
     };
     picker.set_status("Searching transcripts…".to_owned());
-    terminal.draw(|frame| session_picker_render::render_picker(picker, frame, theme))?;
     let request = bcode_session_search::SessionSearchRequest {
         query: bcode_session_search::SessionSearchQuery::Text {
             text: parsed.query,
@@ -717,27 +718,39 @@ async fn search_picker_transcript<W: Write>(
         cursor: None,
         deadline_ms: Some(5_000),
     };
-    let (response, hydrated) = client
-        .session_search(
-            request,
-            bcode_session_search::SessionSearchPlanPolicy {
-                execution_class: parsed.execution_class,
-                ..bcode_session_search::SessionSearchPlanPolicy::default()
+    effect.replace(
+        client.clone(),
+        request,
+        bcode_session_search::SessionSearchPlanPolicy {
+            execution_class: parsed.execution_class,
+            ..bcode_session_search::SessionSearchPlanPolicy::default()
+        },
+        Vec::new(),
+        true,
+        completion_tx,
+    );
+    true
+}
+
+fn apply_picker_search_completion(
+    picker: &mut session_picker::SessionPickerApp,
+    effect: &super::session_search_effect::SessionSearchEffect,
+    completion: super::session_search_effect::SessionSearchCompletion,
+) {
+    let Some(completion) = effect.accept(completion) else {
+        return;
+    };
+    if completion.response.hits.is_empty() {
+        picker.set_status(
+            if completion.response.query_complete && completion.response.coverage_complete {
+                "No transcript matches".to_owned()
+            } else {
+                "No transcript matches in incomplete provider coverage".to_owned()
             },
-            Vec::new(),
-            true,
-        )
-        .await?;
-    if response.hits.is_empty() {
-        picker.set_status(if response.query_complete && response.coverage_complete {
-            "No transcript matches".to_owned()
-        } else {
-            "No transcript matches in incomplete provider coverage".to_owned()
-        });
-        return Ok(None);
+        );
+        return;
     }
-    picker.set_search_results(&response, hydrated);
-    Ok(None)
+    picker.set_search_results(&completion.response, completion.hydrated_hits);
 }
 
 async fn import_selected_session<W: Write>(
@@ -870,20 +883,24 @@ pub async fn pick_session<W: Write>(
         "; press Ctrl-N to create one",
     )
     .await;
+    let mut search_effect = super::session_search_effect::SessionSearchEffect::default();
+    let (search_completion_tx, mut search_completion_rx) = tokio::sync::mpsc::unbounded_channel();
     draw_session_picker(io.terminal, &mut picker, services.theme)?;
     loop {
         draw_session_picker(io.terminal, &mut picker, services.theme)?;
-        let event = if watcher.is_some() {
-            tokio::select! {
-                () = apply_next_catalog_snapshot(&mut watcher, &mut picker) => {
-                    continue;
+        let event = tokio::select! {
+            completion = search_completion_rx.recv() => {
+                if let Some(completion) = completion {
+                    apply_picker_search_completion(&mut picker, &search_effect, completion);
                 }
-                event = io.input.recv() => {
-                    event?
-                }
+                continue;
             }
-        } else {
-            io.input.recv().await?
+            () = apply_next_catalog_snapshot(&mut watcher, &mut picker), if watcher.is_some() => {
+                continue;
+            }
+            event = io.input.recv() => {
+                event?
+            }
         };
         let Some(event) = event else {
             continue;
@@ -916,13 +933,12 @@ pub async fn pick_session<W: Write>(
                             return Ok(PickSessionOutcome::SearchHit(hydrated));
                         }
                     } else {
-                        let _ = search_picker_transcript(
-                            io.terminal,
+                        let _started = start_picker_transcript_search(
                             services.client,
                             &mut picker,
-                            services.theme,
-                        )
-                        .await?;
+                            &mut search_effect,
+                            search_completion_tx.clone(),
+                        );
                     }
                 }
                 PickerKeyOutcome::Selected => {

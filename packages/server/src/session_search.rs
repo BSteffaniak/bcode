@@ -199,6 +199,34 @@ pub async fn backfill_provider(
             });
             continue;
         }
+        if let Some(root) = state.sessions.session_store_root()
+            && bcode_session::lease::session_maintenance_is_active(&root, session_id).map_err(
+                |error| SessionSearchServiceError {
+                    code: SearchErrorCode::ProviderUnavailable,
+                    message: bounded_message(&error.to_string()),
+                    retryable: true,
+                },
+            )?
+        {
+            sessions.push(SessionSearchBackfillSessionResult {
+                session_id,
+                outcome: SessionSearchBackfillOutcome::Failed,
+                batches_applied: 0,
+                indexed_through_sequence: provider
+                    .status
+                    .coverage
+                    .iter()
+                    .find(|coverage| coverage.generation.session_id == session_id)
+                    .and_then(|coverage| coverage.indexed_through_sequence),
+                canonical_tail_sequence: None,
+                error: Some(SessionSearchServiceError {
+                    code: SearchErrorCode::ProviderUnavailable,
+                    message: "canonical session maintenance is active; retry backfill after repair/reindex reaches a terminal outcome".to_owned(),
+                    retryable: true,
+                }),
+            });
+            continue;
+        }
         let result = ingest_provider_pages(
             state,
             session_id,
@@ -3210,6 +3238,55 @@ pub(crate) mod tests {
             .wait_for(|snapshot| snapshot.outcome.is_some())
             .await
             .expect("migration reaches terminal outcome");
+    }
+
+    #[tokio::test]
+    async fn explicit_backfill_refuses_to_overlap_active_canonical_repair_maintenance() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        let state = state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Fast)]);
+        let working_directory = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(
+                Some("repair overlap".to_owned()),
+                working_directory.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        let root = state
+            .sessions
+            .session_store_root()
+            .expect("persistent session root");
+        state
+            .sessions
+            .release_session_ownership(session.id)
+            .await
+            .expect("release runtime ownership");
+        let maintenance =
+            bcode_session::lease::acquire_session_maintenance_guard(&root, session.id)
+                .expect("active repair maintenance guard");
+
+        let response = backfill_provider(
+            &state,
+            BackfillSessionSearchRequest {
+                provider_id: FAST_PROVIDER_ID.to_owned(),
+                session_ids: BTreeSet::from([session.id]),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                cursor: None,
+                deadline_ms: 5_000,
+            },
+        )
+        .await
+        .expect("backfill returns explicit per-session repair overlap result");
+
+        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(response.failed_sessions, 1);
+        let error = response.sessions[0].error.as_ref().expect("overlap error");
+        assert!(error.retryable);
+        assert!(error.message.contains("maintenance") || error.message.contains("owned"));
+        drop(maintenance);
     }
 
     #[tokio::test]
