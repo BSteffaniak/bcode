@@ -290,13 +290,6 @@ impl<'a> TranscriptItems<'a> {
     pub fn iter(self) -> impl DoubleEndedIterator<Item = &'a TranscriptItem> {
         self.canonical.iter().chain(self.notices.iter())
     }
-
-    /// Collect visible items into an owned vector for isolated tests.
-    #[cfg(test)]
-    #[must_use]
-    pub fn to_vec(self) -> Vec<TranscriptItem> {
-        self.iter().cloned().collect()
-    }
 }
 
 impl<'a> IntoIterator for TranscriptItems<'a> {
@@ -2152,7 +2145,7 @@ impl BmuxApp {
         }
         self.session_view.set_reasoning_visible(visible);
         self.refresh_thinking_label();
-        self.rebuild_transcript_from_history();
+        self.apply_session_view_terminal_adapter();
     }
 
     /// Apply selected reasoning request settings locally without changing transcript presentation.

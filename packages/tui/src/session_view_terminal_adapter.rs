@@ -52,11 +52,18 @@ impl SessionViewTerminalAdapter {
         target: &mut TranscriptDocument,
     ) -> TranscriptDocumentDamage {
         let source = &snapshot.transcript;
+        let source_items = source.items.iter().filter(|item| {
+            snapshot.thinking.visible
+                || !matches!(
+                    item.kind,
+                    bcode_session_view_models::TranscriptViewItemKind::ReasoningMessage { .. }
+                        | bcode_session_view_models::TranscriptViewItemKind::ReasoningActivity { .. }
+                )
+        });
         if !target.source_index_is_consistent() {
             target.replace_from_shared(
-                source
-                    .items
-                    .iter()
+                source_items
+                    .clone()
                     .map(|item| {
                         apply_stream_integrity(
                             terminal_item_from_shared(item),
@@ -65,21 +72,19 @@ impl SessionViewTerminalAdapter {
                     })
                     .collect(),
             );
-            self.item_revisions = source
-                .items
-                .iter()
+            self.item_revisions = source_items
+                .clone()
                 .map(|item| (item.id.clone(), item.revision))
                 .collect();
             self.stream_statuses = snapshot
                 .text_streams
                 .iter()
-                .filter(|(id, _)| source.items.iter().any(|item| item.id == **id))
+                .filter(|(id, _)| source_items.clone().any(|item| item.id == **id))
                 .map(|(id, state)| (id.clone(), state.status))
                 .collect();
             self.document_revision = Some(source.revision);
             return TranscriptDocumentDamage::FullReset;
         }
-        let source_items = source.items.iter();
         let ordered_source_ids = source_items
             .clone()
             .map(|item| item.id.clone())
@@ -166,6 +171,59 @@ mod tests {
             },
         );
         snapshot
+    }
+
+    #[test]
+    fn hidden_reasoning_is_removed_without_reinterpreting_shared_items() {
+        let mut snapshot = SessionViewSnapshot::empty();
+        snapshot.thinking.visible = true;
+        snapshot.transcript.items = vec![
+            TranscriptViewItem {
+                id: TranscriptViewItemId::new("reasoning"),
+                revision: 1,
+                sequence: Some(1),
+                timestamp_ms: None,
+                output_location: None,
+                streaming: false,
+                kind: TranscriptViewItemKind::ReasoningMessage {
+                    message: ChatMessageView::markdown("private reasoning"),
+                },
+            },
+            TranscriptViewItem {
+                id: TranscriptViewItemId::new("answer"),
+                revision: 1,
+                sequence: Some(2),
+                timestamp_ms: None,
+                output_location: None,
+                streaming: false,
+                kind: TranscriptViewItemKind::AssistantMessage {
+                    message: ChatMessageView::markdown("answer"),
+                },
+            },
+        ];
+        snapshot.transcript.revision = 1;
+        let mut adapter = SessionViewTerminalAdapter::default();
+        let mut document = TranscriptDocument::default();
+
+        adapter.apply(&snapshot, &mut document);
+        assert_eq!(document.items().len(), 2);
+
+        snapshot.thinking.visible = false;
+        snapshot.transcript.revision = 2;
+        assert_eq!(
+            adapter.apply(&snapshot, &mut document),
+            TranscriptDocumentDamage::Structural
+        );
+        assert_eq!(document.items().len(), 1);
+        assert_eq!(document.items()[0].text(), "answer");
+
+        snapshot.thinking.visible = true;
+        snapshot.transcript.revision = 3;
+        assert_eq!(
+            adapter.apply(&snapshot, &mut document),
+            TranscriptDocumentDamage::Structural
+        );
+        assert_eq!(document.items().len(), 2);
     }
 
     #[test]
