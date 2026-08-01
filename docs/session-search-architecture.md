@@ -340,6 +340,9 @@ responses, and UTF-8-safe truncation. Remote providers require separately approv
 and the explicit portable `allow_remote` authorization described above before receiving session
 content.
 
+Operational setup, supported CLI workflows, status interpretation, maintenance, recovery, and
+measured limits are documented in [`session-search-operations.md`](session-search-operations.md).
+
 ## Frontend and skill boundary
 
 Public search and investigation contracts remain portable. Renderers adapt shared semantic results

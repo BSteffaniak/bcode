@@ -251,5 +251,19 @@ commit cost is intentionally explicit and belongs on asynchronous provider worke
 or delay canonical append. These measurements cover one deterministic 25,000-record transcript
 profile, not the final 100,000-event representative corpus or daemon-level p50/p95/p99 acceptance.
 
-The initial Tantivy transcript measurement does not replace future large-output provider/corpus
-amplification measurements before that backend is accepted.
+The same benchmark accepts `BCODE_SESSION_SEARCH_BENCH_RECORDS=100000` for the bounded final-size
+provider corpus. A 2026-08-01 release run measured:
+
+* 100,000 records in 400 durable 250-record commits;
+* 107,278,586 normalized bytes and 18,611,647 index bytes (17.3% amplification);
+* 34.737 seconds total ingestion, or 2,878 records/second;
+* 78.653 ms commit p50 and 132.091 ms commit p95;
+* 1.063 ms warm-query p50 and 1.260 ms warm-query p95 over 100 runs;
+* 3.943 ms provider reopen;
+* 15 MiB configured writer memory.
+
+The final-size provider run remains within the 100 ms ordinary-query and 50% amplification budgets.
+Commit p95 is intentionally not an interactive-path budget: each batch executes on detached provider
+maintenance/ingestion work after canonical append. Process peak RSS and canonical hydration still
+require application-level measurement because the provider test harness cannot isolate them or access
+canonical storage without violating ownership boundaries.

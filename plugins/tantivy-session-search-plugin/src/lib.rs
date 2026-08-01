@@ -2359,12 +2359,21 @@ mod tests {
     fn benchmark_tantivy_provider_query_ingestion_open_and_amplification() {
         use std::time::Instant;
 
-        const RECORDS: usize = 25_000;
+        const DEFAULT_RECORDS: usize = 25_000;
+        const MAX_RECORDS: usize = 100_000;
         const BATCH_SIZE: usize = 250;
         const QUERY_RUNS: usize = 100;
         const QUERY_P95_BUDGET_US: u128 = 100_000;
         const MAX_AMPLIFICATION_PERMILLE: u64 = 500;
 
+        let records = std::env::var("BCODE_SESSION_SEARCH_BENCH_RECORDS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_RECORDS);
+        assert!(
+            records > 0 && records <= MAX_RECORDS && records.is_multiple_of(BATCH_SIZE),
+            "benchmark record count must be a non-zero multiple of {BATCH_SIZE} no larger than {MAX_RECORDS}"
+        );
         let root = tempfile::tempdir().expect("root");
         let mut provider_config = config(root.path());
         provider_config.quota_bytes = DEFAULT_QUOTA_BYTES;
@@ -2372,11 +2381,11 @@ mod tests {
         let session_id = SessionId::new();
         let mut normalized_bytes = 0_u64;
         let ingestion_started = Instant::now();
-        let mut commit_durations = Vec::with_capacity(RECORDS / BATCH_SIZE);
+        let mut commit_durations = Vec::with_capacity(records / BATCH_SIZE);
         let mut previous_sequence = None;
         let mut previous_session_text_bytes = 0_u64;
 
-        for batch_index in 0..(RECORDS / BATCH_SIZE) {
+        for batch_index in 0..(records / BATCH_SIZE) {
             let first = batch_index * BATCH_SIZE + 1;
             let records = (first..first + BATCH_SIZE)
                 .map(|sequence| {
@@ -2450,9 +2459,9 @@ mod tests {
         drop(reopened);
 
         eprintln!(
-            "tantivy_session_search_benchmark records={RECORDS} batches={} normalized_bytes={normalized_bytes} index_bytes={index_bytes} amplification_permille={amplification_permille} ingestion_us={ingestion_us} records_per_second={} commit_p50_us={commit_p50_us} commit_p95_us={commit_p95_us} query_runs={QUERY_RUNS} query_p50_us={query_p50_us} query_p95_us={query_p95_us} open_us={open_us} configured_writer_memory_bytes={writer_memory_bytes} hydration=not_measured_provider_has_no_canonical_access",
-            RECORDS / BATCH_SIZE,
-            u128::try_from(RECORDS)
+            "tantivy_session_search_benchmark records={records} batches={} normalized_bytes={normalized_bytes} index_bytes={index_bytes} amplification_permille={amplification_permille} ingestion_us={ingestion_us} records_per_second={} commit_p50_us={commit_p50_us} commit_p95_us={commit_p95_us} query_runs={QUERY_RUNS} query_p50_us={query_p50_us} query_p95_us={query_p95_us} open_us={open_us} configured_writer_memory_bytes={writer_memory_bytes} hydration=not_measured_provider_has_no_canonical_access",
+            records / BATCH_SIZE,
+            u128::try_from(records)
                 .unwrap_or(u128::MAX)
                 .saturating_mul(1_000_000)
                 .checked_div(ingestion_us)
