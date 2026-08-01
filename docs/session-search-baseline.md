@@ -219,6 +219,25 @@ explicit revision:
 The 50,000-event page baseline currently exceeds the 100 ms target. That is recorded as a known gap,
 not relaxed into the budget.
 
+## Canonical hydration benchmark
+
+The ignored server benchmark exercises the production exact-locator hydration path through the
+session manager and zero-neighbor `around` reads:
+
+```sh
+cargo test -p bcode_server benchmark_canonical_hit_hydration --lib -- \
+  --ignored --nocapture
+```
+
+A 2026-08-01 debug-profile run hydrated 20 hits over a 200-event persistent canonical session for 20
+runs at 56.826 ms p50 and 80.268 ms p95, within the initial 100 ms bounded-read budget. The benchmark
+asserts that every locator returns the exact canonical event and rejects p95 above 100 ms. Attempts
+to construct 1,000- and 10,000-event corpora through ordinary one-event durable append exceeded the
+five-minute command envelope during setup, before reporting hydration timings. This is not evidence
+of hydration failure, but it means representative 100,000-event hydration remains open until the
+benchmark has a bounded bulk fixture/setup path that preserves canonical schema and sequence rules.
+
+
 ## Tantivy transcript-provider benchmark
 
 Run on 2026-07-28 with:
@@ -260,7 +279,15 @@ provider corpus. A 2026-08-01 release run measured:
 * 78.653 ms commit p50 and 132.091 ms commit p95;
 * 1.063 ms warm-query p50 and 1.260 ms warm-query p95 over 100 runs;
 * 3.943 ms provider reopen;
-* 15 MiB configured writer memory.
+* 15 MiB configured writer memory;
+* 70,074,368-byte maximum resident set size and 33,980,944-byte peak memory footprint when the
+  already-built release test binary was run under macOS `/usr/bin/time -l` in a fresh process.
+
+The measured whole-process peak RSS is 66.8 MiB, including the Rust test harness, Tantivy runtime,
+normalized-record construction, index writer, and query/reopen phases. It is not the coordinator-only
+incremental RSS budget and should not be interpreted as such. It supplies a conservative isolated
+provider-process ceiling for this corpus; daemon coordinator and compiled-but-disabled startup
+measurements remain separate.
 
 The final-size provider run remains within the 100 ms ordinary-query and 50% amplification budgets.
 Commit p95 is intentionally not an interactive-path budget: each batch executes on detached provider

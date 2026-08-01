@@ -159,7 +159,13 @@ or replace canonical session writes.
 The deterministic Tantivy provider baseline now covers both 25,000 and 100,000 records. The final-size
 100,000-record run measured 1.063 ms p50 and 1.260 ms p95 warm query latency, 78.653 ms p50 and
 132.091 ms p95 commit latency per 250-record batch, 3.943 ms reopen time, and 17.3% index
-amplification using a 15 MiB writer cache. These results satisfy the initial 100 ms ordinary-query and
-50% amplification budgets. Commit latency belongs to detached asynchronous provider work, not the
-canonical append path. Peak RSS, canonical hydration, daemon startup modes, and daemon-level
-p50/p95/p99 measurements remain outstanding; see `docs/session-search-baseline.md`.
+amplification using a 15 MiB writer cache. A fresh already-built release test process measured
+70,074,368 bytes (66.8 MiB) maximum RSS and 33,980,944 bytes peak memory footprint under macOS
+`/usr/bin/time -l`; this is a conservative whole-provider-process value including the test harness,
+record construction, ingestion, query, and reopen phases, not coordinator-only incremental RSS.
+These results satisfy the initial 100 ms ordinary-query and 50% amplification budgets. A separate
+production-path hydration benchmark measured 56.826/80.268 ms p50/p95 for 20 exact locators over a
+200-event persistent session, within the 100 ms bounded-read budget; larger representative hydration
+setup remains open. Commit latency belongs to detached asynchronous provider work, not the canonical
+append path. Daemon startup modes and daemon-level p50/p95/p99 measurements remain outstanding; see
+`docs/session-search-baseline.md`.

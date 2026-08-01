@@ -2663,6 +2663,94 @@ mod tests {
         assert!(state.session_search_dirty.snapshot().await.0.is_empty());
     }
 
+    #[tokio::test]
+    #[ignore = "manual canonical hydration performance baseline"]
+    async fn benchmark_canonical_hit_hydration() {
+        const DEFAULT_EVENTS: usize = 200;
+        const MAX_EVENTS: usize = 100_000;
+        const HITS: usize = 20;
+        const RUNS: usize = 20;
+        const HYDRATION_P95_BUDGET_US: u128 = 100_000;
+
+        let events = std::env::var("BCODE_SESSION_SEARCH_HYDRATION_EVENTS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_EVENTS);
+        assert!(events > 0 && events <= MAX_EVENTS);
+        let state = state_with_providers(&[]);
+        let working_directory = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(
+                Some("hydration benchmark".to_owned()),
+                working_directory.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        for sequence in 0..events {
+            state
+                .sessions
+                .append_context_compacted(
+                    session.id,
+                    format!("hydration benchmark event {sequence}"),
+                    0,
+                )
+                .await
+                .expect("append event");
+        }
+        let tail = state
+            .sessions
+            .session_history_page(
+                session.id,
+                bcode_session_models::SessionHistoryQuery {
+                    cursor: None,
+                    limit: HITS,
+                    direction: bcode_session_models::SessionHistoryDirection::Backward,
+                },
+            )
+            .await
+            .expect("read hydration locators");
+        assert_eq!(tail.events.len(), HITS);
+        let hits = tail
+            .events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| SessionSearchHit {
+                locator: SessionSearchLocator {
+                    session_id: session.id,
+                    sequence: event.sequence,
+                    record_id: Some(format!("hydration-{index}")),
+                },
+                content_kind: SearchContentKind::Compaction,
+                matched_field: SearchField::Text,
+                provider_id: FAST_PROVIDER_ID.to_owned(),
+                provider_rank: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                provider_score: None,
+                preview: None,
+                preview_truncated: false,
+            })
+            .collect::<Vec<_>>();
+        let mut durations = Vec::with_capacity(RUNS);
+        for _ in 0..RUNS {
+            let started = Instant::now();
+            let hydrated = hydrate_hits(&state, hits.clone()).await;
+            durations.push(started.elapsed().as_micros());
+            assert!(hydrated.iter().all(|hit| {
+                hit.outcome == SearchHitHydrationOutcome::Hydrated && hit.event.is_some()
+            }));
+        }
+        durations.sort_unstable();
+        let p50_us = durations[RUNS / 2];
+        let p95_us = durations[(RUNS * 95 / 100).min(RUNS - 1)];
+        println!(
+            "session_search_hydration_benchmark events={events} hits={HITS} runs={RUNS} p50_us={p50_us} p95_us={p95_us}"
+        );
+        assert!(
+            p95_us <= HYDRATION_P95_BUDGET_US,
+            "canonical hydration p95 {p95_us} us exceeds 100 ms budget"
+        );
+    }
+
     #[test]
     fn apply_batch_acknowledgment_rejects_conflicts_and_mismatches() {
         let request = ApplySearchRecordsRequest {
