@@ -29,6 +29,7 @@ bcode_provider_auth       = { workspace = true }
 bcode_ralph               = { workspace = true }
 bcode_server              = { workspace = true }
 bcode_session_models      = { workspace = true }
+bcode_session_search      = { workspace = true }
 bcode_session_view        = { workspace = true }
 bcode_session_view_models = { workspace = true }
 bcode_settings            = { workspace = true }

@@ -2089,7 +2089,10 @@ impl ServerState {
         if !self.session_search_enabled {
             return;
         }
-        let state = Arc::clone(self);
+        Self::spawn_session_search_ingestion_worker(Arc::clone(self));
+    }
+
+    fn spawn_session_search_ingestion_worker(state: Arc<Self>) {
         tokio::spawn(async move {
             loop {
                 state.session_search_dirty.notified().await;
@@ -30512,6 +30515,108 @@ mod tests {
     use std::sync::Mutex as TestMutex;
     use switchy::database::{DatabaseValue, query::FilterableQuery};
     use tracing_subscriber::fmt::MakeWriter;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_ipc_investigation_and_search_run_while_daemon_owns_session_storage() {
+        let session_root = tempfile::tempdir().expect("session root");
+        let sessions = SessionManager::persistent(session_root.path()).expect("sessions");
+        let session = sessions
+            .create_session(
+                Some("active owner search".to_owned()),
+                test_working_directory(),
+            )
+            .await
+            .expect("session");
+        sessions
+            .append_context_compacted(session.id, "needle active owner".to_owned(), 0)
+            .await
+            .expect("append canonical event");
+        let state = Arc::new(session_search::tests::state_with_providers(&[(
+            "test.fast-session-search",
+            session_search::tests::TestProviderBehavior::Fast,
+        )]));
+        // Use the same persistent manager the daemon owns, while retaining its lease and DB handles.
+        let mut state = Arc::into_inner(state).expect("unshared test state");
+        state.sessions = sessions.clone();
+        let state = Arc::new(state);
+        state.session_search_dirty.mark_committed(session.id).await;
+        session_search::process_dirty_sessions(&state).await;
+
+        let socket_dir = tempfile::tempdir().expect("IPC socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.path().join("server.sock"));
+        let listener = LocalIpcListener::bind(&endpoint).expect("IPC listener");
+        let server_state = Arc::clone(&state);
+        let server = tokio::spawn(async move {
+            loop {
+                let stream = listener.accept().await.expect("client connection");
+                let state = Arc::clone(&server_state);
+                tokio::spawn(async move {
+                    handle_client(stream, state).await.expect("handle client");
+                });
+            }
+        });
+
+        let client = bcode_client::BcodeClient::new(endpoint);
+        let page = client
+            .session_history_page(
+                session.id,
+                bcode_session_models::SessionHistoryQuery {
+                    cursor: None,
+                    limit: 20,
+                    direction: bcode_session_models::SessionHistoryDirection::Backward,
+                },
+            )
+            .await
+            .expect("bounded history through real IPC");
+        assert!(page.events.iter().any(|event| {
+            matches!(
+                &event.kind,
+                bcode_session_models::SessionEventKind::ContextCompacted { summary, .. }
+                    if summary == "needle active owner"
+            )
+        }));
+
+        let (search, hydrated) = client
+            .session_search(
+                bcode_session_search::SessionSearchRequest {
+                    query: bcode_session_search::SessionSearchQuery::Text {
+                        text: "needle".to_owned(),
+                        mode: bcode_session_search::TextMatchMode::Terms,
+                        fields: BTreeSet::new(),
+                    },
+                    filters: bcode_session_search::SessionSearchFilters {
+                        session_ids: BTreeSet::from([session.id]),
+                        content_kinds: BTreeSet::from([
+                            bcode_session_search::SearchContentKind::UserMessage,
+                        ]),
+                        ..bcode_session_search::SessionSearchFilters::default()
+                    },
+                    sort: bcode_session_search::SessionSearchSort::ProviderRelevance,
+                    limit: 20,
+                    cursor: None,
+                    deadline_ms: Some(2_000),
+                },
+                bcode_session_search::SessionSearchPlanPolicy {
+                    per_provider_deadline_ms: 1_000,
+                    ..bcode_session_search::SessionSearchPlanPolicy::default()
+                },
+                Vec::new(),
+                false,
+            )
+            .await
+            .expect("search through real IPC");
+        assert_eq!(search.hits.len(), 1, "search response: {search:?}");
+        assert!(
+            search
+                .providers
+                .iter()
+                .any(|provider| provider.provider_id == "test.fast-session-search")
+        );
+        assert!(hydrated.is_empty());
+
+        server.abort();
+    }
 
     #[cfg(unix)]
     #[tokio::test]

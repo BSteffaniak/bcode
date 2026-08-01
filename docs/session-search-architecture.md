@@ -179,6 +179,12 @@ Fast indexed results are not held indefinitely by cold or deep scans. Provider s
 opaque and are not treated as directly comparable across backends. Results are grouped or combined
 using backend-neutral rank information, then deduplicated by canonical locator.
 
+Canonical semantic records carry only native Bcode-owned metadata. The ingestion coordinator enriches
+approved records from the canonical session summary with normalized working directory and, for
+imported sessions, the stable import `source_id`. It does not copy external session IDs, source
+database paths, source schemas, or other source-persistence details. Original source-native history
+remains owned by source-specific skills and import plugins.
+
 Every v1 response is one bounded terminal aggregate; partial provider response streaming is deferred.
 Every provider contribution or failure identifies its terminal stage, elapsed time, requested/searched
 or hydration-affected content, completion, timeout/failure classification, stale checkpoints, content
@@ -206,6 +212,12 @@ size, page events, batch records/text bytes, per-session duration, completion/fa
 requeue without session IDs or provider-controlled labels. Retry classification treats stale generation,
 checkpoint conflict, quota exhaustion, disabled content, invalid requests, and typed response
 incompatibility as terminal for the dirty item; only transient transport/service failures retry.
+Before any provider invocation, ingestion also refuses to overlap an active canonical migration,
+requires checkpoint generation fingerprints to match current canonical identity plus writer/event/
+search-record/normalization/policy versions, and rejects checkpoints ahead of the current canonical
+tail after repair or truncation. Explicit backfill reports active migration as a retryable per-session
+failure; generation mismatch or canonical-tail regression requires explicit provider rebuild before
+backfill. These guards do not treat checkpoints as reconnect-safe transport resume.
 Provider-side expected sequence/text checks remain the atomic stale-write guard. The host additionally
 validates that every apply-batch acknowledgment has the requested batch identity, requested terminal
 sequence, and outcome-consistent record count; conflicting duplicates are terminal rather than being
@@ -227,7 +239,17 @@ produces terminal stale or rebuild-required state before paging and never causes
 merge.
 
 Historical backfill, full rebuild, policy-change reindexing, and purge are explicit cancellable
-maintenance operations. The public client/IPC/CLI boundary exposes provider-scoped purge, empty
+maintenance operations. Provider routing is query-time policy, not derived-state identity. Changing a route may leave
+compatible provider data retained but immediately changes which providers are selected; disabling a
+route performs no hidden deletion. A provider upgrade or provider-owned content-policy change must
+validate retained schema/tokenizer/projection/policy/configuration state and report incompatible or
+rebuild-required rather than reuse uncertain data. Mutable canonical summary metadata does not create
+a new canonical history generation: rename emits a new title record, and records projected after a
+working-directory change receive the new summary directory without rewriting earlier historical
+records. Import completion and fork lineage do change the generation fingerprint because they define
+canonical provenance.
+
+The public client/IPC/CLI boundary exposes provider-scoped purge, empty
 rebuild, and daemon-owned bounded backfill. `session search-backfill` selects either explicitly named
 canonical sessions or at most 256 catalog sessions filtered by summary update timestamps and an
 explicit stable continuation cursor, applies a
@@ -362,6 +384,11 @@ measured limits are documented in [`session-search-operations.md`](session-searc
 Public search and investigation contracts remain portable. Renderers adapt shared semantic results
 without owning provider workflows or canonical session state. The TUI owns terminal layout and
 interaction only.
+
+The first TUI search slice is canonical picker filtering over portable summary metadata; it remains
+renderer-local and does not invoke providers or imply transcript coverage. Dedicated transcript
+search is a separate later slice that must consume these contracts asynchronously and hydrate
+canonical locators before navigation.
 
 The intended `bcode-session-history` skill contract is to use supported Bcode commands and report
 session IDs, query scope, content/provider coverage, truncation, freshness, and failures. A native

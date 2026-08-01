@@ -72,6 +72,7 @@ pub(crate) mod session_fork_dialog_render;
 pub(crate) mod session_fork_flow;
 pub(crate) mod session_picker;
 pub(crate) mod session_picker_render;
+pub mod session_search_effect;
 pub(crate) mod setup_board;
 pub(crate) mod skill_flow;
 pub(crate) mod skill_picker;

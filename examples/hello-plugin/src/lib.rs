@@ -94,6 +94,7 @@ impl RustPlugin for HelloPlugin {
                     ServiceResponse::text("timeout")
                 }
             }
+            "abort-process" => std::process::abort(),
             "event-count" => ServiceResponse::text(self.event_count.to_string()),
             _ => ServiceResponse::error(
                 "unsupported_operation",

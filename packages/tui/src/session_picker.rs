@@ -287,6 +287,13 @@ fn session_matches(session: &SessionSummary, query: &str) -> bool {
     }
     session.display_title().to_ascii_lowercase().contains(query)
         || session.id.to_string().contains(query)
+        || session.import.as_ref().is_some_and(|import| {
+            import.source_id.to_ascii_lowercase().contains(query)
+                || import
+                    .source_display_name
+                    .to_ascii_lowercase()
+                    .contains(query)
+        })
         || session
             .fork
             .as_ref()
@@ -315,4 +322,54 @@ fn empty_item(message: &str) -> ListItem {
         message.to_owned(),
         Style::new().fg(Color::BrightBlack),
     )]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn summary(title: &str, working_directory: &str) -> SessionSummary {
+        SessionSummary {
+            id: SessionId::new(),
+            name: Some(title.to_owned()),
+            explicit_name: None,
+            derived_title: None,
+            title_source: bcode_session_models::SessionTitleSource::Explicit,
+            client_count: 0,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            working_directory: working_directory.into(),
+            import: None,
+            fork: None,
+            execution: None,
+        }
+    }
+
+    #[test]
+    fn filter_matches_only_portable_summary_metadata() {
+        let source_session_id = SessionId::new();
+        let mut session = summary("Visible title", "/workspace/project");
+        session.import = Some(bcode_session_models::SessionImportSummary {
+            source_id: "opencode".to_owned(),
+            source_display_name: "OpenCode".to_owned(),
+            external_session_id: "external".to_owned(),
+            imported_at_ms: 1,
+        });
+        session.fork = Some(bcode_session_models::SessionForkSummary {
+            source_session_id,
+            source_title: Some("Parent title".to_owned()),
+            source_cutoff_sequence: Some(1),
+            source_prompt_sequence: Some(1),
+            forked_at_ms: 1,
+            kind: bcode_session_models::SessionForkKind::Fork,
+        });
+        assert!(session_matches(&session, "visible"));
+        assert!(session_matches(&session, &session.id.to_string()));
+        assert!(session_matches(&session, "workspace/project"));
+        assert!(session_matches(&session, "opencode"));
+        assert!(session_matches(&session, "parent title"));
+        assert!(session_matches(&session, &source_session_id.to_string()));
+        assert!(!session_matches(&session, "transcript-only-term"));
+        assert!(!session_matches(&session, "external"));
+    }
 }

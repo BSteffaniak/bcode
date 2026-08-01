@@ -6323,6 +6323,43 @@ library = "libexample_plugin.dylib"
     }
 
     #[test]
+    #[ignore = "subprocess helper for aborting_dynamic_library_terminates_only_fixture_process"]
+    fn aborting_dynamic_library_subprocess_helper() {
+        if std::env::var_os("BCODE_ABORT_DYNAMIC_PLUGIN_HELPER").is_none() {
+            return;
+        }
+        let plugin = load_dynamic_hello_plugin();
+        let _ = plugin.invoke_service_with_events(
+            "example-hello/v1",
+            "abort-process",
+            Vec::new(),
+            |_| {},
+        );
+        panic!("aborting dynamic plugin unexpectedly returned");
+    }
+
+    #[test]
+    fn aborting_dynamic_library_terminates_only_fixture_process() {
+        let executable = std::env::current_exe().expect("current test executable");
+        let output = std::process::Command::new(executable)
+            .arg("tests::aborting_dynamic_library_subprocess_helper")
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("BCODE_ABORT_DYNAMIC_PLUGIN_HELPER", "1")
+            .output()
+            .expect("run aborting dynamic plugin helper");
+        assert!(
+            !output.status.success(),
+            "aborting dynamic plugin helper must terminate unsuccessfully"
+        );
+        assert!(
+            !String::from_utf8_lossy(&output.stdout)
+                .contains("aborting dynamic plugin unexpectedly returned")
+        );
+    }
+
+    #[test]
     fn static_loader_supports_all_bridge_families_and_cancellation() {
         assert_hello_plugin_bridge_and_cancellation(load_static_hello_plugin());
     }

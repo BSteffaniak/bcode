@@ -1,0 +1,23 @@
+{
+  "provider_id": "example.search",
+  "outcome": "complete",
+  "hits": [
+    {
+      "locator": {
+        "session_id": "00000000-0000-0000-0000-000000000001",
+        "sequence": 1,
+        "record_id": "1:user-message:0"
+      },
+      "content_kind": "user_message",
+      "matched_field": "text",
+      "provider_id": "example.search",
+      "provider_rank": 1,
+      "provider_score": "1.0",
+      "preview": "hello",
+      "preview_truncated": false
+    }
+  ],
+  "query_complete": true,
+  "coverage_complete": true,
+  "searched_content": ["user_message"]
+}

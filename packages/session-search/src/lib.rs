@@ -2669,6 +2669,127 @@ mod tests {
     }
 
     #[test]
+    fn retained_v1_status_fixture_decodes_validates_and_reencodes() {
+        let fixture = include_str!("../tests/fixtures/session-search-status-v1.json");
+        let status: SessionSearchStatus =
+            serde_json::from_str(fixture).expect("decode retained status fixture");
+        status.validate().expect("validate retained status fixture");
+        let expected: serde_json::Value =
+            serde_json::from_str(fixture).expect("decode fixture value");
+        let actual = serde_json::to_value(status).expect("encode status fixture");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn retained_v1_response_fixture_decodes_validates_and_reencodes() {
+        let fixture = include_str!("../tests/fixtures/session-search-response-v1.json");
+        let response: SessionSearchResponse =
+            serde_json::from_str(fixture).expect("decode retained response fixture");
+        let expected: serde_json::Value =
+            serde_json::from_str(fixture).expect("decode fixture value");
+        let actual = serde_json::to_value(response).expect("encode response fixture");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn retained_v1_ingestion_acknowledgment_fixture_decodes_and_reencodes() {
+        let fixture = include_str!("../tests/fixtures/apply-search-records-response-v1.json");
+        let response: ApplySearchRecordsResponse =
+            serde_json::from_str(fixture).expect("decode retained ingestion acknowledgment");
+        let expected: serde_json::Value =
+            serde_json::from_str(fixture).expect("decode fixture value");
+        let actual = serde_json::to_value(response).expect("encode ingestion acknowledgment");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn future_shared_versions_fail_closed_across_contract_surfaces() {
+        let status_fixture = include_str!("../tests/fixtures/session-search-status-v1.json");
+        for field in [
+            "record_schema_version",
+            "normalization_version",
+            "policy_version",
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_str(status_fixture).expect("decode status fixture value");
+            value[field] = serde_json::json!(u64::from(u16::MAX));
+            let status: SessionSearchStatus =
+                serde_json::from_value(value).expect("decode structurally valid future status");
+            assert!(matches!(
+                status.validate(),
+                Err(ContractValidationError::InvalidProjection(
+                    "provider status uses unsupported projection versions"
+                ))
+            ));
+        }
+
+        let ingestion_fixture = include_str!("../tests/fixtures/apply-search-records-v1.json");
+        for field in ["schema_version", "normalization_version", "policy_version"] {
+            let mut value: serde_json::Value =
+                serde_json::from_str(ingestion_fixture).expect("decode ingestion fixture value");
+            value["records"][0][field] = serde_json::json!(u64::from(u16::MAX));
+            let request: ApplySearchRecordsRequest =
+                serde_json::from_value(value).expect("decode structurally valid future batch");
+            assert!(
+                request.validate().is_err(),
+                "future {field} must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn future_enum_variants_fail_closed_across_contract_surfaces() {
+        for (fixture, pointer, replacement) in [
+            (
+                include_str!("../tests/fixtures/session-search-request-v1.json"),
+                "/query/mode",
+                "future_match_mode",
+            ),
+            (
+                include_str!("../tests/fixtures/session-search-capabilities-v1.json"),
+                "/execution",
+                "future_execution",
+            ),
+            (
+                include_str!("../tests/fixtures/session-search-response-v1.json"),
+                "/outcome",
+                "future_outcome",
+            ),
+            (
+                include_str!("../tests/fixtures/apply-search-records-response-v1.json"),
+                "/outcome",
+                "future_batch_outcome",
+            ),
+        ] {
+            let mut value: serde_json::Value =
+                serde_json::from_str(fixture).expect("decode retained fixture value");
+            *value
+                .pointer_mut(pointer)
+                .expect("fixture pointer must identify an enum field") =
+                serde_json::Value::String(replacement.to_owned());
+            let encoded = serde_json::to_vec(&value).expect("encode future fixture");
+            let error = match pointer {
+                "/query/mode" => serde_json::from_slice::<SessionSearchRequest>(&encoded)
+                    .expect_err("future match mode must fail closed"),
+                "/execution" => serde_json::from_slice::<SessionSearchCapabilities>(&encoded)
+                    .expect_err("future execution mode must fail closed"),
+                "/outcome" if replacement == "future_outcome" => {
+                    serde_json::from_slice::<SessionSearchResponse>(&encoded)
+                        .expect_err("future provider outcome must fail closed")
+                }
+                "/outcome" => serde_json::from_slice::<ApplySearchRecordsResponse>(&encoded)
+                    .expect_err("future batch outcome must fail closed"),
+                _ => unreachable!("all compatibility cases are explicit"),
+            };
+            assert!(
+                error.to_string().contains("unknown variant")
+                    || error.to_string().contains("expected one of"),
+                "future enum must be rejected explicitly: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn ingestion_validation_bounds_cumulative_session_text() {
         let fixture = include_str!("../tests/fixtures/apply-search-records-v1.json");
         let mut request: ApplySearchRecordsRequest =

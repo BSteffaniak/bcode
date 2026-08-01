@@ -89,6 +89,26 @@ if cargo tree -p bcode --no-default-features -i tantivy 2>/dev/null | grep -q '^
   fail "Tantivy enters the product facade when its feature is disabled"
 fi
 
+# Renderer-local session picker state may adapt portable summaries, but session-search contracts and
+# provider behavior must remain outside the renderer. The picker must not open canonical storage or
+# persist its filter/presentation state as session history.
+if rg -n \
+  'bcode_session::(db|lease|repair|store)|SessionDb|catalog\.db|session\.db|rusqlite::|switchy::database' \
+  packages/tui/src/session_picker.rs packages/tui/src/session_picker_render.rs \
+  packages/tui/src/session_search_effect.rs \
+  >/tmp/bcode-session-search-tui-picker-storage.txt; then
+  cat /tmp/bcode-session-search-tui-picker-storage.txt >&2
+  fail "TUI session picker depends on canonical persistence internals"
+fi
+if rg -n \
+  'SESSION_SEARCH_INTERFACE_ID|tantivy::|PluginRuntimeHost|invoke_service' \
+  packages/tui/src/session_picker.rs packages/tui/src/session_picker_render.rs \
+  packages/tui/src/session_search_effect.rs \
+  >/tmp/bcode-session-search-tui-picker-provider-semantics.txt; then
+  cat /tmp/bcode-session-search-tui-picker-provider-semantics.txt >&2
+  fail "local TUI picker filtering acquired provider-search semantics"
+fi
+
 # Application coordination stays at the server boundary; the generic plugin host must not acquire
 # session-search planning, projection, routing, hydration, or backend policy.
 if rg -n \

@@ -179,6 +179,26 @@ pub async fn backfill_provider(
             break;
         }
         let session_id = summary.id;
+        if state.session_migrations.is_active(session_id).await {
+            sessions.push(SessionSearchBackfillSessionResult {
+                session_id,
+                outcome: SessionSearchBackfillOutcome::Failed,
+                batches_applied: 0,
+                indexed_through_sequence: provider
+                    .status
+                    .coverage
+                    .iter()
+                    .find(|coverage| coverage.generation.session_id == session_id)
+                    .and_then(|coverage| coverage.indexed_through_sequence),
+                canonical_tail_sequence: None,
+                error: Some(SessionSearchServiceError {
+                    code: SearchErrorCode::ProviderUnavailable,
+                    message: "canonical session migration is active; retry backfill after migration reaches a terminal outcome".to_owned(),
+                    retryable: true,
+                }),
+            });
+            continue;
+        }
         let result = ingest_provider_pages(
             state,
             session_id,
@@ -720,6 +740,11 @@ async fn ingest_provider_pages(
     deadline: Option<Instant>,
     requeue_incomplete: bool,
 ) -> Result<ProviderIngestionProgress, IngestionError> {
+    if state.session_migrations.is_active(session_id).await {
+        return Err(IngestionError::permanent(
+            "canonical session migration is active; retry search ingestion after migration reaches a terminal outcome",
+        ));
+    }
     let checkpoint = provider
         .status
         .coverage
@@ -729,6 +754,16 @@ async fn ingest_provider_pages(
     if checkpoint.is_some_and(|coverage| coverage.generation.fingerprint != generation) {
         return Err(IngestionError::permanent(
             "provider checkpoint generation differs from canonical session identity; explicit rebuild is required",
+        ));
+    }
+    let canonical_tail_before_ingestion = canonical_session_tail(state, session_id).await?;
+    if checkpoint.is_some_and(|coverage| {
+        coverage.indexed_through_sequence.is_some_and(|indexed| {
+            canonical_tail_before_ingestion.is_none_or(|canonical_tail| indexed > canonical_tail)
+        })
+    }) {
+        return Err(IngestionError::permanent(
+            "provider checkpoint is ahead of the canonical session tail; explicit rebuild is required after canonical repair or truncation",
         ));
     }
     let mut previous_sequence = checkpoint.and_then(|coverage| coverage.indexed_through_sequence);
@@ -741,6 +776,7 @@ async fn ingest_provider_pages(
         let Some((indexed_through_sequence, indexed_text_bytes)) = ingest_provider_page(
             state,
             session_id,
+            summary,
             provider,
             &generation,
             previous_sequence,
@@ -803,6 +839,11 @@ fn canonical_generation_fingerprint(summary: &bcode_session_models::SessionSumma
     digest.update(b"bcode-session-search-generation-v1\0");
     digest.update(summary.id.to_string().as_bytes());
     digest.update(summary.created_at_ms.to_le_bytes());
+    digest.update(bcode_session_models::CURRENT_SESSION_STORAGE_WRITER_EPOCH.to_le_bytes());
+    digest.update(bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION.to_le_bytes());
+    digest.update(bcode_session_search::CURRENT_SEARCH_RECORD_VERSION.to_le_bytes());
+    digest.update(bcode_session_search::CURRENT_NORMALIZATION_VERSION.to_le_bytes());
+    digest.update(bcode_session_search::CURRENT_SEARCH_POLICY_VERSION.to_le_bytes());
     if let Some(import) = &summary.import {
         digest.update(b"import\0");
         digest.update(import.source_id.as_bytes());
@@ -834,10 +875,27 @@ fn canonical_generation_fingerprint(summary: &bcode_session_models::SessionSumma
     format!("{:x}", digest.finalize())
 }
 
-#[allow(clippy::too_many_lines)]
+fn apply_session_summary_attributes(
+    mut record: bcode_session_search::SessionSearchRecord,
+    summary: &bcode_session_models::SessionSummary,
+) -> bcode_session_search::SessionSearchRecord {
+    record.attributes.insert(
+        "working_directory".to_owned(),
+        summary.working_directory.to_string_lossy().into_owned(),
+    );
+    if let Some(import) = &summary.import {
+        record
+            .attributes
+            .insert("source".to_owned(), import.source_id.clone());
+    }
+    record
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 async fn ingest_provider_page(
     state: &ServerState,
     session_id: bcode_session_models::SessionId,
+    summary: &bcode_session_models::SessionSummary,
     provider: &SessionSearchProviderInfo,
     generation: &str,
     previous_sequence: Option<u64>,
@@ -900,6 +958,7 @@ async fn ingest_provider_page(
                             .content_kinds
                             .contains(&record.content_kind)
                     })
+                    .map(|record| apply_session_summary_attributes(record, summary))
                     .collect::<Vec<_>>(),
                 bcode_session_search::projection::EventProjection::Excluded(_) => continue,
             };
@@ -1809,7 +1868,7 @@ fn bounded_message(message: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use bcode_plugin::{PluginHost, PluginManifest};
     use bcode_plugin_sdk::{
@@ -1886,6 +1945,8 @@ mod tests {
     static SLOW_SEARCH_CANCELLED: AtomicBool = AtomicBool::new(false);
     static SLOW_SEARCH_FINISHED: AtomicBool = AtomicBool::new(false);
     static APPLY_BATCH_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SLOW_APPLY_STARTED: AtomicBool = AtomicBool::new(false);
+    static SLOW_APPLY_CANCELLED: AtomicBool = AtomicBool::new(false);
     static REMOVE_SESSION_CALLS: AtomicUsize = AtomicUsize::new(0);
     static SEARCH_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -1936,7 +1997,7 @@ mod tests {
     );
 
     #[derive(Debug, Clone, Copy)]
-    enum TestProviderBehavior {
+    pub enum TestProviderBehavior {
         Fast,
         Slow,
         Malformed,
@@ -2112,6 +2173,26 @@ mod tests {
                     .request
                     .payload_json::<ApplySearchRecordsRequest>()
                     .expect("apply batch request");
+                if matches!(provider.behavior, TestProviderBehavior::Slow) {
+                    SLOW_APPLY_STARTED.store(true, Ordering::SeqCst);
+                    let cancelled = cancellation_callback
+                        .is_some_and(|callback| callback(5_000, cancellation_user_data));
+                    SLOW_APPLY_CANCELLED.store(cancelled, Ordering::SeqCst);
+                    return bcode_plugin_sdk::write_service_response(
+                        &if cancelled {
+                            ServiceResponse::error("cancelled", "cancelled by host")
+                        } else {
+                            ServiceResponse::error(
+                                "not_cancelled",
+                                "host cancellation was not observed",
+                            )
+                        },
+                        output,
+                        output_capacity,
+                        output_len,
+                        bcode_plugin_sdk::ServiceEventEmitter::new(event_callback, event_user_data),
+                    );
+                }
                 assert!(request.records.iter().all(|record| {
                     matches!(
                         record.content_kind,
@@ -2270,7 +2351,7 @@ mod tests {
         }
     }
 
-    fn state_with_providers(
+    pub fn state_with_providers(
         providers: &[(&'static str, TestProviderBehavior)],
     ) -> crate::ServerState {
         let loaded = providers
@@ -2672,7 +2753,75 @@ mod tests {
     }
 
     #[test]
-    fn canonical_generation_fingerprint_binds_identity_import_and_fork_provenance() {
+    fn projected_records_use_canonical_summary_scope_without_source_persistence_details() {
+        let session_id = SessionId::new();
+        let summary = bcode_session_models::SessionSummary {
+            id: session_id,
+            name: None,
+            explicit_name: None,
+            derived_title: None,
+            title_source: bcode_session_models::SessionTitleSource::EmptyDraft,
+            client_count: 0,
+            created_at_ms: 10,
+            updated_at_ms: 20,
+            working_directory: std::path::PathBuf::from("/workspace/imported"),
+            import: Some(bcode_session_models::SessionImportSummary {
+                source_id: "opencode".to_owned(),
+                source_display_name: "OpenCode".to_owned(),
+                external_session_id: "source-native-id".to_owned(),
+                imported_at_ms: 30,
+            }),
+            fork: None,
+            execution: None,
+        };
+        let record = bcode_session_search::SessionSearchRecord {
+            schema_version: CURRENT_SEARCH_RECORD_VERSION,
+            record_id: "1:user-message:0".to_owned(),
+            locator: SessionSearchLocator {
+                session_id,
+                sequence: 1,
+                record_id: Some("1:user-message:0".to_owned()),
+            },
+            timestamp_ms: 1,
+            content_kind: SearchContentKind::UserMessage,
+            field: Some(SearchField::Text),
+            text: Some("hello".to_owned()),
+            attributes: std::collections::BTreeMap::new(),
+            source_bytes: 5,
+            normalized_bytes: 5,
+            indexed_bytes: 5,
+            truncated: false,
+            source_range_start: Some(0),
+            source_range_end: Some(5),
+            normalization_version: CURRENT_NORMALIZATION_VERSION,
+            policy_version: CURRENT_SEARCH_POLICY_VERSION,
+        };
+
+        let record = apply_session_summary_attributes(record, &summary);
+
+        assert_eq!(
+            record
+                .attributes
+                .get("working_directory")
+                .map(String::as_str),
+            Some("/workspace/imported")
+        );
+        assert_eq!(
+            record.attributes.get("source").map(String::as_str),
+            Some("opencode")
+        );
+        assert!(
+            !record
+                .attributes
+                .values()
+                .any(|value| value == "source-native-id")
+        );
+        assert!(!record.attributes.contains_key("source_database"));
+        assert!(!record.attributes.contains_key("source_path"));
+    }
+
+    #[test]
+    fn canonical_generation_fingerprint_binds_identity_import_and_fork_but_not_mutable_metadata() {
         let session_id = SessionId::new();
         let mut summary = bcode_session_models::SessionSummary {
             id: session_id,
@@ -2690,6 +2839,10 @@ mod tests {
         };
         let native = canonical_generation_fingerprint(&summary);
         summary.updated_at_ms = 999;
+        summary.name = Some("renamed".to_owned());
+        summary.explicit_name = Some("renamed".to_owned());
+        summary.derived_title = Some("derived".to_owned());
+        summary.working_directory = std::path::PathBuf::from("/renamed/workspace");
         assert_eq!(canonical_generation_fingerprint(&summary), native);
         summary.import = Some(bcode_session_models::SessionImportSummary {
             source_id: "source".to_owned(),
@@ -2863,6 +3016,200 @@ mod tests {
             indexed_through_sequence: 1,
         };
         assert!(validate_apply_batch_response(&request, wrong_batch).is_err());
+    }
+
+    #[tokio::test]
+    async fn backfill_deadline_cancels_inflight_provider_ingestion() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        SLOW_APPLY_STARTED.store(false, Ordering::SeqCst);
+        SLOW_APPLY_CANCELLED.store(false, Ordering::SeqCst);
+        let state = state_with_providers(&[(SLOW_PROVIDER_ID, TestProviderBehavior::Slow)]);
+        let working_directory = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(
+                Some("cancel backfill".to_owned()),
+                working_directory.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        state
+            .sessions
+            .append_context_compacted(session.id, "cancel me".to_owned(), 0)
+            .await
+            .expect("append event");
+
+        let response = backfill_provider(
+            &state,
+            BackfillSessionSearchRequest {
+                provider_id: SLOW_PROVIDER_ID.to_owned(),
+                session_ids: BTreeSet::from([session.id]),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                cursor: None,
+                deadline_ms: 40,
+            },
+        )
+        .await
+        .expect("backfill returns terminal cancellation progress");
+
+        assert!(SLOW_APPLY_STARTED.load(Ordering::SeqCst));
+        assert!(SLOW_APPLY_CANCELLED.load(Ordering::SeqCst));
+        assert_eq!(response.failed_sessions, 1);
+        assert!(response.deadline_reached);
+        let error = response.sessions[0].error.as_ref().expect("deadline error");
+        assert!(error.retryable);
+        assert_eq!(error.code, SearchErrorCode::ProviderUnavailable);
+    }
+
+    #[tokio::test]
+    async fn ingestion_rejects_checkpoint_ahead_of_canonical_tail_after_truncation() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        let state = state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Fast)]);
+        let working_directory = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(
+                Some("truncated canonical tail".to_owned()),
+                working_directory.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        let summary = state
+            .sessions
+            .session_summary(session.id)
+            .await
+            .expect("read session summary");
+        let canonical_tail = canonical_session_tail(&state, session.id)
+            .await
+            .expect("read canonical tail")
+            .expect("created session has canonical events");
+        let mut provider = list_providers(&state)
+            .await
+            .providers
+            .into_iter()
+            .find(|provider| provider.plugin_id == FAST_PROVIDER_ID)
+            .expect("fast provider");
+        provider
+            .status
+            .coverage
+            .push(bcode_session_search::SessionSearchCoverage {
+                generation: SearchCanonicalGeneration {
+                    session_id: session.id,
+                    fingerprint: canonical_generation_fingerprint(&summary),
+                    last_sequence: Some(canonical_tail),
+                },
+                content_kinds: BTreeSet::from([SearchContentKind::UserMessage]),
+                indexed_through_sequence: Some(canonical_tail.saturating_add(1)),
+                complete: true,
+                indexed_text_bytes: 1,
+                skipped_records: 0,
+                truncated_records: 0,
+                exclusions: Vec::new(),
+            });
+
+        let error = ingest_provider_pages(&state, session.id, &summary, &provider, 1, None, false)
+            .await
+            .expect_err("checkpoint ahead of canonical tail must fail closed");
+
+        assert!(!error.retryable);
+        assert!(
+            error
+                .message
+                .contains("ahead of the canonical session tail")
+        );
+        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn explicit_backfill_refuses_to_overlap_active_canonical_migration() {
+        use bcode_session_models::{
+            SessionMigrationProgress, SessionMigrationStage, SessionOpenOperationId,
+            SessionOpenOperationSnapshot, SessionOpenTerminalOutcome,
+        };
+        use std::sync::Arc;
+
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        let state = state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Fast)]);
+        let working_directory = tempfile::tempdir().expect("workspace");
+        let session = state
+            .sessions
+            .create_session(
+                Some("migration overlap".to_owned()),
+                working_directory.path().to_path_buf(),
+            )
+            .await
+            .expect("create session");
+        state
+            .sessions
+            .append_context_compacted(session.id, "must not index yet".to_owned(), 0)
+            .await
+            .expect("append event");
+
+        let blocker = Arc::new(tokio::sync::Notify::new());
+        let task_blocker = Arc::clone(&blocker);
+        let operation = state
+            .session_migrations
+            .operations()
+            .start_or_join(
+                SessionOpenOperationSnapshot {
+                    operation_id: SessionOpenOperationId::new(),
+                    revision: 0,
+                    session_id: session.id,
+                    source_writer_epoch: Some(5),
+                    target_writer_epoch: 6,
+                    progress: SessionMigrationProgress {
+                        stage: SessionMigrationStage::WaitingForOwnership,
+                        completed_units: None,
+                        total_units: None,
+                        unit: None,
+                        message: "migration active".to_owned(),
+                    },
+                    outcome: None,
+                    backup_path: None,
+                },
+                move |_| async move {
+                    task_blocker.notified().await;
+                    SessionOpenTerminalOutcome::Ready
+                },
+            )
+            .await;
+        assert!(state.session_migrations.is_active(session.id).await);
+
+        let response = backfill_provider(
+            &state,
+            BackfillSessionSearchRequest {
+                provider_id: FAST_PROVIDER_ID.to_owned(),
+                session_ids: BTreeSet::from([session.id]),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                cursor: None,
+                deadline_ms: 5_000,
+            },
+        )
+        .await
+        .expect("backfill returns explicit per-session overlap result");
+
+        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(response.failed_sessions, 1);
+        assert_eq!(response.sessions.len(), 1);
+        assert_eq!(
+            response.sessions[0].outcome,
+            SessionSearchBackfillOutcome::Failed
+        );
+        let error = response.sessions[0].error.as_ref().expect("overlap error");
+        assert_eq!(error.code, SearchErrorCode::ProviderUnavailable);
+        assert!(error.retryable);
+        assert!(error.message.contains("migration is active"));
+
+        blocker.notify_one();
+        let mut terminal = operation.subscribe();
+        terminal
+            .wait_for(|snapshot| snapshot.outcome.is_some())
+            .await
+            .expect("migration reaches terminal outcome");
     }
 
     #[tokio::test]

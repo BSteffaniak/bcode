@@ -2670,6 +2670,7 @@ dependencies = [
  "bcode_ralph",
  "bcode_server",
  "bcode_session_models",
+ "bcode_session_search",
  "bcode_session_view",
  "bcode_session_view_models",
  "bcode_settings",

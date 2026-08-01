@@ -1,0 +1,26 @@
+{
+  "provider_id": "example.search",
+  "state": "ready",
+  "record_schema_version": 1,
+  "normalization_version": 1,
+  "policy_version": 1,
+  "index_bytes": 4096,
+  "quota_bytes": 1048576,
+  "document_count": 1,
+  "pending_sessions": 0,
+  "coverage": [
+    {
+      "generation": {
+        "session_id": "00000000-0000-0000-0000-000000000001",
+        "fingerprint": "generation-1",
+        "last_sequence": 1
+      },
+      "content_kinds": ["user_message"],
+      "indexed_through_sequence": 1,
+      "complete": true,
+      "indexed_text_bytes": 5,
+      "skipped_records": 0,
+      "truncated_records": 0
+    }
+  ]
+}

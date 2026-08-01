@@ -148,7 +148,12 @@ bcode session search-purge --provider bcode.tantivy-session-search \
   root, then backfill.
 * canonical `repair_required` or incompatible hydration: use `session diagnose`, `session doctor`,
   and explicit canonical repair/migration commands. Never use a derived index to repair canonical
-  history.
+  history. Search ingestion refuses active canonical migration. After repair or truncation, a
+  provider checkpoint ahead of the canonical tail or bound to an older writer/event/projection
+  generation requires explicit provider rebuild followed by bounded backfill.
+* Imported canonical Bcode sessions may be filtered by stable import source ID. Native search records
+  do not contain source database paths or external source-session persistence details. Use the
+  matching source-specific history skill when the original source-native conversation is required.
 * deletion races: canonical deletion wins; provider generation tombstones reject stale ingestion
   that could otherwise recreate deleted derived records.
 

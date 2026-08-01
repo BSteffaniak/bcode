@@ -1,5 +1,28 @@
 # TUI rendering configuration
 
+## Session picker and search scope
+
+The initial TUI session-search slice is intentionally limited to local filtering of the canonical
+session-summary picker. That filter remains renderer-owned interaction state and may match title,
+session ID, working directory, import source, and fork metadata already present in portable
+summaries. It does not invoke optional search providers, claim transcript coverage, expose deep or
+content-category controls, or render provider documents as canonical history.
+
+A later dedicated transcript-search mode must consume the portable session-search request/result/
+status contracts asynchronously, expose partial/degraded coverage, and navigate through canonical
+locator hydration. Its reusable effect waits 150 ms before dispatch, aborts superseded renderer
+work, advances a renderer-local generation on replacement/cancel, and accepts terminal aggregates
+only for the latest generation. Provider deadlines and cancellation remain application-owned; this
+is not a reconnect-safe replay protocol. It must not reuse local picker filtering as evidence that
+transcript search or provider coverage exists. Picker text input, selection/viewport, key routing,
+rendering, and hit surfaces stay in TUI modules, and picker filter state is ephemeral: rebuilding from catalog summaries
+must not emit canonical events or persistence writes.
+
+The presentation adapter keeps content kind, canonical session locator/ID, canonical catalog title,
+provider/rank, bounded preview and truncation, canonical hydrated timestamp/outcome, query/corpus
+completeness, provider/failure counts, and explicit degraded state. Provider documents never become
+title or history authority.
+
 ## Semantic transcript boundary
 
 The TUI holds `SessionView` as its sole canonical transcript reducer. Durable and live session events
