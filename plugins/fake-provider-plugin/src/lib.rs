@@ -294,13 +294,17 @@ impl FakeProviderPlugin {
             Ok(request) => request,
             Err(error) => return invalid_request(&error),
         };
-        json_response(&models(
-            request
-                .provider_context
-                .settings
-                .get("fake_unknown_context_window")
-                .is_none_or(|value| value != "true"),
-        ))
+        let has_context_window = request
+            .provider_context
+            .settings
+            .get("fake_unknown_context_window")
+            .is_none_or(|value| value != "true");
+        let subset_reasoning = request
+            .provider_context
+            .settings
+            .get("fake_reasoning_subset")
+            .is_some_and(|value| value == "true");
+        json_response(&models(has_context_window, subset_reasoning))
     }
 
     fn compact_context(request: &ServiceRequest) -> ServiceResponse {
@@ -1596,7 +1600,15 @@ fn capabilities() -> ProviderCapabilities {
     }
 }
 
-fn models(has_context_window: bool) -> ModelList {
+fn models(has_context_window: bool, subset_reasoning: bool) -> ModelList {
+    let effort_values = if subset_reasoning {
+        vec!["low".to_owned(), "high".to_owned()]
+    } else {
+        ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect()
+    };
     ModelList {
         models: vec![ModelInfo {
             model_id: "fake-echo".to_string(),
@@ -1615,10 +1627,7 @@ fn models(has_context_window: bool) -> ModelList {
             .collect(),
             feature_support: fake_feature_support(),
             reasoning: Some(bcode_model::ModelReasoningInfo {
-                effort_values: ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
-                    .into_iter()
-                    .map(ToOwned::to_owned)
-                    .collect(),
+                effort_values,
                 default_effort: Some("medium".to_owned()),
                 source: bcode_model::ModelReasoningCapabilitySource::ProviderMetadata,
                 ..bcode_model::ModelReasoningInfo::default()
@@ -2217,9 +2226,17 @@ mod tests {
     }
 
     #[test]
+    fn fake_subset_model_advertises_only_low_and_high_reasoning() {
+        let model = models(true, true).models.remove(0);
+        let reasoning = model.reasoning.expect("reasoning metadata");
+
+        assert_eq!(reasoning.effort_values, ["low", "high"]);
+    }
+
+    #[test]
     fn fake_capability_contract_matches_request_validation() {
         let provider = capabilities();
-        let model = models(true).models.remove(0);
+        let model = models(true, false).models.remove(0);
         assert!(provider.feature_support.has_complete_inventory());
         assert!(model.feature_support.has_complete_inventory());
         assert!(
