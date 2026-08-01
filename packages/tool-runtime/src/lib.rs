@@ -406,6 +406,9 @@ fn configure_command_for_timeout(command: &mut Command) {
 const fn configure_command_for_timeout(_command: &mut Command) {}
 
 #[cfg(windows)]
+const _: fn(&mut Command) = configure_command_for_timeout;
+
+#[cfg(windows)]
 struct ChildProcessGuard(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]

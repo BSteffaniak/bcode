@@ -28,6 +28,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+          targets: x86_64-pc-windows-msvc
 
       - name: Validate release workflow syntax
         shell: pwsh
@@ -118,6 +119,7 @@ jobs:
           cargo test --package bcode_shell_plugin terminal_mode_executes_cmd_through_native_pty
           cargo test --package bcode_shell_plugin cancellation_terminates_windows_terminal_child_promptly
           cargo test --package bcode_tool_runtime cancellation_terminates_windows_process_tree
+          cargo test --package bcode_tool_runtime --all-targets --features fail-on-warnings
           cargo test --package bcode_mermaid_render --test worker public_worker_adapter_forcefully_terminates_cancelled_worker
           cargo test --package bcode_mermaid_render --test worker public_worker_adapter_forcefully_terminates_timed_out_worker
           cargo test --package bcode_tesseract_ocr runtime_root_tests
