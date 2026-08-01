@@ -325,6 +325,7 @@ pub struct ServerState {
     session_migrations: bcode_session_migration::SessionMigrationService,
     pub session_catalog: Arc<session_catalog::SessionCatalog>,
     pub plugins: bcode_plugin::PluginRuntimeHost,
+    session_search_enabled: bool,
     session_search_dirty: session_search::SessionSearchDirtyQueue,
     model_catalog: bcode_model_catalog::ModelCatalogResolver,
     selected_provider_plugin_id: Option<String>,
@@ -1354,6 +1355,7 @@ struct ServerStateInit {
     selected_reasoning_capabilities: Option<bcode_model::ModelReasoningInfo>,
     provider_state: ProviderStateStore,
     observability: bcode_config::ObservabilityConfig,
+    session_search_enabled: bool,
     trace_store: TraceStore,
     max_tool_rounds: Option<u32>,
     tool_execution: bcode_tool::ToolExecutionOptions,
@@ -1527,6 +1529,7 @@ impl ServerState {
             session_migrations,
             session_catalog: Arc::new(session_catalog::SessionCatalog::default()),
             plugins,
+            session_search_enabled: init.session_search_enabled,
             session_search_dirty: session_search::SessionSearchDirtyQueue::default(),
             model_catalog: init
                 .model_catalog
@@ -2077,6 +2080,9 @@ impl ServerState {
     }
 
     fn start_session_search_ingestion(self: &Arc<Self>) {
+        if !self.session_search_enabled {
+            return;
+        }
         let state = Arc::clone(self);
         tokio::spawn(async move {
             loop {
@@ -2116,12 +2122,13 @@ impl ServerState {
                             .session_catalog
                             .upsert_native_session(mutation.summary)
                             .await;
-                        if state
-                            .plugins
-                            .registry()
-                            .service_registry()
-                            .providers_for(bcode_session_search::SESSION_SEARCH_INTERFACE_ID)
-                            .is_some_and(|providers| !providers.is_empty())
+                        if state.session_search_enabled
+                            && state
+                                .plugins
+                                .registry()
+                                .service_registry()
+                                .providers_for(bcode_session_search::SESSION_SEARCH_INTERFACE_ID)
+                                .is_some_and(|providers| !providers.is_empty())
                         {
                             state.session_search_dirty.mark_committed(session_id).await;
                         }
@@ -2133,12 +2140,13 @@ impl ServerState {
                             "session mutation subscriber lagged; refreshing native catalog"
                         );
                         state.session_catalog.refresh_native_now(&state).await;
-                        if state
-                            .plugins
-                            .registry()
-                            .service_registry()
-                            .providers_for(bcode_session_search::SESSION_SEARCH_INTERFACE_ID)
-                            .is_some_and(|providers| !providers.is_empty())
+                        if state.session_search_enabled
+                            && state
+                                .plugins
+                                .registry()
+                                .service_registry()
+                                .providers_for(bcode_session_search::SESSION_SEARCH_INTERFACE_ID)
+                                .is_some_and(|providers| !providers.is_empty())
                         {
                             state.session_search_dirty.mark_rescan_required().await;
                         }
@@ -3282,6 +3290,7 @@ async fn run_with_static_bundled_inner(
             ),
             provider_state: ProviderStateStore::load(default_provider_state_path()),
             observability: config.observability,
+            session_search_enabled: config.session_search.enabled,
             trace_store: TraceStore::new(default_trace_store_dir()),
             max_tool_rounds: config.model.effective_max_tool_rounds(),
             tool_execution: config.tools.execution.runtime_options(),
@@ -3681,6 +3690,7 @@ const fn request_kind(request: &Request) -> &'static str {
         Request::SessionSearchExplain { .. } => "session_search_explain",
         Request::SessionSearchPurge { .. } => "session_search_purge",
         Request::SessionSearchRebuild { .. } => "session_search_rebuild",
+        Request::SessionSearchBackfill { .. } => "session_search_backfill",
         Request::PrepareSessionOpen { .. } => "prepare_session_open",
         Request::WaitSessionOpenProgress { .. } => "wait_session_open_progress",
         Request::AttachSession { .. } => "attach_session",
@@ -4077,6 +4087,10 @@ async fn handle_request_inner(
         } => {
             let result = session_search::rebuild_provider(state, &provider_id, confirmation).await;
             handle_session_search_maintenance(request_id, writer, result).await
+        }
+        Request::SessionSearchBackfill { request } => {
+            let result = session_search::backfill_provider(state, request).await;
+            handle_session_search_backfill(request_id, writer, result).await
         }
         Request::PrepareSessionOpen { session_id } => {
             handle_prepare_session_open(request_id, state, writer, session_id).await
@@ -8743,6 +8757,37 @@ async fn handle_session_search_maintenance(
                 writer,
                 request_id,
                 Response::Ok(ResponsePayload::SessionSearchMaintenance { response }),
+            )
+            .await
+        }
+        Err(error) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Err(ErrorResponse::new(
+                    format!("session_search_{:?}", error.code).to_lowercase(),
+                    error.message,
+                )),
+            )
+            .await
+        }
+    }
+}
+
+async fn handle_session_search_backfill(
+    request_id: u64,
+    writer: &SharedWriter,
+    result: Result<
+        bcode_session_search::SessionSearchBackfillResponse,
+        bcode_session_search::SessionSearchServiceError,
+    >,
+) -> Result<(), ServerError> {
+    match result {
+        Ok(response) => {
+            send_response(
+                writer,
+                request_id,
+                Response::Ok(ResponsePayload::SessionSearchBackfill { response }),
             )
             .await
         }
@@ -29853,6 +29898,7 @@ const fn response_payload_kind(response: &Response) -> &'static str {
             ResponsePayload::SessionSearchProviders { .. } => "session_search_providers",
             ResponsePayload::SessionSearchPlan { .. } => "session_search_plan",
             ResponsePayload::SessionSearchMaintenance { .. } => "session_search_maintenance",
+            ResponsePayload::SessionSearchBackfill { .. } => "session_search_backfill",
             ResponsePayload::SessionList { .. } => "session_list",
             ResponsePayload::SessionCatalogRefreshed { .. } => "session_catalog_refreshed",
             ResponsePayload::PermissionList { .. } => "permission_list",
@@ -46988,6 +47034,7 @@ library = "test"
                 selected_reasoning_capabilities: None,
                 provider_state: ProviderStateStore::load(PathBuf::new()),
                 observability: bcode_config::ObservabilityConfig::default(),
+                session_search_enabled: true,
                 trace_store: TraceStore::new(PathBuf::new()),
                 max_tool_rounds: None,
                 tool_execution: bcode_tool::ToolExecutionOptions::default(),
@@ -55867,6 +55914,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 selected_reasoning_capabilities: None,
                 provider_state: ProviderStateStore::load(PathBuf::new()),
                 observability: bcode_config::ObservabilityConfig::default(),
+                session_search_enabled: true,
                 trace_store: TraceStore::new(PathBuf::new()),
                 max_tool_rounds: None,
                 tool_execution: bcode_tool::ToolExecutionOptions::default(),
@@ -56555,6 +56603,7 @@ event_symbol = "bcode_plugin_handle_event_v1"
                 selected_reasoning_capabilities: None,
                 provider_state: ProviderStateStore::load(PathBuf::new()),
                 observability: bcode_config::ObservabilityConfig::default(),
+                session_search_enabled: true,
                 trace_store: TraceStore::new(PathBuf::new()),
                 max_tool_rounds: None,
                 tool_execution: bcode_tool::ToolExecutionOptions::default(),

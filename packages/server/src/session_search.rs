@@ -1,15 +1,17 @@
 //! Session-search provider discovery and typed service routing.
 
 use bcode_session_search::{
-    ApplySearchRecordsRequest, ApplySearchRecordsResponse, FederatedProviderContribution,
-    FederatedProviderReport, FederatedSessionSearchResponse, HydratedSessionSearchHit,
-    ListSessionSearchProvidersResponse, MAX_FEDERATED_PROVIDERS, OP_APPLY_BATCH, OP_CAPABILITIES,
-    OP_PURGE, OP_REBUILD, OP_REMOVE_SESSION, OP_SEARCH, OP_STATUS, PurgeSessionSearchRequest,
+    ApplySearchRecordsRequest, ApplySearchRecordsResponse, BackfillSessionSearchRequest,
+    FederatedProviderContribution, FederatedProviderReport, FederatedSessionSearchResponse,
+    HydratedSessionSearchHit, ListSessionSearchProvidersResponse, MAX_BACKFILL_BATCHES_PER_SESSION,
+    MAX_BACKFILL_SESSIONS, MAX_FEDERATED_PROVIDERS, OP_APPLY_BATCH, OP_CAPABILITIES, OP_PURGE,
+    OP_REBUILD, OP_REMOVE_SESSION, OP_SEARCH, OP_STATUS, PurgeSessionSearchRequest,
     RebuildSessionSearchRequest, RemoveSessionSearchRequest, SESSION_SEARCH_INTERFACE_ID,
     SearchCanonicalGeneration, SearchErrorCode, SearchFeature, SearchHitHydrationOutcome,
-    SessionSearchCapabilities, SessionSearchContentRoute, SessionSearchMaintenanceResponse,
-    SessionSearchProviderFailure, SessionSearchProviderInfo, SessionSearchRequest,
-    SessionSearchResponse, SessionSearchServiceError, SessionSearchStatus,
+    SessionSearchBackfillOutcome, SessionSearchBackfillResponse,
+    SessionSearchBackfillSessionResult, SessionSearchCapabilities, SessionSearchContentRoute,
+    SessionSearchMaintenanceResponse, SessionSearchProviderFailure, SessionSearchProviderInfo,
+    SessionSearchRequest, SessionSearchResponse, SessionSearchServiceError, SessionSearchStatus,
     aggregate_federated_search, plan_session_search_with_policy_and_routes,
 };
 use futures::future::join_all;
@@ -77,6 +79,195 @@ pub async fn rebuild_provider(
     .await
 }
 
+/// Explicitly backfill selected or bounded catalog sessions into one provider.
+///
+/// The daemon owns canonical selection and bounded forward reads. Progress resumes from the
+/// provider's durable coverage checkpoints and no full-history work is started by normal paths.
+///
+/// # Errors
+///
+/// Returns a normalized service error for an invalid request, unavailable/incompatible provider,
+/// catalog failure, or inability to obtain fresh terminal provider status.
+#[allow(clippy::too_many_lines)]
+pub async fn backfill_provider(
+    state: &ServerState,
+    request: BackfillSessionSearchRequest,
+) -> Result<SessionSearchBackfillResponse, SessionSearchServiceError> {
+    request
+        .validate()
+        .map_err(|error| SessionSearchServiceError {
+            code: SearchErrorCode::InvalidRequest,
+            message: bounded_message(&error.to_string()),
+            retryable: false,
+        })?;
+    if !state.session_search_enabled {
+        return Err(SessionSearchServiceError {
+            code: SearchErrorCode::ProviderUnavailable,
+            message: "session search is globally disabled".to_owned(),
+            retryable: false,
+        });
+    }
+    let inventory = list_providers(state).await;
+    let provider = inventory
+        .providers
+        .into_iter()
+        .find(|provider| provider.plugin_id == request.provider_id)
+        .ok_or_else(|| SessionSearchServiceError {
+            code: SearchErrorCode::ProviderUnavailable,
+            message: format!(
+                "session-search provider '{}' is not loaded and ready",
+                request.provider_id
+            ),
+            retryable: false,
+        })?;
+    if !provider
+        .capabilities
+        .features
+        .contains(&SearchFeature::IncrementalIngestion)
+    {
+        return Err(SessionSearchServiceError {
+            code: SearchErrorCode::UnsupportedQuery,
+            message: format!(
+                "session-search provider '{}' does not support bounded ingestion",
+                request.provider_id
+            ),
+            retryable: false,
+        });
+    }
+
+    state
+        .sessions
+        .wait_catalog_loaded()
+        .await
+        .map_err(|error| SessionSearchServiceError {
+            code: SearchErrorCode::ProviderUnavailable,
+            message: bounded_message(&error.to_string()),
+            retryable: true,
+        })?;
+    let mut summaries = state.sessions.all_session_summaries().await;
+    summaries.retain(|summary| {
+        (request.session_ids.is_empty() || request.session_ids.contains(&summary.id))
+            && request
+                .after_timestamp_ms
+                .is_none_or(|after| summary.updated_at_ms >= after)
+            && request
+                .before_timestamp_ms
+                .is_none_or(|before| summary.updated_at_ms <= before)
+            && request.cursor.as_ref().is_none_or(|cursor| {
+                (summary.updated_at_ms, summary.id) > (cursor.updated_at_ms, cursor.session_id)
+            })
+    });
+    summaries.sort_by_key(|summary| (summary.updated_at_ms, summary.id));
+    let selection_truncated = summaries.len() > MAX_BACKFILL_SESSIONS;
+    summaries.truncate(MAX_BACKFILL_SESSIONS);
+    let next_cursor = selection_truncated
+        .then(|| summaries.last())
+        .flatten()
+        .map(
+            |summary| bcode_session_search::SessionSearchBackfillCursor {
+                updated_at_ms: summary.updated_at_ms,
+                session_id: summary.id,
+            },
+        );
+
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(request.deadline_ms);
+    let selected_sessions = summaries.len();
+    let mut sessions = Vec::with_capacity(selected_sessions);
+    for summary in summaries {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let session_id = summary.id;
+        let result = ingest_provider_pages(
+            state,
+            session_id,
+            &summary,
+            &provider,
+            MAX_BACKFILL_BATCHES_PER_SESSION,
+            Some(deadline),
+            false,
+        )
+        .await;
+        sessions.push(match result {
+            Ok(progress) => SessionSearchBackfillSessionResult {
+                session_id,
+                outcome: if progress.complete {
+                    SessionSearchBackfillOutcome::Complete
+                } else {
+                    SessionSearchBackfillOutcome::Incomplete
+                },
+                batches_applied: progress.batches_applied,
+                indexed_through_sequence: progress.indexed_through_sequence,
+                canonical_tail_sequence: progress.canonical_tail_sequence,
+                error: None,
+            },
+            Err(error) => SessionSearchBackfillSessionResult {
+                session_id,
+                outcome: SessionSearchBackfillOutcome::Failed,
+                batches_applied: 0,
+                indexed_through_sequence: provider
+                    .status
+                    .coverage
+                    .iter()
+                    .find(|coverage| coverage.generation.session_id == session_id)
+                    .and_then(|coverage| coverage.indexed_through_sequence),
+                canonical_tail_sequence: None,
+                error: Some(SessionSearchServiceError {
+                    code: if error.retryable {
+                        SearchErrorCode::ProviderUnavailable
+                    } else {
+                        SearchErrorCode::InvalidRequest
+                    },
+                    message: bounded_message(&error.to_string()),
+                    retryable: error.retryable,
+                }),
+            },
+        });
+    }
+    let deadline_reached = sessions.len() < selected_sessions || Instant::now() >= deadline;
+    let completed_sessions = sessions
+        .iter()
+        .filter(|result| result.outcome == SessionSearchBackfillOutcome::Complete)
+        .count();
+    let incomplete_sessions = sessions
+        .iter()
+        .filter(|result| result.outcome == SessionSearchBackfillOutcome::Incomplete)
+        .count()
+        .saturating_add(selected_sessions.saturating_sub(sessions.len()));
+    let failed_sessions = sessions
+        .iter()
+        .filter(|result| result.outcome == SessionSearchBackfillOutcome::Failed)
+        .count();
+    state.metrics.record_histogram(
+        "server.session_search.backfill_selected_sessions",
+        u64::try_from(selected_sessions).unwrap_or(u64::MAX),
+    );
+    state.metrics.record_histogram(
+        "server.session_search.backfill_elapsed_ms",
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
+    if deadline_reached {
+        state
+            .metrics
+            .increment_counter("server.session_search.backfill_deadline_total");
+    }
+    let status = provider_status(state, &request.provider_id).await?;
+    Ok(SessionSearchBackfillResponse {
+        provider_id: request.provider_id,
+        selected_sessions,
+        selection_truncated,
+        next_cursor,
+        completed_sessions,
+        incomplete_sessions,
+        failed_sessions,
+        deadline_reached,
+        elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        sessions,
+        status,
+    })
+}
+
 async fn invoke_provider_maintenance<Q>(
     state: &ServerState,
     provider_id: &str,
@@ -87,6 +278,13 @@ async fn invoke_provider_maintenance<Q>(
 where
     Q: serde::Serialize + Sync,
 {
+    if !state.session_search_enabled {
+        return Err(SessionSearchServiceError {
+            code: SearchErrorCode::ProviderUnavailable,
+            message: "session search is globally disabled".to_owned(),
+            retryable: false,
+        });
+    }
     let capabilities = provider_capabilities(state, provider_id).await?;
     if !capabilities.features.contains(&required_feature) {
         return Err(SessionSearchServiceError {
@@ -243,6 +441,9 @@ pub(crate) async fn remove_session_from_providers(
     session_id: bcode_session_models::SessionId,
     expected_generation_fingerprint: Option<String>,
 ) {
+    if !state.session_search_enabled {
+        return;
+    }
     let provider_ids = state
         .plugins
         .registry()
@@ -488,9 +689,26 @@ async fn ingest_session_tail(
         .await
         .map_err(IngestionError::retryable)?;
     for provider in providers {
-        ingest_provider_pages(state, session_id, &summary, &provider).await?;
+        ingest_provider_pages(
+            state,
+            session_id,
+            &summary,
+            &provider,
+            MAX_INCREMENTAL_BATCHES_PER_SESSION,
+            None,
+            true,
+        )
+        .await?;
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct ProviderIngestionProgress {
+    batches_applied: usize,
+    indexed_through_sequence: Option<u64>,
+    canonical_tail_sequence: Option<u64>,
+    complete: bool,
 }
 
 async fn ingest_provider_pages(
@@ -498,7 +716,10 @@ async fn ingest_provider_pages(
     session_id: bcode_session_models::SessionId,
     summary: &bcode_session_models::SessionSummary,
     provider: &SessionSearchProviderInfo,
-) -> Result<(), IngestionError> {
+    max_batches: usize,
+    deadline: Option<Instant>,
+    requeue_incomplete: bool,
+) -> Result<ProviderIngestionProgress, IngestionError> {
     let checkpoint = provider
         .status
         .coverage
@@ -512,7 +733,11 @@ async fn ingest_provider_pages(
     }
     let mut previous_sequence = checkpoint.and_then(|coverage| coverage.indexed_through_sequence);
     let mut previous_text_bytes = checkpoint.map_or(0, |coverage| coverage.indexed_text_bytes);
-    for _ in 0..MAX_INCREMENTAL_BATCHES_PER_SESSION {
+    let mut batches_applied = 0;
+    for _ in 0..max_batches {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            break;
+        }
         let Some((indexed_through_sequence, indexed_text_bytes)) = ingest_provider_page(
             state,
             session_id,
@@ -520,19 +745,57 @@ async fn ingest_provider_pages(
             &generation,
             previous_sequence,
             previous_text_bytes,
+            deadline,
         )
         .await?
         else {
-            return Ok(());
+            let canonical_tail_sequence = canonical_session_tail(state, session_id).await?;
+            return Ok(ProviderIngestionProgress {
+                batches_applied,
+                indexed_through_sequence: previous_sequence,
+                canonical_tail_sequence,
+                complete: previous_sequence == canonical_tail_sequence,
+            });
         };
+        batches_applied += 1;
         previous_sequence = Some(indexed_through_sequence);
         previous_text_bytes = indexed_text_bytes;
     }
-    state.session_search_dirty.mark_committed(session_id).await;
-    state
-        .metrics
-        .increment_counter("server.session_search.ingestion_slice_requeued_total");
-    Ok(())
+    let canonical_tail_sequence = canonical_session_tail(state, session_id).await?;
+    let complete = previous_sequence == canonical_tail_sequence;
+    if !complete && requeue_incomplete {
+        state.session_search_dirty.mark_committed(session_id).await;
+        state
+            .metrics
+            .increment_counter("server.session_search.ingestion_slice_requeued_total");
+    }
+    Ok(ProviderIngestionProgress {
+        batches_applied,
+        indexed_through_sequence: previous_sequence,
+        canonical_tail_sequence,
+        complete,
+    })
+}
+
+async fn canonical_session_tail(
+    state: &ServerState,
+    session_id: bcode_session_models::SessionId,
+) -> Result<Option<u64>, IngestionError> {
+    Ok(state
+        .sessions
+        .session_history_page(
+            session_id,
+            bcode_session_models::SessionHistoryQuery {
+                cursor: None,
+                limit: 1,
+                direction: bcode_session_models::SessionHistoryDirection::Backward,
+            },
+        )
+        .await
+        .map_err(IngestionError::retryable)?
+        .events
+        .last()
+        .map(|event| event.sequence))
 }
 
 fn canonical_generation_fingerprint(summary: &bcode_session_models::SessionSummary) -> String {
@@ -579,6 +842,7 @@ async fn ingest_provider_page(
     generation: &str,
     previous_sequence: Option<u64>,
     previous_text_bytes: u64,
+    deadline: Option<Instant>,
 ) -> Result<Option<(u64, u64)>, IngestionError> {
     let page = state
         .sessions
@@ -672,16 +936,7 @@ async fn ingest_provider_page(
             records,
         };
         request.validate().map_err(IngestionError::permanent)?;
-        state
-            .plugins
-            .invoke_service_json::<_, ApplySearchRecordsResponse>(
-                &provider.plugin_id,
-                SESSION_SEARCH_INTERFACE_ID,
-                OP_APPLY_BATCH,
-                &request,
-            )
-            .await
-            .map_err(classify_ingestion_call_error)?;
+        invoke_apply_batch(state, provider, &request, deadline).await?;
         return Ok(Some((indexed_through_sequence, previous_text_bytes)));
     }
     let last_sequence = records.last().map(|record| record.locator.sequence);
@@ -716,17 +971,46 @@ async fn ingest_provider_page(
         previous_text_bytes.saturating_add(request.records.iter().fold(0_u64, |total, record| {
             total.saturating_add(record.normalized_bytes)
         }));
-    state
-        .plugins
-        .invoke_service_json::<_, ApplySearchRecordsResponse>(
-            &provider.plugin_id,
-            SESSION_SEARCH_INTERFACE_ID,
-            OP_APPLY_BATCH,
-            &request,
-        )
-        .await
-        .map_err(classify_ingestion_call_error)?;
+    invoke_apply_batch(state, provider, &request, deadline).await?;
     Ok(Some((indexed_through_sequence, indexed_text_bytes)))
+}
+
+async fn invoke_apply_batch(
+    state: &ServerState,
+    provider: &SessionSearchProviderInfo,
+    request: &ApplySearchRecordsRequest,
+    deadline: Option<Instant>,
+) -> Result<ApplySearchRecordsResponse, IngestionError> {
+    if let Some(deadline) = deadline {
+        let Some(timeout) = deadline.checked_duration_since(Instant::now()) else {
+            return Err(IngestionError::retryable(
+                "historical backfill deadline reached",
+            ));
+        };
+        state
+            .plugins
+            .invoke_service_json_scoped_with_timeout(
+                &provider.plugin_id,
+                SESSION_SEARCH_INTERFACE_ID,
+                OP_APPLY_BATCH,
+                request,
+                bcode_plugin::PluginInvocationScope::Global,
+                timeout,
+            )
+            .await
+            .map_err(classify_ingestion_call_error)
+    } else {
+        state
+            .plugins
+            .invoke_service_json(
+                &provider.plugin_id,
+                SESSION_SEARCH_INTERFACE_ID,
+                OP_APPLY_BATCH,
+                request,
+            )
+            .await
+            .map_err(classify_ingestion_call_error)
+    }
 }
 
 /// Discover loaded session-search providers and query their typed capabilities/status.
@@ -735,6 +1019,12 @@ async fn ingest_provider_page(
 /// provider does not conceal healthy providers.
 #[allow(clippy::too_many_lines)]
 pub async fn list_providers(state: &ServerState) -> ListSessionSearchProvidersResponse {
+    if !state.session_search_enabled {
+        return ListSessionSearchProvidersResponse {
+            providers: Vec::new(),
+            failures: Vec::new(),
+        };
+    }
     let provider_ids = state
         .plugins
         .registry()
@@ -912,6 +1202,13 @@ async fn search_provider_with_timeout(
     request: &SessionSearchRequest,
     timeout: Duration,
 ) -> Result<SessionSearchResponse, SessionSearchServiceError> {
+    if !state.session_search_enabled {
+        return Err(SessionSearchServiceError {
+            code: SearchErrorCode::ProviderUnavailable,
+            message: "session search is globally disabled".to_owned(),
+            retryable: false,
+        });
+    }
     request
         .validate()
         .map_err(|error| SessionSearchServiceError {
@@ -2110,6 +2407,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn global_search_disablement_prevents_inventory_ingestion_query_and_maintenance() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        let mut state = state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Fast)]);
+        state.session_search_enabled = false;
+
+        let inventory = list_providers(&state).await;
+        assert!(inventory.providers.is_empty());
+        assert!(inventory.failures.is_empty());
+
+        let error = search_provider(&state, FAST_PROVIDER_ID, &request())
+            .await
+            .expect_err("query must be disabled");
+        assert_eq!(error.code, SearchErrorCode::ProviderUnavailable);
+        assert!(!error.retryable);
+
+        let error = purge_provider(&state, FAST_PROVIDER_ID, "purge".to_owned())
+            .await
+            .expect_err("maintenance must be disabled");
+        assert_eq!(error.code, SearchErrorCode::ProviderUnavailable);
+
+        state
+            .session_search_dirty
+            .mark_committed(SessionId::new())
+            .await;
+        process_dirty_sessions(&state).await;
+        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn federated_runtime_preserves_fast_results_when_slow_provider_times_out() {
         let _guard = SEARCH_TEST_LOCK.lock().await;
         reset_slow_provider_state();
@@ -2293,6 +2620,64 @@ mod tests {
 
         assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 1);
         assert!(state.session_search_dirty.snapshot().await.0.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_backfill_indexes_only_selected_sessions_with_bounded_progress() {
+        let _guard = SEARCH_TEST_LOCK.lock().await;
+        APPLY_BATCH_CALLS.store(0, Ordering::SeqCst);
+        let state = state_with_providers(&[(FAST_PROVIDER_ID, TestProviderBehavior::Fast)]);
+        let working_directory = tempfile::tempdir().expect("workspace");
+        let selected = state
+            .sessions
+            .create_session(
+                Some("selected backfill".to_owned()),
+                working_directory.path().to_path_buf(),
+            )
+            .await
+            .expect("create selected session");
+        let omitted = state
+            .sessions
+            .create_session(
+                Some("omitted backfill".to_owned()),
+                working_directory.path().to_path_buf(),
+            )
+            .await
+            .expect("create omitted session");
+        state
+            .sessions
+            .append_context_compacted(selected.id, "selected content".to_owned(), 0)
+            .await
+            .expect("append selected event");
+        state
+            .sessions
+            .append_context_compacted(omitted.id, "omitted content".to_owned(), 0)
+            .await
+            .expect("append omitted event");
+
+        let response = backfill_provider(
+            &state,
+            BackfillSessionSearchRequest {
+                provider_id: FAST_PROVIDER_ID.to_owned(),
+                session_ids: std::iter::once(selected.id).collect(),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                cursor: None,
+                deadline_ms: 5_000,
+            },
+        )
+        .await
+        .expect("selected backfill");
+
+        assert_eq!(response.selected_sessions, 1);
+        assert_eq!(response.sessions.len(), 1);
+        assert_eq!(response.sessions[0].session_id, selected.id);
+        assert_eq!(response.completed_sessions, 1);
+        assert_eq!(response.failed_sessions, 0);
+        assert!(!response.deadline_reached);
+        assert!(!response.selection_truncated);
+        assert!(response.next_cursor.is_none());
+        assert_eq!(APPLY_BATCH_CALLS.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

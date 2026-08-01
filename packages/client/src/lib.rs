@@ -1873,6 +1873,25 @@ impl BcodeClient {
         }
     }
 
+    /// Explicitly backfill selected or bounded catalog sessions into one provider.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the daemon cannot be reached or rejects the bounded maintenance
+    /// request.
+    pub async fn session_search_backfill(
+        &self,
+        request: bcode_session_search::BackfillSessionSearchRequest,
+    ) -> Result<bcode_session_search::SessionSearchBackfillResponse, ClientError> {
+        match self
+            .send_request(Request::SessionSearchBackfill { request })
+            .await?
+        {
+            ResponsePayload::SessionSearchBackfill { response } => Ok(response),
+            _ => Err(ClientError::UnexpectedResponse),
+        }
+    }
+
     /// Send a user message to a session.
     ///
     /// # Errors

@@ -235,6 +235,8 @@ pub struct BcodeConfig {
     #[serde(default)]
     pub session_import: SessionImportConfig,
     #[serde(default)]
+    pub session_search: SessionSearchConfig,
+    #[serde(default)]
     pub client: ClientConfig,
     #[serde(default)]
     pub daemon: DaemonConfig,
@@ -261,6 +263,7 @@ impl Default for BcodeConfig {
             system_prompt: SystemPromptConfig::default(),
             tui: TuiConfig::default(),
             session_import: SessionImportConfig::default(),
+            session_search: SessionSearchConfig::default(),
             client: ClientConfig::default(),
             daemon: DaemonConfig::default(),
             worktree: WorktreeConfig::default(),
@@ -319,6 +322,10 @@ impl ConfigDocSchema for BcodeConfig {
             schema_section_doc::<SessionImportConfig>(
                 "session_import",
                 "External session import plugin settings.",
+            ),
+            schema_section_doc::<SessionSearchConfig>(
+                "session_search",
+                "Global derived session-search enablement.",
             ),
             schema_section_doc::<ClientConfig>("client", "Client connection and request settings."),
             schema_section_doc::<DaemonConfig>(
@@ -1672,6 +1679,22 @@ impl Default for SessionImportConfig {
             pi: PiSessionImportConfig::default(),
             opencode: OpenCodeSessionImportConfig::default(),
         }
+    }
+}
+
+/// Global derived session-search configuration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "session_search")]
+pub struct SessionSearchConfig {
+    /// Whether optional derived session-search discovery, querying, and ingestion are enabled.
+    /// Canonical session investigation remains available when disabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+impl Default for SessionSearchConfig {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
@@ -6584,6 +6607,19 @@ scheme = "api_key"
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn session_search_global_enablement_defaults_on_and_loads_from_toml() {
+        assert!(BcodeConfig::default().session_search.enabled);
+        let config: BcodeConfig = toml::from_str(
+            r"
+[session_search]
+enabled = false
+",
+        )
+        .expect("session search config should parse");
+        assert!(!config.session_search.enabled);
     }
 
     #[test]

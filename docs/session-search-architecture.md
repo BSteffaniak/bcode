@@ -111,14 +111,26 @@ receives bounded versioned search records projected by Bcode from finalized sema
 
 ## Complete disablement
 
-Session investigation remains available when no search provider exists. Search providers can be
-absent at compile time, disabled at runtime, or excluded from a content route. A disabled provider:
+Session investigation remains available when no search provider exists. Global
+`[session_search].enabled` is independent from generic plugin selection and defaults to `true`. When
+false, the daemon starts no search ingestion worker, schedules no dirty work, exposes no active search
+provider inventory, invokes no query or maintenance operation, and sends no session content to a
+provider; canonical list/history/around/inspection/export APIs remain available. Search providers can
+also be absent at compile time, disabled at runtime, or excluded from a content route. A disabled
+provider:
 
 * opens no provider index or corpus;
 * starts no indexing or scan workers;
 * receives no session content;
 * allocates no backend writer/cache resources;
 * cannot affect session creation, append, listing, attach, history, export, or structured inspection.
+
+The operational acceptance matrix spans layers: the architecture guard verifies compile-time absence;
+configuration tests verify global enablement parsing/defaults; contract planning tests verify route
+disablement and unsupported future capabilities; server tests verify no inventory/query/maintenance/
+ingestion under global disablement and sanitize malformed providers; provider tests verify retained data
+after disable, explicit purge, quota behavior, confined paths, incompatible versions, and sensitive
+content defaults.
 
 Disabling a provider does not delete its data. Re-enabling the same configured provider root reuses
 retained compatible derived state. Purge is a separate explicit maintenance operation requiring the
@@ -210,9 +222,18 @@ produces terminal stale or rebuild-required state before paging and never causes
 merge.
 
 Historical backfill, full rebuild, policy-change reindexing, and purge are explicit cancellable
-maintenance operations. The public client/IPC/CLI boundary currently exposes provider-scoped purge
-and empty rebuild with exact provider-defined confirmation tokens and fresh post-operation status;
-historical backfill remains a separate unfinished workflow rather than being implied by rebuild.
+maintenance operations. The public client/IPC/CLI boundary exposes provider-scoped purge, empty
+rebuild, and daemon-owned bounded backfill. `session search-backfill` selects either explicitly named
+canonical sessions or at most 256 catalog sessions filtered by summary update timestamps and an
+explicit stable continuation cursor, applies a
+bounded wall-clock deadline, and processes no more than 1,024 provider-sized canonical pages per
+session. It resumes from provider-owned durable sequence/text checkpoints, reports per-session
+through/tail progress plus incomplete/failure/deadline and selection-truncation state, and uses
+cancellation-propagating deadlines for provider ingestion calls. The operation never hands canonical
+storage paths or event envelopes to providers. Reissuing the request is restart-safe because each
+batch has a deterministic canonical sequence identity and provider-side expected checkpoint checks;
+this does not imply transport-level durable resume or replay.
+
 Canonical deletion remains authoritative and occurs first; after success the
 server best-effort invokes each loaded provider's typed `remove_session` with the expected generation,
 without rolling canonical deletion back on provider failure. The Tantivy provider's rebuild operation
@@ -220,8 +241,9 @@ is deliberately provider-local: an exact provider-specific confirmation detaches
 state, removes only the canonicalized confined derived root, and creates an empty index and checkpoint
 at current versions. It does not read
 or replay canonical history; daemon-owned maintenance must refill it through bounded idempotent
-batches. These operations do not run from daemon startup, catalog listing, attach, ordinary
-history, rendering, model-context construction, or ordinary search. Search failure, quota
+batches. Full historical work runs only after the explicit backfill command; daemon startup,
+catalog listing, attach, ordinary history, rendering, model-context construction, and ordinary
+search never schedule it. Search failure, quota
 exhaustion, corruption, or provider absence never delays or rolls back canonical session writes.
 
 ## Large-output search
@@ -282,6 +304,11 @@ records the resulting latency, commit, reopen, and storage-amplification behavio
 `docs/session-search-baseline.md`. Reaching a quota preserves valid derived data, stops or narrows
 advancement, and reports incomplete coverage. It does not silently claim completeness or mutate
 canonical history.
+
+Per-provider enablement is represented by loaded provider inventory plus explicit backend-neutral
+content routes. Routes select provider IDs with primary, fallback, parallel, or disjoint semantics;
+providers omitted from an applicable route are not invoked. Shared query AST/filter semantics remain
+backend-neutral even though deployment configuration names concrete provider plugins.
 
 Provider status is the operational source for active provider identity, execution kind, advertised
 content policy/features, shared projection versions, index/quota/document/pending counts, degraded

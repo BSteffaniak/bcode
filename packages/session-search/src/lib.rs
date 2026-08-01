@@ -35,6 +35,12 @@ pub const OP_REMOVE_SESSION: &str = "remove_session";
 pub const OP_PURGE: &str = "purge";
 /// Explicitly discard and recreate provider-owned derived state for historical backfill.
 pub const OP_REBUILD: &str = "rebuild";
+/// Maximum canonical sessions selected by one explicit backfill request.
+pub const MAX_BACKFILL_SESSIONS: usize = 256;
+/// Maximum bounded ingestion batches processed per session in one backfill request.
+pub const MAX_BACKFILL_BATCHES_PER_SESSION: usize = 1_024;
+/// Maximum wall-clock deadline accepted for one bounded backfill request.
+pub const MAX_BACKFILL_DEADLINE_MS: u64 = 300_000;
 
 /// Current terminal-text normalization algorithm version.
 pub const CURRENT_NORMALIZATION_VERSION: u16 = 1;
@@ -1568,6 +1574,115 @@ pub struct RebuildSessionSearchRequest {
     pub confirmation: String,
 }
 
+/// Stable continuation point for bounded catalog-wide historical backfill selection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchBackfillCursor {
+    pub updated_at_ms: u64,
+    pub session_id: SessionId,
+}
+
+/// Explicit daemon-owned historical backfill request.
+///
+/// An empty session set selects a bounded catalog slice using the optional canonical summary
+/// timestamps. Providers receive only projected records through the ordinary typed ingestion
+/// operation; they never receive canonical storage access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackfillSessionSearchRequest {
+    pub provider_id: String,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub session_ids: BTreeSet<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_timestamp_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_timestamp_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<SessionSearchBackfillCursor>,
+    #[serde(default = "default_backfill_deadline_ms")]
+    pub deadline_ms: u64,
+}
+
+const fn default_backfill_deadline_ms() -> u64 {
+    30_000
+}
+
+impl BackfillSessionSearchRequest {
+    /// Validate portable selection and execution bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the selected-session count or deadline exceeds portable bounds, a
+    /// timestamp range is reversed, or the provider identity is empty or oversized.
+    pub fn validate(&self) -> Result<(), ContractValidationError> {
+        validate_nonempty_bounded("provider_id", &self.provider_id, MAX_FILTER_VALUE_BYTES)?;
+        if self.session_ids.len() > MAX_BACKFILL_SESSIONS {
+            return Err(ContractValidationError::LimitExceeded {
+                field: "session_ids",
+                actual: self.session_ids.len(),
+                maximum: MAX_BACKFILL_SESSIONS,
+            });
+        }
+        if self.deadline_ms == 0 || self.deadline_ms > MAX_BACKFILL_DEADLINE_MS {
+            return Err(ContractValidationError::LimitExceeded {
+                field: "deadline_ms",
+                actual: usize::try_from(self.deadline_ms).unwrap_or(usize::MAX),
+                maximum: usize::try_from(MAX_BACKFILL_DEADLINE_MS).unwrap_or(usize::MAX),
+            });
+        }
+        if self
+            .after_timestamp_ms
+            .zip(self.before_timestamp_ms)
+            .is_some_and(|(after, before)| after > before)
+        {
+            return Err(ContractValidationError::InvalidFilter(
+                "after timestamp must not exceed before timestamp",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Terminal outcome for one selected canonical session in explicit historical backfill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionSearchBackfillOutcome {
+    Complete,
+    Incomplete,
+    Failed,
+}
+
+/// Bounded progress result for one selected canonical session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchBackfillSessionResult {
+    pub session_id: SessionId,
+    pub outcome: SessionSearchBackfillOutcome,
+    pub batches_applied: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indexed_through_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_tail_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<SessionSearchServiceError>,
+}
+
+/// Portable summary of one explicit bounded historical backfill request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSearchBackfillResponse {
+    pub provider_id: String,
+    pub selected_sessions: usize,
+    /// Whether additional matching catalog sessions were omitted by the portable selection bound.
+    pub selection_truncated: bool,
+    /// Stable cursor for the next catalog selection slice, when more matches remain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<SessionSearchBackfillCursor>,
+    pub completed_sessions: usize,
+    pub incomplete_sessions: usize,
+    pub failed_sessions: usize,
+    pub deadline_reached: bool,
+    pub elapsed_ms: u64,
+    pub sessions: Vec<SessionSearchBackfillSessionResult>,
+    pub status: SessionSearchStatus,
+}
+
 /// Portable summary of an explicit provider maintenance operation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionSearchMaintenanceResponse {
@@ -1673,6 +1788,48 @@ mod tests {
             mode: TextMatchMode::Terms,
             fields: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn backfill_request_enforces_selection_and_deadline_bounds() {
+        let request = BackfillSessionSearchRequest {
+            provider_id: "bcode.example-search".to_owned(),
+            session_ids: BTreeSet::new(),
+            after_timestamp_ms: Some(10),
+            before_timestamp_ms: Some(20),
+            cursor: None,
+            deadline_ms: 30_000,
+        };
+        request.validate().expect("valid bounded backfill");
+
+        let mut too_many = request.clone();
+        too_many.session_ids = (0..=MAX_BACKFILL_SESSIONS)
+            .map(|_| SessionId::new())
+            .collect();
+        assert!(matches!(
+            too_many.validate(),
+            Err(ContractValidationError::LimitExceeded {
+                field: "session_ids",
+                ..
+            })
+        ));
+
+        let mut reversed = request.clone();
+        reversed.after_timestamp_ms = Some(21);
+        assert!(matches!(
+            reversed.validate(),
+            Err(ContractValidationError::InvalidFilter(_))
+        ));
+
+        let mut unbounded = request;
+        unbounded.deadline_ms = MAX_BACKFILL_DEADLINE_MS + 1;
+        assert!(matches!(
+            unbounded.validate(),
+            Err(ContractValidationError::LimitExceeded {
+                field: "deadline_ms",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -2322,6 +2479,70 @@ mod tests {
             BatchDeliveryClassification::ConflictingDuplicate { operation_digest }
                 if operation_digest == digest
         ));
+    }
+
+    #[test]
+    fn explicit_route_can_disable_an_available_provider() {
+        fn provider(id: &str) -> SessionSearchProviderInfo {
+            SessionSearchProviderInfo {
+                plugin_id: id.to_owned(),
+                capabilities: SessionSearchCapabilities {
+                    provider_id: id.to_owned(),
+                    execution: SearchExecutionKind::Indexed,
+                    content_kinds: BTreeSet::from([SearchContentKind::UserMessage]),
+                    features: BTreeSet::from([
+                        SearchFeature::Terms,
+                        SearchFeature::StructuredFilters,
+                        SearchFeature::RelevanceSort,
+                    ]),
+                    max_hits: 20,
+                    max_batch_records: 20,
+                    max_batch_text_bytes: 1024,
+                },
+                status: SessionSearchStatus {
+                    provider_id: id.to_owned(),
+                    state: SearchProviderState::Ready,
+                    record_schema_version: CURRENT_SEARCH_RECORD_VERSION,
+                    normalization_version: CURRENT_NORMALIZATION_VERSION,
+                    policy_version: CURRENT_SEARCH_POLICY_VERSION,
+                    index_bytes: 0,
+                    quota_bytes: 1024,
+                    document_count: 0,
+                    pending_sessions: 0,
+                    coverage: Vec::new(),
+                    degraded_reason: None,
+                },
+            }
+        }
+
+        let request = SessionSearchRequest {
+            query: text_query("needle"),
+            filters: SessionSearchFilters {
+                content_kinds: std::iter::once(SearchContentKind::UserMessage).collect(),
+                ..SessionSearchFilters::default()
+            },
+            sort: SessionSearchSort::ProviderRelevance,
+            limit: 10,
+            cursor: None,
+            deadline_ms: Some(5_000),
+        };
+        let discovery = ListSessionSearchProvidersResponse {
+            providers: vec![provider("enabled"), provider("route-disabled")],
+            failures: Vec::new(),
+        };
+        let routes = [SessionSearchContentRoute {
+            content_kinds: BTreeSet::from([SearchContentKind::UserMessage]),
+            mode: SessionSearchRouteMode::Primary,
+            provider_ids: vec!["enabled".to_owned()],
+        }];
+        let plan = plan_session_search_with_routes(&request, discovery, &routes);
+        assert_eq!(plan.providers.len(), 1);
+        assert_eq!(plan.providers[0].plugin_id, "enabled");
+        assert!(
+            plan.providers
+                .iter()
+                .all(|provider| provider.plugin_id != "route-disabled")
+        );
     }
 
     #[test]

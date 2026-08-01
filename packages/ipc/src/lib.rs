@@ -749,6 +749,10 @@ pub enum Request {
         provider_id: String,
         confirmation: String,
     },
+    /// Explicitly backfill selected or bounded catalog sessions into one provider.
+    SessionSearchBackfill {
+        request: bcode_session_search::BackfillSessionSearchRequest,
+    },
     /// Append one durable, presentation-only note at the current session sequence.
     AppendPresentationNote {
         session_id: SessionId,
@@ -2416,6 +2420,9 @@ pub enum ResponsePayload {
     SessionSearchMaintenance {
         response: bcode_session_search::SessionSearchMaintenanceResponse,
     },
+    SessionSearchBackfill {
+        response: bcode_session_search::SessionSearchBackfillResponse,
+    },
     PresentationNoteAppended,
 }
 
@@ -3872,6 +3879,20 @@ mod tests {
             decode_typed_stable(&encode_typed_stable(&rebuild).expect("encode rebuild"))
                 .expect("decode rebuild");
         assert_eq!(decoded, rebuild);
+        let backfill = Request::SessionSearchBackfill {
+            request: bcode_session_search::BackfillSessionSearchRequest {
+                provider_id: "bcode.tantivy-session-search".to_owned(),
+                session_ids: std::iter::once(SessionId::new()).collect(),
+                after_timestamp_ms: None,
+                before_timestamp_ms: None,
+                cursor: None,
+                deadline_ms: 30_000,
+            },
+        };
+        let decoded: Request =
+            decode_typed_stable(&encode_typed_stable(&backfill).expect("encode backfill"))
+                .expect("decode backfill");
+        assert_eq!(decoded, backfill);
 
         let maintenance = Response::Ok(ResponsePayload::SessionSearchMaintenance {
             response: bcode_session_search::SessionSearchMaintenanceResponse {
