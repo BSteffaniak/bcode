@@ -11,16 +11,18 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bcode_config     = { workspace = true }
-bcode_ipc        = { workspace = true }
-bcode_plugin_sdk = { workspace = true }
-serde            = { workspace = true, features = ["derive", "std"] }
-serde_json       = { workspace = true }
-sha2             = { workspace = true }
-sysinfo          = { workspace = true }
-thiserror        = { workspace = true }
-tokio            = { workspace = true, features = ["process", "time"] }
-tracing          = { workspace = true }
+bcode_config         = { workspace = true }
+bcode_ipc            = { workspace = true }
+bcode_plugin_sdk     = { workspace = true }
+bcode_session_models = { workspace = true }
+libc                 = { workspace = true }
+serde                = { workspace = true, features = ["derive", "std"] }
+serde_json           = { workspace = true }
+sha2                 = { workspace = true }
+sysinfo              = { workspace = true }
+thiserror            = { workspace = true }
+tokio                = { workspace = true, features = ["process", "time"] }
+tracing              = { workspace = true }
 
 [features]
 default          = []

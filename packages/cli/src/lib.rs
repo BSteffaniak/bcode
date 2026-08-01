@@ -1279,7 +1279,7 @@ fn init_tracing() {
         .ok()
         .unwrap_or_else(|| {
             if std::env::var_os("BCODE_STARTUP_TRACE").is_some() {
-                "bcode_server::startup=debug,bcode_plugin::startup=debug".to_string()
+                "bcode_server::startup=debug,bcode_plugin::startup=debug,bcode_daemon_lifecycle::startup=debug".to_string()
             } else if foreground_server {
                 "info".to_string()
             } else {
@@ -7113,12 +7113,6 @@ fn daemon_log_path() -> PathBuf {
 }
 
 fn print_server_identity(status: &ServerStatus, verbose: bool) -> Result<(), CliError> {
-    let (client_executable, client_digest) = bcode_daemon_lifecycle::current_executable_identity()?;
-    let record = bcode_daemon_lifecycle::read_records(&bcode_config::default_state_dir())
-        .into_iter()
-        .find_map(|(_path, record)| {
-            (record.namespace == status.daemon.namespace).then_some(record)
-        });
     println!("daemon: running");
     println!("namespace: {}", status.daemon.namespace);
     println!(
@@ -7138,6 +7132,13 @@ fn print_server_identity(status: &ServerStatus, verbose: bool) -> Result<(), Cli
             .unwrap_or("<unknown>")
     );
     if verbose {
+        let (client_executable, client_digest) =
+            bcode_daemon_lifecycle::current_executable_identity()?;
+        let record = bcode_daemon_lifecycle::read_records(&bcode_config::default_state_dir())
+            .into_iter()
+            .find_map(|(_path, record)| {
+                (record.namespace == status.daemon.namespace).then_some(record)
+            });
         println!(
             "client executable: {}",
             display_from_current_dir(&client_executable)
@@ -7178,10 +7179,9 @@ fn print_server_identity(status: &ServerStatus, verbose: bool) -> Result<(), Cli
 }
 
 async fn daemon_startup_probe() -> Result<(), CliError> {
+    let client = BcodeClient::default_endpoint();
     let started = Instant::now();
-    BcodeClient::default_endpoint()
-        .connect("bcode-daemon-startup-probe")
-        .await?;
+    client.connect("bcode-daemon-startup-probe").await?;
     println!("{}", started.elapsed().as_micros());
     Ok(())
 }

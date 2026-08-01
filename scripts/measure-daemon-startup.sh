@@ -132,7 +132,7 @@ for ((iteration = 0; iteration < samples; iteration++)); do
   run_bcode "${cache_workdir}" "${probe}" server startup-probe >>"${output_dir}/cached-cold.samples"
   run_bcode "${cache_workdir}" "${bcode}" server stop --force >/dev/null
 done
-summarize cached-cold "bcode server startup-probe"
+summarize cached-cold "bcode server startup-probe" 500000
 
 : >"${output_dir}/first-cold.samples"
 for ((iteration = 0; iteration < samples; iteration++)); do

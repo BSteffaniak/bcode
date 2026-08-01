@@ -2263,6 +2263,8 @@ fn register_daemon(
         .filter(|digest| {
             executable_path.as_deref().is_some_and(|path| {
                 bcode_daemon_lifecycle::executable_path_matches_digest(path, digest)
+                    || bcode_daemon_lifecycle::executable_sha256(path)
+                        .is_ok_and(|actual| actual == *digest)
             })
         });
     let mut record = if executable_digest.is_some() {
@@ -47348,6 +47350,7 @@ library = "test"
                 daemon_status: DaemonStatus {
                     namespace: bcode_ipc::daemon_namespace(),
                     protocol_version: u32::from(bcode_ipc::CURRENT_PROTOCOL_VERSION),
+                    artifact_id: Some(bcode_ipc::ArtifactId::current()),
                     build_fingerprint: bcode_ipc::BUILD_FINGERPRINT.to_owned(),
                     executable_digest: bcode_daemon_lifecycle::current_executable_identity()
                         .ok()

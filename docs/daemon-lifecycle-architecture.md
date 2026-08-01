@@ -45,7 +45,7 @@ Daemon images are stored under an artifact-scoped directory and a SHA-256 subdir
 
 Bootstrap captures an open read handle before CLI setup. Cold copy and digest operations rewind and read that retained handle rather than reopening the diagnostic pathname. On Unix this keeps the original inode readable after rename or replacement; on Windows the open handle retains the exact opened file and replacement follows native sharing rules. The source pathname is never trusted as later artifact authority.
 
-Materialization occurs only on the cold start path while lifecycle owns the artifact startup lock. Publication writes a process-specific temporary executable, preserves executable permissions, verifies SHA-256, atomically renames the image, and then publishes matching metadata. Existing images are reused only when both bytes and metadata validate. A corrupt image or metadata pair is removed and rebuilt once while the startup lock is held.
+Materialization occurs only on the cold start path while lifecycle owns the artifact startup lock. On supported macOS and Linux filesystems, lifecycle first attempts a copy-on-write clone from the retained exact-artifact file descriptor; unsupported filesystems fall back to a fused stream copy and SHA-256 pass. Both paths verify SHA-256, preserve executable permissions, synchronize the temporary image, atomically rename it, and then publish matching metadata. Existing images are reused only when both bytes and metadata validate. A corrupt image or metadata pair is removed and rebuilt once while the startup lock is held.
 
 Digest and metadata are retained for diagnostics and conservative process verification. Cleanup retains images referenced by daemon records and the current image. A state-root image lock allows independent artifact startups to hold shared use leases while cleanup requires a nonblocking exclusive lease; cleanup skips instead of racing image materialization, spawn, or record publication. Malformed records, unreadable registry evidence, and unknown record schemas also make image cleanup fail closed so a newer or historical daemon image is never removed merely because the current build cannot interpret its evidence.
 
@@ -53,7 +53,7 @@ Digest and metadata are retained for diagnostics and conservative process verifi
 
 The startup lock is artifact-scoped through the namespace. A lock holder rechecks readiness before spawn, owns stale endpoint recovery, materializes the image, spawns the child, and waits for readiness. Other processes wait for the lock and recheck rather than intentionally launching another child.
 
-A successful verified `Hello` is full application readiness. The server initializes configuration, plugins, session services, application state, workflow recovery, and ownership behavior before accepting that handshake. No partial-ready protocol is currently justified by measurements.
+A successful verified `Hello` is full application readiness. Lifecycle readiness performs that exact handshake and validates artifact identity, protocol, build fingerprint, storage writer epoch, and session event schema without hashing executable bytes. The server initializes configuration, plugins, session services, application state, workflow recovery, and ownership behavior before accepting that handshake. No partial-ready protocol is currently justified by measurements.
 
 Lifecycle must preserve a responsive foreign endpoint and report incompatibility rather than deleting it. Endpoint and record cleanup is permitted only with positive stale evidence.
 

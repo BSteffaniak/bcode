@@ -136,7 +136,9 @@ if kill -0 "${initial_pid}" 2>/dev/null; then
     exit 1
 fi
 
-python3 - "${root}/target/debug/bcode" "${session_id}" "${initial_pid}" <<'PY'
+expected_artifact_id="$("${root}/target/debug/bcode" artifact-id)"
+
+python3 - "${root}/target/debug/bcode" "${session_id}" "${initial_pid}" "${expected_artifact_id}" <<'PY'
 import fcntl
 import glob
 import json
@@ -149,7 +151,7 @@ import sys
 import termios
 import time
 
-binary, session_id, initial_pid = sys.argv[1:]
+binary, session_id, initial_pid, expected_artifact_id = sys.argv[1:]
 initial_pid = int(initial_pid)
 session_marker = f"#{session_id[:8]}".encode()
 started = time.monotonic()
@@ -160,6 +162,7 @@ fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
 capture = bytearray()
 daemon_ready_at = None
 connected_at = None
+verified_artifact_id = None
 request_sent = False
 deadline = started + 10
 while time.monotonic() < deadline:
@@ -181,6 +184,7 @@ while time.monotonic() < deadline:
                 artifact_id = record.get("artifact_id")
                 if daemon_pid and daemon_pid != initial_pid and artifact_id:
                     os.kill(daemon_pid, 0)
+                    verified_artifact_id = artifact_id
                     daemon_ready_at = time.monotonic()
                     break
             except (OSError, ValueError):
@@ -216,6 +220,7 @@ checks = {
     "daemon started within 10 seconds": daemon_ready_at is not None
     and daemon_ready_at - started <= 10,
     "TUI observed auto-started daemon": connected_at is not None,
+    "auto-started daemon has exact invoking artifact identity": verified_artifact_id == expected_artifact_id,
     "TUI connected within 10 seconds": connected_at is not None and connected_at - started <= 10,
 }
 failures = [name for name, passed in checks.items() if not passed]

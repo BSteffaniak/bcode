@@ -4726,6 +4726,67 @@ mod client_timeout_tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn custom_endpoint_warm_handshake_uses_one_connection_without_startup() {
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bcw-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory");
+        let endpoint = bcode_ipc::IpcEndpoint::unix_socket(socket_dir.join("warm.sock"));
+        let listener = bcode_ipc::LocalIpcListener::bind(&endpoint).expect("listener");
+        let expected_client_id = bcode_session_models::ClientId::new();
+        let server = tokio::spawn(async move {
+            let mut stream = listener.accept().await.expect("accept client");
+            let hello = bcode_ipc::recv_envelope(&mut stream)
+                .await
+                .expect("receive hello");
+            assert!(matches!(
+                bcode_ipc::decode_request(&hello.payload).expect("decode hello"),
+                bcode_ipc::Request::Hello { artifact_id: Some(artifact_id), .. }
+                    if artifact_id == bcode_ipc::ArtifactId::current()
+            ));
+            let response = bcode_ipc::Response::Ok(bcode_ipc::ResponsePayload::Hello {
+                protocol_version: bcode_ipc::ProtocolVersion::current(),
+                client_id: expected_client_id,
+                daemon: matching_daemon_status(),
+            });
+            let envelope =
+                bcode_ipc::response_envelope(hello.request_id, &response).expect("hello response");
+            bcode_ipc::send_envelope(&mut stream, &envelope)
+                .await
+                .expect("send hello");
+        });
+        let client = BcodeClient::new(endpoint);
+
+        let connection = client
+            .connect("custom-warm-test")
+            .await
+            .expect("warm connect");
+        assert_eq!(connection.client_id(), Some(expected_client_id));
+
+        server.await.expect("server task");
+        std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_custom_endpoint_requires_running_without_auto_start() {
+        let socket_dir =
+            std::path::PathBuf::from(format!("/tmp/bcm-{}", SessionOpenOperationId::new()));
+        std::fs::create_dir_all(&socket_dir).expect("socket directory");
+        let socket_path = socket_dir.join("missing.sock");
+        let client = BcodeClient::new(bcode_ipc::IpcEndpoint::unix_socket(socket_path.clone()));
+
+        let error = client
+            .connect("custom-missing-test")
+            .await
+            .expect_err("custom endpoint must require a running daemon");
+        assert!(error.is_daemon_unavailable());
+        assert!(!socket_path.exists());
+
+        std::fs::remove_dir_all(socket_dir).expect("socket cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn connection_timeout_is_distinct_and_does_not_trigger_auto_start() {
         let socket_dir =
             std::path::PathBuf::from(format!("/tmp/bcc-{}", SessionOpenOperationId::new()));

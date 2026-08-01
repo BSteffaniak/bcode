@@ -1,75 +1,52 @@
 # Daemon startup performance baseline
 
-Measured on 2026-07-31 from the `bcode/daemon-client-compatibility` worktree after adding the isolated daemon-startup harness.
+Measured on 2026-07-31 from the `bcode/daemon-client-compatibility` worktree with the isolated daemon-startup harness.
 
 ## Environment
 
 * Host: macOS Darwin 25.5.0, Apple arm64.
 * Profile: Cargo `release` with the `distribution` feature set.
-* Artifact size: 105,757,632 bytes.
-* Samples: 20 per serial scenario; 16 clients for the concurrent cold scenario.
+* Current artifact size: 101,639,600 bytes.
+* Current full sample set: 20 serial samples; 16 clients for concurrent cold startup.
 * Isolation: every cold sample used a fresh `BCODE_STATE_DIR`, `TMPDIR`, `BCODE_SOCKET`, and config. No invoking daemon variables were inherited.
 * Command: `BCODE_STARTUP_TRACE=1 BCODE_DAEMON_PERF_SAMPLES=20 BCODE_DAEMON_PERF_CONCURRENT_CLIENTS=16 scripts/measure-daemon-startup.sh`.
 
 Generated JSON reports and raw samples are written under `target/daemon-startup-performance/` and are intentionally build artifacts rather than committed source.
 
-## Results
+## Current results
 
 | Scenario | p50 | p95 | Notes |
 | --- | ---: | ---: | --- |
-| In-process local connect + verified `Hello` | 1.232 ms | 1.823 ms | Measured inside `server startup-probe`; excludes process launch. |
-| Warm CLI `server status` | 676.060 ms | 803.212 ms | Includes full CLI process launch and status request. |
-| CLI process baseline (`--version`) | 689.352 ms | 822.336 ms | Shows that warm command latency is dominated by launching the 105.8 MB distribution artifact on this host, not IPC. |
-| Cached cold connect | 1.099 s | 1.344 s | Existing valid cached daemon image; includes client process launch, daemon launch, polling, and verified `Hello`. |
-| First cold connect | 1.857 s | 3.101 s | Fresh state; includes image materialization and digest verification. |
-| 16-client concurrent cold wall time | 5.123 s | n/a | One daemon record/process was observed after all clients completed. |
+| In-process local connect + verified `Hello` | 0.511 ms | 4.319 ms | Measures from an already-constructed client and excludes process launch/config-context assembly. Passes the 5 ms budget. |
+| Warm CLI `server status` | 65.184 ms | 89.508 ms | Includes CLI process launch and status request. |
+| CLI process baseline (`--version`) | 52.048 ms | 64.683 ms | Warm status p95 overhead is 24.825 ms. Passes the 25 ms budget. |
+| Cached cold connect | 252.993 ms | 263.271 ms | Existing verified image. Passes the 500 ms budget. |
+| First cold connect | 1.739 s | 3.501 s | Fresh image publication. Does not meet the 1.5 s p95 budget. |
+| 16-client concurrent cold wall time | 1.801 s | n/a | One daemon process/record; within first-cold budget plus 500 ms coordination allowance. |
 
-## Startup stage evidence
+## Current startup stage evidence
 
-The captured first-startup trace reports:
+The lifecycle and server traces show:
 
-| Server stage | Time |
-| --- | ---: |
-| Config | 1 ms |
-| Plugin loading/activation | 13 ms (7 ms in plugin host) |
-| Historical session recovery | <1 ms |
-| IPC bind plus daemon record publication | 231 ms |
-| Lazy session service construction | <1 ms |
-| Remaining state construction/workflow recovery/readiness | 17 ms |
-| Total server entry to ready | 265 ms |
+* Copy-on-write clone from the retained exact artifact handle: under 1 ms on APFS.
+* SHA-256 verification plus durable image synchronization: about 78 ms for the 101.6 MB image.
+* Full server entry through verified `Hello`: about 40 ms.
+* The remaining first-cold tail is dominated by launching the newly published 101.6 MB product image on this host; one captured run spent about 1.76 s between child spawn and server entry.
 
-The dominant end-to-end costs are outside plugin or session initialization:
+A measured daemon-sidecar experiment did not close this requirement. A 76 MB server-only product binary shared the exact embedded artifact ID and improved a five-sample first-cold median to 0.886 s, but its p95 was 1.648 s. The required 20-sample run measured 1.370 s p50 / 2.585 s p95 and 3.074 s concurrent cold wall time. Direct fresh-clone launch probes remained highly variable, and explicit `codesign --verify --strict` added cost without prewarming execution. The sidecar experiment was removed rather than adding release complexity that did not meet the locked tail budget.
 
-1. Distribution artifact process launch: approximately 0.69 s p50.
-2. First-cold image copy and SHA-256 verification: approximately 0.76 s p50 above cached cold.
-3. Lifecycle readiness polling and repeated executable digest verification: cached cold is roughly 0.41 s above process baseline plus measured server initialization, and IPC bind itself spends about 0.23 s probing the endpoint.
-4. Concurrent clients serialize behind startup coordination and each performs heavyweight client startup/identity work.
+The measured optimizations preserve the architecture boundaries:
 
-These results support retaining exact digest verification as cold-path evidence while removing executable hashing from warm routing, replacing fixed polling/retry windows, and preserving full `Hello` readiness. They do not justify a partial-readiness protocol.
-
-## Follow-up measurements
-
-A 2026-07-31 implementation sample (5 serial samples, 8 concurrent clients) removed redundant child-side executable hashing and skipped stale-socket confirmation when no endpoint path exists. It measured:
-
-* warm handshake: 1.105 ms p50 / 2.244 ms p95;
-* cached cold: 577.395 ms p50 / 623.110 ms p95;
-* first cold: 1.385 s p50 / 2.392 s p95;
-* 8-client concurrent cold: 3.128 s wall time.
-
-This confirms warm handshake remains inside budget and first-cold median improved, but cached-cold p95, first-cold p95, and concurrent cold still require optimization. No partial-readiness protocol is justified: successful `Hello` remains the readiness boundary.
-
-A later 2026-07-31 sample fused first-cold copy and hashing into one retained-handle read. With 5 serial samples and 8 concurrent clients it measured:
-
-* warm handshake: 1.122 ms p50 / 2.050 ms p95;
-* cached cold: 524.534 ms p50 / 552.124 ms p95;
-* first cold: 1.373 s p50 / 2.682 s p95;
-* 8-client concurrent cold: 2.903 s wall time.
-
-Cached cold is now close to budget and first-cold median remains within budget, but tail and concurrent performance still require work. The full-readiness conclusion is unchanged.
+* lifecycle readiness now uses the exact verified `Hello` contract rather than `ServerStatus`;
+* readiness validates artifact, protocol, build, writer epoch, and event schema without runtime executable hashing;
+* cached-image discovery verifies content-addressed metadata and cached bytes without first hashing the source artifact;
+* SHA-256 uses the crate's AArch64 acceleration where available;
+* first materialization attempts a retained-handle copy-on-write clone on supported macOS/Linux filesystems, verifies and synchronizes the clone, and falls back to fused stream copy plus hashing;
+* successful `Hello` remains full readiness—no partial-ready protocol is justified.
 
 ## Initial budgets
 
-These are product budgets for the replacement architecture, not allowances for the current workaround. They are locked from the measured component costs and must be enforced at the narrowest stable layer:
+These product budgets remain locked:
 
 * In-process warm connect + verified `Hello`: p95 **<= 5 ms**.
 * Warm CLI daemon-backed command overhead above same-artifact `--version`: p95 **<= 25 ms**.
@@ -77,4 +54,4 @@ These are product budgets for the replacement architecture, not allowances for t
 * First cold connect for an approximately 106 MB artifact, measured from an already-running client process: p95 **<= 1.5 s**.
 * Concurrent cold launch: exactly one daemon process; all 16 clients complete within the first-cold p95 plus **500 ms** coordination allowance.
 
-Full CLI totals remain host-sensitive because executable startup dominates on this machine. CI regression gates should therefore enforce the in-process handshake and lifecycle component budgets, while broader CLI totals remain benchmark reports normalized against the same binary's process baseline.
+The harness blocks on warm-handshake and cached-cold p95. Full CLI totals remain host-sensitive and are normalized against the same binary's process baseline. First-cold remains an open optimization target; it must not be marked complete until its p95 meets budget without weakening exact-image integrity, full readiness, or release architecture.
