@@ -2199,6 +2199,14 @@ impl BmuxApp {
         }
     }
 
+    /// Return the pending reasoning effort, if one overrides canonical session state.
+    #[must_use]
+    pub fn pending_reasoning_effort(&self) -> Option<&str> {
+        self.pending_reasoning_effort
+            .as_ref()
+            .map(|pending| pending.value.as_str())
+    }
+
     /// Return the effective reasoning effort for the next submission, if any.
     #[must_use]
     pub fn reasoning_effort(&self) -> Option<&str> {

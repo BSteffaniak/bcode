@@ -69,6 +69,16 @@ fn apply_draft_agent_selection(
     }
 }
 
+fn thinking_dialog_status(
+    app: &super::app::BmuxApp,
+    mut status: bcode_ipc::SessionModelStatus,
+) -> bcode_ipc::SessionModelStatus {
+    if let Some(pending_effort) = app.pending_reasoning_effort() {
+        status.reasoning_effort = Some(pending_effort.to_owned());
+    }
+    status
+}
+
 async fn open_thinking_settings(
     services: &TuiServices<'_>,
     chat: &mut ActiveChat,
@@ -91,13 +101,14 @@ async fn open_thinking_settings(
         }
     };
     chat.app.apply_model_status(status.clone());
+    let dialog_status = thinking_dialog_status(&chat.app, status);
     chat.app
         .set_status("reasoning output settings: enter apply, esc cancel".to_owned());
     Ok(Some(ComposerModalRequest::Thinking(
         thinking_dialog::ThinkingDialogState::new_focused(
             chat.app.reasoning_visible(),
             chat.app.reasoning_display_mode(),
-            &status,
+            &dialog_status,
             focus,
         ),
     )))
@@ -485,6 +496,7 @@ mod tests {
     use bcode_command::{
         CommandAction, CommandContribution, CommandExecution, CommandOwner, CommandSurface,
     };
+    use bcode_model::{ModelReasoningCapabilitySource, ModelReasoningInfo};
     use std::collections::BTreeSet;
 
     fn loop_command() -> slash_registry::SlashResolution {
@@ -529,6 +541,45 @@ mod tests {
             "message after migration"
         );
         assert!(chat.app.status().contains("still opening"));
+    }
+
+    #[test]
+    fn thinking_dialog_status_preserves_newer_pending_effort_over_stale_hydration() {
+        let mut app = super::super::app::BmuxApp::new_with_history(None, &[], &[], false);
+        app.set_pending_reasoning_effort("high".to_owned());
+        let status = bcode_ipc::SessionModelStatus {
+            provider_plugin_id: Some("provider".to_owned()),
+            requested_model_id: Some("model".to_owned()),
+            effective_model_id: Some("model".to_owned()),
+            model_id: Some("model".to_owned()),
+            context_window: None,
+            context_occupancy: None,
+            request_context_error: None,
+            pricing: None,
+            auth_profile: None,
+            context_format_version: None,
+            compatibility_key: None,
+            max_output_tokens: None,
+            reasoning: Some(ModelReasoningInfo {
+                effort_values: vec!["low".to_owned(), "high".to_owned()],
+                source: ModelReasoningCapabilitySource::ProviderMetadata,
+                ..ModelReasoningInfo::default()
+            }),
+            reasoning_effort: Some("low".to_owned()),
+            reasoning_summary: Some("detailed".to_owned()),
+            prompt_cache_mode: None,
+            conversation_reuse_mode: None,
+            compaction_mode: None,
+            compaction_backend: None,
+            proactive_compaction_threshold_percent: None,
+            cache: None,
+            metadata_source: None,
+        };
+
+        let dialog_status = thinking_dialog_status(&app, status);
+
+        assert_eq!(dialog_status.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(dialog_status.reasoning_summary.as_deref(), Some("detailed"));
     }
 
     #[test]

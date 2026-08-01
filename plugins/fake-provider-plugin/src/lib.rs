@@ -978,13 +978,39 @@ fn insert_fake_error_turn(state: &Mutex<FakeProviderState>, error: ProviderError
     provider_turn_id
 }
 
+fn unsupported_fake_sampling_parameters(
+    parameters: &bcode_model::ModelParameters,
+) -> Option<(&'static str, &'static str)> {
+    let mut supported_parameters = parameters.clone();
+    supported_parameters.reasoning_effort = None;
+    supported_parameters.reasoning_effort_value = None;
+    supported_parameters.reasoning_summary = None;
+    (supported_parameters != bcode_model::ModelParameters::default()).then_some((
+        "fake_model_parameters_unsupported",
+        "fake provider does not implement model sampling parameters",
+    ))
+}
+
+fn unsupported_fake_error(code: &str, message: &str) -> ProviderError {
+    ProviderError {
+        code: code.to_owned(),
+        category: ProviderErrorCategory::UnsupportedFeature,
+        message: message.to_owned(),
+        retryable: false,
+        provider_message: None,
+        failure: None,
+        request_id: None,
+        diagnostic_context: Box::default(),
+        sources: Box::default(),
+        retry: None,
+    }
+}
+
 fn validate_fake_request(request: &ModelTurnRequest) -> Option<ProviderError> {
-    let unsupported = if request.parameters != bcode_model::ModelParameters::default() {
-        Some((
-            "fake_model_parameters_unsupported",
-            "fake provider does not implement model sampling or reasoning parameters",
-        ))
-    } else if matches!(
+    if let Some((code, message)) = unsupported_fake_sampling_parameters(&request.parameters) {
+        return Some(unsupported_fake_error(code, message));
+    }
+    let unsupported = if matches!(
         request.prompt_cache.mode,
         bcode_model::PromptCacheMode::Aggressive
     ) || request.prompt_cache.cache_system_prompt
@@ -994,8 +1020,7 @@ fn validate_fake_request(request: &ModelTurnRequest) -> Option<ProviderError> {
                 .content
                 .iter()
                 .any(|block| matches!(block, ContentBlock::CachePoint { .. }))
-        })
-    {
+        }) {
         Some((
             "fake_prompt_cache_unsupported",
             "fake provider does not implement prompt caching",
@@ -1584,11 +1609,20 @@ fn models(has_context_window: bool) -> ModelList {
                 ModelCapability::ToolCalls,
                 ModelCapability::ParallelToolCalls,
                 ModelCapability::JsonMode,
+                ModelCapability::Reasoning,
             ]
             .into_iter()
             .collect(),
             feature_support: fake_feature_support(),
-            reasoning: None,
+            reasoning: Some(bcode_model::ModelReasoningInfo {
+                effort_values: ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+                    .into_iter()
+                    .map(ToOwned::to_owned)
+                    .collect(),
+                default_effort: Some("medium".to_owned()),
+                source: bcode_model::ModelReasoningCapabilitySource::ProviderMetadata,
+                ..bcode_model::ModelReasoningInfo::default()
+            }),
             cache: bcode_model::ModelCacheInfo::default(),
             metadata_source: Some(bcode_model::ModelMetadataSource::BundledCatalog),
             pricing: None,
@@ -1892,6 +1926,17 @@ mod tests {
                 .iter()
                 .any(|event| { matches!(event, ProviderTurnEvent::ToolCallFinished { .. }) })
         );
+    }
+
+    #[test]
+    fn fake_reasoning_parameters_are_removed_from_sampling_validation() {
+        let parameters = bcode_model::ModelParameters {
+            reasoning_effort_value: Some("high".to_owned()),
+            reasoning_summary: Some("detailed".to_owned()),
+            ..bcode_model::ModelParameters::default()
+        };
+
+        assert_eq!(unsupported_fake_sampling_parameters(&parameters), None);
     }
 
     #[test]
