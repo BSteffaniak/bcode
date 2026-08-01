@@ -251,6 +251,68 @@ struct PendingReasoningEffort {
     generation: u64,
 }
 
+/// Zero-copy ordered terminal transcript view over canonical items and TUI-local notices.
+#[derive(Debug, Clone, Copy)]
+pub struct TranscriptItems<'a> {
+    canonical: &'a [TranscriptItem],
+    notices: &'a [TranscriptItem],
+}
+
+impl<'a> TranscriptItems<'a> {
+    pub(crate) const fn new(
+        canonical: &'a [TranscriptItem],
+        notices: &'a [TranscriptItem],
+    ) -> Self {
+        Self { canonical, notices }
+    }
+
+    /// Return the number of visible transcript items.
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.canonical.len() + self.notices.len()
+    }
+
+    /// Return whether no transcript items are visible.
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.canonical.is_empty() && self.notices.is_empty()
+    }
+
+    /// Return one visible item by index.
+    #[must_use]
+    pub fn get(self, index: usize) -> Option<&'a TranscriptItem> {
+        self.canonical
+            .get(index)
+            .or_else(|| self.notices.get(index.saturating_sub(self.canonical.len())))
+    }
+
+    /// Iterate visible items in canonical-then-local order.
+    pub fn iter(self) -> impl DoubleEndedIterator<Item = &'a TranscriptItem> {
+        self.canonical.iter().chain(self.notices.iter())
+    }
+}
+
+impl<'a> IntoIterator for TranscriptItems<'a> {
+    type Item = &'a TranscriptItem;
+    type IntoIter = std::iter::Chain<
+        std::slice::Iter<'a, TranscriptItem>,
+        std::slice::Iter<'a, TranscriptItem>,
+    >;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.canonical.iter().chain(self.notices.iter())
+    }
+}
+
+impl std::ops::Index<usize> for TranscriptItems<'_> {
+    type Output = TranscriptItem;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.get(index)
+            .expect("transcript item index out of bounds")
+    }
+}
+
 /// State owned by the terminal user interface.
 #[derive(Debug, Clone)]
 pub struct BmuxApp {
@@ -278,10 +340,7 @@ pub struct BmuxApp {
     input_history: InputHistory,
     transcript: TranscriptDocument,
     local_notices: Vec<TranscriptItem>,
-    local_notice_revision: u64,
-    projected_items: Vec<TranscriptItem>,
-    projected_items_revision: u64,
-    projected_items_source_revision: Option<(u64, u64)>,
+    transcript_projection_revision: u64,
     session_view_terminal_adapter: SessionViewTerminalAdapter,
     session_view: bcode_session_view::SessionView,
     transcript_window: TranscriptResidentWindow,
@@ -487,10 +546,7 @@ impl BmuxApp {
             input_history: InputHistory::from_entries(input_history),
             transcript: TranscriptDocument::default(),
             local_notices: Vec::new(),
-            local_notice_revision: 0,
-            projected_items: Vec::new(),
-            projected_items_revision: 0,
-            projected_items_source_revision: None,
+            transcript_projection_revision: 0,
             session_view_terminal_adapter: SessionViewTerminalAdapter::default(),
             session_view: bcode_session_view::SessionView::new(),
             transcript_window: TranscriptResidentWindow::default(),
@@ -541,7 +597,6 @@ impl BmuxApp {
             last_transcript_damage: TranscriptDocumentDamage::None,
         };
         app.absorb_history(history);
-        app.sync_projected_items();
         app
     }
 
@@ -1415,23 +1470,8 @@ impl BmuxApp {
 
     /// Return terminal presentation items, including TUI-owned ephemeral notices.
     #[must_use]
-    pub fn transcript(&self) -> &[TranscriptItem] {
-        &self.projected_items
-    }
-
-    /// Recompose terminal presentation items when semantic transcript or local notices changed.
-    pub fn sync_projected_items(&mut self) {
-        let source_revision = (self.transcript.revision(), self.local_notice_revision);
-        if self.projected_items_source_revision == Some(source_revision) {
-            return;
-        }
-        self.projected_items.clear();
-        self.projected_items
-            .extend(self.transcript.items().iter().cloned());
-        self.projected_items
-            .extend(self.local_notices.iter().cloned());
-        self.projected_items_revision = self.projected_items_revision.saturating_add(1);
-        self.projected_items_source_revision = Some(source_revision);
+    pub fn transcript(&self) -> TranscriptItems<'_> {
+        TranscriptItems::new(self.transcript.items(), &self.local_notices)
     }
 
     /// Return TUI-owned ephemeral notices rendered outside the canonical transcript.
@@ -1439,6 +1479,23 @@ impl BmuxApp {
     #[must_use]
     pub fn local_notices(&self) -> &[TranscriptItem] {
         &self.local_notices
+    }
+
+    /// Return whether one invocation has reached authoritative terminal state.
+    #[must_use]
+    pub fn tool_invocation_is_terminal(&self, invocation_id: &str) -> bool {
+        self.session_view
+            .snapshot()
+            .tools
+            .get(invocation_id)
+            .is_some_and(|tool| {
+                matches!(
+                    tool.status,
+                    bcode_session_view_models::ToolInvocationViewStatus::Finished
+                        | bcode_session_view_models::ToolInvocationViewStatus::Cancelled
+                        | bcode_session_view_models::ToolInvocationViewStatus::Failed
+                )
+            })
     }
 
     /// Return revision for elapsed-time labels in active transcript entries.
@@ -1450,7 +1507,7 @@ impl BmuxApp {
     /// Return revision for transcript collection changes.
     #[must_use]
     pub const fn transcript_projection_revision(&self) -> u64 {
-        self.projected_items_revision
+        self.transcript_projection_revision
     }
 
     /// Drain at most `limit` transcript invocation identifiers whose elapsed-time label changed.
@@ -2051,8 +2108,7 @@ impl BmuxApp {
     ) {
         self.local_notices
             .push(TranscriptItem::with_format("System", text, format));
-        self.local_notice_revision = self.local_notice_revision.saturating_add(1);
-        self.sync_projected_items();
+        self.transcript_projection_revision = self.transcript_projection_revision.saturating_add(1);
     }
 
     /// Replace the current status line.
@@ -3397,7 +3453,7 @@ impl BmuxApp {
         {
             self.last_transcript_damage.clone_from(&damage);
         }
-        self.sync_projected_items();
+        self.transcript_projection_revision = self.transcript_projection_revision.saturating_add(1);
         damage
     }
 
@@ -6267,12 +6323,8 @@ mod tests {
             reasoning[0].text_format(),
             bcode_session_view_models::TextFormat::Markdown
         );
-        let streaming_rows = crate::render::transcript_item_rows(
-            app.transcript(),
-            app.transcript()
-                .iter()
-                .position(|item| item.role().starts_with("Reasoning"))
-                .unwrap(),
+        let streaming_rows = crate::render::transcript_item_rows_from_item(
+            reasoning[0],
             48,
             None,
             bcode_config::TuiDiffViewerConfig::default(),
@@ -6300,12 +6352,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(reasoning.len(), 1);
         assert!(!reasoning[0].streaming());
-        let finalized_rows = crate::render::transcript_item_rows(
-            app.transcript(),
-            app.transcript()
-                .iter()
-                .position(|item| item.role().starts_with("Reasoning"))
-                .unwrap(),
+        let finalized_rows = crate::render::transcript_item_rows_from_item(
+            reasoning[0],
             48,
             None,
             bcode_config::TuiDiffViewerConfig::default(),

@@ -157,6 +157,10 @@ reasoning_request_sent = False
 reasoning_first_before_second = False
 reasoning_second_after_first = False
 reasoning_final_after_updates = False
+viewport_detached = False
+viewport_anchor = None
+viewport_stable = True
+viewport_check_frames = 0
 raw_argument_json_visible = False
 running_timeout_visible = False
 next_screen_probe = 0.0
@@ -169,9 +173,9 @@ filesystem_second_marker = b"PTYFILESYSTEMSECOND"
 filesystem_edit_marker = b"PTYFILESYSTEMEDITED"
 assistant_prefix_marker = b"ASSISTANTPREFIX"
 assistant_suffix_marker = b"ASSISTANTSUFFIX"
-reasoning_first_marker = b"REASONINGFIRST"
-reasoning_combined_marker = b"REASONINGFIRSTREASONINGSECOND"
-reasoning_final_marker = b"REASONINGFINAL"
+reasoning_first_marker = b"  REASONINGFIRST "
+reasoning_combined_marker = b"  REASONINGFIRSTREASONINGSECOND "
+reasoning_final_marker = b"  REASONINGFINAL "
 
 def screen_text():
     with open(capture_path, "wb") as capture_file:
@@ -211,7 +215,9 @@ while time.monotonic() < deadline:
         if shell_request_sent and not filesystem_request_sent:
             running_shell = b"running tool: shell" in screen.lower()
             final_shell = b"shell run" in screen.lower() and b"exit code" in screen.lower()
-            raw_argument_json_visible |= b'"command"' in screen or b"arguments" in screen.lower()
+            raw_argument_json_visible |= running_shell and (
+                b'"command"' in screen or b"arguments" in screen.lower()
+            )
             if running_shell and b"timeout 30.0s" in screen.lower():
                 running_timeout_visible = True
             output_lines = {
@@ -232,7 +238,6 @@ while time.monotonic() < deadline:
                 and final_output_after_finish
                 and b"ready" in screen.lower()
             ):
-                capture.extend(b"\nBCODE_SMOKE_SHELL_FINAL_MARKER_VISIBLE\n")
                 os.write(
                     fd,
                     b"tool-write pty-progressive.txt PTYFILESYSTEMFIRST\\nPTYFILESYSTEMSECOND\r",
@@ -270,7 +275,6 @@ while time.monotonic() < deadline:
                 and b"ready" in lower_screen
                 and b"tool-write" not in lower_screen
             ):
-                capture.extend(b"\nBCODE_SMOKE_FILESYSTEM_WRITE_FINAL_MARKER_VISIBLE\n")
                 os.write(fd, b"\x15")
                 os.write(
                     fd,
@@ -305,15 +309,44 @@ while time.monotonic() < deadline:
                 filesystem_edit_final_after_draft = True
             if filesystem_edit_final and not filesystem_edit_draft_before_finish:
                 filesystem_edit_final_seen_before_draft = True
-            if (
-                filesystem_edit_final_after_draft
-                and not assistant_request_sent
-                and b"ready" in lower_screen
-                and b"tool-edit" not in lower_screen
-            ):
-                capture.extend(b"\nBCODE_SMOKE_FILESYSTEM_EDIT_FINAL_MARKER_VISIBLE\n")
-                os.write(fd, b"stream-text ASSISTANTPREFIXASSISTANTSUFFIX\r")
-                assistant_request_sent = True
+        if (
+            filesystem_edit_final_after_draft
+            and not viewport_detached
+            and not assistant_request_sent
+            and b"ready" in lower_screen
+            and b"tool-edit" not in lower_screen
+        ):
+            os.write(fd, b"\x1b[5~")
+            viewport_detached = True
+            next_screen_probe = time.monotonic()
+        if viewport_detached and not assistant_request_sent:
+            candidate = next(
+                (
+                    line.strip()
+                    for line in screen.splitlines()
+                    if line.strip()
+                    and b"ready" not in line.lower()
+                    and b"ask bcode" not in line.lower()
+                ),
+                None,
+            )
+            if viewport_anchor is None and candidate is not None:
+                viewport_anchor = candidate
+            elif viewport_anchor is not None and viewport_anchor in screen:
+                viewport_check_frames += 1
+            viewport_stable &= viewport_anchor is None or viewport_anchor in screen
+        if (
+            filesystem_edit_final_after_draft
+            and not assistant_request_sent
+            and viewport_anchor is not None
+            and viewport_check_frames >= 2
+            and b"ready" in lower_screen
+            and b"tool-edit" not in lower_screen
+        ):
+            os.write(fd, b"stream-text ASSISTANTPREFIXASSISTANTSUFFIX\r")
+            assistant_request_sent = True
+        if viewport_detached and assistant_request_sent and viewport_anchor is not None:
+            viewport_stable &= viewport_anchor in screen
         if assistant_request_sent:
             prefix_visible = assistant_prefix_marker in screen
             suffix_visible = assistant_suffix_marker in screen
@@ -329,7 +362,6 @@ while time.monotonic() < deadline:
                 and b"ready" in screen.lower()
                 and b"stream-text" not in screen.lower()
             ):
-                capture.extend(b"\nBCODE_SMOKE_ASSISTANT_FINAL_MARKER_VISIBLE\n")
                 os.write(fd, b"stream-reasoning REASONINGFIRSTREASONINGSECOND\r")
                 reasoning_request_sent = True
         if reasoning_request_sent:
@@ -342,7 +374,6 @@ while time.monotonic() < deadline:
                 reasoning_second_after_first = True
             if final_visible and reasoning_second_after_first:
                 reasoning_final_after_updates = True
-                capture.extend(b"\nBCODE_SMOKE_REASONING_FINAL_MARKER_VISIBLE\n")
         next_screen_probe = time.monotonic() + 0.25
 
     if (
@@ -365,6 +396,9 @@ while time.monotonic() < deadline:
         and reasoning_first_before_second
         and reasoning_second_after_first
         and reasoning_final_after_updates
+        and viewport_detached
+        and viewport_anchor is not None
+        and viewport_stable
     ):
         try:
             os.write(fd, b"\x04")
@@ -403,6 +437,21 @@ with open(capture_path + ".frames", "wb") as frames_file:
         frames_file.write(f"\n--- frame {index} ---\n".encode())
         frames_file.write(screen)
 
+metadata_markers = (
+    b"runtime_work_started",
+    b"runtime_work_finished",
+    b"model_usage",
+    b"request_context_observed",
+    b"trace_event",
+    b"input_tokens",
+    b"output_tokens",
+    b"reasoning_tokens",
+)
+metadata_excluded = all(
+    all(marker not in screen.lower() for marker in metadata_markers)
+    for screen in screen_frames
+)
+
 checks = {
     "alternate-screen entry": b"\x1b[?1049h" in capture,
     "alternate-screen restoration": b"\x1b[?1049l" in capture,
@@ -437,6 +486,9 @@ checks = {
     "reasoning first update visible before second": reasoning_first_before_second,
     "reasoning second update preserves first": reasoning_second_after_first,
     "reasoning final follows ordered updates": reasoning_final_after_updates,
+    "viewport detached before operational updates": viewport_detached and viewport_anchor is not None,
+    "detached viewport anchor remains visible": viewport_stable,
+    "usage and runtime metadata excluded from transcript": metadata_excluded,
     "clean Ctrl-D exit": os.WIFEXITED(exit_status) and os.WEXITSTATUS(exit_status) == 0,
 }
 failures = [name for name, passed in checks.items() if not passed]

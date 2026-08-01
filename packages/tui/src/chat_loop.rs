@@ -2186,6 +2186,19 @@ pub fn absorb_session_live_event(
     artifact_stream: &mut ArtifactStreamCoordinator,
     event: &bcode_session_models::SessionLiveEvent,
 ) {
+    app.absorb_session_live_event(event);
+    let invocation_id = match &event.kind {
+        bcode_session_models::SessionLiveEventKind::ToolContributionPlaced { envelope } => {
+            Some(envelope.contribution.invocation_id.as_str())
+        }
+        bcode_session_models::SessionLiveEventKind::ToolPresentationUpdated { update } => {
+            Some(update.invocation_id.as_str())
+        }
+        _ => None,
+    };
+    if invocation_id.is_some_and(|invocation_id| app.tool_invocation_is_terminal(invocation_id)) {
+        return;
+    }
     let presentation = app.plugin_presentation();
     artifact_stream.observe_session_live_artifact(
         event.session_id,
@@ -2202,7 +2215,6 @@ pub fn absorb_session_live_event(
             })
         },
     );
-    app.absorb_session_live_event(event);
 }
 
 fn absorb_bcode_event(
@@ -3262,6 +3274,124 @@ mod scheduler_tests {
         assert_eq!(stats.observed_targets, 1);
         assert_eq!(stats.fetches_started, 1);
         assert_eq!(stats.backlog, 1);
+    }
+
+    #[tokio::test]
+    async fn terminal_invocation_rejects_late_presentation_artifact_before_hydration() {
+        let session_id = bcode_session_models::SessionId::new();
+        let history = [bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::ToolInvocationResultRecorded {
+                record: bcode_session_models::ToolInvocationResultRecord {
+                    invocation_id: "call-shell".to_owned(),
+                    model_output: "finished".to_owned(),
+                    is_error: false,
+                    presentation: None,
+                    result: None,
+                },
+            },
+        }];
+        let mut app =
+            super::super::app::BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+        let bundled = [bcode_plugin::StaticBundledPlugin::new(
+            include_str!("../../../plugins/shell-plugin/bcode-plugin.toml"),
+            bcode_shell_plugin::static_plugin(),
+        )];
+        let selected = bcode_plugin::filter_selected_static_plugins(
+            &bundled,
+            &bcode_plugin::PluginSelection::all_enabled(),
+        )
+        .expect("select shell plugin");
+        let host =
+            bcode_plugin::PluginHost::load_static_plugins(&selected).expect("load shell plugin");
+        app.set_plugin_host(std::sync::Arc::new(host));
+        assert!(app.tool_invocation_is_terminal("call-shell"));
+        let mut artifact_stream = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
+        let event = bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::ToolPresentationUpdated {
+                update: bcode_tool::ToolPresentationUpdate {
+                    invocation_id: "call-shell".to_owned(),
+                    producer_id: "bcode.shell".to_owned(),
+                    generation: 0,
+                    revision: 99,
+                    identity: bcode_tool::ToolPresentationIdentity::Primary,
+                    retention: bcode_tool::ToolPresentationRetention::RetainLatest,
+                    schema: "bcode.shell.run".to_owned(),
+                    schema_version: 1,
+                    artifact: Some(bcode_tool::ToolContributionArtifact {
+                        artifact_id: "late-shell-run".to_owned(),
+                        reference_key: "shell_recording".to_owned(),
+                        content_type: Some(
+                            "application/x-bcode-shell-recording; version=3".to_owned(),
+                        ),
+                        storage_uri: "untrusted://opaque".to_owned(),
+                        committed_bytes: 128,
+                        revision: 99,
+                        finalized: false,
+                        availability: None,
+                    }),
+                    payload: serde_json::json!({"mode": "terminal"}),
+                },
+            },
+        };
+
+        absorb_session_live_event(&mut app, &mut artifact_stream, &event);
+
+        let stats = artifact_stream.drain_stats();
+        assert_eq!(stats.observed_targets, 0);
+        assert_eq!(stats.fetches_started, 0);
+        assert!(app.tool_invocation_is_terminal("call-shell"));
+        assert_eq!(app.transcript().len(), 1);
+    }
+
+    #[test]
+    fn invocation_progress_updates_runtime_activity_without_transcript_duplication() {
+        let session_id = bcode_session_models::SessionId::new();
+        let history = [bcode_session_models::SessionEvent {
+            schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+            sequence: 1,
+            timestamp_ms: 1,
+            session_id,
+            provenance: None,
+            kind: bcode_session_models::SessionEventKind::ToolCallRequested {
+                tool_call_id: "call-progress".to_owned(),
+                producer_plugin_id: Some("bcode.filesystem".to_owned()),
+                tool_name: "filesystem.find".to_owned(),
+                arguments_json: "{}".to_owned(),
+                working_directory: None,
+            },
+        }];
+        let mut app =
+            super::super::app::BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+        let transcript_len = app.transcript().len();
+        let mut artifact_stream = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
+        let event = bcode_session_models::SessionLiveEvent {
+            session_id,
+            kind: bcode_session_models::SessionLiveEventKind::ToolInvocationProgress {
+                event: bcode_session_models::ToolInvocationLifecycleEvent {
+                    invocation_id: "call-progress".to_owned(),
+                    sequence: 1,
+                    stage: bcode_session_models::ToolInvocationLifecycleStage::Progress,
+                    message: Some("find: scanned 25 entries".to_owned()),
+                    metadata: serde_json::Value::Null,
+                },
+            },
+        };
+
+        absorb_session_live_event(&mut app, &mut artifact_stream, &event);
+
+        assert_eq!(app.transcript().len(), transcript_len);
+        assert!(!app.tool_invocation_is_terminal("call-progress"));
+        assert!(matches!(
+            app.activity(),
+            super::super::activity::ActivityState::RuntimeWork { detail }
+                if detail == "running tool"
+        ));
     }
 
     fn test_chat() -> ActiveChat {

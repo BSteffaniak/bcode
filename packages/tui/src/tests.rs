@@ -2299,9 +2299,8 @@ fn pending_rich_markdown_finalizes_without_layout_drift_or_duplicate_content() {
         user_items[0].text_format(),
         bcode_session_view_models::TextFormat::Markdown
     );
-    let finalized_rows = render::transcript_item_rows(
-        app.transcript(),
-        app.transcript().len() - 1,
+    let finalized_rows = render::transcript_item_rows_from_item(
+        &app.transcript()[app.transcript().len() - 1],
         48,
         None,
         bcode_config::TuiDiffViewerConfig::default(),
@@ -2455,16 +2454,14 @@ fn reconstructed_rich_history_matches_equivalent_live_projection() {
             item.text_format(),
             bcode_session_view_models::TextFormat::Markdown
         );
-        let reconstructed_rows = render::transcript_item_rows(
-            reconstructed.transcript(),
-            index,
+        let reconstructed_rows = render::transcript_item_rows_from_item(
+            &reconstructed.transcript()[index],
             52,
             None,
             bcode_config::TuiDiffViewerConfig::default(),
         );
-        let live_rows = render::transcript_item_rows(
-            live.transcript(),
-            index,
+        let live_rows = render::transcript_item_rows_from_item(
+            &live.transcript()[index],
             52,
             None,
             bcode_config::TuiDiffViewerConfig::default(),
@@ -2540,11 +2537,10 @@ fn live_assistant_rich_markdown_updates_preserve_stream_and_final_layout() {
         first_item.text_format(),
         bcode_session_view_models::TextFormat::Markdown
     );
-    let first_rows = render::transcript_item_rows(
-        app.transcript(),
+    let first_rows = render::transcript_item_rows_from_item(
         app.transcript()
             .iter()
-            .position(|item| item.role() == "Assistant")
+            .find(|item| item.role() == "Assistant")
             .unwrap(),
         48,
         None,
@@ -2565,9 +2561,8 @@ fn live_assistant_rich_markdown_updates_preserve_stream_and_final_layout() {
         .iter()
         .position(|item| item.role() == "Assistant")
         .unwrap();
-    let streaming_rows = render::transcript_item_rows(
-        app.transcript(),
-        streaming_index,
+    let streaming_rows = render::transcript_item_rows_from_item(
+        &app.transcript()[streaming_index],
         48,
         None,
         bcode_config::TuiDiffViewerConfig::default(),
@@ -2590,11 +2585,10 @@ fn live_assistant_rich_markdown_updates_preserve_stream_and_final_layout() {
     assert_eq!(assistant_items.len(), 1);
     assert!(!assistant_items[0].streaming());
     assert_eq!(assistant_items[0].text(), final_text);
-    let finalized_rows = render::transcript_item_rows(
-        app.transcript(),
+    let finalized_rows = render::transcript_item_rows_from_item(
         app.transcript()
             .iter()
-            .position(|item| item.role() == "Assistant")
+            .find(|item| item.role() == "Assistant")
             .unwrap(),
         48,
         None,
@@ -5536,7 +5530,7 @@ fn live_progress_contribution_renders_replaces_in_place_and_removes() {
 
 #[tokio::test]
 #[allow(clippy::too_many_lines)]
-async fn live_shell_recording_chunk_renders_once_from_presentation_update() {
+async fn live_shell_recording_chunk_renders_once_from_contribution_artifact() {
     let session_id = SessionId::new();
     let mut app = BmuxApp::new_with_history(Some(session_id), &[], &[], false);
     app.set_plugin_host(Arc::new(shell_plugin_host()));
@@ -5696,28 +5690,33 @@ async fn live_shell_recording_chunk_renders_once_from_presentation_update() {
     );
     let live_event = bcode_session_models::SessionLiveEvent {
         session_id,
-        kind: bcode_session_models::SessionLiveEventKind::ToolPresentationUpdated {
-            update: bcode_tool::ToolPresentationUpdate {
-                invocation_id: "call-live-shell".to_owned(),
-                producer_id: "bcode.shell".to_owned(),
-                generation: 0,
-                revision: 2,
-                identity: bcode_tool::ToolPresentationIdentity::Primary,
-                retention: bcode_tool::ToolPresentationRetention::RetainLatest,
-                schema: "bcode.shell.run".to_owned(),
-                schema_version: 1,
-                artifact: Some(bcode_tool::ToolContributionArtifact {
-                    artifact_id: "call-live-shell-shell-run".to_owned(),
-                    reference_key: "shell_recording".to_owned(),
-                    content_type: Some("application/x-bcode-shell-recording; version=3".to_owned()),
-                    storage_uri: String::new(),
-                    committed_bytes: u64::try_from(bytes.len()).expect("recording length"),
-                    revision: 2,
-                    finalized: false,
-                    availability: None,
-                }),
-                payload: serde_json::json!({"mode": "terminal", "timeout_ms": 30_000}),
-            },
+        kind: bcode_session_models::SessionLiveEventKind::ToolContributionPlaced {
+            envelope: bcode_session_models::ToolContributionEnvelope::new(
+                bcode_session_models::ToolContributionPlacement::Progress,
+                bcode_session_models::ToolContributionEvent {
+                    invocation_id: "call-live-shell".to_owned(),
+                    contribution_id: "call-live-shell-recording".to_owned(),
+                    sequence: 2,
+                    producer_id: "bcode.shell".to_owned(),
+                    schema: "bcode.shell.run".to_owned(),
+                    schema_version: 1,
+                    operation: bcode_session_models::ToolContributionOperation::Upsert,
+                    persistence: bcode_session_models::ToolContributionPersistence::Transient,
+                    artifact: Some(bcode_session_models::ToolContributionArtifact {
+                        artifact_id: "call-live-shell-shell-run".to_owned(),
+                        reference_key: "shell_recording".to_owned(),
+                        content_type: Some(
+                            "application/x-bcode-shell-recording; version=3".to_owned(),
+                        ),
+                        storage_uri: String::new(),
+                        committed_bytes: u64::try_from(bytes.len()).expect("recording length"),
+                        revision: 2,
+                        finalized: false,
+                        availability: None,
+                    }),
+                    payload: serde_json::json!({"mode": "terminal", "timeout_ms": 30_000}),
+                },
+            ),
         },
     };
     assert!(

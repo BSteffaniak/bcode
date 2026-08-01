@@ -366,7 +366,8 @@ fn execute_workflow_command_plan(
         if context.cancellation.is_cancelled() {
             commands.push(cancelled_workflow_command_result(
                 index,
-                command_accepted_exit_codes(plan.version, command),
+                (plan.version == contracts::SHELL_COMMAND_PLAN_VERSION)
+                    .then(|| command_accepted_exit_codes(plan.version, command)),
             ));
             break;
         }
@@ -391,12 +392,15 @@ fn execute_workflow_command_plan(
     }
     let _ = progress.finish();
     let passed = commands.len() == plan.commands.len()
-        && commands.iter().all(|result| {
-            result.status == ShellWorkflowCommandStatus::Exited
-                && result
-                    .exit_code
-                    .is_some_and(|exit_code| result.accepted_exit_codes.contains(&exit_code))
-        });
+        && commands
+            .iter()
+            .zip(&plan.commands)
+            .all(|(result, command)| {
+                result.status == ShellWorkflowCommandStatus::Exited
+                    && result.exit_code.is_some_and(|exit_code| {
+                        command_accepted_exit_codes(plan.version, command).contains(&exit_code)
+                    })
+            });
     Ok(ShellWorkflowCommandPlanResult {
         version: plan.version,
         passed,
@@ -526,7 +530,8 @@ fn execute_workflow_command(
                     index: u32::try_from(index).map_err(|error| error.to_string())?,
                     status: ShellWorkflowCommandStatus::SpawnFailed,
                     exit_code: None,
-                    accepted_exit_codes,
+                    accepted_exit_codes: (plan.version == contracts::SHELL_COMMAND_PLAN_VERSION)
+                        .then_some(accepted_exit_codes),
                     signal: None,
                     duration_ms: elapsed_millis(started),
                     stdout_preview: String::new(),
@@ -579,7 +584,8 @@ fn execute_workflow_command(
                 ShellWorkflowCommandStatus::Exited
             },
             exit_code: outcome.exit_code,
-            accepted_exit_codes,
+            accepted_exit_codes: (plan.version == contracts::SHELL_COMMAND_PLAN_VERSION)
+                .then_some(accepted_exit_codes),
             signal: None,
             duration_ms: outcome.duration_ms,
             stdout_preview,
@@ -641,7 +647,7 @@ fn write_workflow_output_artifact(
 
 fn cancelled_workflow_command_result(
     index: usize,
-    accepted_exit_codes: Vec<i32>,
+    accepted_exit_codes: Option<Vec<i32>>,
 ) -> ShellWorkflowCommandResult {
     ShellWorkflowCommandResult {
         index: u32::try_from(index).unwrap_or(u32::MAX),
@@ -2286,7 +2292,7 @@ mod tests {
         assert!(result.passed);
         assert_eq!(result.version, contracts::SHELL_COMMAND_PLAN_VERSION);
         assert_eq!(result.commands[0].exit_code, Some(7));
-        assert_eq!(result.commands[0].accepted_exit_codes, [0, 7]);
+        assert_eq!(result.commands[0].accepted_exit_codes, Some(vec![0, 7]));
 
         plan.commands = vec![
             command("exit 8", Some(vec![7]), true),
@@ -2303,7 +2309,7 @@ mod tests {
         .expect("continued result");
         assert!(!continued.passed);
         assert_eq!(continued.commands.len(), 2);
-        assert_eq!(continued.commands[0].accepted_exit_codes, [7]);
+        assert_eq!(continued.commands[0].accepted_exit_codes, Some(vec![7]));
     }
 
     #[cfg(unix)]
@@ -2334,6 +2340,13 @@ mod tests {
         )
         .expect("result");
         assert!(!result.passed);
+        assert_eq!(result.version, contracts::SHELL_COMMAND_PLAN_VERSION_1);
+        assert!(
+            result
+                .commands
+                .iter()
+                .all(|command| command.accepted_exit_codes.is_none())
+        );
         assert_eq!(result.commands.len(), 2);
         assert_eq!(result.commands[0].exit_code, Some(7));
         assert_eq!(result.commands[0].stdout_preview, "firs");
@@ -2549,7 +2562,7 @@ mod tests {
                 index: 0,
                 status: ShellWorkflowCommandStatus::Exited,
                 exit_code: Some(7),
-                accepted_exit_codes: vec![0],
+                accepted_exit_codes: Some(vec![0]),
                 signal: None,
                 duration_ms: 1,
                 stdout_preview: String::new(),

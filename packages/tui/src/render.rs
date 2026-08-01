@@ -145,7 +145,6 @@ pub fn prepare_frame_with_bottom_dock(
     area: Rect,
     dock_height: u16,
 ) -> Option<(FrameLayout, Rect)> {
-    app.sync_projected_items();
     let layout = frame_layout(app, area)?;
     app.set_composer_content_area(layout.composer_content);
     let (layout, dock) = layout.with_bottom_dock(app, dock_height);
@@ -168,8 +167,10 @@ pub fn render_prepared(app: &mut BmuxApp, frame: &mut Frame<'_>, layout: FrameLa
         return;
     }
 
-    app.transcript_markdown_cache()
-        .retain_resident(app.transcript(), app.transcript_projection_revision());
+    app.transcript_markdown_cache().retain_resident_iter(
+        app.transcript().iter(),
+        app.transcript_projection_revision(),
+    );
     let theme = TuiTheme::for_app(app);
     render_header(app, layout.header, frame, theme);
     render_composer(app, layout.composer, frame, theme);
@@ -331,7 +332,7 @@ fn details_state_survives_reconstruction_resize_and_cache_reuse_then_drops_on_re
         TextFormat::Markdown,
     );
     let replacement_ids =
-        transcript_markdown_details_ids_for_items(&app, std::slice::from_ref(&replacement), 24);
+        transcript_markdown_details_ids_for_items(&app, std::iter::once(&replacement), 24);
     app.reconcile_markdown_details(&replacement_ids);
     assert!(!app.markdown_details_open().contains_key(&details_id));
 }
@@ -1133,16 +1134,15 @@ fn transcript_markdown_details_ids(
     app: &BmuxApp,
     width: u16,
 ) -> std::collections::BTreeSet<String> {
-    transcript_markdown_details_ids_for_items(app, app.transcript(), width)
+    transcript_markdown_details_ids_for_items(app, app.transcript().iter(), width)
 }
 
-fn transcript_markdown_details_ids_for_items(
+fn transcript_markdown_details_ids_for_items<'a>(
     app: &BmuxApp,
-    items: &[TranscriptItem],
+    items: impl Iterator<Item = &'a TranscriptItem>,
     width: u16,
 ) -> std::collections::BTreeSet<String> {
     items
-        .iter()
         .filter(|item| item.text_format() == TextFormat::Markdown)
         .flat_map(|item| {
             transcript_markdown_projection(app, item, width)
@@ -1506,6 +1506,19 @@ fn markdown_hit_regions_follow_scroll_resize_and_replacement() {
     }));
 }
 
+pub fn transcript_item_rows_from_item(
+    item: &TranscriptItem,
+    width: u16,
+    plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
+    diff_viewer_config: TuiDiffViewerConfig,
+) -> Vec<Line> {
+    DIFF_VIEWER_CONFIG.with(|config| config.set(diff_viewer_config));
+    let mut rows = Vec::new();
+    push_transcript_item_rows(&mut rows, item, width, plugin_host);
+    rows
+}
+
+#[cfg(test)]
 pub fn transcript_item_rows(
     transcript: &[TranscriptItem],
     index: usize,
@@ -1513,10 +1526,7 @@ pub fn transcript_item_rows(
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
     diff_viewer_config: TuiDiffViewerConfig,
 ) -> Vec<Line> {
-    DIFF_VIEWER_CONFIG.with(|config| config.set(diff_viewer_config));
-    let mut rows = Vec::new();
-    push_transcript_item_rows(&mut rows, transcript, index, width, plugin_host);
-    rows
+    transcript_item_rows_from_item(&transcript[index], width, plugin_host, diff_viewer_config)
 }
 
 pub fn pending_submission_rows(pending: &PendingSubmission, width: u16) -> Vec<Line> {
@@ -1596,12 +1606,10 @@ pub fn pending_submission_signature(
 #[allow(clippy::too_many_lines)]
 fn push_transcript_item_rows(
     rows: &mut Vec<Line>,
-    transcript: &[TranscriptItem],
-    index: usize,
+    item: &TranscriptItem,
     width: u16,
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
 ) {
-    let item = &transcript[index];
     if let Some(integrity) = item.stream_integrity() {
         let message = match integrity {
             TranscriptStreamIntegrity::Incomplete => {

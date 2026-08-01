@@ -2,7 +2,7 @@
 
 use bmux_tui::geometry::Rect;
 
-use super::app::BmuxApp;
+use super::app::{BmuxApp, TranscriptItems};
 use super::pending_submission::PendingSubmission;
 use super::render;
 use super::transcript::TranscriptItem;
@@ -81,9 +81,8 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
             &transcript_dirty_items,
             |index| transcript_item_signature(&input.transcript[index], &input),
             |index| {
-                render::transcript_item_rows(
-                    input.transcript,
-                    index,
+                render::transcript_item_rows_from_item(
+                    &input.transcript[index],
                     input.width,
                     input.plugin_host,
                     input.diff_viewer_config,
@@ -109,9 +108,8 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
             &dirty_visuals,
             |index| transcript_item_signature(&input.transcript[index], &input),
             |index| {
-                render::transcript_item_rows(
-                    input.transcript,
-                    index,
+                render::transcript_item_rows_from_item(
+                    &input.transcript[index],
                     input.width,
                     input.plugin_host,
                     input.diff_viewer_config,
@@ -129,9 +127,8 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
         pending_len: input.pending.len(),
         transcript_signature: |index| transcript_item_signature(&input.transcript[index], &input),
         transcript_rows: |index| {
-            render::transcript_item_rows(
-                input.transcript,
-                index,
+            render::transcript_item_rows_from_item(
+                &input.transcript[index],
                 input.width,
                 input.plugin_host,
                 input.diff_viewer_config,
@@ -160,7 +157,7 @@ fn sync_layout(app: &mut BmuxApp, width: u16) {
 
 struct TranscriptLayoutInput<'a> {
     width: u16,
-    transcript: &'a [TranscriptItem],
+    transcript: TranscriptItems<'a>,
     plugin_host: Option<&'a crate::plugin_tui::PluginTuiPresentation>,
     diff_viewer_config: TuiDiffViewerConfig,
     pending: &'a [PendingSubmission],
@@ -239,7 +236,7 @@ pub fn test_layout_signature(
     let pending = [];
     let input = TranscriptLayoutInput {
         width,
-        transcript: &transcript,
+        transcript: TranscriptItems::new(&transcript, &[]),
         plugin_host,
         diff_viewer_config: TuiDiffViewerConfig::default(),
         pending: &pending,

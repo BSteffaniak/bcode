@@ -426,10 +426,15 @@ impl ArtifactStreamCoordinator {
                 self.stats.stale_completions = self.stats.stale_completions.saturating_add(1);
                 return false;
             }
-            state.fetching = false;
             let Some(target) = state.target.clone() else {
                 return false;
             };
+            if completion.target_revision != target.revision {
+                state.fetching = false;
+                self.stats.stale_completions = self.stats.stale_completions.saturating_add(1);
+                return false;
+            }
+            state.fetching = false;
             let range = match completion.result {
                 Ok(range) => range,
                 Err(error) => {
@@ -952,7 +957,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn in_flight_live_fetch_accepts_a_newer_committed_revision() {
+    async fn in_flight_live_fetch_rejects_a_newer_committed_revision() {
         let mut coordinator = ArtifactStreamCoordinator::new(BcodeClient::default_endpoint());
         let session_id = SessionId::new();
         let key = (
@@ -977,22 +982,21 @@ mod tests {
             target_revision: 2,
             result: Ok(range(0, 20, 3, b"abcdefghij")),
         };
+        let mut delivered = false;
         assert!(
-            coordinator.handle_completion(Some(session_id), completion, |chunk| {
-                assert_eq!(chunk.total_bytes, 20);
-                assert_eq!(chunk.revision, 3);
-                assert_eq!(chunk.bytes, b"abcdefghij");
+            !coordinator.handle_completion(Some(session_id), completion, |_| {
+                delivered = true;
                 Ok(true)
             })
         );
-        assert_eq!(
-            coordinator
-                .artifact_fetches
-                .get(&key)
-                .expect("artifact state")
-                .next_offset,
-            10
-        );
+        assert!(!delivered);
+        let state = coordinator
+            .artifact_fetches
+            .get(&key)
+            .expect("artifact state");
+        assert_eq!(state.next_offset, 0);
+        assert!(!state.fetching);
+        assert_eq!(coordinator.stats.stale_completions, 1);
     }
 
     #[test]

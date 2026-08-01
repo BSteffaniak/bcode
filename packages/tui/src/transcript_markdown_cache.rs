@@ -84,7 +84,11 @@ impl TranscriptMarkdownCache {
     }
 
     /// Remove stale projections once after the transcript document changes.
-    pub fn retain_resident(&self, resident_items: &[TranscriptItem], transcript_revision: u64) {
+    pub fn retain_resident_iter<'a>(
+        &self,
+        resident_items: impl Iterator<Item = &'a TranscriptItem>,
+        transcript_revision: u64,
+    ) {
         if self
             .retained_revision
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -93,7 +97,6 @@ impl TranscriptMarkdownCache {
             return;
         }
         let resident_revisions = resident_items
-            .iter()
             .map(|item| (item.id().get(), item.revision()))
             .collect::<BTreeMap<_, _>>();
         self.entries

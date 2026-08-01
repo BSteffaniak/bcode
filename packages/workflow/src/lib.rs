@@ -2872,8 +2872,13 @@ impl WorkflowAuthoringCatalogSnapshot {
         }
         for (key, definition) in &self.workflow_definitions {
             definition.validate()?;
-            let identity =
-                WorkflowDefinitionIdentity::for_definition(definition.name.clone(), definition)?;
+            let (kind, _) = key.rsplit_once('@').ok_or_else(|| {
+                authoring_error(
+                    "catalog.workflow_definitions",
+                    format!("catalog definition key '{key}' is not an exact content identity"),
+                )
+            })?;
+            let identity = WorkflowDefinitionIdentity::for_definition(kind, definition)?;
             if key != &identity.definition_id {
                 return Err(authoring_error(
                     "catalog.workflow_definitions",
@@ -8823,6 +8828,39 @@ mod tests {
             agent_profiles: BTreeSet::from(["build".to_string(), "review".to_string()]),
             skills: BTreeSet::new(),
         }
+    }
+
+    #[test]
+    fn authoring_catalog_validates_definition_identity_from_stored_logical_kind() {
+        let mut catalog = authoring_catalog();
+        let definition = authored_document().definition;
+        let identity = WorkflowDefinitionIdentity::for_definition("authored/example", &definition)
+            .expect("identity");
+        catalog
+            .workflow_definitions
+            .insert(identity.definition_id, definition);
+
+        catalog.validate().expect("catalog");
+    }
+
+    #[test]
+    fn authoring_catalog_rejects_definition_key_with_stale_content_digest() {
+        let mut catalog = authoring_catalog();
+        let definition = authored_document().definition;
+        let identity = WorkflowDefinitionIdentity::for_definition("authored/example", &definition)
+            .expect("identity");
+        let mut changed = definition;
+        changed.name = "changed".to_string();
+        catalog
+            .workflow_definitions
+            .insert(identity.definition_id, changed);
+
+        let error = catalog.validate().expect_err("stale identity");
+        assert!(
+            error
+                .to_string()
+                .contains("does not match exact content identity")
+        );
     }
 
     fn authored_mutating_block_document() -> (
