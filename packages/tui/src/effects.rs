@@ -913,6 +913,19 @@ impl TuiEffectQueue {
         })
     }
 
+    /// Return the projection request queued for one open session.
+    #[cfg(test)]
+    pub fn open_session_request(&self, session_id: SessionId) -> Option<&ProjectionWindowRequest> {
+        self.effects.values().find_map(|(_, effect)| match effect {
+            TuiEffect::OpenSession {
+                session_id: queued,
+                initial_window_request,
+                ..
+            } if *queued == session_id => Some(initial_window_request),
+            _ => None,
+        })
+    }
+
     /// Drain queued effects.
     fn drain(&mut self) -> Vec<(EffectSchedule, TuiEffect)> {
         std::mem::take(&mut self.effects).into_values().collect()

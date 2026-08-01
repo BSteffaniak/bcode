@@ -3687,6 +3687,7 @@ mod scheduler_tests {
             event_task: None,
             opening_session_id: None,
             opening_session_progress: None,
+            opening_session_anchor_sequence: None,
             pending_effects: super::super::effects::TuiEffectQueue::default(),
         }
     }

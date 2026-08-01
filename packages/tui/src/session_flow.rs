@@ -40,6 +40,7 @@ pub struct ActiveChat {
     pub event_task: Option<JoinHandle<()>>,
     pub opening_session_id: Option<SessionId>,
     pub opening_session_progress: Option<bcode_session_models::SessionOpenOperationSnapshot>,
+    pub opening_session_anchor_sequence: Option<u64>,
     pub pending_effects: super::effects::TuiEffectQueue,
 }
 
@@ -177,6 +178,34 @@ pub fn start_switch_session(
     next_session_id: SessionId,
     initial_window_request: bcode_session_models::ProjectionWindowRequest,
 ) {
+    start_switch_session_at_sequence(chat, next_session_id, initial_window_request, None);
+}
+
+/// Start asynchronously opening the canonical transcript window around a hydrated search hit.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn start_switch_session_from_search_hit(
+    chat: &mut ActiveChat,
+    hydrated: &bcode_session_search::HydratedSessionSearchHit,
+    mut initial_window_request: bcode_session_models::ProjectionWindowRequest,
+) -> Result<(), super::session_search_effect::SessionSearchNavigationUnavailable> {
+    let target = super::session_search_effect::canonical_navigation_target(hydrated)?;
+    initial_window_request.anchor =
+        bcode_session_models::ProjectionWindowAnchor::AroundSequence(target.sequence);
+    start_switch_session_at_sequence(
+        chat,
+        target.session_id,
+        initial_window_request,
+        Some(target.sequence),
+    );
+    Ok(())
+}
+
+fn start_switch_session_at_sequence(
+    chat: &mut ActiveChat,
+    next_session_id: SessionId,
+    initial_window_request: bcode_session_models::ProjectionWindowRequest,
+    anchor_sequence: Option<u64>,
+) {
     if let Some(event_task) = chat.event_task.take() {
         event_task.abort();
     }
@@ -184,6 +213,7 @@ pub fn start_switch_session(
     let draft_text = chat.app.composer().text().to_owned();
     chat.opening_session_id = Some(next_session_id);
     chat.opening_session_progress = None;
+    chat.opening_session_anchor_sequence = anchor_sequence;
     chat.session_id = None;
     let previous_app = std::mem::replace(
         &mut chat.app,
@@ -220,6 +250,7 @@ pub fn complete_switch_session(
     }
     chat.opening_session_id = None;
     chat.opening_session_progress = None;
+    let anchor_sequence = chat.opening_session_anchor_sequence.take();
     match result {
         Ok((attached, next_task)) => {
             let draft_text = chat.app.composer().text().to_owned();
@@ -248,6 +279,16 @@ pub fn complete_switch_session(
                 .apply_runtime_selection(attached.runtime_selection.clone());
             chat.app
                 .set_status("session writable and attached".to_owned());
+            if let Some(sequence) = anchor_sequence {
+                if chat.app.transcript_index_for_sequence(sequence).is_some() {
+                    chat.app.request_transcript_top_anchor_sequence(sequence);
+                    chat.app.set_status("jumped to search result".to_owned());
+                } else {
+                    chat.app.set_status(format!(
+                        "search result seq {sequence} was not in the loaded canonical window"
+                    ));
+                }
+            }
             chat.replace_effect(super::effects::TuiEffect::LoadSessionStatus { session_id });
             chat.start_effect(super::effects::TuiEffect::ListPermissions);
         }
@@ -355,6 +396,7 @@ pub fn switch_to_draft_session(chat: &mut ActiveChat) {
     while chat.event_receiver.try_recv().is_ok() {}
     chat.opening_session_id = None;
     chat.opening_session_progress = None;
+    chat.opening_session_anchor_sequence = None;
     chat.session_id = None;
     let current_agent_id = chat.app.current_agent_id().to_owned();
     let previous_app = std::mem::replace(

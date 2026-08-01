@@ -530,6 +530,7 @@ mod tests {
             event_task: None,
             opening_session_id: Some(session_id),
             opening_session_progress: None,
+            opening_session_anchor_sequence: None,
             pending_effects: super::super::effects::TuiEffectQueue::default(),
         };
         chat.app.replace_composer_with("message after migration");

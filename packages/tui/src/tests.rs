@@ -1820,6 +1820,7 @@ fn new_draft_preserves_selected_agent() {
         event_task: None,
         opening_session_id: None,
         opening_session_progress: None,
+        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.set_current_agent_id("plan");
@@ -1959,6 +1960,7 @@ fn leaving_opening_session_keeps_detached_observer_stale_and_allows_reselection(
             outcome: None,
             backup_path: None,
         }),
+        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     let request = super::session_flow::initial_transcript_window_request(Rect::new(0, 0, 80, 24));
@@ -1992,6 +1994,90 @@ fn leaving_opening_session_keeps_detached_observer_stale_and_allows_reselection(
 }
 
 #[tokio::test]
+async fn hydrated_search_hit_opens_canonical_around_sequence_window_and_anchors_result() {
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let session_id = SessionId::new();
+    let mut chat = super::session_flow::ActiveChat {
+        app: BmuxApp::new_with_history(None, &[], &[], false),
+        agents: super::session_flow::AgentCatalog::default(),
+        session_id: None,
+        event_sender: sender,
+        event_receiver: receiver,
+        event_task: None,
+        opening_session_id: None,
+        opening_session_progress: None,
+        opening_session_anchor_sequence: None,
+        pending_effects: super::effects::TuiEffectQueue::default(),
+    };
+    let canonical_event = event(
+        session_id,
+        7,
+        SessionEventKind::AssistantMessage {
+            text: "canonical search result".to_owned(),
+        },
+    );
+    let hydrated = bcode_session_search::HydratedSessionSearchHit {
+        hit: bcode_session_search::SessionSearchHit {
+            locator: bcode_session_search::SessionSearchLocator {
+                session_id,
+                sequence: 7,
+                record_id: Some("search-result".to_owned()),
+            },
+            content_kind: bcode_session_search::SearchContentKind::AssistantMessage,
+            matched_field: bcode_session_search::SearchField::Text,
+            provider_id: "provider".to_owned(),
+            provider_rank: 1,
+            provider_score: None,
+            preview: Some("provider preview".to_owned()),
+            preview_truncated: false,
+        },
+        outcome: bcode_session_search::SearchHitHydrationOutcome::Hydrated,
+        event: Some(Box::new(canonical_event.clone())),
+        message: None,
+    };
+    let request = super::session_flow::initial_transcript_window_request(Rect::new(0, 0, 80, 24));
+
+    super::session_flow::start_switch_session_from_search_hit(&mut chat, &hydrated, request)
+        .expect("hydrated search hit navigates");
+    assert_eq!(chat.opening_session_id, Some(session_id));
+    assert_eq!(chat.opening_session_anchor_sequence, Some(7));
+    let initial_window_request = chat
+        .pending_effects
+        .open_session_request(session_id)
+        .expect("canonical open effect");
+    assert_eq!(
+        initial_window_request.anchor,
+        bcode_session_models::ProjectionWindowAnchor::AroundSequence(7)
+    );
+
+    let (_event_sender, event_receiver) = tokio::sync::broadcast::channel::<SessionEvent>(1);
+    super::session_flow::complete_switch_session(
+        &mut chat,
+        session_id,
+        true,
+        Ok((
+            AttachedSessionHistory {
+                session: session_summary(session_id),
+                history: vec![canonical_event],
+                input_history: Vec::new(),
+                import_warnings: Vec::new(),
+                draft: None,
+                runtime_selection: bcode_ipc::SessionRuntimeSelection::default(),
+                projection_window: None,
+            },
+            tokio::spawn(async move {
+                drop(event_receiver);
+            }),
+        )),
+    );
+
+    assert_eq!(chat.session_id, Some(session_id));
+    assert_eq!(chat.opening_session_anchor_sequence, None);
+    assert_eq!(chat.app.status(), "jumped to search result");
+    assert!(chat.app.transcript_index_for_sequence(7).is_some());
+}
+
+#[tokio::test]
 async fn async_session_open_preserves_typed_draft() {
     let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
     let session_id = SessionId::new();
@@ -2004,6 +2090,7 @@ async fn async_session_open_preserves_typed_draft() {
         event_task: None,
         opening_session_id: Some(session_id),
         opening_session_progress: None,
+        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.replace_composer_with("draft while opening");
@@ -2057,6 +2144,7 @@ async fn async_session_open_initial_state_preserves_existing_draft() {
         event_task: None,
         opening_session_id: None,
         opening_session_progress: None,
+        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.replace_composer_with("draft before opening");
@@ -2098,6 +2186,7 @@ async fn async_session_open_failure_clears_progress_and_remains_visible() {
             outcome: None,
             backup_path: None,
         }),
+        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
 
@@ -2129,6 +2218,7 @@ async fn async_session_open_initial_state_preserves_plugin_host() {
         event_task: None,
         opening_session_id: None,
         opening_session_progress: None,
+        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));
@@ -2155,6 +2245,7 @@ async fn async_session_open_completion_preserves_plugin_host() {
         event_task: None,
         opening_session_id: Some(session_id),
         opening_session_progress: None,
+        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));
@@ -2197,6 +2288,7 @@ fn switch_to_draft_session_preserves_plugin_host() {
         event_task: None,
         opening_session_id: None,
         opening_session_progress: None,
+        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));
@@ -2219,6 +2311,7 @@ async fn session_open_preserved_plugin_host_renders_live_request_contribution() 
         event_task: None,
         opening_session_id: None,
         opening_session_progress: None,
+        opening_session_anchor_sequence: None,
         pending_effects: super::effects::TuiEffectQueue::default(),
     };
     chat.app.set_plugin_host(Arc::new(filesystem_plugin_host()));

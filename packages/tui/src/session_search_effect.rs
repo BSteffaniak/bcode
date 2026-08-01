@@ -1,5 +1,6 @@
 //! Asynchronous portable session-search effect state for TUI adapters.
 
+use std::future::Future;
 use std::time::Duration;
 
 /// Default debounce applied before dispatching a changed transcript query.
@@ -99,6 +100,79 @@ impl SessionSearchCompletion {
     }
 }
 
+/// Canonical target accepted for navigation from one hydrated provider hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionSearchNavigationTarget {
+    /// Canonical session containing the hydrated event.
+    pub session_id: bcode_session_models::SessionId,
+    /// Exact canonical event sequence used as the surrounding-window anchor.
+    pub sequence: u64,
+}
+
+/// Why a provider hit cannot currently navigate to canonical history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionSearchNavigationUnavailable {
+    /// The provider locator no longer identifies canonical history.
+    StaleLocator,
+    /// The canonical session was deleted after provider indexing.
+    SessionMissing,
+    /// Canonical state requires explicit repair before navigation.
+    RepairRequired,
+    /// Canonical state uses an unsupported version.
+    Incompatible,
+    /// Canonical history is temporarily unavailable.
+    Unavailable,
+    /// A nominally hydrated response omitted or mismatched the canonical event.
+    InvalidHydration,
+}
+
+/// Accept a search hit for navigation only when exact canonical hydration still matches its locator.
+///
+/// The returned target is suitable for the existing bounded around-sequence/timeline-window path.
+/// Provider previews and provider locators alone never authorize transcript navigation.
+///
+/// # Errors
+///
+/// Returns the canonical hydration condition that prevents navigation, including stale/deleted,
+/// damaged, unavailable, missing-event, or locator-mismatch state.
+pub fn canonical_navigation_target(
+    hydrated: &bcode_session_search::HydratedSessionSearchHit,
+) -> Result<SessionSearchNavigationTarget, SessionSearchNavigationUnavailable> {
+    use bcode_session_search::SearchHitHydrationOutcome;
+
+    match hydrated.outcome {
+        SearchHitHydrationOutcome::Hydrated => {
+            let Some(event) = hydrated.event.as_deref() else {
+                return Err(SessionSearchNavigationUnavailable::InvalidHydration);
+            };
+            if event.session_id != hydrated.hit.locator.session_id
+                || event.sequence != hydrated.hit.locator.sequence
+            {
+                return Err(SessionSearchNavigationUnavailable::InvalidHydration);
+            }
+            Ok(SessionSearchNavigationTarget {
+                session_id: event.session_id,
+                sequence: event.sequence,
+            })
+        }
+        SearchHitHydrationOutcome::StaleLocator => {
+            Err(SessionSearchNavigationUnavailable::StaleLocator)
+        }
+        SearchHitHydrationOutcome::SessionMissing => {
+            Err(SessionSearchNavigationUnavailable::SessionMissing)
+        }
+        SearchHitHydrationOutcome::RepairRequired => {
+            Err(SessionSearchNavigationUnavailable::RepairRequired)
+        }
+        SearchHitHydrationOutcome::Incompatible => {
+            Err(SessionSearchNavigationUnavailable::Incompatible)
+        }
+        SearchHitHydrationOutcome::Unavailable => {
+            Err(SessionSearchNavigationUnavailable::Unavailable)
+        }
+    }
+}
+
 /// Owns one replaceable debounced TUI search task.
 #[derive(Debug, Default)]
 pub struct SessionSearchEffect {
@@ -126,15 +200,38 @@ impl SessionSearchEffect {
         hydrate: bool,
         completion_tx: tokio::sync::mpsc::UnboundedSender<SessionSearchCompletion>,
     ) -> u64 {
+        self.replace_with(
+            move || async move {
+                client
+                    .session_search(request, policy, routes, hydrate)
+                    .await
+                    .ok()
+            },
+            completion_tx,
+        )
+    }
+
+    fn replace_with<Dispatch, DispatchFuture>(
+        &mut self,
+        dispatch: Dispatch,
+        completion_tx: tokio::sync::mpsc::UnboundedSender<SessionSearchCompletion>,
+    ) -> u64
+    where
+        Dispatch: FnOnce() -> DispatchFuture + Send + 'static,
+        DispatchFuture: Future<
+                Output = Option<(
+                    bcode_session_search::FederatedSessionSearchResponse,
+                    Vec<bcode_session_search::HydratedSessionSearchHit>,
+                )>,
+            > + Send
+            + 'static,
+    {
         self.cancel();
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
         self.task = Some(tokio::spawn(async move {
             tokio::time::sleep(SESSION_SEARCH_DEBOUNCE).await;
-            if let Ok((response, hydrated_hits)) = client
-                .session_search(request, policy, routes, hydrate)
-                .await
-            {
+            if let Some((response, hydrated_hits)) = dispatch().await {
                 let _ = completion_tx.send(SessionSearchCompletion {
                     generation,
                     response,
@@ -184,6 +281,101 @@ mod tests {
             },
             hydrated_hits: Vec::new(),
         }
+    }
+
+    fn hydrated_hit(
+        outcome: bcode_session_search::SearchHitHydrationOutcome,
+        include_event: bool,
+    ) -> bcode_session_search::HydratedSessionSearchHit {
+        let session_id = bcode_session_models::SessionId::new();
+        let hit = bcode_session_search::SessionSearchHit {
+            locator: bcode_session_search::SessionSearchLocator {
+                session_id,
+                sequence: 7,
+                record_id: Some("navigation".to_owned()),
+            },
+            content_kind: bcode_session_search::SearchContentKind::UserMessage,
+            matched_field: bcode_session_search::SearchField::Text,
+            provider_id: "provider".to_owned(),
+            provider_rank: 1,
+            provider_score: None,
+            preview: Some("provider preview".to_owned()),
+            preview_truncated: false,
+        };
+        bcode_session_search::HydratedSessionSearchHit {
+            hit,
+            outcome,
+            event: include_event.then(|| {
+                Box::new(bcode_session_models::SessionEvent {
+                    schema_version: bcode_session_models::CURRENT_SESSION_EVENT_SCHEMA_VERSION,
+                    sequence: 7,
+                    timestamp_ms: 99,
+                    session_id,
+                    provenance: None,
+                    kind: bcode_session_models::SessionEventKind::UserMessage {
+                        client_id: bcode_session_models::ClientId::new(),
+                        text: "canonical".to_owned(),
+                        admission: bcode_session_models::TurnAdmissionMetadata::default(),
+                    },
+                })
+            }),
+            message: None,
+        }
+    }
+
+    #[test]
+    fn navigation_accepts_only_exact_canonical_hydration() {
+        let hydrated = hydrated_hit(
+            bcode_session_search::SearchHitHydrationOutcome::Hydrated,
+            true,
+        );
+        let target = canonical_navigation_target(&hydrated).expect("canonical target");
+        assert_eq!(target.session_id, hydrated.hit.locator.session_id);
+        assert_eq!(target.sequence, hydrated.hit.locator.sequence);
+
+        let mut mismatched = hydrated;
+        mismatched.event.as_mut().expect("event").sequence += 1;
+        assert_eq!(
+            canonical_navigation_target(&mismatched),
+            Err(SessionSearchNavigationUnavailable::InvalidHydration)
+        );
+    }
+
+    #[test]
+    fn deleted_changed_and_degraded_hits_cannot_navigate() {
+        use bcode_session_search::SearchHitHydrationOutcome;
+
+        for (outcome, expected) in [
+            (
+                SearchHitHydrationOutcome::StaleLocator,
+                SessionSearchNavigationUnavailable::StaleLocator,
+            ),
+            (
+                SearchHitHydrationOutcome::SessionMissing,
+                SessionSearchNavigationUnavailable::SessionMissing,
+            ),
+            (
+                SearchHitHydrationOutcome::RepairRequired,
+                SessionSearchNavigationUnavailable::RepairRequired,
+            ),
+            (
+                SearchHitHydrationOutcome::Incompatible,
+                SessionSearchNavigationUnavailable::Incompatible,
+            ),
+            (
+                SearchHitHydrationOutcome::Unavailable,
+                SessionSearchNavigationUnavailable::Unavailable,
+            ),
+        ] {
+            assert_eq!(
+                canonical_navigation_target(&hydrated_hit(outcome, false)),
+                Err(expected)
+            );
+        }
+        assert_eq!(
+            canonical_navigation_target(&hydrated_hit(SearchHitHydrationOutcome::Hydrated, false,)),
+            Err(SessionSearchNavigationUnavailable::InvalidHydration)
+        );
     }
 
     #[test]
@@ -322,6 +514,54 @@ mod tests {
         let accepted = effect.accept(disabled).expect("latest disabled result");
         assert!(accepted.response.providers.is_empty());
         assert!(!accepted.response.query_complete);
+    }
+
+    #[tokio::test]
+    async fn rapid_replacement_dispatches_only_latest_query_after_debounce() {
+        let (completion_tx, mut completion_rx) = tokio::sync::mpsc::unbounded_channel();
+        let first_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let latest_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut effect = SessionSearchEffect::default();
+
+        let dispatches = std::sync::Arc::clone(&first_dispatches);
+        let first_generation = effect.replace_with(
+            move || {
+                dispatches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Some((completion(0).response, Vec::new())))
+            },
+            completion_tx.clone(),
+        );
+        tokio::time::sleep(SESSION_SEARCH_DEBOUNCE / 2).await;
+        let dispatches = std::sync::Arc::clone(&latest_dispatches);
+        let latest_generation = effect.replace_with(
+            move || {
+                dispatches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Some((completion(0).response, Vec::new())))
+            },
+            completion_tx,
+        );
+
+        tokio::time::timeout(SESSION_SEARCH_DEBOUNCE * 2, async {
+            loop {
+                if let Some(completion) = completion_rx.recv().await
+                    && completion.generation == latest_generation
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("latest replacement completes after debounce");
+        assert!(latest_generation > first_generation);
+        assert_eq!(
+            first_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(
+            latest_dispatches.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(completion_rx.try_recv().is_err());
     }
 
     #[tokio::test]

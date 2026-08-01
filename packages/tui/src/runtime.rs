@@ -154,6 +154,7 @@ async fn run_event_loop_with_input_and_static_bundled<W: Write>(
         event_task: None,
         opening_session_id: None,
         opening_session_progress: None,
+        opening_session_anchor_sequence: None,
         pending_effects: TuiEffectQueue::default(),
     };
     match config {
