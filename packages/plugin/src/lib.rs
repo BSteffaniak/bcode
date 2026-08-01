@@ -580,6 +580,10 @@ pub struct PluginVisualAdapterDeclaration {
 pub struct PluginToolPresentationDeclaration {
     /// Exact model-callable tool name owned by this plugin.
     pub tool_name: String,
+    /// Plugin-owned schema used to present a complete assembled request.
+    pub request_schema: String,
+    /// Version of `request_schema`.
+    pub request_schema_version: u32,
     /// Plugin-owned schema used to present streamed request arguments.
     pub request_draft_schema: String,
     /// Version of `request_draft_schema`.
@@ -616,12 +620,32 @@ fn validate_tool_presentation_declarations<'a>(
                     "the tool is declared more than once by this plugin",
                 ));
             }
+            if presentation.request_schema.trim().is_empty() {
+                return Err(invalid("request_schema must not be empty"));
+            }
+            if presentation.request_schema_version == 0 {
+                return Err(invalid("request_schema_version must be greater than zero"));
+            }
             if presentation.request_draft_schema.trim().is_empty() {
                 return Err(invalid("request_draft_schema must not be empty"));
             }
             if presentation.request_draft_schema_version == 0 {
                 return Err(invalid(
                     "request_draft_schema_version must be greater than zero",
+                ));
+            }
+            let request_adapter_matches = manifest.visual_adapters.iter().any(|adapter| {
+                adapter.schema == presentation.request_schema
+                    && adapter
+                        .min_schema_version
+                        .is_none_or(|minimum| presentation.request_schema_version >= minimum)
+                    && adapter
+                        .max_schema_version
+                        .is_none_or(|maximum| presentation.request_schema_version <= maximum)
+            });
+            if !request_adapter_matches {
+                return Err(invalid(
+                    "no visual adapter supports the declared request schema version",
                 ));
             }
             let adapter_matches = manifest.visual_adapters.iter().any(|adapter| {
@@ -2869,6 +2893,24 @@ impl PluginRegistry {
             .find(|surface| surface.kind == surface_kind)
     }
 
+    /// Return compatible visual adapter routes from highest to lowest default precedence.
+    #[must_use]
+    pub fn visual_adapters(
+        &self,
+        schema: &str,
+        schema_version: u32,
+        surface: &str,
+        producer_plugin_id: Option<&str>,
+    ) -> Vec<PluginVisualAdapterRoute> {
+        select_visual_adapters(
+            self.manifests.iter(),
+            schema,
+            schema_version,
+            surface,
+            producer_plugin_id,
+        )
+    }
+
     /// Return the highest-priority compatible visual adapter route for an artifact.
     #[must_use]
     pub fn visual_adapter(
@@ -2878,13 +2920,9 @@ impl PluginRegistry {
         surface: &str,
         producer_plugin_id: Option<&str>,
     ) -> Option<PluginVisualAdapterRoute> {
-        select_visual_adapter(
-            self.manifests.iter(),
-            schema,
-            schema_version,
-            surface,
-            producer_plugin_id,
-        )
+        self.visual_adapters(schema, schema_version, surface, producer_plugin_id)
+            .into_iter()
+            .next()
     }
 
     /// Return runtime policy metadata for a plugin service interface.
@@ -2912,17 +2950,25 @@ pub struct PluginVisualAdapterRoute {
     pub render_mode: PluginVisualAdapterRenderMode,
 }
 
-fn select_visual_adapter<'a, I>(
+impl PluginVisualAdapterRoute {
+    /// Return this route's stable user-facing adapter reference.
+    #[must_use]
+    pub fn adapter_reference(&self) -> String {
+        format!("{}/{}", self.plugin_id, self.adapter_id)
+    }
+}
+
+fn select_visual_adapters<'a, I>(
     manifests: I,
     schema: &str,
     schema_version: u32,
     surface: &str,
     producer_plugin_id: Option<&str>,
-) -> Option<PluginVisualAdapterRoute>
+) -> Vec<PluginVisualAdapterRoute>
 where
     I: Iterator<Item = (&'a String, &'a PluginManifest)>,
 {
-    manifests
+    let mut routes = manifests
         .flat_map(|(plugin_id, manifest)| {
             manifest
                 .visual_adapters
@@ -2936,14 +2982,25 @@ where
                     (plugin_id, adapter, producer_bonus)
                 })
         })
-        .max_by_key(|(plugin_id, adapter, producer_bonus)| {
-            (
-                adapter.priority,
-                *producer_bonus,
-                plugin_id.as_str(),
-                adapter.id.as_str(),
-            )
-        })
+        .collect::<Vec<_>>();
+    routes.sort_by(|left, right| {
+        let (left_plugin, left_adapter, left_producer_bonus) = left;
+        let (right_plugin, right_adapter, right_producer_bonus) = right;
+        (
+            right_adapter.priority,
+            right_producer_bonus,
+            right_plugin.as_str(),
+            right_adapter.id.as_str(),
+        )
+            .cmp(&(
+                left_adapter.priority,
+                left_producer_bonus,
+                left_plugin.as_str(),
+                left_adapter.id.as_str(),
+            ))
+    });
+    routes
+        .into_iter()
         .map(|(plugin_id, adapter, _)| PluginVisualAdapterRoute {
             plugin_id: plugin_id.clone(),
             adapter_id: adapter.id.clone(),
@@ -2954,6 +3011,7 @@ where
             producer_default: adapter.producer_default,
             render_mode: adapter.render_mode,
         })
+        .collect()
 }
 
 /// Runtime policy metadata for a declared plugin service.
@@ -3154,13 +3212,15 @@ impl PluginRuntimeHost {
         surface: &str,
         producer_plugin_id: Option<&str>,
     ) -> Option<PluginVisualAdapterRoute> {
-        select_visual_adapter(
+        select_visual_adapters(
             self.registry.manifests().iter(),
             schema,
             schema_version,
             surface,
             producer_plugin_id,
         )
+        .into_iter()
+        .next()
     }
 
     /// Return plugin executor status snapshots.
@@ -4103,6 +4163,55 @@ impl Default for PluginHost {
 }
 
 impl PluginHost {
+    /// Return whether one loaded plugin declares a service interface.
+    #[must_use]
+    pub fn has_service(&self, plugin_id: &str, interface_id: &str) -> bool {
+        self.loaded.iter().any(|plugin| {
+            plugin.manifest.id == plugin_id
+                && plugin
+                    .manifest
+                    .services
+                    .iter()
+                    .any(|service| service.interface_id == interface_id)
+        })
+    }
+
+    /// Return presentation metadata for an exact model-callable tool.
+    #[must_use]
+    pub fn tool_presentation(
+        &self,
+        tool_name: &str,
+    ) -> Option<(&str, &PluginToolPresentationDeclaration)> {
+        self.loaded.iter().find_map(|plugin| {
+            plugin
+                .manifest
+                .tool_presentations
+                .iter()
+                .find(|presentation| presentation.tool_name == tool_name)
+                .map(|presentation| (plugin.manifest.id.as_str(), presentation))
+        })
+    }
+
+    /// Return compatible visual adapter routes for loaded plugins.
+    #[must_use]
+    pub fn visual_adapters(
+        &self,
+        schema: &str,
+        schema_version: u32,
+        surface: &str,
+        producer_plugin_id: Option<&str>,
+    ) -> Vec<PluginVisualAdapterRoute> {
+        select_visual_adapters(
+            self.loaded
+                .iter()
+                .map(|plugin| (&plugin.manifest.id, &plugin.manifest)),
+            schema,
+            schema_version,
+            surface,
+            producer_plugin_id,
+        )
+    }
+
     /// Return the highest-priority compatible visual adapter route for a loaded plugin.
     #[must_use]
     pub fn visual_adapter(
@@ -4112,15 +4221,9 @@ impl PluginHost {
         surface: &str,
         producer_plugin_id: Option<&str>,
     ) -> Option<PluginVisualAdapterRoute> {
-        select_visual_adapter(
-            self.loaded
-                .iter()
-                .map(|plugin| (&plugin.manifest.id, &plugin.manifest)),
-            schema,
-            schema_version,
-            surface,
-            producer_plugin_id,
-        )
+        self.visual_adapters(schema, schema_version, surface, producer_plugin_id)
+            .into_iter()
+            .next()
     }
 
     /// Discover, load, and activate plugins from default roots.
@@ -5739,6 +5842,8 @@ library = "libexample_plugin.dylib"
         manifest.services[0].interface_id = bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned();
         manifest.tool_presentations = vec![PluginToolPresentationDeclaration {
             tool_name: "filesystem.write".to_owned(),
+            request_schema: "bcode.filesystem.request-draft.write".to_owned(),
+            request_schema_version: 1,
             request_draft_schema: String::new(),
             request_draft_schema_version: 1,
         }];
@@ -5758,6 +5863,8 @@ library = "libexample_plugin.dylib"
         manifest.services[0].interface_id = bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned();
         manifest.tool_presentations = vec![PluginToolPresentationDeclaration {
             tool_name: "filesystem.write".to_owned(),
+            request_schema: "bcode.filesystem.request-draft.write".to_owned(),
+            request_schema_version: 1,
             request_draft_schema: "bcode.filesystem.request-draft.write".to_owned(),
             request_draft_schema_version: 1,
         }];
@@ -5767,7 +5874,7 @@ library = "libexample_plugin.dylib"
         assert!(matches!(
             error,
             PluginLoadError::InvalidToolPresentation { reason, .. }
-                if reason == "no visual adapter supports the declared draft schema version"
+                if reason == "no visual adapter supports the declared request schema version"
         ));
     }
 
@@ -5788,6 +5895,8 @@ library = "libexample_plugin.dylib"
         });
         first.tool_presentations = vec![PluginToolPresentationDeclaration {
             tool_name: "duplicate.tool".to_owned(),
+            request_schema: "test.draft".to_owned(),
+            request_schema_version: 1,
             request_draft_schema: "test.draft".to_owned(),
             request_draft_schema_version: 1,
         }];
@@ -5808,6 +5917,8 @@ library = "libexample_plugin.dylib"
         let mut manifest = test_manifest("bcode.catalog-owner");
         manifest.tool_presentations = vec![PluginToolPresentationDeclaration {
             tool_name: "expected.tool".to_owned(),
+            request_schema: "test.draft".to_owned(),
+            request_schema_version: 1,
             request_draft_schema: "test.draft".to_owned(),
             request_draft_schema_version: 1,
         }];
@@ -7532,6 +7643,81 @@ library = "libexample_plugin.dylib"
         assert_eq!(templates.len(), 1);
         assert_eq!(templates[0].0, "bcode.enabled");
         assert_eq!(templates[0].1.template_id, "example");
+    }
+
+    #[test]
+    fn visual_adapter_candidates_preserve_default_precedence() {
+        let mut producer = test_manifest("bcode.producer");
+        producer
+            .visual_adapters
+            .push(PluginVisualAdapterDeclaration {
+                id: "producer".to_owned(),
+                schema: "test.visual".to_owned(),
+                min_schema_version: Some(1),
+                max_schema_version: Some(1),
+                service_interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned(),
+                surfaces: vec!["tui".to_owned()],
+                priority: 10,
+                producer_default: true,
+                render_mode: PluginVisualAdapterRenderMode::TranscriptBlock,
+            });
+        let mut custom = test_manifest("user.custom");
+        custom.visual_adapters.push(PluginVisualAdapterDeclaration {
+            id: "custom".to_owned(),
+            schema: "test.visual".to_owned(),
+            min_schema_version: Some(1),
+            max_schema_version: Some(1),
+            service_interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned(),
+            surfaces: vec!["tui".to_owned()],
+            priority: 20,
+            producer_default: false,
+            render_mode: PluginVisualAdapterRenderMode::FullBlock,
+        });
+        let manifests =
+            BTreeMap::from([(producer.id.clone(), producer), (custom.id.clone(), custom)]);
+
+        let routes = select_visual_adapters(
+            manifests.iter(),
+            "test.visual",
+            1,
+            "tui",
+            Some("bcode.producer"),
+        );
+
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].adapter_reference(), "user.custom/custom");
+        assert_eq!(routes[1].adapter_reference(), "bcode.producer/producer");
+    }
+
+    #[test]
+    fn visual_adapter_producer_default_breaks_equal_priority_tie() {
+        let adapter = |id: &str, producer_default| PluginVisualAdapterDeclaration {
+            id: id.to_owned(),
+            schema: "test.visual".to_owned(),
+            min_schema_version: Some(1),
+            max_schema_version: Some(1),
+            service_interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned(),
+            surfaces: vec!["tui".to_owned()],
+            priority: 10,
+            producer_default,
+            render_mode: PluginVisualAdapterRenderMode::TranscriptBlock,
+        };
+        let mut producer = test_manifest("bcode.producer");
+        producer.visual_adapters.push(adapter("producer", true));
+        let mut other = test_manifest("user.other");
+        other.visual_adapters.push(adapter("other", false));
+        let manifests =
+            BTreeMap::from([(producer.id.clone(), producer), (other.id.clone(), other)]);
+
+        let routes = select_visual_adapters(
+            manifests.iter(),
+            "test.visual",
+            1,
+            "tui",
+            Some("bcode.producer"),
+        );
+
+        assert_eq!(routes[0].adapter_reference(), "bcode.producer/producer");
     }
 
     fn test_manifest(id: &str) -> PluginManifest {

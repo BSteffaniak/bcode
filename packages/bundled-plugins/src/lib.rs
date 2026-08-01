@@ -870,7 +870,7 @@ mod tests {
             None,
         );
         let rows = registry
-            .visual_rows(&route.schema, &payload, &context)
+            .visual_rows(&route.adapter_id, &route.schema, &payload, &context)
             .expect("filesystem TUI visual adapter renders file change payload");
         assert!(!rows.is_empty());
     }

@@ -201,6 +201,7 @@ pub enum ShellInvocationAction {
 pub struct ShellLiveRecordingPayload {
     pub mode: &'static str,
     pub timeout_ms: u64,
+    pub arguments: serde_json::Value,
 }
 
 const fn default_format_commands() -> bool {

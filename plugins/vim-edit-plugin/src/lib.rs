@@ -1133,9 +1133,17 @@ pub fn static_plugin() -> StaticPluginVtable {
 #[must_use]
 pub fn vim_edit_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
-    registry.register_visual_adapter(Box::new(
-        vim_edit_playback_tui::VimEditPlaybackTuiVisualAdapter,
-    ));
+    registry.register_visual_adapter(
+        [
+            "vim-edit-preview-request-card",
+            "vim-edit-apply-request-card",
+            "vim-edit-preview-request-draft",
+            "vim-edit-apply-request-draft",
+            "vim-edit-live-card",
+            "vim-edit-playback-card",
+        ],
+        Box::new(vim_edit_playback_tui::VimEditPlaybackTuiVisualAdapter),
+    );
     registry
 }
 

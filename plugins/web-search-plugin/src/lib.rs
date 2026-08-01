@@ -2736,7 +2736,19 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[must_use]
 pub fn web_search_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
-    registry.register_visual_adapter(Box::new(web_search_tui::WebSearchTuiVisualAdapter));
+    registry.register_visual_adapter(
+        [
+            "web-search-request-card",
+            "web-fetch-request-card",
+            "web-status-request-card",
+            "web-inspect-request-card",
+            "web-search-results-card",
+            "web-fetch-result-card",
+            "web-status-card",
+            "web-inspect-result-card",
+        ],
+        Box::new(web_search_tui::WebSearchTuiVisualAdapter),
+    );
     registry
 }
 

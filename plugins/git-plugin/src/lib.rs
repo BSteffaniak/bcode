@@ -1112,7 +1112,10 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[must_use]
 pub fn git_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
-    registry.register_visual_adapter(Box::new(git_tui::GitTuiVisualAdapter));
+    registry.register_visual_adapter(
+        ["git-clone-request-card", "git-clone-result-card"],
+        Box::new(git_tui::GitTuiVisualAdapter),
+    );
     registry
 }
 

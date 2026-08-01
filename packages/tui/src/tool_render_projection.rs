@@ -16,6 +16,10 @@ pub enum CanonicalToolVisual {
 /// Canonical plugin visual routed through the plugin visual-adapter registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalPluginVisual {
+    /// Stable invocation identity used for adapter state and cache isolation.
+    pub invocation_id: Option<String>,
+    /// Semantic/presentation revision used for cache invalidation.
+    pub revision: u64,
     /// Preferred producer plugin id. This is a routing preference, not a hard lookup key.
     pub producer_plugin_id: Option<String>,
     /// Plugin-owned schema id.
@@ -33,6 +37,36 @@ pub struct CanonicalPluginVisual {
 }
 
 impl CanonicalToolVisual {
+    /// Build a plugin visual from one complete canonical tool request.
+    #[must_use]
+    pub fn from_request(
+        invocation_id: &str,
+        producer_plugin_id: Option<&str>,
+        tool_name: &str,
+        schema: String,
+        schema_version: u32,
+        arguments_json: &str,
+    ) -> Option<Self> {
+        let mut payload: serde_json::Value = serde_json::from_str(arguments_json).ok()?;
+        if let Some(object) = payload.as_object_mut() {
+            object.insert(
+                "_bcode_invocation".to_owned(),
+                serde_json::json!({"tool_name": tool_name}),
+            );
+        }
+        Some(Self::Plugin(CanonicalPluginVisual {
+            invocation_id: Some(invocation_id.to_owned()),
+            revision: 0,
+            producer_plugin_id: producer_plugin_id.map(ToOwned::to_owned),
+            schema,
+            schema_version,
+            title: None,
+            subtitle: None,
+            payload,
+            streaming: false,
+        }))
+    }
+
     /// Build a canonical plugin visual from a final semantic artifact.
     #[must_use]
     pub fn from_artifact(artifact: &ToolArtifact) -> Self {
@@ -77,6 +111,12 @@ impl CanonicalToolVisual {
             object.insert("_artifact_refs".to_owned(), refs);
         }
         Self::Plugin(CanonicalPluginVisual {
+            invocation_id: artifact.tool_call_id.clone(),
+            revision: artifact
+                .metadata
+                .get("_bcode_presentation_revision")
+                .and_then(Value::as_u64)
+                .unwrap_or_default(),
             producer_plugin_id: Some(artifact.producer_plugin_id.clone()),
             schema: artifact.schema.clone(),
             schema_version: artifact.schema_version,

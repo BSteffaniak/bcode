@@ -118,14 +118,29 @@ async fn run_event_loop_with_input_and_static_bundled<W: Write>(
         .with_interaction_adapters(super::bundled_interaction_adapters("tui"));
     let (event_sender, event_receiver) = mpsc::unbounded_channel();
     let mut app = BmuxApp::new_with_history(session_id, &[], &[], false);
-    match super::plugin_tui::load_default_presentation_with_static_bundled(static_plugins) {
+    let presentation_config = config.as_ref().ok();
+    let plugin_selection =
+        presentation_config.map_or_else(bcode_plugin::PluginSelection::all_enabled, |config| {
+            let default_plugin_ids =
+                bcode_plugin::static_bundled_default_plugin_ids(static_plugins).unwrap_or_default();
+            bcode_config::plugin_selection_with_default_plugin_ids(config, &default_plugin_ids)
+        });
+    let visual_adapter_config = presentation_config
+        .map(|config| config.tui.visual_adapters.clone())
+        .unwrap_or_default();
+    match super::plugin_tui::load_default_presentation_with_static_bundled(
+        &plugin_selection,
+        visual_adapter_config,
+        static_plugins,
+    ) {
         Ok(presentation) => app.set_plugin_presentation(Arc::new(presentation)),
         Err(error) => app.set_status(format!("plugin presentation unavailable: {error}")),
     }
     let agents = session_flow::AgentCatalog::default();
     agents.refresh_app_agent_metadata(&mut app);
     let launch_working_directory = std::env::current_dir().unwrap_or_else(|_| ".".into());
-    let mut settings = chat_loop::TuiRuntimeSettings::bootstrap(launch_working_directory.clone());
+    let mut settings =
+        chat_loop::TuiRuntimeSettings::bootstrap(launch_working_directory.clone(), static_plugins);
     if let Ok(config) = &config {
         settings.set_metrics_enabled(config.metrics.enabled);
     }

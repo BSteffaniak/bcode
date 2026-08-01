@@ -701,6 +701,29 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
             "timeout_ms".to_owned(),
             serde_json::Value::from(descriptor.timeout_ms),
         );
+        if arguments.get("cwd").is_none()
+            && let Some(workspace_root) = descriptor.workspace_root.as_deref()
+        {
+            arguments.insert(
+                "cwd".to_owned(),
+                serde_json::Value::String(workspace_root.display().to_string()),
+            );
+        }
+    }
+    let primary_presentation = Arc::new(StdMutex::new(
+        PrimaryPresentationPublisher::with_limits_and_cancellation(
+            context.events,
+            &request.tool_call_id,
+            "bcode.shell",
+            "bcode.tool.request.shell.run",
+            SHELL_SCHEMA_VERSION,
+            bcode_tool::ToolPresentationRetention::RetainLatest,
+            context.transient_progress_limits,
+            context.cancellation.clone(),
+        ),
+    ));
+    if let Ok(mut presentation) = primary_presentation.lock() {
+        let _ = presentation.replace(&arguments);
     }
     let response = match request.name.as_str() {
         "shell.run" => run_shell_tool(
@@ -713,6 +736,7 @@ fn invoke_tool(context: &NativeServiceContext) -> ServiceResponse {
                 session_cwd: descriptor.workspace_root.as_deref(),
                 artifact_dir: descriptor.artifact_root.as_deref(),
                 input_bridge: Some(&context.bridge),
+                primary_presentation: Some(Arc::clone(&primary_presentation)),
             },
         ),
         _ => ToolInvocationResponse {
@@ -989,11 +1013,12 @@ fn shell_program_and_args(
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct TerminalRunPaths<'a> {
     session_cwd: Option<&'a Path>,
     artifact_dir: Option<&'a Path>,
     input_bridge: Option<&'a ServiceBridge>,
+    primary_presentation: Option<Arc<StdMutex<PrimaryPresentationPublisher>>>,
 }
 
 fn run_terminal_shell_command(
@@ -1327,6 +1352,8 @@ fn run_terminal_shell_command_inner(
                     columns,
                     rows,
                     timeout_ms: u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX),
+                    arguments: arguments_json,
+                    primary_presentation: paths.primary_presentation,
                     prelude_markers,
                     progress_limits,
                     cancellation: cancellation_for_reader,
@@ -1536,6 +1563,8 @@ struct ShellVisualStreamContext {
     columns: u16,
     rows: u16,
     timeout_ms: u64,
+    arguments: serde_json::Value,
+    primary_presentation: Option<Arc<StdMutex<PrimaryPresentationPublisher>>>,
     prelude_markers: PreludeGateMarkers,
     progress_limits: bcode_plugin_sdk::TransientProgressLimits,
     cancellation: bcode_plugin_sdk::ServiceCancellation,
@@ -1716,9 +1745,11 @@ where
                 visual_context.columns,
                 visual_context.rows,
                 Some(shell_recording_commit_observer(
+                    visual_context.primary_presentation.clone(),
                     events,
                     tool_call_id,
                     visual_context.timeout_ms,
+                    visual_context.arguments.clone(),
                     visual_context.progress_limits,
                     visual_context.cancellation.clone(),
                 )),
@@ -1919,26 +1950,30 @@ fn artifact_writer(path: Option<&Path>) -> Result<Box<dyn Write + Send>, String>
 }
 
 fn shell_recording_commit_observer(
+    existing_presentation: Option<Arc<StdMutex<PrimaryPresentationPublisher>>>,
     events: ServiceEventEmitter,
     tool_call_id: &str,
     timeout_ms: u64,
+    arguments: serde_json::Value,
     limits: bcode_plugin_sdk::TransientProgressLimits,
     cancellation: bcode_plugin_sdk::ServiceCancellation,
 ) -> recording::ShellRecordingCommitObserver {
     let tool_call_id = tool_call_id.to_owned();
     let publication_state = Arc::new(std::sync::atomic::AtomicU8::new(0));
-    let presentation = Arc::new(StdMutex::new(
-        PrimaryPresentationPublisher::with_limits_and_cancellation(
-            events,
-            &tool_call_id,
-            "bcode.shell",
-            SHELL_RUN_SCHEMA,
-            SHELL_SCHEMA_VERSION,
-            bcode_tool::ToolPresentationRetention::RetainLatest,
-            limits,
-            cancellation,
-        ),
-    ));
+    let presentation = existing_presentation.unwrap_or_else(|| {
+        Arc::new(StdMutex::new(
+            PrimaryPresentationPublisher::with_limits_and_cancellation(
+                events,
+                &tool_call_id,
+                "bcode.shell",
+                SHELL_RUN_SCHEMA,
+                SHELL_SCHEMA_VERSION,
+                bcode_tool::ToolPresentationRetention::RetainLatest,
+                limits,
+                cancellation,
+            ),
+        ))
+    });
     Arc::new(move |commit| {
         let artifact = ToolContributionArtifact {
             artifact_id: format!("{tool_call_id}-shell-run"),
@@ -1966,18 +2001,24 @@ fn shell_recording_commit_observer(
             false
         };
         if publish_immediately {
-            let _ = presentation.replace_with_artifact(
+            let _ = presentation.replace_with_artifact_as(
+                SHELL_RUN_SCHEMA,
+                SHELL_SCHEMA_VERSION,
                 &ShellLiveRecordingPayload {
                     mode: "terminal",
                     timeout_ms,
+                    arguments: arguments.clone(),
                 },
                 artifact,
             );
         } else {
-            let _ = presentation.replace_with_artifact_if_ready(
+            let _ = presentation.replace_with_artifact_as_if_ready(
+                SHELL_RUN_SCHEMA,
+                SHELL_SCHEMA_VERSION,
                 &ShellLiveRecordingPayload {
                     mode: "terminal",
                     timeout_ms,
+                    arguments: arguments.clone(),
                 },
                 artifact,
             );
@@ -2160,7 +2201,10 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[must_use]
 pub fn shell_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
-    registry.register_visual_adapter(Box::new(shell_run_tui::ShellRunTuiVisualAdapter::default()));
+    registry.register_visual_adapter(
+        ["shell-run-request-card", "shell-run-terminal-card"],
+        Box::new(shell_run_tui::ShellRunTuiVisualAdapter::default()),
+    );
     registry
 }
 
@@ -2922,9 +2966,11 @@ mod tests {
             std::ptr::from_ref(&events).cast_mut().cast(),
         );
         let observer = shell_recording_commit_observer(
+            None,
             emitter,
             "live-recording",
             DEFAULT_SHELL_TIMEOUT_MS,
+            serde_json::json!({"command": "printf hello"}),
             bcode_plugin_sdk::TransientProgressLimits {
                 max_encoded_bytes: bcode_plugin_sdk::DEFAULT_TRANSIENT_PROGRESS_MAX_ENCODED_BYTES,
                 min_interval_ms: 60_000,
@@ -3182,6 +3228,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: None,
                 input_bridge: None,
+                primary_presentation: None,
             },
             &environment,
         );
@@ -3220,6 +3267,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: None,
                 input_bridge: None,
+                primary_presentation: None,
             },
             &environment,
         );
@@ -3259,6 +3307,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: None,
                 input_bridge: None,
+                primary_presentation: None,
             },
             &environment,
         );
@@ -3302,6 +3351,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: None,
                 input_bridge: None,
+                primary_presentation: None,
             },
             &environment,
         );
@@ -3341,6 +3391,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: Some(artifact_dir.path()),
                 input_bridge: Some(&bridge),
+                primary_presentation: None,
             },
             &environment,
         );
@@ -3398,6 +3449,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: Some(artifact_dir.path()),
                 input_bridge: None,
+                primary_presentation: None,
             },
             &environment,
         );
@@ -3462,6 +3514,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: Some(artifact_dir.path()),
                 input_bridge: None,
+                primary_presentation: None,
             },
             &environment,
         );
@@ -3618,6 +3671,7 @@ mod tests {
                     session_cwd: None,
                     artifact_dir: Some(artifact_dir.path()),
                     input_bridge: None,
+                    primary_presentation: None,
                 },
                 &environment,
             );
@@ -3680,6 +3734,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: None,
                 input_bridge: None,
+                primary_presentation: None,
             },
             &environment,
         );
@@ -3727,6 +3782,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: None,
                 input_bridge: None,
+                primary_presentation: None,
             },
             &environment,
         );
@@ -3769,6 +3825,7 @@ mod tests {
                 session_cwd: None,
                 artifact_dir: None,
                 input_bridge: None,
+                primary_presentation: None,
             },
         );
 
@@ -3924,6 +3981,8 @@ mod tests {
             columns: 120,
             rows: 30,
             timeout_ms: DEFAULT_SHELL_TIMEOUT_MS,
+            arguments: serde_json::Value::Null,
+            primary_presentation: None,
             prelude_markers: PreludeGateMarkers::default(),
             progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
             cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
@@ -4169,6 +4228,8 @@ mod tests {
                 columns: 80,
                 rows: 24,
                 timeout_ms: DEFAULT_SHELL_TIMEOUT_MS,
+                arguments: serde_json::Value::Null,
+                primary_presentation: None,
                 prelude_markers: PreludeGateMarkers::default(),
                 progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
                 cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
@@ -4318,6 +4379,8 @@ mod tests {
             columns: 80,
             rows: 24,
             timeout_ms: DEFAULT_SHELL_TIMEOUT_MS,
+            arguments: serde_json::Value::Null,
+            primary_presentation: None,
             prelude_markers: PreludeGateMarkers::default(),
             progress_limits: bcode_plugin_sdk::TransientProgressLimits::default(),
             cancellation: bcode_plugin_sdk::ServiceCancellation::default(),
@@ -4396,6 +4459,8 @@ mod tests {
                 columns: 80,
                 rows: 24,
                 timeout_ms: DEFAULT_SHELL_TIMEOUT_MS,
+                arguments: serde_json::Value::Null,
+                primary_presentation: None,
                 prelude_markers: PreludeGateMarkers {
                     live: vec!["__MARK__".to_owned()],
                     replay: vec!["__MARK__".to_owned()],
@@ -4436,6 +4501,8 @@ mod tests {
                 columns: 80,
                 rows: 24,
                 timeout_ms: DEFAULT_SHELL_TIMEOUT_MS,
+                arguments: serde_json::Value::Null,
+                primary_presentation: None,
                 prelude_markers: PreludeGateMarkers {
                     live: vec!["__MARK__".to_string()],
                     replay: vec!["__MARK__".to_string()],
@@ -4468,6 +4535,8 @@ mod tests {
                 columns: 80,
                 rows: 24,
                 timeout_ms: DEFAULT_SHELL_TIMEOUT_MS,
+                arguments: serde_json::Value::Null,
+                primary_presentation: None,
                 prelude_markers: PreludeGateMarkers {
                     live: vec!["__MARK__".to_string()],
                     replay: Vec::new(),

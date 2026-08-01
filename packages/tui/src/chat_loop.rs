@@ -3,6 +3,7 @@
 use bcode_plugin_sdk::path::display_from_current_dir;
 use std::collections::BTreeSet;
 use std::io::Write;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use bcode_client::{BcodeClient, ClientError, DaemonAvailability};
@@ -418,17 +419,22 @@ pub struct TuiRuntimeSettings {
     mouse_scroll_rows: usize,
     frame_interval: Option<Duration>,
     metrics_enabled: bool,
+    static_plugins: Vec<bcode_plugin::StaticBundledPlugin>,
     launch_working_directory: std::path::PathBuf,
 }
 
 impl TuiRuntimeSettings {
-    pub fn bootstrap(launch_working_directory: std::path::PathBuf) -> Self {
+    pub fn bootstrap(
+        launch_working_directory: std::path::PathBuf,
+        static_plugins: &[bcode_plugin::StaticBundledPlugin],
+    ) -> Self {
         let tui_config = TuiConfig::default();
         Self {
             keymap: BmuxKeyMap::from_config(&tui_config),
             mouse_scroll_rows: tui_config.mouse.effective_scroll_rows(),
             frame_interval: tui_config.render.frame_interval(),
             metrics_enabled: false,
+            static_plugins: static_plugins.to_vec(),
             launch_working_directory,
         }
     }
@@ -441,6 +447,10 @@ impl TuiRuntimeSettings {
 
     pub const fn set_metrics_enabled(&mut self, enabled: bool) {
         self.metrics_enabled = enabled;
+    }
+
+    pub fn static_plugins(&self) -> &[bcode_plugin::StaticBundledPlugin] {
+        &self.static_plugins
     }
 
     pub fn launch_working_directory(&self) -> &std::path::Path {
@@ -715,6 +725,10 @@ async fn handle_loop_housekeeping(
 ) -> bool {
     let mut needs_redraw = false;
     needs_redraw |= poll_finished_effects(settings, chat, draft_autosave, loop_state).await;
+    needs_redraw |= chat
+        .app
+        .plugin_presentation()
+        .is_some_and(crate::plugin_tui::PluginTuiPresentation::poll_dynamic_visuals);
     needs_redraw |= loop_state.drain_pending_effects(chat);
     needs_redraw |= maybe_start_interactive_surface(chat, loop_state).await;
     loop_state.artifact_stream.start_due_fetches(Instant::now());
@@ -1009,6 +1023,23 @@ fn apply_config_result(
             settings.apply_tui_config(&config.tui);
             settings.set_metrics_enabled(config.metrics.enabled);
             loop_state.telemetry.set_enabled(config.metrics.enabled);
+            let default_plugin_ids =
+                bcode_plugin::static_bundled_default_plugin_ids(settings.static_plugins())
+                    .unwrap_or_default();
+            let selection = bcode_config::plugin_selection_with_default_plugin_ids(
+                &config,
+                &default_plugin_ids,
+            );
+            match super::plugin_tui::load_default_presentation_with_static_bundled(
+                &selection,
+                config.tui.visual_adapters.clone(),
+                settings.static_plugins(),
+            ) {
+                Ok(presentation) => chat.app.set_plugin_presentation(Arc::new(presentation)),
+                Err(error) => chat
+                    .app
+                    .set_status(format!("plugin presentation unavailable: {error}")),
+            }
             chat.app.apply_tui_config(config.tui.clone());
             chat.replace_effect(TuiEffect::ReconcileAuthSecurity {
                 config: Box::new(config),
@@ -1769,7 +1800,7 @@ mod render_cadence_tests {
 
     #[test]
     fn configured_cadence_and_reload_drive_redraw_deadline() {
-        let mut settings = TuiRuntimeSettings::bootstrap(PathBuf::from("."));
+        let mut settings = TuiRuntimeSettings::bootstrap(PathBuf::from("."), &[]);
         let start = Instant::now();
         assert_eq!(
             next_redraw_at(start, settings.frame_interval),

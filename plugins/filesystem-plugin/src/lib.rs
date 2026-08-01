@@ -2528,8 +2528,28 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[must_use]
 pub fn filesystem_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
-    registry.register_visual_adapter(Box::new(file_change_tui::FileChangeTuiVisualAdapter));
-    registry.register_visual_adapter(Box::new(filesystem_tui::FilesystemTuiVisualAdapter));
+    registry.register_visual_adapter(
+        ["filesystem-change-card"],
+        Box::new(file_change_tui::FileChangeTuiVisualAdapter),
+    );
+    registry.register_visual_adapter(
+        [
+            "filesystem-write-request-draft",
+            "filesystem-edit-request-draft",
+            "filesystem-request-card",
+            "filesystem-read-card",
+            "filesystem-image-card",
+            "filesystem-exists-card",
+            "filesystem-list-card",
+            "filesystem-find-card",
+            "filesystem-grep-card",
+            "filesystem-stat-card",
+            "filesystem-artifact-metadata-card",
+            "filesystem-artifact-read-card",
+            "filesystem-artifact-grep-card",
+        ],
+        Box::new(filesystem_tui::FilesystemTuiVisualAdapter),
+    );
     registry
 }
 

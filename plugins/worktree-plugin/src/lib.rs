@@ -603,7 +603,15 @@ pub fn worktree_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
         surface_kind: "command.work-tree.remove",
         title: "Remove Worktree",
     }));
-    registry.register_visual_adapter(Box::new(WorktreeTuiVisualAdapter));
+    registry.register_visual_adapter(
+        [
+            "worktree-request-card",
+            "worktree-list-card",
+            "worktree-create-result-card",
+            "worktree-remove-result-card",
+        ],
+        Box::new(WorktreeTuiVisualAdapter),
+    );
     registry
 }
 

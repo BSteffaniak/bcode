@@ -671,9 +671,10 @@ pub fn question_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
         question_interaction::QuestionInteractionController,
         question_tui::QuestionTerminalRenderer,
     >();
-    registry.register_visual_adapter(Box::new(
-        question_outcome_tui::QuestionOutcomeTuiVisualAdapter,
-    ));
+    registry.register_visual_adapter(
+        ["question-outcome-component"],
+        Box::new(question_outcome_tui::QuestionOutcomeTuiVisualAdapter),
+    );
     registry
 }
 

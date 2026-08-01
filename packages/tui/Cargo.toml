@@ -84,6 +84,9 @@ static-bundled-plugins = ["bcode_bundled_plugins/static-bundled-plugins"]
 static-bundled-ralph-plugin = [
     "bcode_bundled_plugins/static-bundled-ralph-plugin",
 ]
+static-bundled-shell-plugin = [
+    "bcode_bundled_plugins/static-bundled-shell-plugin",
+]
 static-bundled-workflow-plugin = [
     "bcode_bundled_plugins/static-bundled-workflow-plugin",
 ]

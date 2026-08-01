@@ -91,6 +91,8 @@ name         = "Shell Tools"
 [[tool_presentations]]
 request_draft_schema         = "bcode.tool.request.shell.run"
 request_draft_schema_version = 1
+request_schema               = "bcode.tool.request.shell.run"
+request_schema_version       = 1
 tool_name                    = "shell.run"
 
 [[visual_adapters]]

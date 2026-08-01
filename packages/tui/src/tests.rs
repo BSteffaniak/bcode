@@ -4902,6 +4902,64 @@ fn transcript_resident_window_prunes_old_tool_state_after_trim() {
     assert!(app.session_view_snapshot().tools.len() < 360);
 }
 
+#[test]
+fn canonical_running_filesystem_write_renders_file_preview() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-write".to_owned(),
+            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+            tool_name: "filesystem.write".to_owned(),
+            arguments_json: serde_json::json!({
+                "path": "src/generated.rs",
+                "contents": "fn generated() {}\n",
+            })
+            .to_string(),
+            working_directory: None,
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("Filesystem write"), "{rendered}");
+    assert!(rendered.contains("fn generated() {}"), "{rendered}");
+    assert!(!rendered.contains("Tool · filesystem.write"), "{rendered}");
+}
+
+#[test]
+fn canonical_running_filesystem_edit_renders_diff() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-edit".to_owned(),
+            producer_plugin_id: Some("bcode.filesystem".to_owned()),
+            tool_name: "filesystem.edit".to_owned(),
+            arguments_json: serde_json::json!({
+                "path": "src/lib.rs",
+                "old_text": "before\n",
+                "new_text": "after\n",
+            })
+            .to_string(),
+            working_directory: None,
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(filesystem_plugin_host()));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("Filesystem edit"), "{rendered}");
+    assert!(rendered.contains("before"), "{rendered}");
+    assert!(rendered.contains("after"), "{rendered}");
+    assert!(!rendered.contains("Tool · filesystem.edit"), "{rendered}");
+}
+
 fn filesystem_change_artifact() -> bcode_session_models::ToolArtifact {
     bcode_session_models::ToolArtifact {
         artifact_id: "call-file-filesystem-change".to_owned(),
@@ -6882,6 +6940,38 @@ fn plugin_visual_degrades_without_rendering_raw_payload() {
     assert!(!output.contains("old_text"), "{output}");
     assert!(!output.contains("new_text"), "{output}");
     assert!(!output.contains("fn main() {}"), "{output}");
+}
+
+#[test]
+fn canonical_running_shell_request_uses_owner_visual_adapter() {
+    let session_id = SessionId::new();
+    let history = [event(
+        session_id,
+        1,
+        SessionEventKind::ToolCallRequested {
+            tool_call_id: "call-shell".to_owned(),
+            producer_plugin_id: Some("bcode.shell".to_owned()),
+            tool_name: "shell.run".to_owned(),
+            arguments_json: serde_json::json!({
+                "command": "cargo check --workspace",
+                "cwd": "/Users/braden/GitHub/bcode",
+                "timeout_ms": 120_000,
+            })
+            .to_string(),
+            working_directory: None,
+        },
+    )];
+    let mut app = BmuxApp::new_with_history(Some(session_id), &history, &[], false);
+    app.set_plugin_host(Arc::new(shell_plugin_host()));
+
+    let rendered = render_app_text(&mut app);
+
+    assert!(rendered.contains("❯ cargo check --workspace"), "{rendered}");
+    assert!(
+        rendered.contains("/Users/braden/GitHub/bcode ❯"),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("Tool · shell.run"), "{rendered}");
 }
 
 #[test]

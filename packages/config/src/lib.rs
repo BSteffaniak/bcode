@@ -1909,6 +1909,10 @@ pub struct TuiConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub markdown: TuiMarkdownConfig,
+    /// Visual adapter selection and fallback configuration.
+    #[config_doc(nested)]
+    #[serde(default)]
+    pub visual_adapters: TuiVisualAdapterConfig,
     /// Provider-exposed reasoning / thinking display configuration.
     #[config_doc(nested)]
     #[serde(default)]
@@ -1917,6 +1921,45 @@ pub struct TuiConfig {
     #[config_doc(nested)]
     #[serde(default)]
     pub theme: TuiThemeConfig,
+}
+
+/// Terminal visual-adapter selection configuration.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "visual_adapters")]
+pub struct TuiVisualAdapterConfig {
+    /// Stable `<plugin-id>/<adapter-id>` references in descending preference order.
+    #[serde(default)]
+    pub preferred: Vec<String>,
+    /// Stable `<plugin-id>/<adapter-id>` references that must not be selected.
+    #[serde(default)]
+    pub disabled: BTreeSet<String>,
+}
+
+impl TuiVisualAdapterConfig {
+    /// Return compatible routes in configured preference order followed by manifest defaults.
+    #[must_use]
+    pub fn order_routes(
+        &self,
+        routes: Vec<bcode_plugin::PluginVisualAdapterRoute>,
+    ) -> Vec<bcode_plugin::PluginVisualAdapterRoute> {
+        let preferred = self
+            .preferred
+            .iter()
+            .enumerate()
+            .map(|(index, adapter)| (adapter.as_str(), index))
+            .collect::<BTreeMap<_, _>>();
+        let mut routes = routes
+            .into_iter()
+            .filter(|route| !self.disabled.contains(&route.adapter_reference()))
+            .collect::<Vec<_>>();
+        routes.sort_by_key(|route| {
+            preferred
+                .get(route.adapter_reference().as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        routes
+    }
 }
 
 /// Terminal render scheduling configuration.
@@ -3622,6 +3665,30 @@ fn validate_config(config: &BcodeConfig) -> Result<(), ConfigError> {
         return Err(ConfigError::Composition {
             message: "client.request_timeout_secs must be greater than zero".to_owned(),
         });
+    }
+    let mut visual_adapters = BTreeSet::new();
+    for adapter in config
+        .tui
+        .visual_adapters
+        .preferred
+        .iter()
+        .chain(&config.tui.visual_adapters.disabled)
+    {
+        let valid = adapter
+            .split_once('/')
+            .is_some_and(|(plugin_id, adapter_id)| {
+                !plugin_id.is_empty()
+                    && !adapter_id.is_empty()
+                    && adapter.len() <= 512
+                    && !adapter.chars().any(char::is_whitespace)
+            });
+        if !valid || !visual_adapters.insert(adapter) {
+            return Err(ConfigError::Composition {
+                message: format!(
+                    "TUI visual adapter references must be unique `<plugin-id>/<adapter-id>` values: {adapter}"
+                ),
+            });
+        }
     }
     for (agent_id, agent) in &config.agent {
         for tool_id in agent.tools.keys() {
@@ -6309,16 +6376,17 @@ mod tests {
         BcodeConfig, CompactionBackend, CompactionMode, ConfigDocSchema, ConfigEnvironmentSnapshot,
         ConfigError, ConfigLoadOverrides, ContextStrategyMode, FieldDoc, InvariantGuidanceMode,
         InvariantSelectorTimeoutPolicy, InvariantsConfig, NestedFieldDoc, TuiAccentTransitionCurve,
-        TuiMouseConfig, TuiRenderConfig, default_config_paths_from, default_permissions_state_path,
-        load_config_from_paths, load_config_from_paths_with_overrides, load_permissions_state_from,
+        TuiMouseConfig, TuiRenderConfig, TuiVisualAdapterConfig, default_config_paths_from,
+        default_permissions_state_path, load_config_from_paths,
+        load_config_from_paths_with_overrides, load_permissions_state_from,
         load_runtime_auth_subscriptions, merge_config_values,
         plugin_selection_with_default_plugin_ids, register_runtime_auth_profile,
         register_runtime_auth_subscription, set_openai_compatible_sshenv_auth_method,
-        upsert_agent_permission_rule,
+        upsert_agent_permission_rule, validate_config,
     };
     use bcode_agent_policy_models::Action;
     use bcode_plugin::{PluginSelection, PluginSelectionMode};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -8771,6 +8839,46 @@ extends = ["a"]
 
         assert!(paths.contains(&root.join("bcode.toml")));
         assert!(paths.contains(&root.join(".bcode").join("bcode.toml")));
+    }
+
+    #[test]
+    fn visual_adapter_preferences_override_defaults_and_disabled_routes_are_removed() {
+        let route = |plugin_id: &str, adapter_id: &str| bcode_plugin::PluginVisualAdapterRoute {
+            plugin_id: plugin_id.to_owned(),
+            adapter_id: adapter_id.to_owned(),
+            schema: "test.visual".to_owned(),
+            service_interface_id: bcode_tool::TOOL_SERVICE_INTERFACE_ID.to_owned(),
+            surfaces: vec!["tui".to_owned()],
+            priority: 0,
+            producer_default: false,
+            render_mode: bcode_plugin::PluginVisualAdapterRenderMode::TranscriptBlock,
+        };
+        let config = TuiVisualAdapterConfig {
+            preferred: vec!["user/custom".to_owned()],
+            disabled: BTreeSet::from(["bcode/disabled".to_owned()]),
+        };
+
+        let routes = config.order_routes(vec![
+            route("bcode", "default"),
+            route("user", "custom"),
+            route("bcode", "disabled"),
+        ]);
+
+        assert_eq!(routes[0].adapter_reference(), "user/custom");
+        assert_eq!(routes[1].adapter_reference(), "bcode/default");
+        assert_eq!(routes.len(), 2);
+    }
+
+    #[test]
+    fn config_rejects_duplicate_or_malformed_visual_adapter_references() {
+        for preferred in [
+            vec!["missing-separator".to_owned()],
+            vec!["plugin/adapter".to_owned(), "plugin/adapter".to_owned()],
+        ] {
+            let mut config = BcodeConfig::default();
+            config.tui.visual_adapters.preferred = preferred;
+            assert!(validate_config(&config).is_err());
+        }
     }
 
     fn unique_temp_dir() -> std::path::PathBuf {

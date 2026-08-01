@@ -205,7 +205,47 @@ fn request_rows(
     context: &bcode_plugin_sdk::tui::PluginTuiVisualRenderContext,
 ) -> Vec<Line> {
     let arguments = payload.get("arguments").unwrap_or(payload);
-    let operation = text(payload, "operation").unwrap_or("filesystem tool");
+    let operation = text(payload, "operation")
+        .or_else(|| {
+            payload
+                .pointer("/_bcode_invocation/tool_name")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("filesystem tool");
+    if operation == "filesystem.write"
+        && let (Some(path), Some(contents)) = (text(arguments, "path"), text(arguments, "contents"))
+    {
+        return file_change_rows(
+            &serde_json::json!({
+                "path": path,
+                "old_text": "",
+                "new_text": contents,
+                "title": "Filesystem write",
+                "subtitle": "new file preview",
+                "old_start_line": 1,
+                "new_start_line": 1,
+            }),
+            context,
+        );
+    }
+    if operation == "filesystem.edit"
+        && let (Some(path), Some(old_text), Some(new_text)) = (
+            text(arguments, "path"),
+            text(arguments, "old_text"),
+            text(arguments, "new_text"),
+        )
+    {
+        return file_change_rows(
+            &serde_json::json!({
+                "path": path,
+                "old_text": old_text,
+                "new_text": new_text,
+                "title": "Filesystem edit",
+                "subtitle": "line numbers pending execution",
+            }),
+            context,
+        );
+    }
     let mut rows = vec![Line::from_spans(vec![
         Span::styled("◆ ", accent()),
         Span::styled(operation.to_owned(), title()),

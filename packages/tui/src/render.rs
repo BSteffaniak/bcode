@@ -1713,19 +1713,43 @@ fn push_transcript_item_rows(
             push_reasoning_rows(rows, item, width, markdown);
         }
         TranscriptItemKind::ToolRequest {
-            tool_call_id: _,
-            producer_plugin_id: _,
+            tool_call_id,
+            producer_plugin_id,
             tool_name,
-            working_directory: _,
+            working_directory,
             timing: _,
             active: _,
             status,
         } => {
-            let context = ToolRequestRenderContext {
-                tool_name,
-                status: *status,
-            };
-            push_tool_request_rows(rows, item, &context, width);
+            let request_visual = plugin_host
+                .and_then(|presentation| presentation.host().tool_presentation(tool_name))
+                .and_then(|(_, declaration)| {
+                    CanonicalToolVisual::from_request(
+                        tool_call_id,
+                        producer_plugin_id.as_deref(),
+                        tool_name,
+                        declaration.request_schema.clone(),
+                        declaration.request_schema_version,
+                        item.text(),
+                    )
+                });
+            if request_visual.as_ref().is_some_and(|visual| {
+                push_canonical_tool_visual_rows(
+                    rows,
+                    visual,
+                    working_directory.as_deref(),
+                    width,
+                    plugin_host,
+                )
+            }) {
+                rows.push(Line::default());
+            } else {
+                let context = ToolRequestRenderContext {
+                    tool_name,
+                    status: *status,
+                };
+                push_tool_request_rows(rows, item, &context, width);
+            }
         }
         TranscriptItemKind::ToolResult {
             tool_call_id: _,
@@ -1845,7 +1869,16 @@ fn push_transcript_item_rows(
                 schema_version: contribution.schema_version,
                 tool_call_id: Some(contribution.invocation_id.clone()),
                 title: Some("Tool contribution".to_owned()),
-                metadata: contribution.payload.clone(),
+                metadata: {
+                    let mut payload = contribution.payload.clone();
+                    if let Some(object) = payload.as_object_mut() {
+                        object.insert(
+                            "_bcode_presentation_revision".to_owned(),
+                            serde_json::Value::from(contribution.sequence),
+                        );
+                    }
+                    payload
+                },
                 refs: Vec::new(),
             };
             let visual = CanonicalToolVisual::from_artifact(&artifact);
@@ -2866,10 +2899,9 @@ fn canonical_plugin_visual_render_mode(
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
 ) -> Option<PluginTuiVisualRenderMode> {
     let presentation = plugin_host?;
-    let route = presentation.host().visual_adapter(
+    let route = presentation.visual_route(
         &visual.schema,
         visual.schema_version,
-        "tui",
         visual.producer_plugin_id.as_deref(),
     )?;
     Some(match route.render_mode {
@@ -2888,15 +2920,14 @@ fn canonical_plugin_visual_header(
     plugin_host: Option<&crate::plugin_tui::PluginTuiPresentation>,
 ) -> Option<bcode_plugin_sdk::tui::PluginTuiTranscriptHeader> {
     let presentation = plugin_host?;
-    let route = presentation.host().visual_adapter(
+    let route = presentation.visual_route(
         &visual.schema,
         visual.schema_version,
-        "tui",
         visual.producer_plugin_id.as_deref(),
     )?;
     presentation
         .registry(&route.plugin_id)?
-        .visual_transcript_header(&route.schema, &visual.payload)
+        .visual_transcript_header(&route.adapter_id, &route.schema, &visual.payload)
 }
 
 fn canonical_plugin_visual_available(
@@ -2908,11 +2939,9 @@ fn canonical_plugin_visual_available(
         return false;
     };
     presentation
-        .host()
-        .visual_adapter(
+        .visual_route(
             &plugin_visual.schema,
             plugin_visual.schema_version,
-            "tui",
             plugin_visual.producer_plugin_id.as_deref(),
         )
         .is_some()
@@ -2940,30 +2969,27 @@ fn push_canonical_plugin_visual_rows(
         return false;
     };
     let producer = visual.producer_plugin_id.as_deref();
-    let Some(route) =
-        presentation
-            .host()
-            .visual_adapter(&visual.schema, visual.schema_version, "tui", producer)
-    else {
-        return false;
-    };
-    let Some(registry) = presentation.registry(&route.plugin_id) else {
-        return false;
-    };
     let visual_started = Instant::now();
-    let native_rows = registry.visual_rows(
-        &route.schema,
+    let routed = presentation.routed_visual(
+        visual
+            .invocation_id
+            .as_deref()
+            .unwrap_or("unknown-invocation"),
+        visual.revision,
+        &visual.schema,
+        visual.schema_version,
+        producer,
         &visual.payload,
         &plugin_visual_context(width, working_directory),
     );
-    presentation.record_visual_timing(
-        "render_rows",
-        &route.plugin_id,
-        &route.schema,
-        visual_started,
-    );
-    if let Some(native_rows) = native_rows {
-        rows.extend(native_rows);
+    if let Some(routed) = &routed {
+        presentation.record_visual_timing(
+            "render_rows",
+            &routed.route.plugin_id,
+            &routed.route.schema,
+            visual_started,
+        );
+        rows.extend(routed.rows.clone());
         return true;
     }
     false

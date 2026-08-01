@@ -501,6 +501,60 @@ impl PrimaryPresentationPublisher {
         )
     }
 
+    /// Replace the current primary payload and artifact while changing its visual schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when updates are unavailable, cancelled, oversized, exhausted, or cannot
+    /// be encoded.
+    pub fn replace_with_artifact_as<T: Serialize + ?Sized>(
+        &mut self,
+        schema: impl Into<String>,
+        schema_version: u32,
+        payload: &T,
+        artifact: bcode_tool::ToolContributionArtifact,
+    ) -> Result<u64, PresentationUpdateError> {
+        self.replace_value_as(
+            serde_json::to_value(payload)?,
+            Some(artifact),
+            schema.into(),
+            schema_version,
+        )
+    }
+
+    /// Replace the current primary payload and artifact under another schema when cadence permits.
+    /// Finalized artifacts bypass cadence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when updates are unavailable, cancelled, oversized, exhausted, or cannot
+    /// be encoded.
+    pub fn replace_with_artifact_as_if_ready<T: Serialize + ?Sized>(
+        &mut self,
+        schema: impl Into<String>,
+        schema_version: u32,
+        payload: &T,
+        artifact: bcode_tool::ToolContributionArtifact,
+    ) -> Result<Option<u64>, PresentationUpdateError> {
+        let schema = schema.into();
+        if artifact.finalized {
+            return self
+                .replace_with_artifact_as(schema, schema_version, payload, artifact)
+                .map(Some);
+        }
+        if !self.is_ready() {
+            if self.cancellation.is_cancelled() {
+                return Err(PresentationUpdateError::Cancelled);
+            }
+            if !self.events.is_available() {
+                return Err(PresentationUpdateError::Unavailable);
+            }
+            return Ok(None);
+        }
+        self.replace_with_artifact_as(schema, schema_version, payload, artifact)
+            .map(Some)
+    }
+
     /// Replace the current primary payload and return its revision.
     ///
     /// # Errors

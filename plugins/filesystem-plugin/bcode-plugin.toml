@@ -16,11 +16,15 @@ name         = "Filesystem Tools"
 [[tool_presentations]]
 request_draft_schema         = "bcode.filesystem.request-draft.write"
 request_draft_schema_version = 1
+request_schema               = "bcode.filesystem.request"
+request_schema_version       = 1
 tool_name                    = "filesystem.write"
 
 [[tool_presentations]]
 request_draft_schema         = "bcode.filesystem.request-draft.edit"
 request_draft_schema_version = 1
+request_schema               = "bcode.filesystem.request"
+request_schema_version       = 1
 tool_name                    = "filesystem.edit"
 
 [[visual_adapters]]

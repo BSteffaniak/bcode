@@ -1001,7 +1001,14 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[must_use]
 pub fn ocr_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
-    registry.register_visual_adapter(Box::new(ocr_tui::OcrTuiVisualAdapter));
+    registry.register_visual_adapter(
+        [
+            "ocr-request-card",
+            "ocr-extract-result-card",
+            "ocr-status-card",
+        ],
+        Box::new(ocr_tui::OcrTuiVisualAdapter),
+    );
     registry
 }
 

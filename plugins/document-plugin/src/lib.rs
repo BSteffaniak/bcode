@@ -780,7 +780,14 @@ pub fn static_plugin() -> bcode_plugin_sdk::StaticPluginVtable {
 #[must_use]
 pub fn document_tui_registry() -> bcode_plugin_sdk::tui::PluginTuiRegistry {
     let mut registry = bcode_plugin_sdk::tui::PluginTuiRegistry::default();
-    registry.register_visual_adapter(Box::new(document_tui::DocumentTuiVisualAdapter));
+    registry.register_visual_adapter(
+        [
+            "document-request-card",
+            "document-extract-result-card",
+            "document-status-card",
+        ],
+        Box::new(document_tui::DocumentTuiVisualAdapter),
+    );
     registry
 }
 
